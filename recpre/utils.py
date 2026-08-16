@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: Fabric setup/checkpoint API changes, hardened chunked cross-entropy. See README and git history.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 """Utility functions for training and inference."""
@@ -45,6 +47,10 @@ from lightning.fabric.utilities.apply_func import convert_tensors_to_scalars, co
 from lightning.pytorch.loggers import WandbLogger
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
+
+COMPILE_ARGS = {
+    "backend": "inductor", # "inductor", # "cudagraphs"
+}
 
 if TYPE_CHECKING:
     import torch.distributed
@@ -890,8 +896,8 @@ def fsdp_auto_wrap_policy(set_of_transformer_layers: set[Type[torch.nn.Module]])
 
 # wrapper for lightning fabrics
 class LightningFabric:
-    def __init__(self, devices, strategy, precision, loggers=[], num_nodes: int = 1):
-        fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=loggers, num_nodes=num_nodes)
+    def __init__(self, devices, strategy, precision, loggers=[], num_nodes: int = 1, plugins=None):
+        fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=loggers, num_nodes=num_nodes, plugins=plugins)
         self._underlying_fabric = fabric
         self._precision = precision
         self.strategy_name = strategy.__class__.__name__
@@ -913,7 +919,7 @@ class LightningFabric:
         if self.global_rank == 0:
             self.loggers[0].experiment.log(dict_of_charts)
 
-    def setup(self, model: torch.nn.Module, compile: bool = False, compile_ddp: bool = True):
+    def setup(self, model: torch.nn.Module, optimizer = None, compile: bool = False, compile_ddp: bool = True):
         """Compiling DDP turns out not to improve speed on the A6000 ada cards"""
 
         if "DDP" in self.strategy_name and compile and compile_ddp:
@@ -924,16 +930,16 @@ class LightningFabric:
             elif "16-true" in self._precision:
                 torch.set_default_dtype(torch.float16)
 
-            model = self._underlying_fabric.setup(model)
-            if compile:
-                model = torch.compile(model, fullgraph=False, dynamic=False, mode="max-autotune-no-cudagraphs")  # type: ignore
+        if compile:
+            model = torch.compile(model, fullgraph=False, dynamic=True, mode="max-autotune-no-cudagraphs", **COMPILE_ARGS)  # type: ignore
+            
+
+        if optimizer:
+            (model, optimizer) = self._underlying_fabric.setup(model, optimizer)
         else:
-            if compile:
-                # error on dynamic shape
-                model = torch.compile(model, fullgraph=False, dynamic=False, mode="max-autotune-no-cudagraphs")  # type: ignore
             model = self._underlying_fabric.setup(model)
 
-        return model
+        return model, optimizer
 
 
 @torch.no_grad()
@@ -1163,7 +1169,7 @@ class SimpleFabric:
         # compile after DDP to compile DDP calls
         if compile:
             self.model_ref = torch.compile(
-                self.model_ref, fullgraph=False, dynamic=False, mode="max-autotune-no-cudagraphs"
+                self.model_ref, fullgraph=False, dynamic=False, mode="max-autotune-no-cudagraphs", **COMPILE_ARGS
             )
         return self.model_ref
 
@@ -1563,7 +1569,26 @@ def get_abacus_param_groups(
     return param_groups
 
 
-from torch._inductor.codecache import _reload_python_module, _reload_python_module_in_subproc, ModuleType
+from types import ModuleType  # standard lib
+
+try:
+    # Newer PyTorch (2.5+ era): functions live in runtime.compile_tasks
+    from torch._inductor.runtime.compile_tasks import (
+        _reload_python_module,
+        _reload_python_module_in_subproc,
+    )
+except Exception:
+    # Older PyTorch: fall back to codecache (may not have the *_in_subproc symbol)
+    from torch._inductor.codecache import _reload_python_module  # type: ignore[attr-defined]
+    try:
+        from torch._inductor.codecache import _reload_python_module_in_subproc  # type: ignore[attr-defined]
+    except Exception:
+        _reload_python_module_in_subproc = None  # type: ignore[assignment]
+
+def reload_generated_module(key: str, path: str, *, use_subproc: bool = True):
+    if use_subproc and _reload_python_module_in_subproc is not None:
+        return _reload_python_module_in_subproc(key, path)
+    return _reload_python_module(key, path)
 
 
 def load_by_key_path_with_retry(
@@ -1700,8 +1725,18 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
     def forward(self, x, y=None):
         if y is None:
             return torch.matmul(x, self.weight.t())
+        """
         if x.is_meta:
             return torch.nn.functional.cross_entropy(torch.mm(x, self.weight.t()), y, ignore_index=self.ignore_index)
+        else:
+            return ChunkedCE.apply(
+                x.view(-1, self.in_features), self.weight, y.view(-1), False, self.ignore_index, self.chunk_size
+            )
+        """
+        if x.is_meta:
+            N = x.numel() // self.in_features
+            logits = torch.mm(x.view(N, self.in_features), self.weight.t())
+            return torch.nn.functional.cross_entropy(logits, y.view(-1), ignore_index=self.ignore_index)
         else:
             return ChunkedCE.apply(
                 x.view(-1, self.in_features), self.weight, y.view(-1), False, self.ignore_index, self.chunk_size

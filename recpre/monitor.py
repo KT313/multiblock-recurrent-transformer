@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: NameError fix, MFU metric adaptations. See README and git history.
 """Glue functions to enable/disable monitoring."""
 
 import torch
@@ -123,14 +125,22 @@ def track_gradient_metrics(model, optimizer, metrics):
     optim_metrics["l1_param_norm"] = l1_param_norm
 
     # sub-group param norms
-    optim_metrics["core_block_l2_param_norm"] = torch.norm(
-        torch.stack([torch.norm(p.detach()) for p in model.transformer.core_block.parameters()])
-    )
+    # For RecurrentGPT with multiple core_blocks - log each separately
+    if hasattr(model.transformer, 'core_blocks'):
+        for block_idx, core_block in enumerate(model.transformer.core_blocks):
+            optim_metrics[f"core_block_{block_idx}_l2_param_norm"] = torch.norm(
+                torch.stack([torch.norm(p.detach()) for p in core_block.parameters()])
+            )
+    # For standard GPT with single core_block (backward compatibility)
+    elif hasattr(model.transformer, 'core_block'):
+        optim_metrics["core_block_l2_param_norm"] = torch.norm(
+            torch.stack([torch.norm(p.detach()) for p in model.transformer.core_block.parameters()])
+        )
     optim_metrics["word_embed_l2_param_norm"] = torch.norm(
         torch.stack([torch.norm(p.detach()) for p in model.transformer.wte.parameters()])
     )
     optim_metrics["model_l2_param_norm"] = torch.norm(
-        torch.stack([torch.norm(p.detach()) for n, p in model.named_parameters() if "wte" not in name])
+        torch.stack([torch.norm(p.detach()) for n, p in model.named_parameters() if "wte" not in n])
     )
 
     # finalize if all metrics were recorded successfully
@@ -165,19 +175,53 @@ def _actually_measure_flops(model_config, objective, gradient_checkpointing, mic
     try:
         with torch.device("meta"):
             config_copy = copy.deepcopy(model_config)
-            # # Annoying special rules for improper triton implementations
+            # Simplify ops to make tracing more likely to succeed
             config_copy.simple_ops = True
             config_copy.use_fused_head = False
-            # construct a new model made up only of meta tensors:
-            meta_model = config_copy.construct_model(objective=objective, gradient_checkpointing=gradient_checkpointing)
-            x = torch.randint(0, config_copy.padded_vocab_size, (micro_batch_size, model_config.block_size))
+
+            # Construct meta model
+            meta_model = config_copy.construct_model(
+                objective=objective, gradient_checkpointing=gradient_checkpointing
+            )
+
+            V = getattr(config_copy, "padded_vocab_size", None) or getattr(config_copy, "vocab_size", None)
+            if V is None:
+                raise RuntimeError("MFU: could not determine vocab size")
+
+            # Create synthetic labels/input_ids on meta
+            x = torch.randint(low=0, high=V, size=(micro_batch_size, model_config.block_size), dtype=torch.long)
 
             flop_counter = FlopCounterMode(display=not torch.distributed.is_initialized())
             with flop_counter:
-                meta_model(input_ids=x, labels=x)["loss"].backward()
+
+                # Try a meta forward/backward; if unsupported, fall back to estimator
+                try:
+                    logits_vocab = getattr(meta_model, "lm_head", None)
+                    if logits_vocab is not None and hasattr(logits_vocab, "weight"):
+                        n_classes = logits_vocab.weight.shape[0]
+                    else:
+                        # fallback after a dummy forward to get logits shape
+                        tmp = meta_model(input_ids=x, labels=None)
+                        logits = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
+                        n_classes = logits.shape[-1]
+
+                    ig = -100
+                    labels = x.clone()
+                    labels[(labels < 0) | (labels >= n_classes)] = ig
+
+                    out = meta_model(input_ids=x, labels=labels)
+                    loss = out.get("loss", None)
+                    if loss is None:
+                        raise RuntimeError("MFU meta: forward did not return 'loss'")
+                    loss.backward()  # single backward is enough
+                except Exception as e:
+                    # Force outer fallback
+                    raise RuntimeError(f"MFU meta trace failed: {e}")
+
             measured_flops = flop_counter.get_total_flops()
             del meta_model, x
-    except (NotImplementedError, AssertionError, RuntimeError) as e:
+
+    except Exception as e:
         print(
             "Cannot trace model with meta tensors for flop calculation, falling back on estimated flop count. "
             f"This may be (very) inaccurate for exotic archs. Original error: {e}"

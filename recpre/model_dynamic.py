@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: multi-block recurrent architecture (per-block recurrence/adapters/norms), rewritten forward and recurrence internals. See README and git history.
 """Implementation of all possible dynamic model variants.
 Not closely following the model_axonn/model separation, writing for unified implementation
 """
@@ -8,6 +10,7 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 from recpre.config_dynamic import Config, GPTConfig, RecurrentConfig
 from .ops import LinearCrossEntropyLoss
@@ -85,7 +88,13 @@ class GPT(torch.nn.Module):
 
     def reset_parameters(self) -> None:
         self.config.init.apply(self.transformer.wte, "embedding")
-        self.config.init.apply(self.transformer.ln_f, "normalization")
+        # Initialize per-block normalizations (RecurrentGPT) or single ln_f (GPT)
+        if hasattr(self.transformer, 'ln_fs'):
+            for ln_f in self.transformer.ln_fs:
+                self.config.init.apply(ln_f, "normalization")
+            self.config.init.apply(self.transformer.ln_final, "normalization")
+        else:
+            self.config.init.apply(self.transformer.ln_f, "normalization")
         # lm_head init already defined above
 
     def forward(
@@ -124,10 +133,22 @@ class GPT(torch.nn.Module):
             if self.config.use_fused_head:
                 loss = self.lm_head(x, labels)
             else:
-                logits = torch.matmul(x, self.lm_head.weight)
-                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
+                logits = F.linear(x, self.lm_head.weight) # torch.matmul(x, self.lm_head.weight)
+                ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
+                # loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ig)
+                n_classes = logits.shape[-1]
+                labels = labels.to(torch.long)                     # ensure correct dtype
+                ig = -100 if "ig" not in locals() else ig          # keep existing ig if you have it
+                invalid = (labels < 0) | (labels >= n_classes)     # out-of-range targets
+                labels = labels.masked_fill(invalid, ig)           # ignore invalids
+
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, n_classes),
+                    labels.view(-1),
+                    ignore_index=ig,
+                )
         else:
-            outputs = torch.matmul(x, self.lm_head.weight).float()
+            outputs = F.linear(x, self.lm_head.weight) # torch.matmul(x, self.lm_head.weight).float()
             loss = torch.as_tensor(0.0)
         return {
             "loss": loss,
@@ -137,11 +158,13 @@ class GPT(torch.nn.Module):
 
     @torch.no_grad()
     def monitor_module(self, x: torch.Tensor):
+
         x_c = x - x.mean(dim=-1, keepdim=True)
         normed_x = x_c / x_c.norm(dim=-1, keepdim=True)
         token_corr = (normed_x @ normed_x.transpose(1, 2)).mean() - 1 / x.shape[1]
         metrics = {"last_hidden_token_corr": token_corr, "last_hidden_norm": x.norm(dim=-1).mean()}
         self.latest_metrics = metrics  # will be picked up from monitoring caller
+
 
 
 ############################ Individual Blocks ########################################################################
@@ -324,6 +347,8 @@ class RevTransformerPreNormBlock(torch.nn.Module):
 
 
 class CausalSelfAttention(torch.nn.Module):
+    __constants__ = ("n_head", "n_kv_heads", "head_dim", "n_rep", "chunks")
+
     def __init__(self, config: AnyConfig, layer_id: int) -> None:
         super().__init__()
         self.config = config
@@ -332,7 +357,12 @@ class CausalSelfAttention(torch.nn.Module):
         self.head_dim = config.n_embd // self.n_head
         self.n_rep = self.n_head // self.n_kv_heads
         shape = (self.n_head + 2 * self.n_kv_heads) * self.head_dim
-        self.chunks = [config.n_embd, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim]
+        # self.chunks = [config.n_embd, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim]
+        self.chunks = (
+            config.n_embd,
+            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
+        )
         self.Wqkv = config.Linear(config.n_embd, shape, bias=config.bias, init_method=config.init.fn("qkv", layer_id))
         if config.qk_bias:
             self.qk_bias = torch.nn.Parameter(torch.zeros(2, 1, self.n_head, self.head_dim))
@@ -590,6 +620,7 @@ class TransformerPostNormPosBlock(TransformerPostNormBlock):
 
 
 class ParallelGatedMLPSelfAttention(CausalSelfAttention):
+    __constants__ = ("n_head", "n_kv_heads", "head_dim", "n_rep", "chunks")
     expanded = False
 
     def __init__(self, config: AnyConfig, layer_id) -> None:
@@ -601,13 +632,13 @@ class ParallelGatedMLPSelfAttention(CausalSelfAttention):
         self.head_dim = config.n_embd // self.n_head
         self.n_rep = self.n_head // self.n_kv_heads
         out_dim = config.intermediate_size * 2 + (self.n_head + 2 * self.n_kv_heads) * self.head_dim
-        self.chunks = [
+        self.chunks = (
             config.intermediate_size,
             config.intermediate_size,
             config.n_embd,
             self.n_kv_heads * self.head_dim,
             self.n_kv_heads * self.head_dim,
-        ]
+        )
 
         self.Wqkv_fc = config.Linear(
             config.n_embd, out_dim, bias=config.bias, init_method=config.init.fn("in_proj", layer_id)
@@ -647,18 +678,19 @@ class ParallelGatedMLPSelfAttention(CausalSelfAttention):
 
 
 class GatedBlock(ParallelGatedMLPSelfAttention):
+    __constants__ = ("head_dim", "chunks")
     expanded = True
 
     def __init__(self, config: AnyConfig, layer_id) -> None:
         super().__init__(config, layer_id)
 
         self.head_dim = config.intermediate_size // self.n_head
-        self.chunks = [
+        self.chunks = (
             config.intermediate_size,
             config.intermediate_size,
             self.n_kv_heads * self.head_dim,
             self.n_kv_heads * self.head_dim,
-        ]
+        )
         self.Wqkv_fc = config.Linear(
             config.n_embd, sum(self.chunks), bias=config.bias, init_method=config.init.fn("in_proj", layer_id)
         )
@@ -676,6 +708,8 @@ class GatedBlock(ParallelGatedMLPSelfAttention):
 
 
 class OPSelfAttention(torch.nn.Module):
+    __constants__ = ("n_head", "n_kv_heads", "head_dim", "n_rep", "chunks")
+
     def __init__(self, config: AnyConfig, layer_id: int) -> None:
         super().__init__()
         self.config = config
@@ -684,7 +718,12 @@ class OPSelfAttention(torch.nn.Module):
         self.head_dim = config.n_embd // self.n_head
         self.n_rep = self.n_head // self.n_kv_heads
         shape = (self.n_head + 2 * self.n_kv_heads) * self.head_dim
-        self.chunks = [config.n_embd, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim]
+        # self.chunks = [config.n_embd, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim]
+        self.chunks = (
+            config.n_embd,
+            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
+        )
         self.Wqkv = config.Linear(config.n_embd, shape, bias=config.bias, init_method=config.init.fn("qkv", layer_id))
         # output projection
         self.proj = config.Linear(
@@ -965,42 +1004,69 @@ class RecurrentGPT(torch.nn.Module):
         config: RecurrentConfig,
         objective,
         gradient_checkpointing=False,
+        *,
+        tokenizer: Optional[Any] = None,   # absorb optional tokenizer
+        **_extras,                         # absorb any other future kwargs
     ) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
+        # intentionally ignore `tokenizer` and other extras.
 
         # Transformer layers
         prelude = torch.nn.ModuleList(config.Block(config, layer_id=i) for i in range(config.n_layers_in_prelude))
 
-        if config.injection_type == "linear":
-            adapter = config.Linear(
-                config.n_embd * 2,
-                config.n_embd,
-                bias=config.bias,
-                init_method=config.init.fn("in_proj", config.n_layers_in_prelude),
+        # Create core_blocks dynamically
+        core_blocks = torch.nn.ModuleList()
+        layer_offset = config.n_layers_in_prelude
+        for block_idx, n_layers in enumerate(config.n_layers_in_recurrent_block):
+            core_block = torch.nn.ModuleList(
+                config.Block(config, layer_id=i + layer_offset)
+                for i in range(n_layers)
             )
-        elif config.injection_type == "ffn":
-            adapter = config.MLP(config, layer_id=0, in_features=config.n_embd * 2)
-        else:
-            adapter = torch.nn.Identity()
+            core_blocks.append(core_block)
+            layer_offset += n_layers * config.mean_recurrence[block_idx]
 
-        core_block = torch.nn.ModuleList(
-            config.Block(config, layer_id=i + config.n_layers_in_prelude)
-            for i in range(config.n_layers_in_recurrent_block)
-        )
-        o = config.n_layers_in_prelude + config.n_layers_in_recurrent_block * config.mean_recurrence
+        # Create per-block adapters
+        adapters = torch.nn.ModuleList()
+        for block_idx in range(len(config.n_layers_in_recurrent_block)):
+            if config.injection_type == "linear":
+                adapter = config.Linear(
+                    config.n_embd * 2,
+                    config.n_embd,
+                    bias=config.bias,
+                    init_method=config.init.fn("in_proj", config.n_layers_in_prelude),
+                )
+            elif config.injection_type == "ffn":
+                adapter = config.MLP(config, layer_id=block_idx, in_features=config.n_embd * 2)
+            else:
+                adapter = torch.nn.Identity()
+            adapters.append(adapter)
+
+        o = layer_offset
         coda = torch.nn.ModuleList(config.Block(config, layer_id=i + o) for i in range(config.n_layers_in_coda))
 
         hidden_state_dim = config.n_embd if config.Block is not RevTransformerPreNormBlock else config.n_embd * 2
+
+        # Create per-block output normalizations (one for each core block)
+        ln_fs = torch.nn.ModuleList([
+            # config.Norm(hidden_state_dim, eps=config.norm_eps)
+            torch.nn.LayerNorm(hidden_state_dim, eps=config.norm_eps)
+            for _ in range(len(config.n_layers_in_recurrent_block))
+        ])
+
+        # Final normalization after coda blocks, before LM head
+        ln_final = torch.nn.LayerNorm(hidden_state_dim, eps=config.norm_eps)
+
         self.transformer = torch.nn.ModuleDict(
             dict(
                 wte=torch.nn.Embedding(config.padded_vocab_size, hidden_state_dim),
                 prelude=prelude,
-                adapter=adapter,
-                core_block=core_block,
+                adapters=adapters,
+                core_blocks=core_blocks,
                 coda=coda,
-                ln_f=config.Norm(hidden_state_dim, eps=config.norm_eps),
+                ln_fs=ln_fs,
+                ln_final=ln_final,
             )
         )
         self.emb_scale = config.init.embedding_scale
@@ -1050,11 +1116,22 @@ class RecurrentGPT(torch.nn.Module):
         self.monitoring = False
         self.latest_metrics = {}
         # Remaining inits:
+        # Load pretrained embeddings if configured (must happen before reset_parameters)
+        if self.config.pretrained_embeddings_from:
+            self._load_pretrained_embeddings()
         self.reset_parameters()
 
     def _precompute_freqs_cis(self):
         # Trigger resetting the rope-cache
-        dim = self.config.intermediate_size if self.transformer.core_block[0].expanded else self.config.n_embd
+        # Handle case where there are 0 core blocks by checking prelude, coda, or defaulting to n_embd
+        if len(self.transformer.core_blocks) > 0:
+            dim = self.config.intermediate_size if self.transformer.core_blocks[0][0].expanded else self.config.n_embd
+        elif len(self.transformer.prelude) > 0:
+            dim = self.config.intermediate_size if self.transformer.prelude[0].expanded else self.config.n_embd
+        elif len(self.transformer.coda) > 0:
+            dim = self.config.intermediate_size if self.transformer.coda[0].expanded else self.config.n_embd
+        else:
+            dim = self.config.n_embd
         if self.config.randomize_positions_from is not None:
             max_length = self.config.randomize_positions_from
         else:
@@ -1067,10 +1144,94 @@ class RecurrentGPT(torch.nn.Module):
         )  # can actually be a buffer now, and remains in fp32! (at least in the settings I tested)
         return freqs_cis
 
+    def _load_pretrained_embeddings(self) -> None:
+        """Load and freeze pretrained embeddings from a HuggingFace model."""
+        from transformers import AutoModelForCausalLM
+
+        print(f"Loading pretrained embeddings from {self.config.pretrained_embeddings_from}...")
+
+        # Load the HuggingFace model
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            self.config.pretrained_embeddings_from,
+            torch_dtype=torch.float32,  # Load in fp32 to match our model
+        )
+
+        # Extract embedding layer - try common attribute names
+        if hasattr(hf_model, 'model') and hasattr(hf_model.model, 'embed_tokens'):
+            # LLaMA-style models
+            hf_embeddings = hf_model.model.embed_tokens
+        elif hasattr(hf_model, 'transformer') and hasattr(hf_model.transformer, 'wte'):
+            # GPT-style models
+            hf_embeddings = hf_model.transformer.wte
+        elif hasattr(hf_model, 'embeddings'):
+            hf_embeddings = hf_model.embeddings
+        else:
+            raise ValueError(
+                f"Could not find embedding layer in {self.config.pretrained_embeddings_from}. "
+                f"Tried: model.embed_tokens, transformer.wte, embeddings"
+            )
+
+        # Validate dimensions
+        hf_vocab_size, hf_embed_dim = hf_embeddings.weight.shape
+        assert hf_embed_dim == self.config.n_embd, (
+            f"Embedding dimension mismatch: HF model has {hf_embed_dim}, "
+            f"but config specifies {self.config.n_embd}"
+        )
+        assert hf_vocab_size == self.config.vocab_size, (
+            f"Vocabulary size mismatch: HF model has {hf_vocab_size}, "
+            f"but config specifies {self.config.vocab_size}. "
+            f"Note: padded_vocab_size is {self.config.padded_vocab_size}"
+        )
+
+        # Copy weights to our embedding layer
+        with torch.no_grad():
+            self.transformer.wte.weight[:hf_vocab_size, :].copy_(hf_embeddings.weight)
+            # If our vocab is padded beyond HF vocab, those extra embeddings remain randomly initialized
+
+        # Freeze the embeddings
+        self.transformer.wte.weight.requires_grad = False
+        print(f"✓ Loaded and froze {hf_vocab_size} embeddings of dimension {hf_embed_dim}")
+
+        # Handle LM head freezing if tied
+        if self.config.tie_embeddings and self.config.freeze_lm_head:
+            self.lm_head.weight.requires_grad = False
+            print(f"✓ Froze LM head (tied to embeddings)")
+
+        # Clean up the HF model to free memory
+        del hf_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
     def reset_parameters(self) -> None:
-        self.config.init.apply(self.transformer.wte, "embedding")
-        self.config.init.apply(self.transformer.ln_f, "normalization")
+        # Skip embedding initialization if using pretrained embeddings
+        if not self.config.pretrained_embeddings_from:
+            self.config.init.apply(self.transformer.wte, "embedding")
+        # Initialize per-block normalizations (RecurrentGPT) or single ln_f (GPT)
+        if hasattr(self.transformer, 'ln_fs'):
+            for ln_f in self.transformer.ln_fs:
+                self.config.init.apply(ln_f, "normalization")
+            self.config.init.apply(self.transformer.ln_final, "normalization")
+        else:
+            self.config.init.apply(self.transformer.ln_f, "normalization")
         # lm_head init already defined above
+
+    def _canon_steps(self, steps) -> Optional[tuple[int, int]]:
+        if steps is None:
+            return None
+        # Tensor -> flatten to 1D, accept 1 or 2 items (no CPU transfer needed)
+        if isinstance(steps, torch.Tensor):
+            v = steps.detach().reshape(-1)  # Stay on CUDA - .item() works on CUDA tensors
+            if v.numel() == 2:
+                return int(v[0].item()), int(v[1].item())
+            elif v.numel() == 1:
+                return int(v[0].item()), 0
+            else:
+                # if someone passes a schedule vector, decide outside compile and pass a 2-tuple here
+                return int(v[0].item()), int(v[1].item())
+        # list/tuple
+        if isinstance(steps, (list, tuple)):
+            return int(steps[0]), int(steps[1] if len(steps) > 1 else 0)
+        # scalar
+        return int(steps), 0
 
     def forward(
         self,
@@ -1086,25 +1247,68 @@ class RecurrentGPT(torch.nn.Module):
                 torch.randint(0, self.config.randomize_positions_from, (input_ids.shape[1],), device=input_ids.device)
             )[0]
 
+        # 1 create embeddings
+        # 2 ff prelude
+        # 
+
         if position_ids is None:
             freqs_cis = self.freqs_cis[:, : input_ids.shape[1]]
         else:
             freqs_cis = self.freqs_cis.index_select(1, position_ids)
 
+        # 1
         input_embeds = self.transformer.wte(input_ids)
         if self.emb_scale != 1:
             input_embeds = input_embeds * self.emb_scale
 
+        # 2
         for _, block in enumerate(self.transformer.prelude):
-            input_embeds = block(input_embeds, freqs_cis, attention_mask)
+            latent_tensor_merker = block(input_embeds, freqs_cis, attention_mask)
 
-        x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
-            input_embeds,  # type: ignore
-            freqs_cis,
-            attention_mask,
-            num_steps_pair,
-        )
-        x_rec_output = x
+        # Normalize num_steps_pair to list format for per-block control
+        # If there are no core blocks, ignore num_steps_pair (useful for evaluation)
+        if len(self.transformer.core_blocks) == 0:
+            normalized_steps = []
+        elif num_steps_pair is not None:
+            # Check if it's already a list of tuples/tensors
+            if isinstance(num_steps_pair, list):
+                # Already a list, validate length
+                assert len(num_steps_pair) == len(self.transformer.core_blocks), \
+                    f"num_steps_pair list length ({len(num_steps_pair)}) must match number of core_blocks ({len(self.transformer.core_blocks)})"
+                normalized_steps = [self._canon_steps(s) for s in num_steps_pair]
+            else:
+                # Single tuple/tensor, replicate for all blocks (legacy support)
+                canonized = self._canon_steps(num_steps_pair)
+                normalized_steps = [canonized] * len(self.transformer.core_blocks)
+        else:
+            normalized_steps = [None] * len(self.transformer.core_blocks)
+
+        # Process all core blocks dynamically
+        x = latent_tensor_merker
+        x_rec_outputs = []
+        num_steps_no_grads = []
+        num_steps_with_grads = []
+        xks = []
+
+        # loop over recurrent blocks
+        for block_idx, core_block in enumerate(self.transformer.core_blocks):
+            steps = normalized_steps[block_idx]
+            x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
+                x,  # type: ignore
+                freqs_cis,
+                attention_mask,
+                steps,
+                core_block=core_block,
+                core_block_number=block_idx,
+            )
+            x_rec_outputs.append(x)
+            num_steps_no_grads.append(num_steps_no_grad)
+            num_steps_with_grads.append(num_steps_with_grad)
+            xks.append(xk)
+
+            # apply residual connection
+            x = x + latent_tensor_merker
+            latent_tensor_merker = x
 
         for _, block in enumerate(self.transformer.coda):
             if self.gradient_checkpointing and "in-coda" in self.config.activation_checkpoint_impl:
@@ -1112,44 +1316,65 @@ class RecurrentGPT(torch.nn.Module):
             else:
                 x = block(x, freqs_cis, attention_mask)
         if self.gradient_checkpointing and "in-coda" in self.config.activation_checkpoint_impl:
-            x = self.config.checkpoint(self.transformer.ln_f, x)
+            x = self.config.checkpoint(self.transformer.ln_final, x)
         else:
-            x = self.transformer.ln_f(x)
+            x = self.transformer.ln_final(x)
 
         if self.monitoring:
-            self.monitor_module(x, x_rec_output, xk, input_embeds, num_steps_no_grad, num_steps_with_grad)
+            for block_idx in range(len(self.transformer.core_blocks)):
+                self.monitor_module(
+                    x, x_rec_outputs[block_idx], xks[block_idx], latent_tensor_merker,
+                    num_steps_no_grads[block_idx], num_steps_with_grads[block_idx],
+                    postfix=f"_{block_idx}"
+                )
 
         if labels is not None:
             logits = None
             if self.config.use_fused_head == "cce":
                 from cut_cross_entropy import linear_cross_entropy  # type: ignore[unusal import]
-
+                
+                ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
                 loss = linear_cross_entropy(
-                    x * self.config.init.logit_scale, self.lm_head.weight, labels, filter_eps="auto"
+                    x * self.config.init.logit_scale, self.lm_head.weight, labels, ignore_index=ig, filter_eps="auto"
                 )
             elif self.config.use_fused_head == "hhe" or self.config.use_fused_head == "full-triton":
                 loss = self.lm_head(x * self.config.init.logit_scale, labels)
             else:
                 logits = self.lm_head(x).float() * self.config.init.logit_scale
-                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
+                ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
+                # loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ig)
+                n_classes = logits.shape[-1]
+                labels = labels.to(torch.long)                     # ensure correct dtype
+                ig = -100 if "ig" not in locals() else ig          # keep existing ig if you have it
+                invalid = (labels < 0) | (labels >= n_classes)     # out-of-range targets
+                labels = labels.masked_fill(invalid, ig)           # ignore invalids
+
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, n_classes),
+                    labels.view(-1),
+                    ignore_index=ig,
+                )
             log_ppl = loss.clone().detach()
             if self.config.mcleish_throttle and self.training:
-                loss = loss / torch.as_tensor(num_steps_with_grad, device=loss.device)
+                total_steps = sum(num_steps_with_grads)
+                loss = loss / torch.as_tensor(total_steps, device=loss.device)
             if self.config.elbayad_weighing and self.training:
-                t = self.config.mean_recurrence
+                t = sum(self.config.mean_recurrence)
                 weights = torch.arange(1, 16 * t, device=loss.device) ** self.config.elbayad_exponent
                 weights /= torch.sum(torch.arange(1, t + 1, device=loss.device) ** self.config.elbayad_exponent, dim=0)
-                this_weight = weights[num_steps_no_grad + num_steps_with_grad] / weights[t // 2]
+                total_steps = sum(num_steps_no_grads[i] + num_steps_with_grads[i] for i in range(len(num_steps_no_grads)))
+                this_weight = weights[total_steps] / weights[t // 2]
                 loss = loss * this_weight
         else:
             if self.config.use_fused_head == "cce":
                 logits = self.lm_head(x).float() * self.config.init.logit_scale
             elif self.config.use_fused_head == "full-triton":
                 logits = (
-                    torch.matmul(
-                        x, self.lm_head.weight.T if self.config.tie_embeddings else self.lm_head.weight
-                    ).float()
-                    * self.config.init.logit_scale
+                    # torch.matmul(
+                    #     x, self.lm_head.weight.T if self.config.tie_embeddings else self.lm_head.weight
+                    # ).float()
+                    # * self.config.init.logit_scale
+                    F.linear(x, self.lm_head.weight.T if self.config.tie_embeddings else self.lm_head.weight) * self.config.init.logit_scale
                 )
             else:
                 logits = self.lm_head(x).float() * self.config.init.logit_scale
@@ -1162,18 +1387,33 @@ class RecurrentGPT(torch.nn.Module):
         }
 
     @torch._dynamo.disable(recursive=False)  # type: ignore
-    def iterate_forward(self, input_embeds, freqs_cis, mask, num_steps_pair: Optional[torch.Tensor] = None):
-        x = self.initialize_state(input_embeds)
+    def iterate_forward(
+        self,
+        input_tensor,
+        freqs_cis,
+        mask,
+        num_steps_pair: Optional[tuple[int, int]] = None,
+        *,
+        core_block: torch.nn.ModuleList,
+        core_block_number: int,
+    ):
+        
+        x_base = self.transformer.ln_fs[core_block_number](input_tensor) # config "none": x = input_tensor
+        x_latent = self.initialize_state(input_tensor)
+
+        # x_base = self.transformer.ln_fs[core_block_number](x_base)
 
         if num_steps_pair is None:
-            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()  # type: ignore
+            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler(core_block_number)  # type: ignore
         elif len(num_steps_pair) > 1:
             num_steps_no_grad, num_steps_with_grad = num_steps_pair
         else:
             num_steps_no_grad, num_steps_with_grad = num_steps_pair, torch.tensor(0)
 
         if self.config.randomize_embed_step:
-            offset = torch.randint(0, self.config.mean_recurrence * 8, (1,), device=input_embeds.device)
+            mean_recurrence = self.config.mean_recurrence[core_block_number]
+            mean_backprop_depth = self.config.mean_backprop_depth[core_block_number]
+            offset = torch.randint(0, mean_recurrence * 8, (1,), device=x_base.device)
         else:
             offset = 0
 
@@ -1183,77 +1423,90 @@ class RecurrentGPT(torch.nn.Module):
             # for now running with find_unused_params=True enabled even though the graph structure is (technically) clear
             # and all parameters are always used
             for step in range(num_steps_no_grad):
-                xk = x
-                x = self.core_block_forward(xk, input_embeds, freqs_cis, mask, step + offset)
+                x_latent = self.core_block_forward(x_latent, x_base, freqs_cis, mask, step + offset, core_block=core_block, core_block_number=core_block_number)
 
         for step in range(num_steps_with_grad):
-            xk = x
             if self.gradient_checkpointing and "per-iteration" in self.config.activation_checkpoint_impl:
-                x = self.config.checkpoint(
-                    self.core_block_forward, xk, input_embeds, freqs_cis, mask, num_steps_no_grad + step + offset
+                x_latent = self.config.checkpoint(
+                    self.core_block_forward, x_latent, x_base, freqs_cis, mask, num_steps_no_grad + step + offset, core_block=core_block, core_block_number=core_block_number
                 )
             else:
-                x = self.core_block_forward(xk, input_embeds, freqs_cis, mask, num_steps_no_grad + step + offset)
-        return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach()
+                x_latent = self.core_block_forward(x_latent, x_base, freqs_cis, mask, num_steps_no_grad + step + offset, core_block=core_block, core_block_number=core_block_number)
+        return x_latent, num_steps_no_grad, num_steps_with_grad, x_latent.detach()
 
-    def core_block_forward(self, x, input_embeds, freqs_cis, mask, step: Union[torch.Tensor, int]):
+    def core_block_forward(self, x_latent, x_base, freqs_cis, mask, step: Union[torch.Tensor, int], core_block, core_block_number: int):
+
         if self.config.embed_step:
-            context = self.step_embedding(torch.as_tensor([step], device=input_embeds.device))
+            context = self.step_embedding(torch.as_tensor([step], device=x_latent.device))
         else:
             context = None
 
-        if self.config.injection_type == "add":
-            x = x + input_embeds
+        if self.config.injection_type == "none":
+            x_latent = x_latent
+        elif self.config.injection_type == "add-orig-noise-diffusion":
+            inject_ratio = torch.tensor(1/(step+1), device=x_base.device) # between 1.0 0.000...1. smaller the higher the 'step' param is
+            x_latent = x_latent * (1-inject_ratio) + x_base * inject_ratio
+
+        elif self.config.injection_type == "add-scaled":
+            inject_ratio = torch.tensor(1/(step+1), device=x_base.device) # between 1.0 0.000...1. smaller the higher the 'step' param is
+            x_latent = x_latent + x_base * inject_ratio
+
+        elif self.config.injection_type == "add":
+            x_latent = x_latent + x_base
         elif self.config.injection_type == "gate":
-            x = x * input_embeds
+            x_latent = x_latent * x_base
         elif self.config.injection_type in ["linear", "ffn"]:
-            x = self.transformer.adapter(torch.cat([x, input_embeds], dim=-1))
+            x_latent = self.transformer.adapters[core_block_number](torch.cat([x_latent, x_base], dim=-1))
         elif self.config.injection_type == "modulated":  # use in conjunction with Modulated blocks, not with embed_step
-            context = x.clone()
+            context = x_latent.clone()
         else:
             raise ValueError("Invalid injection type")
 
         if self.config.intermediate_noise_injection > 0:
             n = self.config.intermediate_noise_injection
             if self.config.geom_noise_injection == "geom":
-                step1 = torch.as_tensor(step + 1, device=x.device)  # need to cast for compile
-                x = x * (1 - n / step1) + torch.randn_like(x) * n / step1
+                step1 = torch.as_tensor(step + 1, device=x_latent.device)  # need to cast for compile
+                x_latent = x_latent * (1 - n / step1) + torch.randn_like(x_latent) * n / step1
             elif self.config.geom_noise_injection == "sqrt":
-                step1sqrt = torch.as_tensor(step + 1, device=x.device).sqrt()  # need to cast for compile
-                x = x * (1 - n / step1sqrt) + torch.randn_like(x) * n / step1sqrt
+                step1sqrt = torch.as_tensor(step + 1, device=x_latent.device).sqrt()  # need to cast for compile
+                x_latent = x_latent * (1 - n / step1sqrt) + torch.randn_like(x_latent) * n / step1sqrt
             elif self.config.geom_noise_injection == "line":
                 noise = max(n, (self.config.maximal_recurrence - step) / self.config.maximal_recurrence)  # type: ignore
-                x = x * (1 - noise) + torch.randn_like(x) * noise
+                x_latent = x_latent * (1 - noise) + torch.randn_like(x_latent) * noise
             elif self.config.geom_noise_injection == "chi":
-                noise = 2 * torch.rand(1, device=x.device, dtype=x.dtype) * n
+                noise = 2 * torch.rand(1, device=x_latent.device, dtype=x_latent.dtype) * n
             else:
-                x = x * (1 - n) + torch.randn_like(x) * n
+                x_latent = x_latent * (1 - n) + torch.randn_like(x_latent) * n
 
-        if isinstance(self.transformer.core_block[0], ModulatedTransformerPostNormBlock):
-            for _, block in enumerate(self.transformer.core_block):
+        if isinstance(core_block[0], ModulatedTransformerPostNormBlock):
+            for _, block in enumerate(core_block):
                 if not self.gradient_checkpointing:
-                    x = block(x, freqs_cis, mask, context=context)
+                    x_latent = block(x_latent, freqs_cis, mask, context=context)
                 else:
-                    x = self.config.checkpoint(block, x, freqs_cis, mask, context=context)
+                    x_latent = self.config.checkpoint(block, x_latent, freqs_cis, mask, context=context)
         else:
             if context is not None:
-                x = x + context
+                x_latent = x_latent + context
 
-            for _, block in enumerate(self.transformer.core_block):
+            for _, block in enumerate(core_block):
                 if self.gradient_checkpointing and "per-block" in self.config.activation_checkpoint_impl:
-                    x = self.config.checkpoint(block, x, freqs_cis, mask)
+                    x_latent = self.config.checkpoint(block, x_latent, freqs_cis, mask)
                 else:
-                    x = block(x, freqs_cis, mask)
-        return x
+                    x_latent = block(x_latent, freqs_cis, mask)
+        return x_latent
 
     @torch._dynamo.disable(recursive=False)  # type: ignore
-    def randomized_iteration_sampler(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def randomized_iteration_sampler(self, core_block_number: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Outputs are long tensors so that they can be passed through compiled functions"""
+
+        mean_recurrence = self.config.mean_recurrence[core_block_number]
+        mean_backprop_depth = self.config.mean_backprop_depth[core_block_number]
+
         if torch.rand((1,)).is_meta:  # annoying clause to make meta-tensor-based flop counting work
             # these values are only approximate, not all schemes exactly target a mean of n and k
             # they overvalue the compute done when curricula are turned on, but that may be considered
             # a feature, given that it is a valid form of training acceleration
-            return self.config.mean_recurrence - self.config.mean_backprop_depth, self.config.mean_backprop_depth  # type: ignore
+            return mean_recurrence - mean_backprop_depth, mean_backprop_depth  # type: ignore
 
         seed_n = 514229 + self.step  # easiest way to make the sampler re-runnable in checkpointing
         seed_k = 317811 + self.step
@@ -1270,15 +1523,15 @@ class RecurrentGPT(torch.nn.Module):
         if "curriculum-" in self.config.sampling_scheme:
             ramp_length = int(self.config.sampling_scheme.split("curriculum-")[1])
             if self.step > ramp_length:
-                t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
-                s = self.config.mean_backprop_depth
+                t = max(mean_recurrence - mean_backprop_depth, 0)
+                s = mean_backprop_depth
             else:
                 slope = self.step / ramp_length
-                t = max(math.ceil(slope * (self.config.mean_recurrence - self.config.mean_backprop_depth)), 0)
-                s = max(math.ceil(slope * self.config.mean_backprop_depth), 1)
+                t = max(math.ceil(slope * (mean_recurrence - mean_backprop_depth)), 0)
+                s = max(math.ceil(slope * mean_backprop_depth), 1)
         else:
-            t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
-            s = self.config.mean_backprop_depth
+            t = max(mean_recurrence - mean_backprop_depth, 0)
+            s = mean_backprop_depth
 
         if self.training:
             if "bptt" in self.config.sampling_scheme:  # skewed toward n+k ~ max_recurrence
@@ -1346,27 +1599,31 @@ class RecurrentGPT(torch.nn.Module):
             elif "full" in self.config.sampling_scheme:
                 n, k = torch.as_tensor(0), torch.randint(low=1, high=2 * s + 1, size=(1,), generator=k_generator)
         else:
-            n, k = torch.as_tensor(self.config.mean_recurrence), torch.as_tensor(0)
+            n, k = torch.as_tensor(mean_recurrence), torch.as_tensor(0)
 
         return n.to(dtype=torch.long), k.to(dtype=torch.long)
 
-    def initialize_state(self, input_embeds):
-        if self.config.injection_type == "none":
-            return input_embeds
+    def initialize_state(self, latent_tensor_merker):
+        if self.config.state_init == "none":
+            return latent_tensor_merker
+        if self.config.state_init == "none-detach":
+            x = latent_tensor_merker.detach()
         if self.config.state_init == "normal":
-            x = torch.randn_like(input_embeds)
+            x = torch.randn_like(latent_tensor_merker)
+        if self.config.state_init == "normal-small":
+            x = torch.randn_like(latent_tensor_merker).mul(0.2)
         elif self.config.state_init == "embed":  # initialized like a scaled embedding:
-            x = torch.randn_like(input_embeds).mul(1 / math.sqrt(input_embeds.shape[-1]))
+            x = torch.randn_like(latent_tensor_merker).mul(1 / math.sqrt(latent_tensor_merker.shape[-1]))
         elif self.config.state_init == "like-init":
-            x = torch.randn_like(input_embeds)
+            x = torch.randn_like(latent_tensor_merker)
             std = self.config.init.get_std("embedding")
             torch.nn.init.trunc_normal_(x, mean=0.0, std=std, a=-3 * std, b=3 * std)
             if self.emb_scale != 1:
                 x = x * self.emb_scale
         elif self.config.state_init == "zero":
-            x = torch.zeros_like(input_embeds)
+            x = torch.zeros_like(latent_tensor_merker)
         elif self.config.state_init == "unit":
-            x = torch.randn_like(input_embeds)
+            x = torch.randn_like(latent_tensor_merker)
             std, mean = torch.std_mean(x, dim=-1, keepdim=True)
             x = (x - mean) / std
         return x
@@ -1377,9 +1634,10 @@ class RecurrentGPT(torch.nn.Module):
         x_out: torch.Tensor,
         x_rec: torch.Tensor,
         xk: torch.Tensor,
-        input_embeds: torch.Tensor,
+        latent_tensor_merker: torch.Tensor,
         num_steps_no_grad: torch.Tensor,
         num_steps_with_grad: torch.Tensor,
+        postfix: str = "",
     ):
         """Should update to track more recurrence metrics"""
         x_out_c = x_out - x_out.mean(dim=-1, keepdim=True)
@@ -1391,15 +1649,15 @@ class RecurrentGPT(torch.nn.Module):
         token_corr_rec = (normed_x @ normed_x.transpose(1, 2)).mean() - 1 / x_rec.shape[1]
         # k = num_steps_no_grad + num_steps_with_grad
         metrics = {
-            "last_hidden_token_corr": token_corr,
-            "recurrent_state_token_corr": token_corr_rec,
-            "last_hidden_norm": x_out.norm(dim=-1).mean(),
-            "recurrent_state_norm": x_rec.norm(dim=-1).mean(),
-            "recurrent_diff": (x_rec - input_embeds).norm(dim=-1).mean(),
-            "num_steps_no_grad": num_steps_no_grad,
-            "num_steps_with_grad": num_steps_with_grad,
-            "recurrent_residual": (x_rec - xk).norm(dim=-1).mean(),
-            "rel_residual": ((x_rec - xk).norm(dim=-1) / x_rec.norm(dim=-1)).mean(),
+            f"last_hidden_token_corr{postfix}": token_corr,
+            f"recurrent_state_token_corr{postfix}": token_corr_rec,
+            f"last_hidden_norm{postfix}": x_out.norm(dim=-1).mean(),
+            f"recurrent_state_norm{postfix}": x_rec.norm(dim=-1).mean(),
+            f"recurrent_diff{postfix}": (x_rec - latent_tensor_merker).norm(dim=-1).mean(),
+            f"num_steps_no_grad{postfix}": num_steps_no_grad,
+            f"num_steps_with_grad{postfix}": num_steps_with_grad,
+            f"recurrent_residual{postfix}": (x_rec - xk).norm(dim=-1).mean(),
+            f"rel_residual{postfix}": ((x_rec - xk).norm(dim=-1) / x_rec.norm(dim=-1)).mean(),
             # f"rel_residual_at_{k}": ((x_rec - xk).norm(dim=-1) / x_rec.norm(dim=-1)).mean(),
         }
         self.latest_metrics = metrics  # will be picked up from monitoring caller

@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: multi-stage settings, device/env detection, sequence padding controls. See README and git history.
 import os
 import json
 import torch
@@ -46,7 +48,7 @@ class HuggingfaceConfig:
 class DataEntry:
     type: str
     prefix: str
-    weight: int = 1
+    weight: float = 1.0
     data_signature: Optional[dict[str, list[str] | str]] = None
     name: Optional[str] = None
     data_dir: Optional[str] = None
@@ -63,6 +65,21 @@ class GoldfishConfig:
     start_position: int = 0
     context_width: int = 13
     strategy: Optional[str] = None  # off by default, set to "hash-table" or "hash-avalanche" to enable
+
+
+@dataclass
+class TrainingStage:
+    """Configuration for a single training stage in multi-stage training.
+
+    Each stage can have different datasets, learning rate, and token budget.
+    Stages transition smoothly over a specified percentage of tokens.
+    """
+    name: str                                   # Stage name (e.g., "pretrain_phase1", "finetune")
+    tokens: int                                 # Number of tokens to train on in this stage
+    base_lr: float                              # Base learning rate for this stage
+    train_data: list[DataEntry]                 # Training datasets for this stage
+    val_data: list[DataEntry]                   # Validation datasets for this stage
+    transition_pct: float = 0.05                # Transition period as % of this stage's tokens (0-1)
 
 
 @dataclass
@@ -84,9 +101,14 @@ class CLISettings:
     run_name: str = "default-run"  # The name for logging.
     out_dir: str = None  # type: ignore # The directory to save checkpoints. Required to be given or set as OUT_DIR
     resume: bool = True  # Whether to resume from a checkpoint in the out_dir.
+    resume_checkpoint_path: Optional[str] = None  # Manual checkpoint path for resume (overrides automatic search)
     max_tokens: int = 1_000_000_000_000  # The maximum number of tokens to train on (determines max_iters).
     max_steps: Optional[int] = None  # Set max_tokens=0 if setting max_steps
     seed: int = 1337  # The random seed to use for reproducibility.
+
+    # Multi-stage training
+    enable_multi_stage: bool = False  # Enable multi-stage training with smooth dataset transitions
+    training_stages: Optional[list[TrainingStage]] = None  # List of training stages (if None, use legacy single-stage)
 
     # Model configuration
     model_name: str = "tiny-llama-1.1b"  # The model name to use when creating the model from config.py / config_dynamic
@@ -94,6 +116,12 @@ class CLISettings:
     block_size: int = 2048  # The block size to use (lit-gpt-ese for sequence length).
     ignore_block_size_mismatch: bool = False  # Whether to ignore block size mismatch.
     model_checkpoint: Optional[str] = None  # The model checkpoint to load. Else, from config.
+    freeze_embeddings: bool = False  # Whether to freeze embeddings during finetuning
+    freeze_lm_head: bool = False  # Whether to freeze LM head during finetuning
+    # HuggingFace Export
+    export_to_hf: bool = False  # Whether to automatically export to HuggingFace format after training
+    export_hf_path: Optional[str] = None  # Where to save HF format (default: out_dir/hf_export)
+    model_description: str = ""  # User-provided description for model metadata
     doc_block_attn: bool = False  # Whether to mask out the attention between tokens from different documents.
     cache_attn: bool = False  # Whether to train the model with cache attention with cache tokens randomly inserted.
     eod_token: Optional[str] = None  # 'eos','bos','pad' The end-of-document token name (used for doc-block-attn).
@@ -113,6 +141,8 @@ class CLISettings:
     grad_clip: float = 1.0  # The gradient clipping value.
     warmup_steps: int = 0  # The number of warmup steps.
     cooldown_steps: int = 0  # The number of cooldown steps.
+    resume_freeze_steps: int = 0  # The number of steps with LR=0 after resume to let optimizer stabilize (0 = disabled).
+    resume_warmup_steps: int = 0  # The number of warmup steps when resuming from checkpoint (0 = disabled).
     lr_schedule: str = "cosine"  # The learning rate schedule to use.
     min_lr: float = 0.00004  # The minimum learning rate to decay to.
     no_weight_decay_for_bias_and_norm_params: bool = False  # do not use weight decay for bias and norm params
@@ -139,6 +169,7 @@ class CLISettings:
         )
     )
     micro_batch_size: int = 4  # The micro batch size to use.
+    sort_batches_by_length: bool = False  # Sort samples by length within each global batch to reduce padding waste
     compile_model: bool = False  # Whether to compile the model.
     matmul_precision: str = "high"  # enable tf32 acc on cuda with this
     dataloader_num_workers: int = 0  # The number of workers to use for the dataloaders.
@@ -175,6 +206,7 @@ class CLISettings:
     shuffle_blocks: bool = True  # (PKDS only.) Whether to shuffle the blocks in files.
     # HFDS arguments:
     pad_to_block_size: bool = False  # Whether to pad to the block size (HFDS only).
+    sequence_padding_multiple: Optional[int] = None  # Pad sequences to nearest multiple (e.g., 128, 256, 512) for better efficiency. None uses max length in batch.
     add_bos: bool = True  # Whether to add the BOS token to the input (HFDS only).
     add_eos: bool = True  # Whether to add the EOS token to the input (HFDS only).
     data_signature: dict[str, list[str] | str] = field(
@@ -282,7 +314,12 @@ class CLISettings:
         self.MASTER_PORT = int(os.getenv("MASTER_PORT", 0))
         self.WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
         self.RANK = int(os.getenv("SLURM_PROCID", "0"))
-        self.devices = int(os.getenv("SLURM_NTASKS_PER_NODE", torch.cuda.device_count()))
+        # Prioritize WORLD_SIZE (set by torchrun) over SLURM_NTASKS_PER_NODE for devices
+
+
+        self.devices = int(os.getenv("WORLD_SIZE", os.getenv("SLURM_NTASKS_PER_NODE", torch.cuda.device_count())))
+
+
         self.num_nodes = int(os.getenv("SLURM_JOB_NUM_NODES", 1))
 
     def _validate_data_config(self) -> dict[str, list[DataEntry]]:

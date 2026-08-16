@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: hardcoded 3-block recurrent variant, loss/generation tweaks. See README and git history.
 """Modeling file for HF compatibility and zero-shot experiments."""
 
 import torch
@@ -117,6 +119,9 @@ class CausalLMOutputRecurrentLatents(ModelOutput):
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
     latent_states: Optional[torch.Tensor] = None
+    latent_states_0: Optional[torch.Tensor] = None
+    latent_states_1: Optional[torch.Tensor] = None
+    latent_states_2: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     attention_maps: Optional[dict[int, torch.Tensor]] = None
     stats: Optional[dict] = None
@@ -552,11 +557,22 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         prelude = torch.nn.ModuleList(SandwichBlock(config, layer_id=i) for i in range(config.n_layers_in_prelude))
         adapter = torch.nn.Linear(config.n_embd * 2, config.n_embd, bias=config.bias)
         core_block = torch.nn.ModuleList(
-            SandwichBlock(config, layer_id=i + config.n_layers_in_prelude)
+            config.Block(config, layer_id=i + config.n_layers_in_prelude)
             for i in range(config.n_layers_in_recurrent_block)
         )
-        o = config.n_layers_in_prelude + config.n_layers_in_recurrent_block * config.mean_recurrence
-        coda = torch.nn.ModuleList(SandwichBlock(config, layer_id=i + o) for i in range(config.n_layers_in_coda))
+        core_block_1 = torch.nn.ModuleList(
+            config.Block(config, layer_id=i + config.n_layers_in_prelude + config.n_layers_in_recurrent_block * config.mean_recurrence)
+            for i in range(config.n_layers_in_recurrent_block_1)
+        )
+        core_block_2 = torch.nn.ModuleList(
+            config.Block(config, layer_id=i + config.n_layers_in_prelude + + config.n_layers_in_recurrent_block * config.mean_recurrence + config.n_layers_in_recurrent_block_1 * config.mean_recurrence_1)
+            for i in range(config.n_layers_in_recurrent_block_2)
+        )
+        o = config.n_layers_in_prelude + \
+            config.n_layers_in_recurrent_block * config.mean_recurrence + \
+            config.n_layers_in_recurrent_block_1 * config.mean_recurrence_1 + \
+            config.n_layers_in_recurrent_block_2 * config.mean_recurrence_2
+        coda = torch.nn.ModuleList(config.Block(config, layer_id=i + o) for i in range(config.n_layers_in_coda))
 
         self.transformer = torch.nn.ModuleDict(
             dict(
@@ -564,6 +580,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 prelude=prelude,
                 adapter=adapter,
                 core_block=core_block,
+                core_block_1=core_block_1,
+                core_block_2=core_block_2,
                 coda=coda,
                 ln_f=RMSNorm(config.n_embd, eps=config.norm_eps),  # used twice :>
             )
@@ -678,7 +696,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
 
         # Main recurrence
-        x, num_steps_no_grad, num_steps_with_grad, xk, block_idx = self.iterate_forward(
+        x, num_steps_no_grad_0, num_steps_with_grad_0, xk_0, block_idx_0 = self.iterate_forward(
             input_embeds,  # type: ignore # mystery typing error
             input_states,
             freqs_cis,
@@ -687,8 +705,35 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             past_key_values,
             num_steps,
             init_scale,
+            core_block_number=0,
         )
-        latent_states = x.clone().detach()
+        latent_states_0 = x.clone().detach()
+
+        x, num_steps_no_grad_1, num_steps_with_grad_1, xk_1, block_idx_1 = self.iterate_forward(
+            x,  # type: ignore # mystery typing error
+            input_states,
+            freqs_cis,
+            block_idx,
+            prepared_attn_mask,
+            past_key_values,
+            num_steps,
+            init_scale,
+            core_block_number=1,
+        )
+        latent_states_1 = x.clone().detach()
+
+        x, num_steps_no_grad_2, num_steps_with_grad_2, xk_2, block_idx_2 = self.iterate_forward(
+            x,  # type: ignore # mystery typing error
+            input_states,
+            freqs_cis,
+            block_idx,
+            prepared_attn_mask,
+            past_key_values,
+            num_steps,
+            init_scale,
+            core_block_number=2,
+        )
+        latent_states_2 = x.clone().detach()
 
         # Coda layers
         block_idx = torch.tensor(0, device=torch.device("cpu"), dtype=torch.long)  # use negative indices for head
@@ -700,8 +745,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         # Prediction head, assuming labels really are labels and not equal to input_ids
         if labels is not None:
             logits = self.lm_head(x).float()
+            ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
             loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100
+                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ig
             )
             log_ppl = loss.clone().detach().exp()
         else:
@@ -714,8 +760,26 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             logits=logits if output_details["return_logits"] else None,
             past_key_values=past_key_values,
             hidden_states=x if output_details["return_head"] else None,
-            latent_states=latent_states if output_details["return_latents"] else None,
-            stats=self.get_stats(logits, x, latent_states, xk, input_embeds, num_steps_no_grad, num_steps_with_grad)
+            latent_states_0=latent_states_0 if output_details["return_latents"] else None,
+            latent_states_1=latent_states_1 if output_details["return_latents"] else None,
+            latent_states_2=latent_states_2 if output_details["return_latents"] else None,
+            stats=self.get_stats(
+                logits, 
+                x, 
+                latent_states_0, 
+                latent_states_1, 
+                latent_states_2, 
+                xk_0, 
+                xk_1, 
+                xk_2, 
+                input_embeds, 
+                num_steps_no_grad_0, 
+                num_steps_no_grad_1, 
+                num_steps_no_grad_2, 
+                num_steps_with_grad_0, 
+                num_steps_with_grad_1, 
+                num_steps_with_grad_2, 
+                )
             if output_details["return_stats"]
             else None,
         )
@@ -731,10 +795,11 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values: Optional[ValidCache] = None,
         num_steps: Optional[torch.Tensor] = None,
         init_scale: float = 1.0,
+        core_block_number: int = 0,
     ):
         x = xk = self.initialize_state(input_embeds, scale=init_scale) if input_states is None else input_states.clone()
         if num_steps is None:
-            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()  # type: ignore
+            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler(core_block_number)  # type: ignore
         elif hasattr(num_steps, "__len__") and len(num_steps) > 1:
             num_steps_no_grad, num_steps_with_grad = num_steps
         else:
@@ -748,13 +813,13 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             for no_grad_step in range(num_steps_no_grad):
                 xk = x
                 x, block_idx = self.core_block_forward(
-                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, no_grad_step
+                    xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, no_grad_step, core_block_number=core_block_number
                 )
 
         for grad_step in range(num_steps_with_grad):
             xk = x
             x, block_idx = self._maybe_checkpoint_core_block(
-                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, num_steps_no_grad + grad_step
+                xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, num_steps_no_grad + grad_step, core_block_number=core_block_number
             )
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx  # type: ignore # types broken in 2.6+
 
@@ -767,21 +832,44 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values,
         block_idx: torch.Tensor,
         current_step: int | Tensor,
+        core_block_number: int = 0,
     ):
+        
+        if core_block_number == 0:
+            core_block = self.transformer.core_block
+        elif core_block_number == 1:
+            core_block = self.transformer.core_block_1
+        else:
+            core_block = self.transformer.core_block_2
+
         block_idx = block_idx.detach().clone()  # line only included to convince torch.checkpointing
-        x = self._maybe_inject_noise(x, current_step)
+        x = self._maybe_inject_noise(x, current_step, core_block=core_block)
         x = self.transformer.adapter(torch.cat([x, input_embeds.to(x.device)], dim=-1))  # type: ignore # types broken in 2.6+
-        for block in self.transformer.core_block:  # type: ignore # types broken in 2.6+
+        for block in core_block:  # type: ignore # types broken in 2.6+
             block_idx += 1
             x = block(x, freqs_cis, block_idx, mask, past_key_values)
 
         return x, block_idx
 
     @torch._dynamo.disable(recursive=False)  # type: ignore
-    def randomized_iteration_sampler(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def randomized_iteration_sampler(self, core_block_number: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Outputs are long tensors so that they can be passed through compiled functions"""
-        t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
-        s = self.config.mean_backprop_depth
+
+        if core_block_number == 0:
+            mean_recurrence = self.config.mean_recurrence
+            mean_backprop_depth = self.config.mean_backprop_depth
+            core_block = self.transformer.core_block
+        elif core_block_number == 1:
+            mean_recurrence = self.config.mean_recurrence_1
+            mean_backprop_depth = self.config.mean_backprop_depth_1
+            core_block = self.transformer.core_block_1
+        else:
+            mean_recurrence = self.config.mean_recurrence_2
+            mean_backprop_depth = self.config.mean_backprop_depth_2
+            core_block = self.transformer.core_block_2
+
+        t = max(mean_recurrence - mean_backprop_depth, 0)
+        s = mean_backprop_depth
         if torch.rand((1,)).is_meta:  # annoying clause to make meta-tensor-based flop counting work
             # these values are only the mean TFLOPs of the randomized sampler
             # Note that this clause also breaks the contract, and returns ints in meta tensor mode
@@ -794,7 +882,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             n = torch.clamp(p - s, min=0)
             k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
         else:
-            n, k = torch.as_tensor(self.config.mean_recurrence), torch.as_tensor(0)
+            n, k = torch.as_tensor(mean_recurrence), torch.as_tensor(0)
 
         return n.to(dtype=torch.long), k.to(dtype=torch.long)
 
@@ -809,7 +897,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             x.zero_()
         return x
 
-    def _maybe_inject_noise(self, x, current_step, renorm=True):
+    def _maybe_inject_noise(self, x, current_step, core_block, renorm=True):
         if self.config.test_time_noise > 0:
             n = self.config.test_time_noise * self.config.init_values["std"] * self.emb_scale
             if self.config.test_time_noise_type == "geom":
@@ -830,7 +918,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 raise ValueError()
 
             if renorm:
-                x = self.transformer.core_block[-1].norm_4(x)  # type: ignore moduledict types still broken in pytorch
+                x = core_block[-1].norm_4(x)  # type: ignore moduledict types still broken in pytorch
         return x
 
     """ ------------------ Alternative interfaces into the model forward ---------------------------------------- """
@@ -1015,7 +1103,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             input_ids, exit_evaluator, past_key_values, init_scale
         )
         if labels is not None:
-            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ig)
             log_ppl = loss.clone().detach()
         else:
             loss, log_ppl = torch.as_tensor(0.0), torch.as_tensor(0.0)
@@ -1031,17 +1120,29 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             stats={"compute_steps": compute_steps},
         )
 
-    def get_stats(self, logits, x, latent_states, xk, input_embeds, num_steps_no_grad, num_steps_with_grad):
+    def get_stats(self, logits, x, latent_states_0, latent_states_1, latent_states_2, xk_0, xk_1, xk_2, input_embeds, num_steps_no_grad_0, num_steps_no_grad_1, num_steps_no_grad_2, num_steps_with_grad_0, num_steps_with_grad_1, num_steps_with_grad_2):
         probs = torch.softmax(logits.float(), dim=-1)
         prob_entropy = torch.where(probs > 0, -probs * probs.log(), 0).sum(dim=-1)
-        residual_diff = (x - latent_states).norm(dim=-1)
-        rel_residual = residual_diff / latent_states.norm(dim=-1)
+        residual_diff_0 = (x - latent_states_0).norm(dim=-1)
+        residual_diff_1 = (x - latent_states_1).norm(dim=-1)
+        residual_diff_2 = (x - latent_states_2).norm(dim=-1)
+        rel_residual_0 = residual_diff_0 / latent_states_0.norm(dim=-1)
+        rel_residual_1 = residual_diff_1 / latent_states_1.norm(dim=-1)
+        rel_residual_2 = residual_diff_2 / latent_states_2.norm(dim=-1)
         stats = {
             "entropy": prob_entropy,
-            "residual_diff": residual_diff,
-            "rel_residual": rel_residual,
-            "num_steps_no_grad": num_steps_no_grad,
-            "num_steps_with_grad": num_steps_with_grad,
+            "residual_diff_0": residual_diff_0,
+            "residual_diff_1": residual_diff_1,
+            "residual_diff_2": residual_diff_2,
+            "rel_residual_0": rel_residual_0,
+            "rel_residual_1": rel_residual_1,
+            "rel_residual_2": rel_residual_2,
+            "num_steps_no_grad_0": num_steps_no_grad_0,
+            "num_steps_no_grad_1": num_steps_no_grad_1,
+            "num_steps_no_grad_2": num_steps_no_grad_2,
+            "num_steps_with_grad_0": num_steps_with_grad_0,
+            "num_steps_with_grad_1": num_steps_with_grad_1,
+            "num_steps_with_grad_2": num_steps_with_grad_2,
         }
         return stats
 
@@ -1611,7 +1712,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             tokenizer = model_kwargs["stopping_criteria"][0].tokenizer
         if hasattr(generation_config, "stop_strings") and tokenizer and generation_config.stop_strings:
             for s in generation_config.stop_strings:
-                token_id = tokenizer(s, add_special_tokens=False)["input_ids"][0]
+                token_id = tokenizer(s, truncation=True, add_special_tokens=False)["input_ids"][0]
                 stop_tokens.add(token_id)
         return torch.tensor(list(stop_tokens))
 

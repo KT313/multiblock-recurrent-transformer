@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: minor compatibility tweaks. See README and git history.
 """This is an old modeling file, the updated version is in raven_modeling_minimal.py"""
 
 import torch
@@ -430,7 +432,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         # Prediction head, assuming labels really are labels and not equal to input_ids
         if labels is not None:
             logits = self.lm_head(x).float()
-            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            ig = self.objective.get("ignore_index", -100) if isinstance(self.objective, dict) else -100
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ig)
             log_ppl = loss.clone().detach().exp()
         else:
             logits = self.lm_head(x).float()
@@ -997,7 +1000,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             stop_tokens.add(generation_config.eos_token_id)
         if hasattr(generation_config, "stop_strings") and tokenizer and generation_config.stop_strings:
             for s in generation_config.stop_strings:
-                token_id = tokenizer(s, add_special_tokens=False)["input_ids"][0]
+                token_id = tokenizer(s, truncation=True, add_special_tokens=False)["input_ids"][0]
                 stop_tokens.add(token_id)
         return torch.tensor(list(stop_tokens))
 

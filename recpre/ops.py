@@ -1,3 +1,6 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: safe head/reference cross-entropy path (REC_SAFE_HEAD). See README and git history.
+import os
 import torch
 import torch.nn.functional as F
 from typing import TYPE_CHECKING
@@ -10,14 +13,27 @@ if TYPE_CHECKING:
 
 
 def reference_torch(x, y, A, ignore_index=5, z_regularization=0.0, logit_scale=1.0):
+    """
+    Safe reference path: flatten leading dims so autograd never hits 3D .t()/.mm().
+    x: [..., H], A: [V, H]
+    """
+    import torch
+    import torch.nn.functional as F
     V = A.shape[0]
-    logits = F.linear(x, A).view(-1, V).float() * logit_scale
-    loss = F.cross_entropy(logits, y.view(-1), ignore_index=ignore_index)
-    z_reg = logits.logsumexp(dim=-1)[y != ignore_index].pow(2).mean()
-    loss += z_regularization * z_reg
-    log_probs = torch.log_softmax(logits, dim=-1)[y != ignore_index]
-    logit_ent = (-log_probs.exp() * log_probs).sum(dim=-1).mean()
-    return loss, z_reg.detach(), logits.max().detach(), logit_ent.detach(), logits.norm(dim=-1).mean().detach()
+    x2 = x.reshape(-1, x.shape[-1])        # [N, H]
+    y2 = y.reshape(-1)                      # [N]
+    logits2 = F.linear(x2, A).float() * logit_scale  # [N, V]
+    loss = F.cross_entropy(logits2, y2, ignore_index=ignore_index)
+    valid = (y2 != ignore_index)
+    if valid.any():
+        z_reg = logits2.logsumexp(dim=-1)[valid].pow(2).mean()
+        log_probs = torch.log_softmax(logits2, dim=-1)[valid]
+        logit_ent = (-log_probs.exp() * log_probs).sum(dim=-1).mean()
+    else:
+        z_reg = logits2.new_tensor(0.0)
+        logit_ent = logits2.new_tensor(0.0)
+    loss = loss + z_regularization * z_reg
+    return loss, z_reg.detach(), logits2.max().detach(), logit_ent.detach(), logits2.norm(dim=-1).mean().detach()
 
 
 def early_config_prune(configs, named_args, **kwargs):
@@ -1106,6 +1122,7 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
             std = math.sqrt(1 / self.in_features)
             torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
+    """
     def forward(self, x, y):
         loss, z_reg, logit_max, logit_ent, logit_norm = LinearXentImplementation.apply(
             x,
@@ -1117,6 +1134,42 @@ class LinearCrossEntropyLoss(torch.nn.Linear):  # an instance of nn.Linear to be
             self.N_chunk_size,
             self.monitoring,
         )  # type: ignore
+        if self.monitoring:
+            metrics = {
+                "logit_norm": logit_norm,
+                "logit_max": logit_max,
+                "logit_entropy": logit_ent,
+                "z_value": z_reg,
+            }
+            self.latest_metrics = metrics  # will be picked up from monitoring caller
+        return loss
+    """
+
+    def forward(self, x, y):
+        # Optional runtime override (safe PyTorch path): export REC_SAFE_HEAD=1
+        use_safe = os.getenv("REC_SAFE_HEAD", "0") == "1"
+        # Also fall back safely if Triton isn't usable or we're not on CUDA
+        if use_safe or (not x.is_cuda) or (not torch.cuda.is_available()) or (not triton.runtime.driver.active):
+            A = (self.weight.T if self.transposed_weight else self.weight)  # A: [V, H]
+            loss, z_reg, logit_max, logit_ent, logit_norm = reference_torch(
+                x,
+                y,
+                A,
+                ignore_index=self.ignore_index,
+                z_regularization=self.z_regularization,
+                logit_scale=self.logit_scale,
+            )
+        else:
+            loss, z_reg, logit_max, logit_ent, logit_norm = LinearXentImplementation.apply(
+                x,
+                y,
+                self.weight if self.transposed_weight else self.weight.T,
+                self.ignore_index,
+                self.z_regularization,
+                self.logit_scale,
+                self.N_chunk_size,
+                self.monitoring,
+            )  # type: ignore
         if self.monitoring:
             metrics = {
                 "logit_norm": logit_norm,

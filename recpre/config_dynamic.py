@@ -1,9 +1,21 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: per-block list config, pretrained-embedding options. See README and git history.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Literal, Optional, Type, Union, Callable, Self, TYPE_CHECKING
+
+from typing import Any, Optional, Type, Union, Callable, TYPE_CHECKING
+try:
+    from typing import Literal  # py>=3.8
+except ImportError:
+    from typing_extensions import Literal
+try:
+    from typing import Self     # py>=3.11
+except ImportError:
+    from typing_extensions import Self
+
 from functools import partial
 from collections import defaultdict
 import contextlib
@@ -50,6 +62,10 @@ class Config:
     vocab_size: int = 50254
     padding_multiple: int = 512
     padded_vocab_size: Optional[int] = None
+    # Special token IDs (optional overrides for tokenizer)
+    bos_token_id: Optional[int] = None
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
     rope_settings: RoPESettings = field(default_factory=lambda: RoPESettings())
     use_abacus: bool = False
     abacus_ids: list[int] = field(default_factory=lambda: list(range(10)))  # Will be initialized correctly later
@@ -398,14 +414,14 @@ class RecurrentConfig(Config):
     normalize_rec: str = ""
     intermediate_noise_injection: float = 0.0
     geom_noise_injection: str = "geom"
-    n_layers_in_recurrent_block: int = 4
+    n_layers_in_recurrent_block: int | list[int] = 4
     n_layers_in_prelude: int = 1
     n_layers_in_coda: int = 1
     state_init: str = "like-init"
     # Sampling
     sampling_scheme: str = "poisson-unbounded"
-    mean_recurrence: int = 32
-    mean_backprop_depth: int = 8
+    mean_recurrence: int | list[int] = 32
+    mean_backprop_depth: int | list[int] = 8
     lockstep_n: bool = False
     lockstep_k: bool = False
     # Objective Modification
@@ -417,14 +433,44 @@ class RecurrentConfig(Config):
     # sac to force saving of mm and sdpa, # per-iteration / per-block to change granularity:
     activation_checkpoint_impl: str = "per-iteration"
     tie_embeddings: bool = False
+    # Pretrained embeddings
+    pretrained_embeddings_from: str = ""  # HuggingFace model ID (e.g., "meta-llama/Llama-2-7b-hf")
+    freeze_lm_head: Optional[bool] = None  # whether to freeze LM head when using pretrained embeddings (defaults to tie_embeddings)
 
     def __post_init__(self):
         super().__post_init__()
 
+        # Set default for freeze_lm_head based on tie_embeddings
+        if self.freeze_lm_head is None:
+            self.freeze_lm_head = self.tie_embeddings
+
+        # Normalize to lists for uniform handling (legacy support)
+        if isinstance(self.n_layers_in_recurrent_block, int):
+            self.n_layers_in_recurrent_block = [self.n_layers_in_recurrent_block]
+        if isinstance(self.mean_recurrence, int):
+            self.mean_recurrence = [self.mean_recurrence]
+        if isinstance(self.mean_backprop_depth, int):
+            self.mean_backprop_depth = [self.mean_backprop_depth]
+
+        # Ensure all lists have the same length
+        num_blocks = len(self.n_layers_in_recurrent_block)
+        if len(self.mean_recurrence) == 1 and num_blocks > 1:
+            self.mean_recurrence = self.mean_recurrence * num_blocks
+        if len(self.mean_backprop_depth) == 1 and num_blocks > 1:
+            self.mean_backprop_depth = self.mean_backprop_depth * num_blocks
+
+        assert len(self.n_layers_in_recurrent_block) == len(self.mean_recurrence) == len(self.mean_backprop_depth), \
+            "n_layers_in_recurrent_block, mean_recurrence, and mean_backprop_depth must have the same length"
+
+        # Calculate effective depth
         effective_expected_depth = (
-            self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
+            self.n_layers_in_prelude + self.n_layers_in_coda +
+            sum(n_layers * mean_rec for n_layers, mean_rec in zip(self.n_layers_in_recurrent_block, self.mean_recurrence))
         )
-        self.n_layer = self.n_layers_in_recurrent_block * self.mean_backprop_depth  # for compat
+
+        # For compatibility: sum of all blocks
+        self.n_layer = sum(n * d for n, d in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth))
+
         # Define initializer object from strategy
         self.init = Init(
             self.init_strategy,
@@ -463,8 +509,9 @@ class Linear(torch.nn.Linear):
             self.bias.data.zero_()
 
     def forward(self, input, **kwargs):
-        """Additional args like scatter_input from axonn are ignored in this wrapper."""
-        return super().forward(input)
+        """Use F.linear for optimal performance - it's specifically optimized for this operation.
+        Additional args like scatter_input from axonn are ignored in this wrapper."""
+        return torch.nn.functional.linear(input, self.weight, self.bias)
 
 
 class Relu2(torch.nn.Module):

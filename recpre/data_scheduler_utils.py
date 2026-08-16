@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: scheduled dataset weights. See README and git history.
 import math
 import torch
 
@@ -36,6 +38,10 @@ class LinearWeight(object):
         self.total_steps = total_steps
 
     def get_weight(self, current_step):
+        # Handle zero transition steps - immediately return end weight
+        if self.total_steps == 0:
+            return self.end_weight
+
         current_step = min(current_step, self.total_steps)
         current_weight = self.initial_weight + (self.end_weight - self.initial_weight) * (
             current_step / self.total_steps
@@ -165,6 +171,7 @@ class DataScheduler(object):
 
             if self.max_epochs[i] <= self.data_scheduler_tracker.epoch_count[i]:
                 self.data_scheduler_tracker.weights[i] = 0
+
 
         if self.base_id is not None:
             if sum(self.data_scheduler_tracker.weights) > 100.0 and not self._warned_once_base_sum:

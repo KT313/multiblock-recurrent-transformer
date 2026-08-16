@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: 3-block variant config fields. See README and git history.
 """A HuggingFace-style model configuration."""
 
 from transformers import PretrainedConfig
@@ -13,7 +15,7 @@ class RavenConfig(PretrainedConfig):
         self,
         n_embd: int = 5280,
         n_heads: int = 55,
-        n_layers: int = 8,  # total of prelude + recurrent + coda
+        n_layers: int = 16,  # total of prelude + recurrent + coda
         block_size: int = 4096,
         vocab_size: int = 65536,
         padding_multiple: int = 4096,
@@ -31,9 +33,15 @@ class RavenConfig(PretrainedConfig):
         state_init: str = "like-init",
         injection_type: str = "linear",
         n_layers_in_recurrent_block: int = 4,
+        n_layers_in_recurrent_block_1: int = 4,
+        n_layers_in_recurrent_block_2: int = 4,
         mean_recurrence: int = 32,
+        mean_recurrence_1: int = 32,
+        mean_recurrence_2: int = 32,
         sampling_scheme: str = "poisson-lognormal-filling",
         mean_backprop_depth: int = 8,
+        mean_backprop_depth_1: int = 8,
+        mean_backprop_depth_2: int = 8,
         n_layers_in_prelude: int = 2,
         n_layers_in_coda: int = 2,
         qk_bias: bool = True,
@@ -63,9 +71,15 @@ class RavenConfig(PretrainedConfig):
         self.state_init = state_init
         self.injection_type = injection_type
         self.n_layers_in_recurrent_block = n_layers_in_recurrent_block
+        self.n_layers_in_recurrent_block_1 = n_layers_in_recurrent_block_1
+        self.n_layers_in_recurrent_block_2 = n_layers_in_recurrent_block_2
         self.mean_recurrence = mean_recurrence
+        self.mean_recurrence_1 = mean_recurrence_1
+        self.mean_recurrence_2 = mean_recurrence_2
         self.sampling_scheme = sampling_scheme
         self.mean_backprop_depth = mean_backprop_depth
+        self.mean_backprop_depth_1 = mean_backprop_depth_1
+        self.mean_backprop_depth_2 = mean_backprop_depth_2
         self.n_layers_in_prelude = n_layers_in_prelude
         self.n_layers_in_coda = n_layers_in_coda
         self.qk_bias = qk_bias
@@ -81,7 +95,10 @@ class RavenConfig(PretrainedConfig):
         self.num_attention_heads = n_heads
         self.head_dim = n_embd // n_heads
         self.effective_expected_depth = (
-            self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
+            self.n_layers_in_prelude + self.n_layers_in_coda + \
+            self.n_layers_in_recurrent_block * self.mean_recurrence + \
+            self.n_layers_in_recurrent_block_1 * self.mean_recurrence_1 + \
+            self.n_layers_in_recurrent_block_2 * self.mean_recurrence_2
         )
         self.init_values = {
             "std": sqrt(2 / (5 * self.n_embd)),

@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: minor adjustments. See README and git history.
 import os
 import sys
 import torch
@@ -174,7 +176,7 @@ def get_redpajama_dataloader(tokenizer: PreTrainedTokenizer | PreTrainedTokenize
 
     def collate_fn(batch):
         examples = [d["text"] for d in batch]
-        tokens = tokenizer(examples)["input_ids"]
+        tokens = tokenizer(examples, truncation=True)["input_ids"]
         tokens = [map_fn(t) for t in tokens] # type: ignore
         return tokens
 

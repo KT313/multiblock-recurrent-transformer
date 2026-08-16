@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: stateful parquet streaming, iterator bounds fix, weighted dataset mixing. See README and git history.
 # Build based on the original foundation from Lightning AI
 # litgpt/packed_dataset.py - but completely with a new Parquet Dataset implementation
 
@@ -325,16 +327,35 @@ class HuggingfaceDataset(IterableDataset):
         self._ds_min = None
         self._ds_max = None
 
+        print(f"loading dataset {ds_name_or_path}...")
+
         # Here is where we load the dataset from disk (whole thing, but just the memmap ofc)
         if repetitions is not None:
             ds_list = [load_from_disk(ds_name_or_path) for _ in range(repetitions)]
             self._ds: Dataset = concatenate_datasets(ds_list)  # type: ignore
         else:
-            self._ds: Dataset = load_from_disk(ds_name_or_path)  # type: ignore
+            try:
+                self._ds: Dataset = load_dataset(ds_name_or_path)  # type: ignore
+            except:
+                self._ds: Dataset = load_from_disk(ds_name_or_path)  # type: ignore
 
-        assert not isinstance(self._ds, DatasetDict), (
-            "Dataset path should point to a single split, try adding /train ?."
-        )
+        try:
+            print(f"splits in dataset (type {type(self._ds)}: {list(self._ds.keys())}")
+        except:
+            print(f"dataset (type {type(self._ds)} has no keys, not showing")
+
+        if isinstance(self._ds, DatasetDict):
+            if "train" in self._ds:
+                self._ds = self._ds["train"]
+            elif len(self._ds) == 1:
+                # fall back to "the only split"
+                self._ds = next(iter(self._ds.values()))
+            else:
+                raise ValueError(
+                    f"Multiple splits found {list(self._ds.keys())}, "
+                    "but I only know how to work with one. "
+                    "Pass a single-split path or update HuggingfaceDataset."
+                )
 
         self._ds_total_length = len(self._ds)
 
@@ -426,8 +447,15 @@ class HuggingfaceDatasetIterator:
         return len(self._ds)
 
     def __next__(self):
-        row = self._ds[self.state["data_idx"]]
-        self.state["data_idx"] += 1
+        # row = self._ds[self.state["data_idx"]]
+        # self.state["data_idx"] += 1
+
+        idx = self.state["data_idx"]
+        # Stop cleanly at the end of the shard
+        if idx >= len(self._ds):
+            raise StopIteration
+        row = self._ds[idx]
+        self.state["data_idx"] = idx + 1
 
         # the data signature tells us what keys to extract from the row
         row = {k: row[k] for k in self._data_signature["keys"]}
@@ -442,11 +470,12 @@ class HuggingfaceDatasetIterator:
 
 
 class HuggingfaceCombinedDataset(IterableDataset):
-    def __init__(self, datasets, seed, weights=None, data_telemetry=False):
+    def __init__(self, datasets, seed, weights=None, data_telemetry=False, tracker=None):
         self._seed = seed
         self._datasets = datasets
         self._weights = weights
         self._data_telemetry = data_telemetry
+        self._tracker = tracker  # Reference to DataSchedulerTracker for dynamic weights
         n_datasets = len(datasets)
         if weights is None:
             self._weights = [1 / n_datasets] * n_datasets
@@ -454,19 +483,28 @@ class HuggingfaceCombinedDataset(IterableDataset):
             self._weights = [w / sum(weights) for w in weights]
 
     def __iter__(self):
-        return HuggingfaceCombinedDatasetIterator(self._datasets, self._seed, self._weights, self._data_telemetry)
+        return HuggingfaceCombinedDatasetIterator(
+            self._datasets, self._seed, self._weights, self._data_telemetry, self._tracker
+        )
 
 
 class HuggingfaceCombinedDatasetIterator:
-    def __init__(self, datasets, seed, weights, data_telemetry=False):
-        self._datasets = [iter(el) for el in datasets]
-        self._weights = weights
+    def __init__(self, datasets, seed, weights, data_telemetry=False, tracker=None):
+        self._dataset_objects = datasets  # Store original dataset objects for restarting
+        self._datasets = [iter(el) for el in datasets]  # Current iterators
+        self._initial_weights = weights  # Keep initial weights as fallback
+        self._tracker = tracker  # Reference to DataSchedulerTracker for dynamic weights
         self._rng = random.Random(seed)
         self._iter_ct = 0
         self._data_telemetry = data_telemetry
 
     def __next__(self):
-        (dataset,) = self._rng.choices(self._datasets, weights=self._weights, k=1)
+        # Use tracker weights if available (dynamic), otherwise use initial weights (static)
+        weights = self._tracker.weights if self._tracker is not None else self._initial_weights
+
+        # Sample dataset index (not dataset directly) so we can restart if needed
+        (dataset_idx,) = self._rng.choices(range(len(self._datasets)), weights=weights, k=1)
+        dataset = self._datasets[dataset_idx]
         self._iter_ct += 1
 
         # this is the very beginning of data telemetry
@@ -478,7 +516,34 @@ class HuggingfaceCombinedDatasetIterator:
         elif self._data_telemetry and self._iter_ct == 5:
             logger.info("Data telemetry off ...")
 
-        return next(dataset)
+        try:
+            return next(dataset)
+        except StopIteration:
+            # Dataset exhausted - restart from beginning
+            dataset_obj = self._dataset_objects[dataset_idx]
+            dataset_name = getattr(dataset_obj, '_data_id', f'dataset_{dataset_idx}')
+            print(
+                f"[DATASET CYCLING] Dataset '{dataset_name}' exhausted at iteration {self._iter_ct}, "
+                f"restarting from beginning",
+                flush=True
+            )
+
+            # Reset dataset state before restarting (necessary for stateful datasets)
+            # For HuggingfaceDataset: state is reset in __iter__(), so this is a no-op
+            # For ParquetStream/ParquetStreamPure: must manually reset state for stateful mode
+            if hasattr(dataset_obj, '_state') and isinstance(dataset_obj._state, dict):
+                # ParquetStream state
+                dataset_obj._state['file_idx'] = 0
+                dataset_obj._state['row_group_idx'] = 0
+                dataset_obj._state['buffer'] = []
+            elif hasattr(dataset_obj, 'state') and isinstance(dataset_obj.state, dict):
+                # HuggingfaceDataset state (though it resets in __iter__ anyway)
+                if 'data_idx' in dataset_obj.state:
+                    dataset_obj.state['data_idx'] = 0
+
+            # Restart the iterator
+            self._datasets[dataset_idx] = iter(dataset_obj)
+            return next(self._datasets[dataset_idx])
 
 
 class RandomTokensDataset(IterableDataset):

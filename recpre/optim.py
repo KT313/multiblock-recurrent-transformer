@@ -1,3 +1,5 @@
+# Modified from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f.
+# Changes (c) 2025-2026 Tobias Kerner: distributed optimizer checkpoint format (single-rank return) with backward-compat load. See README and git history.
 # type: ignore
 import torch
 from torch.optim import Optimizer
@@ -136,7 +138,8 @@ class SimpleZeroRedundancyOptimizer(Optimizer):
     """
 
     verbose = False
-    single_rank_return = False
+    single_rank_return = True  # FIX: Changed from False to True to properly handle multi-rank checkpoints
+    # When True: rank 0 gathers all optimizer states during save, each rank loads their own state during resume
 
     def __init__(
         self,
@@ -151,6 +154,8 @@ class SimpleZeroRedundancyOptimizer(Optimizer):
         else:
             global_rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
             self.global_rank = global_rank
+
+
             self.local_devices = min(int(os.getenv("SLURM_NTASKS_PER_NODE", torch.cuda.device_count())), world_size)
             self.local_rank = int(os.getenv("LOCAL_RANK", global_rank % self.local_devices))
             # Form a local process group
@@ -217,6 +222,10 @@ class SimpleZeroRedundancyOptimizer(Optimizer):
 
         if not self.single_rank_return:
             local_state = self.local_optim_group.state_dict()
+            print(f"[DEBUG SAVE OPTIM] Rank {self.local_rank} saving optimizer state (single_rank_return=False)", flush=True)
+            print(f"[DEBUG SAVE OPTIM]   Saving {len(local_state['param_groups'])} param groups:", flush=True)
+            for i, pg in enumerate(local_state['param_groups']):
+                print(f"[DEBUG SAVE OPTIM]     Group {i}: {len(pg['params'])} params, lr={pg['lr']}", flush=True)
             return [local_state]
         else:
             torch.cuda.empty_cache()  # thanks HIP
@@ -235,12 +244,50 @@ class SimpleZeroRedundancyOptimizer(Optimizer):
 
     def load_state_dict(self, state_dict):
         """Each rank loads its relevant parts from the checkpoint."""
+        print(f"[DEBUG LOAD OPTIM] Rank {self.local_rank} loading optimizer state", flush=True)
+        print(f"[DEBUG LOAD OPTIM]   single_rank_return: {self.single_rank_return}", flush=True)
+        print(f"[DEBUG LOAD OPTIM]   state_dict is list: {isinstance(state_dict, list)}, len: {len(state_dict) if isinstance(state_dict, list) else 'N/A'}", flush=True)
+
+        # Show current optimizer structure (what we expect)
+        print(f"[DEBUG LOAD OPTIM]   Current optimizer param_groups (expected):", flush=True)
+        for i, pg in enumerate(self.local_optim_group.param_groups):
+            print(f"[DEBUG LOAD OPTIM]     Group {i}: {len(pg['params'])} params, lr={pg['lr']}", flush=True)
+
+        # BACKWARD COMPATIBILITY: Handle old checkpoints saved with single_rank_return=False
+        # Old checkpoints only contain rank 0's state (len=1), new checkpoints have all ranks (len=local_devices)
+        if isinstance(state_dict, list) and len(state_dict) == 1 and self.local_rank > 0:
+            print(f"[DEBUG LOAD OPTIM]   ⚠️  OLD CHECKPOINT FORMAT detected (only rank 0's state available)", flush=True)
+            print(f"[DEBUG LOAD OPTIM]   ⚠️  Rank {self.local_rank} will start with fresh optimizer state", flush=True)
+            print(f"[DEBUG LOAD OPTIM]   ⚠️  Note: LR and optimizer momentum will be reset for this rank", flush=True)
+            # Don't load anything - let the optimizer start fresh for ranks 1-3
+            # This is a one-time migration penalty when switching from old checkpoint format
+            return
+
         if not self.single_rank_return:
             local_state = state_dict[0]
-            self.local_optim_group.load_state_dict(local_state)
         else:
+            # With single_rank_return=True, each rank loads its own state
             local_state = state_dict[self.local_rank]
+
+        # Show checkpoint structure (what we're loading)
+        print(f"[DEBUG LOAD OPTIM]   Checkpoint param_groups (loading):", flush=True)
+        for i, pg in enumerate(local_state['param_groups']):
+            print(f"[DEBUG LOAD OPTIM]     Group {i}: {len(pg['params'])} params, lr={pg['lr']}", flush=True)
+
+        # Check for mismatch
+        if len(self.local_optim_group.param_groups) != len(local_state['param_groups']):
+            print(f"[DEBUG LOAD OPTIM]   ❌ MISMATCH: Expected {len(self.local_optim_group.param_groups)} groups, got {len(local_state['param_groups'])}", flush=True)
+        else:
+            for i, (current_pg, loaded_pg) in enumerate(zip(self.local_optim_group.param_groups, local_state['param_groups'])):
+                if len(current_pg['params']) != len(loaded_pg['params']):
+                    print(f"[DEBUG LOAD OPTIM]   ❌ MISMATCH in group {i}: Expected {len(current_pg['params'])} params, got {len(loaded_pg['params'])}", flush=True)
+
+        try:
             self.local_optim_group.load_state_dict(local_state)
+            print(f"[DEBUG LOAD OPTIM]   ✓ Successfully loaded optimizer state", flush=True)
+        except Exception as e:
+            print(f"[DEBUG LOAD OPTIM]   ❌ Failed to load: {type(e).__name__}: {str(e)}", flush=True)
+            raise
 
     def _cpu_state_dict(self, state_dict):
         """Helper to move optimizer state dict to CPU"""
@@ -1491,6 +1538,7 @@ class ZeroShampooWithAdamGraftingOptimizer(torch.optim.Optimizer):
                 block_param.shape,
                 block_grad.shape,
             )
+            assert block_grad.dim() == 2, "Shampoo block_grad must be 2D"
 
             left_shape, right_shape = block_param.shape
 
