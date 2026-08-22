@@ -138,6 +138,15 @@ def tiny_forward():
     with torch.no_grad():
         out = model(ids, labels=ids.clone(), return_logits=True)
     n_params = sum(p.numel() for p in model.parameters())
+
+    # gradient coverage: a training-mode backward must reach every trainable
+    # param (guards the prelude-chaining fix — pre-fix, prelude.0.* got none)
+    model.train()
+    torch.manual_seed(123)
+    model(ids, labels=ids.clone())["loss"].backward()
+    no_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    check("all trainable params receive gradients", not no_grad,
+          f"missing: {no_grad[:4]}" if no_grad else f"{sum(1 for _ in model.parameters())} tensors")
     return out["logits"].float(), out["loss"].item(), n_params
 
 

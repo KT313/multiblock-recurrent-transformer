@@ -1262,8 +1262,9 @@ class RecurrentGPT(torch.nn.Module):
             input_embeds = input_embeds * self.emb_scale
 
         # 2
-        for _, block in enumerate(self.transformer.prelude):
-            latent_tensor_merker = block(input_embeds, freqs_cis, attention_mask)
+        latent_tensor_merker = input_embeds
+        for block in self.transformer.prelude:
+            latent_tensor_merker = block(latent_tensor_merker, freqs_cis, attention_mask)
 
         # Normalize num_steps_pair to list format for per-block control
         # If there are no core blocks, ignore num_steps_pair (useful for evaluation)
