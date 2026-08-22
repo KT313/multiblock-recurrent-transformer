@@ -1,0 +1,58 @@
+>>> A python program that calculates the first 10 prime numbers.
+[DEBUG] Starting generate_text()
+[DEBUG] Prompt: 'A python program that calculates the first 10 prime numbers.'
+[DEBUG] Calling tokenizer.encode()...
+[DEBUG] tokenizer.encode() returned: type=<class 'torch.Tensor'>, value=tensor([    1,   319,  3017,  1824,   393,  3408,  1078,   278,   937, 29871,
+        29896, 29900,  6019,  3694, 29889], dtype=torch.int32)
+[DEBUG] input_ids is already a tensor, cloning...
+[DEBUG] Before clone: type=<class 'torch.Tensor'>, shape=torch.Size([15]), dtype=torch.int32
+[DEBUG] After clone: type=<class 'torch.Tensor'>, shape=torch.Size([15]), dtype=torch.int32
+[DEBUG] Checking shape... ndim=1
+[DEBUG] ndim=1, unsqueezing...
+[DEBUG] After unsqueeze: shape=torch.Size([1, 15])
+[DEBUG] Moving to device cuda...
+[DEBUG] After to(device): shape=torch.Size([1, 15]), dtype=torch.int32, device=cuda:0
+
+[Input tokens: 15]
+[Generating 512 tokens...]
+
+[DEBUG] Creating attention mask...
+[DEBUG] attention_mask: shape=torch.Size([1, 15]), dtype=torch.int64, device=cuda:0
+[DEBUG] Entering generation with torch.no_grad()...
+[DEBUG] About to call model.generate()...
+[DEBUG] Arguments:
+[DEBUG]   input_ids: type=<class 'torch.Tensor'>, shape=torch.Size([1, 15])
+[DEBUG]   attention_mask: type=<class 'torch.Tensor'>, shape=torch.Size([1, 15])
+[DEBUG]   max_new_tokens: 512
+[DEBUG]   do_sample: True
+[DEBUG]   temperature: 0.8
+[DEBUG]   top_p: 0.9
+[DEBUG]   pad_token_id: 2
+[DEBUG]   eos_token_id: 2
+[DEBUG] model.generate() succeeded! output_ids type=<class 'torch.Tensor'>, shape=torch.Size([1, 527])
+[DEBUG] Calling tokenizer.decode() for full output...
+[DEBUG] Decoded full output, length: 636
+[DEBUG] Extracting generated tokens...
+[DEBUG] generated_ids type: <class 'torch.Tensor'>, shape: torch.Size([512])
+[DEBUG] Calling tokenizer.decode() for generated part...
+[DEBUG] Decoded generated text, length: 572
+[DEBUG] generate_text() completed successfully
+--------------------------------------------------------------------------------
+Full output (prompt + generated):
+--------------------------------------------------------------------------------
+<s> A python program that calculates the first 10 prime numbers.
+
+The second number of numbers are the prime prime numbers and they are also
+
+GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+
+--------------------------------------------------------------------------------
+Generated only:
+--------------------------------------------------------------------------------
+
+
+The second number of numbers are the prime prime numbers and they are also
+
+GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+
+================================================================================

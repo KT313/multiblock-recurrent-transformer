@@ -1,50 +1,22 @@
-__pycache__
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
 .idea
-.DS_Store
-*.egg-info
-build
-.venv
 .vscode
+.DS_Store
 
-# data
-data
-datasets
-!recpre/data
-!tests/data
-checkpoints
-out
-output
-outputs
-log
-wandb
-events.out.tfevents*
-results
-
-tests/reference_models
-
-# umd artifact paths
-slurm_logs/
-# logs/
-checkpoints/
-
-jwk_scratch/ahans/*
-mia_outputs/
-data_extraction_outputs/
-mem_output/
-launch_scripts/ahans/archive
-
-# ignore triton benchmark runs
-*.html
-*.csv
-*.png
-# ignore traces
-*.trace.pickle
-*.ods#
-
-evaluate_raven/huginn_raven_test_upload
-huginn_raven_test_upload/
-
+# training artifacts
+outputs/
+checkpoints*/
+**/wandb/
 *.pth
 *.safetensors
 *.log
-*.pdf
+events.out.tfevents*
+
+# test-run artifacts
+tests/train_smoke/data/
+tests/train_smoke/out/

@@ -1,0 +1,8 @@
+{
+  "frozen_sha256": {
+    "recpre/modeling_recurrent_gpt_standalone.py": "d73b5626e7777f01e8f7e964de0d4c540dba5d1cc733eb6163dd41c5b9868c4d",
+    "recpre/configuration_recurrent_gpt_standalone.py": "c981b061e7cb14ce84bf62cb4616044e92fa6a0f0593fd7123fd87361117e5c8"
+  },
+  "n_params": 239872,
+  "torch_version": "2.10.0+cu128"
+}

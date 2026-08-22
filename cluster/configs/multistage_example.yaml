@@ -1,0 +1,178 @@
+# Multi-Stage Training Example Configuration
+#
+# This example demonstrates how to configure 3-stage training:
+# 1. Pretraining Phase 1: General pretraining data
+# 2. Pretraining Phase 2: More specific pretraining data
+# 3. Finetuning: Instruction-following data
+#
+# Key features:
+# - Each stage has different dataset mix, token budget, and base LR
+# - Smooth transitions between stages (gradual dataset mixing)
+# - Automatic checkpoint saving before stage transitions
+# - Stage-aware LR scheduling with interpolation during transitions
+
+# Enable multi-stage training
+enable_multi_stage: true
+
+# Define training stages
+training_stages:
+  # Stage 0: Pretraining Phase 1
+  - name: "pretrain_phase1"
+    tokens: 1_000_000_000_000  # 1T tokens
+    base_lr: 3e-4
+    transition_pct: 0.05  # 5% of phase 1 tokens for transition to phase 2
+    train_data:
+      - type: hfds
+        prefix: fw-train-1
+        data_dir: /path/to/shared_storage/recpre/datasets/fineweb-edu/train
+        weight: 1.0
+    val_data:
+      - type: hfds
+        prefix: fw-val-1
+        data_dir: /path/to/shared_storage/recpre/datasets/fineweb-edu/validation
+        weight: 1.0
+
+  # Stage 1: Pretraining Phase 2
+  - name: "pretrain_phase2"
+    tokens: 1_000_000_000_000  # 1T tokens
+    base_lr: 1e-4
+    transition_pct: 0.05  # 5% of phase 2 tokens for transition to finetuning
+    train_data:
+      - type: hfds
+        prefix: fw2-train
+        data_dir: /path/to/shared_storage/recpre/datasets/fineweb-edu/train
+        weight: 1.0
+    val_data:
+      - type: hfds
+        prefix: fw2-val
+        data_dir: /path/to/shared_storage/recpre/datasets/fineweb-edu/validation
+        weight: 1.0
+
+  # Stage 2: Finetuning
+  - name: "finetune"
+    tokens: 100_000_000_000  # 100B tokens
+    base_lr: 5e-5
+    transition_pct: 0.0  # No transition after finetuning (last stage)
+    train_data:
+      - type: hfds
+        prefix: flan-train
+        data_dir: /path/to/shared_storage/recpre/datasets/flan_mixture_v1/train
+        weight: 1.0
+    val_data:
+      - type: hfds
+        prefix: flan-val
+        data_dir: /path/to/shared_storage/recpre/datasets/flan_mixture_v1/val
+        weight: 1.0
+
+# Main settings
+run_name: multistage_training_example
+resume: False
+seed: 233
+
+# Model configuration
+model_name: nebel-raven-0p7b-mig  # Your custom model from cluster/registry/model_registry.py
+model_impl: dynamic
+block_size: 2048
+fabric_precision: bf16-mixed
+model_overwrite:
+  attn_impl: sdpa
+
+dataloader_num_workers: 8
+measure_utilization: True
+model_telemetry: True
+
+# Training hyperparameters
+micro_batch_size: 4
+world_batch_size: 256
+batch_size_ramp: 0
+
+optimizer: ELLISAdam
+optim_config:
+  lr: 3e-4  # This will be overridden by stage base_lr, but needed for initialization
+  weight_decay: 4e-5
+  betas:
+    - 0.9
+    - 0.95
+  update_clipping: True
+  atan_adam: True
+  running_init: True
+  tensor_wise_finite_check: False
+  tensor_wise_gradient_normalization: False
+  decouple_wd: True
+
+min_lr: 0
+warmup_steps: 2000  # Global warmup at the beginning of stage 1
+lr_schedule: constant  # Within each stage (constant, cosine, or linear)
+cooldown_steps: 2000  # Global cooldown at the end of final stage
+no_weight_decay_for_bias_and_norm_params: True
+grad_clip: 1.0
+
+# Implementation and backend
+fabric_strategy: single
+compile_model: True
+dynamo_ddp_config: python_reducer
+gradient_checkpointing: False
+loss_guardrail_active: False
+skip_nonfinite_grads: False
+fail_instead_of_recompile: False
+
+# Logging
+logger_project: "recurtrain-multistage"
+logger_name: wandb
+shape_watching_steps: 0
+log_step_interval: 32
+save_step_interval: 1000
+eval_step_interval: 1000
+eval_iters: 50
+save_n_min_before_job_done: 5
+save_last_step: True
+
+partial_depth_eval: [1, 2, 4, 8, 16]
+
+# Data Handling
+all_block_size_tensors: True
+pad_to_block_size: False
+sequence_padding_multiple: 128
+
+tokenizer_path: /path/to/shared_storage/recpre/artifacts/tokenizer_llama32k
+
+# NOTE: data_config is automatically generated from training_stages when enable_multi_stage=true
+# You don't need to specify data_config manually
+
+# Important Notes:
+# ================
+#
+# 1. TOTAL TRAINING TIME:
+#    Total tokens = sum of all stage tokens (1T + 1T + 100B = 2.1T tokens)
+#    Total steps calculated automatically based on micro_batch_size and block_size
+#
+# 2. LEARNING RATE SCHEDULE:
+#    - Global warmup (warmup_steps) applies at the beginning of stage 1
+#    - Global cooldown (cooldown_steps) applies at the end of final stage
+#    - Each stage has its own base_lr
+#    - During transitions, LR interpolates smoothly between stages
+#    - Within stages, lr_schedule (constant/cosine/linear) is applied
+#
+# 3. DATASET TRANSITIONS:
+#    - transition_pct specifies transition period as % of THAT stage's tokens
+#    - e.g., transition_pct: 0.05 means last 5% of stage tokens are transition
+#    - During transition, dataset weights smoothly interpolate from 100:0 to 0:100
+#    - This creates a gradual shift between dataset distributions
+#
+# 4. CHECKPOINTING:
+#    - Regular checkpoints saved at save_step_interval
+#    - ADDITIONAL checkpoint automatically saved before each stage transition
+#    - Stage transition checkpoints named: step-XXXXXXXX-{run_name}-stage-N_end
+#
+# 5. VALIDATION:
+#    - Each stage can have its own validation dataset
+#    - Useful for monitoring performance on stage-specific distributions
+#
+# 6. MONITORING:
+#    - WandB logs include stage metrics: stage/current_stage, stage/base_lr,
+#      stage/in_transition, stage/transition_progress, etc.
+#    - Data scheduler weights logged per dataset
+#
+# 7. BACKWARD COMPATIBILITY:
+#    - Set enable_multi_stage: false to use legacy single-stage training
+#    - Legacy configs work without modification
