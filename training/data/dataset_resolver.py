@@ -17,7 +17,8 @@ from typing import Any, Optional, Protocol
 from data_preparation.lib.build import build, plan as compute_plan, status
 from data_preparation.lib.schema.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.lib.schema.layout import DatasetLayout
-from data_preparation.lib.log import configure_logging, get_logger
+from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger
+from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
 from training.settings import DataEntry, Settings
 from training.stage_manager import TrainingStage
 
@@ -156,13 +157,14 @@ def _ensure_prepared(
 
     log.info("dataset %s is incomplete, preparing missing data (%d item(s))", cfg.name, len(plan.missing()))
     if backend is None or backend.is_main:
-        build(
-            cfg,
-            layout,
-            num_workers=settings.prepare_num_workers,
-            max_parallel_downloads=settings.prepare_max_parallel_downloads,
-            hf_token=os.environ.get("HF_TOKEN"),
-        )
+        with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
+            build(
+                cfg,
+                layout,
+                num_workers=settings.prepare_num_workers,
+                max_parallel_downloads=settings.prepare_max_parallel_downloads,
+                hf_token=os.environ.get("HF_TOKEN"),
+            )
     if backend is not None:
         backend.barrier()
 

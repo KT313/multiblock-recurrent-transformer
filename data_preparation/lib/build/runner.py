@@ -30,7 +30,7 @@ from pathlib import Path
 from data_preparation.lib.schema.dataset_config import DatasetConfig
 from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.progress import progress
+from data_preparation.lib.ui.dashboard import progress
 from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
 from data_preparation.lib.sources import github_code_repo_key
 from data_preparation.lib.stages import (

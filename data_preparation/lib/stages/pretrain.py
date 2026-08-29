@@ -22,7 +22,8 @@ from data_preparation.lib.schema.dataset_config import DatasetConfig, Decontamin
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.schema.layout import PROCESSED_COLUMNS, DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.progress import Progress, progress
+from data_preparation.lib.progress import Progress
+from data_preparation.lib.ui.dashboard import progress
 from data_preparation.lib.storage.manifest import Manifest, ShardInfo
 from data_preparation.lib.stages.row_pipeline import check_contamination, check_quality, preprocess_batch
 from data_preparation.lib.stages.shared import (

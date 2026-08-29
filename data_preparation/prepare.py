@@ -17,6 +17,7 @@ caches. Any failure logs the exception and exits 1.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -27,7 +28,8 @@ from data_preparation.lib.build import DEFAULT_MAX_PARALLEL_DOWNLOADS, STEPS, bu
 from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
 from data_preparation.lib.schema.dataset_config import load_dataset_config  # noqa: E402
 from data_preparation.lib.schema.layout import DatasetLayout  # noqa: E402
-from data_preparation.lib.log import configure_logging, get_logger  # noqa: E402
+from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger  # noqa: E402
+from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -87,16 +89,18 @@ def run_build(args: argparse.Namespace) -> None:
     cfg = load_dataset_config(args.dataset_config)
     layout = DatasetLayout(args.dataset_dir)
     log.info("building dataset config %s (%s) under %s", cfg.name, args.dataset_config, layout.root)
-    result = build(
-        cfg,
-        layout,
-        sources=args.sources,
-        steps=None if args.steps is None else set(args.steps),
-        num_workers=args.num_workers,
-        hf_token=args.hf_token,
-        dry_run=args.dry_run,
-        max_parallel_downloads=args.max_parallel_downloads,
-    )
+    log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
+    with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
+        result = build(
+            cfg,
+            layout,
+            sources=args.sources,
+            steps=None if args.steps is None else set(args.steps),
+            num_workers=args.num_workers,
+            hf_token=args.hf_token,
+            dry_run=args.dry_run,
+            max_parallel_downloads=args.max_parallel_downloads,
+        )
     partial_build = args.dry_run or args.sources is not None or args.steps is not None
     if partial_build:
         return  # the dataset is not expected to be complete after a partial build

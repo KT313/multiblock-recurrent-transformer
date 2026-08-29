@@ -32,7 +32,8 @@ from data_preparation.lib.storage.parquet import (
 from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.progress import Progress, progress
+from data_preparation.lib.progress import Progress
+from data_preparation.lib.ui.dashboard import progress
 from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows, shard_tokens
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
