@@ -269,6 +269,8 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
             failures: list[BaseException] = []
             try:
                 for future in as_completed(futures):
+                    if future.cancelled():
+                        continue  # never started: cancelled after another item failed
                     error = future.exception()
                     if error is None:
                         bar.update(1)

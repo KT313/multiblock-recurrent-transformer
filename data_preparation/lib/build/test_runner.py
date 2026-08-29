@@ -323,11 +323,11 @@ def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
 def test_build_overlaps_downloads_with_processing(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
     trace = _slow_stages(monkeypatch, delay=0.2)
     cfg = _three_sources(cfg_factory)
-    started = time.monotonic()
     assert build(cfg, layout, num_workers=1, max_parallel_downloads=1).complete
-    elapsed = time.monotonic() - started
-    # 3 downloads + 3 process rounds of 0.2 s each: sequential would take >= 1.2 s, overlapped ~0.8 s
-    assert elapsed < 1.1, f"downloads and processing did not overlap ({elapsed:.2f} s)"
+    # the stages ran back to back in less wall-clock time than their summed durations: some of them overlapped
+    stage_time = sum(trace.span(stage, name)[1] - trace.span(stage, name)[0] for stage in ("download", "process") for name in ("s0", "s1", "s2"))
+    wall = max(t for *_, t in trace.events) - min(t for *_, t in trace.events)
+    assert wall < stage_time * 0.9, f"downloads and processing did not overlap ({wall:.2f} s wall for {stage_time:.2f} s of stages)"
     assert trace.peak["download"] == 1 and trace.peak["process"] == 1, "the bounds were respected"
     # some download ran while another source was being processed
     overlaps = [
@@ -378,11 +378,14 @@ def test_failing_item_aborts_the_build_and_stops_the_others(
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(OSError, match="s1: network down"):
         build(cfg, layout, num_workers=1, max_parallel_downloads=1)
     assert "source s1 failed" in caplog.text and "network down" in caplog.text  # with the traceback
-    # one download slot: s0 downloaded first, s1 failed while s0 was processing; s2 never got a slot
+    # whichever of s0 / s1 got the single download slot first, nothing starts after the failure: s2 never
+    # downloads (cancelled before it started, or stopped at its first slot) and no stage starts after the failure
     started = {(s, n) for s, n, kind, _ in trace.events if kind == "start"}
-    assert started == {("download", "s0"), ("process", "s0"), ("download", "s1")}
+    assert ("download", "s1") in started and ("download", "s2") not in started
+    assert started <= {("download", "s0"), ("process", "s0"), ("download", "s1")}
+    failed_at = trace.span("download", "s1")[1]
+    assert all(t <= failed_at + 0.01 for s, n, kind, t in trace.events if kind == "start")
     assert not layout.source_dir("s2", "raw").exists()
-    assert "source s2 stopped: another item failed" in caplog.text
 
 
 def test_the_original_error_wins_over_items_that_merely_stopped(
