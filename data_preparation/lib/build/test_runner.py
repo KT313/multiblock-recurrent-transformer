@@ -26,12 +26,13 @@ def all_mtimes(root: Path) -> dict[Path, int]:
 
 
 def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
-    """Estimates are ~100x too high; the measured tokens/row of round 1 sizes the second download correctly."""
+    """Estimates are ~10x too high (but below the max_seq_length cap, which would otherwise clamp them); the measured
+    tokens/row of round 1 sizes the second download correctly."""
     sources = {
-        "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=20_000),
-        "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, tokens_per_row_estimate=5_000),
+        "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=3_000),
+        "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, tokens_per_row_estimate=2_000),
     }
-    cfg = cfg_factory(sources, mixtures={"m": MixtureConfig(sources={"i": 1.0}, max_tokens=64)}, tokens=3000, max_seq_length=64)
+    cfg = cfg_factory(sources, mixtures={"m": MixtureConfig(sources={"i": 1.0}, max_tokens=4096)}, tokens=3000, max_seq_length=4096)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         result = build(cfg, layout, max_rounds=3)
     assert result.complete
@@ -128,7 +129,13 @@ def test_build_rebuilds_stale_hash(cfg_factory: CfgFactory, layout: DatasetLayou
 
 
 def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="holdout", loader="synthetic", seed=1, rows=4)}, tokens=500)
+    # estimate 500 tokens/row vs ~220 real (uncapped: max_seq_length above the document length), so the first
+    # estimate-sized download falls short of the budget
+    cfg = cfg_factory(
+        {"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="holdout", loader="synthetic", seed=1, rows=4)},
+        tokens=500,
+        max_seq_length=4096,
+    )
     result = build(cfg, layout, steps={"tokenizer", "download"})
     assert not result.complete and result.tokenizer_complete
     assert (layout.source_dir("p", "raw") / "MANIFEST.json").is_file()

@@ -118,7 +118,13 @@ def _run(what: str, name: str, action: Callable[[], object]) -> None:
 def _log_plan(result: Plan) -> None:
     for item in result.sources + result.holdouts:
         if item.complete and item.exhausted:
-            log.warning("%s: %s", item.name, item.reason)
+            if item.reason == "ok":  # e.g. a repeat_to_budget source that was downloaded whole
+                log.warning(
+                    "%s: source exhausted at %d rows (%d tokens, budget %d)",
+                    item.name, item.rows_present, item.tokens_present, item.budget_tokens,
+                )
+            else:
+                log.warning("%s: %s", item.name, item.reason)
     log.info("dataset status:\n%s", result.summary())
 
 
