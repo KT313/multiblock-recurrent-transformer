@@ -175,6 +175,18 @@ def test_processed_without_hash_column_is_not_complete(layout: DatasetLayout) ->
     assert build(cfg, layout).complete
 
 
+def test_status_reports_processed_behind_raw_after_a_top_up(layout: DatasetLayout) -> None:
+    cfg = two_stage_cfg()
+    build(cfg, layout)
+    bigger = two_stage_cfg(tokens_a=5000, tokens_b=5000)
+    build(bigger, layout, steps={"download"})  # raw topped up, processed not yet
+    a = next(s for s in plan(bigger, layout).sources if s.name == "a")
+    assert not a.complete and a.manifest_current and a.reason == "processed: behind raw"
+    build(bigger, layout, steps={"process"})
+    a = next(s for s in plan(bigger, layout).sources if s.name == "a")
+    assert a.reason != "processed: behind raw"
+
+
 def test_tokens_below_budget_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)

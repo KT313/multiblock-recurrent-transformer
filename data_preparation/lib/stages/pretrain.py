@@ -51,8 +51,8 @@ def process(
     num_workers: int = 1,
 ) -> Manifest:
     """Stream the raw shards not yet covered by the processed manifest, in order, through the length filter
-    (``preprocess_batch``: drop null / short texts, truncate to ``max_chars``) -> exact dedup -> quality filter ->
-    decontamination -> token count and **append** processed shards (``text``, ``source``, ``tokens``, ``hash``).
+    (``preprocess_batch``: drop null / short texts, truncate to ``max_chars``) -> quality filter -> decontamination
+    -> exact dedup -> token count and **append** processed shards (``text``, ``source``, ``tokens``, ``hash``).
     ``hash`` is the row's 64-bit exact-dedup key (:func:`text_hash64`); the keys of every processed row already on
     disk are loaded first, so new rows are deduplicated against old ones and first occurrence still wins — the
     rows kept are exactly those of a full pass over every shard. Every kept row is written once; a source smaller
@@ -89,13 +89,15 @@ def process(
     # build the lazy pipeline: nothing runs until the shard writer pulls rows through it
     rows: Iterator[Row] = _length_filtered_rows(raw_dir, pending, source.text_field, name, processing, shard_size, stats["length_filter"])
     stats["tokens_recounted"] = 0
-    rows = _with_hashes(rows, processing.dedup.normalize)
-    if processing.dedup.mode == "exact":
-        rows = _exact_dedup(rows, seen, stats["dedup"])
+    # the row filters run before the dedup, so the hashes stored on disk are exactly the dedup's "seen" set and an
+    # incremental run keeps the same rows as a full pass (a filtered-out row never claims a hash)
     if processing.quality_filter:
         rows = _quality_filter(rows, stats["quality_filter"])
     if processing.decontamination.enabled:
         rows = _decontaminate(rows, processing.decontamination, num_workers, layout, stats["decontamination"])
+    rows = _with_hashes(rows, processing.dedup.normalize)
+    if processing.dedup.mode == "exact":
+        rows = _exact_dedup(rows, seen, stats["dedup"])
     pending_rows = sum(shard.rows for shard in pending)
     start_shard = len(manifest.shards)
     tokens_per_new_shard: list[int] = []

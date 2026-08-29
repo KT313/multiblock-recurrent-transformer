@@ -125,6 +125,7 @@ def build(
         return current
     log.info("building %s under %s (%d item(s) missing)", cfg.name, layout.root, len(current.missing()))
 
+    _remove_orphaned_filtered_dirs(layout)
     slots = _Slots.create(max_parallel_downloads, num_workers)
     if "tokenizer" in active_steps and not current.tokenizer_complete:
         _run(_WorkItem("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout)), slots)
@@ -199,6 +200,15 @@ def _work_items(
     return items
 
 
+def _remove_orphaned_filtered_dirs(layout: DatasetLayout) -> None:
+    """Delete ``sources/*/filtered/`` directories left behind by builds from before the length filter moved into
+    ``process`` (they were a third copy of the text; raw and processed are the only copies now)."""
+    for directory in sorted((layout.root / "sources").glob("*/filtered")):
+        if directory.is_dir():
+            log.warning("removing orphaned %s (the filtered stage no longer exists)", directory)
+            shutil.rmtree(directory)
+
+
 def _github_code_groups(cfg: DatasetConfig, plans: list[SourcePlan]) -> list[list[SourcePlan]]:
     """The `github_code` sources among ``plans`` that share a repo (:func:`github_code_repo_key`), two or more per
     group, in plan order; a single source of a repo goes through the ordinary per-source path."""
@@ -229,7 +239,7 @@ def _run(item: _WorkItem, slots: _Slots) -> None:
         raise
     except BaseException:
         slots.abort.set()
-        log.error("%s %s failed", item.what, item.name)
+        log.exception("%s %s failed", item.what, item.name)
         raise
 
 
@@ -256,15 +266,29 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="build") as pool:
             futures: dict[Future[None], _WorkItem] = {pool.submit(run_and_track, item): item for item in items}
+            failures: list[BaseException] = []
             try:
                 for future in as_completed(futures):
-                    future.result()
-                    bar.update(1)
-            except BaseException:
+                    error = future.exception()
+                    if error is None:
+                        bar.update(1)
+                        continue
+                    slots.abort.set()
+                    for other in futures:
+                        other.cancel()
+                    failures.append(error)
+            except BaseException:  # e.g. KeyboardInterrupt while waiting
                 slots.abort.set()
                 for future in futures:
                     future.cancel()
                 raise
+    # every item has finished or been cancelled: re-raise the failure that caused it (items that merely stopped
+    # because of it raised BuildAborted, which is only reported when nothing else went wrong)
+    for error in failures:
+        if not isinstance(error, BuildAborted):
+            raise error
+    if failures:
+        raise failures[0]
 
 
 def _log_plan(result: Plan) -> None:

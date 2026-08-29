@@ -377,8 +377,38 @@ def test_failing_item_aborts_the_build_and_stops_the_others(
     cfg = _three_sources(cfg_factory)
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(OSError, match="s1: network down"):
         build(cfg, layout, num_workers=1, max_parallel_downloads=1)
-    assert "source s1 failed" in caplog.text
-    # s0 started before the failure and stopped at its next stage boundary; s2 never started a stage
-    started = {n for s, n, kind, _ in trace.events if kind == "start"}
-    assert "s1" in started and not (layout.source_dir("s2", "raw") / "MANIFEST.json").exists() or "s2" not in started
-    assert "stopped: another item failed" in caplog.text or started == {"s0", "s1"}
+    assert "source s1 failed" in caplog.text and "network down" in caplog.text  # with the traceback
+    # one download slot: s0 downloaded first, s1 failed while s0 was processing; s2 never got a slot
+    started = {(s, n) for s, n, kind, _ in trace.events if kind == "start"}
+    assert started == {("download", "s0"), ("process", "s0"), ("download", "s1")}
+    assert not layout.source_dir("s2", "raw").exists()
+    assert "source s2 stopped: another item failed" in caplog.text
+
+
+def test_the_original_error_wins_over_items_that_merely_stopped(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With several items in flight the items that stop because of the failure may finish before the failing
+    one; the build still raises the failure itself, never `BuildAborted`."""
+    _slow_stages(monkeypatch, delay=0.05, fail="s0")
+    original_error = build_mod.log.error
+
+    def slow_error(*args: Any, **kwargs: Any) -> None:
+        time.sleep(0.3)  # widen the window between `abort.set()` and the failing future completing
+        original_error(*args, **kwargs)
+
+    monkeypatch.setattr(build_mod.log, "error", slow_error)
+    monkeypatch.setattr(build_mod.log, "exception", slow_error)
+    cfg = _three_sources(cfg_factory)
+    with pytest.raises(OSError, match="s0: network down"):
+        build(cfg, layout, num_workers=3, max_parallel_downloads=3)
+
+
+def test_build_removes_orphaned_filtered_dirs(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
+    orphan = layout.root / "sources" / "p" / "filtered"
+    orphan.mkdir(parents=True)
+    (orphan / "data-00000.parquet").write_bytes(b"old")
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")})
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        assert build(cfg, layout).complete
+    assert not orphan.exists() and "removing orphaned" in caplog.text

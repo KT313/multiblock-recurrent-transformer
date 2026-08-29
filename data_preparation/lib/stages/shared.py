@@ -547,12 +547,15 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
     text_of = raw_text_of(source)
     for shard in progress(list(manifest.shards), desc=f"{name}: count_tokens", unit="shard", leave=False):
         path = out / shard.name
-        rows = pq.read_table(path).to_pylist()
-        _tokenized(rows, counter, text_of)  # no batching needed: a shard is one batch
+        table = pq.read_table(path)
+        tokens = counter.count_many([text_of(row) for row in table.to_pylist()])  # a shard is one batch
+        if "tokens" in table.column_names:
+            table = table.drop_columns(["tokens"])
+        table = table.append_column("tokens", pa.array(tokens, type=pa.int64()))  # original schema kept
         tmp = path.with_suffix(".parquet.tmp")
-        pq.write_table(pa.Table.from_pylist(rows), tmp, compression=SHARD_COMPRESSION)
+        pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
         tmp.replace(path)
-        shard.tokens = sum(int(row["tokens"]) for row in rows)
+        shard.tokens = sum(tokens)
     manifest.token_count = cfg.token_count
     manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
     manifest.save(out)

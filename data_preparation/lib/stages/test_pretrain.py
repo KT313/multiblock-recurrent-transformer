@@ -185,6 +185,33 @@ def test_process_appends_only_the_new_shards(
     assert [sh.rows for sh in m_fresh.shards] == [4, 4], "only the shard boundaries differ from the appended layout"
 
 
+def test_incremental_process_with_quality_filter_equals_a_full_pass(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    read_rows: Reader, tmp_path: Path,
+) -> None:  # fmt: skip
+    """A row the quality filter drops must not claim its dedup hash: a later (differently cased) duplicate that
+    passes the filter is kept, in the incremental and in the full pass alike."""
+    bad_caps = GOOD.upper()  # dropped: too many ALL-CAPS words; same normalized hash as GOOD
+    proc = ProcessingConfig(min_chars=5, quality_filter=True)
+    cfg = _prepare(cfg_factory, layout, source_dir, [bad_caps, "Another good text. It has sentences. Three of them here."],
+                   with_tokenizer, write=write_local, processing=proc, max_seq_length=500, shard_size=2)  # fmt: skip
+    m1 = process(cfg, "s", layout)
+    assert m1.rows() == 1 and m1.extra["stats"]["quality_filter"]["filtered_count"] == 1
+    write_local(source_dir, [{"text": GOOD}], "parquet")
+    download(cfg, "s", layout, rows_needed=3, shard_size=2)
+    m2 = process(cfg, "s", layout)
+    incremental = read_rows(layout.source_dir("s", "processed"))
+    assert [r["text"] for r in incremental][-1] == GOOD and m2.extra["stats"]["dedup"]["duplicates_removed"] == 0
+
+    fresh = DatasetLayout(tmp_path / "fresh")
+    from data_preparation.lib.stages.shared import prepare_tokenizer
+
+    prepare_tokenizer(cfg, fresh)
+    download(cfg, "s", fresh, rows_needed=3, shard_size=2)
+    m_fresh = process(cfg, "s", fresh)
+    assert read_rows(fresh.source_dir("s", "processed")) == incremental and m_fresh.extra["stats"] == m2.extra["stats"]
+
+
 def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
     cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, caplog: pytest.LogCaptureFixture,

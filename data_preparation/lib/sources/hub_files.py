@@ -153,7 +153,7 @@ class FileIndex:
     ) -> FileIndex:
         """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it.
         A persisted index is one process-wide instance per path, so concurrent readers of the same repo files
-        (the build runs items in threads) share it and its saves never overwrite each other's counts."""
+        (the build runs items in threads) share it; its mutations and saves are serialised by ``_lock``."""
         path = None if index_dir is None else index_path(index_dir, repo_id, revision, pattern)
         if path is None:
             index = cls._from_repo_listing(repo_id, revision, pattern, None, token)
@@ -204,7 +204,9 @@ class FileIndex:
         """Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed)."""
         missing = [f for f in self.files if f not in self.sizes]
         if missing:
-            self.sizes.update(paths_info(self.repo_id, missing, self.revision, token))
+            sizes = paths_info(self.repo_id, missing, self.revision, token)
+            with self._lock:
+                self.sizes.update(sizes)
 
     def save(self) -> None:
         """Write the index to ``path`` atomically (no-op for an in-memory index); serialised per instance."""
@@ -214,7 +216,9 @@ class FileIndex:
             self._write()
 
     def _write(self) -> None:
-        assert self.path is not None
+        """Write the JSON (caller holds ``_lock``; no-op for an in-memory index)."""
+        if self.path is None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "repo_id": self.repo_id,
@@ -239,17 +243,19 @@ class FileIndex:
 
     def record(self, key: str | None, file: str, value: int) -> None:
         """Store the row count of ``file`` (``key=None``: all rows; else the ``counts[key]`` counter) and save."""
-        if key is None:
-            self.rows[file] = value
-        else:
-            self.counts.setdefault(key, {})[file] = value
-        self.save()
+        with self._lock:
+            if key is None:
+                self.rows[file] = value
+            else:
+                self.counts.setdefault(key, {})[file] = value
+            self._write()
 
     def record_row_groups(self, file: str, groups: list[int]) -> None:
         """Store a parquet file's row-group row counts (and thereby its total row count)."""
-        self.row_groups[file] = groups
-        self.rows[file] = sum(groups)
-        self.save()
+        with self._lock:
+            self.row_groups[file] = groups
+            self.rows[file] = sum(groups)
+            self._write()
 
     def known_group_counts(self, key: str | None, file: str) -> list[int]:
         """Rows per row group of ``file`` that count towards ``key`` (``key=None``: the footer's row counts; else the
@@ -260,8 +266,9 @@ class FileIndex:
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
         """Store the matching rows per row group read so far under ``key`` (a prefix of the file's groups) and save."""
-        self.group_counts.setdefault(key, {})[file] = groups
-        self.save()
+        with self._lock:
+            self.group_counts.setdefault(key, {})[file] = groups
+            self._write()
 
 
 # --- fetching -----------------------------------------------------------------------------------------------------------
