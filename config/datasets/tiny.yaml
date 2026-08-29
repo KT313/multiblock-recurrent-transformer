@@ -16,7 +16,7 @@ processing:
 sources:
   synthetic_pretrain: {kind: pretrain, loader: synthetic, seed: 0, tokens_per_row_estimate: 224}
   synthetic_val:      {kind: holdout,  loader: synthetic, seed: 1, rows: 32, tokens_per_row_estimate: 224}
-  synthetic_instruct: {kind: instruct, loader: synthetic, seed: 2, tokens_per_row_estimate: 224}
+  synthetic_instruct: {kind: instruct, loader: synthetic, seed: 2, tokens_per_row_estimate: 64}
 
 mixtures:
   tiny_mixture: {sources: {synthetic_instruct: 1.0}, max_tokens: 256, input_inversions: 0.1, val_split: 0.2, seed: 0}

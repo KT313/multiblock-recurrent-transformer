@@ -20,12 +20,14 @@ from training.data.loader import (
 )
 from training.data.tokenizer import Tokenizer
 
+INSTRUCT_SIGNATURE = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
+
 
 @pytest.fixture
-def specs(tiny_dataset_dir: Path) -> list[DatasetSpec]:
+def specs(tiny_holdout_dir: Path, tiny_mixture_dirs: dict[str, Path]) -> list[DatasetSpec]:
     return [
-        DatasetSpec("pre", str(tiny_dataset_dir / "pretrain" / "val"), weight=0.7),
-        DatasetSpec("ft", str(tiny_dataset_dir / "finetune" / "val"), weight=0.3),
+        DatasetSpec("pre", str(tiny_holdout_dir), weight=0.7),
+        DatasetSpec("ft", str(tiny_mixture_dirs["validation"]), weight=0.3, data_signature=INSTRUCT_SIGNATURE),
     ]
 
 
@@ -77,8 +79,8 @@ def test_non_hfds_type_rejected() -> None:
         DatasetSpec("p", "dir", type="jsonl")
 
 
-def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_dataset_dir: Path) -> None:
-    d = str(tiny_dataset_dir / "pretrain" / "val")
+def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_holdout_dir: Path) -> None:
+    d = str(tiny_holdout_dir)
     with pytest.raises(ValueError, match="unique"):
         build_dataloader([DatasetSpec("p", d), DatasetSpec("p", d)], tokenizer, 64, 2)
 

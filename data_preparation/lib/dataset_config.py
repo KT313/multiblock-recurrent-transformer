@@ -259,6 +259,10 @@ class DatasetConfig:
         }
         return _stable_hash(payload)
 
+    def tokenizer_hash(self) -> str:
+        """Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`)."""
+        return _stable_hash(asdict(self.tokenizer))
+
     def config_hash(self) -> str:
         """Hash of the complete config (recorded in checkpoints so a resume with different data is detected)."""
         return _stable_hash(asdict(self))

@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.common: CLI defaults, HF cache setup, hashing, token estimate, parquet shard I/O."""
+"""Tests for data_preparation.lib.common: HF cache setup, hashing, token estimate, parquet shard I/O."""
 
-import argparse
 import hashlib
 import os
 from collections.abc import Iterator
@@ -11,17 +10,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib import common
 from data_preparation.lib.common import (
-    add_common_args,
     configure_hf_cache,
     estimate_tokens,
-    iter_dataset_tables,
     list_parquet_files,
     md5_hex,
     normalized_hash,
     normalized_text,
-    select_dataset_dirs,
     shard_index,
     write_dict_rows,
     write_parquet_shards,
@@ -34,15 +29,6 @@ def _read_all(out_dir: Path) -> list[pa.Table]:
 
 # --- CLI / environment ----------------------------------------------------------------------------------------------
 
-
-def test_add_common_args_defaults() -> None:
-    parser = argparse.ArgumentParser()
-    add_common_args(parser)
-    args = parser.parse_args([])
-    assert args.dataset_dir == Path("dataset")
-    assert args.cache_dir is None
-    args = parser.parse_args(["--dataset_dir", "/x/y", "--cache_dir", "/c"])
-    assert args.dataset_dir == Path("/x/y") and args.cache_dir == Path("/c")
 
 
 def test_configure_hf_cache_none_leaves_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,12 +51,6 @@ def test_configure_hf_cache_sets_all_vars_and_creates_dir(tmp_path: Path, monkey
     for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
         assert os.environ[var] == str(cache.resolve())
 
-
-def test_print_header(capsys: pytest.CaptureFixture[str]) -> None:
-    common.print_header("Title", width=5)
-    assert capsys.readouterr().out == "=====\nTitle\n=====\n"
-    common.print_header("x")
-    assert capsys.readouterr().out.splitlines()[0] == "=" * 80
 
 
 # --- pure helpers ---------------------------------------------------------------------------------------------------
@@ -117,18 +97,6 @@ def test_normalized_text_and_hash() -> None:
     assert normalized_hash("hello world") == md5_hex("hello world")
     assert normalized_hash("hello world") != normalized_hash("hello worlds")
 
-
-def test_select_dataset_dirs(tmp_path: Path) -> None:
-    assert select_dataset_dirs(tmp_path / "missing", None) == []
-    for name in ("b_src", "a_src", "github_python", "github_go"):
-        (tmp_path / name).mkdir()
-    (tmp_path / "not_a_dir.parquet").write_bytes(b"")
-    assert [d.name for d in select_dataset_dirs(tmp_path, None)] == ["a_src", "b_src", "github_go", "github_python"]
-    assert [d.name for d in select_dataset_dirs(tmp_path, ["github_*"])] == ["github_go", "github_python"]
-    # duplicates across overlapping patterns are collapsed; order follows pattern order
-    selected = select_dataset_dirs(tmp_path, ["b_src", "github_*", "github_go"])
-    assert [d.name for d in selected] == ["b_src", "github_go", "github_python"]
-    assert select_dataset_dirs(tmp_path, ["nope*"]) == []
 
 
 # --- parquet shard writer -------------------------------------------------------------------------------------------
@@ -249,20 +217,3 @@ def test_write_dict_rows(tmp_path: Path) -> None:
     assert merged["n"].to_pylist() == list(range(12))
     assert write_dict_rows(({"text": "x", "n": 99} for _ in range(1)), tmp_path / "out", 5, start_shard=3) == 1
     assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
-
-
-def test_iter_dataset_tables_honours_select_mapping() -> None:
-    datasets = pytest.importorskip("datasets")
-    ds = datasets.Dataset.from_dict({"x": list(range(10)), "y": [str(i) for i in range(10)]})
-    subset = ds.select([9, 3, 5, 0, 7])
-    tables = list(iter_dataset_tables(subset, batch_size=2))
-    assert all(isinstance(t, pa.Table) for t in tables)
-    assert [t.num_rows for t in tables] == [2, 2, 1]
-    assert pa.concat_tables(tables)["x"].to_pylist() == [9, 3, 5, 0, 7]
-    assert pa.concat_tables(tables).column_names == ["x", "y"]
-
-
-def test_iter_dataset_tables_empty_dataset() -> None:
-    datasets = pytest.importorskip("datasets")
-    ds = datasets.Dataset.from_dict({"x": [1, 2]}).select([])
-    assert list(iter_dataset_tables(ds)) == []

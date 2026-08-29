@@ -1,6 +1,7 @@
 # Tiny smoke-run config: the real train.py code path with a ~240K-parameter model on synthetic data.
 # Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
-# a few seconds on CPU or GPU. Generate the data with `python data_preparation/prepare.py tiny`.
+# a few seconds on CPU or GPU. Generate the data with `python data_preparation/prepare.py tiny` (builds
+# config/datasets/tiny.yaml under dataset/: sources/, mixtures/, tokenizers/).
 
 run_name: tiny
 out_dir: outputs/tiny
@@ -9,7 +10,7 @@ seed: 42
 
 model_name: tiny
 block_size: 256
-tokenizer_path: dataset/tiny/tokenizer
+tokenizer_path: dataset/tokenizers/synthetic
 
 backend: single_device
 precision: bf16-mixed
@@ -46,17 +47,19 @@ training_stages:
     tokens: 8192
     base_lr: 3e-4
     transition_pct: 0.25
-    train_data: [{prefix: pretrain-train, data_dir: dataset/tiny/pretrain/train}]
-    val_data: [{prefix: pretrain-val, data_dir: dataset/tiny/pretrain/val}]
+    train_data: [{prefix: pretrain-train, data_dir: dataset/sources/synthetic_pretrain/processed}]
+    val_data: [{prefix: pretrain-val, data_dir: dataset/sources/synthetic_val/holdout}]
   - name: pretrain_b
     tokens: 8192
     base_lr: 1e-4
     transition_pct: 0.25
-    train_data: [{prefix: pretrain-train, data_dir: dataset/tiny/pretrain/train}]
-    val_data: [{prefix: pretrain-val, data_dir: dataset/tiny/pretrain/val}]
+    train_data: [{prefix: pretrain-train, data_dir: dataset/sources/synthetic_pretrain/processed}]
+    val_data: [{prefix: pretrain-val, data_dir: dataset/sources/synthetic_val/holdout}]
   - name: finetune
     tokens: 4096
     base_lr: 5e-5
     transition_pct: 0.0
-    train_data: [{prefix: finetune-train, data_dir: dataset/tiny/finetune/train}]
-    val_data: [{prefix: finetune-val, data_dir: dataset/tiny/finetune/val}]
+    train_data: [{prefix: finetune-train, data_dir: dataset/mixtures/tiny/tiny_mixture/train,
+                  data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}}]
+    val_data: [{prefix: finetune-val, data_dir: dataset/mixtures/tiny/tiny_mixture/validation,
+                data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}}]

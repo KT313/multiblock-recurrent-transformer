@@ -46,7 +46,10 @@ def test_parse_tiny_yaml(tiny_tokenizer_path: Path) -> None:
     assert s0.base_lr == pytest.approx(3e-4) and s2.base_lr == pytest.approx(5e-5)
     assert isinstance(s1.train_data[0], DataEntry)
     assert s1.train_data[0].prefix == "pretrain-train" and s1.train_data[0].weight == 1.0
-    assert s2.val_data[0].data_dir == "dataset/tiny/finetune/val"
+    assert s2.val_data[0].data_dir == "dataset/mixtures/tiny/tiny_mixture/validation"
+    assert s2.val_data[0].data_signature == {
+        "keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output",
+    }  # fmt: skip
 
 
 def test_cli_overrides_win_over_yaml(tiny_tokenizer_path: Path) -> None:
@@ -118,12 +121,12 @@ def test_validation_batch_divisibility(tiny_tokenizer_path: Path) -> None:
         )
 
 
-def test_validation_runs_for_yaml_configs_too(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_validation_runs_for_yaml_configs_too(tmp_path: Path, tiny_tokenizer_path: Path) -> None:
     """`parse_settings` goes through `Settings.__post_init__`, so a bad YAML value is rejected the same way."""
     yaml = tmp_path / "bad.yaml"
     yaml.write_text(TINY_YAML.read_text().replace("micro_batch_size: 2", "micro_batch_size: 3"))
     with pytest.raises(ValueError, match="multiple of micro_batch_size"):
-        parse_settings(["--config", str(yaml), "--tokenizer_path", str(tiny_dataset_dir / "tokenizer")])
+        parse_settings(["--config", str(yaml), "--tokenizer_path", str(tiny_tokenizer_path)])
 
 
 def test_validation_missing_tokenizer(tmp_path: Path) -> None:

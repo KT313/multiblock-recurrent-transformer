@@ -21,8 +21,8 @@ def _expected_rows(data_dir: Path) -> list[str]:
 
 
 @pytest.fixture
-def pretrain_dir(tiny_dataset_dir: Path) -> Path:
-    return tiny_dataset_dir / "pretrain" / "train"
+def pretrain_dir(tiny_pretrain_dir: Path) -> Path:
+    return tiny_pretrain_dir
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ def small_dir(tmp_path: Path) -> Path:
 
 def test_len_counts_all_rows(pretrain_dir: Path) -> None:
     ds = ParquetTextDataset(pretrain_dir, "pre")
-    assert len(ds) == 4 * 64
+    assert len(ds) == len(_expected_rows(pretrain_dir)) > 0
 
 
 def test_yields_every_row_once_in_sorted_file_order(small_dir: Path) -> None:
@@ -186,10 +186,12 @@ def test_mixture_deterministic_under_seed() -> None:
     assert draw(7) != draw(8)
 
 
-def test_mixture_over_parquet_datasets(tiny_dataset_dir: Path) -> None:
-    pre = ParquetTextDataset(tiny_dataset_dir / "pretrain" / "val", "pre")
-    ft = ParquetTextDataset(tiny_dataset_dir / "finetune" / "val", "ft")
+def test_mixture_over_parquet_datasets(tiny_holdout_dir: Path, tiny_mixture_dirs: dict[str, Path]) -> None:
+    sig = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
+    pre = ParquetTextDataset(tiny_holdout_dir, "pre")
+    ft = ParquetTextDataset(tiny_mixture_dirs["validation"], "ft", data_signature=sig)
     ds = WeightedMixtureDataset([pre, ft], [1.0, 1.0], seed=0)
     rows = list(itertools.islice(iter(ds), 100))
     assert {r["data_id"] for r in rows} == {"pre", "ft"}
-    assert all("text" in r for r in rows)
+    assert all("text" in r for r in rows if r["data_id"] == "pre")
+    assert all({"instruction", "input", "output"} <= set(r) for r in rows if r["data_id"] == "ft")

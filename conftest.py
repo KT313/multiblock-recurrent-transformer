@@ -1,13 +1,18 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Shared pytest fixtures: the synthetic tiny dataset + tokenizer and the tiny model config."""
+"""Shared pytest fixtures: the tiny dataset config built into a session temp dir, its tokenizer, the tiny model."""
 
 from pathlib import Path
 
 import pytest
 import torch
 
-from data_preparation.lib.make_tiny_dataset import make_tiny_dataset
+from data_preparation.lib.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.lib.layout import DatasetLayout
+from data_preparation.prepare import build_dataset
 from model import RecurrentGPT
+
+REPO_ROOT = Path(__file__).resolve().parent
+TINY_DATASET_CONFIG = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -19,16 +24,42 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.fixture(scope="session")
-def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """`dataset/tiny` layout (tokenizer/, pretrain/{train,val}, finetune/{train,val}) in a session temp dir."""
-    out: Path = tmp_path_factory.mktemp("tiny_dataset")
-    make_tiny_dataset(out)
-    return out
+def tiny_dataset_config() -> DatasetConfig:
+    return load_dataset_config(TINY_DATASET_CONFIG)
 
 
 @pytest.fixture(scope="session")
-def tiny_tokenizer_path(tiny_dataset_dir: Path) -> Path:
-    return tiny_dataset_dir / "tokenizer"
+def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_config: DatasetConfig) -> Path:
+    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, mixtures/,
+    tokenizers/) that `config/tiny.yaml` expects under `dataset/`."""
+    root: Path = tmp_path_factory.mktemp("tiny_dataset")
+    build_dataset(tiny_dataset_config, DatasetLayout(root))
+    return root
+
+
+@pytest.fixture(scope="session")
+def tiny_layout(tiny_dataset_dir: Path) -> DatasetLayout:
+    return DatasetLayout(tiny_dataset_dir)
+
+
+@pytest.fixture(scope="session")
+def tiny_pretrain_dir(tiny_layout: DatasetLayout) -> Path:
+    return tiny_layout.source_dir("synthetic_pretrain", "processed")
+
+
+@pytest.fixture(scope="session")
+def tiny_holdout_dir(tiny_layout: DatasetLayout) -> Path:
+    return tiny_layout.holdout_dir("synthetic_val")
+
+
+@pytest.fixture(scope="session")
+def tiny_mixture_dirs(tiny_layout: DatasetLayout) -> dict[str, Path]:
+    return {split: tiny_layout.mixture_dir("tiny", "tiny_mixture", split) for split in ("train", "validation")}
+
+
+@pytest.fixture(scope="session")
+def tiny_tokenizer_path(tiny_layout: DatasetLayout) -> Path:
+    return tiny_layout.tokenizer_dir("synthetic")
 
 
 @pytest.fixture

@@ -39,7 +39,7 @@ def _write_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrid
             line = f"out_dir: {out_dir}"
         elif key in overrides:
             line = f"{key}: {overrides.pop(key)}"
-        lines.append(line.replace("dataset/tiny", str(tiny_dataset_dir)))
+        lines.append(line.replace("dataset/", f"{tiny_dataset_dir}/"))
     lines += [f"{k}: {v}" for k, v in overrides.items()]
     path = tmp_path / "tiny.yaml"
     path.write_text("\n".join(lines) + "\n")
