@@ -1,7 +1,7 @@
 # Data preparation
 
 Standalone CLIs that rebuild the datasets consumed by `config/crow_300m_final.yaml`. Every command is run from the
-repo root as `python -m data_preparation.<name>` and writes below `dataset/` (`--dataset_dir` overrides the root,
+repo root as `python data_preparation/prepare.py <command>` (implementation in `lib/`) and writes below `dataset/` (`--dataset_dir` overrides the root,
 `--cache_dir` the HuggingFace cache). The logic (sources, sample budgets, filters, deduplication, PII masking,
 decontamination, mixture shares, seeds) is the one used for the thesis run; only the cluster wrappers, hard-coded
 paths and unused code paths were removed.
@@ -10,12 +10,12 @@ paths and unused code paths were removed.
 
 | Step | Command | Writes |
 |---|---|---|
-| 1 | `python -m data_preparation.download_pretraining [--parallel N] [--datasets ...]` | `dataset/pretraining/raw/<source>/shard-*.parquet` (raw HF columns) |
-| 2 | `python -m data_preparation.filter_pretraining [--min_chars 50] [--max_chars 20000]` | `dataset/pretraining/filtered/<source>/data-*.parquet` (`text`, `source`, `original_length`) |
-| 3 | `python -m data_preparation.process_pretraining [--skip_fuzzy_dedup] [--skip_decontamination] [--dry_run]` | `dataset/pretraining/processed/merged/<source>/data-*.parquet` (`text`, `source`, `estimated_tokens`), `preprocessing_stats.json`, `verification_samples.txt` |
-| 4 | `python -m data_preparation.prepare_fineweb_validation` | `dataset/fineweb-edu/validation/data-*.parquet` |
-| 5 | `python -m data_preparation.prepare_flan_mixture --add_input_inversions --inversion_ratio 0.05 [--dry_run]` | `dataset/flan_mixture/{train,validation}/data-*.parquet` (`instruction`, `input`, `output`), `metadata.json` |
-| 6 | `python -m data_preparation.prepare_tokenizer` | `dataset/tokenizer/` |
+| 1 | `python data_preparation/prepare.py download [--parallel N] [--datasets ...]` | `dataset/pretraining/raw/<source>/shard-*.parquet` (raw HF columns) |
+| 2 | `python data_preparation/prepare.py filter [--min_chars 50] [--max_chars 20000]` | `dataset/pretraining/filtered/<source>/data-*.parquet` (`text`, `source`, `original_length`) |
+| 3 | `python data_preparation/prepare.py process [--skip_fuzzy_dedup] [--skip_decontamination] [--dry_run]` | `dataset/pretraining/processed/merged/<source>/data-*.parquet` (`text`, `source`, `estimated_tokens`), `preprocessing_stats.json`, `verification_samples.txt` |
+| 4 | `python data_preparation/prepare.py fineweb-validation` | `dataset/fineweb-edu/validation/data-*.parquet` |
+| 5 | `python data_preparation/prepare.py flan-mixture --add_input_inversions --inversion_ratio 0.05 [--dry_run]` | `dataset/flan_mixture/{train,validation}/data-*.parquet` (`instruction`, `input`, `output`), `metadata.json` |
+| 6 | `python data_preparation/prepare.py tokenizer` | `dataset/tokenizer/` |
 
 Steps 4-6 are independent of 1-3. Step 3 needs `datasketch` for fuzzy deduplication (`--skip_fuzzy_dedup`
 otherwise) and downloads the benchmark test sets for decontamination. Sources 1-3 that need authentication

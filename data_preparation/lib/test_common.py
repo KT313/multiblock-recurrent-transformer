@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.common: CLI defaults, HF cache setup, hashing, token estimate, parquet shard I/O."""
+"""Tests for data_preparation.lib.common: CLI defaults, HF cache setup, hashing, token estimate, parquet shard I/O."""
 
 import argparse
 import hashlib
@@ -11,8 +11,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation import common
-from data_preparation.common import (
+from data_preparation.lib import common
+from data_preparation.lib.common import (
     add_common_args,
     configure_hf_cache,
     estimate_tokens,

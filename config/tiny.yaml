@@ -1,6 +1,6 @@
 # Tiny smoke-run config: the real train.py code path with a ~240K-parameter model on synthetic data.
 # Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
-# a few seconds on CPU or GPU. Generate the data with `python -m data_preparation.make_tiny_dataset`.
+# a few seconds on CPU or GPU. Generate the data with `python data_preparation/prepare.py tiny`.
 
 run_name: tiny
 out_dir: outputs/tiny

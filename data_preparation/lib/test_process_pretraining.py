@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.process_pretraining: row-level heuristics, dataset-level steps, and the CLI."""
+"""Tests for data_preparation.lib.process_pretraining: row-level heuristics, dataset-level steps, and the CLI."""
 
 import json
 import sys
@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 import pytest
 from typing import Any
 
-from data_preparation import process_pretraining as pp
-from data_preparation.common import list_parquet_files
+from data_preparation.lib import process_pretraining as pp
+from data_preparation.lib.common import list_parquet_files
 
 GOOD = (
     "The quick brown fox jumps over the lazy dog. Then it went home to sleep. It dreamed of chasing rabbits all night."

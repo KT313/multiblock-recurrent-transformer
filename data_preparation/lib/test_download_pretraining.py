@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.download_pretraining: pure helpers, per-source handlers and the CLI with a stubbed
+"""Tests for data_preparation.lib.download_pretraining: pure helpers, per-source handlers and the CLI with a stubbed
 Hub."""
 
 import sys
@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 import pytest
 from typing import Any
 
-from data_preparation import download_pretraining as dp
-from data_preparation.common import list_parquet_files
+from data_preparation.lib import download_pretraining as dp
+from data_preparation.lib.common import list_parquet_files
 
 # --- pure helpers ---------------------------------------------------------------------------------------------------
 

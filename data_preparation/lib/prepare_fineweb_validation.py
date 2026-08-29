@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 
-from data_preparation.common import (
+from data_preparation.lib.common import (
     RANDOM_SEED,
     add_common_args,
     configure_hf_cache,
@@ -22,14 +22,20 @@ N_VAL = 50_000
 SHARD_SIZE = 10_000
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
     add_common_args(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     configure_hf_cache(args.cache_dir)
     from datasets import load_dataset
 
@@ -41,5 +47,6 @@ def main() -> None:
     print(f"Saved {len(validation):,} validation documents in {num_shards} shards to {out_dir}")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

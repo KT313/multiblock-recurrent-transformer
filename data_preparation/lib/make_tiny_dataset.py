@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Generate the synthetic dataset used by `config/tiny.yaml` and the tests.
 
-    python -m data_preparation.make_tiny_dataset [--out dataset/tiny]
+    python data_preparation/prepare.py tiny [--out dataset/tiny]
 
 Writes a minimal WordLevel tokenizer (<pad>, <bos>, <eos> + tok_0..tok_255) and parquet files with a "text"
 column of random tok_i words for pretrain/{train,val} and finetune/{train,val}. Deterministic; a few hundred KB.
@@ -85,13 +85,24 @@ def make_tiny_dataset(out: Path, seed: int = 0) -> None:
             write_split(out / name / split, n_files, rows, rng)
 
 
-def main() -> None:
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
+    parser.add_argument("--out", type=Path, default=Path("dataset/tiny"), help="Output directory (default: dataset/tiny)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", type=Path, default=Path("dataset/tiny"))
-    args = parser.parse_args()
+    add_arguments(parser)
+    return parser
+
+
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     make_tiny_dataset(args.out)
     print(f"tiny dataset written to {args.out} ({VOCAB_SIZE} tokenizer entries)")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

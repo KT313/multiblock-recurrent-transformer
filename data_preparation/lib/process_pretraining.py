@@ -26,7 +26,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from data_preparation.common import (
+from data_preparation.lib.common import (
     RANDOM_SEED,
     add_common_args,
     configure_hf_cache,
@@ -412,8 +412,8 @@ def write_verification_samples(merged_dir: Path, path: Path) -> None:
 # --- CLI ------------------------------------------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
     add_common_args(parser)
     parser.add_argument(
         "--datasets", type=str, nargs="+", default=None, help=f"Source names to process (default: {' '.join(SOURCES)})"
@@ -437,11 +437,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minhash_num_perm", type=int, default=256, help="MinHash permutations (default: 256)")
     parser.add_argument("--shard_size", type=int, default=10000, help="Rows per output parquet file (default: 10000)")
     parser.add_argument("--dry_run", action="store_true", help="Print the plan and exit")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     if args.max_seq_length and not args.tokenizer_path:
         raise SystemExit("--max_seq_length requires --tokenizer_path")
     configure_hf_cache(args.cache_dir)
@@ -525,5 +531,6 @@ def main() -> None:
     print(f"Output: {merged_dir}\nStatistics: {stats_file}\nVerification: {verification_file}")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

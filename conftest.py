@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from data_preparation.make_tiny_dataset import make_tiny_dataset
+from data_preparation.lib.make_tiny_dataset import make_tiny_dataset
 from model import RecurrentGPT
 
 

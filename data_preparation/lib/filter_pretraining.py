@@ -21,7 +21,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from data_preparation.common import (
+from data_preparation.lib.common import (
     add_common_args,
     list_parquet_files,
     print_header,
@@ -160,8 +160,8 @@ def process_dataset(
     return totals
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
     add_common_args(parser)
     parser.add_argument("--min_chars", type=int, default=50, help="Minimum text length in characters (default: 50)")
     parser.add_argument(
@@ -172,11 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--datasets", type=str, nargs="+", default=None, help="Source names or glob patterns to process (default: all)"
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     input_dir = args.dataset_dir / "pretraining" / "raw"
     output_dir = args.dataset_dir / "pretraining" / "filtered"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -219,5 +225,6 @@ def main() -> None:
     print(f"Time: {(time.time() - start) / 3600:.2f} hours; stats saved to {stats_file}")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

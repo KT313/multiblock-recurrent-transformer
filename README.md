@@ -21,7 +21,7 @@ The code was restructured and trimmed after the thesis: only the code path of th
 ```bash
 uv sync --all-extras                                        # environment (uv only)
 uv run pytest                                               # tests, CPU, < 1 min
-uv run python -m data_preparation.make_tiny_dataset         # synthetic smoke data
+uv run python data_preparation/prepare.py tiny         # synthetic smoke data
 uv run python training/train.py --config config/tiny.yaml   # 20-step smoke run
 uv run python training/train.py --config config/crow_300m_final.yaml   # the thesis run (needs dataset/, see data_preparation/README.md)
 ```

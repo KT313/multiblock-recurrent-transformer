@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare_fineweb_validation with a stubbed Hub."""
+"""Tests for data_preparation.lib.prepare_fineweb_validation with a stubbed Hub."""
 
 import sys
 from pathlib import Path
@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 from typing import cast
 import pytest
 
-from data_preparation import prepare_fineweb_validation as pfv
-from data_preparation.common import list_parquet_files
+from data_preparation.lib import prepare_fineweb_validation as pfv
+from data_preparation.lib.common import list_parquet_files
 
 
 def test_parser_only_has_common_args() -> None:

@@ -21,7 +21,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
-from data_preparation.common import (
+from data_preparation.lib.common import (
     RANDOM_SEED,
     add_common_args,
     configure_hf_cache,
@@ -195,8 +195,8 @@ def download_source(key: str, display: str, hf_dataset: str, target_count: int, 
 # --- CLI ------------------------------------------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
     add_common_args(parser)
     parser.add_argument("--total_examples", type=int, default=400000, help="Total examples (default: 400,000)")
     for key, display, _, share in SOURCES:
@@ -208,11 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_split", type=float, default=0.05, help="Validation share (default: 0.05)")
     parser.add_argument("--num_workers", type=int, default=4, help="Worker processes for datasets.map (default: 4)")
     parser.add_argument("--dry_run", action="store_true", help="Print the plan and exit")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     configure_hf_cache(args.cache_dir)
     output_dir = args.dataset_dir / "flan_mixture"
     counts = {
@@ -303,5 +309,6 @@ def main() -> None:
     print(f"Output: {output_dir} (train/, validation/, metadata.json)")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

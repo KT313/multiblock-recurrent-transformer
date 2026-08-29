@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare_tokenizer with the Hub download stubbed by the tiny tokenizer."""
+"""Tests for data_preparation.lib.prepare_tokenizer with the Hub download stubbed by the tiny tokenizer."""
 
 import sys
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation import prepare_tokenizer as pt
+from data_preparation.lib import prepare_tokenizer as pt
 
 
 def test_parser_and_constants() -> None:

@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from data_preparation.common import (
+from data_preparation.lib.common import (
     add_common_args,
     configure_hf_cache,
     iter_dataset_tables,
@@ -180,16 +180,22 @@ def download_dataset(config: dict[str, Any], raw_dir: Path) -> bool:
         return False
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register this command's options on ``parser`` (used by ``prepare.py`` and ``build_parser``)."""
     add_common_args(parser)
     parser.add_argument("--parallel", type=int, default=1, help="Datasets to download concurrently (default: 1)")
     parser.add_argument("--datasets", type=str, nargs="+", default=None, help="Source names to download (default: all)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser for this command."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Execute the command with parsed ``args``."""
     configure_hf_cache(args.cache_dir)
     raw_dir = args.dataset_dir / "pretraining" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -220,5 +226,6 @@ def main() -> None:
     print(f"Total time: {(time.time() - start) / 3600:.2f} hours")
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: list[str] | None = None) -> None:
+    """Parse ``argv`` (default ``sys.argv``) and run."""
+    run(build_parser().parse_args(argv))

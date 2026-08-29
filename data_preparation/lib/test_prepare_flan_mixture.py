@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare_flan_mixture: schema conversion, filters, inversions and the CLI with a
+"""Tests for data_preparation.lib.prepare_flan_mixture: schema conversion, filters, inversions and the CLI with a
 stubbed Hub."""
 
 import json
@@ -13,8 +13,8 @@ import pyarrow.parquet as pq
 import pytest
 from collections.abc import Iterator
 
-from data_preparation import prepare_flan_mixture as pfm
-from data_preparation.common import list_parquet_files
+from data_preparation.lib import prepare_flan_mixture as pfm
+from data_preparation.lib.common import list_parquet_files
 
 # --- standardize_format ---------------------------------------------------------------------------------------------
 

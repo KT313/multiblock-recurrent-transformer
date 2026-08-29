@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.make_tiny_dataset: layout, tokenizer ids and determinism."""
+"""Tests for data_preparation.lib.make_tiny_dataset: layout, tokenizer ids and determinism."""
 
 import json
 import random
@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 from typing import cast
 import pytest
 
-from data_preparation import make_tiny_dataset as mtd
+from data_preparation.lib import make_tiny_dataset as mtd
 
 
 def test_constants() -> None:

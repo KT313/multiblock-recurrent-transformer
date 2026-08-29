@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.filter_pretraining: text-field detection, batch filtering, and the CLI end to end."""
+"""Tests for data_preparation.lib.filter_pretraining: text-field detection, batch filtering, and the CLI end to end."""
 
 import json
 import sys
@@ -10,8 +10,8 @@ import pyarrow.parquet as pq
 import pytest
 from typing import cast
 
-from data_preparation import filter_pretraining as fp
-from data_preparation.common import list_parquet_files
+from data_preparation.lib import filter_pretraining as fp
+from data_preparation.lib.common import list_parquet_files
 
 
 @pytest.mark.parametrize("field", ["text", "TEXT", "content", "code"])
