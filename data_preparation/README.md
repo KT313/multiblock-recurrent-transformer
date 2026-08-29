@@ -128,9 +128,10 @@ Two caches, with different lifetimes:
   fetch keeps **every** row of the row groups it read — `rows needed` is a minimum, the raw shards and
   `rows_fetched` advance to the row-group boundary — so a top-up never re-downloads a row group; row groups can be
   large for book-like sources (gutenberg is ~300 MB per 1,000 rows, so the smallest fetch costs one such group).
-  Larger `.jsonl[.zst|.gz]` files are streamed from the start until exactly enough rows were read (their row count
-  is only recorded once read to the end, so a top-up inside a partially consumed file re-streams that one file),
-  and a plain `.json` array above the threshold is an error (use `hf_split`).
+  Larger `.jsonl[.zst|.gz]` and plain `.json` array files are streamed from the start until exactly enough rows
+  were read (`.json` arrays are parsed incrementally with `ijson`; their row count is only recorded once read to
+  the end, so a top-up inside a partially consumed file re-streams that one file from its start — a prefix read,
+  a few MB for the first few hundred rows).
 * **`dataset/sources/<source>/raw/`**: the rows this pipeline kept, in shards, with a manifest — the append-only
   source cache that `filter` / `process` / mixtures are built from. `dataset/hub_index/` holds the small JSON file
   indexes (file list per glob, rows per file, row-group layout and per-language rows per row group) that let `hf_files` fetch at an offset without opening earlier files;
@@ -163,8 +164,8 @@ Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -
 
 | Loader | Use for | Notes |
 |---|---|---|
-| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>, max_cached_file_mb: 32}` (`data_files` required, relative to the repo root); files sorted by path; files up to `max_cached_file_mb` are downloaded one at a time into the Hub cache on demand and read locally, larger `.parquet` files are read remotely by row group (every row of a fetched row group is kept, so a top-up never re-downloads one) and larger `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz` files are streamed (small `.json` arrays only); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
-| `hf_split` | small single-file repos (one `.json`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
+| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>, max_cached_file_mb: 32}` (`data_files` required, relative to the repo root); files sorted by path; files up to `max_cached_file_mb` are downloaded one at a time into the Hub cache on demand and read locally, larger `.parquet` files are read remotely by row group (every row of a fetched row group is kept, so a top-up never re-downloads one) and larger `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz` files and plain `.json` arrays (incrementally via `ijson`) are streamed from the start; a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
+| `hf_split` | split-name based repos (e.g. `gsm8k` with `name: main`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
 | `hf_stream` | fallback | `datasets` streaming with `skip(offset)`; **caches nothing** — every fetch re-streams from the start, so avoid it for anything large |
 | `github_code` | `codeparrot/github-code-clean` | `hf_files` over `data/*.parquet` keeping rows of `language:` (`text_field: code`); all language sources read the same cached files and the shared index stores per-language row counts (per row group for partially read parquet files) |
 | `local` | your own data | `path:` directory of `*.parquet` / `*.jsonl` files, read in sorted file order |

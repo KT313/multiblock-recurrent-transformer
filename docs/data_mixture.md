@@ -147,10 +147,10 @@ Validation: `flan_mixture/validation` (mixture) at 100%
 | `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 12.6M |
 | `fineweb_val` | holdout | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet | `87f09149ef47` | - |
 | `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets` |
-| `metamath` | instruct | `hf_split` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
+| `metamath` | instruct | `hf_files` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
 | `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer` |
-| `evol_code` | instruct | `hf_split` | `nickrosh/Evol-Instruct-Code-80k-v1` data_files=EvolInstruct-Code-80k.json | `3ae930c20d54` | fields instruction←`instruction`, output←`output` |
-| `code_alpaca` | instruct | `hf_split` | `sahil2801/CodeAlpaca-20k` data_files=code_alpaca_20k.json | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output` |
+| `evol_code` | instruct | `hf_files` | `nickrosh/Evol-Instruct-Code-80k-v1` data_files=EvolInstruct-Code-80k.json | `3ae930c20d54` | fields instruction←`instruction`, output←`output` |
+| `code_alpaca` | instruct | `hf_files` | `sahil2801/CodeAlpaca-20k` data_files=code_alpaca_20k.json | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output` |
 | `slimorca` | instruct | `hf_files` | `Open-Orca/SlimOrca-Dedup` data_files=data/*.parquet | `bd7d445aa1ff` | converter `sharegpt_conversations` |
-| `sharegpt` | instruct | `hf_split` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000 |
-| `wizardlm` | instruct | `hf_split` | `WizardLM/WizardLM_evol_instruct_V2_196k` data_files=WizardLM_evol_instruct_V2_143k.json | `8a7d15a83028` | converter `first_two_turns` |
+| `sharegpt` | instruct | `hf_files` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000 |
+| `wizardlm` | instruct | `hf_files` | `WizardLM/WizardLM_evol_instruct_V2_196k` data_files=WizardLM_evol_instruct_V2_143k.json | `8a7d15a83028` | converter `first_two_turns` |

@@ -14,11 +14,13 @@ rows in file order. How a file is fetched depends on its size (known from the in
   the row group that satisfied it (``align_to_row_group=True``), so the rows a top-up needs next are already on disk
   and the same bytes are never downloaded twice (row groups can be large for book-like sources: gutenberg is
   ~300 MB per 1,000 rows). A top-up at a larger offset seeks straight to the right row group.
-* **larger ``.jsonl`` / ``.jsonl.zst`` / ``.jsonl.gz`` / ``.json.gz`` files** are streamed sequentially from the
-  same remote file object (through the zstd/gzip decompressor) and the stream is dropped as soon as exactly
-  ``count`` rows were yielded (a stream has no cheap unit to finish; the rest of the file could be gigabytes). Their row count is only known once a file was read to its end, so a top-up that starts inside a
-  partially consumed file re-streams that file from its start (bounded by one file). Plain ``.json`` arrays above
-  the threshold cannot be streamed: use the ``hf_split`` loader for those.
+* **larger ``.jsonl`` / ``.jsonl.zst`` / ``.jsonl.gz`` / ``.json.gz`` / ``.json`` files** are streamed sequentially
+  from the same remote file object (through the zstd/gzip decompressor; a plain ``.json`` array is parsed
+  incrementally with ``ijson``, see :func:`iter_json_array`) and the stream is dropped as soon as exactly ``count``
+  rows were yielded (a stream has no cheap unit to finish; the rest of the file could be gigabytes). Their row
+  count is only known once a file was read to its end, so a top-up that starts inside a partially consumed file
+  re-streams that file from its start (bounded by one file; for a ``.json`` array that is a sequential prefix
+  read, so a top-up of the first few hundred rows of a 400 MB file costs a few MB, not the file).
 
 A :class:`FileIndex` per ``(repo, revision, glob)`` remembers the file list, the file sizes (one batched
 ``HfApi.get_paths_info`` call), the row count of every file read so far and the row-group row counts of every
@@ -44,6 +46,7 @@ import fnmatch
 import gzip
 import hashlib
 import io
+import itertools
 import json
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -282,12 +285,6 @@ class HubFetcher:
             with path.open("rb") as fh:
                 yield fh
             return
-        if fmt == ".json":
-            raise ValueError(
-                f"{index.repo_id}: {file} is a plain .json array of {size / 2**20:.0f} MB, above max_cached_file_mb="
-                f"{self.max_cached_file_mb:g} and it cannot be streamed; use the hf_split loader for this source"
-                " or raise load_kwargs.max_cached_file_mb"
-            )
         block_size = PARQUET_BLOCK_SIZE if fmt == ".parquet" else STREAM_BLOCK_SIZE
         raw = (self.remote or open_remote)(index.repo_id, file, index.revision, self.token, block_size)
         self.stats.files_streamed += 1
@@ -296,7 +293,7 @@ class HubFetcher:
             with counting:
                 yield counting
             return
-        with io.BufferedReader(counting, buffer_size=1 << 16) as buffered:  # sequential text decoding
+        with io.BufferedReader(counting, buffer_size=1 << 16) as buffered:  # sequential decoding (json lines / ijson)
             yield buffered
 
 
@@ -344,11 +341,7 @@ def iter_stream(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
         yield from iter_parquet(pq.ParquetFile(handle), skip)
         return
     if fmt == ".json":
-        data = json.loads(handle.read().decode("utf-8"))
-        if not isinstance(data, list):
-            raise ValueError(f"{name}: plain .json must contain a JSON array of rows")
-        for row in data[skip:]:
-            yield row
+        yield from iter_json_array(handle, name, skip)
         return
     yield from _iter_json_lines(handle, fmt, skip)
 
@@ -357,6 +350,29 @@ def iter_file(path: Path, name: str, skip: int = 0) -> Iterator[Row]:
     """:func:`iter_stream` over a local file."""
     with path.open("rb") as handle:
         yield from iter_stream(handle, name, skip)
+
+
+def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
+    """Elements of a top-level JSON array parsed incrementally with ``ijson`` (the C ``yajl2_c`` backend when it is
+    installed, else ijson's pure-Python one), skipping the first ``skip``. Only the bytes up to the last element
+    consumed are read, so a consumer that stops early never pulls the rest of the file; this is the single ``.json``
+    code path for cached and remote files alike (a cached file is read from disk in 64 KB chunks the same way).
+    A file whose top-level value is not an array (e.g. an object) is a clear error."""
+    import ijson  # in the `data` extra; ijson ships no type information (mypy override in pyproject.toml)
+
+    events = ijson.parse(handle, use_float=True)  # reads 64 KB chunks: the granularity of an early stop
+    try:
+        first = next(events)
+    except ijson.IncompleteJSONError as error:  # empty or truncated file
+        raise ValueError(f"{name}: plain .json must contain a JSON array of rows (empty file)") from error
+    if first[1] != "start_array":
+        raise ValueError(f"{name}: plain .json must contain a JSON array of rows (top-level {first[1].removeprefix('start_')})")
+    for position, row in enumerate(ijson.items(itertools.chain([first], events), "item")):
+        if position < skip:
+            continue
+        if not isinstance(row, dict):
+            raise ValueError(f"{name}: element {position} of the JSON array is not an object")
+        yield cast(Row, row)
 
 
 def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:

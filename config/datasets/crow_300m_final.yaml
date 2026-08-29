@@ -126,16 +126,17 @@ sources:
     tokens_per_row_estimate: 2000
 
   # --- instruction tuning (kind: instruct), consumed through the flan_mixture below ----------------------------------
-  # Multi-file parquet repos use `hf_files` (one file at a time through the Hub cache); single-file JSON repos use
-  # `hf_split` with an explicit `data_files`, which `datasets` downloads and caches once and then slices locally.
+  # Every repo uses `hf_files`: multi-file parquet repos one file at a time through the Hub cache, the single-file
+  # JSON-array repos (metamath 396 MB, wizardlm 375 MB, sharegpt 671 MB, evol_code 122 MB) streamed incrementally
+  # from the start with `ijson` so a build reads only the prefix it needs instead of downloading the whole file.
   flan:        {kind: instruct, loader: hf_files, hf_id: Open-Orca/FLAN,                            revision: 6845b1b3b53c6d5c5b1e49767ed759df3fc246cc, load_kwargs: {data_files: "flan_zsopt_data/*.parquet"}, fields: {instruction: inputs, output: targets}, tokens_per_row_estimate: 300}
-  metamath:    {kind: instruct, loader: hf_split, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, load_kwargs: {data_files: "MetaMathQA-395K.json"}, fields: {instruction: query, output: response}, tokens_per_row_estimate: 300}
+  metamath:    {kind: instruct, loader: hf_files, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, load_kwargs: {data_files: "MetaMathQA-395K.json"}, fields: {instruction: query, output: response}, tokens_per_row_estimate: 300}
   orca_math:   {kind: instruct, loader: hf_files, hf_id: microsoft/orca-math-word-problems-200k,    revision: 29255d1770cc4eac66e5e7fa378cba542c026350, load_kwargs: {data_files: "data/*.parquet"}, fields: {instruction: question, output: answer}, tokens_per_row_estimate: 300}
-  evol_code:   {kind: instruct, loader: hf_split, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, load_kwargs: {data_files: "EvolInstruct-Code-80k.json"}, fields: {instruction: instruction, output: output}, tokens_per_row_estimate: 400}
-  code_alpaca: {kind: instruct, loader: hf_split, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, load_kwargs: {data_files: "code_alpaca_20k.json"}, fields: {instruction: instruction, input: input, output: output}, tokens_per_row_estimate: 200}
+  evol_code:   {kind: instruct, loader: hf_files, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, load_kwargs: {data_files: "EvolInstruct-Code-80k.json"}, fields: {instruction: instruction, output: output}, tokens_per_row_estimate: 400}
+  code_alpaca: {kind: instruct, loader: hf_files, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, load_kwargs: {data_files: "code_alpaca_20k.json"}, fields: {instruction: instruction, input: input, output: output}, tokens_per_row_estimate: 200}
   slimorca:    {kind: instruct, loader: hf_files, hf_id: Open-Orca/SlimOrca-Dedup,                  revision: bd7d445aa1ff695fb7e223bf3b5b321e075f244e, load_kwargs: {data_files: "data/*.parquet"}, converter: sharegpt_conversations, tokens_per_row_estimate: 300}
-  sharegpt:    {kind: instruct, loader: hf_split, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, tokens_per_row_estimate: 400}
-  wizardlm:    {kind: instruct, loader: hf_split, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, tokens_per_row_estimate: 400}
+  sharegpt:    {kind: instruct, loader: hf_files, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, tokens_per_row_estimate: 400}
+  wizardlm:    {kind: instruct, loader: hf_files, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, tokens_per_row_estimate: 400}
 
 mixtures:
   flan_mixture:

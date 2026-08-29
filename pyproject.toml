@@ -22,6 +22,7 @@ dependencies = [
 data = [
   "datasets>=2.18.0",
   "datasketch",
+  "ijson>=3.5.1",
   "zstandard>=0.25.0",
 ]
 
@@ -68,7 +69,7 @@ strict = true
 warn_unreachable = true
 # third-party packages without (complete) stubs
 [[tool.mypy.overrides]]
-module = ["transformers.*", "datasets.*", "datasketch.*", "wandb.*", "jsonargparse.*", "safetensors.*", "tqdm.*"]
+module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*", "tqdm.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]

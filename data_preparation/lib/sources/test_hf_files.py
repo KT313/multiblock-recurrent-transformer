@@ -214,8 +214,67 @@ def test_unknown_format_and_missing_files(hub: FakeHub) -> None:
 def test_plain_json_must_be_array(tmp_path: Path) -> None:
     path = tmp_path / "x.json"
     path.write_text(json.dumps({"a": 1}))
-    with pytest.raises(ValueError, match="JSON array"):
+    with pytest.raises(ValueError, match="JSON array of rows \\(top-level map\\)"):
         list(iter_file(path, "x.json"))
+    path.write_text("")
+    with pytest.raises(ValueError, match="empty file"):
+        list(iter_file(path, "x.json"))
+    path.write_text(json.dumps([{"a": 1}, 2]))
+    with pytest.raises(ValueError, match="element 1 .* not an object"):
+        list(iter_file(path, "x.json"))
+
+
+def _padded_rows(prefix: str, n: int, pad: int = 16 * 1024) -> list[Row]:
+    """Rows of ~`pad` bytes each (ijson pulls 64 KB chunks, so a file of 50 rows is ~800 KB: 7 rows are one chunk)."""
+    return [{"id": f"{prefix}{i}", "text": "x" * pad, "score": i + 0.5} for i in range(n)]
+
+
+def _bytes_read(handle: RecordingFile) -> int:
+    return sum(end - start for start, end in handle.ranges)
+
+
+def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path) -> None:
+    """A `.json` array above the cache threshold is read remotely through ijson: `count` rows cost a prefix of the
+    file, the row count is recorded only after a full read, and a top-up re-streams the file from its start."""
+    hub.add("big/a.json", _padded_rows("a", 50))
+    size = hub.files["big/a.json"].stat().st_size
+    assert size > 50 * 16 * 1024
+    index_dir = tmp_path / "index"
+    stats = FetchStats()
+    src = _src(load_kwargs={"data_files": "big/*.json", "max_cached_file_mb": 0.01})  # 10 KB: force the remote path
+    opened: list[str] = []
+    rows = list(LOADERS["hf_files"](src, 0, 7, index_dir=index_dir, stats=stats, on_file=opened.append))
+    assert [r["id"] for r in rows] == [f"a{i}" for i in range(7)] and rows[0]["score"] == 0.5
+    assert opened == ["big/a.json"] and hub.downloads == [] and hub.streams == ["big/a.json"]
+    read = _bytes_read(hub.handles["big/a.json"])
+    assert 0 < read < size * 0.25, (read, size)
+    assert stats.bytes_read == read and stats.files_streamed == 1 and stats.files_downloaded == 0
+    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {}  # not read to the end
+    # top-up at an offset re-streams from the start (prefix read: still far less than the file)
+    assert _ids(LOADERS["hf_files"](src, 5, 4, index_dir=index_dir)) == ["a5", "a6", "a7", "a8"]
+    assert hub.streams == ["big/a.json", "big/a.json"]
+    assert _bytes_read(hub.handles["big/a.json"]) < size * 0.3
+    # reading to the end records the row count, after which a fetch past it opens nothing
+    assert len(list(LOADERS["hf_files"](src, 40, 100, index_dir=index_dir))) == 10
+    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {"big/a.json": 50}
+    hub.streams.clear()
+    assert _ids(LOADERS["hf_files"](src, 50, 5, index_dir=index_dir)) == []
+    assert hub.streams == []
+
+
+def test_large_json_non_array_errors_clearly(hub: FakeHub) -> None:
+    (hub.root / "big__o.json").write_text(json.dumps({"rows": _padded_rows("o", 10)}), encoding="utf-8")
+    hub.files["big/o.json"] = hub.root / "big__o.json"
+    src = _src(load_kwargs={"data_files": "big/*.json", "max_cached_file_mb": 0.001})
+    with pytest.raises(ValueError, match="big/o.json: plain .json must contain a JSON array"):
+        list(LOADERS["hf_files"](src, 0, 1))
+
+
+def test_small_json_array_uses_cache(hub: FakeHub) -> None:
+    hub.add("s/a.json", _padded_rows("a", 5))
+    src = _src(load_kwargs={"data_files": "s/*.json"})
+    assert _ids(LOADERS["hf_files"](src, 1, 2)) == ["a1", "a2"]
+    assert hub.downloads == ["s/a.json"] and hub.streams == []
 
 
 def test_on_file_and_token_passthrough(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -410,12 +469,12 @@ def test_large_json_lines_stream_sequentially_and_reread_partial_files(hub: Fake
     assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {f"f/a{suffix}": 4, f"f/b{suffix}": 4}
 
 
-def test_large_plain_json_is_an_error(hub: FakeHub) -> None:
+def test_plain_json_streams_remotely_and_reads_from_cache(hub: FakeHub) -> None:
     hub.add("x/one.json", _rows("o", 5))
-    src = _src(load_kwargs={"data_files": "x/*.json", **REMOTE})
-    with pytest.raises(ValueError, match="hf_split"):
-        list(LOADERS["hf_files"](src, 0, 1))
+    assert _ids(LOADERS["hf_files"](_src(load_kwargs={"data_files": "x/*.json", **REMOTE}), 0, 1)) == ["o0"]
+    assert hub.streams == ["x/one.json"] and hub.downloads == []
     assert _ids(LOADERS["hf_files"](_src(load_kwargs={"data_files": "x/*.json"}), 0, 1)) == ["o0"]
+    assert hub.downloads == ["x/one.json"]
 
 
 def test_github_code_streams_large_files(hub: FakeHub, tmp_path: Path) -> None:
