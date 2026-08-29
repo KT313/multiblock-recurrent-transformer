@@ -213,6 +213,7 @@ class Dashboard:
         self._live: Live | None = None
         self._depth = 0
         self._saved_env: dict[str, str | None] = {}
+        self._silenced_modules: list[str] = []
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
@@ -255,16 +256,20 @@ class Dashboard:
     def _silence_third_party_bars(self) -> None:
         """Turn off the tqdm bars of ``huggingface_hub`` / ``datasets`` (file downloads, ``load_dataset``) while
         the live display is up — their carriage returns would garble it. The env vars cover the not-yet-imported
-        libraries, the function calls the already-imported ones; :meth:`_restore_third_party_bars` undoes both."""
+        libraries (which then stay silent for the rest of the process: they read the variable once, at import),
+        the function calls the already-imported ones; :meth:`_restore_third_party_bars` undoes both."""
         self._saved_env = {name: os.environ.get(name) for name in self._THIRD_PARTY_BAR_ENV}
         for name in self._THIRD_PARTY_BAR_ENV:
             os.environ[name] = "1"
+        self._silenced_modules = []
         hub = sys.modules.get("huggingface_hub")
         if hub is not None:
             hub.utils.disable_progress_bars()
+            self._silenced_modules.append("huggingface_hub")
         datasets = sys.modules.get("datasets")
         if datasets is not None:
             datasets.utils.logging.disable_progress_bar()
+            self._silenced_modules.append("datasets")
 
     def _restore_third_party_bars(self) -> None:
         for name, value in self._saved_env.items():
@@ -272,12 +277,10 @@ class Dashboard:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-        hub = sys.modules.get("huggingface_hub")
-        if hub is not None and self._saved_env["HF_HUB_DISABLE_PROGRESS_BARS"] is None:
-            hub.utils.enable_progress_bars()
-        datasets = sys.modules.get("datasets")
-        if datasets is not None and self._saved_env["HF_DATASETS_DISABLE_PROGRESS_BARS"] is None:
-            datasets.utils.logging.enable_progress_bar()
+        if "huggingface_hub" in self._silenced_modules and self._saved_env["HF_HUB_DISABLE_PROGRESS_BARS"] is None:
+            sys.modules["huggingface_hub"].utils.enable_progress_bars()
+        if "datasets" in self._silenced_modules and self._saved_env["HF_DATASETS_DISABLE_PROGRESS_BARS"] is None:
+            sys.modules["datasets"].utils.logging.enable_progress_bar()
 
     @property
     def is_active(self) -> bool:

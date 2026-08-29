@@ -208,6 +208,7 @@ def test_warnings_and_kept_records_are_printed_into_the_scrollback() -> None:
 def test_attach_swaps_the_stream_handler_and_writes_the_log_file(tmp_path: Path) -> None:
     logger = logging.getLogger("data_preparation.test_dashboard_attach")
     logger.propagate = False
+    logger.setLevel(logging.INFO)
     stream_handler = ProgressStreamHandler(io.StringIO())
     logger.addHandler(stream_handler)
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
