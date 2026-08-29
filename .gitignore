@@ -22,3 +22,6 @@ dataset/
 outputs/
 .pytest_cache/
 .ruff_cache/
+
+# local agent instructions, not part of the repo
+CLAUDE.md
