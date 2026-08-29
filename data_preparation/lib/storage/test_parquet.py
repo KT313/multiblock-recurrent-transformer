@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.common: HF cache setup, hashing, token estimate, parquet shard I/O."""
+"""Tests for data_preparation.lib.storage.parquet: HF cache setup, hashing, token estimate, parquet shard I/O."""
 
 import hashlib
 import os
@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib.common import (
+from data_preparation.lib.storage.parquet import (
     configure_hf_cache,
     estimate_tokens,
     list_parquet_files,

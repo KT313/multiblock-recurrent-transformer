@@ -16,13 +16,13 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from data_preparation.lib.common import normalized_hash, write_dict_rows
-from data_preparation.lib.dataset_config import DatasetConfig
-from data_preparation.lib.layout import MIXTURE_SPLITS, DatasetLayout
+from data_preparation.lib.storage.parquet import normalized_hash, write_dict_rows
+from data_preparation.lib.schema.dataset_config import DatasetConfig
+from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.manifest import Manifest
-from data_preparation.lib.row_pipeline import check_length, create_input_inversion, has_required_fields, instruct_text
-from data_preparation.lib.stages_shared import (
+from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.stages.row_pipeline import check_length, create_input_inversion, has_required_fields, instruct_text
+from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     current_manifest,

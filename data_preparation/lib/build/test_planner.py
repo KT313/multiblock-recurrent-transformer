@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from data_preparation.lib.build import build
-from data_preparation.lib.dataset_config import (
+from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
     MixtureConfig,
     ProcessingConfig,
@@ -15,9 +15,9 @@ from data_preparation.lib.dataset_config import (
     StageConfig,
     TokenizerConfig,
 )
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.manifest import Manifest
-from data_preparation.lib.planner import Plan, plan, rows_for_budget, stage_problems
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.build.planner import Plan, plan, rows_for_budget, stage_problems
 
 CfgFactory = Callable[..., DatasetConfig]
 

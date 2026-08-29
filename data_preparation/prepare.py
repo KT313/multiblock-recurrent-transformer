@@ -22,9 +22,9 @@ if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data_preparation.lib.build import STEPS, build, status  # noqa: E402
-from data_preparation.lib.common import configure_hf_cache  # noqa: E402
-from data_preparation.lib.dataset_config import load_dataset_config  # noqa: E402
-from data_preparation.lib.layout import DatasetLayout  # noqa: E402
+from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
+from data_preparation.lib.schema.dataset_config import load_dataset_config  # noqa: E402
+from data_preparation.lib.schema.layout import DatasetLayout  # noqa: E402
 from data_preparation.lib.log import configure_logging, get_logger  # noqa: E402
 
 log = get_logger(__name__)

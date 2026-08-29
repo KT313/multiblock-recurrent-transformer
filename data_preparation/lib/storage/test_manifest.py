@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.manifest."""
+"""Tests for data_preparation.lib.storage.manifest."""
 
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib.manifest import (
+from data_preparation.lib.storage.manifest import (
     MANIFEST_NAME,
     Manifest,
     ShardInfo,

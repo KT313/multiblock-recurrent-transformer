@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
 
-from data_preparation.lib.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.lib.layout import MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
-from data_preparation.lib.manifest import Manifest, verify_shards
+from data_preparation.lib.schema.dataset_config import SAFETY_MARGIN, DatasetConfig
+from data_preparation.lib.schema.layout import MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest, verify_shards
 
 
 def rows_for_budget(budget_tokens: float, tokens_per_row: float, margin: float = SAFETY_MARGIN) -> int:

@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.dataset_config: loading the shipped configs, every validation rule, hashes and
+"""Tests for data_preparation.lib.schema.dataset_config: loading the shipped configs, every validation rule, hashes and
 budget arithmetic."""
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from typing import Any
 import pytest
 import yaml
 
-from data_preparation.lib import dataset_config as dc
-from data_preparation.lib.dataset_config import (
+from data_preparation.lib.schema import dataset_config as dc
+from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
     DedupConfig,
     MixtureConfig,
@@ -24,7 +24,7 @@ from data_preparation.lib.dataset_config import (
     load_dataset_config,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 CROW = REPO / "config" / "datasets" / "crow_300m_final.yaml"
 TINY = REPO / "config" / "datasets" / "tiny.yaml"
 

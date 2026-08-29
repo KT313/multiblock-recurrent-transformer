@@ -24,8 +24,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from data_preparation.lib.dataset_config import DedupConfig
-from data_preparation.lib.row_pipeline import get_ngrams
+from data_preparation.lib.schema.dataset_config import DedupConfig
+from data_preparation.lib.stages.row_pipeline import get_ngrams
 
 Row = dict[str, Any]
 Signature = NDArray[np.uint64]

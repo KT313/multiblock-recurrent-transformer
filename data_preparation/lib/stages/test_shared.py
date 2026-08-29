@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages_shared: tokenizer stage, token counter, incremental download, holdout."""
+"""Tests for data_preparation.lib.stages.shared: tokenizer stage, token counter, incremental download, holdout."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.manifest import Manifest
+from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.sources import synthetic_row
-from data_preparation.lib.stages_shared import (
+from data_preparation.lib.stages.shared import (
     TokenCounter,
     current_manifest,
     download,

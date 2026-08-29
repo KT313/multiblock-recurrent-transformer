@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages_instruct.build_mixture on local instruct sources."""
+"""Tests for data_preparation.lib.stages.instruct.build_mixture on local instruct sources."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.dataset_config import DatasetConfig, MixtureConfig, SourceConfig
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.manifest import Manifest
-from data_preparation.lib.stages_instruct import build_mixture
-from data_preparation.lib.row_pipeline import instruct_text
-from data_preparation.lib.stages_shared import TokenCounter, download
+from data_preparation.lib.schema.dataset_config import DatasetConfig, MixtureConfig, SourceConfig
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.stages.instruct import build_mixture
+from data_preparation.lib.stages.row_pipeline import instruct_text
+from data_preparation.lib.stages.shared import TokenCounter, download
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]

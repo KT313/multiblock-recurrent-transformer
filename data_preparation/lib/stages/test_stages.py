@@ -1,7 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """The `stages` facade exposes every stage function of the split modules."""
 
-from data_preparation.lib import stages, stages_instruct, stages_pretrain, stages_shared
+from data_preparation.lib import stages
+from data_preparation.lib.stages import instruct as stages_instruct
+from data_preparation.lib.stages import pretrain as stages_pretrain
+from data_preparation.lib.stages import shared as stages_shared
 
 
 def test_facade_reexports_every_stage() -> None:

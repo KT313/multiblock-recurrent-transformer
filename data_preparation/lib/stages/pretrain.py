@@ -20,8 +20,8 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_preparation.lib.benchmarks import load_benchmark_ngrams
-from data_preparation.lib.common import (
+from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
+from data_preparation.lib.storage.parquet import (
     list_parquet_files,
     md5_hex,
     normalized_hash,
@@ -29,19 +29,19 @@ from data_preparation.lib.common import (
     write_dict_rows,
     write_parquet_shards,
 )
-from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig
-from data_preparation.lib.fuzzy_dedup import fuzzy_dedup
-from data_preparation.lib.layout import DatasetLayout
+from data_preparation.lib.schema.dataset_config import DatasetConfig, DecontaminationConfig
+from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
+from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.manifest import Manifest, shard_rows
-from data_preparation.lib.row_pipeline import (
+from data_preparation.lib.storage.manifest import Manifest, shard_rows
+from data_preparation.lib.stages.row_pipeline import (
     FILTERED_SCHEMA,
     check_contamination,
     check_quality,
     preprocess_batch,
 )
 from data_preparation.lib.sources import repeat_indices
-from data_preparation.lib.stages_shared import (
+from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     current_manifest,

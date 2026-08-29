@@ -10,8 +10,8 @@ import pytest
 
 from data_preparation import prepare
 from data_preparation.lib.build import STEPS
-from data_preparation.lib.dataset_config import DatasetConfig
-from data_preparation.lib.layout import DatasetLayout
+from data_preparation.lib.schema.dataset_config import DatasetConfig
+from data_preparation.lib.schema.layout import DatasetLayout
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
@@ -86,7 +86,7 @@ def test_build_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_build_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from data_preparation.lib.planner import Plan
+    from data_preparation.lib.build.planner import Plan
 
     monkeypatch.setattr(prepare, "build", lambda *a, **k: Plan())
     with pytest.raises(SystemExit) as exc:

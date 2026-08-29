@@ -10,12 +10,12 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib import build as build_mod
+from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
-from data_preparation.lib.dataset_config import DatasetConfig, MixtureConfig, SourceConfig, StageConfig
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.manifest import Manifest, verify_shards
-from data_preparation.lib.stages_pretrain import process as real_process
+from data_preparation.lib.schema.dataset_config import DatasetConfig, MixtureConfig, SourceConfig, StageConfig
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest, verify_shards
+from data_preparation.lib.stages.pretrain import process as real_process
 
 CfgFactory = Callable[..., DatasetConfig]
 Writer = Callable[[Path, list[dict[str, Any]], str], Path]
@@ -116,7 +116,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
 
 
 def test_build_rebuilds_stale_hash(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    from data_preparation.lib.dataset_config import ProcessingConfig
+    from data_preparation.lib.schema.dataset_config import ProcessingConfig
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     build(cfg, layout)

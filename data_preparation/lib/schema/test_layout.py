@@ -1,11 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.layout: pure path arithmetic."""
+"""Tests for data_preparation.lib.schema.layout: pure path arithmetic."""
 
 from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.layout import MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
+from data_preparation.lib.schema.layout import MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
 
 
 def test_default_root_is_dataset() -> None:

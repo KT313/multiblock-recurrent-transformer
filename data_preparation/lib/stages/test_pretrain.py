@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages_pretrain: incremental length filter, streaming process (dedup, quality,
+"""Tests for data_preparation.lib.stages.pretrain: incremental length filter, streaming process (dedup, quality,
 decontamination, token counting, fuzzy dedup, repeat_to_budget) on local parquet sources."""
 
 from __future__ import annotations
@@ -13,19 +13,19 @@ from typing import Any
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib import stages_pretrain
-from data_preparation.lib.dataset_config import (
+from data_preparation.lib.stages import pretrain as stages_pretrain
+from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
     DedupConfig,
     ProcessingConfig,
     SourceConfig,
 )
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.manifest import Manifest
-from data_preparation.lib.row_pipeline import get_ngram_set
-from data_preparation.lib.stages_pretrain import length_filter, process
-from data_preparation.lib.stages_shared import download
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.stages.row_pipeline import get_ngram_set
+from data_preparation.lib.stages.pretrain import length_filter, process
+from data_preparation.lib.stages.shared import download
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]

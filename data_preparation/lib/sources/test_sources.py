@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.lib import sources
-from data_preparation.lib.dataset_config import SourceConfig, SourceKind, load_dataset_config
+from data_preparation.lib.schema.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources import (
     CONVERTERS,
     FILTERS,
@@ -38,7 +38,7 @@ from data_preparation.lib.sources import (
     write_synthetic_tokenizer,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config" / "datasets" / "tiny.yaml"]
 
 

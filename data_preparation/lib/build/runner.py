@@ -16,10 +16,10 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from data_preparation.lib.dataset_config import DatasetConfig
-from data_preparation.lib.layout import MIXTURE_SPLITS, DatasetLayout
+from data_preparation.lib.schema.dataset_config import DatasetConfig
+from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.planner import MixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
+from data_preparation.lib.build.planner import MixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
 from data_preparation.lib.stages import build_mixture, download, holdout, length_filter, prepare_tokenizer, process
 
 log = get_logger(__name__)

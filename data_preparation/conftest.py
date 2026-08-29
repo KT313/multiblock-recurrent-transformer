@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib.dataset_config import (
+from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
     MixtureConfig,
     ProcessingConfig,
@@ -23,8 +23,8 @@ from data_preparation.lib.dataset_config import (
     StageConfig,
     TokenizerConfig,
 )
-from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.stages_shared import prepare_tokenizer
+from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.stages.shared import prepare_tokenizer
 
 # Must happen before `datasets` is imported anywhere (its config reads the env at import time).
 _CACHE = tempfile.mkdtemp(prefix="hf_datasets_cache_")

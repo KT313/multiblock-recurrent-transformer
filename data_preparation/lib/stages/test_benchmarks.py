@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.benchmarks with a stubbed `datasets` module."""
+"""Tests for data_preparation.lib.stages.benchmarks with a stubbed `datasets` module."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib import benchmarks as bm
-from data_preparation.lib.row_pipeline import get_ngram_set
+from data_preparation.lib.stages import benchmarks as bm
+from data_preparation.lib.stages.row_pipeline import get_ngram_set
 
 WORDS = " ".join(f"q{i}" for i in range(15))
 

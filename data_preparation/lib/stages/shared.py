@@ -15,11 +15,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from data_preparation.lib.common import estimate_tokens, list_parquet_files, shard_index, write_dict_rows
-from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.lib.layout import DatasetLayout
+from data_preparation.lib.storage.parquet import estimate_tokens, list_parquet_files, shard_index, write_dict_rows
+from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.manifest import Manifest, library_versions, shard_rows
+from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows
 from data_preparation.lib.sources import (
     Row,
     get_converter,

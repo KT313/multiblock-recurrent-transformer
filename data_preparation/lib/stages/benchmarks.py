@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.row_pipeline import get_ngram_set
+from data_preparation.lib.stages.row_pipeline import get_ngram_set
 
 log = get_logger(__name__)
 

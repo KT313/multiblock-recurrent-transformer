@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.dataset_config import DedupConfig
-from data_preparation.lib.fuzzy_dedup import fuzzy_dedup
+from data_preparation.lib.schema.dataset_config import DedupConfig
+from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 
 
 def _has_datasketch() -> bool:

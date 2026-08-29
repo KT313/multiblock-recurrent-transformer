@@ -157,7 +157,7 @@ def library_versions() -> dict[str, str]:
 
 
 def _git_sha() -> str | None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5, check=False

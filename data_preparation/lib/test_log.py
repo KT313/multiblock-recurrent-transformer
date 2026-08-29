@@ -21,7 +21,7 @@ def _clean_root_logger() -> Iterator[None]:
 
 def test_get_logger_is_under_hierarchy() -> None:
     assert get_logger("common").name == "data_preparation.common"
-    assert get_logger("data_preparation.lib.manifest").name == "data_preparation.lib.manifest"
+    assert get_logger("data_preparation.lib.storage.manifest").name == "data_preparation.lib.storage.manifest"
     assert get_logger(ROOT_LOGGER_NAME).name == ROOT_LOGGER_NAME
     parent = get_logger("x").parent
     assert parent is not None and parent.name == ROOT_LOGGER_NAME
