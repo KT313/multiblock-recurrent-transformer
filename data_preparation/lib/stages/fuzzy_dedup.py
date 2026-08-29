@@ -33,12 +33,14 @@ Signature = NDArray[np.uint64]
 CHUNK_SIZE = 1024
 MINHASH_SEED = 1  # datasketch default; pinned so signatures are stable
 
-# per-process signature parameters (set by the pool initializer, or directly for num_workers <= 1)
-_PARAMS: dict[str, int] = {}
-_KWARGS: dict[str, Any] = {}
+# Signature parameters of *this* process: the n-gram size and the MinHash constructor arguments. Set once per process
+# by ``_init_worker`` (the pool initializer, or called directly when num_workers <= 1) before ``_signature`` is used.
+_NGRAM: int = 0
+_MINHASH_KWARGS: dict[str, Any] = {}
 
 
 def _import_datasketch() -> tuple[Any, Any]:
+    """``(MinHash, MinHashLSH)`` -- imported lazily because datasketch is an optional extra."""
     try:
         from datasketch import MinHash, MinHashLSH
     except ImportError as exc:
@@ -59,26 +61,30 @@ def _minhash_kwargs(num_perm: int) -> dict[str, Any]:
     return kwargs
 
 
-def _init_signatures(num_perm: int, ngram: int) -> None:
-    _PARAMS.update({"num_perm": num_perm, "ngram": ngram})
-    _KWARGS.clear()
-    _KWARGS.update(_minhash_kwargs(num_perm))
+def _init_worker(num_perm: int, ngram: int) -> None:
+    """Set the per-process signature parameters (pool initializer)."""
+    global _NGRAM
+    _NGRAM = ngram
+    _MINHASH_KWARGS.clear()
+    _MINHASH_KWARGS.update(_minhash_kwargs(num_perm))
 
 
 def _signature(text: str) -> Signature:
     """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle)."""
     MinHash, _ = _import_datasketch()
-    m = MinHash(**_KWARGS)
-    for ngram in get_ngrams(text, n=_PARAMS["ngram"]):
-        m.update(ngram.encode("utf-8"))
-    return np.asarray(m.hashvalues, dtype=np.uint64)
+    minhash = MinHash(**_MINHASH_KWARGS)
+    for ngram in get_ngrams(text, n=_NGRAM):
+        minhash.update(ngram.encode("utf-8"))
+    return np.asarray(minhash.hashvalues, dtype=np.uint64)
 
 
 def _signatures(texts: list[str]) -> list[Signature]:
+    """Worker task: the signatures of one chunk of texts."""
     return [_signature(text) for text in texts]
 
 
 def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
+    """Consecutive lists of at most ``size`` rows."""
     chunk: list[Row] = []
     for row in rows:
         chunk.append(row)
@@ -89,28 +95,36 @@ def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
         yield chunk
 
 
-def _signature_stream(
+def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[tuple[Row, Signature]]:
+    """``(row, signature)`` pairs computed in this process."""
+    _init_worker(dedup.num_perm, dedup.ngram)
+    for row in rows:
+        yield row, _signature(row["text"])
+
+
+def _signatures_in_pool(
     rows: Iterator[Row], dedup: DedupConfig, num_workers: int, chunk_size: int
 ) -> Iterator[tuple[Row, Signature]]:
-    if num_workers <= 1:
-        _init_signatures(dedup.num_perm, dedup.ngram)
-        for row in rows:
-            yield row, _signature(row["text"])
-        return
-    # Bounded in-order pipeline: at most ``2 * num_workers`` chunks are read ahead of the consumer, so the input
-    # keeps streaming however slow the LSH side is (``pool.imap`` would read the whole input into its task queue).
+    """``(row, signature)`` pairs in input order, signatures computed by a worker pool chunk by chunk.
+
+    Bounded in-order pipeline: at most ``2 * num_workers`` chunks are read ahead of the consumer, so the input keeps
+    streaming however slow the LSH side is (``pool.imap`` would read the whole input into its task queue).
+    """
+    max_inflight = 2 * num_workers
     inflight: deque[tuple[list[Row], AsyncResult[list[Signature]]]] = deque()
-    with multiprocessing.Pool(
-        num_workers, initializer=_init_signatures, initargs=(dedup.num_perm, dedup.ngram)
-    ) as pool:
+
+    def oldest_finished() -> Iterator[tuple[Row, Signature]]:
+        chunk, pending = inflight.popleft()
+        return zip(chunk, pending.get())
+
+    with multiprocessing.Pool(num_workers, initializer=_init_worker, initargs=(dedup.num_perm, dedup.ngram)) as pool:
         for chunk in _chunks(rows, chunk_size):
-            inflight.append((chunk, pool.apply_async(_signatures, ([row["text"] for row in chunk],))))
-            if len(inflight) >= 2 * num_workers:
-                done, result = inflight.popleft()
-                yield from zip(done, result.get())
+            texts = [row["text"] for row in chunk]
+            inflight.append((chunk, pool.apply_async(_signatures, (texts,))))
+            if len(inflight) >= max_inflight:
+                yield from oldest_finished()
         while inflight:
-            done, result = inflight.popleft()
-            yield from zip(done, result.get())
+            yield from oldest_finished()
 
 
 def fuzzy_dedup(
@@ -122,16 +136,21 @@ def fuzzy_dedup(
     MinHash, MinHashLSH = _import_datasketch()
     stats.update({"threshold": dedup.threshold, "num_perm": dedup.num_perm, "near_duplicates_removed": 0})
     lsh = MinHashLSH(threshold=dedup.threshold, num_perm=dedup.num_perm)
-    kwargs = _minhash_kwargs(dedup.num_perm)
+    minhash_kwargs = _minhash_kwargs(dedup.num_perm)
+
+    if num_workers <= 1:
+        signatures = _signatures_in_process(rows, dedup)
+    else:
+        signatures = _signatures_in_pool(rows, dedup, num_workers, chunk_size)
+
     start = time.monotonic()
-    seen = 0
-    for index, (row, signature) in enumerate(_signature_stream(rows, dedup, num_workers, chunk_size)):
-        seen = index + 1
-        m = MinHash(hashvalues=signature, **kwargs)
-        if lsh.query(m):
+    for index, (row, signature) in enumerate(signatures):
+        minhash = MinHash(hashvalues=signature, **minhash_kwargs)
+        if lsh.query(minhash):
             stats["near_duplicates_removed"] += 1
         else:
-            lsh.insert(f"doc_{index}", m)
+            lsh.insert(f"doc_{index}", minhash)
             yield row
-        stats["near_duplicate_rate"] = stats["near_duplicates_removed"] / seen
+        rows_seen = index + 1
+        stats["near_duplicate_rate"] = stats["near_duplicates_removed"] / rows_seen
         stats["seconds"] = round(time.monotonic() - start, 3)

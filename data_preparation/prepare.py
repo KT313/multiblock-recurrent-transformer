@@ -35,36 +35,50 @@ TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
 DEFAULT_DATASET_DIR = Path("dataset")
 
 
+# --- command line ------------------------------------------------------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    def common(sub: argparse.ArgumentParser, *, config_default: Path | None) -> None:
-        sub.add_argument("--dataset_config", type=Path, default=config_default, required=config_default is None, help="dataset config YAML")
-        sub.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR, help="root of all prepared data")
-        sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
-
-    def build_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / instruct mixtures")
-        sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
-        sub.add_argument("--num_workers", type=int, default=1, help="worker processes for processing stages")
-        sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")
-        sub.add_argument("--dry_run", action="store_true", help="print the plan, write nothing")
-        sub.set_defaults(run=run_build)
-
     build_cmd = subparsers.add_parser("build", help="materialise a dataset config (missing parts only)")
-    common(build_cmd, config_default=None)
-    build_options(build_cmd)
+    _add_dataset_options(build_cmd, config_default=None)
+    _add_build_options(build_cmd)
+    build_cmd.set_defaults(run=run_build)
+
     status_cmd = subparsers.add_parser("status", help="print the plan; exit 0 iff the dataset is complete")
-    common(status_cmd, config_default=None)
+    _add_dataset_options(status_cmd, config_default=None)
     status_cmd.set_defaults(run=run_status)
+
     describe_cmd = subparsers.add_parser("describe", help="print the dataset config as a Markdown document")
     describe_cmd.add_argument("--dataset_config", type=Path, required=True, help="dataset config YAML")
     describe_cmd.set_defaults(run=run_describe)
-    tiny = subparsers.add_parser("tiny", help=f"build {TINY_DATASET_CONFIG} (alias of build)")
-    common(tiny, config_default=TINY_DATASET_CONFIG)
-    build_options(tiny)
+
+    tiny_cmd = subparsers.add_parser("tiny", help=f"build {TINY_DATASET_CONFIG} (alias of build)")
+    _add_dataset_options(tiny_cmd, config_default=TINY_DATASET_CONFIG)
+    _add_build_options(tiny_cmd)
+    tiny_cmd.set_defaults(run=run_build)
+
     return parser
+
+
+def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path | None) -> None:
+    """``--dataset_config`` (required unless ``config_default`` is given), ``--dataset_dir``, ``--cache_dir``."""
+    sub.add_argument("--dataset_config", type=Path, default=config_default, required=config_default is None, help="dataset config YAML")
+    sub.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR, help="root of all prepared data")
+    sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
+
+
+def _add_build_options(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / instruct mixtures")
+    sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
+    sub.add_argument("--num_workers", type=int, default=1, help="worker processes for processing stages")
+    sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")
+    sub.add_argument("--dry_run", action="store_true", help="print the plan, write nothing")
+
+
+# --- commands ----------------------------------------------------------------------------------------------------------
 
 
 def run_build(args: argparse.Namespace) -> None:
@@ -81,8 +95,9 @@ def run_build(args: argparse.Namespace) -> None:
         hf_token=args.hf_token,
         dry_run=args.dry_run,
     )
-    if args.dry_run or args.sources is not None or args.steps is not None:
-        return
+    partial_build = args.dry_run or args.sources is not None or args.steps is not None
+    if partial_build:
+        return  # the dataset is not expected to be complete after a partial build
     if not result.complete:
         raise RuntimeError(f"dataset {cfg.name} still incomplete after the build: {result.missing()}")
     log.info("done: %s", layout.root)

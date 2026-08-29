@@ -19,7 +19,8 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 def get_logger(name: str) -> logging.Logger:
     """Logger under the ``data_preparation`` hierarchy (``name`` is prefixed unless it already is)."""
-    if name != ROOT_LOGGER_NAME and not name.startswith(ROOT_LOGGER_NAME + "."):
+    already_under_root = name == ROOT_LOGGER_NAME or name.startswith(ROOT_LOGGER_NAME + ".")
+    if not already_under_root:
         name = f"{ROOT_LOGGER_NAME}.{name}"
     return logging.getLogger(name)
 
@@ -35,15 +36,22 @@ class ProgressStreamHandler(logging.StreamHandler):  # type: ignore[type-arg]  #
             self.handleError(record)
 
 
+def _our_handler(root: logging.Logger) -> ProgressStreamHandler | None:
+    """The handler a previous ``configure_logging`` call attached, if any."""
+    for handler in root.handlers:
+        if isinstance(handler, ProgressStreamHandler):
+            return handler
+    return None
+
+
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
     """Attach a single stderr stream handler to the ``data_preparation`` logger; idempotent."""
     root = logging.getLogger(ROOT_LOGGER_NAME)
     root.setLevel(level)
-    handler = next((h for h in root.handlers if getattr(h, "_data_preparation_handler", False)), None)
+    handler = _our_handler(root)
     if handler is None:
         handler = ProgressStreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter(LOG_FORMAT))
-        handler._data_preparation_handler = True  # type: ignore[attr-defined]  # marker to find our handler again
         root.addHandler(handler)
     handler.setLevel(level)
     return root

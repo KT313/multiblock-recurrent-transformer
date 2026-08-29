@@ -58,6 +58,7 @@ import pyarrow.parquet as pq
 
 Row = dict[str, Any]
 OnFile = Callable[[str], None]
+RowFilter = Callable[[Row], bool]
 
 FORMATS: tuple[str, ...] = (".parquet", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".jsonl", ".json")
 STREAM_FORMATS: tuple[str, ...] = (".jsonl.zst", ".jsonl.gz", ".json.gz", ".jsonl")
@@ -65,6 +66,7 @@ STREAM_FORMATS: tuple[str, ...] = (".jsonl.zst", ".jsonl.gz", ".json.gz", ".json
 DEFAULT_MAX_CACHED_FILE_MB = 32.0  # files up to this size go through the Hub cache whole; larger ones are read remotely by row group / streamed (a 240 MB parquet file for 20 rows is not worth caching)
 PARQUET_BLOCK_SIZE = 1 << 20  # fsspec read-ahead for remote parquet (random access: keep the over-read small)
 STREAM_BLOCK_SIZE = 8 << 20  # fsspec read-ahead for sequential remote streams (fewer, larger range requests)
+STREAM_BUFFER_SIZE = 1 << 16  # local buffer in front of a remote stream (json lines / ijson decode from it)
 PATHS_INFO_BATCH = 500  # paths per `get_paths_info` request
 
 
@@ -93,7 +95,8 @@ def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str 
                 sizes[entry.path] = int(entry.size)
     missing = [p for p in paths if p not in sizes]
     if missing:
-        raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no size for {missing[:3]}{'...' if len(missing) > 3 else ''}")
+        shown = f"{missing[:3]}..." if len(missing) > 3 else f"{missing}"
+        raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no size for {shown}")
     return sizes
 
 
@@ -120,7 +123,8 @@ def open_remote(repo_id: str, filename: str, revision: str | None, token: str | 
 def index_path(index_dir: Path, repo_id: str, revision: str | None, pattern: str) -> Path:
     """``<index_dir>/<repo with / replaced>@<revision>/<sha256(pattern)[:16]>.json``."""
     repo = repo_id.replace("/", "--")
-    return index_dir / f"{repo}@{revision or 'main'}" / f"{hashlib.sha256(pattern.encode()).hexdigest()[:16]}.json"
+    pattern_hash = hashlib.sha256(pattern.encode()).hexdigest()[:16]
+    return index_dir / f"{repo}@{revision or 'main'}" / f"{pattern_hash}.json"
 
 
 @dataclass
@@ -144,19 +148,40 @@ class FileIndex:
         """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it."""
         path = None if index_dir is None else index_path(index_dir, repo_id, revision, pattern)
         if path is not None and path.is_file():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            index = cls(
-                repo_id, revision, pattern, data["files"], data["rows"], data.get("counts", {}),
-                data.get("sizes", {}), data.get("row_groups", {}), data.get("group_counts", {}), path=path,
-            )
+            index = cls._load(repo_id, revision, pattern, path)
         else:
-            files = sorted(f for f in list_repo_files(repo_id, revision, token) if fnmatch.fnmatchcase(f, pattern))
-            if not files:
-                raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no files match data_files={pattern!r}")
-            index = cls(repo_id, revision, pattern, files, path=path)
+            index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
         index.ensure_sizes(token)
         index.save()
         return index
+
+    @classmethod
+    def _load(cls, repo_id: str, revision: str | None, pattern: str, path: Path) -> FileIndex:
+        """The index persisted at ``path`` (older files may lack the optional sections; they default to empty)."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls(
+            repo_id=repo_id,
+            revision=revision,
+            pattern=pattern,
+            files=data["files"],
+            rows=data["rows"],
+            counts=data.get("counts", {}),
+            sizes=data.get("sizes", {}),
+            row_groups=data.get("row_groups", {}),
+            group_counts=data.get("group_counts", {}),
+            path=path,
+        )
+
+    @classmethod
+    def _from_repo_listing(
+        cls, repo_id: str, revision: str | None, pattern: str, path: Path | None, token: str | None
+    ) -> FileIndex:
+        """A fresh index: list the repo once and keep the files matching ``pattern``, sorted by path."""
+        all_files = list_repo_files(repo_id, revision, token)
+        files = sorted(f for f in all_files if fnmatch.fnmatchcase(f, pattern))
+        if not files:
+            raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no files match data_files={pattern!r}")
+        return cls(repo_id, revision, pattern, files, path=path)
 
     def ensure_sizes(self, token: str | None) -> None:
         """Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed)."""
@@ -165,6 +190,7 @@ class FileIndex:
             self.sizes.update(paths_info(self.repo_id, missing, self.revision, token))
 
     def save(self) -> None:
+        """Write the index to ``path`` atomically (no-op for an in-memory index)."""
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +216,7 @@ class FileIndex:
         return self.counts.get(key, {}).get(file)
 
     def record(self, key: str | None, file: str, value: int) -> None:
+        """Store the row count of ``file`` (``key=None``: all rows; else the ``counts[key]`` counter) and save."""
         if key is None:
             self.rows[file] = value
         else:
@@ -210,6 +237,7 @@ class FileIndex:
         return self.group_counts.get(key, {}).get(file, [])
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
+        """Store the matching rows per row group read so far under ``key`` (a prefix of the file's groups) and save."""
         self.group_counts.setdefault(key, {})[file] = groups
         self.save()
 
@@ -273,28 +301,42 @@ class HubFetcher:
     stats: FetchStats = field(default_factory=FetchStats)
 
     def uses_cache(self, size: int) -> bool:
+        """Whether a file of ``size`` bytes is fetched whole into the Hub cache (else it is read remotely)."""
         return size <= self.max_cached_file_mb * 1024 * 1024
 
     @contextmanager
     def open(self, index: FileIndex, file: str, fmt: str) -> Iterator[BinaryIO]:
         """A binary, seekable file object for ``file``: the cached local copy or the remote file."""
-        size = index.sizes[file]
-        if self.uses_cache(size):
-            path = (self.download or hub_download)(index.repo_id, file, index.revision, self.token)
-            self.stats.files_downloaded += 1
-            with path.open("rb") as fh:
-                yield fh
-            return
+        if self.uses_cache(index.sizes[file]):
+            with self._open_cached(index, file) as handle:
+                yield handle
+        else:
+            with self._open_remote(index, file, fmt) as handle:
+                yield handle
+
+    @contextmanager
+    def _open_cached(self, index: FileIndex, file: str) -> Iterator[BinaryIO]:
+        download = self.download or hub_download
+        path = download(index.repo_id, file, index.revision, self.token)
+        self.stats.files_downloaded += 1
+        with path.open("rb") as handle:
+            yield handle
+
+    @contextmanager
+    def _open_remote(self, index: FileIndex, file: str, fmt: str) -> Iterator[BinaryIO]:
+        open_file = self.remote or open_remote
         block_size = PARQUET_BLOCK_SIZE if fmt == ".parquet" else STREAM_BLOCK_SIZE
-        raw = (self.remote or open_remote)(index.repo_id, file, index.revision, self.token, block_size)
+        raw = open_file(index.repo_id, file, index.revision, self.token, block_size)
         self.stats.files_streamed += 1
         counting = _CountingRaw(raw, self.stats)
-        if fmt == ".parquet":  # random access: pyarrow reads exact column-chunk ranges, no extra buffering
+        if fmt == ".parquet":
+            # random access: pyarrow reads exact column-chunk ranges itself, no extra buffering wanted
             with counting:
                 yield counting
-            return
-        with io.BufferedReader(counting, buffer_size=1 << 16) as buffered:  # sequential decoding (json lines / ijson)
-            yield buffered
+        else:
+            # sequential decoding (json lines / ijson): read through a local buffer
+            with io.BufferedReader(counting, buffer_size=STREAM_BUFFER_SIZE) as buffered:
+                yield buffered
 
 
 # --- per-format readers -----------------------------------------------------------------------------------------------
@@ -319,7 +361,7 @@ def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | No
     only from the first one that holds a wanted row on (a consumer that stops early never touches later groups).
     ``columns`` projects the read (None: every column)."""
     for group, group_rows in enumerate(parquet_row_groups(parquet)):
-        if skip >= group_rows:
+        if skip >= group_rows:  # every row of this group is skipped: do not read it
             skip -= group_rows
             continue
         rows = read_row_group(parquet, group, columns)
@@ -339,11 +381,10 @@ def iter_stream(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
     fmt = file_format(name)
     if fmt == ".parquet":
         yield from iter_parquet(pq.ParquetFile(handle), skip)
-        return
-    if fmt == ".json":
+    elif fmt == ".json":
         yield from iter_json_array(handle, name, skip)
-        return
-    yield from _iter_json_lines(handle, fmt, skip)
+    else:
+        yield from _iter_json_lines(handle, fmt, skip)
 
 
 def iter_file(path: Path, name: str, skip: int = 0) -> Iterator[Row]:
@@ -362,12 +403,15 @@ def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]
 
     events = ijson.parse(handle, use_float=True)  # reads 64 KB chunks: the granularity of an early stop
     try:
-        first = next(events)
+        first_event = next(events)
     except ijson.IncompleteJSONError as error:  # empty or truncated file
         raise ValueError(f"{name}: plain .json must contain a JSON array of rows (empty file)") from error
-    if first[1] != "start_array":
-        raise ValueError(f"{name}: plain .json must contain a JSON array of rows (top-level {first[1].removeprefix('start_')})")
-    for position, row in enumerate(ijson.items(itertools.chain([first], events), "item")):
+    first_event_type = first_event[1]
+    if first_event_type != "start_array":
+        top_level = first_event_type.removeprefix("start_")
+        raise ValueError(f"{name}: plain .json must contain a JSON array of rows (top-level {top_level})")
+    all_events = itertools.chain([first_event], events)  # give the consumed event back to ijson
+    for position, row in enumerate(ijson.items(all_events, "item")):
         if position < skip:
             continue
         if not isinstance(row, dict):
@@ -376,29 +420,31 @@ def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]
 
 
 def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:
+    """Rows of a (possibly compressed) json-lines file, skipping the first ``skip`` non-empty lines."""
     if fmt == ".jsonl.zst":
         import zstandard
 
-        with zstandard.ZstdDecompressor().stream_reader(handle, closefd=False) as reader:
-            yield from _lines(io.TextIOWrapper(reader, encoding="utf-8"), skip)
+        with zstandard.ZstdDecompressor().stream_reader(handle, closefd=False) as decompressed:
+            yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
     elif fmt in (".jsonl.gz", ".json.gz"):
-        with gzip.GzipFile(fileobj=handle, mode="rb") as unzipped:
-            yield from _lines(io.TextIOWrapper(unzipped, encoding="utf-8"), skip)
-    else:
+        with gzip.GzipFile(fileobj=handle, mode="rb") as decompressed:
+            yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
+    else:  # plain .jsonl
         text = io.TextIOWrapper(handle, encoding="utf-8")
         try:
-            yield from _lines(text, skip)
+            yield from _parse_json_lines(text, skip)
         finally:
-            text.detach()  # the caller owns `handle`
+            text.detach()  # closing the wrapper would close `handle`, which the caller owns
 
 
-def _lines(lines: Any, skip: int) -> Iterator[Row]:
-    seen = 0
+def _parse_json_lines(lines: Any, skip: int) -> Iterator[Row]:
+    """One JSON object per non-empty line, skipping the first ``skip`` of them."""
+    skipped = 0
     for line in lines:
         if not line.strip():
             continue
-        if seen < skip:
-            seen += 1
+        if skipped < skip:
+            skipped += 1
             continue
         yield json.loads(line)
 
@@ -408,7 +454,11 @@ def _lines(lines: Any, skip: int) -> Iterator[Row]:
 
 @dataclass
 class _Cursor:
-    """Mutable position of one :func:`read_rows` call, shared with the per-file helpers."""
+    """Mutable position of one :func:`read_rows` call, shared with the per-file helpers.
+
+    ``remaining_skip`` counts rows still to skip before the first yielded row — plain rows without ``match``,
+    matching rows with it. The per-file helpers set ``completed`` to True when they enter a file and back to False
+    when they stop before its end."""
 
     count: int  # rows wanted (a minimum when a remote row group is finished)
     remaining_skip: int  # rows (matching rows with `match`) still to skip before the first yielded row
@@ -419,6 +469,14 @@ class _Cursor:
     def satisfied(self) -> bool:
         return self.taken >= self.count
 
+    def skip_whole(self, rows: int) -> bool:
+        """Skip a unit (file / row group) of ``rows`` rows if the skip position lies at or beyond its end;
+        return whether it was skipped."""
+        if self.remaining_skip < rows:
+            return False
+        self.remaining_skip -= rows
+        return True
+
 
 def read_rows(
     index: FileIndex,
@@ -428,7 +486,7 @@ def read_rows(
     token: str | None = None,
     on_file: OnFile | None = None,
     key: str | None = None,
-    match: Callable[[Row], bool] | None = None,
+    match: RowFilter | None = None,
     fetcher: HubFetcher | None = None,
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
@@ -451,34 +509,41 @@ def read_rows(
     """
     if count <= 0:
         return
-    fetcher = HubFetcher(token=token) if fetcher is None else fetcher
+    if fetcher is None:
+        fetcher = HubFetcher(token=token)
     cursor = _Cursor(count=count, remaining_skip=offset)
+
     for file in index.files:
-        known = index.count(key, file)
-        if known is not None and cursor.remaining_skip >= known:
-            cursor.remaining_skip -= known
+        if _skip_file_if_count_known(index, key, file, cursor):
             continue
         fmt = file_format(file)
         if on_file is not None:
             on_file(file)
-        remote = not fetcher.uses_cache(index.sizes[file])
         with fetcher.open(index, file, fmt) as handle:
             if fmt == ".parquet":
                 parquet = pq.ParquetFile(handle)
                 if index.row_groups.get(file) is None:
-                    index.record_row_groups(file, parquet_row_groups(parquet))
-                if known is None and key is None:
-                    known = index.rows[file]
-                    if cursor.remaining_skip >= known:
-                        cursor.remaining_skip -= known
-                        continue
-                yield from _parquet_rows(parquet, index, file, cursor, key, match, columns, align_to_row_group and remote)
+                    index.record_row_groups(file, parquet_row_groups(parquet))  # the footer told us the row count
+                if key is None and _skip_file_if_count_known(index, key, file, cursor):
+                    continue  # the whole file lies before the offset after all (only its footer was read)
+                is_remote = not fetcher.uses_cache(index.sizes[file])
+                finish_group = align_to_row_group and is_remote
+                yield from _parquet_rows(parquet, index, file, cursor, key, match, columns, finish_group)
             else:
                 yield from _stream_rows(handle, index, file, cursor, key, match)
         if cursor.completed:
-            cursor.remaining_skip = 0
+            cursor.remaining_skip = 0  # everything to skip lay inside the files read so far
         if cursor.satisfied:
             return
+
+
+def _skip_file_if_count_known(index: FileIndex, key: str | None, file: str, cursor: _Cursor) -> bool:
+    """Skip ``file`` without opening it when its (matching) row count is known and lies entirely before the skip
+    position; return whether it was skipped."""
+    known = index.count(key, file)
+    if known is None:
+        return False
+    return cursor.skip_whole(known)
 
 
 def _parquet_rows(
@@ -487,53 +552,61 @@ def _parquet_rows(
     file: str,
     cursor: _Cursor,
     key: str | None,
-    match: Callable[[Row], bool] | None,
+    match: RowFilter | None,
     columns: list[str] | None,
     finish_group: bool,
 ) -> Iterator[Row]:
     """Rows of one parquet file from the cursor's skip position; row groups before it are never read. With
     ``finish_group`` the row group in which ``count`` is reached is yielded to its end. Keyed reads record the
     matching rows of every fully read row group (``index.group_counts``); a file read to its end records its counts."""
-    groups = index.row_groups[file]
-    per_group = list(index.known_group_counts(key, file))  # rows per group counting towards `key`, known prefix
-    start = 0
-    for rows_in_group in per_group:
-        if cursor.remaining_skip < rows_in_group:
+    groups = index.row_groups[file]  # rows per row group, from the footer
+    known_group_counts = list(index.known_group_counts(key, file))  # (matching) rows per group, a known prefix
+    record_key = key if match is not None else None  # counts are only recorded under `key` for filtered reads
+
+    # Step 1: skip whole row groups whose (matching) rows all lie before the skip position — they are never read.
+    first_group = 0
+    for rows_in_group in known_group_counts:
+        if not cursor.skip_whole(rows_in_group):
             break
-        cursor.remaining_skip -= rows_in_group
-        start += 1
-    in_group_skip = 0
+        first_group += 1
+
+    # Step 2: without `match` the rest of the skip is a plain row position inside `first_group`; with `match` it
+    # stays on the cursor and is counted down per matching row below.
+    rows_to_skip_in_first_group = 0
     if match is None:
-        in_group_skip, cursor.remaining_skip = cursor.remaining_skip, 0
-    cursor.completed = True
-    for group in range(start, len(groups)):
-        matched = 0
-        stopped = False
+        rows_to_skip_in_first_group = cursor.remaining_skip
+        cursor.remaining_skip = 0
+
+    cursor.completed = True  # cleared below when we stop before the end of the file
+    for group in range(first_group, len(groups)):
+        matched_in_group = 0
         for position, row in enumerate(read_row_group(parquet, group, columns)):
-            if group == start and position < in_group_skip:
+            if group == first_group and position < rows_to_skip_in_first_group:
                 continue
             if match is not None and not match(row):
                 continue
-            matched += 1
+            matched_in_group += 1
             if cursor.remaining_skip > 0:
                 cursor.remaining_skip -= 1
                 continue
             yield dict(row)
             cursor.taken += 1
             if cursor.satisfied and not finish_group:
-                stopped = True
-                break
-        if stopped:
-            cursor.completed = False
+                cursor.completed = False  # stopped in the middle of this row group
+                return
+
+        # This row group was read completely.
+        if record_key is not None and group == len(known_group_counts):
+            known_group_counts.append(matched_in_group)
+            index.record_group_counts(record_key, file, known_group_counts)
+        is_last_group = group == len(groups) - 1
+        if cursor.satisfied and not is_last_group:
+            cursor.completed = False  # done; later row groups of this file were not read
             return
-        if key is not None and match is not None and group == len(per_group):
-            per_group.append(matched)
-            index.record_group_counts(key, file, per_group)
-        if cursor.satisfied and group < len(groups) - 1:
-            cursor.completed = False
-            return
-    if key is not None and match is not None:
-        index.record(key, file, sum(per_group))
+
+    # The whole file was read: with a key, every row group's matching rows are known now.
+    if record_key is not None:
+        index.record(record_key, file, sum(known_group_counts))
 
 
 def _stream_rows(
@@ -542,32 +615,35 @@ def _stream_rows(
     file: str,
     cursor: _Cursor,
     key: str | None,
-    match: Callable[[Row], bool] | None,
+    match: RowFilter | None,
 ) -> Iterator[Row]:
     """Rows of one non-parquet file from the cursor's skip position, exactly up to ``count``; a file read to its end
     records its counts."""
-    file_skip = cursor.remaining_skip if match is None else 0
-    rows_iter = iter_stream(handle, file, file_skip)
-    total_rows = 0
-    matched = 0
-    cursor.completed = True
-    for row in rows_iter:
-        total_rows += 1
+    # Without `match` the reader skips the rows itself; with `match` every row must be seen and the skip is
+    # counted down per matching row below.
+    reader_skip = 0
+    if match is None:
+        reader_skip = cursor.remaining_skip
+        cursor.remaining_skip = 0
+
+    rows_seen = 0  # rows the reader yielded (after `reader_skip`)
+    rows_matched = 0
+    cursor.completed = True  # cleared below when we stop before the end of the file
+    for row in iter_stream(handle, file, reader_skip):
+        rows_seen += 1
         if match is not None and not match(row):
             continue
-        matched += 1
-        if match is not None and cursor.remaining_skip > 0:
+        rows_matched += 1
+        if cursor.remaining_skip > 0:
             cursor.remaining_skip -= 1
             continue
-        cursor.remaining_skip = 0
         yield dict(row)
         cursor.taken += 1
         if cursor.satisfied:
-            cursor.completed = False
+            cursor.completed = False  # stopped in the middle of the file
             return
-    if match is None:
-        index.record(None, file, file_skip + total_rows)
-        return
-    index.record(None, file, total_rows)
-    if key is not None:
-        index.record(key, file, matched)
+
+    # The whole file was read: record what we learned about it.
+    index.record(None, file, reader_skip + rows_seen)
+    if key is not None and match is not None:
+        index.record(key, file, rows_matched)

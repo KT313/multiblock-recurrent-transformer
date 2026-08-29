@@ -6,6 +6,11 @@ import logging
 from pathlib import Path
 from typing import cast
 
+log = logging.getLogger(__name__)
+
+# Tried in order when picking the padding id (see `resolve_pad_id`).
+_PAD_ID_FALLBACKS = ("pad_token_id", "unk_token_id", "eos_token_id")
+
 
 def resolve_pad_id(processor: object, path: Path) -> int:
     """The id used for padding and for masking labels.
@@ -14,14 +19,13 @@ def resolve_pad_id(processor: object, path: Path) -> int:
     code effectively did (`pad_id or 0` = Llama's `<unk>`), then to EOS. Pad positions in the inputs are replaced by
     EOS in the collate function anyway; in the labels they become the ignore index.
     """
-    for attr in ("pad_token_id", "unk_token_id", "eos_token_id"):
+    for attr in _PAD_ID_FALLBACKS:
         token_id = cast(int | None, getattr(processor, attr, None))
-        if token_id is not None:
-            if attr != "pad_token_id":
-                logging.getLogger(__name__).warning(
-                    "Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attr, token_id
-                )
-            return token_id
+        if token_id is None:
+            continue
+        if attr != "pad_token_id":
+            log.warning("Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attr, token_id)
+        return token_id
     raise ValueError(f"Tokenizer at {path} defines no pad, unk or eos token; padding/label masking needs one.")
 
 
@@ -51,6 +55,7 @@ class Tokenizer:
         return len(self.processor)
 
     def __reduce__(self) -> tuple[type["Tokenizer"], tuple[Path]]:
+        """Pickle as (class, (path,)) so worker processes reload the tokenizer from disk instead of copying it."""
         return (self.__class__, (self.path,))
 
     def encode(self, text: str, bos: bool = False, eos: bool = False) -> list[int]:

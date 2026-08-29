@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Pure row-level helpers of the preparation pipeline (no I/O, no config): length filtering, quality heuristics,
-benchmark-contamination n-grams, instruct-row inversions and field checks. The stage functions in ``stages_*.py``
+benchmark-contamination n-grams, instruct-row inversions and field checks. The stage functions in ``stages/*.py``
 apply them to shards.
 """
 
@@ -14,6 +14,7 @@ import pyarrow.compute as pc
 
 Row = dict[str, Any]
 
+# the explicit annotation is what pyarrow-stubs needs to accept the list in ``pa.schema``
 _OUTPUT_FIELDS: list[tuple[str, pa.DataType]] = [
     ("text", pa.string()),
     ("source", pa.string()),
@@ -36,9 +37,10 @@ def preprocess_batch(
     if text_field not in batch.schema.names:
         raise ValueError(f"{source_name}: text_field {text_field!r} not in columns {batch.schema.names}")
     stats = {"input_samples": len(batch), "removed_too_short": 0, "removed_invalid": 0, "truncated": 0}
+
+    # 1. drop null texts
     # the raw shards store text as (large_)string; the cast only narrows the stub type, nothing happens at runtime
     text_array = cast(pa.StringArray, batch[text_field])
-
     is_valid = pc.is_valid(text_array)
     # pyarrow-stubs restricts `pc.sum` to numeric arrays, but summing a boolean array is valid pyarrow
     stats["removed_invalid"] = len(batch) - pc.sum(is_valid).as_py()  # type: ignore[type-var]
@@ -46,28 +48,24 @@ def preprocess_batch(
         batch = batch.filter(is_valid)
         text_array = cast(pa.StringArray, batch[text_field])
     if len(batch) == 0:
-        return pa.RecordBatch.from_pylist([], schema=FILTERED_SCHEMA), stats | {"output_samples": 0}
+        return _empty_filtered_batch(), stats | {"output_samples": 0}
 
+    # 2. drop texts shorter than min_chars
     original_lengths = pc.utf8_length(text_array)
     # pyarrow-stubs does not accept a Python int as the second operand, pyarrow does
-    length_mask = pc.greater_equal(original_lengths, min_chars)  # type: ignore[call-overload]
-    stats["removed_too_short"] = len(batch) - pc.sum(length_mask).as_py()
+    is_long_enough = pc.greater_equal(original_lengths, min_chars)  # type: ignore[call-overload]
+    stats["removed_too_short"] = len(batch) - pc.sum(is_long_enough).as_py()
     if stats["removed_too_short"] > 0:
-        batch = batch.filter(length_mask)
+        batch = batch.filter(is_long_enough)
         text_array = cast(pa.StringArray, batch[text_field])
         original_lengths = pc.utf8_length(text_array)
     if len(batch) == 0:
-        return pa.RecordBatch.from_pylist([], schema=FILTERED_SCHEMA), stats | {"output_samples": 0}
+        return _empty_filtered_batch(), stats | {"output_samples": 0}
 
-    truncated_texts: list[str] = []
+    # 3. truncate to max_chars (original_length keeps the length before truncation)
     texts = cast(list[str], text_array.to_pylist())  # nulls were filtered above
-    lengths = cast(list[int], original_lengths.to_pylist())
-    for text, orig_len in zip(texts, lengths):
-        if orig_len > max_chars:
-            truncated_texts.append(text[:max_chars])
-            stats["truncated"] += 1
-        else:
-            truncated_texts.append(text)
+    truncated_texts = [text[:max_chars] for text in texts]
+    stats["truncated"] = sum(1 for text in texts if len(text) > max_chars)
 
     output = pa.RecordBatch.from_arrays(
         [
@@ -79,6 +77,10 @@ def preprocess_batch(
     )
     stats["output_samples"] = len(output)
     return output, stats
+
+
+def _empty_filtered_batch() -> pa.RecordBatch:
+    return pa.RecordBatch.from_pylist([], schema=FILTERED_SCHEMA)
 
 
 # --- pretrain: quality / contamination ---------------------------------------------------------------------------------
@@ -107,15 +109,16 @@ def check_quality(text: str) -> tuple[bool, str]:
     alphanumeric = sum(1 for c in text if c.isalnum() or c.isspace())
     if alphanumeric / len(text) < 0.25:
         return False, "too_few_alphanumeric"
-    if len(words) > 10:
-        bigrams = [" ".join(words[i : i + 2]) for i in range(len(words) - 1)]
-        if len(set(bigrams)) / len(bigrams) < 0.7:
-            return False, "too_repetitive_bigrams"
-    if len(words) > 20:
-        trigrams = [" ".join(words[i : i + 3]) for i in range(len(words) - 2)]
-        if len(set(trigrams)) / len(trigrams) < 0.8:
-            return False, "too_repetitive_trigrams"
+    if len(words) > 10 and _unique_ratio(get_ngrams(text, 2)) < 0.7:
+        return False, "too_repetitive_bigrams"
+    if len(words) > 20 and _unique_ratio(get_ngrams(text, 3)) < 0.8:
+        return False, "too_repetitive_trigrams"
     return True, "passed"
+
+
+def _unique_ratio(items: list[str]) -> float:
+    """Share of distinct entries in ``items`` (1.0 = no repetition)."""
+    return len(set(items)) / len(items)
 
 
 def normalize_text(text: str) -> str:
@@ -132,13 +135,19 @@ def get_ngram_set(text: str, n: int = 13) -> set[str]:
 def check_contamination(
     text: str, benchmark_ngrams: dict[str, set[str]], n: int = 13, threshold: float = 0.1
 ) -> tuple[bool, list[str]]:
-    """A document is contaminated if more than ``threshold`` of its n-grams occur in any benchmark test set."""
+    """A document is contaminated if more than ``threshold`` of its n-grams occur in any benchmark test set.
+
+    Returns ``(is_contaminated, names of the contaminating benchmarks)``.
+    """
     doc_ngrams = get_ngram_set(text, n)
     if not doc_ngrams:
         return False, []
     contaminated = []
     for name, test_ngrams in benchmark_ngrams.items():
-        if test_ngrams and len(doc_ngrams & test_ngrams) / len(doc_ngrams) > threshold:
+        if not test_ngrams:
+            continue
+        overlap = len(doc_ngrams & test_ngrams) / len(doc_ngrams)
+        if overlap > threshold:
             contaminated.append(name)
     return len(contaminated) > 0, contaminated
 
@@ -157,9 +166,8 @@ def check_length(tokens: int, max_tokens: int) -> bool:
 
 
 def create_input_inversion(row: Row) -> Row:
-    """Ask for the instruction given the output (swap direction); unchanged when instruction or output is empty."""
-    if "instruction" not in row or "output" not in row:
-        return row
+    """Ask for the instruction given the output (swap direction); unchanged when instruction or output is missing
+    or empty."""
     if not row.get("instruction") or not row.get("output"):
         return row
     inverted_output = str(row["instruction"])

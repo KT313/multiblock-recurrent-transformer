@@ -17,6 +17,7 @@ from typing import Any, Protocol, TextIO, TypeVar
 from tqdm import tqdm
 
 ENV_VAR = "DATA_PREP_PROGRESS"
+DISABLING_VALUES = ("0", "false", "no", "off")
 
 T = TypeVar("T")
 
@@ -36,7 +37,7 @@ class Progress(Protocol):
 
 
 class NoProgress:
-    """No-op stand-in for a ``tqdm`` bar (iteration passes the wrapped iterable through)."""
+    """No-op stand-in for a ``tqdm`` bar (iteration passes the wrapped iterable through; ``n`` counts updates)."""
 
     def __init__(self, iterable: Iterable[Any] | None = None) -> None:
         self._iterable = iterable
@@ -70,11 +71,15 @@ class NoProgress:
 
 def progress_enabled(stream: TextIO | None = None) -> bool:
     """False when ``DATA_PREP_PROGRESS=0`` (or ``false``/``no``/``off``) or when ``stream`` (stderr) is not a TTY."""
-    if os.environ.get(ENV_VAR, "1").strip().lower() in ("0", "false", "no", "off"):
+    env_value = os.environ.get(ENV_VAR, "1").strip().lower()
+    if env_value in DISABLING_VALUES:
         return False
-    stream = sys.stderr if stream is None else stream
+    if stream is None:
+        stream = sys.stderr
     isatty = getattr(stream, "isatty", None)
-    return bool(isatty and isatty())
+    if isatty is None:
+        return False
+    return bool(isatty())
 
 
 def progress(

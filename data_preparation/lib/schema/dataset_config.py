@@ -8,7 +8,7 @@ references the file; every data-related setting lives here.
 Layout produced on disk (see CLAUDE.md "Dataset-config restructuring"):
 
     dataset/sources/<source>/{raw,filtered,processed}/   shared by every dataset config, append-only
-    dataset/instruct_instruct_mixtures/<config name>/<mixture>/{train,validation}/
+    dataset/instruct_mixtures/<config name>/<mixture>/{train,validation}/
     dataset/tokenizers/<tokenizer name>/
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, Field, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -26,6 +26,8 @@ SourceKind = Literal["pretrain", "validation", "instruct"]
 LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
 DedupMode = Literal["none", "exact", "minhash"]
 TokenCountMode = Literal["tokenizer", "estimate"]
+
+HUB_LOADERS: tuple[str, ...] = ("hf_files", "hf_split", "hf_stream", "github_code")  # loaders that need `hf_id`
 
 DEFAULT_BENCHMARKS = [
     "gsm8k_test",
@@ -119,25 +121,35 @@ class SourceConfig:
     processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
 
     def __post_init__(self) -> None:
-        if self.loader == "github_code" and not self.language:
-            raise ValueError("loader github_code requires language")
-        if self.loader in ("hf_files", "hf_split", "hf_stream", "github_code") and not self.hf_id:
-            raise ValueError(f"loader {self.loader} requires hf_id")
-        if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
-            raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
-        threshold = self.load_kwargs.get("max_cached_file_mb")
-        if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or threshold < 0):
-            raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
-        if self.loader == "local" and not self.path:
-            raise ValueError("loader local requires path")
-        if self.kind == "validation" and (self.rows is None or self.rows <= 0):
-            raise ValueError("kind validation requires rows > 0")
-        if self.kind == "instruct" and self.fields is None and self.converter is None and self.loader != "synthetic":
-            raise ValueError("kind instruct requires fields or converter")
+        self._check_loader_fields()
+        self._check_kind_fields()
         if self.fields is not None and not {"instruction", "output"} <= set(self.fields):
             raise ValueError("fields must map at least instruction and output")
         if self.tokens_per_row_estimate <= 0:
             raise ValueError("tokens_per_row_estimate must be positive")
+
+    def _check_loader_fields(self) -> None:
+        """Every loader needs some fields the others do not."""
+        if self.loader == "github_code" and not self.language:
+            raise ValueError("loader github_code requires language")
+        if self.loader in HUB_LOADERS and not self.hf_id:
+            raise ValueError(f"loader {self.loader} requires hf_id")
+        if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
+            raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
+        if self.loader == "local" and not self.path:
+            raise ValueError("loader local requires path")
+        max_cached_file_mb = self.load_kwargs.get("max_cached_file_mb")
+        if max_cached_file_mb is not None and not _is_non_negative_number(max_cached_file_mb):
+            raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
+
+    def _check_kind_fields(self) -> None:
+        """Every kind needs some fields the others do not."""
+        if self.kind == "validation" and (self.rows is None or self.rows <= 0):
+            raise ValueError("kind validation requires rows > 0")
+        if self.kind == "instruct":
+            has_row_mapping = self.fields is not None or self.converter is not None
+            if not has_row_mapping and self.loader != "synthetic":
+                raise ValueError("kind instruct requires fields or converter")
         if self.kind != "pretrain" and self.processing is not None:
             raise ValueError("processing overrides only apply to kind pretrain")
 
@@ -193,6 +205,8 @@ class DatasetConfig:
     token_count: TokenCountMode = "tokenizer"  # "estimate" = chars / 4
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
 
+    # --- validation ------------------------------------------------------------------------------------------------
+
     def __post_init__(self) -> None:
         if not self.name or "/" in self.name:
             raise ValueError("name must be a non-empty path component")
@@ -202,21 +216,27 @@ class DatasetConfig:
             raise ValueError("stages must contain at least one stage")
         if len({s.name for s in self.stages}) != len(self.stages):
             raise ValueError("stage names must be unique")
-        if set(self.sources) & set(self.instruct_mixtures):
-            raise ValueError(f"names shared by sources and instruct mixtures: {sorted(set(self.sources) & set(self.instruct_mixtures))}")
-        for instruct_mixture_name, mixture in self.instruct_mixtures.items():
-            for src in mixture.sources:
-                if src not in self.sources:
-                    raise ValueError(f"mixture {instruct_mixture_name}: unknown source {src!r}")
-                if self.sources[src].kind != "instruct":
-                    raise ValueError(f"mixture {instruct_mixture_name}: source {src!r} is not kind instruct")
+        shared_names = set(self.sources) & set(self.instruct_mixtures)
+        if shared_names:
+            raise ValueError(f"names shared by sources and instruct mixtures: {sorted(shared_names)}")
+        for mixture_name, mixture in self.instruct_mixtures.items():
+            self._check_mixture_sources(mixture_name, mixture)
         for stage in self.stages:
             for key in stage.train:
                 self._check_stage_key(stage.name, key, is_val=False)
             for key in stage.val:
                 self._check_stage_key(stage.name, key, is_val=True)
 
+    def _check_mixture_sources(self, mixture_name: str, mixture: InstructMixtureConfig) -> None:
+        """A mixture may only draw from declared sources of kind instruct."""
+        for source_name in mixture.sources:
+            if source_name not in self.sources:
+                raise ValueError(f"mixture {mixture_name}: unknown source {source_name!r}")
+            if self.sources[source_name].kind != "instruct":
+                raise ValueError(f"mixture {mixture_name}: source {source_name!r} is not kind instruct")
+
     def _check_stage_key(self, stage_name: str, key: str, is_val: bool) -> None:
+        """A stage key is `<source>`, `<mixture>`, `<mixture>/train` or `<mixture>/validation`."""
         base, _, split = key.partition("/")
         if base in self.instruct_mixtures:
             if split not in ("", "train", "validation"):
@@ -239,6 +259,11 @@ class DatasetConfig:
         override = self.sources[source_name].processing
         return override if override is not None else self.processing
 
+    def sources_of_kind(self, kind: SourceKind) -> list[str]:
+        return [name for name, source in self.sources.items() if source.kind == kind]
+
+    # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
+
     def source_hash(self, source_name: str) -> str:
         """Hash of everything that determines a source's rows on disk (loader settings + processing + token mode).
 
@@ -246,10 +271,15 @@ class DatasetConfig:
         it — they only change how many rows are needed, not what the rows are.
         """
         source = self.sources[source_name]
-        payload: dict[str, Any] = {"source": hash_fields(source), "token_count": self.token_count}
-        payload["source"].pop("tokens_per_row_estimate", None)
-        payload["source"].pop("processing", None)
-        payload["source"].get("load_kwargs", {}).pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
+
+        source_fields = hash_fields(source)
+        source_fields.pop("tokens_per_row_estimate", None)  # planner prior only
+        source_fields.pop("processing", None)  # the effective processing block is added below instead
+        load_kwargs = source_fields.get("load_kwargs")
+        if load_kwargs is not None:
+            load_kwargs.pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
+
+        payload: dict[str, Any] = {"source": source_fields, "token_count": self.token_count}
         if source.kind == "pretrain":
             payload["processing"] = hash_fields(self.source_processing(source_name))
             payload["max_seq_length"] = self.max_seq_length
@@ -275,12 +305,15 @@ class DatasetConfig:
         """Hash of the complete config (recorded in checkpoints so a resume with different data is detected)."""
         return _stable_hash(asdict(self))
 
+    # --- token budgets ---------------------------------------------------------------------------------------------
+
     def instruct_mixture_budget_tokens(self, instruct_mixture_name: str) -> int:
         """Largest per-stage token demand on a mixture (stages share the built mixture, so max, not sum)."""
         demand = 0
         for stage in self.stages:
             for key, weight in stage.train.items():
-                if key.partition("/")[0] == instruct_mixture_name:
+                mixture_name = key.partition("/")[0]
+                if mixture_name == instruct_mixture_name:
                     demand = max(demand, int(stage.tokens * weight))
         return demand
 
@@ -288,17 +321,23 @@ class DatasetConfig:
         """Largest per-stage token demand on a pretrain source (files are shared between stages → max)."""
         demand = 0
         for stage in self.stages:
-            demand = max(demand, int(stage.tokens * stage.train.get(source_name, 0.0)))
-        for instruct_mixture_name, mixture in self.instruct_mixtures.items():
+            weight = stage.train.get(source_name, 0.0)
+            demand = max(demand, int(stage.tokens * weight))
+        for mixture_name, mixture in self.instruct_mixtures.items():
             if source_name in mixture.sources:
-                demand = max(demand, int(self.instruct_mixture_budget_tokens(instruct_mixture_name) * mixture.sources[source_name]))
+                mixture_budget = self.instruct_mixture_budget_tokens(mixture_name)
+                demand = max(demand, int(mixture_budget * mixture.sources[source_name]))
         return demand
-
-    def sources_of_kind(self, kind: SourceKind) -> list[str]:
-        return [name for name, s in self.sources.items() if s.kind == kind]
 
 
 # --- helpers ----------------------------------------------------------------------------------------------------------
+
+
+def _is_non_negative_number(value: Any) -> bool:
+    """True for ints/floats >= 0; bools are not numbers here (`True` would silently mean 1 MB)."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and value >= 0
 
 
 def _check_weights(what: str, weights: dict[str, float]) -> None:
@@ -312,6 +351,7 @@ def _check_weights(what: str, weights: dict[str, float]) -> None:
 
 
 def _stable_hash(payload: Any) -> str:
+    """First 16 hex chars of the sha256 of the payload as sorted-key JSON (independent of dict insertion order)."""
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -324,15 +364,22 @@ def hash_fields(obj: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for f in fields(obj):
         value = getattr(obj, f.name)
-        if f.default is not MISSING and value == f.default:
-            continue
-        if f.default_factory is not MISSING and value == f.default_factory():
+        if _holds_default(f, value):
             continue
         out[f.name] = _hashable(value)
     return out
 
 
+def _holds_default(f: Field[Any], value: Any) -> bool:
+    if f.default is not MISSING:
+        return bool(value == f.default)
+    if f.default_factory is not MISSING:
+        return bool(value == f.default_factory())
+    return False  # required field: never a default
+
+
 def _hashable(value: Any) -> Any:
+    """Plain dicts/lists/scalars for JSON: nested dataclasses via `hash_fields`, tuples become lists."""
     if is_dataclass(value) and not isinstance(value, type):
         return hash_fields(value)
     if isinstance(value, dict):
@@ -351,9 +398,9 @@ def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None)
     """Load a dataset config YAML; `overrides` are jsonargparse `--key value` strings (nested keys with dots)."""
     parser = ArgumentParser(description="Dataset config")
     parser.add_class_arguments(DatasetConfig, nested_key=None)
-    ns = parser.parse_path(str(path))
+    namespace = parser.parse_path(str(path))
     if overrides:
-        ns = parser.parse_args(overrides, namespace=ns)
-    instantiated = parser.instantiate_classes(ns)
+        namespace = parser.parse_args(overrides, namespace=namespace)
+    instantiated = parser.instantiate_classes(namespace)
     values = instantiated.as_dict() if isinstance(instantiated, Namespace) else instantiated
     return DatasetConfig(**values)

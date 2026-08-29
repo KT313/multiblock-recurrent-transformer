@@ -61,14 +61,14 @@ class ResolvedDataset:
         """The stages in the plain-dict form `training.stage_manager.StageManager` expects."""
         return [
             TrainingStage(
-                name=s.name,
-                tokens=s.tokens,
-                base_lr=s.base_lr,
-                transition_pct=s.transition_pct,
-                train_data=[vars(d) for d in s.train_data],
-                val_data=[vars(d) for d in s.val_data],
+                name=stage.name,
+                tokens=stage.tokens,
+                base_lr=stage.base_lr,
+                transition_pct=stage.transition_pct,
+                train_data=[vars(entry) for entry in stage.train_data],
+                val_data=[vars(entry) for entry in stage.val_data],
             )
-            for s in self.stages
+            for stage in self.stages
         ]
 
 
@@ -77,31 +77,35 @@ def build_command(dataset_config: str, dataset_dir: str) -> str:
     return f"python data_preparation/prepare.py build --dataset_config {dataset_config} --dataset_dir {dataset_dir}"
 
 
+# --- stage keys -> data entries -------------------------------------------------------------------------------------
+
+
+def _data_entry(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float) -> DataEntry:
+    """The `DataEntry` for one stage key (`<source>`, `<mixture>`, `<mixture>/train` or `<mixture>/validation`)."""
+    base, _, split = key.partition("/")
+    prefix = f"{stage_name}-{key.replace('/', '-')}"
+
+    if base in cfg.instruct_mixtures:
+        mixture_dir = layout.instruct_mixture_dir(cfg.name, base, split or "train")
+        return DataEntry(
+            prefix=prefix, data_dir=str(mixture_dir), weight=weight, data_signature=dict(INSTRUCT_DATA_SIGNATURE)
+        )
+
+    kind = cfg.sources[base].kind
+    if kind == "pretrain":
+        source_dir = layout.source_dir(base, "processed")
+    elif kind == "validation":
+        source_dir = layout.validation_dir(base)
+    else:  # unreachable: DatasetConfig rejects instruct sources outside instruct mixtures
+        raise ValueError(f"stage {stage_name}: source {base!r} of kind {kind!r} cannot be used directly")
+    return DataEntry(prefix=prefix, data_dir=str(source_dir), weight=weight)
+
+
 def _entries(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, keys: dict[str, float]) -> list[DataEntry]:
-    entries: list[DataEntry] = []
-    for key, weight in keys.items():
-        base, _, split = key.partition("/")
-        prefix = f"{stage_name}-{key.replace('/', '-')}"
-        if base in cfg.instruct_mixtures:
-            entries.append(
-                DataEntry(
-                    prefix=prefix,
-                    data_dir=str(layout.instruct_mixture_dir(cfg.name, base, split or "train")),
-                    weight=weight,
-                    data_signature=dict(INSTRUCT_DATA_SIGNATURE),
-                )
-            )
-            continue
-        kind = cfg.sources[base].kind
-        if kind == "pretrain":
-            data_dir = layout.source_dir(base, "processed")
-        elif kind == "validation":
-            data_dir = layout.validation_dir(base)
-        else:  # unreachable: DatasetConfig rejects instruct sources outside instruct mixtures
-            raise ValueError(f"stage {stage_name}: source {base!r} of kind {kind!r} cannot be used directly")
-        entries.append(DataEntry(prefix=prefix, data_dir=str(data_dir), weight=weight))
-    if len({e.prefix for e in entries}) != len(entries):
-        raise ValueError(f"stage {stage_name}: duplicate data entry prefixes in {[e.prefix for e in entries]}")
+    entries = [_data_entry(cfg, layout, stage_name, key, weight) for key, weight in keys.items()]
+    prefixes = [entry.prefix for entry in entries]
+    if len(set(prefixes)) != len(prefixes):
+        raise ValueError(f"stage {stage_name}: duplicate data entry prefixes in {prefixes}")
     return entries
 
 
@@ -115,6 +119,9 @@ def resolve_entries(
     split with the instruction/input/output signature. Prefixes are `<stage>-<key>` and unique per stage.
     """
     return _entries(cfg, layout, stage.name, stage.train), _entries(cfg, layout, stage.name, stage.val)
+
+
+# --- run config <-> dataset config ----------------------------------------------------------------------------------
 
 
 def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
@@ -132,6 +139,35 @@ def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
         )
 
 
+def _ensure_prepared(
+    settings: Settings, cfg: DatasetConfig, layout: DatasetLayout, backend: Optional[_MainRankBarrier]
+) -> None:
+    """Verify the dataset on disk; build what is missing when `auto_prepare` allows it, else raise."""
+    plan = status(cfg, layout)  # logs the status table
+    if plan.complete:
+        return
+    missing = "\n  ".join(plan.missing())
+    if not settings.auto_prepare:
+        raise RuntimeError(
+            f"dataset config {settings.dataset_config!r} is not prepared under {settings.dataset_dir!r} "
+            f"(auto_prepare is off). Missing:\n  {missing}\nRun:\n  "
+            + build_command(settings.dataset_config, settings.dataset_dir)
+        )
+
+    log.info("dataset %s is incomplete, preparing missing data (%d item(s))", cfg.name, len(plan.missing()))
+    if backend is None or backend.is_main:
+        build(cfg, layout, num_workers=settings.prepare_num_workers, hf_token=os.environ.get("HF_TOKEN"))
+    if backend is not None:
+        backend.barrier()
+
+    plan = compute_plan(cfg, layout)  # `build` already logged the final status table; re-verify silently
+    if not plan.complete:
+        still_missing = "\n  ".join(plan.missing())
+        raise RuntimeError(
+            f"dataset config {settings.dataset_config!r} is still incomplete after preparing:\n  {still_missing}"
+        )
+
+
 def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = None) -> ResolvedDataset:
     """Load, verify and (with `auto_prepare`) build the dataset of a run; see the module docstring.
 
@@ -142,26 +178,9 @@ def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = No
     cfg = load_dataset_config(settings.dataset_config)
     validate_settings(settings, cfg)
     layout = DatasetLayout(Path(settings.dataset_dir))
-    plan = status(cfg, layout)
-    if not plan.complete:
-        if not settings.auto_prepare:
-            raise RuntimeError(
-                f"dataset config {settings.dataset_config!r} is not prepared under {settings.dataset_dir!r} "
-                f"(auto_prepare is off). Missing:\n  " + "\n  ".join(plan.missing()) + "\nRun:\n  "
-                + build_command(settings.dataset_config, settings.dataset_dir)
-            )
-        log.info("dataset %s is incomplete, preparing missing data (%d item(s))", cfg.name, len(plan.missing()))
-        if backend is None or backend.is_main:
-            build(cfg, layout, num_workers=settings.prepare_num_workers, hf_token=os.environ.get("HF_TOKEN"))
-        if backend is not None:
-            backend.barrier()
-        plan = compute_plan(cfg, layout)  # `build` already logged the final status table; re-verify silently
-        if not plan.complete:
-            raise RuntimeError(
-                f"dataset config {settings.dataset_config!r} is still incomplete after preparing:\n  "
-                + "\n  ".join(plan.missing())
-            )
-    stages = []
+    _ensure_prepared(settings, cfg, layout, backend)
+
+    stages: list[ResolvedStage] = []
     for stage, base_lr in zip(cfg.stages, settings.stage_base_lrs):
         train_data, val_data = resolve_entries(cfg, layout, stage)
         stages.append(

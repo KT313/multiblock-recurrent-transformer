@@ -2,8 +2,8 @@
 """Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
     <root>/sources/<source>/{raw,filtered,processed}/   shared by every dataset config (append-only source cache)
-    <root>/sources/<source>/validation/                     held-out validation rows of a `validation` source
-    <root>/instruct_instruct_mixtures/<config name>/<mixture>/{train,validation}/
+    <root>/sources/<source>/validation/                 held-out validation rows of a `validation` source
+    <root>/instruct_mixtures/<config name>/<mixture>/{train,validation}/
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination
     <root>/hub_index/<repo>@<revision>/<glob hash>.json  file lists + row counts of `hf_files` / `github_code` repos
@@ -23,6 +23,8 @@ INSTRUCT_MIXTURE_SPLITS: tuple[str, ...] = ("train", "validation")
 
 @dataclass(frozen=True)
 class DatasetLayout:
+    """Directory scheme under `root` (default `dataset/`); every method returns a path, none touches the disk."""
+
     root: Path = Path("dataset")
 
     def source_dir(self, name: str, stage: str) -> Path:

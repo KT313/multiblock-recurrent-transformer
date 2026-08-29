@@ -59,6 +59,7 @@ MAX_CACHED_FILE_KEY = "max_cached_file_mb"  # `load_kwargs` knob of hf_files / g
 
 
 def _check_offset_count(offset: int, count: int) -> None:
+    """Every loader's first line: reject negative arguments early with one clear message."""
     if offset < 0 or count < 0:
         raise ValueError(f"offset and count must be non-negative, got offset={offset}, count={count}")
 
@@ -84,18 +85,19 @@ def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> di
     the files are then read through the generic builder from `hf://datasets/<hf_id>@<revision>/<data_files>`.
     """
     load_kwargs = dict(source.load_kwargs)
-    load_kwargs.pop(MAX_CACHED_FILE_KEY, None)
+    load_kwargs.pop(MAX_CACHED_FILE_KEY, None)  # an hf_files knob, meaningless to `load_dataset`
     builder = load_kwargs.pop("builder", None)
-    kwargs: dict[str, Any] = {"token": token, **extra}
-    if builder is None:
-        kwargs.update(path=source.hf_id, revision=source.revision, **load_kwargs)
-        return kwargs
+
+    if builder is None:  # plain repo: `datasets` resolves the files itself
+        return {"token": token, **extra, "path": source.hf_id, "revision": source.revision, **load_kwargs}
+
+    # repo with a loading script: read its data files through the generic `json` / `parquet` builder instead
     data_files = load_kwargs.pop("data_files", None)
     if data_files is None:
         raise ValueError(f"load_kwargs.builder={builder!r} requires load_kwargs.data_files")
     at = f"@{source.revision}" if source.revision else ""
-    kwargs.update(path=builder, data_files=f"hf://datasets/{source.hf_id}{at}/{data_files}", **load_kwargs)
-    return kwargs
+    hub_glob = f"hf://datasets/{source.hf_id}{at}/{data_files}"
+    return {"token": token, **extra, "path": builder, "data_files": hub_glob, **load_kwargs}
 
 
 def load_hf_split(
@@ -234,7 +236,7 @@ def load_github_code(
     language = source.language
     index = hub_file_index(source, GITHUB_CODE_DATA_FILES, index_dir, token)
     if columns is not None and "language" not in columns:
-        columns = [*columns, "language"]
+        columns = [*columns, "language"]  # the `match` filter below needs it even under a projection
     yield from read_rows(
         index,
         offset,
@@ -255,6 +257,7 @@ def list_local_files(directory: Path) -> list[Path]:
 
 
 def _iter_local_file(path: Path, columns: list[str] | None = None) -> Iterator[Row]:
+    """Every row of one local `.parquet` (projected to `columns`) or `.jsonl` file (empty lines skipped)."""
     if path.suffix == ".parquet":
         parquet = pq.ParquetFile(path)
         for batch in parquet.iter_batches(columns=columns):
@@ -264,6 +267,12 @@ def _iter_local_file(path: Path, columns: list[str] | None = None) -> Iterator[R
             for line in fh:
                 if line.strip():
                     yield json.loads(line)
+
+
+def _iter_local_rows(directory: Path, columns: list[str] | None = None) -> Iterator[Row]:
+    """Every row of every file under `directory`, files in sorted order."""
+    for file in list_local_files(directory):
+        yield from _iter_local_file(file, columns)
 
 
 def load_local(
@@ -288,12 +297,7 @@ def load_local(
     directory = Path(source.path)
     if not directory.is_dir():
         raise FileNotFoundError(f"local source directory not found: {directory}")
-
-    def all_rows() -> Iterator[Row]:
-        for file in list_local_files(directory):
-            yield from _iter_local_file(file, columns)
-
-    yield from islice(all_rows(), offset, offset + count)
+    yield from islice(_iter_local_rows(directory, columns), offset, offset + count)
 
 
 def load_synthetic(
@@ -325,6 +329,7 @@ LOADERS: dict[str, Loader] = {
 
 
 def get_loader(name: str) -> Loader:
+    """The loader registered under `name` (a `SourceConfig.loader` value) or a clear error."""
     if name not in LOADERS:
         raise ValueError(f"unknown loader {name!r}; known loaders: {sorted(LOADERS)}")
     return LOADERS[name]

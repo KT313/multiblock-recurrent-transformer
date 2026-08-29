@@ -14,7 +14,7 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig
+from data_preparation.lib.schema.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, TokenizerConfig
 
 GENERATED_WITH = "uv run python data_preparation/prepare.py describe --dataset_config {config}"
 
@@ -55,9 +55,9 @@ def leading_comment(config_path: str | Path) -> str:
         if line.startswith("#"):
             out.append(line[1:].strip())
         elif line:
-            break
+            break  # first real YAML line ends the comment block
         else:
-            out.append("")
+            out.append("")  # blank lines inside the block become paragraph breaks
     return "\n".join(out).strip()
 
 
@@ -65,21 +65,18 @@ def leading_comment(config_path: str | Path) -> str:
 
 
 def _general(cfg: DatasetConfig) -> list[str]:
-    tok = cfg.tokenizer
-    tokenizer = f"`{tok.name}` ({tok.kind}"
-    if tok.hf_id:
-        tokenizer += f", `{tok.hf_id}`"
-        if tok.revision:
-            tokenizer += f" @ `{tok.revision}`"
-    tokenizer += ")"
-    total = sum(s.tokens for s in cfg.stages)
+    total_tokens = sum(stage.tokens for stage in cfg.stages)
+    if cfg.token_count == "tokenizer":
+        token_count = f"`{cfg.token_count}` (real tokenizer counts)"
+    else:
+        token_count = f"`{cfg.token_count}` (chars / 4)"
     return [
         "## Tokenizer and token counting",
         "",
-        f"- tokenizer: {tokenizer}",
+        f"- tokenizer: {_tokenizer_label(cfg.tokenizer)}",
         f"- `max_seq_length`: {cfg.max_seq_length} (token-count cap per document; the run config's `block_size` must not exceed it)",
-        f"- `token_count`: `{cfg.token_count}`" + (" (real tokenizer counts)" if cfg.token_count == "tokenizer" else " (chars / 4)"),
-        f"- training tokens over all stages: {_tokens(total)}",
+        f"- `token_count`: {token_count}",
+        f"- training tokens over all stages: {_tokens(total_tokens)}",
         "",
         "## Processing defaults (`pretrain` sources)",
         "",
@@ -88,21 +85,40 @@ def _general(cfg: DatasetConfig) -> list[str]:
     ]
 
 
+def _tokenizer_label(tok: TokenizerConfig) -> str:
+    """e.g. "`llama-32k` (hf, `hf-internal-testing/llama-tokenizer` @ `<sha>`)"."""
+    label = f"`{tok.name}` ({tok.kind}"
+    if tok.hf_id:
+        label += f", `{tok.hf_id}`"
+        if tok.revision:
+            label += f" @ `{tok.revision}`"
+    return label + ")"
+
+
 def _processing_lines(p: ProcessingConfig) -> list[str]:
-    dedup = f"`{p.dedup.mode}`"
-    if p.dedup.mode == "exact":
-        dedup += f" (normalize: {_yn(p.dedup.normalize)})"
-    elif p.dedup.mode == "minhash":
-        dedup += f" (threshold {p.dedup.threshold}, {p.dedup.num_perm} permutations, {p.dedup.ngram}-grams)"
-    decon = _yn(p.decontamination.enabled)
-    if p.decontamination.enabled:
-        decon += f" ({p.decontamination.ngram}-grams, threshold {p.decontamination.threshold}, benchmarks: {', '.join(p.decontamination.benchmarks)})"
     return [
         f"- length filter: {p.min_chars} <= chars, truncated at {p.max_chars} chars",
-        f"- dedup: {dedup}",
+        f"- dedup: {_dedup_label(p)}",
         f"- quality filter: {_yn(p.quality_filter)}",
-        f"- decontamination: {decon}",
+        f"- decontamination: {_decontamination_label(p)}",
     ]
+
+
+def _dedup_label(p: ProcessingConfig) -> str:
+    label = f"`{p.dedup.mode}`"
+    if p.dedup.mode == "exact":
+        label += f" (normalize: {_yn(p.dedup.normalize)})"
+    elif p.dedup.mode == "minhash":
+        label += f" (threshold {p.dedup.threshold}, {p.dedup.num_perm} permutations, {p.dedup.ngram}-grams)"
+    return label
+
+
+def _decontamination_label(p: ProcessingConfig) -> str:
+    decon = p.decontamination
+    label = _yn(decon.enabled)
+    if decon.enabled:
+        label += f" ({decon.ngram}-grams, threshold {decon.threshold}, benchmarks: {', '.join(decon.benchmarks)})"
+    return label
 
 
 def _stages(cfg: DatasetConfig) -> list[str]:
@@ -116,7 +132,8 @@ def _stages(cfg: DatasetConfig) -> list[str]:
         ]
         for key, weight in stage.train.items():
             lines.append(f"| {_key(cfg, key)} | {weight:.2%} | {_tokens(int(stage.tokens * weight))} | {_estimate(cfg, key)} |")
-        lines += ["", "Validation: " + ", ".join(f"{_key(cfg, key)} at {weight:.0%}" for key, weight in stage.val.items()), ""]
+        validation = ", ".join(f"{_key(cfg, key)} at {weight:.0%}" for key, weight in stage.val.items())
+        lines += ["", f"Validation: {validation}", ""]
     return lines
 
 
@@ -136,8 +153,9 @@ def _instruct_mixtures(cfg: DatasetConfig) -> list[str]:
             "|---|---:|---:|---:|",
         ]
         for src, share in mixture.sources.items():
-            estimate = cfg.sources[src].tokens_per_row_estimate
-            lines.append(f"| `{src}` | {share:.1%} | {_tokens(int(budget * share))} | {ceil(budget * share / estimate):,} |")
+            share_tokens = budget * share
+            examples = ceil(share_tokens / cfg.sources[src].tokens_per_row_estimate)
+            lines.append(f"| `{src}` | {share:.1%} | {_tokens(int(share_tokens))} | {examples:,} |")
         lines.append("")
     return lines
 
@@ -157,20 +175,27 @@ def _sources(cfg: DatasetConfig) -> list[str]:
     lines = ["## Sources", "", "| Source | Kind | Loader | Origin | Revision | Details |", "|---|---|---|---|---|---|"]
     for name, src in cfg.sources.items():
         revision = f"`{src.revision[:12]}`" if src.revision else "-"
-        lines.append(f"| `{name}` | {src.kind} | `{src.loader}` | {_origin(src)} | {revision} | {_details(cfg, name) or '-'} |")
+        details = _details(cfg, name) or "-"
+        lines.append(f"| `{name}` | {src.kind} | `{src.loader}` | {_origin(src)} | {revision} | {details} |")
     return lines + [""]
 
 
 # --- formatting helpers ------------------------------------------------------------------------------------------------
 
 
+def _base_name(key: str) -> str:
+    """Stage keys name a source or a mixture, optionally with a ``/split`` suffix (``flan_instruct/validation``)."""
+    return key.partition("/")[0]
+
+
 def _key(cfg: DatasetConfig, key: str) -> str:
-    base = key.partition("/")[0]
-    return f"`{key}` (instruct_mixture)" if base in cfg.instruct_mixtures else f"`{key}`"
+    if _base_name(key) in cfg.instruct_mixtures:
+        return f"`{key}` (instruct_mixture)"
+    return f"`{key}`"
 
 
 def _estimate(cfg: DatasetConfig, key: str) -> str:
-    base = key.partition("/")[0]
+    base = _base_name(key)
     if base in cfg.instruct_mixtures:
         return "-"
     return str(cfg.sources[base].tokens_per_row_estimate)
@@ -207,11 +232,13 @@ def _details(cfg: DatasetConfig, name: str) -> str:
     if src.kind == "pretrain":
         parts.append(f"budget {_tokens(cfg.source_budget_tokens(name))}")
         if src.processing is not None:
-            parts.append("processing override: " + "; ".join(line[2:] for line in _processing_lines(src.processing)))
+            override_lines = _processing_lines(src.processing)
+            parts.append("processing override: " + "; ".join(line.removeprefix("- ") for line in override_lines))
     return ", ".join(parts)
 
 
 def _tokens(n: int) -> str:
+    """Human-scale token count: 3.30B, 150.0M, 12.5K, 42."""
     if n >= 10**9:
         return f"{n / 1e9:.2f}B"
     if n >= 10**6:

@@ -21,7 +21,6 @@ SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
 _WHITESPACE = re.compile(r"\s+")
 
 
-
 def configure_hf_cache(cache_dir: Path | None) -> None:
     """Point every HuggingFace cache at ``cache_dir``; must run before ``datasets``/``transformers`` are imported."""
     if cache_dir is None:
@@ -32,6 +31,8 @@ def configure_hf_cache(cache_dir: Path | None) -> None:
         os.environ[var] = str(cache_dir)
     log.info("using HuggingFace cache %s", cache_dir)
 
+
+# --- text hashing / token estimate ----------------------------------------------------------------------------------
 
 
 def md5_hex(text: str) -> str:
@@ -54,6 +55,9 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+# --- shard files -----------------------------------------------------------------------------------------------------
+
+
 def list_parquet_files(directory: Path) -> list[Path]:
     """Sorted ``*.parquet`` files inside ``directory`` (empty if the directory does not exist)."""
     if not directory.is_dir():
@@ -66,6 +70,10 @@ def shard_index(path: Path) -> int | None:
     match = SHARD_PATTERN.match(path.name)
     return int(match.group(1)) if match else None
 
+
+def shard_name(index: int) -> str:
+    """File name of shard ``index``: ``data-{index:05d}.parquet``."""
+    return f"data-{index:05d}.parquet"
 
 
 def write_parquet_shards(
@@ -87,61 +95,73 @@ def write_parquet_shards(
         raise ValueError(f"shard_size must be positive, got {shard_size}")
     if start_shard < 0:
         raise ValueError(f"start_shard must be >= 0, got {start_shard}")
+
     tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
     if tmp_dir.exists():
         log.warning("removing leftover temp dir %s", tmp_dir)
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
-    pending: list[pa.RecordBatch] = []
-    pending_rows = 0
-    shard_num = start_shard
-
-    def flush(rows: int) -> None:
-        nonlocal pending, pending_rows, shard_num
-        taken: list[pa.RecordBatch] = []
-        remaining = rows
-        while remaining > 0:
-            batch = pending.pop(0)
-            if len(batch) <= remaining:
-                taken.append(batch)
-                remaining -= len(batch)
-            else:
-                taken.append(batch.slice(0, remaining))
-                pending.insert(0, batch.slice(remaining))
-                remaining = 0
-        pending_rows -= rows
-        pq.write_table(pa.Table.from_batches(taken), tmp_dir / f"data-{shard_num:05d}.parquet")
-        shard_num += 1
-
+    # 1. Write every shard into the temp dir; leave nothing behind if the input stream fails.
+    next_index = start_shard
     try:
-        for item in batches:
-            for batch in item.to_batches() if isinstance(item, pa.Table) else [item]:
-                if len(batch) == 0:
-                    continue
-                pending.append(batch)
-                pending_rows += len(batch)
-                while pending_rows >= shard_size:
-                    flush(shard_size)
-        if pending_rows > 0:
-            flush(pending_rows)
+        for shard_table in _rechunk(batches, shard_size):
+            pq.write_table(shard_table, tmp_dir / shard_name(next_index))
+            next_index += 1
     except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
+    # 2. Drop the shards the new ones replace, then move the new ones into place.
     out_dir.mkdir(parents=True, exist_ok=True)
-    for stale in list_parquet_files(out_dir):
-        index = shard_index(stale)
+    for existing in list_parquet_files(out_dir):
+        index = shard_index(existing)
         if index is not None and index >= start_shard:
-            log.info("removing stale shard %s", stale)
-            stale.unlink()
+            log.info("removing stale shard %s", existing)
+            existing.unlink()
     for shard in sorted(tmp_dir.glob("data-*.parquet")):
         shard.replace(out_dir / shard.name)
     shutil.rmtree(tmp_dir)
-    written = shard_num - start_shard
+
+    written = next_index - start_shard
     log.info("wrote %d shard(s) to %s (starting at %d)", written, out_dir, start_shard)
     return written
 
+
+def _rechunk(batches: Iterable[pa.RecordBatch | pa.Table], shard_size: int) -> Iterator[pa.Table]:
+    """Regroup a stream of batches/tables into tables of exactly ``shard_size`` rows (the last one may be shorter).
+
+    Empty batches are skipped. Rows keep their order; a batch that straddles a shard boundary is sliced.
+    """
+    pending: list[pa.RecordBatch] = []  # batches not yet emitted, in order
+    pending_rows = 0
+    for item in batches:
+        for batch in item.to_batches() if isinstance(item, pa.Table) else [item]:
+            if len(batch) == 0:
+                continue
+            pending.append(batch)
+            pending_rows += len(batch)
+            while pending_rows >= shard_size:
+                yield pa.Table.from_batches(_take_rows(pending, shard_size))
+                pending_rows -= shard_size
+    if pending_rows > 0:
+        yield pa.Table.from_batches(_take_rows(pending, pending_rows))
+
+
+def _take_rows(pending: list[pa.RecordBatch], rows: int) -> list[pa.RecordBatch]:
+    """Remove the first ``rows`` rows from the front of ``pending`` (slicing the last batch if needed)."""
+    taken: list[pa.RecordBatch] = []
+    remaining = rows
+    while remaining > 0:
+        batch = pending.pop(0)
+        if len(batch) <= remaining:
+            taken.append(batch)
+            remaining -= len(batch)
+        else:
+            taken.append(batch.slice(0, remaining))
+            pending.insert(0, batch.slice(remaining))
+            remaining = 0
+    return taken
 
 
 def write_dict_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, *, start_shard: int = 0) -> int:

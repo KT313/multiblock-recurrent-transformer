@@ -34,8 +34,21 @@ def example_text(example: dict[str, Any]) -> str:
         if isinstance(value, str):
             parts.append(value)
         elif isinstance(value, list):
-            parts.extend(str(v) for v in value if isinstance(v, str))
+            parts.extend(item for item in value if isinstance(item, str))
     return " ".join(parts)
+
+
+def _benchmark_ngrams(name: str, n: int, cache_dir: str | None) -> set[str]:
+    """Download one benchmark test set and collect the normalized ``n``-grams of all its examples."""
+    from datasets import load_dataset
+
+    hf_id, config, split = BENCHMARKS[name]
+    log.info("loading benchmark %s (%s)", name, hf_id)
+    dataset: Any = load_dataset(hf_id, config, split=split, cache_dir=cache_dir)  # iterable of example dicts
+    ngrams: set[str] = set()
+    for example in dataset:
+        ngrams.update(get_ngram_set(example_text(example), n))
+    return ngrams
 
 
 def load_benchmark_ngrams(names: list[str], n: int = 13, cache_dir: str | None = None) -> dict[str, set[str]]:
@@ -43,21 +56,14 @@ def load_benchmark_ngrams(names: list[str], n: int = 13, cache_dir: str | None =
 
     Raises ``KeyError`` for an unknown name and re-raises whatever ``datasets.load_dataset`` raises.
     """
-    from datasets import load_dataset
-
     unknown = [name for name in names if name not in BENCHMARKS]
     if unknown:
         raise KeyError(f"unknown benchmark(s) {unknown}; known: {sorted(BENCHMARKS)}")
+
     all_ngrams: dict[str, set[str]] = {}
     for name in names:
-        hf_id, config, split = BENCHMARKS[name]
-        log.info("loading benchmark %s (%s)", name, hf_id)
-        kwargs: dict[str, Any] = {"split": split, "cache_dir": cache_dir}
-        dataset = load_dataset(hf_id, config, **kwargs) if config else load_dataset(hf_id, **kwargs)
-        ngrams: set[str] = set()
-        for example in dataset:
-            ngrams.update(get_ngram_set(example_text(example), n))
-        all_ngrams[name] = ngrams
-        log.info("  %s: %d %d-grams", name, len(ngrams), n)
-    log.info("benchmarks: %d unique %d-grams in total", sum(len(s) for s in all_ngrams.values()), n)
+        all_ngrams[name] = _benchmark_ngrams(name, n, cache_dir)
+        log.info("  %s: %d %d-grams", name, len(all_ngrams[name]), n)
+    total = sum(len(ngrams) for ngrams in all_ngrams.values())
+    log.info("benchmarks: %d unique %d-grams in total", total, n)
     return all_ngrams

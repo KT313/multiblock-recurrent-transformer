@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Pipeline stages shared by every source kind: tokenizer, raw download, held-out sets; plus the token counter and
-manifest helpers used by ``stages_pretrain.py`` / ``stages_instruct.py``.
+manifest helpers used by ``stages/pretrain.py`` / ``stages/instruct.py``.
 
 Every stage is a function ``(cfg, name, layout, *options) -> Manifest`` that is **idempotent via the manifest**
 (a second call with nothing new returns the stored manifest without touching the shards) and **incremental** where
@@ -11,8 +11,8 @@ a warning and rebuilds the directory from scratch.
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator
-from dataclasses import replace
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -52,14 +52,7 @@ class TokenCounter:
         self.tokenizer_name = cfg.tokenizer.name
         self._tokenizer: Any = None
         if self.mode == "tokenizer":
-            tokenizer_dir = layout.tokenizer_dir(cfg.tokenizer.name)
-            if not (tokenizer_dir / "tokenizer.json").is_file() and not (tokenizer_dir / "tokenizer_config.json").is_file():
-                raise FileNotFoundError(
-                    f"tokenizer {cfg.tokenizer.name!r} not found at {tokenizer_dir}; run the tokenizer stage first"
-                )
-            from transformers import AutoTokenizer
-
-            self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
+            self._tokenizer = _load_tokenizer(layout.tokenizer_dir(cfg.tokenizer.name), cfg.tokenizer.name)
 
     def count(self, text: str) -> int:
         if self._tokenizer is None:
@@ -71,6 +64,16 @@ class TokenCounter:
             return [min(estimate_tokens(t), self.cap) for t in texts]
         encoded = self._tokenizer(texts, add_special_tokens=False)["input_ids"]
         return [min(len(ids), self.cap) for ids in encoded]
+
+
+def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
+    """The saved HF tokenizer in ``tokenizer_dir``; fails if the tokenizer stage has not run yet."""
+    has_tokenizer_files = (tokenizer_dir / "tokenizer.json").is_file() or (tokenizer_dir / "tokenizer_config.json").is_file()
+    if not has_tokenizer_files:
+        raise FileNotFoundError(f"tokenizer {name!r} not found at {tokenizer_dir}; run the tokenizer stage first")
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(str(tokenizer_dir))
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -91,6 +94,7 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
 
 
 def new_manifest(cfg: DatasetConfig, source: str, source_hash: str, stage: str, *, tokens: bool = False) -> Manifest:
+    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured."""
     return Manifest(
         source=source,
         source_hash=source_hash,
@@ -105,8 +109,10 @@ def record_new_shards(manifest: Manifest, directory: Path, start_shard: int, tok
     """Add every ``data-NNNNN.parquet`` with index >= ``start_shard`` to ``manifest`` (row counts from the footer)."""
     for path in list_parquet_files(directory):
         index = shard_index(path)
-        if index is not None and index >= start_shard:
-            manifest.add_shard(path.name, shard_rows(path), tokens.get(path.name) if tokens else None)
+        if index is None or index < start_shard:
+            continue
+        shard_tokens = tokens.get(path.name) if tokens else None
+        manifest.add_shard(path.name, shard_rows(path), shard_tokens)
 
 
 def shard_list(manifest: Manifest) -> list[list[Any]]:
@@ -115,6 +121,7 @@ def shard_list(manifest: Manifest) -> list[list[Any]]:
 
 
 def require_manifest(directory: Path, source_hash: str, stage: str, what: str) -> Manifest:
+    """Like ``current_manifest`` but a missing or stale manifest is an error (the previous stage has to run first)."""
     manifest = current_manifest(directory, source_hash, stage)
     if manifest is None:
         raise FileNotFoundError(f"{what}: no current {stage} manifest in {directory}; run the {stage} stage first")
@@ -142,6 +149,7 @@ def prepare_tokenizer(cfg: DatasetConfig, layout: DatasetLayout) -> Manifest:
     manifest = current_manifest(out, source_hash, "tokenizer")
     if manifest is not None and (out / "tokenizer_config.json").is_file():
         return manifest
+
     log.info("preparing tokenizer %s (%s) -> %s", tok.name, tok.kind, out)
     out.mkdir(parents=True, exist_ok=True)
     if tok.kind == "synthetic":
@@ -165,6 +173,16 @@ def fetch_source(cfg: DatasetConfig, source: SourceConfig) -> SourceConfig:
     if cfg.always_range_requests and source.loader in ("hf_files", "github_code"):
         return replace(source, load_kwargs={**source.load_kwargs, MAX_CACHED_FILE_KEY: 0})
     return source
+
+
+@dataclass
+class _FetchCounters:
+    """What one download increment did so far (updated while ``_fetch_rows`` runs, read back by ``download``)."""
+
+    consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
+    kept: int = 0  # rows written to disk
+    skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
+    exhausted: bool = False  # the loader ran dry, or ``check_limit`` was reached
 
 
 def download(
@@ -195,6 +213,8 @@ def download(
     source_hash = cfg.source_hash(name)
     out = layout.source_dir(name, "raw")
     manifest = current_manifest(out, source_hash, "raw") or new_manifest(cfg, name, source_hash, "raw")
+
+    # nothing to do?
     if manifest.extra.get("exhausted"):
         log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
         return manifest
@@ -207,20 +227,23 @@ def download(
         manifest.save(out)
         return manifest
 
+    # fetch one increment and append it as new shards
     log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
-    stats = {"consumed": 0, "kept": 0, "skipped_malformed": 0, "exhausted": False}
+    counters = _FetchCounters()
     start_shard = len(manifest.shards)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
-        rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, stats, layout, bar)
+        rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar)
         write_dict_rows(rows, out, shard_size, start_shard=start_shard)
+
+    # record the increment
     record_new_shards(manifest, out, start_shard)
-    manifest.rows_fetched += stats["consumed"]  # source rows consumed: a row-group boundary after an over-read
-    manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + stats["skipped_malformed"]
-    if stats["exhausted"]:
+    manifest.rows_fetched += counters.consumed  # source rows consumed: a row-group boundary after an over-read
+    manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + counters.skipped_malformed
+    if counters.exhausted:
         manifest.extra["exhausted"] = True
     manifest.save(out)
-    log.info("%s: kept %d of %d fetched rows (%d rows on disk)", name, stats["kept"], stats["consumed"], manifest.rows())
+    log.info("%s: kept %d of %d fetched rows (%d rows on disk)", name, counters.kept, counters.consumed, manifest.rows())
     return manifest
 
 
@@ -231,7 +254,7 @@ def _fetch_rows(
     wanted: int,
     max_consume: int | None,
     hf_token: str | None,
-    stats: dict[str, Any],
+    counters: _FetchCounters,
     layout: DatasetLayout,
     bar: Progress,
 ) -> Iterator[Row]:
@@ -241,60 +264,90 @@ def _fetch_rows(
     ``count`` — except that consumption stops at ``max_consume``. ``bar`` tracks kept rows (postfix: source rows
     consumed, current repo file, MB read remotely)."""
     loader = get_loader(source.loader)
-    converter = get_converter(source) if source.kind == "instruct" else None
+    is_instruct = source.kind == "instruct"
+    converter = get_converter(source) if is_instruct else None
     row_filter = get_filter(source.filter) if source.filter is not None else None
-    if source.kind == "instruct" and converter is None and source.loader != "synthetic":
+    if is_instruct and converter is None and source.loader != "synthetic":
         raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
     columns = loader_columns(source)
-    postfix: dict[str, Any] = {"consumed": 0}
     fetch_stats = FetchStats()
+    postfix = _DownloadPostfix(bar, fetch_stats)
 
-    def refresh_postfix() -> None:
-        if fetch_stats.bytes_read:
-            postfix["MB"] = f"{fetch_stats.bytes_read / 2**20:.0f}"
-        bar.set_postfix(postfix, refresh=False)
-
-    def on_file(file: str) -> None:
-        postfix["file"] = file.rsplit("/", 1)[-1]
-        refresh_postfix()
-
-    while stats["kept"] < wanted:
-        count = wanted - stats["kept"]
+    while counters.kept < wanted:
+        # how many rows to ask the loader for in this round
+        count = wanted - counters.kept
         if max_consume is not None:
-            count = min(count, max_consume - stats["consumed"])
+            count = min(count, max_consume - counters.consumed)
             if count <= 0:
-                stats["exhausted"] = True
+                counters.exhausted = True
                 return
-        yielded = 0
+        consume_budget = None if max_consume is None else max_consume - counters.consumed
+
         rows = loader(
-            source, offset + stats["consumed"], count, token=hf_token, index_dir=layout.hub_index_dir(), on_file=on_file,
-            stats=fetch_stats, columns=columns, align_to_row_group=True,
+            source, offset + counters.consumed, count, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns,
+            on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
         )
-        for raw in _bounded(rows, None if max_consume is None else max_consume - stats["consumed"]):
+        yielded = 0
+        for raw in _bounded(rows, consume_budget):
             yielded += 1
-            stats["consumed"] += 1
-            postfix["consumed"] = stats["consumed"]
-            if stats["consumed"] % 100 == 0:
-                refresh_postfix()
-            if source.kind != "instruct":
+            counters.consumed += 1
+            postfix.consumed(counters.consumed)
+
+            if not is_instruct:
                 yield text_row(source, raw, name)
-                stats["kept"] += 1
+                counters.kept += 1
                 bar.update(1)
                 continue
+
             if row_filter is not None and not row_filter(raw):
                 continue
             try:
-                row = converter(raw) if converter is not None else dict(raw)
+                row = _instruct_row(raw, converter)
             except ValueError as err:
-                stats["skipped_malformed"] += 1
+                counters.skipped_malformed += 1
                 log.debug("%s: skipping malformed row: %s", name, err)
                 continue
-            yield {"instruction": row["instruction"], "input": row.get("input", ""), "output": row["output"]}
-            stats["kept"] += 1
+            yield row
+            counters.kept += 1
             bar.update(1)
+
         if yielded < count:
-            stats["exhausted"] = True
+            counters.exhausted = True
             return
+
+
+def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
+    """The standardized ``{instruction, input, output}`` row for ``raw``.
+
+    A ``ValueError`` raised by the converter (malformed row) propagates to the caller, which skips the row.
+    """
+    row = converter(raw) if converter is not None else dict(raw)
+    return {"instruction": row["instruction"], "input": row.get("input", ""), "output": row["output"]}
+
+
+class _DownloadPostfix:
+    """The download bar's postfix: source rows consumed, current repo file, MB read remotely (refreshed sparsely)."""
+
+    def __init__(self, bar: Progress, fetch_stats: FetchStats) -> None:
+        self._bar = bar
+        self._fetch_stats = fetch_stats
+        self._values: dict[str, Any] = {"consumed": 0}
+
+    def on_file(self, file: str) -> None:
+        """Loader callback: a new repo file is being read."""
+        self._values["file"] = file.rsplit("/", 1)[-1]
+        self._refresh()
+
+    def consumed(self, total: int) -> None:
+        """Record the running count of consumed source rows; the bar is refreshed every 100 rows."""
+        self._values["consumed"] = total
+        if total % 100 == 0:
+            self._refresh()
+
+    def _refresh(self) -> None:
+        if self._fetch_stats.bytes_read:
+            self._values["MB"] = f"{self._fetch_stats.bytes_read / 2**20:.0f}"
+        self._bar.set_postfix(self._values, refresh=False)
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
@@ -351,10 +404,8 @@ def validation(
     if existing is not None:
         return existing
 
-    offset = 0
-    if source.loader == "local":
-        total = _local_row_count(Path(str(source.path)))
-        offset = max(total - source.rows, 0)
+    # fetch the rows
+    offset = _validation_offset(source, source.rows)
     log.info("%s: holding out %d rows from offset %d -> %s", name, source.rows, offset, out)
     loader = get_loader(source.loader)
     with progress(total=source.rows, desc=f"{name}: validation", unit="row", leave=False) as bar:
@@ -365,18 +416,28 @@ def validation(
         rows = [text_row(source, r, name) for r in bar_rows(bar, fetched)]
     if len(rows) < source.rows:
         log.warning("%s: only %d of %d requested validation rows available", name, len(rows), source.rows)
+
+    # shuffle, count tokens, write
     random.Random(source.seed).shuffle(rows)
-    counter = TokenCounter(cfg, layout)
     texts = [str(r[source.text_field]) for r in rows]
-    tokens = counter.count_many(texts)
+    tokens = TokenCounter(cfg, layout).count_many(texts)
     out_rows = ({"text": t, "source": name, "tokens": n} for t, n in zip(texts, tokens))
     write_dict_rows(out_rows, out, shard_size, start_shard=0)
+
     manifest = new_manifest(cfg, name, source_hash, "validation", tokens=True)
     manifest.rows_fetched = offset + len(rows)
     record_new_shards(manifest, out, 0, tokens=_tokens_per_shard(out, tokens))
     manifest.extra = {"offset": offset, "requested_rows": source.rows, "seed": source.seed}
     manifest.save(out)
     return manifest
+
+
+def _validation_offset(source: SourceConfig, rows: int) -> int:
+    """Where the ``rows`` held-out rows start: the tail of a ``local`` directory, the beginning of everything else."""
+    if source.loader != "local":
+        return 0
+    total = _local_row_count(Path(str(source.path)))
+    return max(total - rows, 0)
 
 
 def bar_rows(bar: Progress, rows: Iterator[Row]) -> Iterator[Row]:
@@ -387,6 +448,7 @@ def bar_rows(bar: Progress, rows: Iterator[Row]) -> Iterator[Row]:
 
 
 def _local_row_count(directory: Path) -> int:
+    """Rows in a ``local`` source directory: parquet footers plus non-blank lines of every other (jsonl) file."""
     total = 0
     for file in list_local_files(directory):
         if file.suffix == ".parquet":

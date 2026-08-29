@@ -1,9 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """``MANIFEST.json`` beside a shard directory: what a source/mixture directory contains and which config built it.
 
-Every stage directory (``dataset/sources/<source>/{raw,filtered,processed}/``, instruct mixtures, validation sources, tokenizers) carries
-one manifest. ``source_hash`` is :meth:`DatasetConfig.source_hash` of the config that produced it; a manifest whose hash
-differs from the current config is stale and its stage is rebuilt. Verification is cheap (parquet metadata only).
+Every stage directory (``dataset/sources/<source>/{raw,filtered,processed}/``, instruct mixtures, validation sources,
+tokenizers) carries one manifest. ``source_hash`` is :meth:`DatasetConfig.source_hash` of the config that produced
+it; a manifest whose hash differs from the current config is stale and its stage is rebuilt. Verification is cheap
+(parquet metadata only).
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ Stage = Literal["raw", "filtered", "processed", "instruct_mixture", "validation"
 STAGES: tuple[str, ...] = ("raw", "filtered", "processed", "instruct_mixture", "validation", "tokenizer")
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 @dataclass
 class ShardInfo:
     name: str
@@ -47,7 +52,7 @@ class Manifest:
     token_count: str | None = None
     tokenizer: str | None = None
     versions: dict[str, str] = field(default_factory=dict)
-    created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    created: str = field(default_factory=_utc_now_iso)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -57,7 +62,7 @@ class Manifest:
     # --- derived -----------------------------------------------------------------------------------------------------
 
     def rows(self) -> int:
-        return sum(s.rows for s in self.shards)
+        return sum(shard.rows for shard in self.shards)
 
     def tokens(self) -> int | None:
         """Total measured tokens, or None if any shard has no token count."""
@@ -72,10 +77,10 @@ class Manifest:
         return self.source_hash == source_hash
 
     def add_shard(self, name: str, rows: int, tokens: int | None = None) -> None:
-        """Record a shard; an existing entry with the same name is replaced."""
-        self.shards = [s for s in self.shards if s.name != name]
+        """Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name."""
+        self.shards = [shard for shard in self.shards if shard.name != name]
         self.shards.append(ShardInfo(name=name, rows=rows, tokens=tokens))
-        self.shards.sort(key=lambda s: s.name)
+        self.shards.sort(key=lambda shard: shard.name)
 
     # --- (de)serialisation -------------------------------------------------------------------------------------------
 
@@ -85,15 +90,13 @@ class Manifest:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Manifest:
         """Build from a JSON dict; unknown keys (from newer versions) are ignored."""
-        known = {f.name for f in fields(cls)}
-        kwargs = {k: v for k, v in payload.items() if k in known}
-        shard_keys = {f.name for f in fields(ShardInfo)}
-        kwargs["shards"] = [
-            ShardInfo(**{k: v for k, v in s.items() if k in shard_keys}) for s in kwargs.get("shards", [])
-        ]
+        kwargs = _known_fields_only(payload, cls)
+        raw_shards: list[dict[str, Any]] = kwargs.get("shards", [])
+        kwargs["shards"] = [ShardInfo(**_known_fields_only(shard, ShardInfo)) for shard in raw_shards]
         return cls(**kwargs)
 
     def save(self, directory: Path) -> Path:
+        """Write ``directory/MANIFEST.json`` atomically (via a ``.json.tmp`` sibling) and return its path."""
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / MANIFEST_NAME
         tmp = path.with_suffix(".json.tmp")
@@ -116,6 +119,12 @@ class Manifest:
         except (ValueError, TypeError) as err:  # json errors are ValueErrors; bad fields raise TypeError/ValueError
             log.warning("ignoring unparsable manifest %s: %s", path, err)
             return None
+
+
+def _known_fields_only(payload: dict[str, Any], dataclass_type: type) -> dict[str, Any]:
+    """``payload`` restricted to the field names of ``dataclass_type``."""
+    known = {f.name for f in fields(dataclass_type)}
+    return {key: value for key, value in payload.items() if key in known}
 
 
 # --- shard helpers ---------------------------------------------------------------------------------------------------
@@ -157,6 +166,7 @@ def library_versions() -> dict[str, str]:
 
 
 def _git_sha() -> str | None:
+    """HEAD commit of this repo, or None when git is unavailable or the tree is not a checkout."""
     repo_root = Path(__file__).resolve().parents[3]
     try:
         result = subprocess.run(

@@ -13,11 +13,22 @@ Row = dict[str, Any]
 Converter = Callable[[Row], Row]
 Filter = Callable[[Row], bool]
 
+INSTRUCT_FIELDS = ("instruction", "input", "output")
+
 
 def _require(row: Row, *keys: str) -> None:
-    missing = [k for k in keys if k not in row]
+    """Raise ``ValueError`` naming the missing columns if ``row`` lacks any of ``keys``."""
+    missing = [key for key in keys if key not in row]
     if missing:
         raise ValueError(f"row is missing column(s) {missing}; available columns: {sorted(row)}")
+
+
+def _text_or_empty(value: Any) -> str:
+    """``str(value)``, with ``None`` becoming the empty string."""
+    return "" if value is None else str(value)
+
+
+# --- converters --------------------------------------------------------------------------------------------------------
 
 
 def gsm8k_question_answer(row: Row) -> Row:
@@ -27,11 +38,12 @@ def gsm8k_question_answer(row: Row) -> Row:
 
 
 def _conversations(row: Row) -> list[Any]:
+    """The `conversations` list of a row (an error if the column is missing or not a list)."""
     _require(row, "conversations")
-    convs = row["conversations"]
-    if not isinstance(convs, list):
-        raise ValueError(f"'conversations' must be a list, got {type(convs).__name__}; columns: {sorted(row)}")
-    return convs
+    conversations = row["conversations"]
+    if not isinstance(conversations, list):
+        raise ValueError(f"'conversations' must be a list, got {type(conversations).__name__}; columns: {sorted(row)}")
+    return conversations
 
 
 def sharegpt_conversations(row: Row) -> Row:
@@ -39,56 +51,56 @@ def sharegpt_conversations(row: Row) -> Row:
 
     Later turns of the same role overwrite earlier ones (as in the thesis pipeline: only one exchange is kept).
     """
-    system_msg = human_msg = gpt_msg = ""
+    by_role = {"system": "", "human": "", "gpt": ""}
     for turn in _conversations(row):
         if not isinstance(turn, dict) or "from" not in turn:
             raise ValueError(f"sharegpt_conversations: turns need 'from'/'value' keys, got {turn!r}")
-        role, value = turn["from"], str(turn.get("value", ""))
-        if role == "system":
-            system_msg = value
-        elif role == "human":
-            human_msg = value
-        elif role == "gpt":
-            gpt_msg = value
-    return {"instruction": human_msg, "input": system_msg, "output": gpt_msg}
+        role = turn["from"]
+        if role in by_role:
+            by_role[role] = str(turn.get("value", ""))
+    return {"instruction": by_role["human"], "input": by_role["system"], "output": by_role["gpt"]}
 
 
 def first_two_turns(row: Row) -> Row:
     """`conversations` without role tags (WizardLM): first `value` = instruction, second = output."""
-    convs = _conversations(row)
-    if len(convs) < 2:
-        raise ValueError(f"first_two_turns: need at least two turns, got {len(convs)}; columns: {sorted(row)}")
-    first, second = convs[0], convs[1]
+    conversations = _conversations(row)
+    if len(conversations) < 2:
+        raise ValueError(f"first_two_turns: need at least two turns, got {len(conversations)}; columns: {sorted(row)}")
+    first, second = conversations[0], conversations[1]
     if not isinstance(first, dict) or not isinstance(second, dict):
-        raise ValueError(f"first_two_turns: turns must be dicts with a 'value' key, got {convs[:2]!r}")
+        raise ValueError(f"first_two_turns: turns must be dicts with a 'value' key, got {conversations[:2]!r}")
     return {"instruction": str(first.get("value", "")), "input": "", "output": str(second.get("value", ""))}
-
-
-def instruction_input_output(row: Row) -> Row:
-    """Rows that already carry `instruction`/`output` (and optionally `input`); missing input -> ""."""
-    return fields_converter({"instruction": "instruction", "input": "input", "output": "output"})(row)
 
 
 def fields_converter(fields: dict[str, str]) -> Converter:
     """Converter mapping `{instruction: <col>, input: <col>?, output: <col>}` to the standard instruct row."""
     if not {"instruction", "output"} <= set(fields):
         raise ValueError(f"fields must map at least instruction and output, got {sorted(fields)}")
-    unknown = set(fields) - {"instruction", "input", "output"}
+    unknown = set(fields) - set(INSTRUCT_FIELDS)
     if unknown:
         raise ValueError(f"fields has unknown keys {sorted(unknown)}; allowed: instruction, input, output")
-    instruction_col, output_col = fields["instruction"], fields["output"]
-    input_col = fields.get("input")
+    instruction_col = fields["instruction"]
+    output_col = fields["output"]
+    input_col = fields.get("input")  # optional; missing column or None value -> ""
 
     def convert(row: Row) -> Row:
         _require(row, instruction_col, output_col)
         input_value = row.get(input_col, "") if input_col is not None else ""
         return {
             "instruction": str(row[instruction_col]),
-            "input": "" if input_value is None else str(input_value),
+            "input": _text_or_empty(input_value),
             "output": str(row[output_col]),
         }
 
     return convert
+
+
+_IDENTITY_FIELDS_CONVERTER = fields_converter({name: name for name in INSTRUCT_FIELDS})
+
+
+def instruction_input_output(row: Row) -> Row:
+    """Rows that already carry `instruction`/`output` (and optionally `input`); missing input -> ""."""
+    return _IDENTITY_FIELDS_CONVERTER(row)
 
 
 CONVERTERS: dict[str, Converter] = {
@@ -112,27 +124,36 @@ def get_converter(source: SourceConfig) -> Converter | None:
 
 # --- filters ----------------------------------------------------------------------------------------------------------
 
+SHAREGPT_MIN_CHARS = 50
+SHAREGPT_MAX_CHARS = 2000
+SHAREGPT_CODE_BLOCK_MARKERS = ("```python", "```java", "```cpp", "```javascript")
+
 
 def sharegpt_quality(row: Row) -> bool:
     """ShareGPT quality filter: human->gpt opening, 50-2000 chars per side, no code blocks in the answer."""
-    convs = row.get("conversations")
-    if not isinstance(convs, list) or len(convs) < 2:
+    conversations = row.get("conversations")
+    if not isinstance(conversations, list) or len(conversations) < 2:
         return False
-    first, second = convs[0], convs[1]
+    first, second = conversations[0], conversations[1]
     if not isinstance(first, dict) or not isinstance(second, dict):
         return False
     if first.get("from") != "human" or second.get("from") != "gpt":
         return False
-    human_text, gpt_text = str(first.get("value", "")), str(second.get("value", ""))
-    if not 50 <= len(human_text) <= 2000 or not 50 <= len(gpt_text) <= 2000:
-        return False
-    return not any(p in gpt_text.lower() for p in ("```python", "```java", "```cpp", "```javascript"))
+
+    human_text = str(first.get("value", ""))
+    gpt_text = str(second.get("value", ""))
+    for text in (human_text, gpt_text):
+        if not SHAREGPT_MIN_CHARS <= len(text) <= SHAREGPT_MAX_CHARS:
+            return False
+    answer = gpt_text.lower()
+    return not any(marker in answer for marker in SHAREGPT_CODE_BLOCK_MARKERS)
 
 
 FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality}
 
 
 def get_filter(name: str) -> Filter:
+    """The registered filter called ``name`` (``ValueError`` for an unknown name)."""
     if name not in FILTERS:
         raise ValueError(f"unknown filter {name!r}; known filters: {sorted(FILTERS)}")
     return FILTERS[name]
