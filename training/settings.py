@@ -28,7 +28,7 @@ class Settings:
     # config; the run config only references it. `training/train.py` verifies the prepared data and, with
     # `auto_prepare`, builds what is missing (`python data_preparation/prepare.py build --dataset_config ...`).
     dataset_config: str  # path to config/datasets/<name>.yaml (required)
-    dataset_dir: str = "dataset"  # root of the prepared data (sources/, mixtures/, tokenizers/)
+    dataset_dir: str = "dataset"  # root of the prepared data (sources/, instruct_mixtures/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
     prepare_num_workers: int = 4  # worker processes for the in-process build
     stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional

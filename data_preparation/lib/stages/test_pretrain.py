@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for data_preparation.lib.stages.pretrain: incremental length filter, streaming process (dedup, quality,
-decontamination, token counting, fuzzy dedup, repeat_to_budget) on local parquet sources."""
+decontamination, token counting, fuzzy dedup) on local parquet sources."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def test_length_filter_requires_raw_and_pretrain_kind(cfg_factory: CfgFactory, l
     cfg = _cfg(cfg_factory, source_dir)
     with pytest.raises(FileNotFoundError, match="no current raw manifest"):
         length_filter(cfg, "s", layout)
-    hold = cfg_factory({"h": SourceConfig(kind="holdout", loader="synthetic", rows=1)})
+    hold = cfg_factory({"h": SourceConfig(kind="validation", loader="synthetic", rows=1)})
     with pytest.raises(ValueError, match="pretrain sources only"):
         length_filter(hold, "h", layout)
 
@@ -303,24 +303,6 @@ def test_process_minhash_without_datasketch_raises(
     with pytest.raises(ImportError, match="datasketch"):
         process(cfg, "s", layout)
 
-
-def test_process_repeat_to_budget_reaches_target(
-    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
-) -> None:
-    texts = [_words(3, 0), _words(4, 10), _words(5, 20)]  # 12 tokens per cycle
-    cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, source={"repeat_to_budget": True})
-    m = process(cfg, "s", layout, shard_size=5, target_tokens=30)
-    rows = read_rows(layout.source_dir("s", "processed"))
-    assert [r["tokens"] for r in rows] == [3, 4, 5, 3, 4, 5, 3, 4], "2 full copies (24) + rows until the remainder 6 is covered"
-    assert m.tokens() == 31 and m.extra["target_tokens"] == 30
-    assert m.extra["stats"]["repeat_to_budget"] == {"unique_rows": 3, "unique_tokens": 12, "target_tokens": 30, "repeated_rows": 8}
-    assert process(cfg, "s", layout, shard_size=5, target_tokens=30) == m
-    # a different target rebuilds; None or a target below the unique tokens does not repeat
-    m2 = process(cfg, "s", layout, shard_size=5, target_tokens=13)
-    assert [r["tokens"] for r in read_rows(layout.source_dir("s", "processed"))] == [3, 4, 5, 3]
-    assert m2.tokens() == 15
-    assert process(cfg, "s", layout, target_tokens=None).tokens() == 12
-    assert process(cfg, "s", layout, target_tokens=12).tokens() == 12
 
 
 def test_process_requires_filtered_manifest(cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path) -> None:

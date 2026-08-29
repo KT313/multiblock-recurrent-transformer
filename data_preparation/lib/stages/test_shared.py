@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.shared: tokenizer stage, token counter, incremental download, holdout."""
+"""Tests for data_preparation.lib.stages.shared: tokenizer stage, token counter, incremental download, validation."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from data_preparation.lib.stages.shared import (
     TokenCounter,
     current_manifest,
     download,
-    holdout,
+    validation,
     prepare_tokenizer,
     require_manifest,
 )
@@ -191,22 +191,6 @@ def test_download_keeps_extra_columns_and_requires_text_field(
         download(bad, "c", DatasetLayout(layout.root / "other"), rows_needed=1)
 
 
-def test_download_repeat_to_budget_fetches_everything_once(
-    cfg_factory: CfgFactory, layout: DatasetLayout, write_local: Writer
-) -> None:
-    src_dir = layout.root.parent / "small"
-    write_local(src_dir, [{"text": f"doc {i}"} for i in range(5)], "parquet")
-    cfg = cfg_factory({"s": _local(src_dir, repeat_to_budget=True)})
-    m = download(cfg, "s", layout, rows_needed=2, shard_size=2)
-    assert m.rows() == 5 and m.rows_fetched == 5 and m.extra["exhausted"] is True
-    assert download(cfg, "s", layout, rows_needed=1000, shard_size=2) == m
-
-
-def test_download_repeat_to_budget_rejects_synthetic(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    cfg = cfg_factory({"p": _synthetic(repeat_to_budget=True)})
-    with pytest.raises(ValueError, match="unbounded"):
-        download(cfg, "p", layout, rows_needed=1)
-
 
 def test_download_rebuilds_on_stale_hash(
     cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture, read_rows: Reader
@@ -272,7 +256,7 @@ def test_download_columns_follow_the_converter_and_check_limit_bounds_over_reads
     assert download(cfg, "lim", layout, rows_needed=8).extra["exhausted"] is True and len(seen) == 2
 
 
-def test_holdout_asks_for_exact_rows(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_validation_asks_for_exact_rows(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
     from data_preparation.lib.sources import loaders as loaders_mod
 
     seen: dict[str, Any] = {}
@@ -282,8 +266,8 @@ def test_holdout_asks_for_exact_rows(cfg_factory: CfgFactory, layout: DatasetLay
         return iter([{"text": f"t{i}"} for i in range(count)])
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
-    cfg = cfg_factory({"v": _synthetic(kind="holdout", rows=4)}, token_count="estimate")
-    m = holdout(cfg, "v", layout)
+    cfg = cfg_factory({"v": _synthetic(kind="validation", rows=4)}, token_count="estimate")
+    m = validation(cfg, "v", layout)
     assert m.rows() == 4 and seen["count"] == 4 and seen["align_to_row_group"] is False and seen["columns"] == ["text"]
 
 
@@ -355,10 +339,10 @@ def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, layout: Datas
     assert rows == [synthetic_row("instruct", 2, i) for i in range(3)]
 
 
-# --- holdout -----------------------------------------------------------------------------------------------------------
+# --- validation -----------------------------------------------------------------------------------------------------------
 
 
-def test_holdout_synthetic_disjoint_shuffled_and_idempotent(
+def test_validation_synthetic_disjoint_shuffled_and_idempotent(
     cfg_factory: CfgFactory,
     layout: DatasetLayout,
     with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
@@ -366,31 +350,31 @@ def test_holdout_synthetic_disjoint_shuffled_and_idempotent(
     mtimes: Mtimes,
 ) -> None:
     cfg = with_tokenizer(
-        cfg_factory({"train": _synthetic(seed=0), "val": _synthetic(kind="holdout", seed=1, rows=20)}, max_seq_length=100)
+        cfg_factory({"train": _synthetic(seed=0), "val": _synthetic(kind="validation", seed=1, rows=20)}, max_seq_length=100)
     )
     download(cfg, "train", layout, rows_needed=40)
-    m = holdout(cfg, "val", layout, shard_size=8)
-    out = layout.holdout_dir("val")
-    assert m.stage == "holdout" and [s.rows for s in m.shards] == [8, 8, 4] and m.rows_fetched == 20
+    m = validation(cfg, "val", layout, shard_size=8)
+    out = layout.validation_dir("val")
+    assert m.stage == "validation" and [s.rows for s in m.shards] == [8, 8, 4] and m.rows_fetched == 20
     rows = read_rows(out)
     assert [set(r) for r in rows] == [{"text", "source", "tokens"}] * 20
     assert {r["source"] for r in rows} == {"val"}
     train_texts = {r["text"] for r in read_rows(layout.source_dir("train", "raw"))}
-    assert not train_texts & {r["text"] for r in rows}, "holdout rows must not appear in the training source"
-    generated = [synthetic_row("holdout", 1, i)["text"] for i in range(20)]
+    assert not train_texts & {r["text"] for r in rows}, "validation rows must not appear in the training source"
+    generated = [synthetic_row("validation", 1, i)["text"] for i in range(20)]
     assert sorted(r["text"] for r in rows) == sorted(generated) and [r["text"] for r in rows] != generated
     assert all(r["tokens"] == min(len(r["text"].split()), 100) for r in rows)
     assert m.tokens() == sum(r["tokens"] for r in rows)
     before = mtimes(out)
-    assert holdout(cfg, "val", layout, shard_size=8) == m and mtimes(out) == before
+    assert validation(cfg, "val", layout, shard_size=8) == m and mtimes(out) == before
     # deterministic: a second root gets the same order
     other = DatasetLayout(layout.root.parent / "other")
     prepare_tokenizer(cfg, other)
-    holdout(cfg, "val", other, shard_size=8)
-    assert read_rows(other.holdout_dir("val")) == rows
+    validation(cfg, "val", other, shard_size=8)
+    assert read_rows(other.validation_dir("val")) == rows
 
 
-def test_holdout_local_takes_the_last_rows(
+def test_validation_local_takes_the_last_rows(
     cfg_factory: CfgFactory,
     layout: DatasetLayout,
     with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
@@ -400,13 +384,13 @@ def test_holdout_local_takes_the_last_rows(
     src_dir = layout.root.parent / "loc"
     write_local(src_dir, [{"text": f"doc {i}"} for i in range(6)], "parquet")
     write_local(src_dir, [{"text": f"doc {i}"} for i in range(6, 10)], "jsonl")
-    cfg = with_tokenizer(cfg_factory({"v": _local(src_dir, kind="holdout", rows=3)}, token_count="estimate"))
-    m = holdout(cfg, "v", layout)
+    cfg = with_tokenizer(cfg_factory({"v": _local(src_dir, kind="validation", rows=3)}, token_count="estimate"))
+    m = validation(cfg, "v", layout)
     assert m.extra["offset"] == 7 and m.rows_fetched == 10
-    assert sorted(r["text"] for r in read_rows(layout.holdout_dir("v"))) == ["doc 7", "doc 8", "doc 9"]
+    assert sorted(r["text"] for r in read_rows(layout.validation_dir("v"))) == ["doc 7", "doc 8", "doc 9"]
 
 
-def test_holdout_hf_stream_takes_the_first_rows_and_warns_when_short(
+def test_validation_hf_stream_takes_the_first_rows_and_warns_when_short(
     cfg_factory: CfgFactory,
     layout: DatasetLayout,
     with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
@@ -427,18 +411,18 @@ def test_holdout_hf_stream_takes_the_first_rows_and_warns_when_short(
     module = types.ModuleType("datasets")
     module.load_dataset = lambda **kw: Stream([{"text": f"s{i}"} for i in range(4)])  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "datasets", module)
-    src = SourceConfig(kind="holdout", loader="hf_stream", hf_id="org/x", rows=6)
+    src = SourceConfig(kind="validation", loader="hf_stream", hf_id="org/x", rows=6)
     cfg = with_tokenizer(cfg_factory({"v": src}, token_count="estimate"))
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        m = holdout(cfg, "v", layout)
+        m = validation(cfg, "v", layout)
     assert "only 4 of 6" in caplog.text and m.rows() == 4 and m.extra["offset"] == 0
-    assert sorted(r["text"] for r in read_rows(layout.holdout_dir("v"))) == ["s0", "s1", "s2", "s3"]
+    assert sorted(r["text"] for r in read_rows(layout.validation_dir("v"))) == ["s0", "s1", "s2", "s3"]
 
 
-def test_holdout_rejects_non_holdout_source(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+def test_validation_rejects_non_validation_source(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     cfg = cfg_factory({"p": _synthetic()})
-    with pytest.raises(ValueError, match="kind holdout"):
-        holdout(cfg, "p", layout)
+    with pytest.raises(ValueError, match="kind validation"):
+        validation(cfg, "p", layout)
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------

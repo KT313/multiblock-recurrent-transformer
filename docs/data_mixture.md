@@ -95,13 +95,13 @@ Validation: `fineweb_val` at 100%
 
 | Train source | Weight | Tokens | Tokens/row (est.) |
 |---|---:|---:|---:|
-| `flan_mixture` (mixture) | 100.00% | 150.0M | - |
+| `flan_instruct` (instruct_mixture) | 100.00% | 150.0M | - |
 
-Validation: `flan_mixture/validation` (mixture) at 100%
+Validation: `flan_instruct/validation` (instruct_mixture) at 100%
 
 ## Instruct mixtures
 
-### `flan_mixture` (150.0M tokens budget)
+### `flan_instruct` (150.0M tokens budget)
 
 `max_tokens` 2048, input inversions 5%, validation split 5%, seed 42. Examples = budget × share ÷ `tokens_per_row_estimate`.
 
@@ -134,7 +134,7 @@ Validation: `flan_mixture/validation` (mixture) at 100%
 | `openwebmath` | pretrain | `hf_files` | `open-web-math/open-web-math` data_files=data/*.parquet | `fde8ef8de230` | budget 132.0M |
 | `tinygsm` | pretrain | `hf_files` | `ostapeno/tinygsm-mind` data_files=data/*.parquet | `f5ecf416b715` | budget 99.0M |
 | `algebraic_stack` | pretrain | `hf_files` | `EleutherAI/proof-pile-2` data_files=algebraic-stack/train/*.jsonl.zst | `901a9273a770` | budget 66.0M |
-| `gsm8k` | pretrain | `hf_split` | `openai/gsm8k` name=main | `740312add88f` | converter `gsm8k_question_answer`, repeated to budget, budget 33.0M |
+| `gsm8k` | pretrain | `hf_split` | `openai/gsm8k` name=main | `740312add88f` | converter `gsm8k_question_answer`, budget 33.0M |
 | `github_code_clean_python` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Python, text_field `code`, budget 126.0M |
 | `github_code_clean_javascript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language JavaScript, text_field `code`, budget 84.0M |
 | `github_code_clean_typescript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language TypeScript, text_field `code`, budget 42.0M |
@@ -145,7 +145,7 @@ Validation: `flan_mixture/validation` (mixture) at 100%
 | `github_code_clean_shell` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Shell, text_field `code`, budget 16.8M |
 | `github_code_clean_sql` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language SQL, text_field `code`, budget 12.6M |
 | `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 12.6M |
-| `fineweb_val` | holdout | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet | `87f09149ef47` | - |
+| `fineweb_val` | validation | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet | `87f09149ef47` | - |
 | `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets` |
 | `metamath` | instruct | `hf_files` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
 | `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer` |

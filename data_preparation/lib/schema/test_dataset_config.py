@@ -16,7 +16,7 @@ from data_preparation.lib.schema import dataset_config as dc
 from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
     DedupConfig,
-    MixtureConfig,
+    InstructMixtureConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
@@ -37,10 +37,10 @@ def _minimal() -> dict[str, Any]:
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
         "sources": {
             "pre": {"kind": "pretrain", "loader": "synthetic"},
-            "hold": {"kind": "holdout", "loader": "synthetic", "rows": 10},
+            "hold": {"kind": "validation", "loader": "synthetic", "rows": 10},
             "ins": {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}},
         },
-        "mixtures": {"mix": {"sources": {"ins": 1.0}}},
+        "instruct_mixtures": {"mix": {"sources": {"ins": 1.0}}},
         "stages": [
             {"name": "s1", "tokens": 1000, "train": {"pre": 1.0}, "val": {"hold": 1.0}},
             {"name": "s2", "tokens": 500, "train": {"mix": 1.0}, "val": {"mix/validation": 1.0}},
@@ -56,7 +56,7 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
         name=d["name"],
         tokenizer=TokenizerConfig(**d["tokenizer"]),
         sources=sources,
-        mixtures={k: MixtureConfig(**v) for k, v in d.get("mixtures", {}).items()},
+        instruct_mixtures={k: InstructMixtureConfig(**v) for k, v in d.get("instruct_mixtures", {}).items()},
         stages=[StageConfig(**s) for s in d["stages"]],
         **{k: v for k, v in d.items() if k in ("max_seq_length", "token_count")},
     )
@@ -73,7 +73,7 @@ def test_shipped_configs_load(path: Path) -> None:
 
 
 def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
-    """The real-source smoke config differs from the thesis config only in name, budgets and holdout size."""
+    """The real-source smoke config differs from the thesis config only in name, budgets and validation size."""
     final, mini = load_dataset_config(CROW), load_dataset_config(MINI)
     assert mini.name == "crow-300m-mini"
     assert [s.tokens for s in mini.stages] == [300_000, 150_000, 60_000]
@@ -82,10 +82,10 @@ def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
     ]
     assert set(mini.sources) == set(final.sources)
     for name, source in final.sources.items():
-        expected = replace(source, rows=40) if source.kind == "holdout" else source
+        expected = replace(source, rows=40) if source.kind == "validation" else source
         assert mini.sources[name] == expected, name
     assert mini.sources["fineweb_val"].rows == 40
-    assert mini.mixtures == final.mixtures and mini.tokenizer == final.tokenizer
+    assert mini.instruct_mixtures == final.instruct_mixtures and mini.tokenizer == final.tokenizer
     assert (mini.processing, mini.max_seq_length, mini.token_count) == (final.processing, final.max_seq_length, final.token_count)
 
 
@@ -95,14 +95,14 @@ def test_crow_config_matches_thesis_run() -> None:
     assert [s.tokens for s in cfg.stages] == [3_300_000_000, 1_500_000_000, 150_000_000]
     assert len(cfg.sources_of_kind("pretrain")) == 19
     assert len(cfg.sources_of_kind("instruct")) == 8
-    assert cfg.sources_of_kind("holdout") == ["fineweb_val"]
+    assert cfg.sources_of_kind("validation") == ["fineweb_val"]
     assert cfg.token_count == "tokenizer" and cfg.max_seq_length == 2048
     assert cfg.processing.dedup.mode == "exact" and not cfg.processing.quality_filter
     assert not cfg.processing.decontamination.enabled
     assert all(s.revision for s in cfg.sources.values()), "every Hub source must pin a revision"
     assert cfg.sources["books_gutenberg"].text_field == "TEXT"
-    assert cfg.sources["gsm8k"].repeat_to_budget and cfg.sources["gsm8k"].converter == "gsm8k_question_answer"
-    assert cfg.mixtures["flan_mixture"].input_inversions == 0.05
+    assert cfg.sources["gsm8k"].converter == "gsm8k_question_answer"
+    assert cfg.instruct_mixtures["flan_instruct"].input_inversions == 0.05
 
 
 def test_tiny_config_is_synthetic_only() -> None:
@@ -136,13 +136,13 @@ def test_minimal_is_valid() -> None:
     [
         (lambda d: d["stages"][0]["train"].update({"pre": 0.5}), "sum to"),
         (lambda d: d["stages"][0]["train"].update({"nope": 0.0}), "unknown source"),
-        (lambda d: d["stages"][0]["train"].update({"hold": 0.0}), "holdout"),
+        (lambda d: d["stages"][0]["train"].update({"hold": 0.0}), "validation"),
         (lambda d: d["stages"][0]["train"].update({"ins": 0.0}), "instruct source"),
         (lambda d: d["stages"][0]["train"].update({"pre/train": 0.0}), "not a mixture"),
         (lambda d: d["stages"][1]["val"].update({"mix/test": 0.0}), "/validation"),
-        (lambda d: d["mixtures"]["mix"]["sources"].update({"pre": 0.0}), "not kind instruct"),
-        (lambda d: d["mixtures"]["mix"]["sources"].update({"zzz": 0.0}), "unknown source"),
-        (lambda d: d["mixtures"].update({"pre": {"sources": {"ins": 1.0}}}), "shared by sources and mixtures"),
+        (lambda d: d["instruct_mixtures"]["mix"]["sources"].update({"pre": 0.0}), "not kind instruct"),
+        (lambda d: d["instruct_mixtures"]["mix"]["sources"].update({"zzz": 0.0}), "unknown source"),
+        (lambda d: d["instruct_mixtures"].update({"pre": {"sources": {"ins": 1.0}}}), "shared by sources and instruct mixtures"),
         (lambda d: d["stages"].append(dict(d["stages"][0])), "unique"),
         (lambda d: d["stages"].clear(), "at least one stage"),
         (lambda d: d.update({"name": "a/b"}), "path component"),
@@ -151,7 +151,7 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0].update({"transition_pct": 1.0}), "transition_pct"),
         (lambda d: d["stages"][0].update({"train": {}}), "must not be empty"),
         (lambda d: d["stages"][0]["train"].update({"pre": -1.0, "hold": 2.0}), "non-negative"),
-        (lambda d: d["sources"]["hold"].pop("rows"), "holdout requires rows"),
+        (lambda d: d["sources"]["hold"].pop("rows"), "validation requires rows"),
         (lambda d: d["sources"]["ins"].pop("fields"), "requires fields or converter"),
         (lambda d: d["sources"]["ins"].update({"fields": {"instruction": "a"}}), "instruction and output"),
         (lambda d: d["sources"]["ins"].pop("hf_id"), "requires hf_id"),
@@ -162,8 +162,8 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["sources"]["pre"].update({"loader": "local"}), "requires path"),
         (lambda d: d["sources"]["pre"].update({"tokens_per_row_estimate": 0}), "tokens_per_row_estimate"),
         (lambda d: d["sources"]["hold"].update({"processing": {"min_chars": 1}}), "only apply to kind pretrain"),
-        (lambda d: d["mixtures"]["mix"].update({"val_split": 1.0}), "val_split"),
-        (lambda d: d["mixtures"]["mix"].update({"input_inversions": 1.5}), "input_inversions"),
+        (lambda d: d["instruct_mixtures"]["mix"].update({"val_split": 1.0}), "val_split"),
+        (lambda d: d["instruct_mixtures"]["mix"].update({"input_inversions": 1.5}), "input_inversions"),
         (lambda d: d.update({"tokenizer": {"name": "x", "kind": "hf"}}), "requires hf_id"),
     ],
 )
@@ -225,22 +225,22 @@ def test_budget_tokens_use_max_over_stages_not_sum() -> None:
     assert cfg.source_budget_tokens("hold") == 0  # validation sets have a fixed row count instead
 
 
-def test_mixture_budget_and_instruct_source_budget() -> None:
+def test_instruct_mixture_budget_and_instruct_source_budget() -> None:
     d = _minimal()
     d["sources"]["ins2"] = {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/z", "converter": "first_two_turns"}
-    d["mixtures"]["mix"]["sources"] = {"ins": 0.75, "ins2": 0.25}
+    d["instruct_mixtures"]["mix"]["sources"] = {"ins": 0.75, "ins2": 0.25}
     d["stages"][1]["tokens"] = 1000
     d["stages"][1]["train"] = {"mix/train": 1.0}
     cfg = _build(d)
-    assert cfg.mixture_budget_tokens("mix") == 1000
+    assert cfg.instruct_mixture_budget_tokens("mix") == 1000
     assert cfg.source_budget_tokens("ins") == 750 and cfg.source_budget_tokens("ins2") == 250
-    assert cfg.mixture_budget_tokens("unused") == 0
+    assert cfg.instruct_mixture_budget_tokens("unused") == 0
 
 
 def test_sources_of_kind() -> None:
     cfg = _build(_minimal())
     assert cfg.sources_of_kind("pretrain") == ["pre"]
-    assert cfg.sources_of_kind("holdout") == ["hold"]
+    assert cfg.sources_of_kind("validation") == ["hold"]
     assert cfg.sources_of_kind("instruct") == ["ins"]
 
 
@@ -267,6 +267,16 @@ def test_source_hash_stable_across_key_order_and_reloads() -> None:
     assert a.source_hash("synthetic_pretrain") == b.source_hash("synthetic_pretrain")
     assert a.config_hash() == b.config_hash()
     assert dc._stable_hash({"x": 1, "y": [1, 2]}) == dc._stable_hash({"y": [1, 2], "x": 1})
+
+
+def test_hash_fields_drops_defaults_recursively() -> None:
+    """Schema changes with defaults must not invalidate data on disk: only explicitly set values are hashed."""
+    assert dc.hash_fields(DedupConfig()) == {}
+    assert dc.hash_fields(DedupConfig(threshold=0.5)) == {"threshold": 0.5}
+    proc = ProcessingConfig(min_chars=7, dedup=DedupConfig(mode="minhash"))
+    assert dc.hash_fields(proc) == {"min_chars": 7, "dedup": {"mode": "minhash"}}
+    src = SourceConfig(kind="pretrain", loader="hf_files", hf_id="x/y", load_kwargs={"data_files": "*.parquet"})
+    assert dc.hash_fields(src) == {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
 
 
 def test_source_hash_ignores_budget_but_tracks_processing_and_token_mode() -> None:
@@ -308,18 +318,18 @@ def test_tokenizer_change_affects_hash_only_when_counting_with_it() -> None:
     assert _build(d).source_hash("ins") != _build(d2).source_hash("ins")  # instruct always tokenizes
 
 
-def test_mixture_hash_tracks_sources_and_budget() -> None:
+def test_instruct_mixture_hash_tracks_sources_and_budget() -> None:
     base = _build(_minimal())
-    h = base.mixture_hash("mix")
+    h = base.instruct_mixture_hash("mix")
     d = _minimal()
     d["sources"]["ins"]["fields"] = {"instruction": "q", "output": "b"}
-    assert _build(d).mixture_hash("mix") != h
+    assert _build(d).instruct_mixture_hash("mix") != h
     d = _minimal()
     d["stages"][1]["tokens"] = 501
-    assert _build(d).mixture_hash("mix") != h
+    assert _build(d).instruct_mixture_hash("mix") != h
     d = _minimal()
-    d["mixtures"]["mix"]["val_split"] = 0.1
-    assert _build(d).mixture_hash("mix") != h
+    d["instruct_mixtures"]["mix"]["val_split"] = 0.1
+    assert _build(d).instruct_mixture_hash("mix") != h
 
 
 def test_config_hash_changes_on_any_field() -> None:
@@ -331,6 +341,6 @@ def test_config_hash_changes_on_any_field() -> None:
 
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:
-    assert {"name", "tokenizer", "sources", "stages", "mixtures", "processing"} <= set(dc.dataset_config_fields())
+    assert {"name", "tokenizer", "sources", "stages", "instruct_mixtures", "processing"} <= set(dc.dataset_config_fields())
     cfg = _build(_minimal())
     assert asdict(cfg)["sources"]["pre"]["kind"] == "pretrain"

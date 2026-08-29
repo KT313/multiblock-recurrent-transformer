@@ -186,10 +186,10 @@ def test_mixture_deterministic_under_seed() -> None:
     assert draw(7) != draw(8)
 
 
-def test_mixture_over_parquet_datasets(tiny_holdout_dir: Path, tiny_mixture_dirs: dict[str, Path]) -> None:
+def test_mixture_over_parquet_datasets(tiny_validation_dir: Path, tiny_instruct_dirs: dict[str, Path]) -> None:
     sig = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
-    pre = ParquetTextDataset(tiny_holdout_dir, "pre")
-    ft = ParquetTextDataset(tiny_mixture_dirs["validation"], "ft", data_signature=sig)
+    pre = ParquetTextDataset(tiny_validation_dir, "pre")
+    ft = ParquetTextDataset(tiny_instruct_dirs["validation"], "ft", data_signature=sig)
     ds = WeightedMixtureDataset([pre, ft], [1.0, 1.0], seed=0)
     rows = list(itertools.islice(iter(ds), 100))
     assert {r["data_id"] for r in rows} == {"pre", "ft"}

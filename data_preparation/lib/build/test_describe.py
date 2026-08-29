@@ -22,7 +22,7 @@ EXPECTED_TINY_STAGE = """### Stage 1: `pretrain_a` (8.2K tokens, transition 25%)
 Validation: `synthetic_val` at 100%
 """
 
-EXPECTED_TINY_MIXTURE = """### `tiny_mixture` (4.1K tokens budget)
+EXPECTED_TINY_INSTRUCT = """### `tiny_instruct` (4.1K tokens budget)
 
 `max_tokens` 256, input inversions 10%, validation split 20%, seed 0. Examples = budget × share ÷ `tokens_per_row_estimate`.
 
@@ -37,7 +37,7 @@ def test_tiny_snippets_and_determinism(tiny_dataset_config: DatasetConfig) -> No
     assert text == describe(tiny_dataset_config, "config/datasets/tiny.yaml")
     assert text.startswith("# Dataset `tiny`\n\nGenerated from `config/datasets/tiny.yaml` with\n")
     assert GENERATED_WITH.format(config="config/datasets/tiny.yaml") + " > docs/data_mixture.md" in text
-    assert EXPECTED_TINY_STAGE in text and EXPECTED_TINY_MIXTURE in text
+    assert EXPECTED_TINY_STAGE in text and EXPECTED_TINY_INSTRUCT in text
     assert "| `synthetic_val` | 32 | 1 | `synthetic` | generated (seed 1) |" in text
     assert "- tokenizer: `synthetic` (synthetic)" in text and "- `token_count`: `tokenizer`" in text
     assert "- dedup: `exact` (normalize: on)" in text and "- quality filter: off" in text
@@ -66,8 +66,8 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
     # per-source token budgets shown in the source table are the planner's (max over stages, not the sum)
     assert f"budget {_tokens(cfg.source_budget_tokens('fineweb_edu'))}" in text and cfg.source_budget_tokens("fineweb_edu") == int(3_300_000_000 * 0.65)
     assert "| `fineweb_edu` | 65.00% | 2.15B | 2000 |" in text
-    assert "| `flan_mixture` (mixture) | 100.00% | 150.0M | - |" in text
-    budget = cfg.mixture_budget_tokens("flan_mixture")
+    assert "| `flan_instruct` (instruct_mixture) | 100.00% | 150.0M | - |" in text
+    budget = cfg.instruct_mixture_budget_tokens("flan_instruct")
     assert f"| `flan` | 40.0% | {_tokens(int(budget * 0.4))} | {ceil(budget * 0.4 / 300):,} |" in text
     assert "converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000" in text
     assert "repeated to budget" in text and "language Python" in text and "text_field `TEXT`" in text

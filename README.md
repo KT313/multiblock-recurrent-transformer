@@ -48,7 +48,7 @@ model/             architecture (RecurrentGPT, config + presets, HF export)
 training/          train.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
 data_preparation/  prepare.py (build / status / describe / tiny) + lib/
 config/            run configs; config/datasets/ dataset configs
-dataset/           gitignored; prepared data, mixtures and tokenizers
+dataset/           gitignored; prepared data, instruct mixtures and tokenizers
 docs/              thesis documentation and figures
 tools/             dev tooling (download-capped command runner)
 ```

@@ -6,7 +6,7 @@ the repo root; the implementation lives in ``data_preparation/lib/``: ``dataset_
 loaders/converters, ``stages`` pipeline functions, ``manifest`` bookkeeping, ``layout`` paths). Outputs:
 
     dataset/sources/<source>/{raw,filtered,processed}/   shared source cache (pretrain sources)
-    dataset/sources/<source>/holdout/                     held-out validation rows
-    dataset/mixtures/<config>/<mixture>/{train,validation}/
+    dataset/sources/<source>/validation/                     held-out validation rows
+    dataset/instruct_instruct_mixtures/<config>/<mixture>/{train,validation}/
     dataset/tokenizers/<name>/
 """

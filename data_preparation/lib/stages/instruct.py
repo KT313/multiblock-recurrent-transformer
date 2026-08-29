@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``build_mixture``: the per-config instruct mixture (``dataset/mixtures/<config>/<mixture>/{train,validation}/``)
+"""``build_instruct_mixture``: the per-config instruct mixture (``dataset/instruct_instruct_mixtures/<config>/<mixture>/{train,validation}/``)
 built from the standardized raw shards of its ``instruct`` sources.
 
 Per source: measure tokens per row with the tokenizer, take ``ceil(budget_tokens × share ÷ tokens_per_row)`` rows,
@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.parquet import normalized_hash, write_dict_rows
 from data_preparation.lib.schema.dataset_config import DatasetConfig
-from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
+from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import progress
 from data_preparation.lib.storage.manifest import Manifest
@@ -39,9 +39,9 @@ Row = dict[str, Any]
 INSTRUCT_COLUMNS = ("instruction", "input", "output")
 
 
-def build_mixture(
+def build_instruct_mixture(
     cfg: DatasetConfig,
-    mixture_name: str,
+    instruct_mixture_name: str,
     layout: DatasetLayout,
     *,
     budget_tokens: int,
@@ -53,21 +53,21 @@ def build_mixture(
     ``tokens_per_row``, ``short_sources`` (sources with fewer raw rows than needed — the planner tops them up),
     ``input_shards`` (raw shard lists) and the build ``metadata``.
     """
-    mixture = cfg.mixtures[mixture_name]
-    mixture_hash = cfg.mixture_hash(mixture_name)
-    dirs = {split: layout.mixture_dir(cfg.name, mixture_name, split) for split in MIXTURE_SPLITS}
+    mixture = cfg.instruct_mixtures[instruct_mixture_name]
+    instruct_mixture_hash = cfg.instruct_mixture_hash(instruct_mixture_name)
+    dirs = {split: layout.instruct_mixture_dir(cfg.name, instruct_mixture_name, split) for split in INSTRUCT_MIXTURE_SPLITS}
     raw_manifests = {
         src: require_manifest(layout.source_dir(src, "raw"), cfg.source_hash(src), "raw", src) for src in mixture.sources
     }
     input_shards = {src: shard_list(m) for src, m in raw_manifests.items()}
-    existing = {split: current_manifest(path, mixture_hash, "mixture") for split, path in dirs.items()}
+    existing = {split: current_manifest(path, instruct_mixture_hash, "instruct_mixture") for split, path in dirs.items()}
     if all(
         m is not None and m.extra.get("input_shards") == input_shards and m.extra.get("budget_tokens") == budget_tokens
         for m in existing.values()
     ):
         return {split: m for split, m in existing.items() if m is not None}
 
-    log.info("building mixture %s (%d tokens) -> %s", mixture_name, budget_tokens, dirs["train"].parent)
+    log.info("building mixture %s (%d tokens) -> %s", instruct_mixture_name, budget_tokens, dirs["train"].parent)
     counter = TokenCounter(cfg, layout)
     rows: list[Row] = []
     counts: dict[str, dict[str, Any]] = {}
@@ -82,7 +82,7 @@ def build_mixture(
             short_sources[src] = {"available_rows": info["available_rows"], "needed_rows": info["needed_rows"]}
         log.info("  %s: %d of %d needed rows (%.1f tokens/row), %d kept after length check", src, info["available_rows"], info["needed_rows"], info["tokens_per_row"], info["kept_rows"])
 
-    steps = progress(total=4, desc=f"{mixture_name}: build_mixture", unit="step", leave=False)
+    steps = progress(total=4, desc=f"{instruct_mixture_name}: build_instruct_mixture", unit="step", leave=False)
     rng = random.Random(mixture.seed)
     inverted = 0
     steps.set_postfix({"step": "input_inversions"}, refresh=False)
@@ -123,7 +123,7 @@ def build_mixture(
     for split, split_rows in splits.items():
         out = dirs[split]
         write_dict_rows(_ordered(split_rows), out, shard_size, start_shard=0)
-        manifest = new_manifest(cfg, mixture_name, mixture_hash, "mixture", tokens=True)
+        manifest = new_manifest(cfg, instruct_mixture_name, instruct_mixture_hash, "instruct_mixture", tokens=True)
         record_new_shards(manifest, out, 0, tokens=_tokens_per_shard(split_rows, shard_size))
         manifest.extra = {
             "split": split,

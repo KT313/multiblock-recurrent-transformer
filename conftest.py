@@ -30,7 +30,7 @@ def tiny_dataset_config() -> DatasetConfig:
 
 @pytest.fixture(scope="session")
 def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_config: DatasetConfig) -> Path:
-    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, mixtures/,
+    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, instruct_mixtures/,
     tokenizers/) that `config/tiny.yaml` expects under `dataset/`."""
     root: Path = tmp_path_factory.mktemp("tiny_dataset")
     build(tiny_dataset_config, DatasetLayout(root))
@@ -48,13 +48,13 @@ def tiny_pretrain_dir(tiny_layout: DatasetLayout) -> Path:
 
 
 @pytest.fixture(scope="session")
-def tiny_holdout_dir(tiny_layout: DatasetLayout) -> Path:
-    return tiny_layout.holdout_dir("synthetic_val")
+def tiny_validation_dir(tiny_layout: DatasetLayout) -> Path:
+    return tiny_layout.validation_dir("synthetic_val")
 
 
 @pytest.fixture(scope="session")
-def tiny_mixture_dirs(tiny_layout: DatasetLayout) -> dict[str, Path]:
-    return {split: tiny_layout.mixture_dir("tiny", "tiny_mixture", split) for split in ("train", "validation")}
+def tiny_instruct_dirs(tiny_layout: DatasetLayout) -> dict[str, Path]:
+    return {split: tiny_layout.instruct_mixture_dir("tiny", "tiny_instruct", split) for split in ("train", "validation")}
 
 
 @pytest.fixture(scope="session")

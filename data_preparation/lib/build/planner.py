@@ -14,7 +14,7 @@ from math import ceil
 from pathlib import Path
 
 from data_preparation.lib.schema.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.lib.schema.layout import MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
+from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 
 
@@ -25,7 +25,7 @@ def rows_for_budget(budget_tokens: float, tokens_per_row: float, margin: float =
 
 @dataclass
 class SourcePlan:
-    """State of one pretrain or holdout source. ``rows_needed``/``rows_to_fetch`` of a holdout are its ``rows``."""
+    """State of one pretrain or validation source. ``rows_needed``/``rows_to_fetch`` of a validation are its ``rows``."""
 
     name: str
     kind: str
@@ -40,23 +40,35 @@ class SourcePlan:
     complete: bool
     reason: str  # "ok", or what is missing
 
+    @property
+    def epochs(self) -> float | None:
+        """How often the rows on disk are cycled by the training sampler to serve ``budget_tokens`` (the largest
+        single-stage demand): ``budget ÷ tokens``; < 1 means only part of the data is seen. None without tokens."""
+        return _epochs(self.budget_tokens, self.tokens_present)
+
 
 @dataclass
-class MixturePlan:
+class InstructMixturePlan:
     name: str
     budget_tokens: int
     present: bool  # both split manifests exist
     current: bool  # ... and carry the current mixture hash
     short_sources: list[str]  # sources with fewer raw rows than the mixture needed and not exhausted
+    tokens_present: int  # tokens of the built train split (0 unless current)
     complete: bool
     reason: str
+
+    @property
+    def epochs(self) -> float | None:
+        """See :attr:`SourcePlan.epochs` (over the train split)."""
+        return _epochs(self.budget_tokens, self.tokens_present)
 
 
 @dataclass
 class Plan:
     sources: list[SourcePlan] = field(default_factory=list)
-    holdouts: list[SourcePlan] = field(default_factory=list)
-    mixtures: list[MixturePlan] = field(default_factory=list)
+    validations: list[SourcePlan] = field(default_factory=list)
+    instruct_mixtures: list[InstructMixturePlan] = field(default_factory=list)
     tokenizer_complete: bool = False
     complete: bool = False
 
@@ -66,15 +78,16 @@ class Plan:
         if not self.tokenizer_complete:
             lines.append("tokenizer: missing or stale")
         lines.extend(f"source {s.name}: {s.reason}" for s in self.sources if not s.complete)
-        lines.extend(f"holdout {s.name}: {s.reason}" for s in self.holdouts if not s.complete)
-        lines.extend(f"mixture {m.name}: {m.reason}" for m in self.mixtures if not m.complete)
+        lines.extend(f"validation {s.name}: {s.reason}" for s in self.validations if not s.complete)
+        lines.extend(f"instruct_mixture {m.name}: {m.reason}" for m in self.instruct_mixtures if not m.complete)
         return lines
 
     def summary(self) -> str:
-        """A fixed-width table of every planned item plus the tokenizer and overall state."""
-        header = ("item", "kind", "budget", "tokens", "rows", "needed", "fetch", "tok/row", "state", "reason")
+        """A fixed-width table of every planned item plus the tokenizer and overall state (``epochs``: how often
+        the training sampler cycles the rows on disk to serve the budget, see :attr:`SourcePlan.epochs`)."""
+        header = ("item", "kind", "budget", "tokens", "rows", "needed", "fetch", "tok/row", "epochs", "state", "reason")
         rows: list[tuple[str, ...]] = []
-        for s in self.sources + self.holdouts:
+        for s in self.sources + self.validations:
             state = "complete" if s.complete else "incomplete"
             if s.complete and s.exhausted:
                 state = "exhausted"
@@ -88,13 +101,14 @@ class Plan:
                     _fmt(s.rows_needed),
                     "-" if s.complete else _fmt(s.rows_to_fetch),
                     f"{s.tokens_per_row:.1f}",
+                    _fmt_epochs(s.epochs),
                     state,
                     s.reason,
                 )
             )
-        for m in self.mixtures:
-            rows.append((m.name, "mixture", _fmt(m.budget_tokens), "", "", "", "", "", "complete" if m.complete else "incomplete", m.reason))
-        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
+        for m in self.instruct_mixtures:
+            rows.append((m.name, "instruct_mixture", _fmt(m.budget_tokens), _fmt(m.tokens_present), "", "", "", "", _fmt_epochs(m.epochs), "complete" if m.complete else "incomplete", m.reason))
+        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
         widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
         lines = ["  ".join(h.ljust(w) for h, w in zip(header, widths))]
         lines.extend("  ".join(c.ljust(w) for c, w in zip(r, widths)) for r in rows)
@@ -104,6 +118,14 @@ class Plan:
 
 def _fmt(n: int) -> str:
     return f"{n:,}"
+
+
+def _epochs(budget_tokens: int, tokens_present: int) -> float | None:
+    return budget_tokens / tokens_present if tokens_present > 0 and budget_tokens > 0 else None
+
+
+def _fmt_epochs(epochs: float | None) -> str:
+    return "-" if epochs is None else f"{epochs:.2f}"
 
 
 # --- planning ----------------------------------------------------------------------------------------------------------
@@ -116,18 +138,18 @@ def plan(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
     for name in cfg.sources_of_kind("pretrain"):
         if cfg.source_budget_tokens(name) > 0:
             result.sources.append(_plan_pretrain(cfg, name, layout, tokenizer_complete))
-    used_holdouts = {key for stage in cfg.stages for key in stage.val}
-    for name in cfg.sources_of_kind("holdout"):
-        if name in used_holdouts:
-            result.holdouts.append(_plan_holdout(cfg, name, layout, tokenizer_complete))
-    for name in cfg.mixtures:
-        if cfg.mixture_budget_tokens(name) > 0:
-            result.mixtures.append(_plan_mixture(cfg, name, layout, tokenizer_complete))
+    used_validations = {key for stage in cfg.stages for key in stage.val}
+    for name in cfg.sources_of_kind("validation"):
+        if name in used_validations:
+            result.validations.append(_plan_validation(cfg, name, layout, tokenizer_complete))
+    for name in cfg.instruct_mixtures:
+        if cfg.instruct_mixture_budget_tokens(name) > 0:
+            result.instruct_mixtures.append(_plan_instruct_mixture(cfg, name, layout, tokenizer_complete))
     result.complete = (
         tokenizer_complete
         and all(s.complete for s in result.sources)
-        and all(h.complete for h in result.holdouts)
-        and all(m.complete for m in result.mixtures)
+        and all(h.complete for h in result.validations)
+        and all(m.complete for m in result.instruct_mixtures)
     )
     return result
 
@@ -156,9 +178,9 @@ def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict
     (the build removes those directories before rerunning the stage)."""
     problems: dict[str, str] = {}
     source_hash = cfg.source_hash(name)
-    stages = ("holdout",) if cfg.sources[name].kind == "holdout" else SOURCE_STAGES
+    stages = ("validation",) if cfg.sources[name].kind == "validation" else SOURCE_STAGES
     for stage in stages:
-        directory = layout.holdout_dir(name) if stage == "holdout" else layout.source_dir(name, stage)
+        directory = layout.validation_dir(name) if stage == "validation" else layout.source_dir(name, stage)
         manifest = Manifest.load(directory)
         if manifest is None:
             continue
@@ -187,23 +209,18 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     tokens_present = (processed.tokens() or 0) if processed is not None else 0
 
     tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))  # counts are capped there
-    if raw is not None and processed is not None and not source.repeat_to_budget:
+    if raw is not None and processed is not None:
         measured = _measured_tokens_per_row(raw, processed)
         if measured is not None:
             tokens_per_row = measured
     rows_needed = rows_for_budget(budget, tokens_per_row)
-    if source.repeat_to_budget:
-        rows_to_fetch = 0 if raw is not None and raw.rows_fetched > 0 else rows_needed
-    else:
-        rows_to_fetch = max(0, rows_needed - rows_present)
+    rows_to_fetch = max(0, rows_needed - rows_present)
 
     if problem is None and raw is not None and filtered is not None and processed is not None:
         if len(filtered.extra.get("input_shards", [])) != len(raw.shards):
             problem = "filtered: behind raw"
         elif processed.extra.get("input_shards") != [[s.name, s.rows] for s in filtered.shards]:
             problem = "processed: behind filtered"
-        elif source.repeat_to_budget and processed.extra.get("target_tokens") != budget:
-            problem = f"processed: repeated to {processed.extra.get('target_tokens')} tokens, budget is {budget}"
         elif tokens_present < budget and not exhausted:
             problem = f"tokens {tokens_present} < budget {budget}"
     if problem is None and not tokenizer_complete:
@@ -237,22 +254,22 @@ def _measured_tokens_per_row(raw: Manifest, processed: Manifest) -> float | None
     return tokens / raw_rows
 
 
-def _plan_holdout(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
+def _plan_validation(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
     source = cfg.sources[name]
     wanted = int(source.rows or 0)
-    manifest, problem = _current(layout.holdout_dir(name), cfg.source_hash(name), "holdout")
+    manifest, problem = _current(layout.validation_dir(name), cfg.source_hash(name), "validation")
     rows_present = manifest.rows() if manifest is not None else 0
     tokens_present = (manifest.tokens() or 0) if manifest is not None else 0
     exhausted = manifest is not None and rows_present < wanted
     if problem is None and manifest is not None and manifest.extra.get("requested_rows") != wanted:
-        problem = f"holdout: has {rows_present} rows, config wants {wanted}"
+        problem = f"validation: has {rows_present} rows, config wants {wanted}"
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
     tokens_per_row = tokens_present / rows_present if rows_present > 0 else float(min(source.tokens_per_row_estimate, cfg.max_seq_length))
     reason = problem or ("ok" if not exhausted else f"exhausted at {rows_present} of {wanted} rows")
     return SourcePlan(
         name=name,
-        kind="holdout",
+        kind="validation",
         budget_tokens=0,
         tokens_per_row=tokens_per_row,
         rows_needed=wanted,
@@ -266,25 +283,27 @@ def _plan_holdout(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenize
     )
 
 
-def _plan_mixture(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> MixturePlan:
-    mixture = cfg.mixtures[name]
-    mixture_hash = cfg.mixture_hash(name)
-    budget = cfg.mixture_budget_tokens(name)
-    dirs = {split: layout.mixture_dir(cfg.name, name, split) for split in MIXTURE_SPLITS}
+def _plan_instruct_mixture(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> InstructMixturePlan:
+    mixture = cfg.instruct_mixtures[name]
+    instruct_mixture_hash = cfg.instruct_mixture_hash(name)
+    budget = cfg.instruct_mixture_budget_tokens(name)
+    dirs = {split: layout.instruct_mixture_dir(cfg.name, name, split) for split in INSTRUCT_MIXTURE_SPLITS}
     loaded = {split: Manifest.load(path) for split, path in dirs.items()}
     present = all(m is not None for m in loaded.values())
     problem: str | None = None
     manifests: dict[str, Manifest] = {}
     for split, path in dirs.items():
-        manifest, split_problem = _current(path, mixture_hash, "mixture")
+        manifest, split_problem = _current(path, instruct_mixture_hash, "instruct_mixture")
         if manifest is None:
             problem = problem or f"{split} {split_problem}"
         else:
             manifests[split] = manifest
-    current = len(manifests) == len(MIXTURE_SPLITS)
+    current = len(manifests) == len(INSTRUCT_MIXTURE_SPLITS)
     short: list[str] = []
+    tokens_present = 0
     if current:
         train = manifests["train"]
+        tokens_present = train.tokens() or 0
         raw_shards: dict[str, list[list[object]]] = {}
         for src in mixture.sources:
             raw, raw_problem = _current(layout.source_dir(src, "raw"), cfg.source_hash(src), "raw")
@@ -302,15 +321,16 @@ def _plan_mixture(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenize
             problem = f"short sources {short}"
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
-    return MixturePlan(
+    return InstructMixturePlan(
         name=name,
         budget_tokens=budget,
         present=present,
         current=current,
         short_sources=short,
+        tokens_present=tokens_present,
         complete=problem is None,
         reason=problem or "ok",
     )
 
 
-__all__ = ["MixturePlan", "Plan", "SourcePlan", "plan", "rows_for_budget", "stage_problems"]
+__all__ = ["InstructMixturePlan", "Plan", "SourcePlan", "plan", "rows_for_budget", "stage_problems"]

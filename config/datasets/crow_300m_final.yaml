@@ -97,7 +97,8 @@ sources:
     revision: 740312add88f781978c0658806c59bc2815b9866
     load_kwargs: {name: main}
     converter: gsm8k_question_answer               # question + answer -> text
-    repeat_to_budget: true                         # 7.5k rows: repeated to fill the budget instead of sliced
+    # 7.5k rows in total: smaller than its budget in the full run, so the training sampler cycles it (see `epochs`
+    # in the status table)
     tokens_per_row_estimate: 300
   # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). The
   # `github_code` loader reads the repo's 880 `data/*.parquet` files through the Hub cache, so every language source
@@ -114,9 +115,9 @@ sources:
   github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, tokens_per_row_estimate: 500}
   github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, tokens_per_row_estimate: 500}
 
-  # --- held-out validation (kind: holdout) --------------------------------------------------------------------------
+  # --- held-out validation (kind: validation) --------------------------------------------------------------------------
   fineweb_val:
-    kind: holdout
+    kind: validation
     loader: hf_files
     hf_id: HuggingFaceFW/fineweb-edu
     revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
@@ -125,7 +126,7 @@ sources:
     seed: 42
     tokens_per_row_estimate: 2000
 
-  # --- instruction tuning (kind: instruct), consumed through the flan_mixture below ----------------------------------
+  # --- instruction tuning (kind: instruct), consumed through the flan_instruct below ----------------------------------
   # Every repo uses `hf_files`: multi-file parquet repos one file at a time through the Hub cache, the single-file
   # JSON-array repos (metamath 396 MB, wizardlm 375 MB, sharegpt 671 MB, evol_code 122 MB) streamed incrementally
   # from the start with `ijson` so a build reads only the prefix it needs instead of downloading the whole file.
@@ -138,8 +139,8 @@ sources:
   sharegpt:    {kind: instruct, loader: hf_files, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, tokens_per_row_estimate: 400}
   wizardlm:    {kind: instruct, loader: hf_files, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, tokens_per_row_estimate: 400}
 
-mixtures:
-  flan_mixture:
+instruct_mixtures:
+  flan_instruct:
     sources: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
     max_tokens: 2048
     input_inversions: 0.05
@@ -195,5 +196,5 @@ stages:
   - name: finetune
     tokens: 150_000_000
     transition_pct: 0.0
-    train: {flan_mixture: 1.0}
-    val: {flan_mixture/validation: 1.0}
+    train: {flan_instruct: 1.0}
+    val: {flan_instruct/validation: 1.0}

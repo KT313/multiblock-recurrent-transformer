@@ -3,10 +3,10 @@
 with it, so the documentation of the thesis mixture cannot drift from ``config/datasets/crow_300m_final.yaml``).
 
 Pure function of the config file: tokenizer and processing defaults, one table per stage (weights and derived
-token budgets), one per mixture (shares and derived example counts), holdouts and the source registry. The leading
+token budgets), one per mixture (shares and derived example counts), validation sources and the source registry. The leading
 comment block of the YAML file (the lines starting with ``#`` before the first key) is rendered as the "Notes"
 section, so config-specific remarks live next to the config. Numbers are the same arithmetic the planner uses
-(``DatasetConfig.source_budget_tokens`` / ``mixture_budget_tokens``); estimates use ``tokens_per_row_estimate``.
+(``DatasetConfig.source_budget_tokens`` / ``instruct_mixture_budget_tokens``); estimates use ``tokens_per_row_estimate``.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ def describe(cfg: DatasetConfig, config_path: str | Path, notes: str = "") -> st
         lines += ["## Notes", "", notes.strip(), ""]
     lines += _general(cfg)
     lines += _stages(cfg)
-    lines += _mixtures(cfg)
-    lines += _holdouts(cfg)
+    lines += _instruct_mixtures(cfg)
+    lines += _validations(cfg)
     lines += _sources(cfg)
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -120,12 +120,12 @@ def _stages(cfg: DatasetConfig) -> list[str]:
     return lines
 
 
-def _mixtures(cfg: DatasetConfig) -> list[str]:
-    if not cfg.mixtures:
+def _instruct_mixtures(cfg: DatasetConfig) -> list[str]:
+    if not cfg.instruct_mixtures:
         return []
     lines = ["## Instruct mixtures", ""]
-    for name, mixture in cfg.mixtures.items():
-        budget = cfg.mixture_budget_tokens(name)
+    for name, mixture in cfg.instruct_mixtures.items():
+        budget = cfg.instruct_mixture_budget_tokens(name)
         lines += [
             f"### `{name}` ({_tokens(budget)} tokens budget)",
             "",
@@ -142,8 +142,8 @@ def _mixtures(cfg: DatasetConfig) -> list[str]:
     return lines
 
 
-def _holdouts(cfg: DatasetConfig) -> list[str]:
-    names = cfg.sources_of_kind("holdout")
+def _validations(cfg: DatasetConfig) -> list[str]:
+    names = cfg.sources_of_kind("validation")
     if not names:
         return []
     lines = ["## Held-out validation sets", "", "| Source | Rows | Seed | Loader | Origin |", "|---|---:|---:|---|---|"]
@@ -166,12 +166,12 @@ def _sources(cfg: DatasetConfig) -> list[str]:
 
 def _key(cfg: DatasetConfig, key: str) -> str:
     base = key.partition("/")[0]
-    return f"`{key}` (mixture)" if base in cfg.mixtures else f"`{key}`"
+    return f"`{key}` (instruct_mixture)" if base in cfg.instruct_mixtures else f"`{key}`"
 
 
 def _estimate(cfg: DatasetConfig, key: str) -> str:
     base = key.partition("/")[0]
-    if base in cfg.mixtures:
+    if base in cfg.instruct_mixtures:
         return "-"
     return str(cfg.sources[base].tokens_per_row_estimate)
 
@@ -204,8 +204,6 @@ def _details(cfg: DatasetConfig, name: str) -> str:
         parts.append(f"filter `{src.filter}`")
     if src.check_limit is not None:
         parts.append(f"check_limit {src.check_limit:,}")
-    if src.repeat_to_budget:
-        parts.append("repeated to budget")
     if src.kind == "pretrain":
         parts.append(f"budget {_tokens(cfg.source_budget_tokens(name))}")
         if src.processing is not None:

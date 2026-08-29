@@ -10,7 +10,7 @@ with `uv run ...`; the implementation lives in `lib/` (tests beside every module
 ## The dataset config
 
 ```yaml
-name: crow-300m-final                    # -> dataset/mixtures/crow-300m-final/
+name: crow-300m-final                    # -> dataset/instruct_mixtures/crow-300m-final/
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
 max_seq_length: 2048                     # token-count cap per document; the run config's block_size must be <= this
 token_count: tokenizer                   # count with the real tokenizer (or: estimate = chars / 4)
@@ -24,26 +24,26 @@ sources:                                 # keyed by name; `kind` selects the pip
   fineweb_edu: {kind: pretrain, loader: hf_split, hf_id: HuggingFaceFW/fineweb-edu, revision: <sha>,
                 load_kwargs: {name: CC-MAIN-2013-20}, tokens_per_row_estimate: 2000}
   gsm8k:       {kind: pretrain, loader: hf_split, hf_id: openai/gsm8k, revision: <sha>, load_kwargs: {name: main},
-                converter: gsm8k_question_answer, repeat_to_budget: true, tokens_per_row_estimate: 300}
-  fineweb_val: {kind: holdout, loader: hf_split, hf_id: HuggingFaceFW/fineweb-edu, revision: <sha>,
+                converter: gsm8k_question_answer, tokens_per_row_estimate: 300}
+  fineweb_val: {kind: validation, loader: hf_split, hf_id: HuggingFaceFW/fineweb-edu, revision: <sha>,
                 load_kwargs: {name: sample-10BT}, rows: 50000, seed: 42}
   flan:        {kind: instruct, loader: hf_stream, hf_id: Open-Orca/FLAN, revision: <sha>,
                 fields: {instruction: inputs, output: targets}, tokens_per_row_estimate: 300}
-mixtures:                                # instruct mixtures, built per dataset config from `instruct` sources
-  flan_mixture: {sources: {flan: 1.0}, max_tokens: 2048, input_inversions: 0.05, val_split: 0.05, seed: 42}
+instruct_mixtures:                                # instruct mixtures, built per dataset config from `instruct` sources
+  flan_instruct: {sources: {flan: 1.0}, max_tokens: 2048, input_inversions: 0.05, val_split: 0.05, seed: 42}
 stages:                                  # the training curriculum; weights per stage sum to 1
   - {name: pretrain_phase1, tokens: 3_300_000_000, transition_pct: 0.10,
      train: {fineweb_edu: 0.99, gsm8k: 0.01}, val: {fineweb_val: 1.0}}
-  - {name: finetune, tokens: 150_000_000, train: {flan_mixture: 1.0}, val: {flan_mixture/validation: 1.0}}
+  - {name: finetune, tokens: 150_000_000, train: {flan_instruct: 1.0}, val: {flan_instruct/validation: 1.0}}
 ```
 
 Three source kinds: `pretrain` (a `text` column, goes through the processing pipeline and can be used in `train`),
-`holdout` (a fixed number of rows for validation only, no dedup/filters) and `instruct` (`instruction/input/output`
+`validation` (a fixed number of rows for validation only, no dedup/filters) and `instruct` (`instruction/input/output`
 rows, only usable through a mixture; `<mixture>`, `<mixture>/train` and `<mixture>/validation` are the stage keys).
 The schema with every field and the validation rules is `lib/schema/dataset_config.py`; loading fails on unknown
-loader/converter names, weights that do not sum to 1, holdouts in `train`, and so on. The configs in the tree are
+loader/converter names, weights that do not sum to 1, validation sources in `train`, and so on. The configs in the tree are
 `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is generated from it),
-`config/datasets/crow_300m_mini.yaml` (the same sources with 300k / 150k / 60k-token budgets and a 40-row holdout:
+`config/datasets/crow_300m_mini.yaml` (the same sources with 300k / 150k / 60k-token budgets and a 40-row validation:
 a real-source smoke build of a few MB that finishes in minutes and exercises every loader; needs `HF_TOKEN` for
 `mini-peS2o`; `tools/capped_download.sh 500 uv run python data_preparation/prepare.py build --dataset_config
 config/datasets/crow_300m_mini.yaml` runs it under a hard download cap) and `config/datasets/tiny.yaml` (synthetic,
@@ -57,15 +57,15 @@ dataset/
 │   ├── raw/          MANIFEST.json + data-*.parquet     rows as fetched (converter applied), append-only
 │   ├── filtered/     MANIFEST.json + data-*.parquet     length filter, one shard per raw shard
 │   ├── processed/    MANIFEST.json + data-*.parquet     dedup / filters / token counts   <- training reads this
-│   └── holdout/      MANIFEST.json + data-*.parquet     `holdout` sources only            <- validation reads this
-├── mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
+│   └── validation/      MANIFEST.json + data-*.parquet     `validation` sources only            <- validation reads this
+├── instruct_mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
 ├── tokenizers/<tokenizer name>/                            MANIFEST.json + tokenizer files
 ├── hub_index/<repo>@<revision>/<glob hash>.json            file lists, sizes, row counts + parquet row-group layout of `hf_files` / `github_code` repos
 └── benchmarks/                                             cached benchmark test sets (decontamination only)
 ```
 
 `sources/` is shared by every dataset config and by every stage that uses the source (stages 1 and 2 of the thesis
-config draw from the same `fineweb_edu/processed`, only with different weights). Only mixtures are per config.
+config draw from the same `fineweb_edu/processed`, only with different weights). Only instruct mixtures are per config.
 Every directory carries a `MANIFEST.json` (`lib/storage/manifest.py`): the `source_hash` of the config that built
 it (loader settings + processing + token-count mode; budgets and weights are *not* part of it), rows and tokens per
 shard, the loader offset reached, tokenizer and library versions. A manifest whose hash differs from the current
@@ -76,7 +76,7 @@ place, so an interrupted build never leaves a half-written stage behind.
 
 ```bash
 uv run python data_preparation/prepare.py build    --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-        [--sources NAME ...] [--steps tokenizer download filter process holdout mixtures] [--num_workers N]
+        [--sources NAME ...] [--steps tokenizer download filter process validation instruct_mixtures] [--num_workers N]
         [--hf_token T] [--cache_dir DIR] [--dry_run]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
@@ -84,13 +84,13 @@ uv run python data_preparation/prepare.py tiny     # = build --dataset_config co
 ```
 
 - `build` computes the plan (what the config needs versus what the manifests say is there) and runs only the
-  missing parts, in the order tokenizer → pretrain sources (download → filter → process) → holdouts → mixtures.
+  missing parts, in the order tokenizer → pretrain sources (download → filter → process) → validation sources → instruct mixtures.
   `--sources` / `--steps` restrict it, `--dry_run` prints the plan and writes nothing. A failing source is a
   failing build (exit 1) — never a silently smaller dataset.
 - `status` prints the same table (rows/tokens present versus needed, fetch increment, manifest state) and exits 0
   iff the dataset is complete.
 - `describe` renders the config as Markdown (tokenizer, processing defaults, stage tables with derived token
-  budgets, mixture tables with derived example counts, holdouts, sources). The comment block at the top of the YAML
+  budgets, mixture tables with derived example counts, validation sources, sources). The comment block at the top of the YAML
   becomes its "Notes" section. `docs/data_mixture.md` is that output for the crow config; regenerate it after
   editing the config.
 
@@ -104,8 +104,9 @@ before the first build. The download increment is `rows needed − rows present`
 than needed on disk, see "Where things are cached"; that is fine, the next plan simply has nothing to fetch). If the processed
 tokens still fall short of the budget, the runner (`lib/build/runner.py`) refines the estimate with the measured
 value and fetches another increment — at most 5 rounds, then an error. A loader that runs dry marks the source
-`exhausted`; the build completes with a warning. `repeat_to_budget` sources (gsm8k) are fetched whole once and
-their rows repeated at process time.
+`exhausted`; the build completes with a warning. Nothing is repeated on disk: the training sampler draws every
+source with its stage weight and restarts a source that runs out, so a small source (gsm8k in the full run) is simply
+cycled more often — the `epochs` column of the status table (`budget ÷ tokens on disk`) shows how often.
 
 Sources are append-only and deterministic: loaders read the repo's files in sorted order, one file at a time
 (`hf_files`, `github_code`), fetch `train[offset:offset+count]` at a pinned `revision` (`hf_split`), stream with
@@ -133,7 +134,7 @@ Two caches, with different lifetimes:
   the end, so a top-up inside a partially consumed file re-streams that one file from its start — a prefix read,
   a few MB for the first few hundred rows).
 * **`dataset/sources/<source>/raw/`**: the rows this pipeline kept, in shards, with a manifest — the append-only
-  source cache that `filter` / `process` / mixtures are built from. `dataset/hub_index/` holds the small JSON file
+  source cache that `filter` / `process` / instruct mixtures are built from. `dataset/hub_index/` holds the small JSON file
   indexes (file list per glob, rows per file, row-group layout and per-language rows per row group) that let `hf_files` fetch at an offset without opening earlier files;
   it is safe to delete (rebuilt on demand from the repo listing, the file sizes and the cached / remote files).
 
@@ -141,7 +142,7 @@ Two caches, with different lifetimes:
 
 `build` shows a bar over the plan items and every stage shows its own (`<source>: download` with the rows kept,
 source rows consumed and the current repo file; `length_filter` per shard; `process` per row with the running token
-count; `holdout`; `build_mixture` per source and per step). Bars go to stderr and are disabled automatically when
+count; `validation`; `build_instruct_mixture` per source and per step). Bars go to stderr and are disabled automatically when
 stderr is not a terminal or when `DATA_PREP_PROGRESS=0` is set; log lines are written through `tqdm.write` so they
 do not garble the bars. `hf_hub_download` prints its own byte-level bar per file.
 
@@ -171,7 +172,7 @@ Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -
 | `local` | your own data | `path:` directory of `*.parquet` / `*.jsonl` files, read in sorted file order |
 | `synthetic` | tests / smoke runs | random-word rows from `seed:` |
 
-Pretrain and holdout sources need a text column (`text_field`, default `text`); instruct sources need either
+Pretrain and validation sources need a text column (`text_field`, default `text`); instruct sources need either
 `fields: {instruction: <col>, input: <col>, output: <col>}` (input optional) or a `converter`. Converters and filters
 (`lib/sources/converters.py`) turn one source row into the row the pipeline expects: `gsm8k_question_answer`
 (question + answer → `text`), `sharegpt_conversations` (`from`/`value` turns → instruction/output),
@@ -188,18 +189,18 @@ reference it by name in the YAML. A converter raising `ValueError` skips the row
 ```yaml
 sources:
   my_corpus: {kind: pretrain, loader: local, path: /data/my_corpus, text_field: text, tokens_per_row_estimate: 800}
-  my_val:    {kind: holdout,  loader: local, path: /data/my_corpus, rows: 2000, seed: 1}
+  my_val:    {kind: validation,  loader: local, path: /data/my_corpus, rows: 2000, seed: 1}
 ```
 
-`local` reads every `*.parquet` / `*.jsonl` file directly under `path` in sorted order. A holdout over the same
+`local` reads every `*.parquet` / `*.jsonl` file directly under `path` in sorted order. A validation over the same
 directory takes the **last** `rows` rows, so it stays disjoint from a training source reading the first rows as long
-as the training source needs fewer than `total − rows` rows (for `hf_split` holdouts choose a different split or
-subset, as the crow config does with fineweb-edu's `sample-10BT`; `hf_stream` holdouts take the first rows).
+as the training source needs fewer than `total − rows` rows (for `hf_split` validation sources choose a different split or
+subset, as the crow config does with fineweb-edu's `sample-10BT`; `hf_stream` validation sources take the first rows).
 
 ## Processing toggles
 
 `process` (`lib/stages/pretrain.py`) runs per pretrain source, in this order: exact dedup → quality filter →
-decontamination → token counting → fuzzy dedup → repetition (`repeat_to_budget`). Each is configured in the
+decontamination → token counting → fuzzy dedup. Each is configured in the
 `processing` block (dataset-level default, per-source override):
 
 - `dedup.mode: exact` (default) hashes the normalized text (lowercased, whitespace collapsed; `normalize: false` for

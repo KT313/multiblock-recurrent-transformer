@@ -2,13 +2,13 @@
 """Entry point for dataset preparation.
 
     python data_preparation/prepare.py build  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-                                              [--sources S ...] [--steps tokenizer download filter process holdout mixtures]
+                                              [--sources S ...] [--steps tokenizer download filter process validation instruct_mixtures]
                                               [--num_workers N] [--hf_token T] [--dry_run]
     python data_preparation/prepare.py status --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny   # = build --dataset_config config/datasets/tiny.yaml
 
-``build`` materialises a dataset config (tokenizer -> pretrain sources -> holdouts -> mixtures; see
+``build`` materialises a dataset config (tokenizer -> pretrain sources -> validation sources -> instruct mixtures; see
 ``lib/build/runner.py``), ``status`` prints the plan and exits 0 iff the dataset is complete, ``describe`` renders
 the config as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir`` relocates the HuggingFace
 caches. Any failure logs the exception and exits 1.
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
 
     def build_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / mixtures")
+        sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / instruct mixtures")
         sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
         sub.add_argument("--num_workers", type=int, default=1, help="worker processes for processing stages")
         sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")

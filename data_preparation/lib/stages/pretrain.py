@@ -41,7 +41,6 @@ from data_preparation.lib.stages.row_pipeline import (
     check_quality,
     preprocess_batch,
 )
-from data_preparation.lib.sources import repeat_indices
 from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
@@ -129,13 +128,13 @@ def process(
     *,
     shard_size: int = DEFAULT_SHARD_SIZE,
     num_workers: int = 1,
-    target_tokens: int | None = None,
 ) -> Manifest:
     """Stream all filtered shards in order through exact dedup -> quality filter -> decontamination -> token count
-    -> fuzzy dedup -> ``repeat_to_budget`` and write processed shards (``text``, ``source``, ``tokens``).
+    -> fuzzy dedup and write processed shards (``text``, ``source``, ``tokens``). Every kept row is written once;
+    a source smaller than its budget is cycled by the training sampler, not repeated on disk.
 
-    Skipped entirely when the filtered shard list (and, for ``repeat_to_budget`` sources, ``target_tokens``) matches
-    what the processed manifest recorded; otherwise the processed directory is rewritten from shard 0.
+    Skipped entirely when the filtered shard list matches what the processed manifest recorded; otherwise the
+    processed directory is rewritten from shard 0.
     """
     source = cfg.sources[name]
     if source.kind != "pretrain":
@@ -147,11 +146,7 @@ def process(
     filtered = require_manifest(filtered_dir, source_hash, "filtered", name)
     input_shards = shard_list(filtered)
     existing = current_manifest(out, source_hash, "processed")
-    if (
-        existing is not None
-        and existing.extra.get("input_shards") == input_shards
-        and (not source.repeat_to_budget or existing.extra.get("target_tokens") == target_tokens)
-    ):
+    if existing is not None and existing.extra.get("input_shards") == input_shards:
         return existing
 
     log.info("%s: processing %d filtered shard(s) -> %s", name, len(filtered.shards), out)
@@ -174,15 +169,13 @@ def process(
         rows = _count_tokens(rows, counter, name, shard_size, bar)
         if processing.dedup.mode == "minhash":
             rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
-        if source.repeat_to_budget:
-            rows = _repeat_to_budget(list(rows), target_tokens, stats)
         rows = _accumulate_tokens(rows, token_sums, shard_size)
         write_dict_rows(rows, out, shard_size, start_shard=0)
 
     manifest = new_manifest(cfg, name, source_hash, "processed", tokens=True)
     manifest.rows_fetched = filtered.rows_fetched
     record_new_shards(manifest, out, 0, tokens=dict(zip((s.name for s in _sorted_shards(out)), token_sums)))
-    manifest.extra = {"input_shards": input_shards, "target_tokens": target_tokens, "stats": stats}
+    manifest.extra = {"input_shards": input_shards, "stats": stats}
     manifest.save(out)
     log.info("%s: %d rows, %s tokens", name, manifest.rows(), manifest.tokens())
     return manifest
@@ -294,24 +287,6 @@ def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_s
         for row, n in zip(chunk, tokens):
             yield {"text": row["text"], "source": name, "tokens": n}
 
-
-def _repeat_to_budget(rows: list[Row], target_tokens: int | None, stats: dict[str, Any]) -> Iterator[Row]:
-    """Cycle through the kept rows until their token sum reaches ``target_tokens`` (``repeat_indices``)."""
-    total = sum(int(r["tokens"]) for r in rows)
-    stats["repeat_to_budget"] = {"unique_rows": len(rows), "unique_tokens": total, "target_tokens": target_tokens}
-    if target_tokens is None or not rows or total <= 0 or total >= target_tokens:
-        yield from rows
-        return
-    copies, remainder = divmod(target_tokens, total)
-    extra_rows = 0
-    running = 0
-    while running < remainder:
-        running += int(rows[extra_rows]["tokens"])
-        extra_rows += 1
-    indices = repeat_indices(len(rows), copies * len(rows) + extra_rows)
-    stats["repeat_to_budget"]["repeated_rows"] = len(indices)
-    for i in indices:
-        yield rows[i]
 
 
 def _accumulate_tokens(rows: Iterator[Row], sums: list[int], shard_size: int) -> Iterator[Row]:

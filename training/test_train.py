@@ -117,7 +117,7 @@ def test_build_stage_dataloaders(
     assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
     assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
-    assert val_ids == ["finetune-tiny_mixture-validation"] * tiny_settings.micro_batch_size
+    assert val_ids == ["finetune-tiny_instruct-validation"] * tiny_settings.micro_batch_size
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
@@ -346,7 +346,7 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
 def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
     logged: Logged = full_run["logged"]
     assert logged[3]["data_composition/pretrain_a-synthetic_pretrain"] == pytest.approx(1.0)
-    assert logged[18]["data_composition/finetune-tiny_mixture"] == pytest.approx(1.0)
+    assert logged[18]["data_composition/finetune-tiny_instruct"] == pytest.approx(1.0)
     for done in range(15, 17):  # inside the 1 -> 2 transition both mixtures may appear, weights sum to 1
         total = sum(v for k, v in logged[done].items() if k.startswith("data_composition/"))
         assert total == pytest.approx(1.0)
@@ -408,7 +408,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert logged[done]["stage/in_transition"] == full[done]["stage/in_transition"]
         assert logged[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in logged.items() if "val_loss" in m] == [16, 20]
-    assert logged[16]["data_composition/finetune-tiny_mixture"] == pytest.approx(0.5, abs=0.5)  # transition mix
+    assert logged[16]["data_composition/finetune-tiny_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
 
 
 def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:

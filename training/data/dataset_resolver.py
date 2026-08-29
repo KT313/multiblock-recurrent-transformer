@@ -82,11 +82,11 @@ def _entries(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, keys: d
     for key, weight in keys.items():
         base, _, split = key.partition("/")
         prefix = f"{stage_name}-{key.replace('/', '-')}"
-        if base in cfg.mixtures:
+        if base in cfg.instruct_mixtures:
             entries.append(
                 DataEntry(
                     prefix=prefix,
-                    data_dir=str(layout.mixture_dir(cfg.name, base, split or "train")),
+                    data_dir=str(layout.instruct_mixture_dir(cfg.name, base, split or "train")),
                     weight=weight,
                     data_signature=dict(INSTRUCT_DATA_SIGNATURE),
                 )
@@ -95,9 +95,9 @@ def _entries(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, keys: d
         kind = cfg.sources[base].kind
         if kind == "pretrain":
             data_dir = layout.source_dir(base, "processed")
-        elif kind == "holdout":
-            data_dir = layout.holdout_dir(base)
-        else:  # unreachable: DatasetConfig rejects instruct sources outside mixtures
+        elif kind == "validation":
+            data_dir = layout.validation_dir(base)
+        else:  # unreachable: DatasetConfig rejects instruct sources outside instruct mixtures
             raise ValueError(f"stage {stage_name}: source {base!r} of kind {kind!r} cannot be used directly")
         entries.append(DataEntry(prefix=prefix, data_dir=str(data_dir), weight=weight))
     if len({e.prefix for e in entries}) != len(entries):
@@ -110,7 +110,7 @@ def resolve_entries(
 ) -> tuple[list[DataEntry], list[DataEntry]]:
     """`(train_data, val_data)` of one dataset-config stage.
 
-    A pretrain source maps to `sources/<name>/processed`, a holdout source to `sources/<name>/holdout` (both read
+    A pretrain source maps to `sources/<name>/processed`, a validation source to `sources/<name>/validation` (both read
     the `text` column); `<mixture>` / `<mixture>/train` / `<mixture>/validation` map to the per-config mixture
     split with the instruction/input/output signature. Prefixes are `<stage>-<key>` and unique per stage.
     """

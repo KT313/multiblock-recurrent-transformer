@@ -36,8 +36,6 @@ from data_preparation.lib.sources import (
 log = get_logger(__name__)
 
 DEFAULT_SHARD_SIZE = 10_000
-WHOLE_SOURCE = 10**9  # `count` passed to a loader when a source is fetched completely (repeat_to_budget)
-
 
 # --- token counting ----------------------------------------------------------------------------------------------------
 
@@ -124,7 +122,7 @@ def require_manifest(directory: Path, source_hash: str, stage: str, what: str) -
 
 
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
-    """Apply a pretrain/holdout source's converter (if any) and check that ``text_field`` is present."""
+    """Apply a pretrain/validation source's converter (if any) and check that ``text_field`` is present."""
     converter = get_converter(source)
     if converter is not None:
         row = converter(row)
@@ -180,12 +178,12 @@ def download(
 ) -> Manifest:
     """Append raw shards until ``rows_needed`` rows are on disk (no-op if they already are).
 
-    ``manifest.rows_fetched`` is the loader offset reached (source rows consumed); for pretrain/holdout sources
+    ``manifest.rows_fetched`` is the loader offset reached (source rows consumed); for pretrain/validation sources
     every row is kept (converter applied, ``text_field`` guaranteed), for instruct sources the converter and filter
     run at download time and only standardized ``{instruction, input, output}`` rows are stored — malformed rows
     (converter raises ``ValueError``) are skipped and counted in ``extra["skipped_malformed"]``; ``check_limit``
     bounds the number of source rows inspected in total. A loader that yields fewer rows than requested sets
-    ``extra["exhausted"]``; ``repeat_to_budget`` sources are fetched whole once (repetition happens in ``process``).
+    ``extra["exhausted"]`` (a source smaller than its budget is cycled by the training sampler).
 
     ``rows_needed`` is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
     (see ``sources/loaders.py``), **every** row it yields is written and ``rows_fetched`` advances to that row-group
@@ -200,10 +198,7 @@ def download(
     if manifest.extra.get("exhausted"):
         log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
         return manifest
-    if source.repeat_to_budget:
-        wanted = WHOLE_SOURCE if manifest.rows_fetched == 0 else 0
-    else:
-        wanted = rows_needed - manifest.rows()
+    wanted = rows_needed - manifest.rows()
     if wanted <= 0:
         return manifest
     max_consume = None if source.check_limit is None else source.check_limit - manifest.rows_fetched
@@ -212,11 +207,11 @@ def download(
         manifest.save(out)
         return manifest
 
-    log.info("%s: fetching %s rows from offset %d -> %s", name, "all" if wanted == WHOLE_SOURCE else wanted, manifest.rows_fetched, out)
+    log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
     stats = {"consumed": 0, "kept": 0, "skipped_malformed": 0, "exhausted": False}
     start_shard = len(manifest.shards)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
-    with progress(total=None if wanted == WHOLE_SOURCE else wanted, desc=f"{name}: download", unit="row") as bar:
+    with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, stats, layout, bar)
         write_dict_rows(rows, out, shard_size, start_shard=start_shard)
     record_new_shards(manifest, out, start_shard)
@@ -250,8 +245,6 @@ def _fetch_rows(
     row_filter = get_filter(source.filter) if source.filter is not None else None
     if source.kind == "instruct" and converter is None and source.loader != "synthetic":
         raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
-    if source.repeat_to_budget and source.loader == "synthetic":
-        raise ValueError(f"{name}: repeat_to_budget needs a finite source, the synthetic loader is unbounded")
     columns = loader_columns(source)
     postfix: dict[str, Any] = {"consumed": 0}
     fetch_stats = FetchStats()
@@ -305,7 +298,7 @@ def _fetch_rows(
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
-    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain/holdout sources read as-is,
+    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain/validation sources read as-is,
     None (every column) when a converter or ``fields`` mapping may need others or the rows are instruct rows."""
     if source.kind == "instruct" or get_converter(source) is not None:
         return None
@@ -330,13 +323,13 @@ def _bounded(rows: Iterator[Row], limit: int | None) -> Iterator[Row]:
             close()
 
 
-# --- holdout -----------------------------------------------------------------------------------------------------------
+# --- validation -----------------------------------------------------------------------------------------------------------
 
 
-def holdout(
+def validation(
     cfg: DatasetConfig, name: str, layout: DatasetLayout, *, shard_size: int = DEFAULT_SHARD_SIZE
 ) -> Manifest:
-    """Write the held-out validation rows of a ``holdout`` source: ``source.rows`` rows, shuffled with
+    """Write the held-out validation rows of a ``validation`` source: ``source.rows`` rows, shuffled with
     ``random.Random(source.seed)``, token-counted like ``process`` — no dedup and no filters.
 
     Disjointness from the training data is the config author's job and depends on the loader:
@@ -350,11 +343,11 @@ def holdout(
       config must point them at files disjoint from every training source (a different ``data_files`` glob).
     """
     source = fetch_source(cfg, cfg.sources[name])
-    if source.kind != "holdout" or source.rows is None:
-        raise ValueError(f"{name}: holdout() needs a source of kind holdout with rows > 0")
+    if source.kind != "validation" or source.rows is None:
+        raise ValueError(f"{name}: validation() needs a source of kind validation with rows > 0")
     source_hash = cfg.source_hash(name)
-    out = layout.holdout_dir(name)
-    existing = current_manifest(out, source_hash, "holdout")
+    out = layout.validation_dir(name)
+    existing = current_manifest(out, source_hash, "validation")
     if existing is not None:
         return existing
 
@@ -364,21 +357,21 @@ def holdout(
         offset = max(total - source.rows, 0)
     log.info("%s: holding out %d rows from offset %d -> %s", name, source.rows, offset, out)
     loader = get_loader(source.loader)
-    with progress(total=source.rows, desc=f"{name}: holdout", unit="row", leave=False) as bar:
-        fetched = loader(  # exact: a holdout is fetched once, its row count is part of its identity
+    with progress(total=source.rows, desc=f"{name}: validation", unit="row", leave=False) as bar:
+        fetched = loader(  # exact: a validation is fetched once, its row count is part of its identity
             source, offset, source.rows, index_dir=layout.hub_index_dir(), columns=loader_columns(source),
             align_to_row_group=False,
         )
         rows = [text_row(source, r, name) for r in bar_rows(bar, fetched)]
     if len(rows) < source.rows:
-        log.warning("%s: only %d of %d requested holdout rows available", name, len(rows), source.rows)
+        log.warning("%s: only %d of %d requested validation rows available", name, len(rows), source.rows)
     random.Random(source.seed).shuffle(rows)
     counter = TokenCounter(cfg, layout)
     texts = [str(r[source.text_field]) for r in rows]
     tokens = counter.count_many(texts)
     out_rows = ({"text": t, "source": name, "tokens": n} for t, n in zip(texts, tokens))
     write_dict_rows(out_rows, out, shard_size, start_shard=0)
-    manifest = new_manifest(cfg, name, source_hash, "holdout", tokens=True)
+    manifest = new_manifest(cfg, name, source_hash, "validation", tokens=True)
     manifest.rows_fetched = offset + len(rows)
     record_new_shards(manifest, out, 0, tokens=_tokens_per_shard(out, tokens))
     manifest.extra = {"offset": offset, "requested_rows": source.rows, "seed": source.seed}

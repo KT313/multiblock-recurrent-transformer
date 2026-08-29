@@ -15,7 +15,7 @@ Row = dict[str, Any]
 SPECIALS = ["<pad>", "<bos>", "<eos>"]  # ids 0, 1, 2
 N_WORD_TOKENS = 256  # tok_0..tok_255 -> ids 3..258
 VOCAB_SIZE = len(SPECIALS) + N_WORD_TOKENS  # 259; the tiny model preset pads its vocab to 512
-SYNTHETIC_DOC_WORDS = (64, 384)  # pretrain/holdout documents: words per row (inclusive)
+SYNTHETIC_DOC_WORDS = (64, 384)  # pretrain/validation documents: words per row (inclusive)
 SYNTHETIC_INSTRUCTION_WORDS = (4, 32)
 SYNTHETIC_OUTPUT_WORDS = (8, 64)
 

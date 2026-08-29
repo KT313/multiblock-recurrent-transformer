@@ -17,7 +17,7 @@ import pytest
 
 from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
-    MixtureConfig,
+    InstructMixtureConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
@@ -54,9 +54,9 @@ def layout(tmp_path: Path) -> DatasetLayout:
 
 @pytest.fixture
 def cfg_factory() -> CfgFactory:
-    """`make(sources, mixtures=..., processing=..., token_count=..., max_seq_length=..., tokens=...)` -> DatasetConfig.
+    """`make(sources, instruct_mixtures=..., processing=..., token_count=..., max_seq_length=..., tokens=...)` -> DatasetConfig.
 
-    One stage trains on every pretrain source (equal weights) and validates on the holdout sources (or, without
+    One stage trains on every pretrain source (equal weights) and validates on the validation sources (or, without
     any, on the pretrain sources); every mixture gets its own finetune stage; instruct sources outside every
     mixture are wrapped in an `auto` mixture. Without any trainable source a synthetic `_pretrain` source is added
     so the config validates. `tokens` is the per-stage budget.
@@ -65,7 +65,7 @@ def cfg_factory() -> CfgFactory:
     def make(
         sources: dict[str, SourceConfig],
         *,
-        mixtures: dict[str, MixtureConfig] | None = None,
+        instruct_mixtures: dict[str, InstructMixtureConfig] | None = None,
         processing: ProcessingConfig | None = None,
         token_count: str = "tokenizer",
         max_seq_length: int = 64,
@@ -74,19 +74,19 @@ def cfg_factory() -> CfgFactory:
         name: str = "t",
     ) -> DatasetConfig:
         sources = dict(sources)
-        mixtures = dict(mixtures or {})
-        in_mixture = {src for m in mixtures.values() for src in m.sources}
-        loose = [n for n, s in sources.items() if s.kind == "instruct" and n not in in_mixture]
+        instruct_mixtures = dict(instruct_mixtures or {})
+        in_instruct_mixture = {src for m in instruct_mixtures.values() for src in m.sources}
+        loose = [n for n, s in sources.items() if s.kind == "instruct" and n not in in_instruct_mixture]
         if loose:
-            mixtures["auto"] = MixtureConfig(sources={n: 1.0 / len(loose) for n in loose})
+            instruct_mixtures["auto"] = InstructMixtureConfig(sources={n: 1.0 / len(loose) for n in loose})
         pretrain = [n for n, s in sources.items() if s.kind == "pretrain"]
-        holdouts = [n for n, s in sources.items() if s.kind == "holdout"]
-        if not pretrain and not mixtures:
+        validations = [n for n, s in sources.items() if s.kind == "validation"]
+        if not pretrain and not instruct_mixtures:
             sources["_pretrain"] = SourceConfig(kind="pretrain", loader="synthetic")
             pretrain = ["_pretrain"]
         stages: list[StageConfig] = []
         if pretrain:
-            val_names = holdouts or pretrain
+            val_names = validations or pretrain
             stages.append(
                 StageConfig(
                     name="pretrain",
@@ -95,13 +95,13 @@ def cfg_factory() -> CfgFactory:
                     val={n: 1.0 / len(val_names) for n in val_names},
                 )
             )
-        for mixture_name in mixtures:
+        for instruct_mixture_name in instruct_mixtures:
             stages.append(
                 StageConfig(
-                    name=f"finetune_{mixture_name}",
+                    name=f"finetune_{instruct_mixture_name}",
                     tokens=tokens,
-                    train={mixture_name: 1.0},
-                    val={f"{mixture_name}/validation": 1.0},
+                    train={instruct_mixture_name: 1.0},
+                    val={f"{instruct_mixture_name}/validation": 1.0},
                 )
             )
         return DatasetConfig(
@@ -109,7 +109,7 @@ def cfg_factory() -> CfgFactory:
             tokenizer=tokenizer or TokenizerConfig(name="synthetic", kind="synthetic"),
             sources=sources,
             stages=stages,
-            mixtures=mixtures,
+            instruct_mixtures=instruct_mixtures,
             max_seq_length=max_seq_length,
             token_count=token_count,  # type: ignore[arg-type]  # Literal narrowed by the caller
             processing=processing or ProcessingConfig(min_chars=1),

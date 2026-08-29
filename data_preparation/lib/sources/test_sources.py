@@ -31,7 +31,6 @@ from data_preparation.lib.sources import (
     gsm8k_question_answer,
     instruction_input_output,
     iter_language,
-    repeat_indices,
     sharegpt_conversations,
     sharegpt_quality,
     synthetic_row,
@@ -187,15 +186,15 @@ def test_local_missing_directory(tmp_path: Path) -> None:
 # --- synthetic --------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["pretrain", "holdout", "instruct"])
+@pytest.mark.parametrize("kind", ["pretrain", "validation", "instruct"])
 def test_synthetic_offset_property_and_determinism(kind: SourceKind) -> None:
-    source = SourceConfig(kind=kind, loader="synthetic", seed=7, rows=5 if kind == "holdout" else None)
+    source = SourceConfig(kind=kind, loader="synthetic", seed=7, rows=5 if kind == "validation" else None)
     load = LOADERS["synthetic"]
     full = list(load(source, 0, 8))
     assert list(load(source, 5, 3)) == full[5:8]
     assert list(load(source, 0, 8)) == full
     assert len(full) == 8 and len({json.dumps(r) for r in full}) == 8
-    other_seed = SourceConfig(kind=kind, loader="synthetic", seed=8, rows=5 if kind == "holdout" else None)
+    other_seed = SourceConfig(kind=kind, loader="synthetic", seed=8, rows=5 if kind == "validation" else None)
     assert list(load(other_seed, 0, 8)) != full
 
 
@@ -338,13 +337,6 @@ def test_sharegpt_quality() -> None:
 
 # --- misc -------------------------------------------------------------------------------------------------------------
 
-
-def test_repeat_indices() -> None:
-    assert repeat_indices(3, 7) == [0, 1, 2, 0, 1, 2, 0]
-    assert repeat_indices(3, 2) == [0, 1]
-    assert repeat_indices(3, 0) == []
-    with pytest.raises(ValueError):
-        repeat_indices(0, 2)
 
 
 def test_hub_load_kwargs_routes_script_repos_through_generic_builder() -> None:

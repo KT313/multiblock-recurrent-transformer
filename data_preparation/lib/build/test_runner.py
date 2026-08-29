@@ -12,7 +12,7 @@ import pytest
 
 from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
-from data_preparation.lib.schema.dataset_config import DatasetConfig, MixtureConfig, SourceConfig, StageConfig
+from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 from data_preparation.lib.stages.pretrain import process as real_process
@@ -32,13 +32,13 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=3_000),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, tokens_per_row_estimate=2_000),
     }
-    cfg = cfg_factory(sources, mixtures={"m": MixtureConfig(sources={"i": 1.0}, max_tokens=4096)}, tokens=3000, max_seq_length=4096)
+    cfg = cfg_factory(sources, instruct_mixtures={"m": InstructMixtureConfig(sources={"i": 1.0}, max_tokens=4096)}, tokens=3000, max_seq_length=4096)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         result = build(cfg, layout, max_rounds=3)
     assert result.complete
     processed = Manifest.load(layout.source_dir("p", "processed"))
     assert processed is not None and (processed.tokens() or 0) >= 3000
-    train = Manifest.load(layout.mixture_dir("t", "m", "train"))
+    train = Manifest.load(layout.instruct_mixture_dir("t", "m", "train"))
     assert train is not None and train.extra["short_sources"] == {}
     assert "p: round 1:" in caplog.text and "m: round 1: short sources ['i']" in caplog.text
 
@@ -79,7 +79,7 @@ def test_build_exhausted_source_warns_and_is_complete(cfg_factory: CfgFactory, l
 def test_build_twice_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
     sources = {
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
-        "h": SourceConfig(kind="holdout", loader="synthetic", seed=1, rows=4),
+        "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
     cfg = cfg_factory(sources, tokens=500)
@@ -94,15 +94,15 @@ def test_build_twice_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayo
 def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
     sources = {
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
-        "h": SourceConfig(kind="holdout", loader="synthetic", seed=1, rows=4),
+        "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
     cfg = cfg_factory(sources, tokens=500)
     build(cfg, layout)
     victims = [
         next(layout.source_dir("p", "processed").glob("data-*.parquet")),
-        next(layout.holdout_dir("h").glob("data-*.parquet")),
-        next(layout.mixture_dir("t", "auto", "train").glob("data-*.parquet")),
+        next(layout.validation_dir("h").glob("data-*.parquet")),
+        next(layout.instruct_mixture_dir("t", "auto", "train").glob("data-*.parquet")),
     ]
     for victim in victims:
         victim.unlink()
@@ -111,7 +111,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
         result = build(cfg, layout)
     assert result.complete and all(v.is_file() for v in victims)
     assert "missing shard" in caplog.text and "removing" in caplog.text
-    for directory in (layout.source_dir("p", "processed"), layout.holdout_dir("h"), layout.mixture_dir("t", "auto", "train")):
+    for directory in (layout.source_dir("p", "processed"), layout.validation_dir("h"), layout.instruct_mixture_dir("t", "auto", "train")):
         manifest = Manifest.load(directory)
         assert manifest is not None and verify_shards(directory, manifest) == []
 
@@ -132,17 +132,17 @@ def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> N
     # estimate 500 tokens/row vs ~220 real (uncapped: max_seq_length above the document length), so the first
     # estimate-sized download falls short of the budget
     cfg = cfg_factory(
-        {"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="holdout", loader="synthetic", seed=1, rows=4)},
+        {"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4)},
         tokens=500,
         max_seq_length=4096,
     )
     result = build(cfg, layout, steps={"tokenizer", "download"})
     assert not result.complete and result.tokenizer_complete
     assert (layout.source_dir("p", "raw") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("p", "filtered").exists() and not layout.holdout_dir("h").exists()
-    result = build(cfg, layout, steps={"filter", "process", "holdout"})
+    assert not layout.source_dir("p", "filtered").exists() and not layout.validation_dir("h").exists()
+    result = build(cfg, layout, steps={"filter", "process", "validation"})
     (p,) = result.sources
-    assert (layout.source_dir("p", "processed") / "MANIFEST.json").is_file() and result.holdouts[0].complete
+    assert (layout.source_dir("p", "processed") / "MANIFEST.json").is_file() and result.validations[0].complete
     assert not p.complete and p.reason.startswith("tokens ")  # the estimate-sized download cannot be topped up without `download`
     assert build(cfg, layout).complete
     with pytest.raises(ValueError, match="unknown steps"):

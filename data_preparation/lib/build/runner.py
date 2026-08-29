@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``build`` / ``status``: execute a :func:`planner.plan` (tokenizer -> pretrain sources -> holdouts -> mixtures)
+"""``build`` / ``status``: execute a :func:`planner.plan` (tokenizer -> pretrain sources -> validation sources -> instruct mixtures)
 and report it.
 
 Per pretrain source the estimate -> measured refinement loop runs download -> length_filter -> process until the
@@ -17,15 +17,15 @@ from functools import partial
 from pathlib import Path
 
 from data_preparation.lib.schema.dataset_config import DatasetConfig
-from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
+from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import progress
-from data_preparation.lib.build.planner import MixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
-from data_preparation.lib.stages import build_mixture, download, holdout, length_filter, prepare_tokenizer, process
+from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
+from data_preparation.lib.stages import build_instruct_mixture, download, validation, length_filter, prepare_tokenizer, process
 
 log = get_logger(__name__)
 
-STEPS: tuple[str, ...] = ("tokenizer", "download", "filter", "process", "holdout", "mixtures")
+STEPS: tuple[str, ...] = ("tokenizer", "download", "filter", "process", "validation", "instruct_mixtures")
 DEFAULT_MAX_ROUNDS = 5
 
 
@@ -56,9 +56,9 @@ def build(
     if not active <= set(STEPS):
         raise ValueError(f"unknown steps {sorted(active - set(STEPS))}; expected a subset of {STEPS}")
     if sources is not None:
-        unknown = set(sources) - set(cfg.sources) - set(cfg.mixtures)
+        unknown = set(sources) - set(cfg.sources) - set(cfg.instruct_mixtures)
         if unknown:
-            raise ValueError(f"unknown sources/mixtures {sorted(unknown)}")
+            raise ValueError(f"unknown sources/instruct mixtures {sorted(unknown)}")
     selected = None if sources is None else set(sources)
 
     current = plan(cfg, layout)
@@ -77,22 +77,22 @@ def build(
             log.info("%s: complete, skipping", source_plan.name)
             continue
         items.append(("source", source_plan.name, partial(_build_pretrain_source, cfg, source_plan, layout, active, num_workers, hf_token, max_rounds)))
-    if "holdout" in active:
-        for holdout_plan in current.holdouts:
-            if selected is not None and holdout_plan.name not in selected:
+    if "validation" in active:
+        for validation_plan in current.validations:
+            if selected is not None and validation_plan.name not in selected:
                 continue
-            if holdout_plan.complete:
-                log.info("%s: complete, skipping", holdout_plan.name)
+            if validation_plan.complete:
+                log.info("%s: complete, skipping", validation_plan.name)
                 continue
-            items.append(("holdout", holdout_plan.name, partial(_build_holdout, cfg, holdout_plan, layout)))
-    if "mixtures" in active:
-        for mixture_plan in current.mixtures:
-            if selected is not None and mixture_plan.name not in selected:
+            items.append(("validation", validation_plan.name, partial(_build_validation, cfg, validation_plan, layout)))
+    if "instruct_mixtures" in active:
+        for instruct_mixture_plan in current.instruct_mixtures:
+            if selected is not None and instruct_mixture_plan.name not in selected:
                 continue
-            if mixture_plan.complete:
-                log.info("%s: complete, skipping", mixture_plan.name)
+            if instruct_mixture_plan.complete:
+                log.info("%s: complete, skipping", instruct_mixture_plan.name)
                 continue
-            items.append(("mixture", mixture_plan.name, partial(_build_mixture, cfg, mixture_plan, layout, hf_token, max_rounds)))
+            items.append(("instruct_mixture", instruct_mixture_plan.name, partial(_build_instruct_mixture, cfg, instruct_mixture_plan, layout, hf_token, max_rounds)))
     with progress(total=len(items), desc="sources", unit="item") as bar:
         for position, (what, name, action) in enumerate(items, start=1):
             bar.set_description(f"sources {position}/{len(items)}: {name}")
@@ -116,9 +116,9 @@ def _run(what: str, name: str, action: Callable[[], object]) -> None:
 
 
 def _log_plan(result: Plan) -> None:
-    for item in result.sources + result.holdouts:
+    for item in result.sources + result.validations:
         if item.complete and item.exhausted:
-            if item.reason == "ok":  # e.g. a repeat_to_budget source that was downloaded whole
+            if item.reason == "ok":
                 log.warning(
                     "%s: source exhausted at %d rows (%d tokens, budget %d)",
                     item.name, item.rows_present, item.tokens_present, item.budget_tokens,
@@ -131,7 +131,7 @@ def _log_plan(result: Plan) -> None:
 def _remove_broken_stages(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> None:
     """Delete stage directories whose manifest is stale or whose shards do not verify, so the stage rebuilds."""
     for stage, problem in stage_problems(cfg, name, layout).items():
-        directory = layout.holdout_dir(name) if stage == "holdout" else layout.source_dir(name, stage)
+        directory = layout.validation_dir(name) if stage == "validation" else layout.source_dir(name, stage)
         log.warning("%s: %s; removing %s", name, problem, directory)
         shutil.rmtree(directory)
 
@@ -146,7 +146,6 @@ def _build_pretrain_source(
     max_rounds: int,
 ) -> None:
     name, budget = source_plan.name, source_plan.budget_tokens
-    source = cfg.sources[name]
     _remove_broken_stages(cfg, name, layout)
     tokens_per_row = source_plan.tokens_per_row
     for round_index in range(max_rounds):
@@ -159,7 +158,7 @@ def _build_pretrain_source(
             length_filter(cfg, name, layout)
         if "process" not in active:
             return
-        processed = process(cfg, name, layout, num_workers=num_workers, target_tokens=budget if source.repeat_to_budget else None)
+        processed = process(cfg, name, layout, num_workers=num_workers)
         tokens = processed.tokens() or 0
         exhausted = raw is not None and bool(raw.extra.get("exhausted"))
         if tokens >= budget or exhausted or raw is None:
@@ -171,20 +170,20 @@ def _build_pretrain_source(
     raise RuntimeError(f"{name}: token budget {budget} not reached after {max_rounds} rounds")
 
 
-def _build_holdout(cfg: DatasetConfig, holdout_plan: SourcePlan, layout: DatasetLayout) -> None:
-    name = holdout_plan.name
+def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout) -> None:
+    name = validation_plan.name
     _remove_broken_stages(cfg, name, layout)  # `rows` is part of the source hash, so a stale manifest covers row changes
-    holdout(cfg, name, layout)
+    validation(cfg, name, layout)
 
 
-def _build_mixture(cfg: DatasetConfig, mixture_plan: MixturePlan, layout: DatasetLayout, hf_token: str | None, max_rounds: int) -> None:
-    mixture_name, budget = mixture_plan.name, mixture_plan.budget_tokens
-    mixture = cfg.mixtures[mixture_name]
+def _build_instruct_mixture(cfg: DatasetConfig, instruct_mixture_plan: InstructMixturePlan, layout: DatasetLayout, hf_token: str | None, max_rounds: int) -> None:
+    instruct_mixture_name, budget = instruct_mixture_plan.name, instruct_mixture_plan.budget_tokens
+    mixture = cfg.instruct_mixtures[instruct_mixture_name]
     for src in mixture.sources:
         _remove_broken_stages(cfg, src, layout)
-    for split in MIXTURE_SPLITS:
-        directory = layout.mixture_dir(cfg.name, mixture_name, split)
-        if directory.exists() and not mixture_plan.current:
+    for split in INSTRUCT_MIXTURE_SPLITS:
+        directory = layout.instruct_mixture_dir(cfg.name, instruct_mixture_name, split)
+        if directory.exists() and not instruct_mixture_plan.current:
             _remove_dir(directory)
     tokens_per_row = {src: float(cfg.sources[src].tokens_per_row_estimate) for src in mixture.sources}
     short: dict[str, object] = {}
@@ -194,16 +193,16 @@ def _build_mixture(cfg: DatasetConfig, mixture_plan: MixturePlan, layout: Datase
             raw = download(cfg, src, layout, rows_needed=rows_for_budget(budget * share, tokens_per_row[src]), hf_token=hf_token)
             if raw.extra.get("exhausted"):
                 exhausted.add(src)
-        result = build_mixture(cfg, mixture_name, layout, budget_tokens=budget)
+        result = build_instruct_mixture(cfg, instruct_mixture_name, layout, budget_tokens=budget)
         short = {src: info for src, info in result["train"].extra["short_sources"].items() if src not in exhausted}
         if not short:
             for src in exhausted & set(result["train"].extra["short_sources"]):
-                log.warning("%s: source %s exhausted before its share of the budget", mixture_name, src)
+                log.warning("%s: source %s exhausted before its share of the budget", instruct_mixture_name, src)
             return
         for src in short:
             tokens_per_row[src] = max(result["train"].extra["tokens_per_row"][src], 1.0)
-        log.info("%s: round %d: short sources %s, refining tokens/row", mixture_name, round_index + 1, sorted(short))
-    raise RuntimeError(f"{mixture_name}: sources {sorted(short)} still short after {max_rounds} rounds")
+        log.info("%s: round %d: short sources %s, refining tokens/row", instruct_mixture_name, round_index + 1, sorted(short))
+    raise RuntimeError(f"{instruct_mixture_name}: sources {sorted(short)} still short after {max_rounds} rounds")
 
 
 def _remove_dir(directory: Path) -> None:

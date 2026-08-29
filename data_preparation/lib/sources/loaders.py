@@ -308,7 +308,7 @@ def load_synthetic(
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
 ) -> Iterator[Row]:
-    """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/holdout, instruct triple)."""
+    """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/validation, instruct triple)."""
     _check_offset_count(offset, count)
     for index in range(offset, offset + count):
         yield synthetic_row(source.kind, source.seed, index)
@@ -328,11 +328,3 @@ def get_loader(name: str) -> Loader:
     if name not in LOADERS:
         raise ValueError(f"unknown loader {name!r}; known loaders: {sorted(LOADERS)}")
     return LOADERS[name]
-
-
-def repeat_indices(num_rows: int, target: int) -> list[int]:
-    """Indices that cycle through `range(num_rows)` until `target` rows are covered (`repeat_to_budget` sources)."""
-    if num_rows <= 0:
-        raise ValueError("num_rows must be positive")
-    full_copies, remainder = divmod(target, num_rows)
-    return list(range(num_rows)) * full_copies + list(range(remainder))

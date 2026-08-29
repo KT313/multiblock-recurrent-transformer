@@ -33,7 +33,6 @@ from data_preparation.lib.sources.loaders import (
     load_hf_stream,
     load_local,
     load_synthetic,
-    repeat_indices,
 )
 from data_preparation.lib.sources.hub_files import DEFAULT_MAX_CACHED_FILE_MB, FetchStats, HubFetcher
 from data_preparation.lib.sources.synthetic import (
@@ -53,7 +52,7 @@ __all__ = [
     "GITHUB_CODE_DATA_FILES", "LOADERS", "MAX_CACHED_FILE_KEY", "Loader", "Row", "get_loader", "hub_fetcher", "hub_file_index",
     "iter_language", "list_local_files", "load_github_code",
     "DEFAULT_MAX_CACHED_FILE_MB", "FetchStats", "HubFetcher",
-    "load_hf_files", "load_hf_split", "load_hf_stream", "load_local", "load_synthetic", "repeat_indices",
+    "load_hf_files", "load_hf_split", "load_hf_stream", "load_local", "load_synthetic",
     "N_WORD_TOKENS", "SPECIALS", "SYNTHETIC_DOC_WORDS", "SYNTHETIC_INSTRUCTION_WORDS", "SYNTHETIC_OUTPUT_WORDS",
     "VOCAB_SIZE", "synthetic_row", "write_synthetic_tokenizer",
 ]

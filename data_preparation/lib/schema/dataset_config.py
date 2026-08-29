@@ -8,7 +8,7 @@ references the file; every data-related setting lives here.
 Layout produced on disk (see CLAUDE.md "Dataset-config restructuring"):
 
     dataset/sources/<source>/{raw,filtered,processed}/   shared by every dataset config, append-only
-    dataset/mixtures/<config name>/<mixture>/{train,validation}/
+    dataset/instruct_instruct_mixtures/<config name>/<mixture>/{train,validation}/
     dataset/tokenizers/<tokenizer name>/
 """
 
@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 from jsonargparse import ArgumentParser, Namespace
 
-SourceKind = Literal["pretrain", "holdout", "instruct"]
+SourceKind = Literal["pretrain", "validation", "instruct"]
 LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
 DedupMode = Literal["none", "exact", "minhash"]
 TokenCountMode = Literal["tokenizer", "estimate"]
@@ -106,7 +106,7 @@ class SourceConfig:
     revision: Optional[str] = None  # Hub commit sha; pin it so row order is stable across increments
     load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
     split: str = "train"
-    text_field: str = "text"  # pretrain/holdout: column holding the document
+    text_field: str = "text"  # pretrain/validation: column holding the document
     language: Optional[str] = None  # github_code: language label of codeparrot/github-code-clean
     path: Optional[str] = None  # local: directory of parquet/jsonl files
     converter: Optional[str] = None  # named row converter (lib/sources.py), e.g. gsm8k_question_answer
@@ -114,9 +114,8 @@ class SourceConfig:
     filter: Optional[str] = None  # named row filter, e.g. sharegpt_quality
     check_limit: Optional[int] = None  # instruct: stop after inspecting this many rows even if short of target
     tokens_per_row_estimate: int = 500  # planner prior until the manifest has measured tokens/row
-    repeat_to_budget: bool = False  # small sources: download whole, repeat rows to reach the budget
-    rows: Optional[int] = None  # holdout: number of rows to hold out
-    seed: int = 42  # holdout shuffle / synthetic generator seed
+    rows: Optional[int] = None  # validation: number of rows to hold out
+    seed: int = 42  # validation shuffle / synthetic generator seed
     processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
 
     def __post_init__(self) -> None:
@@ -131,8 +130,8 @@ class SourceConfig:
             raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
         if self.loader == "local" and not self.path:
             raise ValueError("loader local requires path")
-        if self.kind == "holdout" and (self.rows is None or self.rows <= 0):
-            raise ValueError("kind holdout requires rows > 0")
+        if self.kind == "validation" and (self.rows is None or self.rows <= 0):
+            raise ValueError("kind validation requires rows > 0")
         if self.kind == "instruct" and self.fields is None and self.converter is None and self.loader != "synthetic":
             raise ValueError("kind instruct requires fields or converter")
         if self.fields is not None and not {"instruction", "output"} <= set(self.fields):
@@ -144,7 +143,7 @@ class SourceConfig:
 
 
 @dataclass
-class MixtureConfig:
+class InstructMixtureConfig:
     """An instruct mixture built per dataset config from `instruct` sources (counts derived from the stage budget)."""
 
     sources: dict[str, float]  # instruct source name -> share of the mixture
@@ -186,7 +185,7 @@ class DatasetConfig:
     tokenizer: TokenizerConfig
     sources: dict[str, SourceConfig]
     stages: list[StageConfig]
-    mixtures: dict[str, MixtureConfig] = field(default_factory=dict)
+    instruct_mixtures: dict[str, InstructMixtureConfig] = field(default_factory=dict)
     max_seq_length: int = 2048  # token-count cap per document; the run config's block_size must be <= this
     always_range_requests: bool = True  # read every Hub file remotely by piece (row groups / stream prefix); False: files
     # up to load_kwargs.max_cached_file_mb are downloaded whole into the Hub cache instead. Traffic only, not part of
@@ -203,14 +202,14 @@ class DatasetConfig:
             raise ValueError("stages must contain at least one stage")
         if len({s.name for s in self.stages}) != len(self.stages):
             raise ValueError("stage names must be unique")
-        if set(self.sources) & set(self.mixtures):
-            raise ValueError(f"names shared by sources and mixtures: {sorted(set(self.sources) & set(self.mixtures))}")
-        for mixture_name, mixture in self.mixtures.items():
+        if set(self.sources) & set(self.instruct_mixtures):
+            raise ValueError(f"names shared by sources and instruct mixtures: {sorted(set(self.sources) & set(self.instruct_mixtures))}")
+        for instruct_mixture_name, mixture in self.instruct_mixtures.items():
             for src in mixture.sources:
                 if src not in self.sources:
-                    raise ValueError(f"mixture {mixture_name}: unknown source {src!r}")
+                    raise ValueError(f"mixture {instruct_mixture_name}: unknown source {src!r}")
                 if self.sources[src].kind != "instruct":
-                    raise ValueError(f"mixture {mixture_name}: source {src!r} is not kind instruct")
+                    raise ValueError(f"mixture {instruct_mixture_name}: source {src!r} is not kind instruct")
         for stage in self.stages:
             for key in stage.train:
                 self._check_stage_key(stage.name, key, is_val=False)
@@ -219,7 +218,7 @@ class DatasetConfig:
 
     def _check_stage_key(self, stage_name: str, key: str, is_val: bool) -> None:
         base, _, split = key.partition("/")
-        if base in self.mixtures:
+        if base in self.instruct_mixtures:
             if split not in ("", "train", "validation"):
                 raise ValueError(f"stage {stage_name}: {key!r} must be <mixture>, <mixture>/train or /validation")
             return
@@ -230,8 +229,8 @@ class DatasetConfig:
         kind = self.sources[base].kind
         if kind == "instruct":
             raise ValueError(f"stage {stage_name}: instruct source {key!r} can only be used through a mixture")
-        if kind == "holdout" and not is_val:
-            raise ValueError(f"stage {stage_name}: holdout source {key!r} cannot be used for training")
+        if kind == "validation" and not is_val:
+            raise ValueError(f"stage {stage_name}: validation source {key!r} cannot be used for training")
 
     # --- derived views ---------------------------------------------------------------------------------------------
 
@@ -247,41 +246,41 @@ class DatasetConfig:
         it — they only change how many rows are needed, not what the rows are.
         """
         source = self.sources[source_name]
-        payload: dict[str, Any] = {"source": asdict(source), "token_count": self.token_count}
-        payload["source"].pop("tokens_per_row_estimate")
-        payload["source"].pop("processing")
-        payload["source"]["load_kwargs"].pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
+        payload: dict[str, Any] = {"source": hash_fields(source), "token_count": self.token_count}
+        payload["source"].pop("tokens_per_row_estimate", None)
+        payload["source"].pop("processing", None)
+        payload["source"].get("load_kwargs", {}).pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
         if source.kind == "pretrain":
-            payload["processing"] = asdict(self.source_processing(source_name))
+            payload["processing"] = hash_fields(self.source_processing(source_name))
             payload["max_seq_length"] = self.max_seq_length
         if self.token_count == "tokenizer" or source.kind == "instruct":
-            payload["tokenizer"] = asdict(self.tokenizer)
+            payload["tokenizer"] = hash_fields(self.tokenizer)
         return _stable_hash(payload)
 
-    def mixture_hash(self, mixture_name: str) -> str:
+    def instruct_mixture_hash(self, instruct_mixture_name: str) -> str:
         """Hash of a mixture definition plus the hashes of the sources it draws from."""
-        mixture = self.mixtures[mixture_name]
+        mixture = self.instruct_mixtures[instruct_mixture_name]
         payload = {
-            "mixture": asdict(mixture),
+            "instruct_mixture": hash_fields(mixture),
             "sources": {name: self.source_hash(name) for name in mixture.sources},
-            "budget_tokens": self.mixture_budget_tokens(mixture_name),
+            "budget_tokens": self.instruct_mixture_budget_tokens(instruct_mixture_name),
         }
         return _stable_hash(payload)
 
     def tokenizer_hash(self) -> str:
         """Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`)."""
-        return _stable_hash(asdict(self.tokenizer))
+        return _stable_hash(hash_fields(self.tokenizer))
 
     def config_hash(self) -> str:
         """Hash of the complete config (recorded in checkpoints so a resume with different data is detected)."""
         return _stable_hash(asdict(self))
 
-    def mixture_budget_tokens(self, mixture_name: str) -> int:
+    def instruct_mixture_budget_tokens(self, instruct_mixture_name: str) -> int:
         """Largest per-stage token demand on a mixture (stages share the built mixture, so max, not sum)."""
         demand = 0
         for stage in self.stages:
             for key, weight in stage.train.items():
-                if key.partition("/")[0] == mixture_name:
+                if key.partition("/")[0] == instruct_mixture_name:
                     demand = max(demand, int(stage.tokens * weight))
         return demand
 
@@ -290,9 +289,9 @@ class DatasetConfig:
         demand = 0
         for stage in self.stages:
             demand = max(demand, int(stage.tokens * stage.train.get(source_name, 0.0)))
-        for mixture_name, mixture in self.mixtures.items():
+        for instruct_mixture_name, mixture in self.instruct_mixtures.items():
             if source_name in mixture.sources:
-                demand = max(demand, int(self.mixture_budget_tokens(mixture_name) * mixture.sources[source_name]))
+                demand = max(demand, int(self.instruct_mixture_budget_tokens(instruct_mixture_name) * mixture.sources[source_name]))
         return demand
 
     def sources_of_kind(self, kind: SourceKind) -> list[str]:
@@ -314,6 +313,33 @@ def _check_weights(what: str, weights: dict[str, float]) -> None:
 
 def _stable_hash(payload: Any) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def hash_fields(obj: Any) -> dict[str, Any]:
+    """`asdict(obj)` without the fields that still hold their default value (recursively for nested dataclasses).
+
+    Manifests key on hashes of this, so adding a field with a default to the schema, or removing one, never
+    invalidates data on disk; only a value that was explicitly set to something else changes the hash.
+    """
+    out: dict[str, Any] = {}
+    for f in fields(obj):
+        value = getattr(obj, f.name)
+        if f.default is not MISSING and value == f.default:
+            continue
+        if f.default_factory is not MISSING and value == f.default_factory():
+            continue
+        out[f.name] = _hashable(value)
+    return out
+
+
+def _hashable(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return hash_fields(value)
+    if isinstance(value, dict):
+        return {k: _hashable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_hashable(v) for v in value]
+    return value
 
 
 def dataset_config_fields() -> list[str]:

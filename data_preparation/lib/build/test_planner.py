@@ -9,7 +9,7 @@ from pathlib import Path
 from data_preparation.lib.build import build
 from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
-    MixtureConfig,
+    InstructMixtureConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
@@ -23,7 +23,7 @@ CfgFactory = Callable[..., DatasetConfig]
 
 
 def two_stage_cfg(tokens_a: int = 1000, tokens_b: int = 1000) -> DatasetConfig:
-    """Source `a` in both stages (0.5 then 1.0), `b` only in the first, holdout `h` for validation, mixture `m`."""
+    """Source `a` in both stages (0.5 then 1.0), `b` only in the first, validation `h` for validation, mixture `m`."""
     return DatasetConfig(
         name="two",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
@@ -31,10 +31,10 @@ def two_stage_cfg(tokens_a: int = 1000, tokens_b: int = 1000) -> DatasetConfig:
             "a": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=100),
             "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1, tokens_per_row_estimate=50),
             "unused": SourceConfig(kind="pretrain", loader="synthetic", seed=2),
-            "h": SourceConfig(kind="holdout", loader="synthetic", seed=3, rows=8),
+            "h": SourceConfig(kind="validation", loader="synthetic", seed=3, rows=8),
             "i": SourceConfig(kind="instruct", loader="synthetic", seed=4, tokens_per_row_estimate=40),
         },
-        mixtures={"m": MixtureConfig(sources={"i": 1.0}, max_tokens=64)},
+        instruct_mixtures={"m": InstructMixtureConfig(sources={"i": 1.0}, max_tokens=64)},
         stages=[
             StageConfig(name="s1", tokens=tokens_a, train={"a": 0.5, "b": 0.5}, val={"h": 1.0}),
             StageConfig(name="s2", tokens=tokens_b, train={"a": 1.0}, val={"h": 1.0}),
@@ -62,13 +62,13 @@ def test_plan_on_empty_dir_by_hand(layout: DatasetLayout) -> None:
     assert a.tokens_per_row == 100 and a.rows_needed == 12 and a.rows_present == 0 and a.rows_to_fetch == 12
     assert b.budget_tokens == 500 and b.rows_needed == 12 and b.rows_to_fetch == 12
     assert not a.complete and not a.manifest_current and "raw: manifest missing" in a.reason
-    (h,) = result.holdouts
-    assert h.kind == "holdout" and h.rows_needed == 8 and h.rows_to_fetch == 8 and not h.complete
-    (m,) = result.mixtures
+    (h,) = result.validations
+    assert h.kind == "validation" and h.rows_needed == 8 and h.rows_to_fetch == 8 and not h.complete
+    (m,) = result.instruct_mixtures
     assert m.name == "m" and m.budget_tokens == 400 and not m.present and not m.current and not m.complete
     missing = result.missing()
     assert missing[0] == "tokenizer: missing or stale" and any(line.startswith("source a:") for line in missing)
-    assert any(line.startswith("holdout h:") for line in missing) and any(line.startswith("mixture m:") for line in missing)
+    assert any(line.startswith("validation h:") for line in missing) and any(line.startswith("mixture m:") for line in missing)
     assert "INCOMPLETE" in result.summary() and "unused" not in result.summary()
 
 
@@ -82,10 +82,12 @@ def test_plan_after_build_is_complete_and_uses_measured_tokens(layout: DatasetLa
     assert a.tokens_per_row == (processed.tokens() or 0) / raw.rows() and a.tokens_per_row != 100
     assert a.tokens_present >= 1000 and a.rows_present == raw.rows() and a.rows_to_fetch == 0 and a.manifest_current
     assert a.reason == "ok" and not a.exhausted
-    (h,) = result.holdouts
+    (h,) = result.validations
     assert h.complete and h.rows_present == 8 and h.tokens_per_row > 0
-    (m,) = result.mixtures
+    (m,) = result.instruct_mixtures
     assert m.complete and m.present and m.current and m.short_sources == []
+    assert m.tokens_present > 0 and m.epochs is not None and 0 < m.epochs <= 1.5  # built to roughly its budget
+    assert a.epochs is not None and a.epochs <= 1.0 and h.epochs is None  # validation sources have no budget
     assert result.summary().endswith("dataset complete")
     row_a = next(line for line in result.summary().splitlines() if line.startswith("a "))
     assert row_a.split()[6] == "-"  # fetch column: nothing to fetch for a complete source
@@ -139,13 +141,13 @@ def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:
     a = next(s for s in result.sources if s.name == "a")
     assert not a.complete and a.reason == f"processed: missing shard {shard.name}"
     assert stage_problems(cfg, "a", layout) == {"processed": f"processed: missing shard {shard.name}"}
-    (hold_shard,) = layout.holdout_dir("h").glob("data-*.parquet")
+    (hold_shard,) = layout.validation_dir("h").glob("data-*.parquet")
     hold_shard.unlink()
-    (h,) = plan(cfg, layout).holdouts
+    (h,) = plan(cfg, layout).validations
     assert not h.complete and "missing shard" in h.reason
-    mix_shard = next(layout.mixture_dir("two", "m", "train").glob("data-*.parquet"))
+    mix_shard = next(layout.instruct_mixture_dir("two", "m", "train").glob("data-*.parquet"))
     mix_shard.unlink()
-    (m,) = plan(cfg, layout).mixtures
+    (m,) = plan(cfg, layout).instruct_mixtures
     assert not m.complete and m.present and not m.current and "missing shard" in m.reason
 
 
@@ -156,15 +158,15 @@ def test_tokens_below_budget_is_not_complete(layout: DatasetLayout) -> None:
     result = plan(bigger, layout)
     a = next(s for s in result.sources if s.name == "a")
     assert not a.complete and a.manifest_current and a.reason.startswith("tokens ") and a.rows_to_fetch > 0
-    (m,) = result.mixtures
+    (m,) = result.instruct_mixtures
     assert m.complete  # the mixture budget (stage ft) did not change
 
 
-def test_mixture_budget_change_is_not_complete(layout: DatasetLayout) -> None:
+def test_instruct_mixture_budget_change_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)
     cfg.stages[2] = StageConfig(name="ft", tokens=800, train={"m": 1.0}, val={"m/validation": 1.0})
-    (m,) = plan(cfg, layout).mixtures
+    (m,) = plan(cfg, layout).instruct_mixtures
     assert not m.complete and m.budget_tokens == 800 and not m.current  # budget is part of the mixture hash
 
 
@@ -175,7 +177,9 @@ def test_exhausted_source_is_complete(cfg_factory: CfgFactory, layout: DatasetLa
     result = build(cfg, layout)
     (s,) = result.sources
     assert result.complete and s.complete and s.exhausted and s.tokens_present == 5 and s.reason == "exhausted at 5 of 1000 tokens"
-    assert "exhausted" in result.summary()
+    assert s.epochs == 200.0  # 1000-token budget over 5 tokens on disk: the sampler cycles the source 200 times
+    row = next(line for line in result.summary().splitlines() if line.startswith("s "))
+    assert row.split()[8] == "200.00" and row.split()[9] == "exhausted"
 
 
 def test_plan_dataclass_defaults() -> None:
