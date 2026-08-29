@@ -1,0 +1,246 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""Tests for `model.hf`: recurrence-step parsing, config conversion and the trust_remote_code export round trip."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import cast
+
+import pytest
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from model import build_model
+from model.config import RecurrentConfig, RoPESettings
+from model.hf import RecurrentGPTConfig, RecurrentGPTForCausalLM, export_to_hf, parse_recurrence_steps
+
+
+def ids(batch: int = 2, seq: int = 16) -> torch.Tensor:
+    return torch.randint(0, 512, (batch, seq), generator=torch.Generator().manual_seed(1))
+
+
+@pytest.mark.parametrize(
+    ("text", "num_blocks", "expected"),
+    [
+        ("12", 3, (12, 0)),
+        (" 7 ", 1, (7, 0)),
+        ("4,12,4", 3, [(4, 0), (12, 0), (4, 0)]),
+        ("4, 4 ,4", 3, [(4, 0), (4, 0), (4, 0)]),
+        ("", 3, None),
+        ("   ", 3, None),
+    ],
+)
+def test_parse_recurrence_steps(text: str, num_blocks: int, expected: object) -> None:
+    assert parse_recurrence_steps(text, num_blocks) == expected
+
+
+def test_parse_recurrence_steps_length_mismatch() -> None:
+    with pytest.raises(ValueError, match="got 2 recurrence values but the model has 3"):
+        parse_recurrence_steps("4,4", 3)
+
+
+def test_config_round_trip() -> None:
+    cfg = RecurrentConfig.from_name("tiny", rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5])
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(cfg)
+    assert hf_cfg.model_type == "recurrent_gpt"
+    assert hf_cfg.rope_base == 12_345
+    assert hf_cfg.hidden_size == cfg.n_embd
+    assert hf_cfg.num_hidden_layers == cfg.effective_expected_depth
+    assert hf_cfg.tie_word_embeddings is True
+    back = hf_cfg.to_recurrent_config()
+    expected = cfg.to_dict()
+    expected["name"] = ""  # the preset name is not an HF field
+    assert back.to_dict() == expected
+    assert back.head_size == cfg.head_size and back.n_layer == cfg.n_layer
+
+
+def test_hf_config_defaults_to_crow_preset() -> None:
+    hf_cfg = RecurrentGPTConfig()
+    crow = RecurrentConfig.from_name("crow-300m-final")
+    assert hf_cfg.n_layers_in_recurrent_block == [4, 4, 4]
+    assert hf_cfg.num_hidden_layers == crow.effective_expected_depth
+    assert hf_cfg.rope_base == 50_000
+
+
+def test_hf_config_survives_json_round_trip(tmp_path: Path) -> None:
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(RecurrentConfig.from_name("tiny"))
+    hf_cfg.save_pretrained(tmp_path)
+    loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
+    assert loaded.to_recurrent_config() == hf_cfg.to_recurrent_config()
+
+
+def tiny_hf_model() -> RecurrentGPTForCausalLM:
+    torch.manual_seed(0)
+    return RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(RecurrentConfig.from_name("tiny")))
+
+
+def test_wrapper_forward_matches_inner_model_in_eval() -> None:
+    hf_model = tiny_hf_model().train(False)
+    assert hf_model.num_recurrent_blocks == 2
+    assert hf_model.get_output_embeddings().weight is hf_model.get_input_embeddings().weight
+    x = ids()
+    torch.manual_seed(1)
+    out = hf_model(x, labels=x)
+    torch.manual_seed(1)
+    ref = hf_model.model(x, labels=x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])
+    assert torch.equal(out.logits, ref["logits"])
+    assert torch.equal(out.loss, ref["loss"])
+    torch.manual_seed(1)
+    tup = hf_model(x, return_dict=False)
+    assert isinstance(tup, tuple) and len(tup) == 1 and torch.equal(tup[0], ref["logits"])
+
+
+def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None:
+    hf_model = tiny_hf_model().train(True)
+    x = ids()
+    hf_model.model.step = 3
+    torch.manual_seed(1)
+    out = hf_model(x, labels=x, return_dict=False)
+    assert isinstance(out, tuple) and len(out) == 2
+    torch.manual_seed(1)
+    ref = hf_model.model(x, labels=x, return_logits=True)  # num_steps_pair=None -> sampled at step 3
+    assert torch.equal(out[0], ref["loss"]) and torch.equal(out[1], ref["logits"])
+    # ... which is not the eval path
+    torch.manual_seed(1)
+    eval_ref = hf_model.model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    assert not torch.equal(out[1], eval_ref)
+
+
+def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    hf_model = tiny_hf_model().train(False)
+    x = ids()
+    monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,4")
+    torch.manual_seed(1)
+    out = hf_model(x).logits
+    torch.manual_seed(1)
+    ref = hf_model.model(x, return_logits=True, num_steps_pair=[(1, 0), (4, 0)])["logits"]
+    assert torch.equal(out, ref)
+    monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,2,3")
+    with pytest.raises(ValueError, match="recurrence values"):
+        hf_model(x)
+
+
+def load_exported(out_dir: Path) -> RecurrentGPTForCausalLM:
+    """The dynamically loaded class is a copy of `RecurrentGPTForCausalLM` with an identical interface."""
+    loaded = cast(RecurrentGPTForCausalLM, AutoModelForCausalLM.from_pretrained(out_dir, trust_remote_code=True))
+    loaded.train(False)
+    return loaded
+
+
+def test_init_weights_is_a_noop() -> None:
+    hf_model = tiny_hf_model()
+    before = hf_model.model.transformer.wte.weight.clone()
+    hf_model._init_weights(hf_model.model.transformer.wte)
+    hf_model._init_weights(hf_model.model.lm_head)
+    assert torch.equal(hf_model.model.transformer.wte.weight, before)
+
+
+def test_embedding_accessors() -> None:
+    hf_model = tiny_hf_model()
+    assert hf_model.get_input_embeddings() is hf_model.model.transformer.wte
+    assert hf_model.get_output_embeddings() is hf_model.model.lm_head
+    new_wte = torch.nn.Embedding(512, 64)
+    hf_model.set_input_embeddings(new_wte)
+    assert hf_model.model.transformer.wte is new_wte
+    new_head = torch.nn.Linear(64, 512, bias=False)
+    hf_model.set_output_embeddings(new_head)
+    assert hf_model.model.lm_head is new_head
+    assert hf_model.get_output_embeddings() is new_head
+
+
+def test_prepare_inputs_for_generation_forwards_only_input_ids() -> None:
+    hf_model = tiny_hf_model()
+    x = ids(1, 4)
+    prepared = hf_model.prepare_inputs_for_generation(x, attention_mask=torch.ones_like(x), past_key_values=None)
+    assert list(prepared) == ["input_ids"]
+    assert prepared["input_ids"] is x
+
+
+def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_path: Path) -> None:
+    torch.manual_seed(0)
+    model = build_model("tiny")
+    out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_path=tiny_tokenizer_path)
+    assert out_dir == tmp_path / "a" / "b"
+    tok = AutoTokenizer.from_pretrained(out_dir)
+    ref = AutoTokenizer.from_pretrained(tiny_tokenizer_path)
+    assert tok("hello world")["input_ids"] == ref("hello world")["input_ids"]
+
+
+def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = build_model("tiny")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    names = {p.name for p in out_dir.iterdir()}
+    assert {"config.json", "model.safetensors", "hf.py", "recurrent_gpt.py", "config.py"} <= names
+    assert not any(n.startswith("test_") for n in names)
+    assert "__init__.py" not in names
+
+    cfg = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
+    assert cfg.model_type == "recurrent_gpt"
+    loaded = load_exported(out_dir)
+    # In-process, transformers resolves the registered class from `model.hf` (see the standalone test for the copied
+    # sources); the weights nevertheless come from the exported safetensors.
+    assert isinstance(loaded, RecurrentGPTForCausalLM)
+    model.eval()
+    x = ids()
+    torch.manual_seed(1)
+    ref = model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    torch.manual_seed(1)
+    got = loaded(x).logits
+    torch.testing.assert_close(got, ref, atol=1e-5, rtol=0)
+    assert loaded.model.lm_head.weight.data_ptr() == loaded.model.transformer.wte.weight.data_ptr()
+    assert loaded.get_output_embeddings() is loaded.model.lm_head
+    assert loaded.get_input_embeddings() is loaded.model.transformer.wte
+    assert json.loads((out_dir / "config.json").read_text())["auto_map"]["AutoModelForCausalLM"] == (
+        "hf.RecurrentGPTForCausalLM"
+    )
+
+
+def test_generate_runs(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = build_model("tiny")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    loaded = load_exported(out_dir)
+    prompt = ids(1, 8)
+    torch.manual_seed(1)
+    # transformers' `GenerativePreTrainedModel` protocol lists attributes PreTrainedModel only sets dynamically.
+    gen = loaded.generate(prompt, max_new_tokens=4, do_sample=False)  # type: ignore[misc]
+    assert isinstance(gen, torch.Tensor)
+    assert gen.shape == (1, 12)
+    assert torch.equal(gen[:, :8], prompt)
+    assert (gen[:, 8:] < 512).all()
+
+
+def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> None:
+    """The copied sources must work without `model` importable: load in a subprocess whose cwd is the temp dir and
+    whose only `sys.path` entries are the interpreter's own, then compare logits with the un-exported model."""
+    torch.manual_seed(0)
+    model = build_model("tiny")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    model.eval()
+    x = ids()
+    torch.manual_seed(1)
+    ref = model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    torch.save({"x": x, "ref": ref}, tmp_path / "ref.pt")
+    script = f"""
+import importlib.util, sys
+assert importlib.util.find_spec("model") is None, "repo package importable; test would not be standalone"
+import torch
+from transformers import AutoModelForCausalLM
+loaded = AutoModelForCausalLM.from_pretrained({str(out_dir)!r}, trust_remote_code=True).train(False)
+assert type(loaded).__module__.startswith("transformers_modules"), type(loaded).__module__
+data = torch.load({str(tmp_path / "ref.pt")!r}, weights_only=True)
+torch.manual_seed(1)
+got = loaded(data["x"]).logits
+torch.testing.assert_close(got, data["ref"], atol=1e-5, rtol=0)
+print("STANDALONE_OK")
+"""
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
+    env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_PROGRESS_BARS="1")
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "STANDALONE_OK" in result.stdout

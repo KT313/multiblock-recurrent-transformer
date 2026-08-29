@@ -3,8 +3,8 @@
 The thesis runs train through three phases (broad pretraining → domain
 upsampling → instruction finetuning) in a single launch, with smooth dataset
 transitions between phases. This document describes the mechanism; the
-implementation lives in `recpre/stage_manager.py` with its integration in
-`train.py` (LR schedule, transition detection, stage checkpoints, metrics).
+implementation lives in `training/stage_manager.py` with its integration in
+`training/train.py` (LR schedule, transition detection, stage checkpoints, metrics).
 
 ## What a stage specifies
 
@@ -17,16 +17,16 @@ Each entry in `training_stages` defines:
 - `transition_pct` — fraction of the stage reserved (at its end) for the
   transition into the next stage; `0.0` for the last stage
 
-Enable with `enable_multi_stage: true`. Without it, training behaves exactly as
-single-stage; multi-stage is opt-in and backward compatible.
+`training_stages` is the only way to configure a run; a single-stage run is one
+entry with `transition_pct: 0.0`.
 
 ## Transitions
 
 Instead of switching datasets abruptly at a stage boundary, the last
-`transition_pct` of a stage gradually shifts sampling weights from the current
-stage's datasets to the next stage's (100→0 / 0→100, linear), using the
-existing `DataScheduler` piecewise-weight machinery. The learning rate
-interpolates linearly between the two stages' `base_lr` over the same window.
+`transition_pct` of a stage gradually shifts sampling from the current stage's
+dataloader to the next stage's: every micro-batch is drawn from the next stage
+with probability equal to the transition progress (0→1, linear). The learning
+rate interpolates linearly between the two stages' `base_lr` over the same window.
 
 Global `warmup_steps` apply at the start of the first stage and
 `cooldown_steps` at the end of the last; within a stage the configured
@@ -43,28 +43,26 @@ per-stage validation metrics.
 
 ## Step accounting
 
-`total steps = Σ stage.tokens / (world_batch_size × block_size)`, computed
-per device by the stage manager. The stage boundary summary is printed at
-startup — check it before long runs.
+Steps are optimizer steps: `total steps = Σ stage.tokens / (world_batch_size ×
+block_size)`, independent of `micro_batch_size` and of the number of devices.
+The stage boundary summary is printed at startup — check it before long runs.
 
 ## Example configs
 
-- `cluster/configs/multistage_example.yaml` — documented 3-stage schema example
-- `cluster/configs/multistage_test_small.yaml` — small test config (~2.5M
-  tokens, minutes on one GPU); also see `tests/train_smoke/` for an even
-  smaller synthetic-data smoke run
-- `cluster/configs/crow_300m_final.yaml` — the real final-run config
+- `config/tiny.yaml` — 3-stage smoke run on synthetic data (20 steps, seconds)
+- `config/crow_300m_final.yaml` — the real final-run config
 
 ## Notable bug found during development
 
-The first version of the stage-boundary computation did not divide token
-budgets by `world_size`. On a single GPU everything looked correct, but on the
-4-GPU DDP setup each stage would have silently run 4× longer than configured —
-there is no error to see, just a schedule that never ends. It was caught in a
-code audit before the main runs by checking the startup boundary summary
-against a hand calculation. The fix divides per-device tokens by
-`devices × num_nodes` and adds validation that `warmup_steps` and
-`cooldown_steps` fit inside the first/last stage. Lesson: in distributed
+The first version of the stage-boundary computation (which counted per-device
+micro-batch steps) did not divide token budgets by `world_size`. On a single GPU
+everything looked correct, but on the 4-GPU DDP setup each stage would have
+silently run 4× longer than configured — there is no error to see, just a
+schedule that never ends. It was caught in a code audit before the main runs by
+checking the startup boundary summary against a hand calculation. The current
+code counts optimizer steps (world batches), which removes the `world_size`
+dependence altogether, and validates that `warmup_steps` and `cooldown_steps`
+fit inside the first/last stage. Lesson: in distributed
 training, verify step arithmetic by hand at startup rather than trusting that
 a config "looks right" — silent factor-of-`world_size` errors are cheap to
 make and expensive to discover mid-run.

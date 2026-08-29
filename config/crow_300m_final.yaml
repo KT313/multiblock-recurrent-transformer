@@ -1,0 +1,121 @@
+# Final thesis run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
+#
+# All step values are OPTIMIZER steps. One step = world_batch_size × block_size = 1024 × 2048 ≈ 2.1M tokens,
+# so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on 4 GPUs;
+# on one GPU the same world batch is 256 micro-batches of 4, so a step takes correspondingly longer.
+# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64, resume_warmup 512 → 8,
+#  save 8192 → 128, eval 1024 → 16.)
+#
+# Data layout under dataset/ is produced by data_preparation/ (see its README).
+
+run_name: crow-300m-final
+out_dir: outputs
+resume: true
+seed: 233
+
+model_name: crow-300m-final
+block_size: 2048
+tokenizer_path: dataset/tokenizer
+
+backend: single_device
+precision: bf16-mixed
+compile_model: true
+gradient_checkpointing: false
+
+micro_batch_size: 4
+world_batch_size: 1024
+dataloader_num_workers: 8
+sort_batches_by_length: true
+sequence_padding_multiple: 128
+
+optimizer: ELLISAdam
+optim_config:
+  lr: 1e-4            # placeholder; the per-stage base_lr below is what the schedule uses
+  weight_decay: 4e-5  # decoupled
+  betas: [0.9, 0.95]
+  update_clipping: true
+  atan_adam: true
+  running_init: true
+  decouple_wd: true
+no_weight_decay_for_bias_and_norm_params: true
+grad_clip: 1.0
+lr_schedule: trapezoid
+warmup_steps: 64
+cooldown_steps: 64
+min_lr: 0
+resume_warmup_steps: 8
+
+log_step_interval: 1
+log_gradient_metrics: true
+eval_step_interval: 16
+eval_iters: 50
+partial_depth_eval: [1, 2, 4, 8, 16]
+save_step_interval: 128
+save_last_step: true
+logger_project: recurtrain-baseline
+wandb_offline: true
+
+training_stages:
+  - name: pretrain_phase1
+    tokens: 3_300_000_000
+    base_lr: 3e-4
+    transition_pct: 0.10
+    train_data:
+      - {prefix: fineweb-train,   data_dir: dataset/pretraining/processed/merged/fineweb_edu,                weight: 0.65}
+      - {prefix: wikipedia-train, data_dir: dataset/pretraining/processed/merged/wikipedia,                  weight: 0.09}
+      - {prefix: books-train,     data_dir: dataset/pretraining/processed/merged/books_gutenberg,            weight: 0.06}
+      - {prefix: code-py-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_python,   weight: 0.036}
+      - {prefix: code-js-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_javascript, weight: 0.024}
+      - {prefix: code-ts-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_typescript, weight: 0.012}
+      - {prefix: code-java-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_java,     weight: 0.012}
+      - {prefix: code-cpp-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_cpp,      weight: 0.0096}
+      - {prefix: code-go-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_go,       weight: 0.0084}
+      - {prefix: code-rust-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_rust,     weight: 0.006}
+      - {prefix: code-shell-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_shell,   weight: 0.0048}
+      - {prefix: code-sql-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_sql,      weight: 0.0036}
+      - {prefix: code-html-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_html,     weight: 0.0036}
+      - {prefix: peso-train,      data_dir: dataset/pretraining/processed/merged/peso,                       weight: 0.03}
+      - {prefix: arxiv-train,     data_dir: dataset/pretraining/processed/merged/arxiv,                      weight: 0.02}
+      - {prefix: math-train,      data_dir: dataset/pretraining/processed/merged/openwebmath,                weight: 0.03}
+    val_data:
+      - {prefix: fw-val-1, data_dir: dataset/fineweb-edu/validation, weight: 1.0}
+
+  - name: pretrain_phase2
+    tokens: 1_500_000_000
+    base_lr: 1e-4
+    transition_pct: 0.10
+    train_data:
+      - {prefix: fineweb2-train,   data_dir: dataset/pretraining/processed/merged/fineweb_edu,                weight: 0.35}
+      - {prefix: code2-py-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_python,   weight: 0.084}
+      - {prefix: code2-js-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_javascript, weight: 0.056}
+      - {prefix: code2-ts-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_typescript, weight: 0.028}
+      - {prefix: code2-java-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_java,     weight: 0.028}
+      - {prefix: code2-cpp-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_cpp,      weight: 0.0224}
+      - {prefix: code2-go-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_go,       weight: 0.0196}
+      - {prefix: code2-rust-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_rust,     weight: 0.014}
+      - {prefix: code2-shell-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_shell,   weight: 0.0112}
+      - {prefix: code2-sql-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_sql,      weight: 0.0084}
+      - {prefix: code2-html-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_html,     weight: 0.0084}
+      - {prefix: math2-owm-train,  data_dir: dataset/pretraining/processed/merged/openwebmath,                weight: 0.088}
+      - {prefix: math2-gsm-train,  data_dir: dataset/pretraining/processed/merged/tinygsm,                    weight: 0.066}
+      - {prefix: math2-alg-train,  data_dir: dataset/pretraining/processed/merged/algebraic_stack,            weight: 0.044}
+      - {prefix: math2-gsm8k-train, data_dir: dataset/pretraining/processed/merged/gsm8k,                     weight: 0.022}
+      - {prefix: peso2-train,      data_dir: dataset/pretraining/processed/merged/peso,                       weight: 0.09}
+      - {prefix: arxiv2-train,     data_dir: dataset/pretraining/processed/merged/arxiv,                      weight: 0.06}
+    val_data:
+      - {prefix: fw2-val, data_dir: dataset/fineweb-edu/validation, weight: 1.0}
+
+  - name: finetune
+    tokens: 150_000_000
+    base_lr: 5e-5
+    transition_pct: 0.0
+    train_data:
+      - prefix: flan-mixture-train
+        data_dir: dataset/flan_mixture/train
+        weight: 1.0
+        data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}
+    val_data:
+      - prefix: flan-mixture-val
+        data_dir: dataset/flan_mixture/validation
+        weight: 1.0
+        data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}

@@ -1,0 +1,62 @@
+# Tiny smoke-run config: the real train.py code path with a ~240K-parameter model on synthetic data.
+# Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
+# a few seconds on CPU or GPU. Generate the data with `python -m data_preparation.make_tiny_dataset`.
+
+run_name: tiny
+out_dir: outputs/tiny
+resume: false
+seed: 42
+
+model_name: tiny
+block_size: 256
+tokenizer_path: dataset/tiny/tokenizer
+
+backend: single_device
+precision: bf16-mixed
+compile_model: false
+gradient_checkpointing: false
+
+micro_batch_size: 2
+world_batch_size: 4
+dataloader_num_workers: 0
+sort_batches_by_length: true
+sequence_padding_multiple: 128
+
+optimizer: AdamW
+optim_config: {lr: 3e-4, weight_decay: 0.1, betas: [0.9, 0.95]}
+no_weight_decay_for_bias_and_norm_params: true
+grad_clip: 1.0
+lr_schedule: trapezoid
+warmup_steps: 2
+cooldown_steps: 2
+min_lr: 0
+
+log_step_interval: 1
+log_gradient_metrics: true
+eval_step_interval: 8
+eval_iters: 2
+partial_depth_eval: [1]
+save_step_interval: 100
+save_last_step: true
+logger_project: train-smoke
+wandb_enabled: false
+
+training_stages:
+  - name: pretrain_a
+    tokens: 8192
+    base_lr: 3e-4
+    transition_pct: 0.25
+    train_data: [{prefix: pretrain-train, data_dir: dataset/tiny/pretrain/train}]
+    val_data: [{prefix: pretrain-val, data_dir: dataset/tiny/pretrain/val}]
+  - name: pretrain_b
+    tokens: 8192
+    base_lr: 1e-4
+    transition_pct: 0.25
+    train_data: [{prefix: pretrain-train, data_dir: dataset/tiny/pretrain/train}]
+    val_data: [{prefix: pretrain-val, data_dir: dataset/tiny/pretrain/val}]
+  - name: finetune
+    tokens: 4096
+    base_lr: 5e-5
+    transition_pct: 0.0
+    train_data: [{prefix: finetune-train, data_dir: dataset/tiny/finetune/train}]
+    val_data: [{prefix: finetune-val, data_dir: dataset/tiny/finetune/val}]

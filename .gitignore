@@ -20,3 +20,9 @@ events.out.tfevents*
 # test-run artifacts
 tests/train_smoke/data/
 tests/train_smoke/out/
+
+# local data and runs
+dataset/
+outputs/
+.pytest_cache/
+.ruff_cache/

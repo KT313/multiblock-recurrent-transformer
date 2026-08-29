@@ -1,0 +1,129 @@
+# Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
+# Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
+"""Architecture configuration of the multi-block recurrent transformer (the `crow-300m-final` code path only)."""
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+from .init import Init
+from .presets import PRESETS
+
+
+def find_multiple(n: int, k: int) -> int:
+    """Smallest multiple of `k` that is >= `n`."""
+    if n % k == 0:
+        return n
+    return n + k - (n % k)
+
+
+@dataclass
+class RoPESettings:
+    rope_base: int = 50_000
+
+
+@dataclass
+class RecurrentConfig:
+    """Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block."""
+
+    name: str = ""
+    # Core
+    block_size: int = 2048
+    n_embd: int = 1024
+    intermediate_size: int | None = None
+    num_attention_heads: int = 16
+    # Vocabulary
+    vocab_size: int = 32000
+    padding_multiple: int = 2048
+    padded_vocab_size: int | None = None
+    tie_embeddings: bool = True
+    # Block details
+    rope_settings: RoPESettings = field(default_factory=RoPESettings)
+    attn_impl: Literal["sdpa"] = "sdpa"
+    norm_eps: float = 1e-6
+    qk_bias: bool = True
+    init_strategy: Literal["takase"] = "takase"
+    init_orthogonal: Literal[True] = True
+    activation_checkpoint_impl: Literal["per-iteration"] = "per-iteration"
+    # Recurrent structure
+    injection_type: Literal["linear"] = "linear"
+    n_layers_in_prelude: int = 2
+    n_layers_in_coda: int = 2
+    n_layers_in_recurrent_block: int | list[int] = 4
+    state_init: Literal["normal"] = "normal"
+    sampling_scheme: Literal["poisson-lognormal-filling"] = "poisson-lognormal-filling"
+    mean_recurrence: int | list[int] = 12
+    mean_backprop_depth: int | list[int] = 8
+
+    def __post_init__(self) -> None:
+        if isinstance(self.rope_settings, dict):
+            self.rope_settings = RoPESettings(**self.rope_settings)
+        for name, allowed in (
+            ("attn_impl", "sdpa"),
+            ("init_strategy", "takase"),
+            ("init_orthogonal", True),
+            ("activation_checkpoint_impl", "per-iteration"),
+            ("injection_type", "linear"),
+            ("state_init", "normal"),
+            ("sampling_scheme", "poisson-lognormal-filling"),
+        ):
+            if getattr(self, name) != allowed:
+                raise ValueError(f"{name}={getattr(self, name)!r} is not supported, only {allowed!r}")
+
+        if self.padded_vocab_size is None:
+            self.padded_vocab_size = find_multiple(self.vocab_size, self.padding_multiple)
+        else:
+            self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
+
+        if self.n_embd % self.num_attention_heads != 0:
+            raise ValueError("n_embd must be divisible by num_attention_heads")
+        self.head_size = self.n_embd // self.num_attention_heads
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.n_embd
+
+        # Normalize per-block fields to lists of equal length.
+        if isinstance(self.n_layers_in_recurrent_block, int):
+            self.n_layers_in_recurrent_block = [self.n_layers_in_recurrent_block]
+        num_blocks = len(self.n_layers_in_recurrent_block)
+        self.mean_recurrence = self._broadcast("mean_recurrence", self.mean_recurrence, num_blocks)
+        self.mean_backprop_depth = self._broadcast("mean_backprop_depth", self.mean_backprop_depth, num_blocks)
+
+        # Expected unrolled depth (used to scale the output-projection init) and the mean backprop depth.
+        self.effective_expected_depth = (
+            self.n_layers_in_prelude
+            + self.n_layers_in_coda
+            + sum(n * r for n, r in zip(self.n_layers_in_recurrent_block, self.mean_recurrence))
+        )
+        self.n_layer = sum(n * d for n, d in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth))
+        self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
+
+    @staticmethod
+    def _broadcast(name: str, value: int | list[int], num_blocks: int) -> list[int]:
+        values = [value] if isinstance(value, int) else list(value)
+        if len(values) == 1 and num_blocks > 1:
+            values = values * num_blocks
+        if len(values) != num_blocks:
+            raise ValueError(f"{name} has {len(values)} entries but there are {num_blocks} recurrent blocks")
+        return values
+
+    @classmethod
+    def from_name(cls, name: str, **overrides: Any) -> "RecurrentConfig":
+        """Build a config from a preset in `presets.PRESETS`, with keyword overrides applied on top."""
+        if name not in PRESETS:
+            raise ValueError(f"{name!r} is not a known preset, choose from {sorted(PRESETS)}")
+        return cls(**{**PRESETS[name], **overrides})
+
+    @classmethod
+    def from_json(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
+        with open(path, encoding="utf-8") as fp:
+            kwargs = json.load(fp)
+        return cls(**{**kwargs, **overrides})
+
+    def to_dict(self) -> dict[str, Any]:
+        """Dataclass fields only (derived attributes and the `Init` object are recomputed on load)."""
+        return asdict(self)
+
+    def to_json(self, path: str | Path) -> None:
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(self.to_dict(), fp, indent=2)

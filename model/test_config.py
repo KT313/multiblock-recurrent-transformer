@@ -1,0 +1,174 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""Tests for `model.config`: per-block broadcasting, derived sizes, presets and JSON round trip."""
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from model.config import RecurrentConfig, RoPESettings, find_multiple
+from model.presets import PRESETS
+
+
+def tiny(**overrides: Any) -> RecurrentConfig:
+    return RecurrentConfig.from_name("tiny", **overrides)
+
+
+@pytest.mark.parametrize(("n", "k", "expected"), [(512, 512, 512), (500, 128, 512), (1, 8, 8), (32000, 2048, 32768)])
+def test_find_multiple(n: int, k: int, expected: object) -> None:
+    assert find_multiple(n, k) == expected
+
+
+def test_int_fields_broadcast_to_single_block_lists() -> None:
+    cfg = tiny(n_layers_in_recurrent_block=4, mean_recurrence=12, mean_backprop_depth=8)
+    assert cfg.n_layers_in_recurrent_block == [4]
+    assert cfg.mean_recurrence == [12]
+    assert cfg.mean_backprop_depth == [8]
+
+
+def test_int_fields_broadcast_across_blocks() -> None:
+    cfg = tiny(n_layers_in_recurrent_block=[4, 4, 4], mean_recurrence=12, mean_backprop_depth=8)
+    assert cfg.mean_recurrence == [12, 12, 12]
+    assert cfg.mean_backprop_depth == [8, 8, 8]
+
+
+def test_single_element_list_is_broadcast_like_an_int() -> None:
+    cfg = tiny(n_layers_in_recurrent_block=[1, 2], mean_recurrence=[5], mean_backprop_depth=[3])
+    assert cfg.mean_recurrence == [5, 5]
+    assert cfg.mean_backprop_depth == [3, 3]
+
+
+def test_per_block_lists_are_kept() -> None:
+    cfg = tiny(n_layers_in_recurrent_block=[1, 2, 3], mean_recurrence=[4, 5, 6], mean_backprop_depth=[1, 2, 3])
+    assert cfg.mean_recurrence == [4, 5, 6]
+    assert cfg.mean_backprop_depth == [1, 2, 3]
+
+
+@pytest.mark.parametrize("field", ["mean_recurrence", "mean_backprop_depth"])
+def test_length_mismatch_raises(field: str) -> None:
+    with pytest.raises(ValueError, match=f"{field} has 2 entries but there are 3"):
+        tiny(n_layers_in_recurrent_block=[1, 1, 1], **{field: [1, 2]})
+
+
+def test_broadcast_helper_directly() -> None:
+    assert RecurrentConfig._broadcast("f", 3, 1) == [3]
+    assert RecurrentConfig._broadcast("f", 3, 3) == [3, 3, 3]
+    assert RecurrentConfig._broadcast("f", [3], 2) == [3, 3]
+    assert RecurrentConfig._broadcast("f", [1, 2], 2) == [1, 2]
+    with pytest.raises(ValueError, match="f has 3 entries but there are 2"):
+        RecurrentConfig._broadcast("f", [1, 2, 3], 2)
+
+
+def test_rope_settings_default() -> None:
+    assert RoPESettings().rope_base == 50_000
+    assert RoPESettings(rope_base=7) != RoPESettings()
+
+
+def test_padded_vocab_size_derived_from_padding_multiple() -> None:
+    cfg = tiny(vocab_size=500, padding_multiple=128)
+    assert cfg.padded_vocab_size == 512
+    assert cfg.vocab_size == 500
+
+
+def test_explicit_padded_vocab_size_clamps_vocab_size() -> None:
+    cfg = tiny(vocab_size=1000, padded_vocab_size=768)
+    assert cfg.padded_vocab_size == 768
+    assert cfg.vocab_size == 768
+
+
+def test_head_size_and_intermediate_size() -> None:
+    cfg = tiny(n_embd=64, num_attention_heads=4, intermediate_size=None)
+    assert cfg.head_size == 16
+    assert cfg.intermediate_size == 256
+
+
+def test_n_embd_not_divisible_by_heads_raises() -> None:
+    with pytest.raises(ValueError, match="divisible"):
+        tiny(n_embd=65, num_attention_heads=4)
+
+
+def test_depth_arithmetic() -> None:
+    cfg = tiny(
+        n_layers_in_prelude=2,
+        n_layers_in_coda=1,
+        n_layers_in_recurrent_block=[1, 2],
+        mean_recurrence=[3, 4],
+        mean_backprop_depth=[2, 1],
+    )
+    assert cfg.effective_expected_depth == 2 + 1 + (1 * 3 + 2 * 4)
+    assert cfg.n_layer == 1 * 2 + 2 * 1
+    assert cfg.init.num_layers == cfg.effective_expected_depth
+
+
+def test_crow_preset_depths() -> None:
+    cfg = RecurrentConfig.from_name("crow-300m-final")
+    assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
+    assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
+    assert cfg.n_layer == 3 * 4 * 8
+    assert cfg.padded_vocab_size == 32768
+    assert cfg.head_size == 64
+
+
+def test_from_name_applies_overrides() -> None:
+    cfg = tiny(n_embd=32, num_attention_heads=2, mean_recurrence=[7, 9])
+    assert cfg.name == "tiny"
+    assert cfg.n_embd == 32
+    assert cfg.head_size == 16
+    assert cfg.mean_recurrence == [7, 9]
+    assert tiny().n_embd == PRESETS["tiny"]["n_embd"]
+
+
+def test_from_name_unknown_preset_raises() -> None:
+    with pytest.raises(ValueError, match="not a known preset"):
+        RecurrentConfig.from_name("does-not-exist")
+
+
+def test_from_name_does_not_mutate_preset() -> None:
+    before = dict(PRESETS["tiny"])
+    tiny(n_layers_in_recurrent_block=3, mean_recurrence=99)
+    assert PRESETS["tiny"] == before
+
+
+def test_json_round_trip(tmp_path: Path) -> None:
+    cfg = tiny(rope_settings=RoPESettings(rope_base=10_000), mean_recurrence=[3, 5])
+    path = tmp_path / "config.json"
+    cfg.to_json(path)
+    loaded = RecurrentConfig.from_json(path)
+    assert loaded == cfg
+    assert isinstance(loaded.rope_settings, RoPESettings)
+    assert loaded.rope_settings.rope_base == 10_000
+    assert loaded.head_size == cfg.head_size
+    assert loaded.effective_expected_depth == cfg.effective_expected_depth
+
+
+def test_from_json_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    tiny().to_json(path)
+    assert RecurrentConfig.from_json(path, n_layers_in_coda=5).n_layers_in_coda == 5
+
+
+def test_rope_settings_accepts_dict() -> None:
+    assert tiny(rope_settings={"rope_base": 123}).rope_settings == RoPESettings(rope_base=123)
+
+
+def test_to_dict_contains_only_dataclass_fields() -> None:
+    d = tiny().to_dict()
+    assert "init" not in d and "head_size" not in d and "n_layer" not in d
+    assert d["rope_settings"] == {"rope_base": 50_000}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attn_impl", "flash"),
+        ("init_strategy", "normal"),
+        ("init_orthogonal", False),
+        ("activation_checkpoint_impl", "per-block"),
+        ("injection_type", "add"),
+        ("state_init", "zero"),
+        ("sampling_scheme", "uniform"),
+    ],
+)
+def test_invalid_single_value_fields_rejected(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=f"{field}="):
+        tiny(**{field: value})
