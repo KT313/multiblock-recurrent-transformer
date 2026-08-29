@@ -41,9 +41,13 @@ Three source kinds: `pretrain` (a `text` column, goes through the processing pip
 `holdout` (a fixed number of rows for validation only, no dedup/filters) and `instruct` (`instruction/input/output`
 rows, only usable through a mixture; `<mixture>`, `<mixture>/train` and `<mixture>/validation` are the stage keys).
 The schema with every field and the validation rules is `lib/schema/dataset_config.py`; loading fails on unknown
-loader/converter names, weights that do not sum to 1, holdouts in `train`, and so on. The two configs in the tree
-are `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is generated from it) and
-`config/datasets/tiny.yaml` (synthetic, builds in seconds, used by the tests and `config/tiny.yaml`).
+loader/converter names, weights that do not sum to 1, holdouts in `train`, and so on. The configs in the tree are
+`config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is generated from it),
+`config/datasets/crow_300m_mini.yaml` (the same sources with 300k / 150k / 60k-token budgets and a 40-row holdout:
+a real-source smoke build of a few MB that finishes in minutes and exercises every loader; needs `HF_TOKEN` for
+`mini-peS2o`; `tools/capped_download.sh 500 uv run python data_preparation/prepare.py build --dataset_config
+config/datasets/crow_300m_mini.yaml` runs it under a hard download cap) and `config/datasets/tiny.yaml` (synthetic,
+builds in seconds, used by the tests and `config/tiny.yaml`).
 
 ## On-disk layout and manifests
 
@@ -56,7 +60,7 @@ dataset/
 │   └── holdout/      MANIFEST.json + data-*.parquet     `holdout` sources only            <- validation reads this
 ├── mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
 ├── tokenizers/<tokenizer name>/                            MANIFEST.json + tokenizer files
-├── hub_index/<repo>@<revision>/<glob hash>.json            file lists + row counts of `hf_files` / `github_code` repos
+├── hub_index/<repo>@<revision>/<glob hash>.json            file lists, sizes, row counts + parquet row-group layout of `hf_files` / `github_code` repos
 └── benchmarks/                                             cached benchmark test sets (decontamination only)
 ```
 
@@ -116,11 +120,17 @@ Two caches, with different lifetimes:
 
 * **Hub cache** (`~/.cache/huggingface/hub`, or `HF_HOME` / `--cache_dir`): the original repo files fetched by
   `hf_files` / `github_code` (`hf_hub_download`, one file at a time, never twice) and the `datasets` cache of
-  `hf_split` sources. Deleting it costs a re-download; nothing else depends on it.
+  `hf_split` sources. Deleting it costs a re-download; nothing else depends on it. Only files up to
+  `max_cached_file_mb` (default 256, per source via `load_kwargs.max_cached_file_mb`) land here: larger parquet
+  files are read remotely row group by row group (a top-up seeks straight to the row group it needs; fineweb-edu's
+  2.4 GB files cost a few MB per 1000 rows), larger `.jsonl[.zst|.gz]` files are streamed from the start until
+  enough rows were read (their row count is only recorded once read to the end, so a top-up inside a partially
+  consumed file re-streams that one file), and a plain `.json` array above the threshold is an error (use
+  `hf_split`).
 * **`dataset/sources/<source>/raw/`**: the rows this pipeline kept, in shards, with a manifest — the append-only
   source cache that `filter` / `process` / mixtures are built from. `dataset/hub_index/` holds the small JSON file
   indexes (file list per glob, rows per file) that let `hf_files` fetch at an offset without opening earlier files;
-  it is safe to delete (rebuilt on demand from the repo listing and the cached files).
+  it is safe to delete (rebuilt on demand from the repo listing, the file sizes and the cached / remote files).
 
 ## Progress bars
 
@@ -149,7 +159,7 @@ Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -
 
 | Loader | Use for | Notes |
 |---|---|---|
-| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>}` (required, relative to the repo root); files sorted by path, downloaded one at a time into the Hub cache on demand and read locally (`.parquet`, `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz`, small `.json` arrays); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
+| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>, max_cached_file_mb: 256}` (`data_files` required, relative to the repo root); files sorted by path; files up to `max_cached_file_mb` are downloaded one at a time into the Hub cache on demand and read locally, larger `.parquet` files are read remotely by row group and larger `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz` files are streamed (small `.json` arrays only); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
 | `hf_split` | small single-file repos (one `.json`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
 | `hf_stream` | fallback | `datasets` streaming with `skip(offset)`; **caches nothing** — every fetch re-streams from the start, so avoid it for anything large |
 | `github_code` | `codeparrot/github-code-clean` | `hf_files` over `data/*.parquet` keeping rows of `language:` (`text_field: code`); all language sources read the same cached files and the shared index stores per-language row counts |

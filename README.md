@@ -33,7 +33,12 @@ or inspect the plan:
 ```bash
 uv run python data_preparation/prepare.py build  --dataset_config config/datasets/crow_300m_final.yaml   # export HF_TOKEN for gated sources
 uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
+uv run python data_preparation/prepare.py build  --dataset_config config/datasets/crow_300m_mini.yaml    # same sources, a few MB: real-source smoke build
 ```
+
+`crow_300m_mini.yaml` is the thesis config with tiny budgets — it touches every real source (minutes, a few MB) and
+is the quickest way to check that the data path works end to end; `tools/capped_download.sh 500 <command>` runs any
+command under a hard download cap (see `tools/README.md`).
 
 See `data_preparation/README.md` for the dataset config, `docs/data_mixture.md` for the thesis mixture (generated
 from the config) and `docs/multistage_training.md` for the stage mechanism.
@@ -45,6 +50,7 @@ data_preparation/  prepare.py (build / status / describe / tiny) + lib/
 config/            run configs; config/datasets/ dataset configs
 dataset/           gitignored; prepared data, mixtures and tokenizers
 docs/              thesis documentation and figures
+tools/             dev tooling (download-capped command runner)
 ```
 
 Final model configs in the original repo were named "raven", so I named my model configs "crow" in the same spirit.

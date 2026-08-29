@@ -104,7 +104,7 @@ class SourceConfig:
     loader: LoaderName = "hf_split"
     hf_id: Optional[str] = None  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
     revision: Optional[str] = None  # Hub commit sha; pin it so row order is stable across increments
-    load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files: {data_files: <glob>}; else `load_dataset` kwargs
+    load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
     split: str = "train"
     text_field: str = "text"  # pretrain/holdout: column holding the document
     language: Optional[str] = None  # github_code: language label of codeparrot/github-code-clean
@@ -126,6 +126,9 @@ class SourceConfig:
             raise ValueError(f"loader {self.loader} requires hf_id")
         if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
             raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
+        threshold = self.load_kwargs.get("max_cached_file_mb")
+        if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or threshold < 0):
+            raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
         if self.loader == "local" and not self.path:
             raise ValueError("loader local requires path")
         if self.kind == "holdout" and (self.rows is None or self.rows <= 0):
@@ -244,6 +247,7 @@ class DatasetConfig:
         payload: dict[str, Any] = {"source": asdict(source), "token_count": self.token_count}
         payload["source"].pop("tokens_per_row_estimate")
         payload["source"].pop("processing")
+        payload["source"]["load_kwargs"].pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
         if source.kind == "pretrain":
             payload["processing"] = asdict(self.source_processing(source_name))
             payload["max_seq_length"] = self.max_seq_length

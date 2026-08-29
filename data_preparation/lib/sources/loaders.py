@@ -2,8 +2,9 @@
 """Row loaders: `LOADERS[name](source, offset, count, *, token, index_dir, on_file) -> Iterator[Row]` yields at most
 `count` raw rows starting at row `offset` of the source's deterministic order (`hf_files`, `hf_split`, `hf_stream`,
 `github_code`, `local`, `synthetic`). `index_dir` is where `hf_files` / `github_code` persist their file index
-(None: in memory), `on_file` is called with every repo file they open (progress display). `datasets` is imported
-lazily so the HF cache environment can be configured before import."""
+(None: in memory), `on_file` is called with every repo file they open (progress display) and `stats` collects
+their download counters (`FetchStats`, remote bytes read). `datasets` is imported lazily so the HF cache
+environment can be configured before import."""
 
 from __future__ import annotations
 
@@ -16,7 +17,14 @@ from typing import Any, Protocol
 import pyarrow.parquet as pq
 
 from data_preparation.lib.schema.dataset_config import SourceConfig
-from data_preparation.lib.sources.hub_files import FileIndex, OnFile, read_rows
+from data_preparation.lib.sources.hub_files import (
+    DEFAULT_MAX_CACHED_FILE_MB,
+    FetchStats,
+    FileIndex,
+    HubFetcher,
+    OnFile,
+    read_rows,
+)
 from data_preparation.lib.sources.synthetic import synthetic_row
 
 Row = dict[str, Any]
@@ -32,10 +40,12 @@ class Loader(Protocol):
         token: str | None = None,
         index_dir: Path | None = None,
         on_file: OnFile | None = None,
+        stats: FetchStats | None = None,
     ) -> Iterator[Row]: ...
 
 
 GITHUB_CODE_DATA_FILES = "data/*.parquet"
+MAX_CACHED_FILE_KEY = "max_cached_file_mb"  # `load_kwargs` knob of hf_files / github_code (not part of the source hash)
 
 
 def _check_offset_count(offset: int, count: int) -> None:
@@ -64,6 +74,7 @@ def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> di
     the files are then read through the generic builder from `hf://datasets/<hf_id>@<revision>/<data_files>`.
     """
     load_kwargs = dict(source.load_kwargs)
+    load_kwargs.pop(MAX_CACHED_FILE_KEY, None)
     builder = load_kwargs.pop("builder", None)
     kwargs: dict[str, Any] = {"token": token, **extra}
     if builder is None:
@@ -85,6 +96,7 @@ def load_hf_split(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via `split[a:b]` slicing (materialised download, deterministic order)."""
     _check_offset_count(offset, count)
@@ -102,6 +114,7 @@ def load_hf_stream(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via streaming with `skip(offset)` (used for instruct sources)."""
     _check_offset_count(offset, count)
@@ -141,6 +154,13 @@ def hub_file_index(source: SourceConfig, default_pattern: str | None, index_dir:
     return FileIndex.open(source.hf_id, source.revision, pattern, index_dir, token)
 
 
+def hub_fetcher(source: SourceConfig, token: str | None, stats: FetchStats | None) -> HubFetcher:
+    """The :class:`HubFetcher` of a `hf_files` / `github_code` source: `load_kwargs.max_cached_file_mb` (default
+    `DEFAULT_MAX_CACHED_FILE_MB`) decides which files go through the Hub cache and which are read remotely."""
+    threshold = source.load_kwargs.get(MAX_CACHED_FILE_KEY, DEFAULT_MAX_CACHED_FILE_MB)
+    return HubFetcher(token=token, max_cached_file_mb=float(threshold), stats=stats or FetchStats())
+
+
 def load_hf_files(
     source: SourceConfig,
     offset: int,
@@ -149,17 +169,20 @@ def load_hf_files(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of the repo files matching `load_kwargs.data_files`, sorted by path.
 
-    Files are downloaded one at a time into the Hub cache (never twice) and read locally; the per-(repo, revision,
-    glob) file index under `index_dir` lets a later fetch skip whole files (see `sources/hub_files.py`).
+    Files up to `load_kwargs.max_cached_file_mb` are downloaded one at a time into the Hub cache (never twice) and
+    read locally; larger parquet files are read remotely row group by row group, larger json-lines files are
+    streamed. The per-(repo, revision, glob) file index under `index_dir` lets a later fetch skip whole files (see
+    `sources/hub_files.py`).
     """
     _check_offset_count(offset, count)
     if count == 0:
         return
     index = hub_file_index(source, None, index_dir, token)
-    yield from read_rows(index, offset, count, token=token, on_file=on_file)
+    yield from read_rows(index, offset, count, on_file=on_file, fetcher=hub_fetcher(source, token, stats))
 
 
 def load_github_code(
@@ -170,6 +193,7 @@ def load_github_code(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """`hf_files` over `hf_id` (codeparrot/github-code-clean, default `data_files: data/*.parquet`) keeping rows of
     `source.language`.
@@ -189,8 +213,8 @@ def load_github_code(
         index,
         offset,
         count,
-        token=token,
         on_file=on_file,
+        fetcher=hub_fetcher(source, token, stats),
         key=f"language={language}",
         match=lambda row: bool(row["language"] == language),
     )
@@ -222,6 +246,7 @@ def load_local(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order)."""
     _check_offset_count(offset, count)
@@ -248,6 +273,7 @@ def load_synthetic(
     token: str | None = None,
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
 ) -> Iterator[Row]:
     """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/holdout, instruct triple)."""
     _check_offset_count(offset, count)

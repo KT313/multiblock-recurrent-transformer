@@ -5,7 +5,7 @@ budget arithmetic."""
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from data_preparation.lib.schema.dataset_config import (
 REPO = Path(__file__).resolve().parents[3]
 CROW = REPO / "config" / "datasets" / "crow_300m_final.yaml"
 TINY = REPO / "config" / "datasets" / "tiny.yaml"
+MINI = REPO / "config" / "datasets" / "crow_300m_mini.yaml"
 
 
 def _minimal() -> dict[str, Any]:
@@ -64,11 +65,28 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
 # --- shipped files ----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", [CROW, TINY])
+@pytest.mark.parametrize("path", [CROW, TINY, MINI])
 def test_shipped_configs_load(path: Path) -> None:
     cfg = load_dataset_config(path)
-    assert cfg.name in ("crow-300m-final", "tiny")
+    assert cfg.name in ("crow-300m-final", "tiny", "crow-300m-mini")
     assert cfg.stages and cfg.sources
+
+
+def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
+    """The real-source smoke config differs from the thesis config only in name, budgets and holdout size."""
+    final, mini = load_dataset_config(CROW), load_dataset_config(MINI)
+    assert mini.name == "crow-300m-mini"
+    assert [s.tokens for s in mini.stages] == [300_000, 150_000, 60_000]
+    assert [(s.name, s.train, s.val, s.transition_pct) for s in mini.stages] == [
+        (s.name, s.train, s.val, s.transition_pct) for s in final.stages
+    ]
+    assert set(mini.sources) == set(final.sources)
+    for name, source in final.sources.items():
+        expected = replace(source, rows=40) if source.kind == "holdout" else source
+        assert mini.sources[name] == expected, name
+    assert mini.sources["fineweb_val"].rows == 40
+    assert mini.mixtures == final.mixtures and mini.tokenizer == final.tokenizer
+    assert (mini.processing, mini.max_seq_length, mini.token_count) == (final.processing, final.max_seq_length, final.token_count)
 
 
 def test_crow_config_matches_thesis_run() -> None:
@@ -227,6 +245,20 @@ def test_sources_of_kind() -> None:
 
 
 # --- hashes -----------------------------------------------------------------------------------------------------------
+
+
+def test_max_cached_file_mb_validated_and_not_hashed() -> None:
+    d = _minimal()
+    d["sources"]["files"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
+    h = _build(d).source_hash("files")
+    d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 1.5
+    assert _build(d).source_hash("files") == h  # how a file is fetched does not change its rows
+    d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 0
+    assert _build(d).source_hash("files") == h
+    for bad in (-1, "big", True):
+        d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = bad
+        with pytest.raises(ValueError, match="max_cached_file_mb"):
+            _build(d)
 
 
 def test_source_hash_stable_across_key_order_and_reloads() -> None:

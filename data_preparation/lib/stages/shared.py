@@ -22,6 +22,7 @@ from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress, progress
 from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows
 from data_preparation.lib.sources import (
+    FetchStats,
     Row,
     get_converter,
     get_filter,
@@ -224,7 +225,8 @@ def _fetch_rows(
 ) -> Iterator[Row]:
     """Rows to store for one download increment; keeps calling the loader until ``wanted`` rows are kept, the
     source is exhausted or ``max_consume`` source rows were inspected (instruct filters may drop rows, so one loader
-    call may not be enough). ``bar`` tracks kept rows (postfix: source rows consumed, current repo file)."""
+    call may not be enough). ``bar`` tracks kept rows (postfix: source rows consumed, current repo file, MB read
+    remotely)."""
     loader = get_loader(source.loader)
     converter = get_converter(source) if source.kind == "instruct" else None
     row_filter = get_filter(source.filter) if source.filter is not None else None
@@ -233,10 +235,16 @@ def _fetch_rows(
     if source.repeat_to_budget and source.loader == "synthetic":
         raise ValueError(f"{name}: repeat_to_budget needs a finite source, the synthetic loader is unbounded")
     postfix: dict[str, Any] = {"consumed": 0}
+    fetch_stats = FetchStats()
+
+    def refresh_postfix() -> None:
+        if fetch_stats.bytes_read:
+            postfix["MB"] = f"{fetch_stats.bytes_read / 2**20:.0f}"
+        bar.set_postfix(postfix, refresh=False)
 
     def on_file(file: str) -> None:
         postfix["file"] = file.rsplit("/", 1)[-1]
-        bar.set_postfix(postfix, refresh=False)
+        refresh_postfix()
 
     while stats["kept"] < wanted:
         count = wanted - stats["kept"]
@@ -247,14 +255,15 @@ def _fetch_rows(
                 return
         yielded = 0
         rows = loader(
-            source, offset + stats["consumed"], count, token=hf_token, index_dir=layout.hub_index_dir(), on_file=on_file
+            source, offset + stats["consumed"], count, token=hf_token, index_dir=layout.hub_index_dir(), on_file=on_file,
+            stats=fetch_stats,
         )
         for raw in rows:
             yielded += 1
             stats["consumed"] += 1
             postfix["consumed"] = stats["consumed"]
             if stats["consumed"] % 100 == 0:
-                bar.set_postfix(postfix, refresh=False)
+                refresh_postfix()
             if source.kind != "instruct":
                 yield text_row(source, raw, name)
                 stats["kept"] += 1
