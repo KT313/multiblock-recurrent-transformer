@@ -345,7 +345,7 @@ def load_filtered_dataset(dataset_dir: Path) -> "Dataset | None":
     """Load ``data-*.parquet`` of one filtered source as a ``datasets.Dataset`` (None if absent)."""
     from datasets import Dataset, concatenate_datasets
 
-    parquet_files = list_parquet_files(dataset_dir, "data")
+    parquet_files = list_parquet_files(dataset_dir)
     if not parquet_files:
         return None
     return concatenate_datasets([Dataset.from_parquet(str(f)) for f in parquet_files])
@@ -400,7 +400,7 @@ def write_verification_samples(merged_dir: Path, path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         f.write("Pretraining dataset verification samples\n")
         for source_dir in sorted(d for d in merged_dir.iterdir() if d.is_dir()):
-            files = list_parquet_files(source_dir, "data")
+            files = list_parquet_files(source_dir)
             if not files:
                 continue
             f.write(f"\n{'=' * 80}\n{source_dir.name}\n{'=' * 80}\n\n")

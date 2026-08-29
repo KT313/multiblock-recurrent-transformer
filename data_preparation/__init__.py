@@ -4,7 +4,7 @@
 Single entry point: ``python data_preparation/prepare.py <command> [options]`` (run from the repo root; the
 implementation lives in ``data_preparation/lib/``). All outputs default to ``dataset/`` (``--dataset_dir``):
 
-    download            -> dataset/pretraining/raw/<source>/shard-*.parquet      (raw HF columns)
+    download            -> dataset/pretraining/raw/<source>/data-*.parquet      (raw HF columns)
     filter              -> dataset/pretraining/filtered/<source>/data-*.parquet  (text, source, original_length)
     process             -> dataset/pretraining/processed/merged/<source>/data-*.parquet
                            (text, source, estimated_tokens) + preprocessing_stats.json + verification_samples.txt

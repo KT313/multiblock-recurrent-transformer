@@ -39,7 +39,7 @@ def _run(
     monkeypatch.setattr(sys, "argv", ["prepare_fineweb_validation", "--dataset_dir", str(tmp_path)])
     pfv.main()
     assert calls == [("HuggingFaceFW/fineweb-edu", "sample-10BT", "train")]
-    files = list_parquet_files(tmp_path / "fineweb-edu" / "validation", "data")
+    files = list_parquet_files(tmp_path / "fineweb-edu" / "validation")
     return files, pa.concat_tables([pq.read_table(f) for f in files])
 
 

@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Download the raw pretraining sources to ``dataset/pretraining/raw/<source>/shard-*.parquet``.
+"""Download the raw pretraining sources to ``dataset/pretraining/raw/<source>/data-*.parquet``.
 
 No filtering happens here (see ``filter_pretraining``); rows are stored with their original HuggingFace columns.
 Sample targets are the 300M-model budgets used for the thesis run. Sources are loaded with ``train[:N]`` split
@@ -104,8 +104,8 @@ DATASETS: list[dict[str, Any]] = [
 
 
 def _save_hf_dataset(dataset: "Dataset", out_dir: Path) -> int:
-    """Write an in-memory ``datasets.Dataset`` to ``shard-*.parquet`` files."""
-    return write_parquet_shards(iter_dataset_tables(dataset), out_dir, SHARD_SIZE, prefix="shard")
+    """Write an in-memory ``datasets.Dataset`` to ``data-*.parquet`` files."""
+    return write_parquet_shards(iter_dataset_tables(dataset), out_dir, SHARD_SIZE)
 
 
 def download_sliced(config: dict[str, Any], out_dir: Path) -> int:
@@ -145,7 +145,7 @@ def download_github_code(config: dict[str, Any], out_dir: Path) -> int:
 
     stream = load_dataset(GITHUB_CODE_DATASET, split="train", streaming=True, token=os.environ.get("HF_TOKEN"))
     rows = iter_language(stream, config["language"], config["target_samples"])
-    return write_dict_rows(rows, out_dir, SHARD_SIZE, prefix="shard")
+    return write_dict_rows(rows, out_dir, SHARD_SIZE)
 
 
 def iter_language(rows: Iterable[dict[str, Any]], language: str, limit: int) -> Iterator[dict[str, Any]]:

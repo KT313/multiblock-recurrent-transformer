@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
+import shutil
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -13,8 +15,14 @@ from typing import TYPE_CHECKING, Any, cast
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from data_preparation.lib.log import get_logger
+
 if TYPE_CHECKING:  # `datasets` is imported lazily at runtime (after the HF cache is configured)
     from datasets import Dataset
+
+log = get_logger(__name__)
+SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
+_WHITESPACE = re.compile(r"\s+")
 
 RANDOM_SEED = 42
 DEFAULT_DATASET_DIR = Path("dataset")
@@ -59,16 +67,32 @@ def md5_hex(text: str) -> str:
     return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def normalized_text(text: str) -> str:
+    """Lower-cased text with runs of whitespace collapsed to one space and stripped (exact-dedup key)."""
+    return _WHITESPACE.sub(" ", text.lower()).strip()
+
+
+def normalized_hash(text: str) -> str:
+    """MD5 of :func:`normalized_text` — the key of the normalized exact deduplication pass."""
+    return md5_hex(normalized_text(text))
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap token count estimate (characters / 4)."""
     return len(text) // 4
 
 
-def list_parquet_files(directory: Path, prefix: str) -> list[Path]:
-    """Sorted ``<prefix>-*.parquet`` files inside ``directory`` (empty if the directory does not exist)."""
+def list_parquet_files(directory: Path) -> list[Path]:
+    """Sorted ``*.parquet`` files inside ``directory`` (empty if the directory does not exist)."""
     if not directory.is_dir():
         return []
-    return sorted(directory.glob(f"{prefix}-*.parquet"))
+    return sorted(directory.glob("*.parquet"))
+
+
+def shard_index(path: Path) -> int | None:
+    """Index ``n`` of a ``data-{n:05d}.parquet`` shard name, or None for other files."""
+    match = SHARD_PATTERN.match(path.name)
+    return int(match.group(1)) if match else None
 
 
 def select_dataset_dirs(root: Path, patterns: list[str] | None) -> list[Path]:
@@ -87,17 +111,30 @@ def write_parquet_shards(
     batches: Iterable[pa.RecordBatch | pa.Table],
     out_dir: Path,
     shard_size: int,
-    prefix: str = "data",
+    *,
+    start_shard: int = 0,
 ) -> int:
-    """Write a stream of record batches to ``out_dir/<prefix>-NNNNN.parquet`` files of ``shard_size`` rows each.
+    """Write a stream of record batches as ``out_dir/data-NNNNN.parquet`` shards of ``shard_size`` rows each.
 
-    Returns the number of shards written. Batches are re-chunked so every shard except the last has exactly
-    ``shard_size`` rows.
+    Atomic with respect to ``out_dir``: shards are written into the sibling ``<out_dir>.tmp/`` (recreated fresh) and
+    moved into ``out_dir`` only after the whole stream has been consumed; if the iterator raises, ``out_dir`` is
+    unchanged and the temp dir is removed. Numbering starts at ``start_shard`` (append mode); pre-existing shards in
+    ``out_dir`` with index >= ``start_shard`` are deleted (stale-shard cleanup), lower ones are kept. Batches are
+    re-chunked so every shard except the last has exactly ``shard_size`` rows. Returns the number of shards written.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if shard_size <= 0:
+        raise ValueError(f"shard_size must be positive, got {shard_size}")
+    if start_shard < 0:
+        raise ValueError(f"start_shard must be >= 0, got {start_shard}")
+    tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
+    if tmp_dir.exists():
+        log.warning("removing leftover temp dir %s", tmp_dir)
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
     pending: list[pa.RecordBatch] = []
     pending_rows = 0
-    shard_num = 0
+    shard_num = start_shard
 
     def flush(rows: int) -> None:
         nonlocal pending, pending_rows, shard_num
@@ -113,20 +150,36 @@ def write_parquet_shards(
                 pending.insert(0, batch.slice(remaining))
                 remaining = 0
         pending_rows -= rows
-        pq.write_table(pa.Table.from_batches(taken), out_dir / f"{prefix}-{shard_num:05d}.parquet")
+        pq.write_table(pa.Table.from_batches(taken), tmp_dir / f"data-{shard_num:05d}.parquet")
         shard_num += 1
 
-    for item in batches:
-        for batch in item.to_batches() if isinstance(item, pa.Table) else [item]:
-            if len(batch) == 0:
-                continue
-            pending.append(batch)
-            pending_rows += len(batch)
-            while pending_rows >= shard_size:
-                flush(shard_size)
-    if pending_rows > 0:
-        flush(pending_rows)
-    return shard_num
+    try:
+        for item in batches:
+            for batch in item.to_batches() if isinstance(item, pa.Table) else [item]:
+                if len(batch) == 0:
+                    continue
+                pending.append(batch)
+                pending_rows += len(batch)
+                while pending_rows >= shard_size:
+                    flush(shard_size)
+        if pending_rows > 0:
+            flush(pending_rows)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in list_parquet_files(out_dir):
+        index = shard_index(stale)
+        if index is not None and index >= start_shard:
+            log.info("removing stale shard %s", stale)
+            stale.unlink()
+    for shard in sorted(tmp_dir.glob("data-*.parquet")):
+        shard.replace(out_dir / shard.name)
+    shutil.rmtree(tmp_dir)
+    written = shard_num - start_shard
+    log.info("wrote %d shard(s) to %s (starting at %d)", written, out_dir, start_shard)
+    return written
 
 
 def iter_dataset_tables(dataset: "Dataset", batch_size: int = 10_000) -> Iterator[pa.Table]:
@@ -137,7 +190,7 @@ def iter_dataset_tables(dataset: "Dataset", batch_size: int = 10_000) -> Iterato
         yield cast(pa.Table, arrow_view[start : start + batch_size])
 
 
-def write_dict_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, prefix: str = "data") -> int:
+def write_dict_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, *, start_shard: int = 0) -> int:
     """Write an iterable of dict rows to parquet shards (see :func:`write_parquet_shards`)."""
 
     def batches() -> Iterator[pa.RecordBatch]:
@@ -150,4 +203,4 @@ def write_dict_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: i
         if buffer:
             yield pa.RecordBatch.from_pylist(buffer)
 
-    return write_parquet_shards(batches(), out_dir, shard_size, prefix)
+    return write_parquet_shards(batches(), out_dir, shard_size, start_shard=start_shard)

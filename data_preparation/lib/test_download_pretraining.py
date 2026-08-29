@@ -110,7 +110,7 @@ def stub_hub(
 
 
 def _table(out_dir: Path) -> pa.Table:
-    return pa.concat_tables([pq.read_table(f) for f in list_parquet_files(out_dir, "shard")])
+    return pa.concat_tables([pq.read_table(f) for f in list_parquet_files(out_dir)])
 
 
 def test_download_sliced_keeps_original_columns(
@@ -122,7 +122,7 @@ def test_download_sliced_keeps_original_columns(
     assert stub_hub == [("some/ds", (), {"split": "train[:10]", "name": "cfg"})]
     table = _table(tmp_path)
     assert table.column_names == ["text", "extra"] and table.num_rows == 10
-    assert [f.name for f in list_parquet_files(tmp_path, "shard")] == [f"shard-{i:05d}.parquet" for i in range(3)]
+    assert [f.name for f in list_parquet_files(tmp_path)] == [f"data-{i:05d}.parquet" for i in range(3)]
 
 
 def test_download_gsm8k_repeats_to_target(
@@ -159,13 +159,13 @@ def test_download_github_code_without_token_passes_none(
     assert _table(tmp_path)["code"].to_pylist() == ["c1"]  # only one GO row in the stub stream
 
 
-def test_save_hf_dataset_uses_shard_prefix(
+def test_save_hf_dataset_writes_data_shards(
     tmp_path: Path, hf_datasets: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(dp, "SHARD_SIZE", 2)
     ds = hf_datasets.Dataset.from_dict({"text": ["a", "b", "c"]}).select([2, 0, 1])
     assert dp._save_hf_dataset(ds, tmp_path) == 2
-    assert [f.name for f in list_parquet_files(tmp_path, "shard")] == ["shard-00000.parquet", "shard-00001.parquet"]
+    assert [f.name for f in list_parquet_files(tmp_path)] == ["data-00000.parquet", "data-00001.parquet"]
     assert _table(tmp_path)["text"].to_pylist() == ["c", "a", "b"]
 
 
@@ -183,7 +183,7 @@ def test_download_dataset_dispatch_and_failure(
     assert _table(raw / "gsm8k").num_rows == 2
     assert _table(raw / "github_code_clean_go").num_rows == 1
     assert _table(raw / "plain").num_rows == 3
-    assert (raw / "broken").is_dir() and not list_parquet_files(raw / "broken", "shard")
+    assert (raw / "broken").is_dir() and not list_parquet_files(raw / "broken")
     assert "Error downloading broken: offline" in capsys.readouterr().out
 
 

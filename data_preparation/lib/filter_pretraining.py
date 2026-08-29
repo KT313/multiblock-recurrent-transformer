@@ -105,13 +105,13 @@ def process_dataset(
     batch_size: int,
     shard_size: int,
 ) -> dict[str, float] | None:
-    """Filter every ``shard-*.parquet`` of one source into ``output_dir/<name>/data-*.parquet``."""
+    """Filter every ``*.parquet`` of one source into ``output_dir/<name>/data-*.parquet``."""
     dataset_input_dir = input_dir / dataset_name
     dataset_output_dir = output_dir / dataset_name
     print_header(f"Processing: {dataset_name}")
     print(f"  Input:  {dataset_input_dir}\n  Output: {dataset_output_dir}")
 
-    parquet_files = list_parquet_files(dataset_input_dir, "shard")
+    parquet_files = list_parquet_files(dataset_input_dir)
     if not parquet_files:
         print("  No parquet files found, skipping")
         return None

@@ -276,7 +276,7 @@ def stub_hub(hf_datasets: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterat
 
 
 def _read_split(root: Path, name: str) -> pa.Table:
-    files = list_parquet_files(root / name, "data")
+    files = list_parquet_files(root / name)
     assert files, name
     return pa.concat_tables([pq.read_table(f) for f in files])
 
@@ -306,8 +306,8 @@ def test_main_end_to_end_split_is_disjoint_and_matches_metadata(
     train, val = _read_split(out, "train"), _read_split(out, "validation")
     assert train.column_names == val.column_names == ["instruction", "input", "output"]
     assert train.num_rows == meta["train_examples"] and val.num_rows == meta["val_examples"]
-    assert [f.name for f in list_parquet_files(out / "train", "data")] == [f"data-{i:05d}.parquet" for i in range(6)]
-    assert [pq.read_metadata(f).num_rows for f in list_parquet_files(out / "train", "data")] == [25] * 5 + [1]
+    assert [f.name for f in list_parquet_files(out / "train")] == [f"data-{i:05d}.parquet" for i in range(6)]
+    assert [pq.read_metadata(f).num_rows for f in list_parquet_files(out / "train")] == [25] * 5 + [1]
 
     train_rows = {pfm.compute_example_hash(r) for r in train.to_pylist()}
     val_rows = {pfm.compute_example_hash(r) for r in val.to_pylist()}
@@ -362,7 +362,7 @@ def test_download_source_direct(tmp_path: Path, hf_datasets: ModuleType, monkeyp
     monkeypatch.setattr(hf_datasets, "load_dataset", fake_load_dataset)
     monkeypatch.setattr(pfm, "SHARD_SIZE", 3)
     assert pfm.download_source("orca_math", "Orca", "good/id", 5, tmp_path / "om") == 5
-    files = list_parquet_files(tmp_path / "om", "data")
+    files = list_parquet_files(tmp_path / "om")
     assert [pq.read_metadata(f).num_rows for f in files] == [3, 2]
     assert pq.read_table(files[0]).column_names == ["instruction", "input", "output"]
     assert pfm.download_source("orca_math", "Orca", "bad/id", 5, tmp_path / "bad") == 0

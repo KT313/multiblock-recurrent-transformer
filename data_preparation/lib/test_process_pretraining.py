@@ -336,7 +336,7 @@ def test_save_dataset_and_verification_samples(tmp_path: Path, hf_datasets: Modu
     )
     info = pp.save_dataset(ds, "s", tmp_path / "merged", shard_size=3)
     assert info == {"dataset_name": "s", "tokens": 150, "documents": 4, "num_shards": 2}
-    table = pq.read_table(list_parquet_files(tmp_path / "merged" / "s", "data")[0])
+    table = pq.read_table(list_parquet_files(tmp_path / "merged" / "s")[0])
     assert table.column_names == ["text", "source", "estimated_tokens"]  # `extra` is dropped
     (tmp_path / "merged" / "no_files").mkdir()
     (tmp_path / "merged" / "stray.txt").write_text("")
@@ -398,7 +398,7 @@ def test_main_end_to_end_without_fuzzy_and_decontamination(
 
     processed = tmp_path / "pretraining" / "processed"
     merged = processed / "merged"
-    alpha_files = list_parquet_files(merged / "alpha", "data")
+    alpha_files = list_parquet_files(merged / "alpha")
     assert [f.name for f in alpha_files] == ["data-00000.parquet", "data-00001.parquet"]
     alpha = pa.concat_tables([pq.read_table(f) for f in alpha_files])
     assert alpha.column_names == ["text", "source", "estimated_tokens"]
@@ -445,7 +445,7 @@ def test_main_decontamination_uses_benchmark_ngrams(
         ["--dataset_dir", str(tmp_path), "--datasets", "src", "--skip_fuzzy_dedup", "--skip_exact_dedup",
          "--skip_quality_filter", "--skip_pii_removal", "--num_workers", "1"],
     )  # fmt: skip
-    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src", "data")[0])
+    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src")[0])
     assert table["text"].to_pylist() == [GOOD]
     stats = json.loads((tmp_path / "pretraining" / "processed" / "preprocessing_stats.json").read_text())
     assert list(stats["statistics"]["src"]) == ["decontamination", "save"]
@@ -461,7 +461,7 @@ def test_main_all_steps_skipped_keeps_everything(
         ["--dataset_dir", str(tmp_path), "--datasets", "src", "--skip_exact_dedup", "--skip_fuzzy_dedup",
          "--skip_quality_filter", "--skip_pii_removal", "--skip_decontamination", "--num_workers", "1"],
     )  # fmt: skip
-    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src", "data")[0])
+    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src")[0])
     assert table["text"].to_pylist() == ["a", "a", "hi"]
     assert table["estimated_tokens"].to_pylist() == [0, 0, 0]
 
@@ -477,7 +477,7 @@ def test_main_with_fuzzy_dedup(tmp_path: Path, hf_datasets: ModuleType, monkeypa
         ["--dataset_dir", str(tmp_path), "--datasets", "src", "--skip_exact_dedup", "--skip_quality_filter",
          "--skip_pii_removal", "--skip_decontamination", "--num_workers", "1", "--minhash_num_perm", "32"],
     )  # fmt: skip
-    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src", "data")[0])
+    table = pq.read_table(list_parquet_files(tmp_path / "pretraining" / "processed" / "merged" / "src")[0])
     assert table.num_rows == 2 and table["text"].to_pylist()[0] == base
     stats = json.loads((tmp_path / "pretraining" / "processed" / "preprocessing_stats.json").read_text())
     assert stats["statistics"]["src"]["fuzzy_dedup"]["near_duplicates_removed"] == 1

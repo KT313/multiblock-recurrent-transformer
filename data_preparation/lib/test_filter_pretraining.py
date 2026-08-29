@@ -126,18 +126,18 @@ def test_main_end_to_end(raw_tree: Path, monkeypatch: pytest.MonkeyPatch, capsys
         "pass_rate", "avg_original_length", "avg_output_length",
     }  # fmt: skip
 
-    files = list_parquet_files(out_root / "alpha", "data")
+    files = list_parquet_files(out_root / "alpha")
     assert [f.name for f in files] == ["data-00000.parquet", "data-00001.parquet"]
     table = pa.concat_tables([pq.read_table(f) for f in files])
     assert table.schema == fp.OUTPUT_SCHEMA
     assert table.num_rows == 8 and set(table["source"].to_pylist()) == {"alpha"}
     assert max(len(t) for t in cast(list[str], table["text"].to_pylist())) == 100
 
-    beta = pq.read_table(list_parquet_files(out_root / "beta_code", "data")[0])
+    beta = pq.read_table(list_parquet_files(out_root / "beta_code")[0])
     assert beta.column_names == ["text", "source", "original_length"] and beta.num_rows == 2
 
     assert not (out_root / "empty_src").exists()
-    assert not list_parquet_files(out_root / "gamma_nofield", "data")
+    assert not list_parquet_files(out_root / "gamma_nofield")
     printed = capsys.readouterr().out
     assert "Failed: ['empty_src', 'gamma_nofield']" in printed
     assert "Successful: 2 / 4" in printed
@@ -167,11 +167,11 @@ def test_process_dataset_direct(raw_tree: Path, capsys: pytest.CaptureFixture[st
     assert stats is not None
     assert stats["input_samples"] == 2 and stats["output_samples"] == 2 and stats["pass_rate"] == 1.0
     assert stats["avg_original_length"] == 80 and stats["avg_output_length"] == 80
-    assert len(list_parquet_files(out / "beta_code", "data")) == 1
+    assert len(list_parquet_files(out / "beta_code")) == 1
     # batch_size smaller than a shard still yields one merged output shard
     stats = fp.process_dataset("alpha", raw, raw_tree / "out2", 50, 100, 1, 100)
     assert stats is not None and stats["output_samples"] == 8
-    assert len(list_parquet_files(raw_tree / "out2" / "alpha", "data")) == 1
+    assert len(list_parquet_files(raw_tree / "out2" / "alpha")) == 1
 
 
 def test_parser_defaults() -> None:
