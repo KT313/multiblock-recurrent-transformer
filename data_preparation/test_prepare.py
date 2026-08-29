@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare: command registration, `status` exit codes, `build` options, tiny end to end."""
+"""Tests for data_preparation.prepare: command registration, `status` exit codes, `describe` output, `build` options,
+tiny end to end."""
 
 from __future__ import annotations
 
@@ -26,9 +27,11 @@ def test_commands_are_registered() -> None:
     assert args.sources == ["a", "b"] and args.steps == ["download", "filter"] and args.dry_run and args.num_workers == 3
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
     assert args.run is prepare.run_status and args.dataset_dir == Path("d")
+    args = parser.parse_args(["describe", "--dataset_config", "x.yaml"])
+    assert args.run is prepare.run_describe and args.dataset_config == Path("x.yaml")
     args = parser.parse_args(["tiny"])
     assert args.run is prepare.run_build and args.dataset_config == Path("config/datasets/tiny.yaml")
-    for command in ("build", "status"):
+    for command in ("build", "status", "describe"):
         with pytest.raises(SystemExit):
             parser.parse_args([command])  # --dataset_config is required
     with pytest.raises(SystemExit):
@@ -53,6 +56,14 @@ def test_status_exit_codes(tmp_path: Path, tiny_layout: DatasetLayout, capsys: p
     assert "INCOMPLETE" in capsys.readouterr().out
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(tiny_layout.root)])  # exit 0
     assert "dataset complete" in capsys.readouterr().out
+
+
+def test_describe_prints_markdown_with_the_config_notes(capsys: pytest.CaptureFixture[str]) -> None:
+    prepare.main(["describe", "--dataset_config", str(TINY)])
+    out = capsys.readouterr().out
+    assert out.startswith("# Dataset `tiny`\n") and out.endswith("\n") and "## Notes" in out
+    assert "Synthetic dataset for the smoke run" in out  # the YAML's leading comment block
+    assert "| `synthetic_pretrain` | pretrain | `synthetic` |" in out
 
 
 def test_build_dry_run_writes_nothing(tmp_path: Path) -> None:

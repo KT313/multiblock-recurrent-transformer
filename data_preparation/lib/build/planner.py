@@ -86,7 +86,7 @@ class Plan:
                     _fmt(s.tokens_present),
                     _fmt(s.rows_present),
                     _fmt(s.rows_needed),
-                    _fmt(s.rows_to_fetch),
+                    "-" if s.complete else _fmt(s.rows_to_fetch),
                     f"{s.tokens_per_row:.1f}",
                     state,
                     s.reason,

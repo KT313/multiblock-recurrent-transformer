@@ -60,9 +60,9 @@ def test_missing_tokenizer_json_raises(tmp_path: Path) -> None:
         Tokenizer(tmp_path)
 
 
-def test_missing_pad_token_raises(tiny_tokenizer_path: Path, tmp_path: Path) -> None:
+def test_missing_pad_token_raises(tiny_tokenizer_dir: Path, tmp_path: Path) -> None:
     dst = tmp_path / "nopad"
-    shutil.copytree(tiny_tokenizer_path, dst)
+    shutil.copytree(tiny_tokenizer_dir, dst)
     for name in ("tokenizer_config.json", "special_tokens_map.json"):
         cfg = json.loads((dst / name).read_text())
         cfg.pop("pad_token", None)

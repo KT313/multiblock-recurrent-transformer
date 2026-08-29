@@ -107,7 +107,7 @@ def test_loop_state_fields() -> None:
 def test_build_stage_dataloaders(
     tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend
 ) -> None:
-    tokenizer = Tokenizer(tiny_resolved.tokenizer_path)
+    tokenizer = Tokenizer(tiny_resolved.tokenizer_dir)
     loaders = build_stage_dataloaders(tiny_settings, tiny_resolved, tokenizer, cpu_backend)
     assert isinstance(loaders, StageDataloaders)
     assert len(loaders.train_loaders) == len(loaders.val_loaders) == 3

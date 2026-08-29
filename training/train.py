@@ -160,7 +160,7 @@ def train(cfg: Settings) -> None:
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
 
     resolved = resolve_dataset(cfg, backend)  # verifies the dataset config's data, auto-prepares if configured
-    tokenizer = Tokenizer(resolved.tokenizer_path)
+    tokenizer = Tokenizer(resolved.tokenizer_dir)
     stage_manager = StageManager(
         resolved.stage_manager_stages(),
         world_batch_size=cfg.world_batch_size,
@@ -339,7 +339,7 @@ def train(cfg: Settings) -> None:
     if cfg.export_to_hf:
         export_dir = Path(cfg.export_hf_path) if cfg.export_hf_path else out_dir / "hf_export"
         raw = unwrap(model)
-        export_to_hf(raw, raw.config, export_dir, tokenizer_path=resolved.tokenizer_path)
+        export_to_hf(raw, raw.config, export_dir, tokenizer_dir=resolved.tokenizer_dir)
         print(f"Exported HuggingFace model to {export_dir}")
 
 

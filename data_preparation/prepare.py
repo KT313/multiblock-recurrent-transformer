@@ -5,11 +5,13 @@
                                               [--sources S ...] [--steps tokenizer download filter process holdout mixtures]
                                               [--num_workers N] [--hf_token T] [--dry_run]
     python data_preparation/prepare.py status --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
+    python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny   # = build --dataset_config config/datasets/tiny.yaml
 
 ``build`` materialises a dataset config (tokenizer -> pretrain sources -> holdouts -> mixtures; see
-``lib/build.py``), ``status`` prints the plan and exits 0 iff the dataset is complete. ``--cache_dir`` relocates the
-HuggingFace caches. Any failure logs the exception and exits 1.
+``lib/build/runner.py``), ``status`` prints the plan and exits 0 iff the dataset is complete, ``describe`` renders
+the config as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir`` relocates the HuggingFace
+caches. Any failure logs the exception and exits 1.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from pathlib import Path
 if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without installing the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data_preparation.lib.build import STEPS, build, status  # noqa: E402
+from data_preparation.lib.build import STEPS, build, describe, leading_comment, status  # noqa: E402
 from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
 from data_preparation.lib.schema.dataset_config import load_dataset_config  # noqa: E402
 from data_preparation.lib.schema.layout import DatasetLayout  # noqa: E402
@@ -56,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     status_cmd = subparsers.add_parser("status", help="print the plan; exit 0 iff the dataset is complete")
     common(status_cmd, config_default=None)
     status_cmd.set_defaults(run=run_status)
+    describe_cmd = subparsers.add_parser("describe", help="print the dataset config as a Markdown document")
+    describe_cmd.add_argument("--dataset_config", type=Path, required=True, help="dataset config YAML")
+    describe_cmd.set_defaults(run=run_describe)
     tiny = subparsers.add_parser("tiny", help=f"build {TINY_DATASET_CONFIG} (alias of build)")
     common(tiny, config_default=TINY_DATASET_CONFIG)
     build_options(tiny)
@@ -92,6 +97,11 @@ def run_status(args: argparse.Namespace) -> None:
         for line in result.missing():
             log.warning("missing: %s", line)
         raise SystemExit(1)
+
+
+def run_describe(args: argparse.Namespace) -> None:
+    cfg = load_dataset_config(args.dataset_config)
+    sys.stdout.write(describe(cfg, args.dataset_config, notes=leading_comment(args.dataset_config)))
 
 
 def main(argv: list[str] | None = None) -> None:

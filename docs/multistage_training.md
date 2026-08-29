@@ -8,17 +8,19 @@ implementation lives in `training/stage_manager.py` with its integration in
 
 ## What a stage specifies
 
-Each entry in `training_stages` defines:
+The stage list lives in the dataset config (`config/datasets/<name>.yaml`,
+`stages:`); each entry defines:
 
-- `train_data` / `val_data` — dataset mix for the stage (same schema as the
-  single-stage `data_config`)
+- `train` / `val` — the mixture over sources (or `<mixture>[/validation]`) for
+  the stage, weights summing to 1
 - `tokens` — the stage's global token budget
-- `base_lr` — stage-specific base learning rate
 - `transition_pct` — fraction of the stage reserved (at its end) for the
   transition into the next stage; `0.0` for the last stage
 
-`training_stages` is the only way to configure a run; a single-stage run is one
-entry with `transition_pct: 0.0`.
+The run config contributes one base learning rate per stage, positionally, as
+`stage_base_lrs: [3e-4, 1e-4, 5e-5]`; `training/data/dataset_resolver.py` joins
+the two into the `TrainingStage` list the stage manager consumes. A single-stage
+run is one entry with `transition_pct: 0.0`.
 
 ## Transitions
 
@@ -26,7 +28,7 @@ Instead of switching datasets abruptly at a stage boundary, the last
 `transition_pct` of a stage gradually shifts sampling from the current stage's
 dataloader to the next stage's: every micro-batch is drawn from the next stage
 with probability equal to the transition progress (0→1, linear). The learning
-rate interpolates linearly between the two stages' `base_lr` over the same window.
+rate interpolates linearly between the two stages' base LRs over the same window.
 
 Global `warmup_steps` apply at the start of the first stage and
 `cooldown_steps` at the end of the last; within a stage the configured
@@ -49,8 +51,8 @@ The stage boundary summary is printed at startup — check it before long runs.
 
 ## Example configs
 
-- `config/tiny.yaml` — 3-stage smoke run on synthetic data (20 steps, seconds)
-- `config/crow_300m_final.yaml` — the real final-run config
+- `config/tiny.yaml` + `config/datasets/tiny.yaml` — 3-stage smoke run on synthetic data (20 steps, seconds)
+- `config/crow_300m_final.yaml` + `config/datasets/crow_300m_final.yaml` — the real final-run config
 
 ## Notable bug found during development
 

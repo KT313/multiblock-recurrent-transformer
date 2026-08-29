@@ -1,12 +1,18 @@
-# Dataset definition of the thesis run (crow-300m-final). Referenced from config/crow_300m_final.yaml via
+# Dataset definition of the thesis run (crow-300m-final). Referenced from `config/crow_300m_final.yaml` via
 # `dataset_config`. Materialise with `python data_preparation/prepare.py build --dataset_config <this file>`;
-# training does it automatically when something is missing.
+# training does it automatically when something is missing (`auto_prepare`). `nampdn-ai/mini-peS2o` is gated:
+# export `HF_TOKEN` before building. This comment block is rendered into `docs/data_mixture.md` by
+# `prepare.py describe`.
 #
-# Mirrors what the thesis run actually used: exact dedup, real tokenizer counts capped at 2048, no quality filter,
-# no decontamination (fuzzy dedup at 0.95 was used in the thesis but is off here, see CLAUDE.md). Token budgets
-# per stage are the thesis budgets; per-source download sizes are derived from them (budget × weight × 1.2).
-# `nampdn-ai/mini-peS2o` is gated: export HF_TOKEN before building.
-
+# Relation to the thesis run: the thesis data was prepared with exact deduplication, fuzzy (MinHash) deduplication
+# at Jaccard threshold 0.95 and real tokenizer counts truncated to 2048 tokens, with the quality filter, benchmark
+# decontamination and PII masking all skipped. This config mirrors that as closely as the restructured pipeline
+# allows: exact dedup on, tokenizer counts capped at 2048, quality filter and decontamination off. Fuzzy dedup is
+# off here (it is available as `dedup: {mode: minhash, threshold: 0.95, num_perm: 256}`), and PII masking no longer
+# exists. The per-stage token budgets are the thesis budgets (3.3B + 1.5B + 0.15B tokens); the stage weights are
+# the thesis run's; per-source download sizes are derived from budget × weight × 1.2 instead of the fixed row
+# counts of the thesis scripts. Several HuggingFace ids had to move (wikipedia -> wikimedia/wikipedia 20231101.en,
+# gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every source is pinned to a revision.
 name: crow-300m-final
 
 tokenizer:

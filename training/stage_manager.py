@@ -92,7 +92,7 @@ class StageManager:
         micro_batch_size: Optional[int] = None,
     ) -> None:
         if not stages:
-            raise ValueError("training_stages must contain at least one stage")
+            raise ValueError("stages must contain at least one stage")
         if world_batch_size % world_size != 0:
             raise ValueError(f"world_batch_size ({world_batch_size}) must be divisible by world_size ({world_size})")
         if micro_batch_size is not None and world_batch_size % (micro_batch_size * world_size) != 0:

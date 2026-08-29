@@ -69,7 +69,7 @@ def test_prepare_tokenizer_rebuilds_on_stale_hash(
 
 
 def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
-    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, tiny_tokenizer_path: Path
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, tiny_tokenizer_dir: Path
 ) -> None:
     import transformers
 
@@ -78,7 +78,7 @@ def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
 
     def fake(name: str, *args: Any, **kwargs: Any) -> Any:
         calls.append((name, kwargs.get("revision")))
-        return real(str(tiny_tokenizer_path), *args)
+        return real(str(tiny_tokenizer_dir), *args)
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", fake)
     tok = TokenizerConfig(name="llama", kind="hf", hf_id="org/tok", revision="abc")

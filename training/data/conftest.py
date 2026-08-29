@@ -23,15 +23,15 @@ CHAT_TEMPLATE = (
 
 
 @pytest.fixture(scope="session")
-def tokenizer(tiny_tokenizer_path: Path) -> Tokenizer:
-    return Tokenizer(tiny_tokenizer_path)
+def tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
+    return Tokenizer(tiny_tokenizer_dir)
 
 
 @pytest.fixture
-def chat_tokenizer(tiny_tokenizer_path: Path, tmp_path: Path) -> Tokenizer:
+def chat_tokenizer(tiny_tokenizer_dir: Path, tmp_path: Path) -> Tokenizer:
     """Copy of the tiny tokenizer carrying a Llama-2-style chat template (fresh per test: the template is mutated)."""
     dst = tmp_path / "chat_tokenizer"
-    shutil.copytree(tiny_tokenizer_path, dst)
+    shutil.copytree(tiny_tokenizer_dir, dst)
     cfg_path = dst / "tokenizer_config.json"
     cfg = json.loads(cfg_path.read_text())
     cfg["chat_template"] = CHAT_TEMPLATE

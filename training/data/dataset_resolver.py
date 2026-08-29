@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
-from data_preparation.lib.build import build, status
+from data_preparation.lib.build import build, plan as compute_plan, status
 from data_preparation.lib.schema.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import configure_logging, get_logger
@@ -54,7 +54,7 @@ class ResolvedStage:
 class ResolvedDataset:
     config: DatasetConfig
     config_hash: str
-    tokenizer_path: str
+    tokenizer_dir: str
     stages: list[ResolvedStage]
 
     def stage_manager_stages(self) -> list[TrainingStage]:
@@ -155,7 +155,7 @@ def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = No
             build(cfg, layout, num_workers=settings.prepare_num_workers, hf_token=os.environ.get("HF_TOKEN"))
         if backend is not None:
             backend.barrier()
-        plan = status(cfg, layout)
+        plan = compute_plan(cfg, layout)  # `build` already logged the final status table; re-verify silently
         if not plan.complete:
             raise RuntimeError(
                 f"dataset config {settings.dataset_config!r} is still incomplete after preparing:\n  "
@@ -177,7 +177,7 @@ def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = No
     return ResolvedDataset(
         config=cfg,
         config_hash=cfg.config_hash(),
-        tokenizer_path=str(layout.tokenizer_dir(cfg.tokenizer.name)),
+        tokenizer_dir=str(layout.tokenizer_dir(cfg.tokenizer.name)),
         stages=stages,
     )
 

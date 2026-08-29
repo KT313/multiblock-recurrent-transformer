@@ -12,7 +12,7 @@ Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
 - HuggingFace export path (`model/hf.py`)
-- dataset download / preprocessing scripts (`data_preparation/`)
+- dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, budgets, mixtures and tokenizer in one YAML, built incrementally and verified before training
 
 The code was restructured and trimmed after the thesis: only the code path of the final run survives, with tests next to every module. The thesis-era tree (SLURM tooling, all upstream model variants) is in git history up to tag `v1.0`.
 
@@ -21,9 +21,30 @@ The code was restructured and trimmed after the thesis: only the code path of th
 ```bash
 uv sync --all-extras                                        # environment (uv only)
 uv run pytest                                               # tests, CPU, < 1 min
-uv run python data_preparation/prepare.py tiny         # synthetic smoke data
-uv run python training/train.py --config config/tiny.yaml   # 20-step smoke run
-uv run python training/train.py --config config/crow_300m_final.yaml   # the thesis run (needs dataset/, see data_preparation/README.md)
+uv run python training/train.py --config config/tiny.yaml   # 20-step smoke run on synthetic data (built on the fly)
+uv run python training/train.py --config config/crow_300m_final.yaml   # the thesis run on one GPU
+```
+
+A run config (`config/<run>.yaml`) holds model, optimizer, LR and batch settings and points to a dataset config
+(`config/datasets/<name>.yaml`) that defines sources, per-stage token budgets/mixtures and the tokenizer. Training
+verifies the prepared data under `dataset/` and builds what is missing (`auto_prepare: true`); to prepare up front
+or inspect the plan:
+
+```bash
+uv run python data_preparation/prepare.py build  --dataset_config config/datasets/crow_300m_final.yaml   # export HF_TOKEN for gated sources
+uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
+```
+
+See `data_preparation/README.md` for the dataset config, `docs/data_mixture.md` for the thesis mixture (generated
+from the config) and `docs/multistage_training.md` for the stage mechanism.
+
+```
+model/             architecture (RecurrentGPT, config + presets, HF export)
+training/          train.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
+data_preparation/  prepare.py (build / status / describe / tiny) + lib/
+config/            run configs; config/datasets/ dataset configs
+dataset/           gitignored; prepared data, mixtures and tokenizers
+docs/              thesis documentation and figures
 ```
 
 Final model configs in the original repo were named "raven", so I named my model configs "crow" in the same spirit.

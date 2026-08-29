@@ -58,7 +58,7 @@ def tiny_mixture_dirs(tiny_layout: DatasetLayout) -> dict[str, Path]:
 
 
 @pytest.fixture(scope="session")
-def tiny_tokenizer_path(tiny_layout: DatasetLayout) -> Path:
+def tiny_tokenizer_dir(tiny_layout: DatasetLayout) -> Path:
     return tiny_layout.tokenizer_dir("synthetic")
 
 

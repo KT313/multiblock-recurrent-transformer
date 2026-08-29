@@ -87,6 +87,8 @@ def test_plan_after_build_is_complete_and_uses_measured_tokens(layout: DatasetLa
     (m,) = result.mixtures
     assert m.complete and m.present and m.current and m.short_sources == []
     assert result.summary().endswith("dataset complete")
+    row_a = next(line for line in result.summary().splitlines() if line.startswith("a "))
+    assert row_a.split()[6] == "-"  # fetch column: nothing to fetch for a complete source
 
 
 def test_rows_to_fetch_is_clamped_at_zero(layout: DatasetLayout) -> None:

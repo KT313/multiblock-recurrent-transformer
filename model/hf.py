@@ -164,7 +164,7 @@ AutoModelForCausalLM.register(RecurrentGPTConfig, RecurrentGPTForCausalLM)
 
 
 def export_to_hf(
-    model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_path: str | Path | None = None
+    model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_dir: str | Path | None = None
 ) -> Path:
     """Write `model` as a self-contained `trust_remote_code` folder (safetensors, config.json, model sources)."""
     out_dir = Path(out_dir)
@@ -186,6 +186,6 @@ def export_to_hf(
         if source.name != "__init__.py" and not source.name.startswith("test_"):
             shutil.copy2(source, out_dir / source.name)
 
-    if tokenizer_path is not None:
-        AutoTokenizer.from_pretrained(tokenizer_path).save_pretrained(out_dir)
+    if tokenizer_dir is not None:
+        AutoTokenizer.from_pretrained(tokenizer_dir).save_pretrained(out_dir)
     return out_dir

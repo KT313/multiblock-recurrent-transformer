@@ -158,13 +158,13 @@ def test_prepare_inputs_for_generation_forwards_only_input_ids() -> None:
     assert prepared["input_ids"] is x
 
 
-def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_path: Path) -> None:
+def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir: Path) -> None:
     torch.manual_seed(0)
     model = build_model("tiny")
-    out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_path=tiny_tokenizer_path)
+    out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_dir=tiny_tokenizer_dir)
     assert out_dir == tmp_path / "a" / "b"
     tok = AutoTokenizer.from_pretrained(out_dir)
-    ref = AutoTokenizer.from_pretrained(tiny_tokenizer_path)
+    ref = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
     assert tok("hello world")["input_ids"] == ref("hello world")["input_ids"]
 
 

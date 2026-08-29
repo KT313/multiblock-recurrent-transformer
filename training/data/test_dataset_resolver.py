@@ -28,11 +28,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CROW_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"
 TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
-# `git show HEAD:config/crow_300m_final.yaml` (the last hand-written run config) as (data_dir, weight,
-# data_signature) per stage, with the old paths mapped to the new layout:
-#   dataset/pretraining/processed/merged/<src>  -> dataset/sources/<src>/processed
-#   dataset/fineweb-edu/validation              -> dataset/sources/fineweb_val/holdout
-#   dataset/flan_mixture/{train,validation}     -> dataset/mixtures/crow-300m-final/flan_mixture/{train,validation}
+# The last hand-written run config (git history before the dataset-config restructure, `config/crow_300m_final.yaml`)
+# as (data_dir, weight, data_signature) per stage, with its per-stage data directories mapped onto the new layout
+# (pretrain source -> sources/<src>/processed, the fineweb validation set -> sources/fineweb_val/holdout, the
+# finetune mixture -> mixtures/crow-300m-final/flan_mixture/{train,validation}).
 _P = "dataset/sources/{}/processed"
 _INSTRUCT = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
 GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
@@ -162,7 +161,7 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
     assert isinstance(resolved, ResolvedDataset) and resolved.config.name == "tiny"
     assert resolved.config_hash == load_dataset_config(TINY_DATASET_YAML).config_hash()
-    assert resolved.tokenizer_path == str(tiny_layout.tokenizer_dir("synthetic"))
+    assert resolved.tokenizer_dir == str(tiny_layout.tokenizer_dir("synthetic"))
     assert [s.name for s in resolved.stages] == ["pretrain_a", "pretrain_b", "finetune"]
     assert [s.base_lr for s in resolved.stages] == pytest.approx([3e-4, 1e-4, 5e-5])
     assert [s.tokens for s in resolved.stages] == [8192, 8192, 4096]
@@ -203,11 +202,12 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         resolved = resolve_dataset(_settings(TINY_DATASET_YAML, empty))
     assert "preparing missing data" in caplog.text
+    assert caplog.text.count("dataset status:") == 2  # once before the build (incomplete), once after it (complete)
     layout = DatasetLayout(empty)
     assert list(layout.source_dir("synthetic_pretrain", "processed").glob("*.parquet"))
     assert list(layout.holdout_dir("synthetic_val").glob("*.parquet"))
     assert list(layout.mixture_dir("tiny", "tiny_mixture", "validation").glob("*.parquet"))
-    assert Path(resolved.tokenizer_path).is_dir()
+    assert Path(resolved.tokenizer_dir).is_dir()
     # a second resolve finds everything complete and does not build again
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="data_preparation"):
@@ -233,7 +233,7 @@ def test_auto_prepare_builds_on_main_rank_only_and_barriers(tmp_path: Path) -> N
     assert worker.barriers == 1 and not (tmp_path / "worker" / "sources").exists()
     main = _FakeBackend(is_main=True)
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "main"), main)
-    assert main.barriers == 1 and Path(resolved.tokenizer_path).is_dir()
+    assert main.barriers == 1 and Path(resolved.tokenizer_dir).is_dir()
 
 
 def test_still_incomplete_after_build_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
