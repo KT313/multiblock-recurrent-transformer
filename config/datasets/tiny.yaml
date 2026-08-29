@@ -1,0 +1,27 @@
+# Synthetic dataset for the smoke run (config/tiny.yaml) and the tests: a hand-written WordLevel tokenizer
+# (<pad>, <bos>, <eos>, tok_0..tok_255) and random-word documents generated on demand. Builds in seconds, no
+# network. `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
+
+name: tiny
+
+tokenizer: {name: synthetic, kind: synthetic}
+max_seq_length: 256
+token_count: tokenizer
+
+processing:
+  min_chars: 1
+  max_chars: 20000
+  dedup: {mode: exact, normalize: true}
+
+sources:
+  synthetic_pretrain: {kind: pretrain, loader: synthetic, seed: 0, tokens_per_row_estimate: 224}
+  synthetic_val:      {kind: holdout,  loader: synthetic, seed: 1, rows: 32, tokens_per_row_estimate: 224}
+  synthetic_instruct: {kind: instruct, loader: synthetic, seed: 2, tokens_per_row_estimate: 224}
+
+mixtures:
+  tiny_mixture: {sources: {synthetic_instruct: 1.0}, max_tokens: 256, input_inversions: 0.1, val_split: 0.2, seed: 0}
+
+stages:
+  - {name: pretrain_a, tokens: 8192, transition_pct: 0.25, train: {synthetic_pretrain: 1.0}, val: {synthetic_val: 1.0}}
+  - {name: pretrain_b, tokens: 8192, transition_pct: 0.25, train: {synthetic_pretrain: 1.0}, val: {synthetic_val: 1.0}}
+  - {name: finetune,   tokens: 4096, transition_pct: 0.0,  train: {tiny_mixture: 1.0}, val: {tiny_mixture/validation: 1.0}}

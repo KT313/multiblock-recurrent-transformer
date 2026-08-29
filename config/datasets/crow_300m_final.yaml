@@ -1,0 +1,182 @@
+# Dataset definition of the thesis run (crow-300m-final). Referenced from config/crow_300m_final.yaml via
+# `dataset_config`. Materialise with `python data_preparation/prepare.py build --dataset_config <this file>`;
+# training does it automatically when something is missing.
+#
+# Mirrors what the thesis run actually used: exact dedup, real tokenizer counts capped at 2048, no quality filter,
+# no decontamination (fuzzy dedup at 0.95 was used in the thesis but is off here, see CLAUDE.md). Token budgets
+# per stage are the thesis budgets; per-source download sizes are derived from them (budget × weight × 1.2).
+# `nampdn-ai/mini-peS2o` is gated: export HF_TOKEN before building.
+
+name: crow-300m-final
+
+tokenizer:
+  name: llama-32k
+  kind: hf
+  hf_id: hf-internal-testing/llama-tokenizer
+  revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+
+max_seq_length: 2048
+token_count: tokenizer          # or: estimate (chars / 4)
+
+processing:                     # defaults for every pretrain source; a source may override with its own block
+  min_chars: 50
+  max_chars: 20000
+  dedup: {mode: exact, normalize: true}   # minhash: {mode: minhash, threshold: 0.95, num_perm: 256}
+  quality_filter: false
+  decontamination: {enabled: false}
+
+sources:
+  # --- pretraining (kind: pretrain) -------------------------------------------------------------------------------
+  fineweb_edu:
+    kind: pretrain
+    loader: hf_split
+    hf_id: HuggingFaceFW/fineweb-edu
+    revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+    load_kwargs: {name: CC-MAIN-2013-20}
+    tokens_per_row_estimate: 2000
+  wikipedia:
+    kind: pretrain
+    loader: hf_split
+    hf_id: wikimedia/wikipedia                     # replaces the removed `wikipedia` script dataset (20220301.en)
+    revision: b04c8d1ceb2f5cd4588862100d08de323dccfbaa
+    load_kwargs: {name: 20231101.en}
+    tokens_per_row_estimate: 1500
+  books_gutenberg:
+    kind: pretrain
+    loader: hf_split
+    hf_id: sedthh/gutenberg_english
+    revision: 28973b04f28fd7be4a6186a042bc26159d4366ca
+    text_field: TEXT
+    tokens_per_row_estimate: 3000
+  peso:
+    kind: pretrain
+    loader: hf_split
+    hf_id: nampdn-ai/mini-peS2o                    # gated
+    revision: 18a60ef8d79fdcae1494469845b0cbcb7e88b8b2
+    tokens_per_row_estimate: 1500
+  arxiv:
+    kind: pretrain
+    loader: hf_split
+    hf_id: common-pile/arxiv_papers_filtered
+    revision: 033cf7f53f9b348deec868c1a5a48484f3ee9e52
+    tokens_per_row_estimate: 1500
+  openwebmath:
+    kind: pretrain
+    loader: hf_split
+    hf_id: open-web-math/open-web-math
+    revision: fde8ef8de2300f5e778f56261843dab89f230815
+    tokens_per_row_estimate: 750
+  tinygsm:
+    kind: pretrain
+    loader: hf_split
+    hf_id: ostapeno/tinygsm-mind
+    revision: f5ecf416b71547b454cb9f4b06e769c2650ca33b
+    tokens_per_row_estimate: 300
+  algebraic_stack:
+    kind: pretrain
+    loader: hf_split
+    hf_id: EleutherAI/proof-pile-2                 # script dataset; load its parquet-free jsonl files directly
+    revision: 901a9273a770e9d4138c5ddd91802f9c5c6cdc4b
+    load_kwargs: {data_files: "algebraic-stack/train/*.jsonl.zst"}
+    tokens_per_row_estimate: 750
+  gsm8k:
+    kind: pretrain
+    loader: hf_split
+    hf_id: openai/gsm8k
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    load_kwargs: {name: main}
+    converter: gsm8k_question_answer               # question + answer -> text
+    repeat_to_budget: true                         # 7.5k rows: repeated to fill the budget instead of sliced
+    tokens_per_row_estimate: 300
+  # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own).
+  github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_java:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Java,       text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_cpp:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: C++,        text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_go:         {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: GO,         text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_rust:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Rust,       text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_shell:      {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Shell,      text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, tokens_per_row_estimate: 500}
+
+  # --- held-out validation (kind: holdout) --------------------------------------------------------------------------
+  fineweb_val:
+    kind: holdout
+    loader: hf_split
+    hf_id: HuggingFaceFW/fineweb-edu
+    revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+    load_kwargs: {name: sample-10BT}               # a different subset than the training source -> disjoint
+    rows: 50000
+    seed: 42
+    tokens_per_row_estimate: 2000
+
+  # --- instruction tuning (kind: instruct), consumed through the flan_mixture below ----------------------------------
+  flan:        {kind: instruct, loader: hf_stream, hf_id: Open-Orca/FLAN,                            revision: 6845b1b3b53c6d5c5b1e49767ed759df3fc246cc, fields: {instruction: inputs, output: targets}, tokens_per_row_estimate: 300}
+  metamath:    {kind: instruct, loader: hf_stream, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, fields: {instruction: query, output: response}, tokens_per_row_estimate: 300}
+  orca_math:   {kind: instruct, loader: hf_stream, hf_id: microsoft/orca-math-word-problems-200k,    revision: 29255d1770cc4eac66e5e7fa378cba542c026350, fields: {instruction: question, output: answer}, tokens_per_row_estimate: 300}
+  evol_code:   {kind: instruct, loader: hf_stream, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, fields: {instruction: instruction, output: output}, tokens_per_row_estimate: 400}
+  code_alpaca: {kind: instruct, loader: hf_stream, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, fields: {instruction: instruction, input: input, output: output}, tokens_per_row_estimate: 200}
+  slimorca:    {kind: instruct, loader: hf_stream, hf_id: Open-Orca/SlimOrca-Dedup,                  revision: bd7d445aa1ff695fb7e223bf3b5b321e075f244e, converter: sharegpt_conversations, tokens_per_row_estimate: 300}
+  sharegpt:    {kind: instruct, loader: hf_stream, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, tokens_per_row_estimate: 400}
+  wizardlm:    {kind: instruct, loader: hf_stream, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, converter: first_two_turns, tokens_per_row_estimate: 400}
+
+mixtures:
+  flan_mixture:
+    sources: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
+    max_tokens: 2048
+    input_inversions: 0.05
+    val_split: 0.05
+    seed: 42
+
+stages:
+  - name: pretrain_phase1
+    tokens: 3_300_000_000
+    transition_pct: 0.10
+    train:
+      fineweb_edu: 0.65
+      wikipedia: 0.09
+      books_gutenberg: 0.06
+      github_code_clean_python: 0.036
+      github_code_clean_javascript: 0.024
+      github_code_clean_typescript: 0.012
+      github_code_clean_java: 0.012
+      github_code_clean_cpp: 0.0096
+      github_code_clean_go: 0.0084
+      github_code_clean_rust: 0.006
+      github_code_clean_shell: 0.0048
+      github_code_clean_sql: 0.0036
+      github_code_clean_html: 0.0036
+      peso: 0.03
+      arxiv: 0.02
+      openwebmath: 0.03
+    val: {fineweb_val: 1.0}
+
+  - name: pretrain_phase2
+    tokens: 1_500_000_000
+    transition_pct: 0.10
+    train:
+      fineweb_edu: 0.35
+      github_code_clean_python: 0.084
+      github_code_clean_javascript: 0.056
+      github_code_clean_typescript: 0.028
+      github_code_clean_java: 0.028
+      github_code_clean_cpp: 0.0224
+      github_code_clean_go: 0.0196
+      github_code_clean_rust: 0.014
+      github_code_clean_shell: 0.0112
+      github_code_clean_sql: 0.0084
+      github_code_clean_html: 0.0084
+      openwebmath: 0.088
+      tinygsm: 0.066
+      algebraic_stack: 0.044
+      gsm8k: 0.022
+      peso: 0.09
+      arxiv: 0.06
+    val: {fineweb_val: 1.0}
+
+  - name: finetune
+    tokens: 150_000_000
+    transition_pct: 0.0
+    train: {flan_mixture: 1.0}
+    val: {flan_mixture/validation: 1.0}
