@@ -19,6 +19,8 @@ SourceStage = Literal["raw", "filtered", "processed"]
 InstructMixtureSplit = Literal["train", "validation"]
 SOURCE_STAGES: tuple[str, ...] = ("raw", "filtered", "processed")
 INSTRUCT_MIXTURE_SPLITS: tuple[str, ...] = ("train", "validation")
+# columns of a processed shard; `hash` (int64 exact-dedup key) lets `process` append new shards instead of rewriting
+PROCESSED_COLUMNS: tuple[str, ...] = ("text", "source", "tokens", "hash")
 
 
 @dataclass(frozen=True)

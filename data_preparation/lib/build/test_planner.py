@@ -151,6 +151,19 @@ def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:
     assert not m.complete and m.present and not m.current and "missing shard" in m.reason
 
 
+def test_processed_without_hash_column_is_not_complete(layout: DatasetLayout) -> None:
+    cfg = two_stage_cfg()
+    build(cfg, layout)
+    processed = Manifest.load(layout.source_dir("a", "processed"))
+    assert processed is not None
+    del processed.extra["columns"]
+    processed.save(layout.source_dir("a", "processed"))
+    a = next(s for s in plan(cfg, layout).sources if s.name == "a")
+    assert not a.complete and a.manifest_current and a.reason == "processed: predates the hash column"
+    assert a.rows_to_fetch == 0  # the rebuild needs no download
+    assert build(cfg, layout).complete
+
+
 def test_tokens_below_budget_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)

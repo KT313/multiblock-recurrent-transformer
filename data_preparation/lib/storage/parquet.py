@@ -50,6 +50,13 @@ def normalized_hash(text: str) -> str:
     return md5_hex(normalized_text(text))
 
 
+def text_hash64(text: str, normalize: bool = True) -> int:
+    """The exact-dedup key of ``text`` as a signed 64-bit integer (the first 64 bits of :func:`normalized_hash` with
+    ``normalize``, else of :func:`md5_hex`); stored as the int64 ``hash`` column of processed shards."""
+    digest = normalized_hash(text) if normalize else md5_hex(text)
+    return int.from_bytes(bytes.fromhex(digest[:16]), "big", signed=True)
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap token count estimate (characters / 4)."""
     return len(text) // 4

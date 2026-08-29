@@ -15,7 +15,7 @@ from math import ceil
 from pathlib import Path
 
 from data_preparation.lib.schema.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, SOURCE_STAGES, DatasetLayout
+from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, PROCESSED_COLUMNS, SOURCE_STAGES, DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 
 
@@ -319,6 +319,8 @@ def _pipeline_problem(raw: Manifest, filtered: Manifest, processed: Manifest, bu
     filtered_inputs = filtered.extra.get("input_shards", [])
     if len(filtered_inputs) != len(raw.shards):
         return "filtered: behind raw"
+    if processed.extra.get("columns") != list(PROCESSED_COLUMNS):
+        return "processed: predates the hash column"  # `process` rebuilds it from the filtered shards, no download
     processed_inputs = processed.extra.get("input_shards")
     if processed_inputs != [[shard.name, shard.rows] for shard in filtered.shards]:
         return "processed: behind filtered"

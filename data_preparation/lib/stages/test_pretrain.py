@@ -25,7 +25,8 @@ from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.stages.row_pipeline import get_ngram_set
 from data_preparation.lib.stages.pretrain import length_filter, process
-from data_preparation.lib.stages.shared import download
+from data_preparation.lib.stages.shared import TokenCounter, download
+from data_preparation.lib.storage.parquet import text_hash64
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]
@@ -157,7 +158,8 @@ def test_process_exact_dedup_tokens_and_idempotence(
     rows = read_rows(processed)
     assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(70)], "normalized duplicates dropped, text untouched"
     assert [r["tokens"] for r in rows] == [5, 3, 64], "token count capped at max_seq_length"
-    assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens"}] * 3
+    assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
+    assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
     assert [(s.rows, s.tokens) for s in m.shards] == [(2, 8), (1, 64)] and m.tokens() == 72
     assert m.extra["stats"]["dedup"] == {"mode": "exact", "duplicates_removed": 2}
     assert m.extra["input_shards"] == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
@@ -176,23 +178,87 @@ def test_process_estimate_mode_caps_too(
     assert [len(r["text"]) for r in read_rows(layout.source_dir("s", "processed"))] == [40, 400]
 
 
-def test_process_keeps_old_rows_as_prefix_when_shards_are_appended(
-    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
-) -> None:
+def test_process_appends_only_the_new_shards(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:  # fmt: skip
+    """A top-up processes (tokenizes) only the filtered shards not yet covered, leaves the old processed shards
+    untouched, removes duplicates across old and new shards, and ends with exactly the rows of a fresh full pass."""
     first = [_words(6, i) for i in range(6)] + [_words(6, 0)]  # one duplicate inside
     cfg = _prepare(cfg_factory, layout, source_dir, first, with_tokenizer, write=write_local, shard_size=3)
     m1 = process(cfg, "s", layout, shard_size=4)
-    old_rows = read_rows(layout.source_dir("s", "processed"))
-    assert len(old_rows) == 6
+    processed = layout.source_dir("s", "processed")
+    old_rows = read_rows(processed)
+    assert len(old_rows) == 6 and m1.extra["stats"]["input_rows"] == 7 and m1.extra["columns"] == ["text", "source", "tokens", "hash"]
+    before = mtimes(processed)
+
     # append: duplicates of old rows plus new ones
     write_local(source_dir, [{"text": _words(6, 2)}, {"text": _words(6, 50)}, {"text": _words(6, 3)}, {"text": _words(6, 51)}], "parquet")
     download(cfg, "s", layout, rows_needed=11, shard_size=3)
     length_filter(cfg, "s", layout)
+    counted: list[int] = []
+    original = TokenCounter.count_many
+
+    def spy(self: Any, texts: list[str]) -> list[int]:
+        counted.append(len(texts))
+        return original(self, texts)
+
+    monkeypatch.setattr(TokenCounter, "count_many", spy)
     m2 = process(cfg, "s", layout, shard_size=4)
-    assert m2 != m1 and m2.extra["stats"]["dedup"]["duplicates_removed"] == 3
-    new_rows = read_rows(layout.source_dir("s", "processed"))
+    assert sum(counted) == 2, "only the two new non-duplicate rows were tokenized"
+    assert m2.extra["stats"]["dedup"]["duplicates_removed"] == 3 and m2.extra["stats"]["input_rows"] == 11
+    assert m2.extra["input_shards"] == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 1, 3, 1])]
+    after = mtimes(processed)
+    untouched = {k: v for k, v in before.items() if not k.endswith("MANIFEST.json")}
+    assert {k: after[k] for k in untouched} == untouched, "old processed shards were not rewritten"
+    new_rows = read_rows(processed)
     assert new_rows[: len(old_rows)] == old_rows, "old rows byte-identical and in place"
     assert [r["text"] for r in new_rows[len(old_rows) :]] == [_words(6, 50), _words(6, 51)]
+    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(4, 24), (2, 12), (2, 12)]
+
+    # golden: a fresh full pass over the same raw data keeps exactly the same rows
+    fresh = DatasetLayout(tmp_path / "fresh")
+    with_tokenizer(cfg)  # the tokenizer fixture prepared `layout`; prepare the fresh layout too
+    from data_preparation.lib.stages.shared import prepare_tokenizer
+
+    prepare_tokenizer(cfg, fresh)
+    download(cfg, "s", fresh, rows_needed=11, shard_size=3)
+    length_filter(cfg, "s", fresh)
+    m_fresh = process(cfg, "s", fresh, shard_size=4)
+    assert read_rows(fresh.source_dir("s", "processed")) == new_rows
+    assert m_fresh.tokens() == m2.tokens() and m_fresh.extra["stats"] == m2.extra["stats"]
+    assert [sh.rows for sh in m_fresh.shards] == [4, 4], "only the shard boundaries differ from the appended layout"
+
+
+def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    read_rows: Reader, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    cfg = _prepare(cfg_factory, layout, source_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local)
+    m = process(cfg, "s", layout)
+    processed = layout.source_dir("s", "processed")
+    rows = read_rows(processed)
+
+    # a processed directory from before the hash column: rebuilt from the filtered shards (no download)
+    legacy = Manifest.load(processed)
+    assert legacy is not None
+    del legacy.extra["columns"]
+    legacy.save(processed)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        rebuilt = process(cfg, "s", layout)
+    assert "predate the hash column" in caplog.text and rebuilt.extra["columns"] == m.extra["columns"]
+    assert read_rows(processed) == rows
+
+    # filtered shards that are no longer a prefix of what was covered: everything is reprocessed
+    caplog.clear()
+    changed = Manifest.load(processed)
+    assert changed is not None
+    changed.extra["input_shards"][0][1] = 99
+    changed.save(processed)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        rebuilt = process(cfg, "s", layout)
+    assert "filtered shards changed" in caplog.text and rebuilt.extra["input_shards"] == m.extra["input_shards"]
+    assert read_rows(processed) == rows
 
 
 def test_process_no_dedup_mode_keeps_duplicates(
@@ -285,6 +351,7 @@ def test_process_minhash_removes_near_duplicates(
                    write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
     m = process(cfg, "s", layout)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial]
+    assert process(cfg, "s", layout) != m and m.extra["stats"]["input_rows"] == 5  # fuzzy dedup: always a full pass
     dedup_stats = m.extra["stats"]["dedup"]
     assert dedup_stats.pop("seconds") >= 0
     assert dedup_stats == {

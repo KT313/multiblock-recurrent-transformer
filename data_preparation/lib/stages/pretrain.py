@@ -4,9 +4,9 @@
 ``fuzzy_dedup`` module), repetition).
 
 Both are idempotent and incremental via the manifests (see ``stages/shared.py``). ``length_filter`` mirrors raw
-shards 1:1, so only new raw shards are filtered. ``process`` rewrites the whole processed directory whenever the
-filtered shard list changed, but by construction the rows it keeps from old shards are identical (first occurrence
-wins in a fresh streaming pass over old + new shards).
+shards 1:1, so only new raw shards are filtered. ``process`` appends: the processed manifest records the filtered
+shards it covers and every processed row carries its exact-dedup key (``hash`` column), so new filtered shards
+are deduplicated against the rows already on disk and only they are tokenized.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import multiprocessing
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,15 +23,14 @@ import pyarrow.parquet as pq
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
 from data_preparation.lib.storage.parquet import (
     list_parquet_files,
-    md5_hex,
-    normalized_hash,
     shard_index,
+    text_hash64,
     write_dict_rows,
     write_parquet_shards,
 )
 from data_preparation.lib.schema.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.schema.layout import PROCESSED_COLUMNS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress, progress
 from data_preparation.lib.storage.manifest import Manifest, ShardInfo, shard_rows
@@ -144,7 +143,6 @@ def _write_empty_shard(path: Path) -> None:
 
 # --- process -----------------------------------------------------------------------------------------------------------
 
-
 def process(
     cfg: DatasetConfig,
     name: str,
@@ -153,12 +151,17 @@ def process(
     shard_size: int = DEFAULT_SHARD_SIZE,
     num_workers: int = 1,
 ) -> Manifest:
-    """Stream all filtered shards in order through exact dedup -> quality filter -> decontamination -> token count
-    -> fuzzy dedup and write processed shards (``text``, ``source``, ``tokens``). Every kept row is written once;
-    a source smaller than its budget is cycled by the training sampler, not repeated on disk.
+    """Stream the filtered shards not yet covered by the processed manifest, in order, through exact dedup ->
+    quality filter -> decontamination -> token count and **append** processed shards (``text``, ``source``,
+    ``tokens``, ``hash``). ``hash`` is the row's 64-bit exact-dedup key (:func:`text_hash64`); the keys of every
+    processed row already on disk are loaded first, so new rows are deduplicated against old ones and first
+    occurrence still wins — the rows kept are exactly those of a full pass over every shard. Every kept row is
+    written once; a source smaller than its budget is cycled by the training sampler, not repeated on disk.
 
-    Skipped entirely when the filtered shard list matches what the processed manifest recorded; otherwise the
-    processed directory is rewritten from shard 0.
+    A no-op when the processed manifest already covers every filtered shard (``extra["input_shards"]``). The
+    directory is rebuilt from scratch when its manifest is stale, when the covered shards are no longer a prefix
+    of the filtered shards, when it predates the ``hash`` column, and — always — with ``dedup.mode: minhash``
+    (fuzzy dedup needs every signature in one LSH index, so it is a full pass over everything).
     """
     source = cfg.sources[name]
     if source.kind != "pretrain":
@@ -168,44 +171,83 @@ def process(
     filtered_dir = layout.source_dir(name, "filtered")
     out = layout.source_dir(name, "processed")
     filtered = require_manifest(filtered_dir, source_hash, "filtered", name)
-    input_shards = shard_list(filtered)
-    existing = current_manifest(out, source_hash, "processed")
-    if existing is not None and existing.extra.get("input_shards") == input_shards:
-        return existing
 
-    log.info("%s: processing %d filtered shard(s) -> %s", name, len(filtered.shards), out)
-    counter = TokenCounter(cfg, layout)
-    # `stats` is stored in the manifest; the generators below update their sub-dict as rows stream through
-    stats: dict[str, Any] = {
-        "input_rows": filtered.rows(),
-        "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
-        "quality_filter": {"enabled": processing.quality_filter, "filtered_count": 0, "rejection_reasons": {}},
-        "decontamination": {"enabled": processing.decontamination.enabled, "contaminated_count": 0, "contaminated_by_benchmark": {}},
-    }
+    full_pass = processing.dedup.mode == "minhash"
+    manifest = _resumable_processed_manifest(cfg, name, source_hash, out, filtered, full_pass)
+    covered = len(manifest.extra["input_shards"])
+    pending = filtered.shards[covered:]
+    if not pending:
+        return manifest
 
-    # build the lazy pipeline: nothing runs until `write_dict_rows` pulls rows through it
-    rows: Iterator[Row] = _iter_filtered_rows(filtered_dir, filtered, shard_size)
+    log.info("%s: processing %d filtered shard(s) (%d already covered) -> %s", name, len(pending), covered, out)
+    stats: dict[str, Any] = manifest.extra["stats"]
+    stats["input_rows"] += sum(shard.rows for shard in pending)
+    seen = _stored_hashes(out, manifest)
+
+    # build the lazy pipeline: nothing runs until the shard writer pulls rows through it
+    rows: Iterator[Row] = _iter_shard_rows(filtered_dir, pending, shard_size)
+    rows = _with_hashes(rows, processing.dedup.normalize)
     if processing.dedup.mode == "exact":
-        rows = _exact_dedup(rows, processing.dedup.normalize, stats["dedup"])
+        rows = _exact_dedup(rows, seen, stats["dedup"])
     if processing.quality_filter:
         rows = _quality_filter(rows, stats["quality_filter"])
     if processing.decontamination.enabled:
         rows = _decontaminate(rows, processing.decontamination, num_workers, layout, stats["decontamination"])
-    tokens_per_output_shard: list[int] = []
-    with progress(total=filtered.rows(), desc=f"{name}: process", unit="row", leave=False) as bar:
-        rows = _count_tokens(rows, counter, name, shard_size, bar)
-        if processing.dedup.mode == "minhash":
+    pending_rows = sum(shard.rows for shard in pending)
+    start_shard = len(manifest.shards)
+    tokens_per_new_shard: list[int] = []
+    with progress(total=pending_rows, desc=f"{name}: process", unit="row", leave=False) as bar:
+        rows = _count_tokens(rows, TokenCounter(cfg, layout), name, shard_size, bar)
+        if full_pass:
             rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
-        rows = _accumulate_tokens(rows, tokens_per_output_shard, shard_size)
-        write_dict_rows(rows, out, shard_size, start_shard=0)
+        rows = _accumulate_tokens(rows, tokens_per_new_shard, shard_size)
+        write_dict_rows(rows, out, shard_size, start_shard=start_shard)
 
-    manifest = new_manifest(cfg, name, source_hash, "processed", tokens=True)
     manifest.rows_fetched = filtered.rows_fetched
-    record_new_shards(manifest, out, 0, tokens=dict(zip(_shard_names(out), tokens_per_output_shard)))
-    manifest.extra = {"input_shards": input_shards, "stats": stats}
+    new_names = _shard_names(out)[start_shard:]
+    record_new_shards(manifest, out, start_shard, tokens=dict(zip(new_names, tokens_per_new_shard)))
+    manifest.extra["input_shards"] = shard_list(filtered)
     manifest.save(out)
     log.info("%s: %d rows, %s tokens", name, manifest.rows(), manifest.tokens())
     return manifest
+
+
+def _resumable_processed_manifest(
+    cfg: DatasetConfig, name: str, source_hash: str, out: Path, filtered: Manifest, full_pass: bool
+) -> Manifest:
+    """The stored processed manifest if new filtered shards can be appended to it (current hash, ``hash`` column
+    present, covered shards a prefix of the filtered shards, not a full-pass mode); otherwise a fresh one, which
+    makes the run rewrite the directory from shard 0."""
+    manifest = current_manifest(out, source_hash, "processed")
+    if manifest is not None and not full_pass:
+        covered: list[list[Any]] = manifest.extra.get("input_shards", [])
+        has_hashes = manifest.extra.get("columns") == list(PROCESSED_COLUMNS)
+        if has_hashes and shard_list(filtered)[: len(covered)] == covered:
+            return manifest
+        why = "filtered shards changed under the processed manifest" if has_hashes else "processed shards predate the hash column"
+        log.warning("%s: %s, reprocessing everything", name, why)
+    processing = cfg.source_processing(name)
+    manifest = new_manifest(cfg, name, source_hash, "processed", tokens=True)
+    manifest.extra = {
+        "input_shards": [],
+        "columns": list(PROCESSED_COLUMNS),
+        "stats": {
+            "input_rows": 0,
+            "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
+            "quality_filter": {"enabled": processing.quality_filter, "filtered_count": 0, "rejection_reasons": {}},
+            "decontamination": {"enabled": processing.decontamination.enabled, "contaminated_count": 0, "contaminated_by_benchmark": {}},
+        },
+    }
+    return manifest
+
+
+def _stored_hashes(directory: Path, manifest: Manifest) -> set[int]:
+    """The ``hash`` column of every processed shard the manifest lists (the exact-dedup keys already on disk)."""
+    seen: set[int] = set()
+    for shard in manifest.shards:
+        column = pq.read_table(directory / shard.name, columns=["hash"]).column("hash")
+        seen.update(cast(list[int], column.to_pylist()))  # int64 column without nulls
+    return seen
 
 
 def _shard_names(directory: Path) -> list[str]:
@@ -213,21 +255,26 @@ def _shard_names(directory: Path) -> list[str]:
     return [p.name for p in list_parquet_files(directory) if shard_index(p) is not None]
 
 
-def _iter_filtered_rows(directory: Path, manifest: Manifest, batch_size: int) -> Iterator[Row]:
-    """``{text, source}`` rows of every filtered shard, in manifest order."""
-    for shard in manifest.shards:
+def _iter_shard_rows(directory: Path, shards: list[ShardInfo], batch_size: int) -> Iterator[Row]:
+    """``{text, source}`` rows of the given shards of ``directory``, in order."""
+    for shard in shards:
         parquet = pq.ParquetFile(directory / shard.name)
         for batch in parquet.iter_batches(batch_size=batch_size, columns=["text", "source"]):
             yield from batch.to_pylist()
 
 
-def _exact_dedup(rows: Iterator[Row], normalize: bool, stats: dict[str, Any]) -> Iterator[Row]:
-    """First occurrence wins; the hash set is built fresh on every run, so rerunning over old + new shards keeps
-    exactly the rows the previous run kept from the old shards."""
-    seen: set[str] = set()
-    hasher = normalized_hash if normalize else md5_hex
+def _with_hashes(rows: Iterator[Row], normalize: bool) -> Iterator[Row]:
+    """Add the 64-bit exact-dedup key of every row's text as ``hash``."""
     for row in rows:
-        key = hasher(row["text"])
+        row["hash"] = text_hash64(row["text"], normalize)
+        yield row
+
+
+def _exact_dedup(rows: Iterator[Row], seen: set[int], stats: dict[str, Any]) -> Iterator[Row]:
+    """First occurrence wins: drop rows whose ``hash`` is in ``seen`` (the keys of every processed row on disk plus
+    the rows kept earlier in this pass), so appending shards keeps exactly the rows a full pass would keep."""
+    for row in rows:
+        key = row["hash"]
         if key in seen:
             stats["duplicates_removed"] += 1
             continue
@@ -317,7 +364,7 @@ def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_s
         bar.update(len(chunk))
         bar.set_postfix({"tokens": total}, refresh=False)
         for row, n in zip(chunk, tokens):
-            yield {"text": row["text"], "source": name, "tokens": n}
+            yield {"text": row["text"], "source": name, "tokens": n, "hash": row["hash"]}
 
 
 def _accumulate_tokens(rows: Iterator[Row], sums: list[int], shard_size: int) -> Iterator[Row]:

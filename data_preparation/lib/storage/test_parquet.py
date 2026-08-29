@@ -19,6 +19,7 @@ from data_preparation.lib.storage.parquet import (
     normalized_hash,
     normalized_text,
     shard_index,
+    text_hash64,
     write_dict_rows,
     write_parquet_shards,
 )
@@ -89,6 +90,13 @@ def test_shard_index() -> None:
     assert shard_index(Path("/x/data-123456.parquet")) == 123456
     assert shard_index(Path("other.parquet")) is None
     assert shard_index(Path("data-7.parquet")) is None
+
+
+def test_text_hash64_is_the_first_64_bits_of_the_digest() -> None:
+    assert text_hash64("Hello  World") == text_hash64("hello world") == int.from_bytes(bytes.fromhex(normalized_hash("hello world")[:16]), "big", signed=True)
+    assert text_hash64("Hello  World", normalize=False) != text_hash64("hello world", normalize=False)
+    assert -(2**63) <= text_hash64("x") < 2**63
+    pa.array([text_hash64("x")], type=pa.int64())  # fits the parquet column type
 
 
 def test_normalized_text_and_hash() -> None:
