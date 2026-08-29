@@ -88,6 +88,13 @@ def test_build_sources_and_steps_filters(tmp_path: Path) -> None:
     assert exc.value.code == 1
 
 
+def test_build_writes_the_build_log(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer"])
+    log_text = (root / "build.log").read_text()
+    assert "building dataset config" in log_text and "dataset status:" in log_text
+
+
 def test_build_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("stage exploded")

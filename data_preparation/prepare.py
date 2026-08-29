@@ -88,9 +88,9 @@ def run_build(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
     cfg = load_dataset_config(args.dataset_config)
     layout = DatasetLayout(args.dataset_dir)
-    log.info("building dataset config %s (%s) under %s", cfg.name, args.dataset_config, layout.root)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
     with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
+        log.info("building dataset config %s (%s) under %s", cfg.name, args.dataset_config, layout.root)
         result = build(
             cfg,
             layout,
@@ -101,12 +101,13 @@ def run_build(args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
             max_parallel_downloads=args.max_parallel_downloads,
         )
-    partial_build = args.dry_run or args.sources is not None or args.steps is not None
-    if partial_build:
-        return  # the dataset is not expected to be complete after a partial build
-    if not result.complete:
-        raise RuntimeError(f"dataset {cfg.name} still incomplete after the build: {result.missing()}")
-    log.info("done: %s", layout.root)
+        partial_build = args.dry_run or args.sources is not None or args.steps is not None
+        if partial_build:
+            return  # the dataset is not expected to be complete after a partial build
+        if not result.complete:
+            log.error("dataset %s still incomplete after the build: %s", cfg.name, result.missing())
+            raise RuntimeError(f"dataset {cfg.name} still incomplete after the build: {result.missing()}")
+        log.info("done: %s", layout.root)
 
 
 def run_status(args: argparse.Namespace) -> None:

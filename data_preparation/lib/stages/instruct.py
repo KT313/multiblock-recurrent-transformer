@@ -96,58 +96,57 @@ def build_instruct_mixture(
     }
 
     # Steps 1-4: inversions -> dedup + empty removal -> shuffle + split -> write. One seeded RNG drives steps 1 and 3.
-    steps = progress(total=4, desc=f"{instruct_mixture_name}: build_instruct_mixture", unit="step", leave=False)
-    rng = random.Random(mixture.seed)
+    with progress(total=4, desc=f"{instruct_mixture_name}: build_instruct_mixture", unit="step", leave=False) as steps:
+        rng = random.Random(mixture.seed)
 
-    steps.set_postfix({"step": "input_inversions"}, refresh=False)
-    inverted = _apply_input_inversions(rows, mixture, rng, counter)
-    steps.update(1)
+        steps.set_postfix({"step": "input_inversions"}, refresh=False)
+        inverted = _apply_input_inversions(rows, mixture, rng, counter)
+        steps.update(1)
 
-    steps.set_postfix({"step": "dedup"}, refresh=False)
-    rows_before_dedup = len(rows)
-    rows = _dedup(rows)
-    duplicates = rows_before_dedup - len(rows)
-    rows_before_empty_removal = len(rows)
-    rows = [row for row in rows if has_required_fields(row)]
-    empty = rows_before_empty_removal - len(rows)
-    steps.update(1)
+        steps.set_postfix({"step": "dedup"}, refresh=False)
+        rows_before_dedup = len(rows)
+        rows = _dedup(rows)
+        duplicates = rows_before_dedup - len(rows)
+        rows_before_empty_removal = len(rows)
+        rows = [row for row in rows if has_required_fields(row)]
+        empty = rows_before_empty_removal - len(rows)
+        steps.update(1)
 
-    steps.set_postfix({"step": "shuffle_split"}, refresh=False)
-    rng.shuffle(rows)
-    split_at = int(len(rows) * (1 - mixture.val_split))
-    splits = {"train": rows[:split_at], "validation": rows[split_at:]}
-    steps.update(1)
+        steps.set_postfix({"step": "shuffle_split"}, refresh=False)
+        rng.shuffle(rows)
+        split_at = int(len(rows) * (1 - mixture.val_split))
+        splits = {"train": rows[:split_at], "validation": rows[split_at:]}
+        steps.update(1)
 
-    steps.set_postfix({"step": "write"}, refresh=False)
-    metadata = {
-        "total_examples": len(rows),
-        "train_examples": len(splits["train"]),
-        "val_examples": len(splits["validation"]),
-        "inverted": inverted,
-        "duplicates_removed": duplicates,
-        "empty_removed": empty,
-        "max_tokens": mixture.max_tokens,
-        "seed": mixture.seed,
-    }
-    manifests: dict[str, Manifest] = {}
-    for split, split_rows in splits.items():
-        out_dir = split_dirs[split]
-        write_dict_rows(_ordered(split_rows), out_dir, shard_size, start_shard=0)
-        manifest = new_manifest(cfg, instruct_mixture_name, mixture_hash, "instruct_mixture", tokens=True)
-        record_new_shards(manifest, out_dir, 0, tokens=_tokens_per_shard(split_rows, shard_size))
-        manifest.extra = {
-            "split": split,
-            "budget_tokens": budget_tokens,
-            "input_shards": input_shards,
-            "counts": counts,
-            "tokens_per_row": tokens_per_row,
-            "short_sources": short_sources,
-            "metadata": metadata,
+        steps.set_postfix({"step": "write"}, refresh=False)
+        metadata = {
+            "total_examples": len(rows),
+            "train_examples": len(splits["train"]),
+            "val_examples": len(splits["validation"]),
+            "inverted": inverted,
+            "duplicates_removed": duplicates,
+            "empty_removed": empty,
+            "max_tokens": mixture.max_tokens,
+            "seed": mixture.seed,
         }
-        manifest.save(out_dir)
-        manifests[split] = manifest
-    steps.update(1)
-    steps.close()
+        manifests: dict[str, Manifest] = {}
+        for split, split_rows in splits.items():
+            out_dir = split_dirs[split]
+            write_dict_rows(_ordered(split_rows), out_dir, shard_size, start_shard=0)
+            manifest = new_manifest(cfg, instruct_mixture_name, mixture_hash, "instruct_mixture", tokens=True)
+            record_new_shards(manifest, out_dir, 0, tokens=_tokens_per_shard(split_rows, shard_size))
+            manifest.extra = {
+                "split": split,
+                "budget_tokens": budget_tokens,
+                "input_shards": input_shards,
+                "counts": counts,
+                "tokens_per_row": tokens_per_row,
+                "short_sources": short_sources,
+                "metadata": metadata,
+            }
+            manifest.save(out_dir)
+            manifests[split] = manifest
+        steps.update(1)
     return manifests
 
 

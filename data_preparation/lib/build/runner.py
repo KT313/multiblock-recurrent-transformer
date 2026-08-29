@@ -121,7 +121,7 @@ def build(
 
     current = plan(cfg, layout)
     if dry_run:
-        log.info("dry run, plan for %s under %s:\n%s", cfg.name, layout.root, current.summary())
+        log.info("dry run, plan for %s under %s:\n%s", cfg.name, layout.root, current.summary(), extra={"keep": True})
         return current
     log.info("building %s under %s (%d item(s) missing)", cfg.name, layout.root, len(current.missing()))
 
@@ -302,7 +302,7 @@ def _log_plan(result: Plan) -> None:
             )
         else:
             log.warning("%s: %s", item.name, item.reason)
-    log.info("dataset status:\n%s", result.summary())
+    log.info("dataset status:\n%s", result.summary(), extra={"keep": True})  # keep: printed unwrapped into the scrollback
 
 
 # --- building the individual items ----------------------------------------------------------------------------------

@@ -26,10 +26,11 @@ from worker threads; the display refreshes on its own timer.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sized
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
@@ -104,22 +105,27 @@ class Task:
 
     def update(self, n: int = 1) -> None:
         self.n += n
-        self._owner.update(self._id, advance=n)
+        if not self._closed:  # like tqdm, a late update is ignored (rich would raise on a removed task)
+            self._owner.update(self._id, advance=n)
 
     def set_postfix(self, ordered_dict: Any = None, refresh: bool = True, **kwargs: Any) -> None:
         values: dict[str, Any] = dict(ordered_dict or {})
         values.update(kwargs)
-        self._owner.update(self._id, postfix=_format_postfix(values))
+        if not self._closed:
+            self._owner.update(self._id, postfix=_format_postfix(values))
 
     def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
-        self._owner.update(self._id, description=desc or "")
+        if not self._closed:
+            self._owner.update(self._id, description=desc or "")
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         if self._leave:
-            self._owner.update(self._id, visible=True)
+            task = self._owner.tasks[self._owner.task_ids.index(self._id)]
+            if task.total is None:
+                self._owner.update(self._id, total=task.completed)  # an indeterminate bar renders as done
             self._owner.stop_task(self._id)
         else:
             self._owner.remove_task(self._id)
@@ -146,8 +152,9 @@ class Task:
 class DashboardLogHandler(logging.Handler):
     """``logging.Handler`` whose records land in the dashboard's log panel (or on ``stream`` when it is disabled).
 
-    Records of ``keep_level`` and above (default WARNING) are additionally printed above the live display, where
-    they scroll into the terminal's history and survive the run — the panel only shows the last few lines."""
+    Records of ``keep_level`` and above (default WARNING), and records logged with ``extra={"keep": True}`` (the
+    plan / status tables), are additionally printed above the live display, unwrapped, where they scroll into the
+    terminal's history and survive the run — the panel only shows the last few lines."""
 
     def __init__(self, dashboard: Dashboard, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> None:
         super().__init__(level)
@@ -158,7 +165,8 @@ class DashboardLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             text = self.format(record)
-            self._dashboard.write(text, keep=record.levelno >= self._keep_level)
+            keep = record.levelno >= self._keep_level or bool(getattr(record, "keep", False))
+            self._dashboard.write(text, keep=keep)
         except Exception:
             self.handleError(record)
 
@@ -185,7 +193,7 @@ class Dashboard:
     ) -> None:
         self.enabled = progress_enabled(stream) if enabled is None else enabled
         self._stream = stream if stream is not None else sys.stderr
-        self._console = console if console is not None else Console(file=self._stream, stderr=stream is None)
+        self._console = console if console is not None else Console(file=self._stream)
         self._refresh_per_second = refresh_per_second
         self._lines: deque[str] = deque(maxlen=log_lines)
         self._lines_lock = threading.Lock()
@@ -204,6 +212,7 @@ class Dashboard:
         )
         self._live: Live | None = None
         self._depth = 0
+        self._saved_env: dict[str, str | None] = {}
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
@@ -216,6 +225,7 @@ class Dashboard:
                 return self
             Dashboard._active = self
         if self.enabled:
+            self._silence_third_party_bars()
             self._live = Live(
                 self, console=self._console, refresh_per_second=self._refresh_per_second, transient=False, redirect_stderr=False,
                 redirect_stdout=False,
@@ -238,6 +248,36 @@ class Dashboard:
         if self._live is not None:
             self._live.stop()
             self._live = None
+            self._restore_third_party_bars()
+
+    _THIRD_PARTY_BAR_ENV = ("HF_HUB_DISABLE_PROGRESS_BARS", "HF_DATASETS_DISABLE_PROGRESS_BARS")
+
+    def _silence_third_party_bars(self) -> None:
+        """Turn off the tqdm bars of ``huggingface_hub`` / ``datasets`` (file downloads, ``load_dataset``) while
+        the live display is up — their carriage returns would garble it. The env vars cover the not-yet-imported
+        libraries, the function calls the already-imported ones; :meth:`_restore_third_party_bars` undoes both."""
+        self._saved_env = {name: os.environ.get(name) for name in self._THIRD_PARTY_BAR_ENV}
+        for name in self._THIRD_PARTY_BAR_ENV:
+            os.environ[name] = "1"
+        hub = sys.modules.get("huggingface_hub")
+        if hub is not None:
+            hub.utils.disable_progress_bars()
+        datasets = sys.modules.get("datasets")
+        if datasets is not None:
+            datasets.utils.logging.disable_progress_bar()
+
+    def _restore_third_party_bars(self) -> None:
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        hub = sys.modules.get("huggingface_hub")
+        if hub is not None and self._saved_env["HF_HUB_DISABLE_PROGRESS_BARS"] is None:
+            hub.utils.enable_progress_bars()
+        datasets = sys.modules.get("datasets")
+        if datasets is not None and self._saved_env["HF_DATASETS_DISABLE_PROGRESS_BARS"] is None:
+            datasets.utils.logging.enable_progress_bar()
 
     @property
     def is_active(self) -> bool:
@@ -257,6 +297,8 @@ class Dashboard:
         """A new progress line (a no-op bar when the dashboard is disabled)."""
         if not self.enabled:
             return NoProgress(iterable)
+        if total is None and iterable is not None and isinstance(iterable, Sized):
+            total = len(iterable)  # like tqdm
         task_id = self._progress.add_task(desc, total=total, unit=unit, postfix="")
         return Task(self._progress, task_id, iterable, leave)
 
@@ -270,7 +312,8 @@ class Dashboard:
         with self._lines_lock:
             self._lines.extend(text.splitlines() or [""])
         if keep:
-            self._console.print(Text(text))  # rich prints above an active Live display
+            # rich prints above an active Live display; no wrapping / cropping so tables keep their columns
+            self._console.print(Text(text, no_wrap=True, overflow="ignore"), crop=False, soft_wrap=True)
 
     def log_handler(self, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> DashboardLogHandler:
         """A logging handler for this dashboard (see :class:`DashboardLogHandler`); :meth:`attach` installs it."""
@@ -317,8 +360,9 @@ class Dashboard:
 
     def __rich__(self) -> RenderableType:
         with self._lines_lock:
-            body = Text("\n".join(self._lines) or "(no log output yet)", no_wrap=False, overflow="ellipsis")
-        return Group(Panel(body, title="log", title_align="left", border_style="dim"), self._progress)
+            body = Text("\n".join(self._lines) or "(no log output yet)", no_wrap=True, overflow="ellipsis")
+        # bars first: a terminal too short for both crops the log panel, never the running tasks
+        return Group(self._progress, Panel(body, title="log", title_align="left", border_style="dim"))
 
     def render_text(self, width: int = 120) -> str:
         """The current display as plain text (tests, or a snapshot for a log file)."""
