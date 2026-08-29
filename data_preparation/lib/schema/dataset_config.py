@@ -7,7 +7,7 @@ references the file; every data-related setting lives here.
 
 Layout produced on disk (see CLAUDE.md "Dataset-config restructuring"):
 
-    dataset/sources/<source>/{raw,filtered,processed}/   shared by every dataset config, append-only
+    dataset/sources/<source>/{raw,processed}/            shared by every dataset config, append-only
     dataset/instruct_mixtures/<config name>/<mixture>/{train,validation}/
     dataset/tokenizers/<tokenizer name>/
 """

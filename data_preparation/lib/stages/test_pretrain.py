@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.pretrain: incremental length filter, streaming process (dedup, quality,
-decontamination, token counting, fuzzy dedup) on local parquet sources."""
+"""Tests for data_preparation.lib.stages.pretrain: the incremental, streaming ``process`` stage (length filter, dedup,
+quality, decontamination, token counting, fuzzy dedup) on local parquet sources."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.lib.stages import pretrain as stages_pretrain
@@ -24,7 +23,7 @@ from data_preparation.lib.schema.dataset_config import (
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.stages.row_pipeline import get_ngram_set
-from data_preparation.lib.stages.pretrain import length_filter, process
+from data_preparation.lib.stages.pretrain import process
 from data_preparation.lib.stages.shared import TokenCounter, download
 from data_preparation.lib.storage.parquet import text_hash64
 
@@ -56,75 +55,6 @@ def _cfg(
     return cfg_factory({"s": src}, processing=processing or ProcessingConfig(min_chars=5), **kwargs)
 
 
-# --- length_filter -----------------------------------------------------------------------------------------------------
-
-
-def test_length_filter_is_1_to_1_incremental_and_idempotent(
-    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, mtimes: Mtimes, read_rows: Reader
-) -> None:
-    write_local(source_dir, [{"text": t} for t in ["ok " * 5, "tiny", None, "x" * 30, "y" * 7, "z" * 8]], "parquet")
-    cfg = _cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5, max_chars=20))
-    download(cfg, "s", layout, rows_needed=6, shard_size=4)  # raw shards: 4 + 2 rows
-    m = length_filter(cfg, "s", layout)
-    filtered = layout.source_dir("s", "filtered")
-    assert m.stage == "filtered" and [(s.name, s.rows) for s in m.shards] == [("data-00000.parquet", 2), ("data-00001.parquet", 2)]
-    assert m.extra["input_shards"] == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
-    assert m.extra["shard_stats"]["data-00000.parquet"] == {
-        "input_samples": 4, "removed_too_short": 1, "removed_invalid": 1, "truncated": 1, "output_samples": 2,
-    }  # fmt: skip
-    rows = read_rows(filtered)
-    assert [r["text"] for r in rows] == ["ok " * 5, "x" * 20, "y" * 7, "z" * 8]
-    assert [r["original_length"] for r in rows] == [15, 30, 7, 8] and {r["source"] for r in rows} == {"s"}
-    before = mtimes(filtered)
-    assert length_filter(cfg, "s", layout) == m and mtimes(filtered) == before
-
-    # append raw rows: only the new raw shards are filtered, old filtered shards untouched
-    write_local(source_dir, [{"text": "new " * 3}, {"text": "no"}], "parquet")
-    download(cfg, "s", layout, rows_needed=8, shard_size=4)
-    m2 = length_filter(cfg, "s", layout)
-    assert [s.name for s in m2.shards] == [f"data-{i:05d}.parquet" for i in range(3)]
-    after = mtimes(filtered)
-    assert {k: after[k] for k in before} == before
-    assert [r["text"] for r in read_rows(filtered)][-1] == "new new new "
-
-
-def test_length_filter_writes_empty_shard_when_everything_is_dropped(
-    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer
-) -> None:
-    write_local(source_dir, [{"text": "a"}, {"text": "b"}, {"text": "long enough text"}], "parquet")
-    cfg = _cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5))
-    download(cfg, "s", layout, rows_needed=3, shard_size=2)
-    m = length_filter(cfg, "s", layout)
-    assert [(s.name, s.rows) for s in m.shards] == [("data-00000.parquet", 0), ("data-00001.parquet", 1)]
-    empty = pq.read_table(layout.source_dir("s", "filtered") / "data-00000.parquet")
-    assert empty.num_rows == 0 and empty.column_names == ["text", "source", "original_length"]
-
-
-def test_length_filter_requires_raw_and_pretrain_kind(cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path) -> None:
-    cfg = _cfg(cfg_factory, source_dir)
-    with pytest.raises(FileNotFoundError, match="no current raw manifest"):
-        length_filter(cfg, "s", layout)
-    hold = cfg_factory({"h": SourceConfig(kind="validation", loader="synthetic", rows=1)})
-    with pytest.raises(ValueError, match="pretrain sources only"):
-        length_filter(hold, "h", layout)
-
-
-def test_length_filter_refilters_when_raw_shards_changed(
-    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, caplog: pytest.LogCaptureFixture
-) -> None:
-    write_local(source_dir, [{"text": "hello world"}] * 3, "parquet")
-    cfg = _cfg(cfg_factory, source_dir)
-    download(cfg, "s", layout, rows_needed=3, shard_size=2)
-    length_filter(cfg, "s", layout)
-    raw = Manifest.load(layout.source_dir("s", "raw"))
-    assert raw is not None
-    raw.shards[0].rows = 99  # pretend the raw shard was rewritten with a different row count
-    raw.save(layout.source_dir("s", "raw"))
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        m = length_filter(cfg, "s", layout)
-    assert "raw shards changed" in caplog.text and m.extra["input_shards"][0] == ["data-00000.parquet", 99]
-
-
 # --- process -----------------------------------------------------------------------------------------------------------
 
 
@@ -142,8 +72,32 @@ def _prepare_rows(
     write(source_dir, rows, "parquet")
     cfg = with_tokenizer(_cfg(cfg_factory, source_dir, **kw))
     download(cfg, "s", layout, rows_needed=len(rows), shard_size=shard_size)
-    length_filter(cfg, "s", layout)
     return cfg
+
+
+def test_process_length_filter_drops_short_truncates_and_keeps_stats(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    texts = ["ok " * 5, "tiny", None, "x" * 30, "y" * 7, "z" * 8]
+    cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local,
+                   processing=ProcessingConfig(min_chars=5, max_chars=20), shard_size=4)  # fmt: skip
+    m = process(cfg, "s", layout)
+    rows = read_rows(layout.source_dir("s", "processed"))
+    assert [r["text"] for r in rows] == ["ok " * 5, "x" * 20, "y" * 7, "z" * 8], "short / null dropped, long truncated"
+    assert m.extra["stats"]["length_filter"] == {
+        "input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "truncated": 1, "output_samples": 4,
+    }  # fmt: skip
+    assert m.extra["stats"]["input_rows"] == 6 and m.rows() == 4
+    assert m.extra["input_shards"] == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
+
+
+def test_process_writes_nothing_when_every_row_is_dropped(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep
+) -> None:
+    cfg = _prepare(cfg_factory, layout, source_dir, ["a", "b"], with_tokenizer, write=write_local, processing=ProcessingConfig(min_chars=5))
+    m = process(cfg, "s", layout)
+    assert m.shards == [] and m.rows() == 0 and m.tokens() == 0 and m.extra["stats"]["length_filter"]["output_samples"] == 0
+    assert m.extra["input_shards"] == [["data-00000.parquet", 2]] and process(cfg, "s", layout) == m
 
 
 def test_process_exact_dedup_tokens_and_idempotence(
@@ -182,7 +136,7 @@ def test_process_appends_only_the_new_shards(
     cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:  # fmt: skip
-    """A top-up processes (tokenizes) only the filtered shards not yet covered, leaves the old processed shards
+    """A top-up processes (tokenizes) only the raw shards not yet covered, leaves the old processed shards
     untouched, removes duplicates across old and new shards, and ends with exactly the rows of a fresh full pass."""
     first = [_words(6, i) for i in range(6)] + [_words(6, 0)]  # one duplicate inside
     cfg = _prepare(cfg_factory, layout, source_dir, first, with_tokenizer, write=write_local, shard_size=3)
@@ -195,7 +149,6 @@ def test_process_appends_only_the_new_shards(
     # append: duplicates of old rows plus new ones
     write_local(source_dir, [{"text": _words(6, 2)}, {"text": _words(6, 50)}, {"text": _words(6, 3)}, {"text": _words(6, 51)}], "parquet")
     download(cfg, "s", layout, rows_needed=11, shard_size=3)
-    length_filter(cfg, "s", layout)
     counted: list[int] = []
     original = TokenCounter.count_many
 
@@ -223,7 +176,6 @@ def test_process_appends_only_the_new_shards(
 
     prepare_tokenizer(cfg, fresh)
     download(cfg, "s", fresh, rows_needed=11, shard_size=3)
-    length_filter(cfg, "s", fresh)
     m_fresh = process(cfg, "s", fresh, shard_size=4)
     assert read_rows(fresh.source_dir("s", "processed")) == new_rows
     assert m_fresh.tokens() == m2.tokens() and m_fresh.extra["stats"] == m2.extra["stats"]
@@ -239,7 +191,7 @@ def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
     processed = layout.source_dir("s", "processed")
     rows = read_rows(processed)
 
-    # a processed directory from before the hash column: rebuilt from the filtered shards (no download)
+    # a processed directory from before the hash column: rebuilt from the raw shards (no download)
     legacy = Manifest.load(processed)
     assert legacy is not None
     del legacy.extra["columns"]
@@ -249,7 +201,7 @@ def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
     assert "predate the hash column" in caplog.text and rebuilt.extra["columns"] == m.extra["columns"]
     assert read_rows(processed) == rows
 
-    # filtered shards that are no longer a prefix of what was covered: everything is reprocessed
+    # raw shards that are no longer a prefix of what was covered: everything is reprocessed
     caplog.clear()
     changed = Manifest.load(processed)
     assert changed is not None
@@ -257,7 +209,7 @@ def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
     changed.save(processed)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         rebuilt = process(cfg, "s", layout)
-    assert "filtered shards changed" in caplog.text and rebuilt.extra["input_shards"] == m.extra["input_shards"]
+    assert "raw shards changed" in caplog.text and rebuilt.extra["input_shards"] == m.extra["input_shards"]
     assert read_rows(processed) == rows
 
 
@@ -271,7 +223,6 @@ def test_process_no_dedup_mode_keeps_duplicates(
     exact_raw = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="exact", normalize=False))
     cfg2 = with_tokenizer(_cfg(cfg_factory, source_dir, exact_raw))
     download(cfg2, "s", layout, rows_needed=3)
-    length_filter(cfg2, "s", layout)
     process(cfg2, "s", layout)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == ["dup", "DUP"]
 
@@ -285,7 +236,6 @@ def test_process_quality_filter_only_when_enabled(
     assert len(read_rows(layout.source_dir("s", "processed"))) == 2
     on = with_tokenizer(_cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5, quality_filter=True), max_seq_length=500))
     download(on, "s", layout, rows_needed=2)
-    length_filter(on, "s", layout)
     m = process(on, "s", layout)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [GOOD]
     assert m.extra["stats"]["quality_filter"] == {
@@ -313,7 +263,6 @@ def test_process_decontamination_only_when_enabled(
     decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test", "mmlu_test"])
     on = with_tokenizer(_cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5, decontamination=decon), max_seq_length=500))
     download(on, "s", layout, rows_needed=3)
-    length_filter(on, "s", layout)
     m = process(on, "s", layout, num_workers=num_workers)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [GOOD]
     assert m.extra["stats"]["decontamination"] == {
@@ -372,7 +321,10 @@ def test_process_minhash_without_datasketch_raises(
 
 
 
-def test_process_requires_filtered_manifest(cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path) -> None:
+def test_process_requires_raw_manifest_and_pretrain_kind(cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path) -> None:
     cfg = _cfg(cfg_factory, source_dir)
-    with pytest.raises(FileNotFoundError, match="no current filtered manifest"):
+    with pytest.raises(FileNotFoundError, match="no current raw manifest"):
         process(cfg, "s", layout)
+    hold = cfg_factory({"h": SourceConfig(kind="validation", loader="synthetic", rows=1)})
+    with pytest.raises(ValueError, match="pretrain sources only"):
+        process(hold, "h", layout)

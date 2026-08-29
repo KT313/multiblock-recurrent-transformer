@@ -9,7 +9,7 @@ import re
 import shutil
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,6 +18,7 @@ from data_preparation.lib.log import get_logger
 
 log = get_logger(__name__)
 SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
+SHARD_COMPRESSION: Literal["zstd"] = "zstd"  # every shard written from now on; older snappy shards stay readable
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -146,7 +147,7 @@ class ShardWriter:
 
     def write_shard(self, table: pa.Table) -> None:
         """Write ``table`` as the next shard into the temp dir (the caller sizes it)."""
-        pq.write_table(table, self._tmp_dir / shard_name(self.start_shard + self.written))
+        pq.write_table(table, self._tmp_dir / shard_name(self.start_shard + self.written), compression=SHARD_COMPRESSION)
         self.written += 1
 
     def _publish(self) -> None:

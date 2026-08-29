@@ -256,7 +256,6 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     budget = cfg.source_budget_tokens(name)
     manifests, problem = _current_stage_manifests(cfg, name, layout)
     raw = manifests.get("raw")
-    filtered = manifests.get("filtered")
     processed = manifests.get("processed")
 
     exhausted = raw is not None and bool(raw.extra.get("exhausted"))
@@ -271,8 +270,8 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     rows_needed = rows_for_budget(budget, tokens_per_row)
     rows_to_fetch = max(0, rows_needed - rows_present)
 
-    if problem is None and raw is not None and filtered is not None and processed is not None:
-        problem = _pipeline_problem(raw, filtered, processed, budget, exhausted)
+    if problem is None and raw is not None and processed is not None:
+        problem = _pipeline_problem(raw, processed, budget, exhausted)
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
 
@@ -300,7 +299,7 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
 
 
 def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> tuple[dict[str, Manifest], str | None]:
-    """The current, verified manifests of the source's stages (``raw``/``filtered``/``processed``) plus the problem
+    """The current, verified manifests of the source's stages (``raw``/``processed``) plus the problem
     of the first stage that has none (None if every stage is fine)."""
     source_hash = cfg.source_hash(name)
     manifests: dict[str, Manifest] = {}
@@ -314,16 +313,13 @@ def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayou
     return manifests, first_problem
 
 
-def _pipeline_problem(raw: Manifest, filtered: Manifest, processed: Manifest, budget: int, exhausted: bool) -> str | None:
+def _pipeline_problem(raw: Manifest, processed: Manifest, budget: int, exhausted: bool) -> str | None:
     """Why the stages of a source are not finished even though every manifest is current, or None."""
-    filtered_inputs = filtered.extra.get("input_shards", [])
-    if len(filtered_inputs) != len(raw.shards):
-        return "filtered: behind raw"
     if processed.extra.get("columns") != list(PROCESSED_COLUMNS):
-        return "processed: predates the hash column"  # `process` rebuilds it from the filtered shards, no download
+        return "processed: predates the hash column"  # `process` rebuilds it from the raw shards, no download
     processed_inputs = processed.extra.get("input_shards")
-    if processed_inputs != [[shard.name, shard.rows] for shard in filtered.shards]:
-        return "processed: behind filtered"
+    if processed_inputs != [[shard.name, shard.rows] for shard in raw.shards]:
+        return "processed: behind raw"
     tokens = processed.tokens() or 0
     if tokens < budget and not exhausted:
         return f"tokens {tokens} < budget {budget}"
@@ -331,8 +327,8 @@ def _pipeline_problem(raw: Manifest, filtered: Manifest, processed: Manifest, bu
 
 
 def _measured_tokens_per_row(raw: Manifest, processed: Manifest) -> float | None:
-    """Processed tokens per **raw** row over the raw shards the processed manifest covers (filtered shard N mirrors
-    raw shard N), or None without usable counts."""
+    """Processed tokens per **raw** row over the raw shards the processed manifest covers, or None without usable
+    counts."""
     tokens = processed.tokens()
     covered = len(processed.extra.get("input_shards", []))
     raw_rows = sum(shard.rows for shard in raw.shards[:covered])

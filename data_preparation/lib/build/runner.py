@@ -2,7 +2,7 @@
 """``build`` / ``status``: execute a :func:`planner.plan` (tokenizer -> pretrain sources -> validation sources -> instruct mixtures)
 and report it.
 
-Per pretrain source the estimate -> measured refinement loop runs download -> length_filter -> process until the
+Per pretrain source the estimate -> measured refinement loop runs download -> process until the
 processed tokens reach the budget or the loader is exhausted (at most ``max_rounds`` rounds, then an error);
 ``github_code`` sources of one repo download together in a single pass over its files (one work item per repo). A
 mixture is rebuilt until none of its sources is short. Stage directories whose manifest is stale or whose shards
@@ -28,7 +28,6 @@ from data_preparation.lib.stages import (
     build_instruct_mixture,
     download,
     download_github_code_group,
-    length_filter,
     prepare_tokenizer,
     process,
     validation,
@@ -37,7 +36,7 @@ from data_preparation.lib.storage.manifest import Manifest
 
 log = get_logger(__name__)
 
-STEPS: tuple[str, ...] = ("tokenizer", "download", "filter", "process", "validation", "instruct_mixtures")
+STEPS: tuple[str, ...] = ("tokenizer", "download", "process", "validation", "instruct_mixtures")
 DEFAULT_MAX_ROUNDS = 5
 
 
@@ -214,7 +213,7 @@ def _build_pretrain_source(
     hf_token: str | None,
     max_rounds: int,
 ) -> None:
-    """download -> filter -> process, repeated with a refined tokens/row until the processed tokens reach the budget."""
+    """download -> process, repeated with a refined tokens/row until the processed tokens reach the budget."""
     name, budget = source_plan.name, source_plan.budget_tokens
     _remove_broken_stages(cfg, name, layout)
     tokens_per_row = source_plan.tokens_per_row
@@ -242,7 +241,7 @@ def _build_github_code_group(
     max_rounds: int,
 ) -> None:
     """`_build_pretrain_source` for the `github_code` sources of one repo: each round downloads every source that
-    still needs rows in one pass over the repo files, then filters / processes them one by one."""
+    still needs rows in one pass over the repo files, then processes them one by one."""
     budgets = {p.name: p.budget_tokens for p in group}
     tokens_per_row = {p.name: p.tokens_per_row for p in group}
     for source_plan in group:
@@ -277,11 +276,8 @@ def _process_round(
     budget: int,
     round_index: int,
 ) -> float | None:
-    """filter -> process after one download round of ``name`` (``raw``: its raw manifest, None without a download
-    step). Returns None when the source is done (budget reached, exhausted, or nothing more to do) or the refined
+    """process after one download round of ``name`` (``raw``: its raw manifest, None without a download step). Returns None when the source is done (budget reached, exhausted, or nothing more to do) or the refined
     tokens/row for the next round."""
-    if "filter" in active_steps:
-        length_filter(cfg, name, layout)
     if "process" not in active_steps:
         return None
     processed = process(cfg, name, layout, num_workers=num_workers)

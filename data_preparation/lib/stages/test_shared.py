@@ -443,8 +443,8 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
     Manifest(source="s", source_hash="h", stage="raw").save(tmp_path)
     assert current_manifest(tmp_path, "h", "raw") is not None
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        assert current_manifest(tmp_path, "h", "filtered") is None
-    assert "manifest stage 'raw' != 'filtered'" in caplog.text
+        assert current_manifest(tmp_path, "h", "processed") is None
+    assert "manifest stage 'raw' != 'processed'" in caplog.text
     assert current_manifest(tmp_path, "other", "raw") is None
     with pytest.raises(FileNotFoundError, match="no current raw manifest"):
         require_manifest(tmp_path / "missing", "h", "raw", "s")

@@ -129,7 +129,7 @@ def test_stale_hash_is_not_complete(layout: DatasetLayout) -> None:
     a = next(s for s in result.sources if s.name == "a")
     assert not a.complete and not a.manifest_current and a.reason == "raw: manifest stale"
     assert a.rows_present == 0 and a.rows_to_fetch == a.rows_needed and a.tokens_per_row == 100  # back to the estimate
-    assert stage_problems(cfg, "a", layout) == {s: f"{s}: manifest stale" for s in ("raw", "filtered", "processed")}
+    assert stage_problems(cfg, "a", layout) == {s: f"{s}: manifest stale" for s in ("raw", "processed")}
 
 
 def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:

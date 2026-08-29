@@ -15,10 +15,11 @@ def test_default_root_is_dataset() -> None:
 def test_source_dirs() -> None:
     layout = DatasetLayout(Path("/d"))
     assert layout.source_dir("fineweb", "raw") == Path("/d/sources/fineweb/raw")
-    assert layout.source_dir("fineweb", "filtered") == Path("/d/sources/fineweb/filtered")
     assert layout.source_dir("fineweb", "processed") == Path("/d/sources/fineweb/processed")
     assert layout.validation_dir("fineweb_val") == Path("/d/sources/fineweb_val/validation")
-    assert SOURCE_STAGES == ("raw", "filtered", "processed")
+    assert SOURCE_STAGES == ("raw", "processed")
+    with pytest.raises(ValueError, match="unknown source stage"):
+        layout.source_dir("fineweb", "filtered")  # the length filter runs inside `process` now
 
 
 def test_instruct_mixture_tokenizer_benchmark_dirs() -> None:

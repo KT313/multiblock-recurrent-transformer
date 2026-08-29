@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
-    <root>/sources/<source>/{raw,filtered,processed}/   shared by every dataset config (append-only source cache)
+    <root>/sources/<source>/{raw,processed}/            shared by every dataset config (append-only source cache)
     <root>/sources/<source>/validation/                 held-out validation rows of a `validation` source
     <root>/instruct_mixtures/<config name>/<mixture>/{train,validation}/
     <root>/tokenizers/<tokenizer name>/
@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-SourceStage = Literal["raw", "filtered", "processed"]
+SourceStage = Literal["raw", "processed"]
 InstructMixtureSplit = Literal["train", "validation"]
-SOURCE_STAGES: tuple[str, ...] = ("raw", "filtered", "processed")
+SOURCE_STAGES: tuple[str, ...] = ("raw", "processed")
 INSTRUCT_MIXTURE_SPLITS: tuple[str, ...] = ("train", "validation")
 # columns of a processed shard; `hash` (int64 exact-dedup key) lets `process` append new shards instead of rewriting
 PROCESSED_COLUMNS: tuple[str, ...] = ("text", "source", "tokens", "hash")

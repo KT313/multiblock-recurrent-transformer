@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """``MANIFEST.json`` beside a shard directory: what a source/mixture directory contains and which config built it.
 
-Every stage directory (``dataset/sources/<source>/{raw,filtered,processed}/``, instruct mixtures, validation sources,
+Every stage directory (``dataset/sources/<source>/{raw,processed}/``, instruct mixtures, validation sources,
 tokenizers) carries one manifest. ``source_hash`` is :meth:`DatasetConfig.source_hash` of the config that produced
 it; a manifest whose hash differs from the current config is stale and its stage is rebuilt. Verification is cheap
 (parquet metadata only).
@@ -27,8 +27,8 @@ from data_preparation.lib.log import get_logger
 log = get_logger(__name__)
 
 MANIFEST_NAME = "MANIFEST.json"
-Stage = Literal["raw", "filtered", "processed", "instruct_mixture", "validation", "tokenizer"]
-STAGES: tuple[str, ...] = ("raw", "filtered", "processed", "instruct_mixture", "validation", "tokenizer")
+Stage = Literal["raw", "processed", "instruct_mixture", "validation", "tokenizer"]
+STAGES: tuple[str, ...] = ("raw", "processed", "instruct_mixture", "validation", "tokenizer")
 
 
 def _utc_now_iso() -> str:

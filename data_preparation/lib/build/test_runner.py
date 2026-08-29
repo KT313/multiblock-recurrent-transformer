@@ -142,8 +142,8 @@ def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> N
     result = build(cfg, layout, steps={"tokenizer", "download"})
     assert not result.complete and result.tokenizer_complete
     assert (layout.source_dir("p", "raw") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("p", "filtered").exists() and not layout.validation_dir("h").exists()
-    result = build(cfg, layout, steps={"filter", "process", "validation"})
+    assert not layout.source_dir("p", "processed").exists() and not layout.validation_dir("h").exists()
+    result = build(cfg, layout, steps={"process", "validation"})
     (p,) = result.sources
     assert (layout.source_dir("p", "processed") / "MANIFEST.json").is_file() and result.validations[0].complete
     assert not p.complete and p.reason.startswith("tokens ")  # the estimate-sized download cannot be topped up without `download`

@@ -11,7 +11,6 @@ def test_facade_reexports_every_stage() -> None:
     assert stages.download is stages_shared.download
     assert stages.validation is stages_shared.validation
     assert stages.prepare_tokenizer is stages_shared.prepare_tokenizer
-    assert stages.length_filter is stages_pretrain.length_filter
     assert stages.process is stages_pretrain.process
     assert stages.build_instruct_mixture is stages_instruct.build_instruct_mixture
-    assert set(stages.__all__) >= {"download", "validation", "prepare_tokenizer", "length_filter", "process", "build_instruct_mixture"}
+    assert set(stages.__all__) >= {"download", "validation", "prepare_tokenizer", "process", "build_instruct_mixture"}

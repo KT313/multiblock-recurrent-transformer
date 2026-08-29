@@ -55,8 +55,7 @@ builds in seconds, used by the tests and `config/tiny.yaml`).
 dataset/
 ├── sources/<source>/
 │   ├── raw/          MANIFEST.json + data-*.parquet     rows as fetched (converter applied), append-only
-│   ├── filtered/     MANIFEST.json + data-*.parquet     length filter, one shard per raw shard
-│   ├── processed/    MANIFEST.json + data-*.parquet     dedup / filters / token counts   <- training reads this
+│   ├── processed/    MANIFEST.json + data-*.parquet     length filter / dedup / filters / token counts, append-only   <- training reads this
 │   └── validation/      MANIFEST.json + data-*.parquet     `validation` sources only            <- validation reads this
 ├── instruct_mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
 ├── tokenizers/<tokenizer name>/                            MANIFEST.json + tokenizer files
@@ -141,7 +140,7 @@ Two caches, with different lifetimes:
 ## Progress bars
 
 `build` shows a bar over the plan items and every stage shows its own (`<source>: download` with the rows kept,
-source rows consumed and the current repo file; `length_filter` per shard; `process` per row with the running token
+source rows consumed and the current repo file; `process` per row with the running token
 count; `validation`; `build_instruct_mixture` per source and per step). Bars go to stderr and are disabled automatically when
 stderr is not a terminal or when `DATA_PREP_PROGRESS=0` is set; log lines are written through `tqdm.write` so they
 do not garble the bars. `hf_hub_download` prints its own byte-level bar per file.

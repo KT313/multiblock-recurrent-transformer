@@ -23,8 +23,8 @@ def test_commands_are_registered() -> None:
     args = parser.parse_args(["build", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_build and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 1 and args.hf_token is None and not args.dry_run and args.cache_dir is None
-    args = parser.parse_args(["build", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "filter", "--dry_run", "--num_workers", "3"])
-    assert args.sources == ["a", "b"] and args.steps == ["download", "filter"] and args.dry_run and args.num_workers == 3
+    args = parser.parse_args(["build", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "process", "--dry_run", "--num_workers", "3"])
+    assert args.sources == ["a", "b"] and args.steps == ["download", "process"] and args.dry_run and args.num_workers == 3
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
     assert args.run is prepare.run_status and args.dataset_dir == Path("d")
     args = parser.parse_args(["describe", "--dataset_config", "x.yaml"])
@@ -36,7 +36,7 @@ def test_commands_are_registered() -> None:
             parser.parse_args([command])  # --dataset_config is required
     with pytest.raises(SystemExit):
         parser.parse_args(["build", "--dataset_config", "x.yaml", "--steps", "nope"])
-    assert set(STEPS) == {"tokenizer", "download", "filter", "process", "validation", "instruct_mixtures"}
+    assert set(STEPS) == {"tokenizer", "download", "process", "validation", "instruct_mixtures"}
 
 
 def test_missing_or_unknown_command_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
@@ -78,9 +78,9 @@ def test_build_sources_and_steps_filters(tmp_path: Path) -> None:
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
     assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
     assert (layout.source_dir("synthetic_pretrain", "raw") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("synthetic_pretrain", "filtered").exists() and not layout.validation_dir("synthetic_val").exists()
+    assert not layout.source_dir("synthetic_pretrain", "processed").exists() and not layout.validation_dir("synthetic_val").exists()
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_val"])
-    assert layout.validation_dir("synthetic_val").is_dir() and not layout.source_dir("synthetic_pretrain", "filtered").exists()
+    assert layout.validation_dir("synthetic_val").is_dir() and not layout.source_dir("synthetic_pretrain", "processed").exists()
     with pytest.raises(SystemExit) as exc:
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == 1
