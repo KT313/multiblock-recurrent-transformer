@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Pipeline stages of ``pretrain`` sources: ``length_filter`` (raw -> filtered, shard by shard) and ``process``
-(filtered -> processed: exact dedup, quality filter, decontamination, token counting, fuzzy dedup, repetition).
+(filtered -> processed: exact dedup, quality filter, decontamination, token counting, fuzzy dedup (see the
+``fuzzy_dedup`` module), repetition).
 
 Both are idempotent and incremental via the manifests (see ``stages_shared``). ``length_filter`` mirrors raw shards
 1:1, so only new raw shards are filtered. ``process`` rewrites the whole processed directory whenever the filtered
@@ -28,7 +29,8 @@ from data_preparation.lib.common import (
     write_dict_rows,
     write_parquet_shards,
 )
-from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
+from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig
+from data_preparation.lib.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.manifest import Manifest, shard_rows
@@ -36,7 +38,6 @@ from data_preparation.lib.row_pipeline import (
     FILTERED_SCHEMA,
     check_contamination,
     check_quality,
-    get_ngrams,
     preprocess_batch,
 )
 from data_preparation.lib.sources import repeat_indices
@@ -169,7 +170,7 @@ def process(
         rows = _decontaminate(rows, processing.decontamination, num_workers, layout, stats["decontamination"])
     rows = _count_tokens(rows, counter, name, shard_size)
     if processing.dedup.mode == "minhash":
-        rows = _fuzzy_dedup(rows, processing, stats["dedup"])
+        rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
     token_sums: list[int] = []
     if source.repeat_to_budget:
         rows = _repeat_to_budget(list(rows), target_tokens, stats)
@@ -282,28 +283,6 @@ def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_s
         tokens = counter.count_many([row["text"] for row in chunk])
         for row, n in zip(chunk, tokens):
             yield {"text": row["text"], "source": name, "tokens": n}
-
-
-def _fuzzy_dedup(rows: Iterator[Row], processing: ProcessingConfig, stats: dict[str, Any]) -> Iterator[Row]:
-    """MinHash + LSH near-duplicate removal over word n-grams, streaming (first occurrence wins)."""
-    try:
-        from datasketch import MinHash, MinHashLSH
-    except ImportError as exc:
-        raise ImportError(
-            "dedup.mode=minhash needs the `datasketch` package (`uv sync --all-extras`), or use dedup.mode=exact"
-        ) from exc
-    dedup = processing.dedup
-    stats.update({"threshold": dedup.threshold, "num_perm": dedup.num_perm, "near_duplicates_removed": 0})
-    lsh = MinHashLSH(threshold=dedup.threshold, num_perm=dedup.num_perm)
-    for index, row in enumerate(rows):
-        m = MinHash(num_perm=dedup.num_perm)
-        for ngram in get_ngrams(row["text"], n=dedup.ngram):
-            m.update(ngram.encode("utf-8"))
-        if lsh.query(m):
-            stats["near_duplicates_removed"] += 1
-            continue
-        lsh.insert(f"doc_{index}", m)
-        yield row
 
 
 def _repeat_to_budget(rows: list[Row], target_tokens: int | None, stats: dict[str, Any]) -> Iterator[Row]:

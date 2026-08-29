@@ -285,8 +285,11 @@ def test_process_minhash_removes_near_duplicates(
                    write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
     m = process(cfg, "s", layout)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial]
-    assert m.extra["stats"]["dedup"] == {
+    dedup_stats = m.extra["stats"]["dedup"]
+    assert dedup_stats.pop("seconds") >= 0
+    assert dedup_stats == {
         "mode": "minhash", "duplicates_removed": 0, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 2,
+        "near_duplicate_rate": 0.4,
     }  # fmt: skip
 
 
