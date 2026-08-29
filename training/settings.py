@@ -6,39 +6,34 @@ batches of `world_batch_size × block_size` tokens. Defaults make a run on one l
 """
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser, Namespace  # type: ignore[attr-defined]
 
-from training.stage_manager import TrainingStage
-
 
 @dataclass
 class DataEntry:
-    """One parquet dataset directory inside a stage mixture."""
+    """One parquet dataset directory inside a stage mixture (produced by `training.data.dataset_resolver`)."""
 
-    prefix: str  # unique name, used for logging
+    prefix: str  # unique name within its stage, used for logging
     data_dir: str  # directory with *.parquet files
     weight: float = 1.0  # sampling weight relative to the other entries of the same stage
     data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
 
 
 @dataclass
-class StageConfig:
-    """One training stage; see docs/multistage_training.md."""
-
-    name: str
-    tokens: int  # global token budget of this stage
-    base_lr: float
-    train_data: list[DataEntry]
-    val_data: list[DataEntry]
-    transition_pct: float = 0.0  # fraction of this stage (at its end) blending into the next stage's data/LR
-
-
-@dataclass
 class Settings:
+    # Data: everything about the data (sources, stages, token budgets, mixtures, tokenizer) lives in the dataset
+    # config; the run config only references it. `training/train.py` verifies the prepared data and, with
+    # `auto_prepare`, builds what is missing (`python data_preparation/prepare.py build --dataset_config ...`).
+    dataset_config: str  # path to config/datasets/<name>.yaml (required)
+    dataset_dir: str = "dataset"  # root of the prepared data (sources/, mixtures/, tokenizers/)
+    auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
+    prepare_num_workers: int = 4  # worker processes for the in-process build
+    stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional
+    allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config
+
     # Run
     run_name: str = "crow-300m"
     out_dir: str = "outputs"  # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
@@ -49,11 +44,9 @@ class Settings:
     # Model
     model_name: str = "crow-300m-final"  # preset name from model/presets.py
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # overrides passed to the preset
-    block_size: int = 2048  # sequence length; must match the model preset
-    tokenizer_path: str = "dataset/tokenizer"
+    block_size: int = 2048  # sequence length; must match the model preset and be <= the dataset's max_seq_length
 
-    # Data / curriculum
-    training_stages: list[StageConfig] = field(default_factory=list)
+    # Data loading
     dataloader_num_workers: int = 4
     sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
     sequence_padding_multiple: Optional[int] = 128  # pad micro-batches to a multiple of this (None: max length)
@@ -96,31 +89,20 @@ class Settings:
     export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
 
     def __post_init__(self) -> None:
-        if not self.training_stages:
-            raise ValueError("training_stages must contain at least one stage")
+        if not self.dataset_config:
+            raise ValueError("dataset_config is required (path to config/datasets/<name>.yaml)")
+        if not self.stage_base_lrs:
+            raise ValueError("stage_base_lrs must list one base LR per stage of the dataset config")
+        if any(lr < 0 for lr in self.stage_base_lrs):
+            raise ValueError("stage_base_lrs must be non-negative")
         if self.world_batch_size % self.micro_batch_size != 0:
             raise ValueError("world_batch_size must be a multiple of micro_batch_size")
-        if not Path(self.tokenizer_path).exists():
-            raise FileNotFoundError(f"tokenizer_path {self.tokenizer_path!r} does not exist")
 
     @property
     def gradient_accumulation_steps(self) -> int:
         """Micro-batches per optimizer step on one device (divide by world_size once distributed training exists)."""
         return self.world_batch_size // self.micro_batch_size
 
-    def stage_manager_stages(self) -> list[TrainingStage]:
-        """The stages in the plain-dict form `training.stage_manager.StageManager` expects."""
-        return [
-            TrainingStage(
-                name=s.name,
-                tokens=s.tokens,
-                base_lr=s.base_lr,
-                transition_pct=s.transition_pct,
-                train_data=[vars(d) for d in s.train_data],
-                val_data=[vars(d) for d in s.val_data],
-            )
-            for s in self.training_stages
-        ]
 
 
 def parse_settings(args: Optional[list[str]] = None) -> Settings:

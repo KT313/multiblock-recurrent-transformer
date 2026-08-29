@@ -1,7 +1,7 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """Checkpoint save/load/resume through the backend. Steps in file names are OPTIMIZER steps.
 
-State layout: `{"model", "optimizer", "step", "stage", "dataloader", "rng", "config"}`; the training loop supplies
+State layout: `{"model", "optimizer", "step", "stage", "rng", "config", "dataset_config_hash"}`; the training loop supplies
 everything except "model"/"optimizer" via `extra`.
 """
 

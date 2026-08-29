@@ -36,6 +36,12 @@ from training.checkpoint import (
     should_save_checkpoint,
 )
 from training.data import DatasetSpec, StageDataloaders, Tokenizer, build_dataloader, length_sorted_batches
+from training.data.dataset_resolver import (
+    CHECKPOINT_HASH_KEY,
+    ResolvedDataset,
+    check_checkpoint_dataset_hash,
+    resolve_dataset,
+)
 from training.data.loader import Batch, sample_stage_batch
 from training.logger import Logger, num_parameters, track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
@@ -58,7 +64,9 @@ def unwrap(model: torch.nn.Module) -> RecurrentGPT:
     return cast(RecurrentGPT, getattr(model, "_orig_mod", model))
 
 
-def build_stage_dataloaders(cfg: Settings, tokenizer: Tokenizer, backend: Backend) -> StageDataloaders:
+def build_stage_dataloaders(
+    cfg: Settings, resolved: ResolvedDataset, tokenizer: Tokenizer, backend: Backend
+) -> StageDataloaders:
     """One train and one validation loader per stage, each mixing its datasets with constant weights."""
 
     def loader(entries: list[DataEntry], num_workers: int) -> Iterable[Batch]:
@@ -82,8 +90,8 @@ def build_stage_dataloaders(cfg: Settings, tokenizer: Tokenizer, backend: Backen
         )
 
     return StageDataloaders(
-        train_loaders=[loader(s.train_data, cfg.dataloader_num_workers) for s in cfg.training_stages],
-        val_loaders=[loader(s.val_data, 0) for s in cfg.training_stages],
+        train_loaders=[loader(s.train_data, cfg.dataloader_num_workers) for s in resolved.stages],
+        val_loaders=[loader(s.val_data, 0) for s in resolved.stages],
     )
 
 
@@ -151,9 +159,10 @@ def train(cfg: Settings) -> None:
     out_dir = Path(cfg.out_dir)
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
 
-    tokenizer = Tokenizer(cfg.tokenizer_path)
+    resolved = resolve_dataset(cfg, backend)  # verifies the dataset config's data, auto-prepares if configured
+    tokenizer = Tokenizer(resolved.tokenizer_path)
     stage_manager = StageManager(
-        cfg.stage_manager_stages(),
+        resolved.stage_manager_stages(),
         world_batch_size=cfg.world_batch_size,
         block_size=cfg.block_size,
         world_size=backend.world_size,
@@ -164,7 +173,7 @@ def train(cfg: Settings) -> None:
     max_steps = stage_manager.total_steps
     print(stage_manager.get_stage_summary())
     print(f"Total training steps: {max_steps:,} ({cfg.gradient_accumulation_steps} micro-batches each)")
-    loaders = build_stage_dataloaders(cfg, tokenizer, backend)
+    loaders = build_stage_dataloaders(cfg, resolved, tokenizer, backend)
 
     raw_model = build_model(
         cfg.model_name, **cfg.model_overwrite, ignore_index=IGNORE_INDEX, gradient_checkpointing=cfg.gradient_checkpointing
@@ -195,6 +204,7 @@ def train(cfg: Settings) -> None:
         )
     if resume_path is not None:
         extra = load_checkpoint(backend, resume_path, model, optimizer)
+        check_checkpoint_dataset_hash(extra, resolved.config_hash, cfg.allow_dataset_change)
         state["step"] = state["resume_step"] = extra["step"]
         restore_rng_state(extra["rng"])
         print(f"Resumed from {resume_path} at step {state['step']}")
@@ -202,7 +212,7 @@ def train(cfg: Settings) -> None:
         print("No checkpoint loaded, starting from scratch.")
 
     logger = Logger(cfg.logger_project, cfg.run_name, out_dir, offline=cfg.wandb_offline, enabled=cfg.wandb_enabled)
-    logger.log_hyperparams(asdict(cfg))
+    logger.log_hyperparams(asdict(cfg) | {CHECKPOINT_HASH_KEY: resolved.config_hash})
     logger.log_summary({"num_parameters": n_params})
 
     rng = random.Random(cfg.seed + state["step"])
@@ -313,7 +323,13 @@ def train(cfg: Settings) -> None:
         ):
             stage_idx = int(stage_suffix.split("-")[1].split("_")[0]) if stage_end else None
             path = checkpoint_dir(out_dir) / checkpoint_name(done, cfg.run_name, stage_end=stage_idx)
-            extra = {"step": done, "stage": next_info.stage_idx, "rng": collect_rng_state(), "config": asdict(cfg)}
+            extra = {
+                "step": done,
+                "stage": next_info.stage_idx,
+                "rng": collect_rng_state(),
+                "config": asdict(cfg),
+                CHECKPOINT_HASH_KEY: resolved.config_hash,
+            }
             save_checkpoint(backend, path, model, optimizer, extra)
             print(f"Saved checkpoint {path}")
 
@@ -323,7 +339,7 @@ def train(cfg: Settings) -> None:
     if cfg.export_to_hf:
         export_dir = Path(cfg.export_hf_path) if cfg.export_hf_path else out_dir / "hf_export"
         raw = unwrap(model)
-        export_to_hf(raw, raw.config, export_dir, tokenizer_path=cfg.tokenizer_path)
+        export_to_hf(raw, raw.config, export_dir, tokenizer_path=resolved.tokenizer_path)
         print(f"Exported HuggingFace model to {export_dir}")
 
 

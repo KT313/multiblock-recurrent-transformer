@@ -20,6 +20,7 @@ from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data import StageDataloaders, Tokenizer
+from training.data.dataset_resolver import CHECKPOINT_HASH_KEY, ResolvedDataset, resolve_dataset
 from training.data.loader import Batch
 from training.logger import Logger
 from training.settings import Settings, parse_settings
@@ -28,18 +29,21 @@ from training.train import IGNORE_INDEX, LoopState, build_stage_dataloaders, mic
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
+TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 
 def _write_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
-    """`config/tiny.yaml` with the dataset/out_dir paths rewritten and optional `key: value` line replacements."""
+    """`config/tiny.yaml` with dataset_dir/out_dir rewritten and optional `key: value` line replacements."""
     lines = []
     for line in TINY_YAML.read_text().splitlines():
         key = line.split(":")[0].strip() if ":" in line and not line.startswith(" ") else None
         if key == "out_dir":
             line = f"out_dir: {out_dir}"
+        elif key == "dataset_dir":
+            line = f"dataset_dir: {tiny_dataset_dir}"
         elif key in overrides:
             line = f"{key}: {overrides.pop(key)}"
-        lines.append(line.replace("dataset/", f"{tiny_dataset_dir}/"))
+        lines.append(line)
     lines += [f"{k}: {v}" for k, v in overrides.items()]
     path = tmp_path / "tiny.yaml"
     path.write_text("\n".join(lines) + "\n")
@@ -76,6 +80,11 @@ def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
 
 
 @pytest.fixture
+def tiny_resolved(tiny_settings: Settings) -> ResolvedDataset:
+    return resolve_dataset(tiny_settings)
+
+
+@pytest.fixture
 def cpu_backend() -> SingleDeviceBackend:
     return SingleDeviceBackend(device="cpu", precision="32")
 
@@ -95,18 +104,20 @@ def test_loop_state_fields() -> None:
     assert set(LoopState.__annotations__) == set(state)
 
 
-def test_build_stage_dataloaders(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
-    tokenizer = Tokenizer(tiny_settings.tokenizer_path)
-    loaders = build_stage_dataloaders(tiny_settings, tokenizer, cpu_backend)
+def test_build_stage_dataloaders(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend
+) -> None:
+    tokenizer = Tokenizer(tiny_resolved.tokenizer_path)
+    loaders = build_stage_dataloaders(tiny_settings, tiny_resolved, tokenizer, cpu_backend)
     assert isinstance(loaders, StageDataloaders)
     assert len(loaders.train_loaders) == len(loaders.val_loaders) == 3
     input_ids, labels, data_ids = loaders.next_train_batch(0)
     assert input_ids.shape[0] == tiny_settings.micro_batch_size and input_ids.shape == labels.shape
     assert input_ids.shape[1] % 128 == 0 and input_ids.shape[1] <= tiny_settings.block_size
-    assert data_ids == ["pretrain-train"] * tiny_settings.micro_batch_size
+    assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
     assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
-    assert val_ids == ["finetune-val"] * tiny_settings.micro_batch_size
+    assert val_ids == ["finetune-tiny_mixture-validation"] * tiny_settings.micro_batch_size
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
@@ -135,7 +146,7 @@ def _stream_setup(
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
     cfg = parse_settings(["--config", str(yaml_path), "--micro_batch_size", "1"])  # 4 micro-batches per step
     loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
-    sm = StageManager(cfg.stage_manager_stages(), cfg.world_batch_size, cfg.block_size)
+    sm = StageManager(resolve_dataset(cfg).stage_manager_stages(), cfg.world_batch_size, cfg.block_size)
     return cfg, loaders, sm
 
 
@@ -270,7 +281,14 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
         logged = _run(yaml_path, mp)
     finally:
         mp.undo()
-    return {"out_dir": out_dir, "yaml": yaml_path, "logged": logged, "optimizer_steps": len(optimizer_steps)}
+    dataset_hash = resolve_dataset(parse_settings(["--config", str(yaml_path)])).config_hash
+    return {
+        "out_dir": out_dir,
+        "yaml": yaml_path,
+        "logged": logged,
+        "optimizer_steps": len(optimizer_steps),
+        "dataset_hash": dataset_hash,
+    }
 
 
 @pytest.mark.slow
@@ -294,6 +312,7 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
         extra = torch.load(checkpoint_dir(full_run["out_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
         assert extra["config"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
+        assert extra[CHECKPOINT_HASH_KEY] == full_run["dataset_hash"]
 
 
 @pytest.mark.slow
@@ -326,8 +345,8 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
 @pytest.mark.slow
 def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
     logged: Logged = full_run["logged"]
-    assert logged[3]["data_composition/pretrain-train"] == pytest.approx(1.0)
-    assert logged[18]["data_composition/finetune-train"] == pytest.approx(1.0)
+    assert logged[3]["data_composition/pretrain_a-synthetic_pretrain"] == pytest.approx(1.0)
+    assert logged[18]["data_composition/finetune-tiny_mixture"] == pytest.approx(1.0)
     for done in range(15, 17):  # inside the 1 -> 2 transition both mixtures may appear, weights sum to 1
         total = sum(v for k, v in logged[done].items() if k.startswith("data_composition/"))
         assert total == pytest.approx(1.0)
@@ -389,16 +408,18 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert logged[done]["stage/in_transition"] == full[done]["stage/in_transition"]
         assert logged[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in logged.items() if "val_loss" in m] == [16, 20]
-    assert logged[16]["data_composition/finetune-train"] == pytest.approx(0.5, abs=0.5)  # transition mix
+    assert logged[16]["data_composition/finetune-tiny_mixture"] == pytest.approx(0.5, abs=0.5)  # transition mix
 
 
 def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
     """tiny.yaml without transitions; fp32 because bf16 autocast is very slow on the CPU and precision is
     irrelevant for the bit-exactness claim."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    path = _write_yaml(tmp_path, tiny_dataset_dir, out_dir, precision='"32"', **overrides)
-    path.write_text(path.read_text().replace("transition_pct: 0.25", "transition_pct: 0.0"))
-    return path
+    dataset_yaml = tmp_path / "tiny_dataset.yaml"
+    dataset_yaml.write_text(TINY_DATASET_YAML.read_text().replace("transition_pct: 0.25", "transition_pct: 0.0"))
+    return _write_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, precision='"32"', dataset_config=str(dataset_yaml), **overrides
+    )
 
 
 @pytest.mark.slow
@@ -456,3 +477,21 @@ def test_resume_from_explicit_checkpoint_path_with_resume_warmup(
     assert logged[7]["lr"] == pytest.approx(0.0)  # step 6: ramp starts at min_lr
     assert logged[8]["lr"] == pytest.approx(0.5 * 2e-4)  # step 7: halfway to the schedule's 2e-4
     assert logged[9]["lr"] == pytest.approx(1e-4)  # step 8: back on the schedule
+
+
+@pytest.mark.slow
+def test_resume_with_changed_dataset_config_raises_unless_allowed(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataset config whose hash differs from the checkpoint's (here: transition_pct changed, data unchanged)."""
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
+    yaml_path = _no_transition_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
+    with pytest.raises(RuntimeError, match="dataset config hash"):
+        train_module.train(parse_settings(["--config", str(yaml_path)]))
+    yaml_path = _no_transition_yaml(
+        tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", allow_dataset_change="true"
+    )
+    logged = _run(yaml_path, monkeypatch)
+    assert sorted(logged) == list(range(15, 21))

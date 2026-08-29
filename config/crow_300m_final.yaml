@@ -6,7 +6,11 @@
 # (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64, resume_warmup 512 → 8,
 #  save 8192 → 128, eval 1024 → 16.)
 #
-# Data layout under dataset/ is produced by data_preparation/ (see its README).
+# Data: sources, per-stage token budgets/mixtures (3.3B + 1.5B + 0.15B tokens) and the tokenizer are defined in
+# config/datasets/crow_300m_final.yaml. Training verifies the prepared data under dataset_dir and builds what is
+# missing (`auto_prepare`); `python data_preparation/prepare.py build --dataset_config config/datasets/crow_300m_final.yaml`
+# does the same up front (export HF_TOKEN for the gated peS2o source). The only per-stage value that stays here is
+# the base learning rate (`stage_base_lrs`, positional, one per dataset-config stage).
 
 run_name: crow-300m-final
 out_dir: outputs
@@ -14,8 +18,13 @@ resume: true
 seed: 233
 
 model_name: crow-300m-final
-block_size: 2048
-tokenizer_path: dataset/tokenizer
+block_size: 2048             # <= max_seq_length of the dataset config
+
+dataset_config: config/datasets/crow_300m_final.yaml
+dataset_dir: dataset
+auto_prepare: true
+prepare_num_workers: 4
+stage_base_lrs: [3e-4, 1e-4, 5e-5]   # pretrain_phase1, pretrain_phase2, finetune
 
 backend: single_device
 precision: bf16-mixed
@@ -54,68 +63,3 @@ save_step_interval: 128
 save_last_step: true
 logger_project: recurtrain-baseline
 wandb_offline: true
-
-training_stages:
-  - name: pretrain_phase1
-    tokens: 3_300_000_000
-    base_lr: 3e-4
-    transition_pct: 0.10
-    train_data:
-      - {prefix: fineweb-train,   data_dir: dataset/pretraining/processed/merged/fineweb_edu,                weight: 0.65}
-      - {prefix: wikipedia-train, data_dir: dataset/pretraining/processed/merged/wikipedia,                  weight: 0.09}
-      - {prefix: books-train,     data_dir: dataset/pretraining/processed/merged/books_gutenberg,            weight: 0.06}
-      - {prefix: code-py-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_python,   weight: 0.036}
-      - {prefix: code-js-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_javascript, weight: 0.024}
-      - {prefix: code-ts-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_typescript, weight: 0.012}
-      - {prefix: code-java-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_java,     weight: 0.012}
-      - {prefix: code-cpp-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_cpp,      weight: 0.0096}
-      - {prefix: code-go-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_go,       weight: 0.0084}
-      - {prefix: code-rust-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_rust,     weight: 0.006}
-      - {prefix: code-shell-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_shell,   weight: 0.0048}
-      - {prefix: code-sql-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_sql,      weight: 0.0036}
-      - {prefix: code-html-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_html,     weight: 0.0036}
-      - {prefix: peso-train,      data_dir: dataset/pretraining/processed/merged/peso,                       weight: 0.03}
-      - {prefix: arxiv-train,     data_dir: dataset/pretraining/processed/merged/arxiv,                      weight: 0.02}
-      - {prefix: math-train,      data_dir: dataset/pretraining/processed/merged/openwebmath,                weight: 0.03}
-    val_data:
-      - {prefix: fw-val-1, data_dir: dataset/fineweb-edu/validation, weight: 1.0}
-
-  - name: pretrain_phase2
-    tokens: 1_500_000_000
-    base_lr: 1e-4
-    transition_pct: 0.10
-    train_data:
-      - {prefix: fineweb2-train,   data_dir: dataset/pretraining/processed/merged/fineweb_edu,                weight: 0.35}
-      - {prefix: code2-py-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_python,   weight: 0.084}
-      - {prefix: code2-js-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_javascript, weight: 0.056}
-      - {prefix: code2-ts-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_typescript, weight: 0.028}
-      - {prefix: code2-java-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_java,     weight: 0.028}
-      - {prefix: code2-cpp-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_cpp,      weight: 0.0224}
-      - {prefix: code2-go-train,   data_dir: dataset/pretraining/processed/merged/github_code_clean_go,       weight: 0.0196}
-      - {prefix: code2-rust-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_rust,     weight: 0.014}
-      - {prefix: code2-shell-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_shell,   weight: 0.0112}
-      - {prefix: code2-sql-train,  data_dir: dataset/pretraining/processed/merged/github_code_clean_sql,      weight: 0.0084}
-      - {prefix: code2-html-train, data_dir: dataset/pretraining/processed/merged/github_code_clean_html,     weight: 0.0084}
-      - {prefix: math2-owm-train,  data_dir: dataset/pretraining/processed/merged/openwebmath,                weight: 0.088}
-      - {prefix: math2-gsm-train,  data_dir: dataset/pretraining/processed/merged/tinygsm,                    weight: 0.066}
-      - {prefix: math2-alg-train,  data_dir: dataset/pretraining/processed/merged/algebraic_stack,            weight: 0.044}
-      - {prefix: math2-gsm8k-train, data_dir: dataset/pretraining/processed/merged/gsm8k,                     weight: 0.022}
-      - {prefix: peso2-train,      data_dir: dataset/pretraining/processed/merged/peso,                       weight: 0.09}
-      - {prefix: arxiv2-train,     data_dir: dataset/pretraining/processed/merged/arxiv,                      weight: 0.06}
-    val_data:
-      - {prefix: fw2-val, data_dir: dataset/fineweb-edu/validation, weight: 1.0}
-
-  - name: finetune
-    tokens: 150_000_000
-    base_lr: 5e-5
-    transition_pct: 0.0
-    train_data:
-      - prefix: flan-mixture-train
-        data_dir: dataset/flan_mixture/train
-        weight: 1.0
-        data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}
-    val_data:
-      - prefix: flan-mixture-val
-        data_dir: dataset/flan_mixture/validation
-        weight: 1.0
-        data_signature: {keys: [instruction, input, output], format_fn: concatenate_instruction_input_output}

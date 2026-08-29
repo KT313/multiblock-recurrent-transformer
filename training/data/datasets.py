@@ -41,6 +41,13 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.files = sorted(self.data_dir.glob("*.parquet"))
         if not self.files:
             raise FileNotFoundError(f"No parquet files in {self.data_dir}")
+        columns = set(pq.ParquetFile(self.files[0]).schema_arrow.names)  # metadata only, no row is read
+        missing = [k for k in self.data_signature["keys"] if k not in columns]
+        if missing:
+            raise ValueError(
+                f"{prefix}: parquet files in {self.data_dir} lack the column(s) {missing} required by "
+                f"data_signature {self.data_signature}; found {sorted(columns)}"
+            )
         self.num_rows = sum(pq.ParquetFile(f).metadata.num_rows for f in self.files)
 
     def __len__(self) -> int:

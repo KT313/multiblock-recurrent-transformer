@@ -195,3 +195,26 @@ def test_mixture_over_parquet_datasets(tiny_holdout_dir: Path, tiny_mixture_dirs
     assert {r["data_id"] for r in rows} == {"pre", "ft"}
     assert all("text" in r for r in rows if r["data_id"] == "pre")
     assert all({"instruction", "input", "output"} <= set(r) for r in rows if r["data_id"] == "ft")
+
+
+def test_missing_signature_column_raises(small_dir: Path) -> None:
+    with pytest.raises(ValueError, match=r"lack the column\(s\) \['instruction', 'output'\]"):
+        ParquetTextDataset(
+            small_dir, "p", data_signature={"keys": ["instruction", "output"], "format_fn": "pass_text"}
+        )
+    # the default signature needs `text`, which the files have; extra columns are fine
+    assert len(ParquetTextDataset(small_dir, "p")) == 23
+
+
+def test_missing_text_column_raises(tmp_path: Path) -> None:
+    d = tmp_path / "notext"
+    d.mkdir()
+    pq.write_table(pa.table({"content": ["a", "b"]}), d / "a.parquet")
+    with pytest.raises(ValueError, match=r"lack the column\(s\) \['text'\].*found \['content'\]"):
+        ParquetTextDataset(d, "p")
+
+
+def test_empty_directory_raises(tmp_path: Path) -> None:
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="No parquet files"):
+        ParquetTextDataset(tmp_path / "empty", "p")
