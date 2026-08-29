@@ -23,6 +23,8 @@ def test_commands_are_registered() -> None:
     args = parser.parse_args(["build", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_build and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 1 and args.hf_token is None and not args.dry_run and args.cache_dir is None
+    assert args.max_parallel_downloads == 2
+    assert parser.parse_args(["build", "--dataset_config", "x.yaml", "--max_parallel_downloads", "4"]).max_parallel_downloads == 4
     args = parser.parse_args(["build", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "process", "--dry_run", "--num_workers", "3"])
     assert args.sources == ["a", "b"] and args.steps == ["download", "process"] and args.dry_run and args.num_workers == 3
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])

@@ -75,7 +75,7 @@ place, so an interrupted build never leaves a half-written stage behind.
 
 ```bash
 uv run python data_preparation/prepare.py build    --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-        [--sources NAME ...] [--steps tokenizer download filter process validation instruct_mixtures] [--num_workers N]
+        [--sources NAME ...] [--steps tokenizer download process validation instruct_mixtures] [--num_workers N] [--max_parallel_downloads N]
         [--hf_token T] [--cache_dir DIR] [--dry_run]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md

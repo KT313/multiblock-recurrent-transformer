@@ -156,7 +156,13 @@ def _ensure_prepared(
 
     log.info("dataset %s is incomplete, preparing missing data (%d item(s))", cfg.name, len(plan.missing()))
     if backend is None or backend.is_main:
-        build(cfg, layout, num_workers=settings.prepare_num_workers, hf_token=os.environ.get("HF_TOKEN"))
+        build(
+            cfg,
+            layout,
+            num_workers=settings.prepare_num_workers,
+            max_parallel_downloads=settings.prepare_max_parallel_downloads,
+            hf_token=os.environ.get("HF_TOKEN"),
+        )
     if backend is not None:
         backend.barrier()
 

@@ -11,6 +11,7 @@ a warning and rebuilds the directory from scratch.
 from __future__ import annotations
 
 import random
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -88,9 +89,20 @@ def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
     has_tokenizer_files = (tokenizer_dir / "tokenizer.json").is_file() or (tokenizer_dir / "tokenizer_config.json").is_file()
     if not has_tokenizer_files:
         raise FileNotFoundError(f"tokenizer {name!r} not found at {tokenizer_dir}; run the tokenizer stage first")
-    from transformers import AutoTokenizer
+    return _auto_tokenizer().from_pretrained(str(tokenizer_dir))
 
-    return AutoTokenizer.from_pretrained(str(tokenizer_dir))
+
+_IMPORT_LOCK = threading.Lock()
+
+
+def _auto_tokenizer() -> Any:
+    """``transformers.AutoTokenizer``, imported lazily (the HF cache env must be configurable before the import)
+    and under a lock: ``transformers`` initialises its lazy modules on first import, which is not thread-safe and
+    the build runs items in threads."""
+    with _IMPORT_LOCK:
+        from transformers import AutoTokenizer
+
+    return AutoTokenizer
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -172,9 +184,7 @@ def prepare_tokenizer(cfg: DatasetConfig, layout: DatasetLayout) -> Manifest:
     if tok.kind == "synthetic":
         write_synthetic_tokenizer(out)
     else:
-        from transformers import AutoTokenizer
-
-        AutoTokenizer.from_pretrained(tok.hf_id, revision=tok.revision).save_pretrained(str(out))
+        _auto_tokenizer().from_pretrained(tok.hf_id, revision=tok.revision).save_pretrained(str(out))
     manifest = new_manifest(cfg, tok.name, source_hash, "tokenizer")
     manifest.extra = {"kind": tok.kind, "hf_id": tok.hf_id, "revision": tok.revision}
     manifest.save(out)

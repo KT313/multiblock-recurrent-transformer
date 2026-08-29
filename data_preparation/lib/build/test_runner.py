@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -222,8 +225,8 @@ def test_build_downloads_github_code_languages_in_one_pass(hub: FakeHub, cfg_fac
 
     monkeypatch.setattr(build_mod, "download", spy_download)
 
-    items = build_mod._work_items(cfg, layout, plan(cfg, layout), set(build_mod.STEPS), None, 1, None, 5)
-    assert [(i.what, i.name) for i in items] == [("tokenizer", "synthetic"), ("github_code group", "code_python, code_java, code_go")]
+    items = build_mod._work_items(cfg, layout, plan(cfg, layout), set(build_mod.STEPS), None, 1, None, 5, build_mod._Slots.create(1, 1))
+    assert [(i.what, i.name) for i in items] == [("github_code group", "code_python, code_java, code_go")]  # the tokenizer is prepared before the items
     result = build(cfg, layout)
     assert result.complete and single == []  # the group pass replaced the per-source downloads
     assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
@@ -235,7 +238,7 @@ def test_build_downloads_github_code_languages_in_one_pass(hub: FakeHub, cfg_fac
     hub.streams.clear()
     bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"], max_seq_length=128)
     bigger.stages[0].tokens = 40
-    items = build_mod._work_items(bigger, layout, plan(bigger, layout), set(build_mod.STEPS), {"code_python"}, 1, None, 5)
+    items = build_mod._work_items(bigger, layout, plan(bigger, layout), set(build_mod.STEPS), {"code_python"}, 1, None, 5, build_mod._Slots.create(1, 1))
     assert [(i.what, i.name) for i in items] == [("source", "code_python")]
     build(bigger, layout, sources=["code_python"])
     assert single == ["code_python"] * len(single) and single
@@ -254,3 +257,128 @@ def test_github_code_group_raises_after_max_rounds(hub: FakeHub, cfg_factory: Cf
     monkeypatch.setattr(build_mod, "process", never_enough)
     with pytest.raises(RuntimeError, match="code_python, code_java: token budget not reached after 2 rounds"):
         build(cfg, layout, max_rounds=2)
+
+
+# --- overlapping download and processing -----------------------------------------------------------------------------
+
+
+@dataclass
+class _Trace:
+    """Start/end instants of stubbed stages plus the largest number of them running at once, per stage kind."""
+
+    events: list[tuple[str, str, str, float]] = field(default_factory=list)  # (stage, source, "start"|"end", t)
+    running: dict[str, int] = field(default_factory=dict)
+    peak: dict[str, int] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def enter(self, stage: str, name: str) -> None:
+        with self.lock:
+            self.running[stage] = self.running.get(stage, 0) + 1
+            self.peak[stage] = max(self.peak.get(stage, 0), self.running[stage])
+            self.events.append((stage, name, "start", time.monotonic()))
+
+    def leave(self, stage: str, name: str) -> None:
+        with self.lock:
+            self.running[stage] -= 1
+            self.events.append((stage, name, "end", time.monotonic()))
+
+    def span(self, stage: str, name: str) -> tuple[float, float]:
+        start = next(t for s, n, kind, t in self.events if (s, n, kind) == (stage, name, "start"))
+        end = next(t for s, n, kind, t in self.events if (s, n, kind) == (stage, name, "end"))
+        return start, end
+
+
+def _slow_stages(monkeypatch: pytest.MonkeyPatch, delay: float, fail: str | None = None) -> _Trace:
+    """Stub `download` / `process` in the runner with versions that sleep `delay` around the real stage."""
+    trace = _Trace()
+
+    def slow_download(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        trace.enter("download", name)
+        try:
+            if name == fail:
+                raise OSError(f"{name}: network down")
+            time.sleep(delay)
+            return real_download(cfg, name, *args, **kwargs)
+        finally:
+            trace.leave("download", name)
+
+    def slow_process(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        trace.enter("process", name)
+        try:
+            time.sleep(delay)
+            return real_process(cfg, name, *args, **kwargs)
+        finally:
+            trace.leave("process", name)
+
+    monkeypatch.setattr(build_mod, "download", slow_download)
+    monkeypatch.setattr(build_mod, "process", slow_process)
+    return trace
+
+
+def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
+    sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i, tokens_per_row_estimate=200) for i in range(3)}
+    return cfg_factory(sources, tokens=600, max_seq_length=4096)
+
+
+def test_build_overlaps_downloads_with_processing(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+    trace = _slow_stages(monkeypatch, delay=0.2)
+    cfg = _three_sources(cfg_factory)
+    started = time.monotonic()
+    assert build(cfg, layout, num_workers=1, max_parallel_downloads=1).complete
+    elapsed = time.monotonic() - started
+    # 3 downloads + 3 process rounds of 0.2 s each: sequential would take >= 1.2 s, overlapped ~0.8 s
+    assert elapsed < 1.1, f"downloads and processing did not overlap ({elapsed:.2f} s)"
+    assert trace.peak["download"] == 1 and trace.peak["process"] == 1, "the bounds were respected"
+    # some download ran while another source was being processed
+    overlaps = [
+        (d, p)
+        for d in ("s0", "s1", "s2")
+        for p in ("s0", "s1", "s2")
+        if d != p and trace.span("download", d)[0] < trace.span("process", p)[1] and trace.span("download", d)[1] > trace.span("process", p)[0]
+    ]
+    assert overlaps
+
+
+def test_build_respects_the_download_and_process_bounds(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+    trace = _slow_stages(monkeypatch, delay=0.1)
+    cfg = _three_sources(cfg_factory)
+    assert build(cfg, layout, num_workers=2, max_parallel_downloads=2).complete
+    assert trace.peak["download"] <= 2 and trace.peak["process"] <= 2
+    assert trace.peak["download"] == 2, "two sources downloaded at the same time"
+    with pytest.raises(ValueError, match="must be >= 1"):
+        build(cfg, layout, max_parallel_downloads=0)
+
+
+def test_parallel_build_equals_sequential_build(cfg_factory: CfgFactory, layout: DatasetLayout, tmp_path: Path) -> None:
+    """The files a source ends up with depend only on its own loader order, not on the interleaving."""
+    cfg = _three_sources(cfg_factory)
+    sequential = DatasetLayout(tmp_path / "sequential")
+    build(cfg, sequential, num_workers=1, max_parallel_downloads=1)
+    build(cfg, layout, num_workers=3, max_parallel_downloads=3)
+
+    def snapshot(root: Path) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for path in sorted(root.rglob("*")):
+            if path.name == "MANIFEST.json":
+                manifest = Manifest.load(path.parent)
+                assert manifest is not None
+                out[str(path.relative_to(root))] = [(s.name, s.rows, s.tokens) for s in manifest.shards]
+            elif path.suffix == ".parquet":
+                out[str(path.relative_to(root))] = path.read_bytes()
+        return out
+
+    assert snapshot(layout.root) == snapshot(sequential.root)
+
+
+def test_failing_item_aborts_the_build_and_stops_the_others(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    trace = _slow_stages(monkeypatch, delay=0.1, fail="s1")
+    cfg = _three_sources(cfg_factory)
+    with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(OSError, match="s1: network down"):
+        build(cfg, layout, num_workers=1, max_parallel_downloads=1)
+    assert "source s1 failed" in caplog.text
+    # s0 started before the failure and stopped at its next stage boundary; s2 never started a stage
+    started = {n for s, n, kind, _ in trace.events if kind == "start"}
+    assert "s1" in started and not (layout.source_dir("s2", "raw") / "MANIFEST.json").exists() or "s2" not in started
+    assert "stopped: another item failed" in caplog.text or started == {"s0", "s1"}

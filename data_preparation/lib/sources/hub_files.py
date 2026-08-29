@@ -48,6 +48,7 @@ import hashlib
 import io
 import itertools
 import json
+import threading
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -127,6 +128,10 @@ def index_path(index_dir: Path, repo_id: str, revision: str | None, pattern: str
     return index_dir / f"{repo}@{revision or 'main'}" / f"{pattern_hash}.json"
 
 
+_OPEN_INDEXES: dict[Path, FileIndex] = {}  # persisted indexes opened in this process, by path
+_OPEN_INDEXES_LOCK = threading.Lock()
+
+
 @dataclass
 class FileIndex:
     repo_id: str
@@ -140,17 +145,29 @@ class FileIndex:
     # key -> parquet file -> matching rows per row group, for the prefix of row groups read so far under `key`
     group_counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     path: Path | None = None  # where the index is persisted (None: in memory)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @classmethod
     def open(
         cls, repo_id: str, revision: str | None, pattern: str, index_dir: Path | None, token: str | None
     ) -> FileIndex:
-        """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it."""
+        """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it.
+        A persisted index is one process-wide instance per path, so concurrent readers of the same repo files
+        (the build runs items in threads) share it and its saves never overwrite each other's counts."""
         path = None if index_dir is None else index_path(index_dir, repo_id, revision, pattern)
-        if path is not None and path.is_file():
-            index = cls._load(repo_id, revision, pattern, path)
-        else:
-            index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
+        if path is None:
+            index = cls._from_repo_listing(repo_id, revision, pattern, None, token)
+            index.ensure_sizes(token)
+            return index
+        with _OPEN_INDEXES_LOCK:
+            cached = _OPEN_INDEXES.get(path)
+            if cached is not None:
+                index = cached
+            elif path.is_file():
+                index = cls._load(repo_id, revision, pattern, path)
+            else:
+                index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
+            _OPEN_INDEXES[path] = index
         index.ensure_sizes(token)
         index.save()
         return index
@@ -190,9 +207,14 @@ class FileIndex:
             self.sizes.update(paths_info(self.repo_id, missing, self.revision, token))
 
     def save(self) -> None:
-        """Write the index to ``path`` atomically (no-op for an in-memory index)."""
+        """Write the index to ``path`` atomically (no-op for an in-memory index); serialised per instance."""
         if self.path is None:
             return
+        with self._lock:
+            self._write()
+
+    def _write(self) -> None:
+        assert self.path is not None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "repo_id": self.repo_id,

@@ -4,7 +4,7 @@ Markdown rendering of a dataset config (`describe.py`)."""
 
 from data_preparation.lib.build.describe import describe, leading_comment
 from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
-from data_preparation.lib.build.runner import DEFAULT_MAX_ROUNDS, STEPS, build, status
+from data_preparation.lib.build.runner import DEFAULT_MAX_PARALLEL_DOWNLOADS, DEFAULT_MAX_ROUNDS, STEPS, BuildAborted, build, status
 
-__all__ = ["DEFAULT_MAX_ROUNDS", "STEPS", "InstructMixturePlan", "Plan", "SourcePlan", "build", "describe", "leading_comment", "plan",
+__all__ = ["DEFAULT_MAX_PARALLEL_DOWNLOADS", "DEFAULT_MAX_ROUNDS", "STEPS", "BuildAborted", "InstructMixturePlan", "Plan", "SourcePlan", "build", "describe", "leading_comment", "plan",
            "rows_for_budget", "stage_problems", "status"]
