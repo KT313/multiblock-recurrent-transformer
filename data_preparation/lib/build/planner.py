@@ -186,7 +186,7 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     rows_present = raw.rows() if raw is not None else 0
     tokens_present = (processed.tokens() or 0) if processed is not None else 0
 
-    tokens_per_row = float(source.tokens_per_row_estimate)
+    tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))  # counts are capped there
     if raw is not None and processed is not None and not source.repeat_to_budget:
         measured = _measured_tokens_per_row(raw, processed)
         if measured is not None:
@@ -248,7 +248,7 @@ def _plan_holdout(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenize
         problem = f"holdout: has {rows_present} rows, config wants {wanted}"
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
-    tokens_per_row = tokens_present / rows_present if rows_present > 0 else float(source.tokens_per_row_estimate)
+    tokens_per_row = tokens_present / rows_present if rows_present > 0 else float(min(source.tokens_per_row_estimate, cfg.max_seq_length))
     reason = problem or ("ok" if not exhausted else f"exhausted at {rows_present} of {wanted} rows")
     return SourcePlan(
         name=name,

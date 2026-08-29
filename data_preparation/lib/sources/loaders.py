@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
@@ -44,18 +45,33 @@ def _load_dataset(**kwargs: Any) -> Any:
     return load_dataset(**kwargs)
 
 
+def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> dict[str, Any]:
+    """`load_dataset` kwargs for a Hub source.
+
+    Plain repos: `path=hf_id, revision=..., **load_kwargs`. Repos that still ship a loading script (refused by
+    `datasets` >= 4) set `load_kwargs.builder` (`json` / `parquet`) plus `data_files` (a glob relative to the repo):
+    the files are then read through the generic builder from `hf://datasets/<hf_id>@<revision>/<data_files>`.
+    """
+    load_kwargs = dict(source.load_kwargs)
+    builder = load_kwargs.pop("builder", None)
+    kwargs: dict[str, Any] = {"token": token, **extra}
+    if builder is None:
+        kwargs.update(path=source.hf_id, revision=source.revision, **load_kwargs)
+        return kwargs
+    data_files = load_kwargs.pop("data_files", None)
+    if data_files is None:
+        raise ValueError(f"load_kwargs.builder={builder!r} requires load_kwargs.data_files")
+    at = f"@{source.revision}" if source.revision else ""
+    kwargs.update(path=builder, data_files=f"hf://datasets/{source.hf_id}{at}/{data_files}", **load_kwargs)
+    return kwargs
+
+
 def load_hf_split(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via `split[a:b]` slicing (materialised download, deterministic order)."""
     _check_offset_count(offset, count)
     if count == 0:
         return
-    dataset = _load_dataset(
-        path=source.hf_id,
-        split=f"{source.split}[{offset}:{offset + count}]",
-        revision=source.revision,
-        token=token,
-        **source.load_kwargs,
-    )
+    dataset = _load_dataset(**hub_load_kwargs(source, token, split=f"{source.split}[{offset}:{offset + count}]"))
     yield from _take(dataset, count)
 
 
@@ -64,14 +80,7 @@ def load_hf_stream(source: SourceConfig, offset: int, count: int, *, token: str 
     _check_offset_count(offset, count)
     if count == 0:
         return
-    stream = _load_dataset(
-        path=source.hf_id,
-        split=source.split,
-        streaming=True,
-        revision=source.revision,
-        token=token,
-        **source.load_kwargs,
-    )
+    stream = _load_dataset(**hub_load_kwargs(source, token, split=source.split, streaming=True))
     if offset:
         stream = stream.skip(offset)
     yield from _take(stream, count)
@@ -106,16 +115,10 @@ def load_github_code(source: SourceConfig, offset: int, count: int, *, token: st
         return
     if source.language is None:  # validated by SourceConfig; repeated for the type checker
         raise ValueError("github_code loader requires source.language")
-    load_kwargs = dict(source.load_kwargs)
-    data_files = load_kwargs.pop("data_files", GITHUB_CODE_DATA_FILES)
+    # the repo ships a loading script, so its parquet files are read through the generic builder
+    load_kwargs = {"builder": "parquet", "data_files": GITHUB_CODE_DATA_FILES, **source.load_kwargs}
     stream = _load_dataset(
-        path=source.hf_id,
-        split=source.split,
-        streaming=True,
-        revision=source.revision,
-        data_files=data_files,
-        token=token,
-        **load_kwargs,
+        **hub_load_kwargs(replace(source, load_kwargs=load_kwargs), token, split=source.split, streaming=True)
     )
     yield from iter_language(stream, source.language, count, offset)
 

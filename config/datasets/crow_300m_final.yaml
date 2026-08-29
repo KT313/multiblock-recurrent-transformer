@@ -35,55 +35,55 @@ sources:
   # --- pretraining (kind: pretrain) -------------------------------------------------------------------------------
   fineweb_edu:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: HuggingFaceFW/fineweb-edu
     revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
     load_kwargs: {name: CC-MAIN-2013-20}
     tokens_per_row_estimate: 2000
   wikipedia:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: wikimedia/wikipedia                     # replaces the removed `wikipedia` script dataset (20220301.en)
     revision: b04c8d1ceb2f5cd4588862100d08de323dccfbaa
     load_kwargs: {name: 20231101.en}
     tokens_per_row_estimate: 1500
   books_gutenberg:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: sedthh/gutenberg_english
     revision: 28973b04f28fd7be4a6186a042bc26159d4366ca
     text_field: TEXT
     tokens_per_row_estimate: 3000
   peso:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: nampdn-ai/mini-peS2o                    # gated
     revision: 18a60ef8d79fdcae1494469845b0cbcb7e88b8b2
     tokens_per_row_estimate: 1500
   arxiv:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: common-pile/arxiv_papers_filtered
     revision: 033cf7f53f9b348deec868c1a5a48484f3ee9e52
     tokens_per_row_estimate: 1500
   openwebmath:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: open-web-math/open-web-math
     revision: fde8ef8de2300f5e778f56261843dab89f230815
     tokens_per_row_estimate: 750
   tinygsm:
     kind: pretrain
-    loader: hf_split
+    loader: hf_stream
     hf_id: ostapeno/tinygsm-mind
     revision: f5ecf416b71547b454cb9f4b06e769c2650ca33b
     tokens_per_row_estimate: 300
   algebraic_stack:
     kind: pretrain
-    loader: hf_split
-    hf_id: EleutherAI/proof-pile-2                 # script dataset; load its parquet-free jsonl files directly
+    loader: hf_stream
+    hf_id: EleutherAI/proof-pile-2                 # ships a loading script: read the jsonl files via the json builder
     revision: 901a9273a770e9d4138c5ddd91802f9c5c6cdc4b
-    load_kwargs: {data_files: "algebraic-stack/train/*.jsonl.zst"}
+    load_kwargs: {builder: json, data_files: "algebraic-stack/train/*.jsonl.zst"}
     tokens_per_row_estimate: 750
   gsm8k:
     kind: pretrain
@@ -109,7 +109,7 @@ sources:
   # --- held-out validation (kind: holdout) --------------------------------------------------------------------------
   fineweb_val:
     kind: holdout
-    loader: hf_split
+    loader: hf_stream
     hf_id: HuggingFaceFW/fineweb-edu
     revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
     load_kwargs: {name: sample-10BT}               # a different subset than the training source -> disjoint

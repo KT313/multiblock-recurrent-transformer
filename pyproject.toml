@@ -22,6 +22,7 @@ dependencies = [
 data = [
   "datasets>=2.18.0",
   "datasketch",
+  "zstandard>=0.25.0",
 ]
 
 [dependency-groups]

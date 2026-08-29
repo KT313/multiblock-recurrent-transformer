@@ -161,3 +161,14 @@ def test_exhausted_source_is_complete(cfg_factory: CfgFactory, layout: DatasetLa
 def test_plan_dataclass_defaults() -> None:
     empty = Plan()
     assert empty.sources == [] and not empty.complete and empty.missing() == ["tokenizer: missing or stale"]
+
+
+
+def test_estimate_is_clamped_to_max_seq_length(tmp_path: Path) -> None:
+    """Token counts are capped at max_seq_length, so a prior above it would only cause a wasted refinement round."""
+    cfg = two_stage_cfg()
+    cfg.sources["a"].tokens_per_row_estimate = cfg.max_seq_length * 10
+    result = plan(cfg, DatasetLayout(tmp_path / "empty"))
+    entry = next(s for s in result.sources if s.name == "a")
+    assert entry.tokens_per_row == cfg.max_seq_length
+    assert entry.rows_needed == rows_for_budget(entry.budget_tokens, cfg.max_seq_length)

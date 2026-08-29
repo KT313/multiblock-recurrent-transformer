@@ -164,14 +164,14 @@ def test_github_code_offset_counts_language_rows(fake_datasets: FakeDatasets) ->
     assert [r["id"] for r in LOADERS["github_code"](source, 2, 3)] == python_ids[2:5]
     assert [r["id"] for r in LOADERS["github_code"](source, 6, 5)] == python_ids[6:]
     call = fake_datasets.calls[0]
-    assert call["data_files"] == sources.GITHUB_CODE_DATA_FILES and call["streaming"] is True
-    assert call["revision"] == "abc"
+    assert call["data_files"] == f"hf://datasets/org/name@abc/{sources.GITHUB_CODE_DATA_FILES}"
+    assert call["streaming"] is True and call["path"] == "parquet" and "revision" not in call
 
 
 def test_github_code_data_files_override(fake_datasets: FakeDatasets) -> None:
     source = _src(loader="github_code", language="Java", load_kwargs={"data_files": "data/train-0000*.parquet"})
     list(LOADERS["github_code"](source, 0, 1))
-    assert fake_datasets.calls[0]["data_files"] == "data/train-0000*.parquet"
+    assert fake_datasets.calls[0]["data_files"] == "hf://datasets/org/name@abc/data/train-0000*.parquet"
     assert list(LOADERS["github_code"](source, 0, 0)) == [] and len(fake_datasets.calls) == 1
 
 
@@ -363,3 +363,31 @@ def test_repeat_indices() -> None:
     assert repeat_indices(3, 0) == []
     with pytest.raises(ValueError):
         repeat_indices(0, 2)
+
+
+def test_hub_load_kwargs_routes_script_repos_through_generic_builder() -> None:
+    from data_preparation.lib.sources.loaders import hub_load_kwargs
+
+    plain = _src(load_kwargs={"name": "cfg"})
+    assert hub_load_kwargs(plain, "tok", split="train") == {
+        "token": "tok", "split": "train", "path": "org/name", "revision": "abc", "name": "cfg",
+    }
+    scripted = _src(load_kwargs={"builder": "json", "data_files": "sub/*.jsonl.zst", "encoding": "utf-8"})
+    assert hub_load_kwargs(scripted, None, streaming=True) == {
+        "token": None, "streaming": True, "path": "json",
+        "data_files": "hf://datasets/org/name@abc/sub/*.jsonl.zst", "encoding": "utf-8",
+    }
+    unpinned = _src(revision=None, load_kwargs={"builder": "parquet", "data_files": "data/*.parquet"})
+    assert hub_load_kwargs(unpinned, None)["data_files"] == "hf://datasets/org/name/data/*.parquet"
+    with pytest.raises(ValueError, match="requires load_kwargs.data_files"):
+        hub_load_kwargs(_src(load_kwargs={"builder": "json"}), None)
+
+
+def test_github_code_uses_parquet_builder_by_default(fake_datasets: FakeDatasets) -> None:
+    source = _src(loader="github_code", language="Python")
+    fake_datasets.rows = [{"language": "Python", "code": "x"}]
+    list(LOADERS["github_code"](source, 0, 1))
+    call = fake_datasets.calls[0]
+    assert call["path"] == "parquet"
+    assert call["data_files"] == "hf://datasets/org/name@abc/data/*.parquet"
+    assert "revision" not in call
