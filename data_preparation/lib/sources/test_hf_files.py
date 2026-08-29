@@ -339,14 +339,15 @@ def test_large_parquet_reads_only_the_needed_row_groups(hub: FakeHub, tmp_path: 
     assert size > 6 * 64 * 1024
     index_dir = tmp_path / "index"
     src = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
-    assert _ids(LOADERS["hf_files"](src, 3, 12, index_dir=index_dir)) == [f"r{i}" for i in range(3, 15)]
+    # 12 rows from offset 3 end inside group 1, which is yielded to its end (rows 3..19)
+    assert _ids(LOADERS["hf_files"](src, 3, 12, index_dir=index_dir)) == [f"r{i}" for i in range(3, 20)]
     assert hub.downloads == [] and hub.streams == ["data/big.parquet"]
     assert _touched_groups(hub.handles["data/big.parquet"].ranges, spans, size) == {0, 1}
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["row_groups"] == {"data/big.parquet": [10] * 6} and saved["rows"] == {"data/big.parquet": 60}
     assert saved["sizes"] == {"data/big.parquet": path.stat().st_size}
-    # a top-up seeks straight to the right row group
-    assert _ids(LOADERS["hf_files"](src, 52, 5, index_dir=index_dir)) == [f"r{i}" for i in range(52, 57)]
+    # a top-up seeks straight to the right row group (and keeps it whole)
+    assert _ids(LOADERS["hf_files"](src, 52, 5, index_dir=index_dir)) == [f"r{i}" for i in range(52, 60)]
     assert hub.streams == ["data/big.parquet"] * 2 and hub.downloads == []
     assert _touched_groups(hub.handles["data/big.parquet"].ranges, spans, size) == {5}
     assert hub.size_lookups == 1 and hub.listings == 1
@@ -379,9 +380,11 @@ def test_fetcher_seams_and_stats(hub: FakeHub) -> None:
 
     fetcher = HubFetcher(token="tok", max_cached_file_mb=0.0, remote=remote)
     assert fetcher.uses_cache(0) and not fetcher.uses_cache(1)
-    assert _ids(read_rows(index, 2, 2, fetcher=fetcher)) == ["a2", "b0"]
-    assert opened == ["data/a.parquet", "data/b.parquet"] and hub.streams == []
-    assert fetcher.stats.files_streamed == 2 and fetcher.stats.files_downloaded == 0
+    assert _ids(read_rows(index, 2, 2, fetcher=HubFetcher(download=lambda repo, file, rev, tok: hub.files[file]))) == ["a2", "b0"]
+    assert _ids(read_rows(index, 2, 2, fetcher=fetcher)) == ["a2", "b0", "b1"]  # b's first row group (2 rows) kept whole
+    assert _ids(read_rows(index, 2, 2, fetcher=fetcher, align_to_row_group=False)) == ["a2", "b0"]
+    assert opened == ["data/a.parquet", "data/b.parquet"] * 2 and hub.streams == []
+    assert fetcher.stats.files_streamed == 4 and fetcher.stats.files_downloaded == 0
     assert fetcher.stats.bytes_read > 0
     cached = HubFetcher(download=lambda repo, file, rev, tok: hub.files[file])
     assert _ids(read_rows(index, 0, 1, fetcher=cached)) == ["a0"]
@@ -453,3 +456,88 @@ def test_parquet_iter_stops_before_later_groups(tmp_path: Path) -> None:
     rows.close()
     assert read == [1]
     assert parquet_row_groups(parquet) == [3, 3, 3]
+
+
+# --- over-read: a remote row group is kept whole ------------------------------------------------------------------------
+
+
+def _spy_read_row_group(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, list[str] | None]]:
+    """Record every ``(row group, columns)`` pulled through ``ParquetFile.read_row_group``."""
+    calls: list[tuple[int, list[str] | None]] = []
+    original = pq.ParquetFile.read_row_group
+
+    def spy(self: pq.ParquetFile, i: int, columns: list[str] | None = None, **kwargs: Any) -> Any:
+        calls.append((i, columns))
+        return original(self, i, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", spy)
+    return calls
+
+
+def test_remote_parquet_keeps_the_row_group_whole_and_never_rereads_it(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "books.parquet"
+    pq.write_table(pa.Table.from_pylist(_big_rows("r", 300)), path, row_group_size=100)  # 3 groups x 100 rows
+    hub.files["data/books.parquet"] = path
+    spans = _group_spans(path)
+    size = path.stat().st_size
+    index_dir = tmp_path / "index"
+    src = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
+    calls = _spy_read_row_group(monkeypatch)
+    load = LOADERS["hf_files"]
+    # 11 rows wanted -> the whole first row group, and only that group was pulled
+    assert _ids(load(src, 0, 11, index_dir=index_dir)) == [f"r{i}" for i in range(100)]
+    assert [g for g, _ in calls] == [0]
+    assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {0}
+    # the top-up starts at the boundary: group 0 is never read again
+    calls.clear()
+    assert _ids(load(src, 100, 3, index_dir=index_dir)) == [f"r{i}" for i in range(100, 200)]
+    assert [g for g, _ in calls] == [1]
+    assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {1}
+    # exact count on request
+    calls.clear()
+    assert _ids(load(src, 0, 11, index_dir=index_dir, align_to_row_group=False)) == [f"r{i}" for i in range(11)]
+    assert [g for g, _ in calls] == [0]
+    assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {0}
+    # cached files stay exact
+    cached = _src(load_kwargs={"data_files": "data/*.parquet", "max_cached_file_mb": 1024})
+    assert _ids(load(cached, 95, 11, index_dir=index_dir)) == [f"r{i}" for i in range(95, 106)]
+
+
+def test_columns_are_projected_for_parquet(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
+    hub.add("data/a.parquet", _rows("a", 3))
+    calls = _spy_read_row_group(monkeypatch)
+    rows = list(LOADERS["hf_files"](_src(), 0, 2, columns=["id"]))
+    assert rows == [{"id": "a0"}, {"id": "a1"}]
+    assert calls == [(0, ["id"])]
+    calls.clear()
+    remote = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
+    assert list(LOADERS["hf_files"](remote, 2, 1, columns=["text"])) == [{"text": "a doc 2"}]
+    assert calls == [(1, ["text"])]
+    assert set(next(iter(LOADERS["hf_files"](_src(), 0, 1)))) == {"id", "text", "language"}  # None: every column
+    hub.add("f/a.jsonl", _rows("a", 2))
+    jsonl = _src(load_kwargs={"data_files": "f/*.jsonl"})
+    assert set(next(iter(LOADERS["hf_files"](jsonl, 0, 1, columns=["id"])))) == {"id", "text", "language"}  # ignored
+
+
+def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_counts(
+    hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub.add("data/a.parquet", _rows("a", 8, _language))  # row groups of 2: [a0 a1] [a2 a3] [a4 a5] [a6 a7]; Python: a0 a3 a6
+    index_dir = tmp_path / "index"
+    src = _src(loader="github_code", language="Python", load_kwargs=REMOTE)
+    calls = _spy_read_row_group(monkeypatch)
+    load = LOADERS["github_code"]
+    assert [r["id"] for r in load(src, 0, 2, index_dir=index_dir, columns=["id"])] == ["a0", "a3"]
+    assert calls == [(0, ["id", "language"]), (1, ["id", "language"])]  # `language` is added for the match
+    saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
+    assert saved["group_counts"] == {"language=Python": {"data/a.parquet": [1, 1]}}
+    assert "language=Python" not in saved["counts"]  # the file is not finished
+    calls.clear()
+    assert _ids(load(src, 2, 1, index_dir=index_dir)) == ["a6"]  # offset 2 = the two finished groups: seek to group 2
+    assert [g for g, _ in calls] == [2, 3]  # group 2 has no Python row, group 3 finishes the file
+    saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
+    assert saved["group_counts"]["language=Python"]["data/a.parquet"] == [1, 1, 0, 1]
+    assert saved["counts"]["language=Python"] == {"data/a.parquet": 3} and saved["rows"] == {"data/a.parquet": 8}
+    calls.clear()
+    assert _ids(load(src, 1, 5, index_dir=index_dir, align_to_row_group=False)) == ["a3", "a6"]
+    assert [g for g, _ in calls] == [1, 2, 3]  # offset 1 lies in group 1: group 0 is skipped by its recorded count

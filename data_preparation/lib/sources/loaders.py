@@ -1,10 +1,18 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Row loaders: `LOADERS[name](source, offset, count, *, token, index_dir, on_file) -> Iterator[Row]` yields at most
-`count` raw rows starting at row `offset` of the source's deterministic order (`hf_files`, `hf_split`, `hf_stream`,
-`github_code`, `local`, `synthetic`). `index_dir` is where `hf_files` / `github_code` persist their file index
-(None: in memory), `on_file` is called with every repo file they open (progress display) and `stats` collects
-their download counters (`FetchStats`, remote bytes read). `datasets` is imported lazily so the HF cache
-environment can be configured before import."""
+"""Row loaders: `LOADERS[name](source, offset, count, *, token, index_dir, on_file, stats, columns,
+align_to_row_group) -> Iterator[Row]` yields raw rows starting at row `offset` of the source's deterministic order
+(`hf_files`, `hf_split`, `hf_stream`, `github_code`, `local`, `synthetic`).
+
+`count` is a **minimum**: a loader yields exactly `count` rows (fewer only when the source runs dry), except that
+`hf_files` / `github_code` reading a large parquet file remotely finish the row group in which `count` was reached
+(`align_to_row_group=True`, the default) so the rows that were downloaded anyway are kept and a later fetch at
+the resulting offset never fetches those bytes again; `align_to_row_group=False` makes every loader exact. The
+caller must consume everything yielded and advance its offset by the number of rows consumed. `columns` projects
+parquet reads to those columns (`github_code` adds `language`); other formats and loaders yield every column.
+
+`index_dir` is where `hf_files` / `github_code` persist their file index (None: in memory), `on_file` is called
+with every repo file they open (progress display) and `stats` collects their download counters (`FetchStats`,
+remote bytes read). `datasets` is imported lazily so the HF cache environment can be configured before import."""
 
 from __future__ import annotations
 
@@ -41,6 +49,8 @@ class Loader(Protocol):
         index_dir: Path | None = None,
         on_file: OnFile | None = None,
         stats: FetchStats | None = None,
+        columns: list[str] | None = None,
+        align_to_row_group: bool = True,
     ) -> Iterator[Row]: ...
 
 
@@ -97,6 +107,8 @@ def load_hf_split(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via `split[a:b]` slicing (materialised download, deterministic order)."""
     _check_offset_count(offset, count)
@@ -115,6 +127,8 @@ def load_hf_stream(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via streaming with `skip(offset)` (used for instruct sources)."""
     _check_offset_count(offset, count)
@@ -170,19 +184,25 @@ def load_hf_files(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of the repo files matching `load_kwargs.data_files`, sorted by path.
 
     Files up to `load_kwargs.max_cached_file_mb` are downloaded one at a time into the Hub cache (never twice) and
-    read locally; larger parquet files are read remotely row group by row group, larger json-lines files are
-    streamed. The per-(repo, revision, glob) file index under `index_dir` lets a later fetch skip whole files (see
+    read locally (exactly `count` rows); larger parquet files are read remotely row group by row group and the
+    last row group read is yielded whole unless `align_to_row_group=False`, larger json-lines files are streamed
+    (exactly `count` rows). The per-(repo, revision, glob) file index under `index_dir` lets a later fetch skip whole files (see
     `sources/hub_files.py`).
     """
     _check_offset_count(offset, count)
     if count == 0:
         return
     index = hub_file_index(source, None, index_dir, token)
-    yield from read_rows(index, offset, count, on_file=on_file, fetcher=hub_fetcher(source, token, stats))
+    yield from read_rows(
+        index, offset, count, on_file=on_file, fetcher=hub_fetcher(source, token, stats), columns=columns,
+        align_to_row_group=align_to_row_group,
+    )
 
 
 def load_github_code(
@@ -194,13 +214,17 @@ def load_github_code(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
     """`hf_files` over `hf_id` (codeparrot/github-code-clean, default `data_files: data/*.parquet`) keeping rows of
     `source.language`.
 
     `offset` counts rows *of that language* already consumed, so an incremental fetch continues where the previous
-    one stopped. The per-language row counts of fully read files are stored in the shared file index, so all
-    language sources read the same cached files and skip files they have already consumed.
+    one stopped. The per-language row counts of fully read files (and per row group of partially read parquet
+    files) are stored in the shared file index, so all language sources read the same cached files and skip files
+    and row groups they have already consumed. A remote row group is kept whole like in `hf_files`, so the
+    language offset it leaves behind is a row-group boundary in source rows. `columns` always includes `language`.
     """
     _check_offset_count(offset, count)
     if count == 0:
@@ -209,6 +233,8 @@ def load_github_code(
         raise ValueError("github_code loader requires source.language")
     language = source.language
     index = hub_file_index(source, GITHUB_CODE_DATA_FILES, index_dir, token)
+    if columns is not None and "language" not in columns:
+        columns = [*columns, "language"]
     yield from read_rows(
         index,
         offset,
@@ -217,6 +243,8 @@ def load_github_code(
         fetcher=hub_fetcher(source, token, stats),
         key=f"language={language}",
         match=lambda row: bool(row["language"] == language),
+        columns=columns,
+        align_to_row_group=align_to_row_group,
     )
 
 
@@ -226,10 +254,10 @@ def list_local_files(directory: Path) -> list[Path]:
     return sorted(files)
 
 
-def _iter_local_file(path: Path) -> Iterator[Row]:
+def _iter_local_file(path: Path, columns: list[str] | None = None) -> Iterator[Row]:
     if path.suffix == ".parquet":
         parquet = pq.ParquetFile(path)
-        for batch in parquet.iter_batches():
+        for batch in parquet.iter_batches(columns=columns):
             yield from batch.to_pylist()
     else:
         with path.open(encoding="utf-8") as fh:
@@ -247,8 +275,11 @@ def load_local(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
-    """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order)."""
+    """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order); parquet
+    files are read with the `columns` projection."""
     _check_offset_count(offset, count)
     if count == 0:
         return
@@ -260,7 +291,7 @@ def load_local(
 
     def all_rows() -> Iterator[Row]:
         for file in list_local_files(directory):
-            yield from _iter_local_file(file)
+            yield from _iter_local_file(file, columns)
 
     yield from islice(all_rows(), offset, offset + count)
 
@@ -274,6 +305,8 @@ def load_synthetic(
     index_dir: Path | None = None,
     on_file: OnFile | None = None,
     stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
     """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/holdout, instruct triple)."""
     _check_offset_count(offset, count)

@@ -40,7 +40,7 @@ def two_stage_cfg(tokens_a: int = 1000, tokens_b: int = 1000) -> DatasetConfig:
             StageConfig(name="s2", tokens=tokens_b, train={"a": 1.0}, val={"h": 1.0}),
             StageConfig(name="ft", tokens=400, train={"m": 1.0}, val={"m/validation": 1.0}),
         ],
-        max_seq_length=64,
+        max_seq_length=128,  # above every tokens_per_row_estimate, so the estimates are not clamped
         processing=ProcessingConfig(min_chars=1),
     )
 
@@ -97,6 +97,26 @@ def test_rows_to_fetch_is_clamped_at_zero(layout: DatasetLayout) -> None:
     result = plan(smaller, layout)
     a = next(s for s in result.sources if s.name == "a")
     assert a.rows_present > a.rows_needed and a.rows_to_fetch == 0 and a.complete
+    assert a.tokens_present >= a.budget_tokens and a.reason == "ok"
+    row_a = next(line for line in result.summary().splitlines() if line.startswith("a "))
+    assert row_a.split()[6] == "-"
+
+
+def test_over_fetched_raw_rows_are_fine(layout: DatasetLayout) -> None:
+    """A remote row group finished beyond `rows_needed` leaves more raw rows than needed: nothing to fetch, complete
+    once the processed tokens cover the budget."""
+    cfg = two_stage_cfg()
+    build(cfg, layout)
+    raw_dir = layout.source_dir("a", "raw")
+    raw = Manifest.load(raw_dir)
+    assert raw is not None
+    before = plan(cfg, layout)
+    a_before = next(s for s in before.sources if s.name == "a")
+    assert a_before.rows_present == raw.rows() and a_before.rows_needed <= raw.rows()
+    # the runner asked for exactly rows_needed; pretend the loader delivered a row-group boundary far beyond it
+    smaller = two_stage_cfg(tokens_a=200, tokens_b=200)
+    a = next(s for s in plan(smaller, layout).sources if s.name == "a")
+    assert a.rows_present > a.rows_needed and a.rows_to_fetch == 0 and a.complete and a.reason == "ok"
 
 
 def test_stale_hash_is_not_complete(layout: DatasetLayout) -> None:

@@ -9,11 +9,14 @@ rows in file order. How a file is fetched depends on its size (known from the in
   ``HF_HOME`` / ``--cache_dir``, never fetched twice), then read locally.
 * **larger parquet files** are never downloaded whole: they are opened remotely (``HfFileSystem``, HTTP range
   requests) and only the row groups covering the requested rows are read — the footer once (its row-group row
-  counts go into the index), then ``ParquetFile.read_row_group(i)`` for each needed group. A top-up at a larger
-  offset therefore seeks straight to the right row group.
+  counts go into the index), then ``ParquetFile.read_row_group(i, columns=...)`` for each needed group. A row
+  group that was fetched is **kept whole**: ``count`` is a minimum and the reader keeps yielding until the end of
+  the row group that satisfied it (``align_to_row_group=True``), so the rows a top-up needs next are already on disk
+  and the same bytes are never downloaded twice (row groups can be large for book-like sources: gutenberg is
+  ~300 MB per 1,000 rows). A top-up at a larger offset seeks straight to the right row group.
 * **larger ``.jsonl`` / ``.jsonl.zst`` / ``.jsonl.gz`` / ``.json.gz`` files** are streamed sequentially from the
-  same remote file object (through the zstd/gzip decompressor) and the stream is dropped as soon as enough rows
-  were yielded. Their row count is only known once a file was read to its end, so a top-up that starts inside a
+  same remote file object (through the zstd/gzip decompressor) and the stream is dropped as soon as exactly
+  ``count`` rows were yielded (a stream has no cheap unit to finish; the rest of the file could be gigabytes). Their row count is only known once a file was read to its end, so a top-up that starts inside a
   partially consumed file re-streams that file from its start (bounded by one file). Plain ``.json`` arrays above
   the threshold cannot be streamed: use the ``hf_split`` loader for those.
 
@@ -22,7 +25,12 @@ A :class:`FileIndex` per ``(repo, revision, glob)`` remembers the file list, the
 parquet footer seen, so a fetch at ``offset`` skips whole files without opening them. It is persisted as JSON under
 ``<index_dir>/<repo>@<revision>/<glob hash>.json`` when an ``index_dir`` is given (``dataset/hub_index/`` in a
 build), else kept in memory for the loader call only. Extra per-file counters (``counts[key][file]``, e.g. rows of
-one language for ``github_code``) share the index.
+one language for ``github_code``) share the index, together with the matching rows per row group of every parquet
+row group read so far under that key (``group_counts[key][file]``), so a keyed fetch at an offset also seeks
+straight to the right row group instead of re-reading the file from its start.
+
+Files that go through the Hub cache (and local files) are read with exact ``count`` semantics: over-reading a
+cached file costs nothing on the wire, so nothing needs to be kept.
 
 Hub access goes through the module-level functions :func:`list_repo_files`, :func:`paths_info`,
 :func:`hub_download` and :func:`open_remote` (stubbed by the tests) or through the callables of a
@@ -122,6 +130,8 @@ class FileIndex:
     counts: dict[str, dict[str, int]] = field(default_factory=dict)  # key -> file -> matching rows, once known
     sizes: dict[str, int] = field(default_factory=dict)  # file -> bytes (from the Hub listing)
     row_groups: dict[str, list[int]] = field(default_factory=dict)  # parquet file -> rows per row group
+    # key -> parquet file -> matching rows per row group, for the prefix of row groups read so far under `key`
+    group_counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     path: Path | None = None  # where the index is persisted (None: in memory)
 
     @classmethod
@@ -134,7 +144,7 @@ class FileIndex:
             data = json.loads(path.read_text(encoding="utf-8"))
             index = cls(
                 repo_id, revision, pattern, data["files"], data["rows"], data.get("counts", {}),
-                data.get("sizes", {}), data.get("row_groups", {}), path,
+                data.get("sizes", {}), data.get("row_groups", {}), data.get("group_counts", {}), path=path,
             )
         else:
             files = sorted(f for f in list_repo_files(repo_id, revision, token) if fnmatch.fnmatchcase(f, pattern))
@@ -164,6 +174,7 @@ class FileIndex:
             "counts": self.counts,
             "sizes": self.sizes,
             "row_groups": self.row_groups,
+            "group_counts": self.group_counts,
         }
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
@@ -186,6 +197,17 @@ class FileIndex:
         """Store a parquet file's row-group row counts (and thereby its total row count)."""
         self.row_groups[file] = groups
         self.rows[file] = sum(groups)
+        self.save()
+
+    def known_group_counts(self, key: str | None, file: str) -> list[int]:
+        """Rows per row group of ``file`` that count towards ``key`` (``key=None``: the footer's row counts; else the
+        matching rows of the row groups already read under ``key``, a prefix of the file's groups)."""
+        if key is None:
+            return self.row_groups.get(file, [])
+        return self.group_counts.get(key, {}).get(file, [])
+
+    def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
+        self.group_counts.setdefault(key, {})[file] = groups
         self.save()
 
 
@@ -295,16 +317,24 @@ def parquet_row_groups(parquet: pq.ParquetFile) -> list[int]:
     return [int(parquet.metadata.row_group(i).num_rows) for i in range(parquet.num_row_groups)]
 
 
-def iter_parquet(parquet: pq.ParquetFile, skip: int = 0) -> Generator[Row, None, None]:
+def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | None = None) -> Generator[Row, None, None]:
     """Rows of an open parquet file in order, skipping the first ``skip``; row groups are read one at a time and
-    only from the first one that holds a wanted row on (a consumer that stops early never touches later groups)."""
+    only from the first one that holds a wanted row on (a consumer that stops early never touches later groups).
+    ``columns`` projects the read (None: every column)."""
     for group, group_rows in enumerate(parquet_row_groups(parquet)):
         if skip >= group_rows:
             skip -= group_rows
             continue
-        rows = parquet.read_row_group(group).to_pylist()
+        rows = read_row_group(parquet, group, columns)
         yield from rows[skip:]
         skip = 0
+
+
+def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | None) -> list[Row]:
+    """``parquet.read_row_group(group, columns=columns)`` as dict rows (the single place that pulls row-group bytes)."""
+    if columns is None:
+        return parquet.read_row_group(group).to_pylist()
+    return parquet.read_row_group(group, columns=columns).to_pylist()
 
 
 def iter_stream(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
@@ -360,6 +390,20 @@ def _lines(lines: Any, skip: int) -> Iterator[Row]:
 # --- the reader --------------------------------------------------------------------------------------------------------
 
 
+@dataclass
+class _Cursor:
+    """Mutable position of one :func:`read_rows` call, shared with the per-file helpers."""
+
+    count: int  # rows wanted (a minimum when a remote row group is finished)
+    remaining_skip: int  # rows (matching rows with `match`) still to skip before the first yielded row
+    taken: int = 0  # rows yielded so far
+    completed: bool = False  # the last file was read through to its end
+
+    @property
+    def satisfied(self) -> bool:
+        return self.taken >= self.count
+
+
 def read_rows(
     index: FileIndex,
     offset: int,
@@ -370,66 +414,144 @@ def read_rows(
     key: str | None = None,
     match: Callable[[Row], bool] | None = None,
     fetcher: HubFetcher | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
 ) -> Iterator[Row]:
-    """Rows ``offset..offset+count`` (counting rows that pass ``match``) across the index's files.
+    """Rows from ``offset`` on (counting rows that pass ``match``) across the index's files: **at least** ``count``
+    of them when the source has that many.
+
+    ``count`` is exact for files read from the Hub cache and for remote streams. For a parquet file read remotely
+    with ``align_to_row_group`` (the default) the reader finishes the row group in which it reached ``count`` — the
+    bytes were already fetched, so keeping the rows means a later fetch at the resulting offset never downloads
+    them again; ``align_to_row_group=False`` stops at exactly ``count`` rows. ``columns`` projects parquet reads
+    (other formats yield every column).
 
     Files whose known row count (``index.count(key, file)``) lies entirely before ``offset`` are skipped without
     being opened; every file read through to its end records its count (``key`` for the matching rows, and the
     total row count) so the next call can skip it. Parquet files record their row-group layout as soon as their
-    footer was read, so a file that lies entirely before ``offset`` is skipped even if it was never read.
-    ``fetcher`` (default: a :class:`HubFetcher` with ``token``) chooses cache vs. remote reading per file.
+    footer was read, so a file that lies entirely before ``offset`` is skipped even if it was never read, and
+    with ``key`` the matching rows of every row group read so far, so a keyed fetch seeks to the right row group
+    too. ``fetcher`` (default: a :class:`HubFetcher` with ``token``) chooses cache vs. remote reading per file.
     """
     if count <= 0:
         return
     fetcher = HubFetcher(token=token) if fetcher is None else fetcher
-    remaining_skip = offset
-    taken = 0
+    cursor = _Cursor(count=count, remaining_skip=offset)
     for file in index.files:
         known = index.count(key, file)
-        if known is not None and remaining_skip >= known:
-            remaining_skip -= known
+        if known is not None and cursor.remaining_skip >= known:
+            cursor.remaining_skip -= known
             continue
         fmt = file_format(file)
         if on_file is not None:
             on_file(file)
+        remote = not fetcher.uses_cache(index.sizes[file])
         with fetcher.open(index, file, fmt) as handle:
-            rows_iter: Iterator[Row]
             if fmt == ".parquet":
                 parquet = pq.ParquetFile(handle)
                 if index.row_groups.get(file) is None:
                     index.record_row_groups(file, parquet_row_groups(parquet))
                 if known is None and key is None:
                     known = index.rows[file]
-                    if remaining_skip >= known:
-                        remaining_skip -= known
+                    if cursor.remaining_skip >= known:
+                        cursor.remaining_skip -= known
                         continue
-                rows_iter = iter_parquet(parquet, remaining_skip if match is None else 0)
+                yield from _parquet_rows(parquet, index, file, cursor, key, match, columns, align_to_row_group and remote)
             else:
-                rows_iter = iter_stream(handle, file, remaining_skip if match is None else 0)
-            file_skip = remaining_skip if match is None else 0
-            total_rows = 0
-            matched = 0
-            completed = True
-            for row in rows_iter:
-                total_rows += 1
-                if match is not None and not match(row):
-                    continue
-                matched += 1
-                if match is not None and remaining_skip > 0:
-                    remaining_skip -= 1
-                    continue
-                remaining_skip = 0
-                yield dict(row)
-                taken += 1
-                if taken >= count:
-                    completed = False
-                    break
-        if completed:
-            if match is None:
-                index.record(None, file, file_skip + total_rows)
-            else:
-                index.record(None, file, total_rows)
-                index.record(key, file, matched)
-            remaining_skip = 0
-        if taken >= count:
+                yield from _stream_rows(handle, index, file, cursor, key, match)
+        if cursor.completed:
+            cursor.remaining_skip = 0
+        if cursor.satisfied:
             return
+
+
+def _parquet_rows(
+    parquet: pq.ParquetFile,
+    index: FileIndex,
+    file: str,
+    cursor: _Cursor,
+    key: str | None,
+    match: Callable[[Row], bool] | None,
+    columns: list[str] | None,
+    finish_group: bool,
+) -> Iterator[Row]:
+    """Rows of one parquet file from the cursor's skip position; row groups before it are never read. With
+    ``finish_group`` the row group in which ``count`` is reached is yielded to its end. Keyed reads record the
+    matching rows of every fully read row group (``index.group_counts``); a file read to its end records its counts."""
+    groups = index.row_groups[file]
+    per_group = list(index.known_group_counts(key, file))  # rows per group counting towards `key`, known prefix
+    start = 0
+    for rows_in_group in per_group:
+        if cursor.remaining_skip < rows_in_group:
+            break
+        cursor.remaining_skip -= rows_in_group
+        start += 1
+    in_group_skip = 0
+    if match is None:
+        in_group_skip, cursor.remaining_skip = cursor.remaining_skip, 0
+    cursor.completed = True
+    for group in range(start, len(groups)):
+        matched = 0
+        stopped = False
+        for position, row in enumerate(read_row_group(parquet, group, columns)):
+            if group == start and position < in_group_skip:
+                continue
+            if match is not None and not match(row):
+                continue
+            matched += 1
+            if cursor.remaining_skip > 0:
+                cursor.remaining_skip -= 1
+                continue
+            yield dict(row)
+            cursor.taken += 1
+            if cursor.satisfied and not finish_group:
+                stopped = True
+                break
+        if stopped:
+            cursor.completed = False
+            return
+        if key is not None and match is not None and group == len(per_group):
+            per_group.append(matched)
+            index.record_group_counts(key, file, per_group)
+        if cursor.satisfied and group < len(groups) - 1:
+            cursor.completed = False
+            return
+    if key is not None and match is not None:
+        index.record(key, file, sum(per_group))
+
+
+def _stream_rows(
+    handle: BinaryIO,
+    index: FileIndex,
+    file: str,
+    cursor: _Cursor,
+    key: str | None,
+    match: Callable[[Row], bool] | None,
+) -> Iterator[Row]:
+    """Rows of one non-parquet file from the cursor's skip position, exactly up to ``count``; a file read to its end
+    records its counts."""
+    file_skip = cursor.remaining_skip if match is None else 0
+    rows_iter = iter_stream(handle, file, file_skip)
+    total_rows = 0
+    matched = 0
+    cursor.completed = True
+    for row in rows_iter:
+        total_rows += 1
+        if match is not None and not match(row):
+            continue
+        matched += 1
+        if match is not None and cursor.remaining_skip > 0:
+            cursor.remaining_skip -= 1
+            continue
+        cursor.remaining_skip = 0
+        yield dict(row)
+        cursor.taken += 1
+        if cursor.satisfied:
+            cursor.completed = False
+            return
+    if match is None:
+        index.record(None, file, file_skip + total_rows)
+        return
+    index.record(None, file, total_rows)
+    if key is not None:
+        index.record(key, file, matched)

@@ -223,6 +223,70 @@ def test_download_rebuilds_on_stale_hash(
     assert [r["text"] for r in read_rows(raw)] == [synthetic_row("pretrain", 9, i)["text"] for i in range(7)]
 
 
+def test_download_keeps_every_row_a_loader_yields_beyond_rows_needed(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """A remote parquet loader finishes its row group: all rows land on disk, `rows_fetched` is the boundary and a
+    later call below that boundary never touches the loader."""
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    calls: list[tuple[int, int, list[str] | None, bool]] = []
+
+    def group_loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        calls.append((offset, count, kwargs["columns"], kwargs["align_to_row_group"]))
+        return iter([{"text": f"row {i}"} for i in range(offset, offset + max(count, 20))])  # a 20-row "row group"
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", group_loader)
+    cfg = cfg_factory({"p": _synthetic()})
+    m = download(cfg, "p", layout, rows_needed=11, shard_size=8)
+    assert m.rows() == 20 and m.rows_fetched == 20 and [s.rows for s in m.shards] == [8, 8, 4]
+    assert calls == [(0, 11, ["text"], True)]
+    assert [r["text"] for r in read_rows(layout.source_dir("p", "raw"))] == [f"row {i}" for i in range(20)]
+    assert download(cfg, "p", layout, rows_needed=15, shard_size=8) == m and len(calls) == 1  # below the boundary: no-op
+    m2 = download(cfg, "p", layout, rows_needed=21, shard_size=8)
+    assert calls[-1] == (20, 1, ["text"], True) and m2.rows_fetched == 40 and m2.rows() == 40
+
+
+def test_download_columns_follow_the_converter_and_check_limit_bounds_over_reads(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    seen: list[list[str] | None] = []
+    closed: list[bool] = []
+
+    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        seen.append(kwargs["columns"])
+        try:
+            for i in range(offset, offset + 20):
+                yield {"question": f"q{i}", "answer": f"a{i}", "text": f"t{i}"}
+        finally:
+            closed.append(True)
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    cfg = cfg_factory({"conv": _synthetic(converter="gsm8k_question_answer"), "lim": _synthetic(check_limit=5)})
+    download(cfg, "conv", layout, rows_needed=1)
+    m = download(cfg, "lim", layout, rows_needed=3)
+    assert seen == [None, ["text"]]
+    assert m.rows() == 5 and m.rows_fetched == 5 and closed == [True, True]  # consumption stopped at check_limit
+    assert download(cfg, "lim", layout, rows_needed=8).extra["exhausted"] is True and len(seen) == 2
+
+
+def test_holdout_asks_for_exact_rows(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    seen: dict[str, Any] = {}
+
+    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        seen.update(kwargs, count=count)
+        return iter([{"text": f"t{i}"} for i in range(count)])
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    cfg = cfg_factory({"v": _synthetic(kind="holdout", rows=4)}, token_count="estimate")
+    m = holdout(cfg, "v", layout)
+    assert m.rows() == 4 and seen["count"] == 4 and seen["align_to_row_group"] is False and seen["columns"] == ["text"]
+
+
 # --- download: instruct ------------------------------------------------------------------------------------------------
 
 

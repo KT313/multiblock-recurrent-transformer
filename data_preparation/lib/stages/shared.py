@@ -176,6 +176,12 @@ def download(
     (converter raises ``ValueError``) are skipped and counted in ``extra["skipped_malformed"]``; ``check_limit``
     bounds the number of source rows inspected in total. A loader that yields fewer rows than requested sets
     ``extra["exhausted"]``; ``repeat_to_budget`` sources are fetched whole once (repetition happens in ``process``).
+
+    ``rows_needed`` is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
+    (see ``sources/loaders.py``), **every** row it yields is written and ``rows_fetched`` advances to that row-group
+    boundary, so a later call with a ``rows_needed`` at or below the rows on disk is a no-op and a top-up beyond it
+    starts at the boundary — the same bytes are never downloaded twice. Sources without a converter are read with
+    only ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
     """
     source = cfg.sources[name]
     source_hash = cfg.source_hash(name)
@@ -199,11 +205,12 @@ def download(
     log.info("%s: fetching %s rows from offset %d -> %s", name, "all" if wanted == WHOLE_SOURCE else wanted, manifest.rows_fetched, out)
     stats = {"consumed": 0, "kept": 0, "skipped_malformed": 0, "exhausted": False}
     start_shard = len(manifest.shards)
+    # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=None if wanted == WHOLE_SOURCE else wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, stats, layout, bar)
         write_dict_rows(rows, out, shard_size, start_shard=start_shard)
     record_new_shards(manifest, out, start_shard)
-    manifest.rows_fetched += stats["consumed"]
+    manifest.rows_fetched += stats["consumed"]  # source rows consumed: a row-group boundary after an over-read
     manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + stats["skipped_malformed"]
     if stats["exhausted"]:
         manifest.extra["exhausted"] = True
@@ -223,10 +230,11 @@ def _fetch_rows(
     layout: DatasetLayout,
     bar: Progress,
 ) -> Iterator[Row]:
-    """Rows to store for one download increment; keeps calling the loader until ``wanted`` rows are kept, the
-    source is exhausted or ``max_consume`` source rows were inspected (instruct filters may drop rows, so one loader
-    call may not be enough). ``bar`` tracks kept rows (postfix: source rows consumed, current repo file, MB read
-    remotely)."""
+    """Rows to store for one download increment; keeps calling the loader until at least ``wanted`` rows are kept,
+    the source is exhausted or ``max_consume`` source rows were inspected (instruct filters may drop rows, so one
+    loader call may not be enough). Everything a loader yields is kept — it may finish a remote row group beyond
+    ``count`` — except that consumption stops at ``max_consume``. ``bar`` tracks kept rows (postfix: source rows
+    consumed, current repo file, MB read remotely)."""
     loader = get_loader(source.loader)
     converter = get_converter(source) if source.kind == "instruct" else None
     row_filter = get_filter(source.filter) if source.filter is not None else None
@@ -234,6 +242,7 @@ def _fetch_rows(
         raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
     if source.repeat_to_budget and source.loader == "synthetic":
         raise ValueError(f"{name}: repeat_to_budget needs a finite source, the synthetic loader is unbounded")
+    columns = loader_columns(source)
     postfix: dict[str, Any] = {"consumed": 0}
     fetch_stats = FetchStats()
 
@@ -256,9 +265,9 @@ def _fetch_rows(
         yielded = 0
         rows = loader(
             source, offset + stats["consumed"], count, token=hf_token, index_dir=layout.hub_index_dir(), on_file=on_file,
-            stats=fetch_stats,
+            stats=fetch_stats, columns=columns, align_to_row_group=True,
         )
-        for raw in rows:
+        for raw in _bounded(rows, None if max_consume is None else max_consume - stats["consumed"]):
             yielded += 1
             stats["consumed"] += 1
             postfix["consumed"] = stats["consumed"]
@@ -283,6 +292,32 @@ def _fetch_rows(
         if yielded < count:
             stats["exhausted"] = True
             return
+
+
+def loader_columns(source: SourceConfig) -> list[str] | None:
+    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain/holdout sources read as-is,
+    None (every column) when a converter or ``fields`` mapping may need others or the rows are instruct rows."""
+    if source.kind == "instruct" or get_converter(source) is not None:
+        return None
+    return [source.text_field]
+
+
+def _bounded(rows: Iterator[Row], limit: int | None) -> Iterator[Row]:
+    """``rows`` up to ``limit`` (None: all), closing the loader's generator when stopping early."""
+    if limit is None:
+        yield from rows
+        return
+    taken = 0
+    try:
+        for row in rows:
+            if taken >= limit:
+                return
+            yield row
+            taken += 1
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
 
 
 # --- holdout -----------------------------------------------------------------------------------------------------------
@@ -320,10 +355,11 @@ def holdout(
     log.info("%s: holding out %d rows from offset %d -> %s", name, source.rows, offset, out)
     loader = get_loader(source.loader)
     with progress(total=source.rows, desc=f"{name}: holdout", unit="row", leave=False) as bar:
-        rows = [
-            text_row(source, r, name)
-            for r in bar_rows(bar, loader(source, offset, source.rows, index_dir=layout.hub_index_dir()))
-        ]
+        fetched = loader(  # exact: a holdout is fetched once, its row count is part of its identity
+            source, offset, source.rows, index_dir=layout.hub_index_dir(), columns=loader_columns(source),
+            align_to_row_group=False,
+        )
+        rows = [text_row(source, r, name) for r in bar_rows(bar, fetched)]
     if len(rows) < source.rows:
         log.warning("%s: only %d of %d requested holdout rows available", name, len(rows), source.rows)
     random.Random(source.seed).shuffle(rows)
