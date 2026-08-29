@@ -2,8 +2,27 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 """Thin wrapper around a HuggingFace fast tokenizer directory (``tokenizer.json`` + ``tokenizer_config.json``)."""
 
+import logging
 from pathlib import Path
 from typing import cast
+
+
+def resolve_pad_id(processor: object, path: Path) -> int:
+    """The id used for padding and for masking labels.
+
+    Tokenizers without a pad token (the Llama tokenizer of the thesis run) fall back to the unk token, as the thesis
+    code effectively did (`pad_id or 0` = Llama's `<unk>`), then to EOS. Pad positions in the inputs are replaced by
+    EOS in the collate function anyway; in the labels they become the ignore index.
+    """
+    for attr in ("pad_token_id", "unk_token_id", "eos_token_id"):
+        token_id = cast(int | None, getattr(processor, attr, None))
+        if token_id is not None:
+            if attr != "pad_token_id":
+                logging.getLogger(__name__).warning(
+                    "Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attr, token_id
+                )
+            return token_id
+    raise ValueError(f"Tokenizer at {path} defines no pad, unk or eos token; padding/label masking needs one.")
 
 
 class Tokenizer:
@@ -21,10 +40,7 @@ class Tokenizer:
         self.processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=False, add_eos_token=False)
         self.bos_id: int | None = self.processor.bos_token_id
         self.eos_id: int | None = self.processor.eos_token_id
-        pad_id: int | None = self.processor.pad_token_id
-        if pad_id is None:
-            raise ValueError(f"Tokenizer at {self.path} defines no pad token; padding/label masking needs one.")
-        self.pad_id: int = pad_id
+        self.pad_id: int = resolve_pad_id(self.processor, self.path)
 
     @property
     def vocab_size(self) -> int:
