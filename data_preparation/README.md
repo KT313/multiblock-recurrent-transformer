@@ -122,7 +122,7 @@ Two caches, with different lifetimes:
 * **Hub cache** (`~/.cache/huggingface/hub`, or `HF_HOME` / `--cache_dir`): the original repo files fetched by
   `hf_files` / `github_code` (`hf_hub_download`, one file at a time, never twice) and the `datasets` cache of
   `hf_split` sources. Deleting it costs a re-download; nothing else depends on it. Only files up to
-  `max_cached_file_mb` (default 32, per source via `load_kwargs.max_cached_file_mb`) land here: larger parquet
+  `always_range_requests: true` (dataset-level default) reads every Hub file remotely by piece; set it to `false` to let files up to `max_cached_file_mb` (default 32, per source via `load_kwargs.max_cached_file_mb`) land here: larger parquet
   files are read remotely row group by row group, projected to the columns the source needs (a top-up seeks
   straight to the row group it needs; fineweb-edu's 2.4 GB files cost a few MB per 1000 rows). A remote parquet
   fetch keeps **every** row of the row groups it read — `rows needed` is a minimum, the raw shards and

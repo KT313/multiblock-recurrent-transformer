@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress, progress
 from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows
+from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.sources import (
     FetchStats,
     Row,
@@ -159,6 +161,14 @@ def prepare_tokenizer(cfg: DatasetConfig, layout: DatasetLayout) -> Manifest:
 # --- download ----------------------------------------------------------------------------------------------------------
 
 
+def fetch_source(cfg: DatasetConfig, source: SourceConfig) -> SourceConfig:
+    """The source as handed to its loader: with ``cfg.always_range_requests`` every Hub file is read remotely by
+    piece (``max_cached_file_mb`` forced to 0), otherwise the source's own threshold applies."""
+    if cfg.always_range_requests and source.loader in ("hf_files", "github_code"):
+        return replace(source, load_kwargs={**source.load_kwargs, MAX_CACHED_FILE_KEY: 0})
+    return source
+
+
 def download(
     cfg: DatasetConfig,
     name: str,
@@ -183,7 +193,7 @@ def download(
     starts at the boundary — the same bytes are never downloaded twice. Sources without a converter are read with
     only ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
     """
-    source = cfg.sources[name]
+    source = fetch_source(cfg, cfg.sources[name])
     source_hash = cfg.source_hash(name)
     out = layout.source_dir(name, "raw")
     manifest = current_manifest(out, source_hash, "raw") or new_manifest(cfg, name, source_hash, "raw")
@@ -339,7 +349,7 @@ def holdout(
     * ``hf_files`` / ``hf_stream``: the **first** ``rows`` rows of the configured files / stream are taken, so the
       config must point them at files disjoint from every training source (a different ``data_files`` glob).
     """
-    source = cfg.sources[name]
+    source = fetch_source(cfg, cfg.sources[name])
     if source.kind != "holdout" or source.rows is None:
         raise ValueError(f"{name}: holdout() needs a source of kind holdout with rows > 0")
     source_hash = cfg.source_hash(name)

@@ -188,6 +188,9 @@ class DatasetConfig:
     stages: list[StageConfig]
     mixtures: dict[str, MixtureConfig] = field(default_factory=dict)
     max_seq_length: int = 2048  # token-count cap per document; the run config's block_size must be <= this
+    always_range_requests: bool = True  # read every Hub file remotely by piece (row groups / stream prefix); False: files
+    # up to load_kwargs.max_cached_file_mb are downloaded whole into the Hub cache instead. Traffic only, not part of
+    # source hashes.
     token_count: TokenCountMode = "tokenizer"  # "estimate" = chars / 4
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
 

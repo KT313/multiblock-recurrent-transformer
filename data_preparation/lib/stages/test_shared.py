@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.sources import synthetic_row
@@ -455,3 +455,24 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
         require_manifest(tmp_path / "missing", "h", "raw", "s")
     payload = json.loads((tmp_path / "MANIFEST.json").read_text())
     assert payload["stage"] == "raw"
+
+
+def test_fetch_source_forces_range_requests_by_default() -> None:
+    from dataclasses import replace
+
+    from data_preparation.lib.schema.dataset_config import SourceConfig
+    from data_preparation.lib.stages.shared import fetch_source
+
+    cfg = load_dataset_config(Path("config/datasets/crow_300m_mini.yaml"))
+    assert cfg.always_range_requests
+    src = cfg.sources["fineweb_edu"]
+    assert fetch_source(cfg, src).load_kwargs["max_cached_file_mb"] == 0
+    assert "max_cached_file_mb" not in src.load_kwargs  # original untouched
+    github = cfg.sources["github_code_clean_python"]
+    assert fetch_source(cfg, github).load_kwargs["max_cached_file_mb"] == 0
+    assert fetch_source(cfg, cfg.sources["gsm8k"]) is cfg.sources["gsm8k"]  # hf_split: not a hub_files source
+    off = replace(cfg, always_range_requests=False)
+    assert fetch_source(off, src) is src
+    custom = SourceConfig(kind="pretrain", loader="hf_files", hf_id="a/b", load_kwargs={"data_files": "*.parquet", "max_cached_file_mb": 7})
+    assert fetch_source(off, custom).load_kwargs["max_cached_file_mb"] == 7
+    assert fetch_source(cfg, custom).load_kwargs["max_cached_file_mb"] == 0
