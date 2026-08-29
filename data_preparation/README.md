@@ -122,7 +122,7 @@ Two caches, with different lifetimes:
 * **Hub cache** (`~/.cache/huggingface/hub`, or `HF_HOME` / `--cache_dir`): the original repo files fetched by
   `hf_files` / `github_code` (`hf_hub_download`, one file at a time, never twice) and the `datasets` cache of
   `hf_split` sources. Deleting it costs a re-download; nothing else depends on it. Only files up to
-  `max_cached_file_mb` (default 256, per source via `load_kwargs.max_cached_file_mb`) land here: larger parquet
+  `max_cached_file_mb` (default 32, per source via `load_kwargs.max_cached_file_mb`) land here: larger parquet
   files are read remotely row group by row group, projected to the columns the source needs (a top-up seeks
   straight to the row group it needs; fineweb-edu's 2.4 GB files cost a few MB per 1000 rows). A remote parquet
   fetch keeps **every** row of the row groups it read — `rows needed` is a minimum, the raw shards and
@@ -163,7 +163,7 @@ Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -
 
 | Loader | Use for | Notes |
 |---|---|---|
-| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>, max_cached_file_mb: 256}` (`data_files` required, relative to the repo root); files sorted by path; files up to `max_cached_file_mb` are downloaded one at a time into the Hub cache on demand and read locally, larger `.parquet` files are read remotely by row group (every row of a fetched row group is kept, so a top-up never re-downloads one) and larger `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz` files are streamed (small `.json` arrays only); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
+| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>, max_cached_file_mb: 32}` (`data_files` required, relative to the repo root); files sorted by path; files up to `max_cached_file_mb` are downloaded one at a time into the Hub cache on demand and read locally, larger `.parquet` files are read remotely by row group (every row of a fetched row group is kept, so a top-up never re-downloads one) and larger `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz` files are streamed (small `.json` arrays only); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
 | `hf_split` | small single-file repos (one `.json`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
 | `hf_stream` | fallback | `datasets` streaming with `skip(offset)`; **caches nothing** — every fetch re-streams from the start, so avoid it for anything large |
 | `github_code` | `codeparrot/github-code-clean` | `hf_files` over `data/*.parquet` keeping rows of `language:` (`text_field: code`); all language sources read the same cached files and the shared index stores per-language row counts (per row group for partially read parquet files) |
