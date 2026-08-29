@@ -10,12 +10,15 @@ from typing import Any
 
 import pytest
 
+from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
+from data_preparation.lib.build.planner import plan
 from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 from data_preparation.lib.stages.pretrain import process as real_process
+from data_preparation.lib.stages.shared import download as real_download
 
 CfgFactory = Callable[..., DatasetConfig]
 Writer = Callable[[Path, list[dict[str, Any]], str], Path]
@@ -187,3 +190,67 @@ def test_build_failure_propagates(cfg_factory: CfgFactory, layout: DatasetLayout
     with caplog.at_level(logging.ERROR, logger="data_preparation"), pytest.raises(OSError, match="network down"):
         build(cfg, layout)
     assert "source p failed" in caplog.text
+
+
+# --- github_code groups ------------------------------------------------------------------------------------------------
+
+
+def _github_cfg(cfg_factory: CfgFactory, languages: list[str], **kwargs: Any) -> DatasetConfig:
+    sources = {
+        f"code_{lang.lower()}": SourceConfig(
+            kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=lang, tokens_per_row_estimate=2,
+        )
+        for lang in languages
+    }
+    return cfg_factory(sources, tokens=20, **kwargs)
+
+
+def _code_rows(prefix: str, n: int) -> list[dict[str, Any]]:
+    languages = ("Python", "Java", "Go")
+    return [{"id": f"{prefix}{i}", "text": f"{prefix} code {i}", "language": languages[i % 3]} for i in range(n)]
+
+
+def test_build_downloads_github_code_languages_in_one_pass(hub: FakeHub, cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+    hub.add("data/a.parquet", _code_rows("a", 30))
+    hub.add("data/b.parquet", _code_rows("b", 30))
+    cfg = _github_cfg(cfg_factory, ["Python", "Java", "Go"])
+    single: list[str] = []
+
+    def spy_download(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        single.append(name)
+        return real_download(cfg, name, *args, **kwargs)
+
+    monkeypatch.setattr(build_mod, "download", spy_download)
+
+    items = build_mod._work_items(cfg, layout, plan(cfg, layout), set(build_mod.STEPS), None, 1, None, 5)
+    assert [(i.what, i.name) for i in items] == [("tokenizer", "synthetic"), ("github_code group", "code_python, code_java, code_go")]
+    result = build(cfg, layout)
+    assert result.complete and single == []  # the group pass replaced the per-source downloads
+    assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
+    for name in ("code_python", "code_java", "code_go"):
+        processed = Manifest.load(layout.source_dir(name, "processed"))
+        assert processed is not None and (processed.tokens() or 0) >= cfg.source_budget_tokens(name)  # a third of the stage
+
+    # `--sources` with one language uses the ordinary per-source path
+    hub.streams.clear()
+    bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"], max_seq_length=128)
+    bigger.stages[0].tokens = 40
+    items = build_mod._work_items(bigger, layout, plan(bigger, layout), set(build_mod.STEPS), {"code_python"}, 1, None, 5)
+    assert [(i.what, i.name) for i in items] == [("source", "code_python")]
+    build(bigger, layout, sources=["code_python"])
+    assert single == ["code_python"] * len(single) and single
+
+
+def test_github_code_group_raises_after_max_rounds(hub: FakeHub, cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
+    hub.add("data/a.parquet", _code_rows("a", 60))
+    cfg = _github_cfg(cfg_factory, ["Python", "Java"])
+
+    def never_enough(*args: Any, **kwargs: Any) -> Manifest:
+        manifest = real_process(*args, **kwargs)
+        stub = Manifest(source=manifest.source, source_hash=manifest.source_hash, stage="processed")
+        stub.add_shard("data-00000.parquet", rows=1, tokens=1)
+        return stub
+
+    monkeypatch.setattr(build_mod, "process", never_enough)
+    with pytest.raises(RuntimeError, match="code_python, code_java: token budget not reached after 2 rounds"):
+        build(cfg, layout, max_rounds=2)

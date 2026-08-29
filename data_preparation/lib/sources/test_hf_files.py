@@ -5,8 +5,6 @@ every supported file format, shared files between two language sources, and the 
 
 from __future__ import annotations
 
-import gzip
-import io
 import json
 import random
 from collections.abc import Callable, Generator, Iterator
@@ -16,10 +14,10 @@ from typing import Any, BinaryIO
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import zstandard
 
+from data_preparation.conftest import REPO, REV, FakeHub, RecordingFile
 from data_preparation.lib.schema.dataset_config import SourceConfig
-from data_preparation.lib.sources import LOADERS, Row, hub_file_index
+from data_preparation.lib.sources import LOADERS, GithubCodeRequest, Row, hub_file_index, read_github_code_group
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import (
     FetchStats,
@@ -32,94 +30,6 @@ from data_preparation.lib.sources.hub_files import (
     parquet_row_groups,
     read_rows,
 )
-
-REPO = "org/name"
-REV = "abc"
-
-
-class RecordingFile(io.FileIO):
-    """A local file that records the byte range of every read (stand-in for the remote fsspec file object)."""
-
-    def __init__(self, path: Path) -> None:
-        super().__init__(path, "rb")
-        self.ranges: list[tuple[int, int]] = []
-
-    def read(self, size: int | None = -1) -> bytes:
-        start = self.tell()
-        data = super().read(-1 if size is None else size)
-        self.ranges.append((start, start + len(data)))
-        return data
-
-    def readinto(self, buffer: Any) -> int:
-        start = self.tell()
-        n = super().readinto(buffer)
-        self.ranges.append((start, start + (n or 0)))
-        return n or 0
-
-
-class FakeHub:
-    """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.files: dict[str, Path] = {}
-        self.downloads: list[str] = []
-        self.streams: list[str] = []
-        self.handles: dict[str, RecordingFile] = {}
-        self.listings = 0
-        self.size_lookups = 0
-
-    def add(self, name: str, rows: list[Row], fmt: str | None = None) -> None:
-        path = self.root / name.replace("/", "__")
-        fmt = file_format(name) if fmt is None else fmt
-        if fmt == ".parquet":
-            pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=2)
-        elif fmt == ".json":
-            path.write_text(json.dumps(rows), encoding="utf-8")
-        else:
-            payload = "".join(json.dumps(r) + "\n" for r in rows).encode()
-            if fmt == ".jsonl.zst":
-                path.write_bytes(zstandard.ZstdCompressor().compress(payload))
-            elif fmt in (".jsonl.gz", ".json.gz"):
-                with gzip.open(path, "wb") as fh:
-                    fh.write(payload)
-            else:
-                path.write_bytes(payload)
-        self.files[name] = path
-
-    def list_repo_files(self, repo_id: str, revision: str | None, token: str | None) -> list[str]:
-        assert (repo_id, revision) == (REPO, REV)
-        self.listings += 1
-        return sorted(self.files, reverse=True) + ["README.md"]
-
-    def paths_info(self, repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
-        assert (repo_id, revision) == (REPO, REV)
-        self.size_lookups += 1
-        return {p: self.files[p].stat().st_size for p in paths}
-
-    def hub_download(self, repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
-        assert (repo_id, revision) == (REPO, REV)
-        self.downloads.append(filename)
-        return self.files[filename]
-
-    def open_remote(self, repo_id: str, filename: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
-        assert (repo_id, revision) == (REPO, REV)
-        self.streams.append(filename)
-        handle = RecordingFile(self.files[filename])
-        self.handles[filename] = handle
-        return handle
-
-
-@pytest.fixture
-def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHub:
-    fake = FakeHub(tmp_path / "hub")
-    fake.root.mkdir()
-    monkeypatch.setattr(hub_files, "list_repo_files", fake.list_repo_files)
-    monkeypatch.setattr(hub_files, "paths_info", fake.paths_info)
-    monkeypatch.setattr(hub_files, "hub_download", fake.hub_download)
-    monkeypatch.setattr(hub_files, "open_remote", fake.open_remote)
-    return fake
-
 
 def _rows(prefix: str, n: int, language: Callable[[int], str] | None = None) -> list[Row]:
     return [
@@ -324,7 +234,7 @@ def test_github_code_offsets_count_language_rows_and_share_files(hub: FakeHub, t
     assert _ids(load(python, 0, 3, index_dir=index_dir)) == ["a0", "a3", "b0"]
     assert _ids(load(python, 3, 2, index_dir=index_dir)) == ["b3", "c0"]
     assert _ids(load(java, 0, 5, index_dir=index_dir)) == ["a1", "a2", "a4", "a5", "b1"]
-    assert _ids(load(java, 9, 5, index_dir=index_dir)) == ["c1", "c2", "c4", "c5"]
+    assert _ids(load(java, 9, 5, index_dir=index_dir)) == ["c2", "c4", "c5"]  # Java rows: a1 a2 a4 a5 b1 b2 b4 b5 c1 c2 ...
     # every file was downloaded (i.e. resolved) but the language counts let later fetches skip files
     assert hub.downloads.count("data/a.parquet") >= 1
     hub.downloads.clear()
@@ -335,6 +245,29 @@ def test_github_code_offsets_count_language_rows_and_share_files(hub: FakeHub, t
     assert saved["counts"]["language=Java"]["data/a.parquet"] == 4
     assert saved["rows"] == {"data/a.parquet": 6, "data/b.parquet": 6, "data/c.parquet": 6}
     assert hub.listings == 1
+
+
+def test_keyed_offset_carries_across_files_with_unknown_counts(hub: FakeHub, tmp_path: Path) -> None:
+    """A file with fewer matching rows than the remaining skip only shrinks the skip (nothing is known about the
+    files yet, so none can be skipped without reading)."""
+    hub.add("data/a.parquet", _rows("a", 6, _language))  # Python: a0 a3
+    hub.add("data/b.parquet", _rows("b", 6, _language))  # Python: b0 b3
+    hub.add("data/c.parquet", _rows("c", 6, _language))  # Python: c0 c3
+    python = _src(loader="github_code", language="Python", load_kwargs={})
+    load = LOADERS["github_code"]
+    assert _ids(load(python, 5, 1, index_dir=tmp_path / "index")) == ["c3"]
+    assert _ids(load(python, 5, 1, index_dir=tmp_path / "index")) == ["c3"]  # now via the recorded counts
+    assert _ids(load(python, 5, 1)) == ["c3"]  # in-memory index
+
+
+def test_stream_offset_beyond_a_file_carries_over(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.jsonl", _rows("a", 3))
+    hub.add("data/b.jsonl", _rows("b", 3))
+    src = _src(load_kwargs={"data_files": "data/*.jsonl"})
+    assert _ids(LOADERS["hf_files"](src, 4, 2, index_dir=tmp_path / "index")) == ["b1", "b2"]
+    saved = json.loads(index_path(tmp_path / "index", REPO, REV, "data/*.jsonl").read_text())
+    assert saved["rows"] == {"data/a.jsonl": 3}  # b was left in the middle: its total is not known yet
+    assert _ids(LOADERS["hf_files"](src, 4, 2, index_dir=tmp_path / "index")) == ["b1", "b2"]
 
 
 def test_github_code_data_files_override_and_language_required(hub: FakeHub) -> None:
@@ -600,3 +533,80 @@ def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_cou
     calls.clear()
     assert _ids(load(src, 1, 5, index_dir=index_dir, align_to_row_group=False)) == ["a3", "a6"]
     assert [g for g, _ in calls] == [1, 2, 3]  # offset 1 lies in group 1: group 0 is skipped by its recorded count
+
+
+# --- github_code group reads (several languages of one repo in one pass) --------------------------------------------
+
+
+def _three_languages(i: int) -> str:
+    return ("Python", "Java", "Go")[i % 3]
+
+
+def _group_ids(pairs: Iterator[tuple[str, Row]]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for name, row in pairs:
+        out.setdefault(name, []).append(row["id"])
+    return out
+
+
+def test_group_read_reads_every_row_group_once_and_matches_separate_loads(
+    hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))  # groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
+    hub.add("data/b.parquet", _rows("b", 8, _three_languages))
+    sources = {lang: _src(loader="github_code", language=lang, load_kwargs=REMOTE) for lang in ("Python", "Java", "Go")}
+    wanted = {"Python": (0, 4), "Java": (1, 2), "Go": (0, 5)}
+
+    expected = {lang: _ids(LOADERS["github_code"](sources[lang], *wanted[lang], index_dir=tmp_path / "separate")) for lang in sources}
+    assert expected == {"Python": ["a0", "a3", "a6", "b0"], "Java": ["a4", "a7"], "Go": ["a2", "a5", "b2", "b5"]}
+
+    calls = _spy_read_row_group(monkeypatch)
+    hub.streams.clear()
+    requests = [GithubCodeRequest(lang, sources[lang], *wanted[lang]) for lang in sources]
+    got = _group_ids(read_github_code_group(requests, index_dir=tmp_path / "group", columns=["id"]))
+    assert got == expected
+    # each file opened once, each of its four row groups read once (Go wants more than the repo has: read to the end)
+    assert hub.streams == ["data/a.parquet", "data/b.parquet"]
+    assert calls == [(g, ["id", "language"]) for g in range(4)] * 2
+    # the shared index recorded every language's counts as a separate read would
+    saved = json.loads(index_path(tmp_path / "group", REPO, REV, "data/*.parquet").read_text())
+    assert saved["counts"]["language=Python"] == {"data/a.parquet": 3}
+    assert saved["group_counts"]["language=Java"]["data/a.parquet"] == [1, 0, 1, 1]
+    assert saved["counts"]["language=Go"] == {"data/a.parquet": 2, "data/b.parquet": 2}
+
+
+def test_group_top_up_reads_only_the_row_groups_still_needed(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))
+    hub.add("data/b.parquet", _rows("b", 8, _three_languages))
+    index_dir = tmp_path / "index"
+    python = _src(loader="github_code", language="Python", load_kwargs=REMOTE)
+    java = _src(loader="github_code", language="Java", load_kwargs=REMOTE)
+    first = [GithubCodeRequest("py", python, 0, 3), GithubCodeRequest("java", java, 0, 3)]
+    assert _group_ids(read_github_code_group(first, index_dir=index_dir)) == {"py": ["a0", "a3", "a6"], "java": ["a1", "a4", "a7"]}
+    calls = _spy_read_row_group(monkeypatch)
+    hub.streams.clear()
+    # python continues at 3 (b0 ...), java is satisfied: only file b is opened, starting at its first group
+    top_up = [GithubCodeRequest("py", python, 3, 1), GithubCodeRequest("java", java, 3, 0)]
+    assert _group_ids(read_github_code_group(top_up, index_dir=index_dir)) == {"py": ["b0"]}
+    assert hub.streams == ["data/b.parquet"] and [g for g, _ in calls] == [0]
+
+
+def test_group_exhausted_language_does_not_stop_the_others(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 6, _three_languages))  # Python a0 a3, Java a1 a4, Go a2 a5
+    sources = {lang: _src(loader="github_code", language=lang, load_kwargs={}) for lang in ("Python", "Java", "Rust")}
+    requests = [GithubCodeRequest(lang, src, 0, 2) for lang, src in sources.items()]
+    got = _group_ids(read_github_code_group(requests, index_dir=tmp_path / "index"))
+    assert got == {"Python": ["a0", "a3"], "Java": ["a1", "a4"]}  # Rust: nothing, the others are complete
+    saved = json.loads(index_path(tmp_path / "index", REPO, REV, "data/*.parquet").read_text())
+    assert saved["counts"]["language=Rust"] == {"data/a.parquet": 0}
+
+
+def test_group_rejects_mixed_repos_and_duplicate_languages(hub: FakeHub) -> None:
+    hub.add("data/a.parquet", _rows("a", 3, _three_languages))
+    python = _src(loader="github_code", language="Python", load_kwargs={})
+    other_repo = _src(loader="github_code", language="Java", load_kwargs={"data_files": "data/a.parquet"})
+    with pytest.raises(ValueError, match="share hf_id, revision and data_files"):
+        list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("j", other_repo, 0, 1)]))
+    with pytest.raises(ValueError, match="distinct languages"):
+        list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("q", python, 0, 1)]))
+    assert list(read_github_code_group([])) == []

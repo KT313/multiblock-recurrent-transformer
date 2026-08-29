@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from data_preparation.lib.storage.parquet import estimate_tokens, list_parquet_files, shard_index, write_dict_rows
+from data_preparation.lib.storage.parquet import ShardWriter, estimate_tokens, list_parquet_files, shard_index, write_dict_rows
 from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
@@ -25,11 +26,14 @@ from data_preparation.lib.storage.manifest import Manifest, library_versions, sh
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.sources import (
     FetchStats,
+    GithubCodeRequest,
     Row,
     get_converter,
     get_filter,
     get_loader,
+    github_code_repo_key,
     list_local_files,
+    read_github_code_group,
     write_synthetic_tokenizer,
 )
 
@@ -314,6 +318,109 @@ def _fetch_rows(
         if yielded < count:
             counters.exhausted = True
             return
+
+
+@dataclass
+class _GroupMember:
+    """One source of a :func:`download_github_code_group` pass that still has rows to fetch."""
+
+    name: str
+    source: SourceConfig
+    out: Path
+    manifest: Manifest
+    wanted: int
+    counters: _FetchCounters
+
+
+def download_github_code_group(
+    cfg: DatasetConfig,
+    names: list[str],
+    layout: DatasetLayout,
+    *,
+    rows_needed: dict[str, int],
+    shard_size: int = DEFAULT_SHARD_SIZE,
+    hf_token: str | None = None,
+) -> dict[str, Manifest]:
+    """:func:`download` for several `github_code` sources of one repo in a **single pass** over its files: every
+    row group is fetched once and its rows are dispatched to the language source that wants them (a source that
+    has its ``rows_needed[name]`` stops taking rows, the others read on). The raw shards, ``rows_fetched`` and
+    ``extra["exhausted"]`` of every source are exactly what separate ``download`` calls would produce. Returns the
+    raw manifest of every source in ``names``.
+    """
+    results: dict[str, Manifest] = {}
+    members: list[_GroupMember] = []
+    for name in names:
+        source = fetch_source(cfg, cfg.sources[name])
+        if source.loader != "github_code" or source.check_limit is not None:
+            raise ValueError(f"{name}: download_github_code_group needs github_code sources without check_limit")
+        if members and github_code_repo_key(source) != github_code_repo_key(members[0].source):
+            raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
+        source_hash = cfg.source_hash(name)
+        out = layout.source_dir(name, "raw")
+        manifest = current_manifest(out, source_hash, "raw") or new_manifest(cfg, name, source_hash, "raw")
+        results[name] = manifest
+        if manifest.extra.get("exhausted"):
+            log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
+            continue
+        wanted = rows_needed[name] - manifest.rows()
+        if wanted > 0:
+            members.append(_GroupMember(name, source, out, manifest, wanted, _FetchCounters()))
+    if not members:
+        return results
+
+    _fetch_group(members, layout, shard_size, hf_token)
+    for member in members:
+        manifest, counters = member.manifest, member.counters
+        record_new_shards(manifest, member.out, len(manifest.shards))
+        manifest.rows_fetched += counters.consumed
+        if counters.exhausted:
+            manifest.extra["exhausted"] = True
+        manifest.save(member.out)
+        log.info("%s: kept %d of %d fetched rows (%d rows on disk)", member.name, counters.kept, counters.consumed, manifest.rows())
+    return results
+
+
+def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size: int, hf_token: str | None) -> None:
+    """Run the group pass and append every member's rows to its raw directory (one shard writer per member)."""
+    for member in members:
+        log.info("%s: fetching %d rows from offset %d -> %s", member.name, member.wanted, member.manifest.rows_fetched, member.out)
+    requests = [GithubCodeRequest(m.name, m.source, m.manifest.rows_fetched, m.wanted) for m in members]
+    columns = _union_columns([loader_columns(m.source) for m in members])
+    fetch_stats = FetchStats()
+    by_name = {m.name: m for m in members}
+    repo = members[0].source.hf_id
+    total = sum(m.wanted for m in members)
+
+    with ExitStack() as stack:
+        bar = stack.enter_context(progress(total=total, desc=f"{repo}: download ({len(members)} languages)", unit="row"))
+        postfix = _DownloadPostfix(bar, fetch_stats)
+        writers = {
+            m.name: stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards))) for m in members
+        }
+        rows = read_github_code_group(
+            requests, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns, on_file=postfix.on_file,
+            stats=fetch_stats, align_to_row_group=True,
+        )
+        for consumed_total, (name, raw) in enumerate(rows, start=1):
+            member = by_name[name]
+            writers[name].add(text_row(member.source, raw, name))
+            member.counters.consumed += 1
+            member.counters.kept += 1
+            postfix.consumed(consumed_total)
+            bar.update(1)
+    for member in members:
+        if member.counters.kept < member.wanted:
+            member.counters.exhausted = True
+
+
+def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
+    """The column projection covering every member's (None as soon as one member needs every column)."""
+    union: list[str] = []
+    for columns in projections:
+        if columns is None:
+            return None
+        union.extend(c for c in columns if c not in union)
+    return union
 
 
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:

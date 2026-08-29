@@ -3,7 +3,8 @@
 and report it.
 
 Per pretrain source the estimate -> measured refinement loop runs download -> length_filter -> process until the
-processed tokens reach the budget or the loader is exhausted (at most ``max_rounds`` rounds, then an error). A
+processed tokens reach the budget or the loader is exhausted (at most ``max_rounds`` rounds, then an error);
+``github_code`` sources of one repo download together in a single pass over its files (one work item per repo). A
 mixture is rebuilt until none of its sources is short. Stage directories whose manifest is stale or whose shards
 do not verify are removed before their stage reruns. Every stage failure propagates after logging which source
 failed; nothing is swallowed.
@@ -22,7 +23,17 @@ from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetL
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import progress
 from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
-from data_preparation.lib.stages import build_instruct_mixture, download, validation, length_filter, prepare_tokenizer, process
+from data_preparation.lib.sources import github_code_repo_key
+from data_preparation.lib.stages import (
+    build_instruct_mixture,
+    download,
+    download_github_code_group,
+    length_filter,
+    prepare_tokenizer,
+    process,
+    validation,
+)
+from data_preparation.lib.storage.manifest import Manifest
 
 log = get_logger(__name__)
 
@@ -116,10 +127,14 @@ def _work_items(
     if "tokenizer" in active_steps and not current.tokenizer_complete:
         items.append(_WorkItem("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout)))
 
-    for source_plan in current.sources:
-        if _wanted(source_plan.name, source_plan.complete, selected):
-            action = partial(_build_pretrain_source, cfg, source_plan, layout, active_steps, num_workers, hf_token, max_rounds)
-            items.append(_WorkItem("source", source_plan.name, action))
+    wanted_sources = [p for p in current.sources if _wanted(p.name, p.complete, selected)]
+    for group in _github_code_groups(cfg, wanted_sources):
+        action = partial(_build_github_code_group, cfg, group, layout, active_steps, num_workers, hf_token, max_rounds)
+        items.append(_WorkItem("github_code group", ", ".join(p.name for p in group), action))
+        wanted_sources = [p for p in wanted_sources if p not in group]
+    for source_plan in wanted_sources:
+        action = partial(_build_pretrain_source, cfg, source_plan, layout, active_steps, num_workers, hf_token, max_rounds)
+        items.append(_WorkItem("source", source_plan.name, action))
 
     if "validation" in active_steps:
         for validation_plan in current.validations:
@@ -134,6 +149,17 @@ def _work_items(
                 items.append(_WorkItem("instruct_mixture", mixture_plan.name, action))
 
     return items
+
+
+def _github_code_groups(cfg: DatasetConfig, plans: list[SourcePlan]) -> list[list[SourcePlan]]:
+    """The `github_code` sources among ``plans`` that share a repo (:func:`github_code_repo_key`), two or more per
+    group, in plan order; a single source of a repo goes through the ordinary per-source path."""
+    groups: dict[tuple[str | None, str | None, str], list[SourcePlan]] = {}
+    for source_plan in plans:
+        source = cfg.sources[source_plan.name]
+        if source.loader == "github_code":
+            groups.setdefault(github_code_repo_key(source), []).append(source_plan)
+    return [group for group in groups.values() if len(group) >= 2]
 
 
 def _wanted(name: str, complete: bool, selected: set[str] | None) -> bool:
@@ -198,26 +224,81 @@ def _build_pretrain_source(
         if "download" in active_steps:
             rows_needed = rows_for_budget(budget, tokens_per_row)
             raw = download(cfg, name, layout, rows_needed=rows_needed, hf_token=hf_token)
-        if "filter" in active_steps:
-            length_filter(cfg, name, layout)
-        if "process" not in active_steps:
+        refined = _process_round(cfg, name, layout, active_steps, num_workers, raw, budget, round_index)
+        if refined is None:
             return
-        processed = process(cfg, name, layout, num_workers=num_workers)
-
-        tokens = processed.tokens() or 0
-        if tokens >= budget:
-            return
-        exhausted = raw is not None and bool(raw.extra.get("exhausted"))
-        if exhausted or raw is None:
-            # nothing more can be fetched; the source stays below its budget
-            why = "exhausted" if exhausted else "no download step"
-            log.warning("%s: %s at %d tokens, budget is %d", name, why, tokens, budget)
-            return
-
-        tokens_per_row = max(tokens / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
-        log.info("%s: round %d: %d of %d tokens after processing, refining to %.1f tokens/row", name, round_index + 1, tokens, budget, tokens_per_row)
+        tokens_per_row = refined
 
     raise RuntimeError(f"{name}: token budget {budget} not reached after {max_rounds} rounds")
+
+
+def _build_github_code_group(
+    cfg: DatasetConfig,
+    group: list[SourcePlan],
+    layout: DatasetLayout,
+    active_steps: set[str],
+    num_workers: int,
+    hf_token: str | None,
+    max_rounds: int,
+) -> None:
+    """`_build_pretrain_source` for the `github_code` sources of one repo: each round downloads every source that
+    still needs rows in one pass over the repo files, then filters / processes them one by one."""
+    budgets = {p.name: p.budget_tokens for p in group}
+    tokens_per_row = {p.name: p.tokens_per_row for p in group}
+    for source_plan in group:
+        _remove_broken_stages(cfg, source_plan.name, layout)
+    pending = [p.name for p in group]  # sources whose budget is not reached yet
+
+    for round_index in range(max_rounds):
+        raws: dict[str, Manifest] = {}
+        if "download" in active_steps:
+            rows_needed = {name: rows_for_budget(budgets[name], tokens_per_row[name]) for name in pending}
+            raws = download_github_code_group(cfg, pending, layout, rows_needed=rows_needed, hf_token=hf_token)
+        still_pending: list[str] = []
+        for name in pending:
+            refined = _process_round(cfg, name, layout, active_steps, num_workers, raws.get(name), budgets[name], round_index)
+            if refined is not None:
+                tokens_per_row[name] = refined
+                still_pending.append(name)
+        pending = still_pending
+        if not pending:
+            return
+
+    raise RuntimeError(f"{', '.join(pending)}: token budget not reached after {max_rounds} rounds")
+
+
+def _process_round(
+    cfg: DatasetConfig,
+    name: str,
+    layout: DatasetLayout,
+    active_steps: set[str],
+    num_workers: int,
+    raw: Manifest | None,
+    budget: int,
+    round_index: int,
+) -> float | None:
+    """filter -> process after one download round of ``name`` (``raw``: its raw manifest, None without a download
+    step). Returns None when the source is done (budget reached, exhausted, or nothing more to do) or the refined
+    tokens/row for the next round."""
+    if "filter" in active_steps:
+        length_filter(cfg, name, layout)
+    if "process" not in active_steps:
+        return None
+    processed = process(cfg, name, layout, num_workers=num_workers)
+
+    tokens = processed.tokens() or 0
+    if tokens >= budget:
+        return None
+    exhausted = raw is not None and bool(raw.extra.get("exhausted"))
+    if exhausted or raw is None:
+        # nothing more can be fetched; the source stays below its budget
+        why = "exhausted" if exhausted else "no download step"
+        log.warning("%s: %s at %d tokens, budget is %d", name, why, tokens, budget)
+        return None
+
+    tokens_per_row = max(tokens / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
+    log.info("%s: round %d: %d of %d tokens after processing, refining to %.1f tokens/row", name, round_index + 1, tokens, budget, tokens_per_row)
+    return tokens_per_row
 
 
 def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout) -> None:

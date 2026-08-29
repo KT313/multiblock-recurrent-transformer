@@ -4,16 +4,20 @@ small dataset configs over `synthetic` / `local` sources used by the stage and p
 
 from __future__ import annotations
 
+import gzip
+import io
+import json
 import os
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, BinaryIO
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import zstandard
 
 from data_preparation.lib.schema.dataset_config import (
     DatasetConfig,
@@ -24,6 +28,8 @@ from data_preparation.lib.schema.dataset_config import (
     TokenizerConfig,
 )
 from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.lib.sources import hub_files
+from data_preparation.lib.sources.hub_files import file_format
 from data_preparation.lib.stages.shared import prepare_tokenizer
 
 # Must happen before `datasets` is imported anywhere (its config reads the env at import time).
@@ -34,6 +40,96 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]
+
+
+# --- a fake Hub for the hf_files / github_code loaders -----------------------------------------------------------------
+
+REPO = "org/name"
+REV = "abc"
+
+
+class RecordingFile(io.FileIO):
+    """A local file that records the byte range of every read (stand-in for the remote fsspec file object)."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, "rb")
+        self.ranges: list[tuple[int, int]] = []
+
+    def read(self, size: int | None = -1) -> bytes:
+        start = self.tell()
+        data = super().read(-1 if size is None else size)
+        self.ranges.append((start, start + len(data)))
+        return data
+
+    def readinto(self, buffer: Any) -> int:
+        start = self.tell()
+        n = super().readinto(buffer)
+        self.ranges.append((start, start + (n or 0)))
+        return n or 0
+
+
+class FakeHub:
+    """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.files: dict[str, Path] = {}
+        self.downloads: list[str] = []
+        self.streams: list[str] = []
+        self.handles: dict[str, RecordingFile] = {}
+        self.listings = 0
+        self.size_lookups = 0
+
+    def add(self, name: str, rows: list[Row], fmt: str | None = None) -> None:
+        path = self.root / name.replace("/", "__")
+        fmt = file_format(name) if fmt is None else fmt
+        if fmt == ".parquet":
+            pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=2)
+        elif fmt == ".json":
+            path.write_text(json.dumps(rows), encoding="utf-8")
+        else:
+            payload = "".join(json.dumps(r) + "\n" for r in rows).encode()
+            if fmt == ".jsonl.zst":
+                path.write_bytes(zstandard.ZstdCompressor().compress(payload))
+            elif fmt in (".jsonl.gz", ".json.gz"):
+                with gzip.open(path, "wb") as fh:
+                    fh.write(payload)
+            else:
+                path.write_bytes(payload)
+        self.files[name] = path
+
+    def list_repo_files(self, repo_id: str, revision: str | None, token: str | None) -> list[str]:
+        assert (repo_id, revision) == (REPO, REV)
+        self.listings += 1
+        return sorted(self.files, reverse=True) + ["README.md"]
+
+    def paths_info(self, repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
+        assert (repo_id, revision) == (REPO, REV)
+        self.size_lookups += 1
+        return {p: self.files[p].stat().st_size for p in paths}
+
+    def hub_download(self, repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
+        assert (repo_id, revision) == (REPO, REV)
+        self.downloads.append(filename)
+        return self.files[filename]
+
+    def open_remote(self, repo_id: str, filename: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
+        assert (repo_id, revision) == (REPO, REV)
+        self.streams.append(filename)
+        handle = RecordingFile(self.files[filename])
+        self.handles[filename] = handle
+        return handle
+
+
+@pytest.fixture
+def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHub:
+    fake = FakeHub(tmp_path / "hub")
+    fake.root.mkdir()
+    monkeypatch.setattr(hub_files, "list_repo_files", fake.list_repo_files)
+    monkeypatch.setattr(hub_files, "paths_info", fake.paths_info)
+    monkeypatch.setattr(hub_files, "hub_download", fake.hub_download)
+    monkeypatch.setattr(hub_files, "open_remote", fake.open_remote)
+    return fake
 
 
 @pytest.fixture

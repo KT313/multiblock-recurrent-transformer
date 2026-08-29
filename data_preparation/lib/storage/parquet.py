@@ -91,41 +91,69 @@ def write_parquet_shards(
     ``out_dir`` with index >= ``start_shard`` are deleted (stale-shard cleanup), lower ones are kept. Batches are
     re-chunked so every shard except the last has exactly ``shard_size`` rows. Returns the number of shards written.
     """
-    if shard_size <= 0:
-        raise ValueError(f"shard_size must be positive, got {shard_size}")
-    if start_shard < 0:
-        raise ValueError(f"start_shard must be >= 0, got {start_shard}")
-
-    tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
-    if tmp_dir.exists():
-        log.warning("removing leftover temp dir %s", tmp_dir)
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
-
-    # 1. Write every shard into the temp dir; leave nothing behind if the input stream fails.
-    next_index = start_shard
-    try:
+    with ShardWriter(out_dir, shard_size, start_shard=start_shard) as writer:
         for shard_table in _rechunk(batches, shard_size):
-            pq.write_table(shard_table, tmp_dir / shard_name(next_index))
-            next_index += 1
-    except BaseException:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
+            writer.write_shard(shard_table)
+    return writer.written
 
-    # 2. Drop the shards the new ones replace, then move the new ones into place.
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for existing in list_parquet_files(out_dir):
-        index = shard_index(existing)
-        if index is not None and index >= start_shard:
-            log.info("removing stale shard %s", existing)
-            existing.unlink()
-    for shard in sorted(tmp_dir.glob("data-*.parquet")):
-        shard.replace(out_dir / shard.name)
-    shutil.rmtree(tmp_dir)
 
-    written = next_index - start_shard
-    log.info("wrote %d shard(s) to %s (starting at %d)", written, out_dir, start_shard)
-    return written
+class ShardWriter:
+    """Incremental version of :func:`write_parquet_shards` (same atomicity, numbering and stale-shard cleanup):
+    ``add(row)`` buffers dict rows and writes a shard every ``shard_size`` rows, the last partial shard and the
+    move into ``out_dir`` happen when the ``with`` block exits normally; an exception leaves ``out_dir`` unchanged.
+    Several writers (one per output directory) can be fed from one input stream."""
+
+    def __init__(self, out_dir: Path, shard_size: int, *, start_shard: int = 0) -> None:
+        if shard_size <= 0:
+            raise ValueError(f"shard_size must be positive, got {shard_size}")
+        if start_shard < 0:
+            raise ValueError(f"start_shard must be >= 0, got {start_shard}")
+        self.out_dir = out_dir
+        self.shard_size = shard_size
+        self.start_shard = start_shard
+        self.written = 0
+        self._buffer: list[dict[str, Any]] = []
+        self._tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
+
+    def __enter__(self) -> ShardWriter:
+        if self._tmp_dir.exists():
+            log.warning("removing leftover temp dir %s", self._tmp_dir)
+            shutil.rmtree(self._tmp_dir)
+        self._tmp_dir.mkdir(parents=True)
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is not None:
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            return
+        if self._buffer:
+            self.write_shard(pa.Table.from_pylist(self._buffer))
+            self._buffer = []
+        self._publish()
+
+    def add(self, row: dict[str, Any]) -> None:
+        self._buffer.append(row)
+        if len(self._buffer) >= self.shard_size:
+            self.write_shard(pa.Table.from_pylist(self._buffer))
+            self._buffer = []
+
+    def write_shard(self, table: pa.Table) -> None:
+        """Write ``table`` as the next shard into the temp dir (the caller sizes it)."""
+        pq.write_table(table, self._tmp_dir / shard_name(self.start_shard + self.written))
+        self.written += 1
+
+    def _publish(self) -> None:
+        """Drop the shards the new ones replace, then move the new ones into place."""
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        for existing in list_parquet_files(self.out_dir):
+            index = shard_index(existing)
+            if index is not None and index >= self.start_shard:
+                log.info("removing stale shard %s", existing)
+                existing.unlink()
+        for shard in sorted(self._tmp_dir.glob("data-*.parquet")):
+            shard.replace(self.out_dir / shard.name)
+        shutil.rmtree(self._tmp_dir)
+        log.info("wrote %d shard(s) to %s (starting at %d)", self.written, self.out_dir, self.start_shard)
 
 
 def _rechunk(batches: Iterable[pa.RecordBatch | pa.Table], shard_size: int) -> Iterator[pa.Table]:

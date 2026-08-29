@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.lib.storage.parquet import (
+    ShardWriter,
     configure_hf_cache,
     estimate_tokens,
     list_parquet_files,
@@ -217,3 +218,30 @@ def test_write_dict_rows(tmp_path: Path) -> None:
     assert merged["n"].to_pylist() == list(range(12))
     assert write_dict_rows(({"text": "x", "n": 99} for _ in range(1)), tmp_path / "out", 5, start_shard=3) == 1
     assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
+
+
+def test_shard_writer_matches_write_dict_rows_and_appends(tmp_path: Path) -> None:
+    write_dict_rows(({"n": i} for i in range(12)), tmp_path / "ref", shard_size=5)
+    with ShardWriter(tmp_path / "out", shard_size=5) as writer:
+        for i in range(12):
+            writer.add({"n": i})
+    assert writer.written == 3
+    assert [t.to_pylist() for t in _read_all(tmp_path / "out")] == [t.to_pylist() for t in _read_all(tmp_path / "ref")]
+    with ShardWriter(tmp_path / "out", shard_size=5, start_shard=3) as writer:
+        writer.add({"n": 99})
+    assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
+    with ShardWriter(tmp_path / "out", shard_size=5, start_shard=1) as writer:
+        pass  # nothing written: shards >= 1 are still cleared (append mode replaces them)
+    assert [p.name for p in list_parquet_files(tmp_path / "out")] == ["data-00000.parquet"]
+
+
+def test_shard_writer_failure_leaves_out_dir_untouched(tmp_path: Path) -> None:
+    write_dict_rows(({"n": i} for i in range(3)), tmp_path / "out", shard_size=5)
+    with pytest.raises(RuntimeError, match="boom"), ShardWriter(tmp_path / "out", shard_size=2) as writer:
+        for i in range(5):
+            writer.add({"n": i})
+        raise RuntimeError("boom")
+    assert [p.name for p in list_parquet_files(tmp_path / "out")] == ["data-00000.parquet"]
+    assert _read_all(tmp_path / "out")[0].num_rows == 3 and not (tmp_path / "out.tmp").exists()
+    with pytest.raises(ValueError, match="shard_size"):
+        ShardWriter(tmp_path / "out", shard_size=0)

@@ -100,10 +100,10 @@ sources:
     # 7.5k rows in total: smaller than its budget in the full run, so the training sampler cycles it (see `epochs`
     # in the status table)
     tokens_per_row_estimate: 300
-  # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). The
-  # `github_code` loader reads the repo's 880 `data/*.parquet` files through the Hub cache, so every language source
-  # scans the same locally cached files; the shared file index (`dataset/hub_index/`) remembers per-language row
-  # counts so a top-up skips files it has already consumed.
+  # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). All
+  # language sources of the repo are downloaded in one pass over its 880 `data/*.parquet` files (every row group is
+  # fetched once and its rows go to the language that wants them); the shared file index (`dataset/hub_index/`)
+  # remembers per-language row counts so a top-up skips files and row groups it has already consumed.
   github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, tokens_per_row_estimate: 500}
   github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, tokens_per_row_estimate: 500}
   github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, tokens_per_row_estimate: 500}

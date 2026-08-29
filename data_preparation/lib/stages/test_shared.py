@@ -17,13 +17,15 @@ from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConf
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.sources import synthetic_row
+from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.stages.shared import (
     TokenCounter,
     current_manifest,
     download,
-    validation,
+    download_github_code_group,
     prepare_tokenizer,
     require_manifest,
+    validation,
 )
 
 Row = dict[str, Any]
@@ -39,6 +41,15 @@ def _synthetic(kind: str = "pretrain", seed: int = 0, **kwargs: Any) -> SourceCo
 
 def _local(path: Path, kind: str = "pretrain", **kwargs: Any) -> SourceConfig:
     return SourceConfig(kind=kind, loader="local", path=str(path), **kwargs)  # type: ignore[arg-type]  # Literal kind
+
+
+def _github(language: str, **kwargs: Any) -> SourceConfig:
+    return SourceConfig(kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=language, **kwargs)
+
+
+def _code_rows(prefix: str, n: int) -> list[Row]:
+    languages = ("Python", "Java", "Go")
+    return [{"id": f"{prefix}{i}", "text": f"{prefix} code {i}", "language": languages[i % 3]} for i in range(n)]
 
 
 # --- tokenizer -----------------------------------------------------------------------------------------------------
@@ -460,3 +471,65 @@ def test_fetch_source_forces_range_requests_by_default() -> None:
     custom = SourceConfig(kind="pretrain", loader="hf_files", hf_id="a/b", load_kwargs={"data_files": "*.parquet", "max_cached_file_mb": 7})
     assert fetch_source(off, custom).load_kwargs["max_cached_file_mb"] == 7
     assert fetch_source(cfg, custom).load_kwargs["max_cached_file_mb"] == 0
+
+
+# --- github_code group download ----------------------------------------------------------------------------------------
+
+
+def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> dict[str, Any]:
+    state: dict[str, Any] = {}
+    for name in names:
+        manifest = Manifest.load(layout.source_dir(name, "raw"))
+        assert manifest is not None
+        state[name] = {
+            "rows_fetched": manifest.rows_fetched,
+            "exhausted": manifest.extra.get("exhausted", False),
+            "shards": [(s.name, s.rows) for s in manifest.shards],
+            "rows": read_rows(layout.source_dir(name, "raw")),
+        }
+    return state
+
+
+def test_download_github_code_group_equals_separate_downloads(
+    hub: FakeHub, cfg_factory: CfgFactory, tmp_path: Path, read_rows: Reader
+) -> None:
+    """Golden: one group pass leaves exactly the raw shards / offsets / exhausted flags of three separate downloads,
+    while opening every repo file once."""
+    hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
+    hub.add("data/b.parquet", _code_rows("b", 8))
+    sources = {"py": _github("Python"), "java": _github("Java"), "rust": _github("Rust")}
+    cfg = cfg_factory(sources)
+    rows_needed = {"py": 4, "java": 2, "rust": 3}
+
+    separate = DatasetLayout(tmp_path / "separate")
+    for name in sources:
+        download(cfg, name, separate, rows_needed=rows_needed[name], shard_size=3)
+    expected = _raw_state(separate, list(sources), read_rows)
+    assert [r["text"] for r in expected["py"]["rows"]] == ["a code 0", "a code 3", "a code 6", "b code 0"]
+    assert expected["py"]["rows_fetched"] == 4 and set(expected["py"]["rows"][0]) == {"text", "language"}
+    assert expected["rust"]["rows"] == [] and expected["rust"]["exhausted"]
+
+    hub.streams.clear()
+    grouped = DatasetLayout(tmp_path / "grouped")
+    manifests = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
+    assert set(manifests) == set(sources)
+    assert _raw_state(grouped, list(sources), read_rows) == expected
+    assert hub.streams == ["data/a.parquet", "data/b.parquet"]  # each file opened once for all three languages
+
+    # a second call with the same needs is a no-op; a larger need for one language tops up only that one
+    hub.streams.clear()
+    again = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
+    assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 4, "java": 2, "rust": 0}
+    topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "java": 4}, shard_size=3)
+    assert [r["text"] for r in read_rows(grouped.source_dir("java", "raw"))] == ["a code 1", "a code 4", "a code 7", "b code 1"]
+    assert topped["java"].rows_fetched == 4 and topped["py"].rows() == 4
+    download(cfg, "java", separate, rows_needed=4, shard_size=3)
+    assert _raw_state(grouped, ["java"], read_rows) == _raw_state(separate, ["java"], read_rows)
+
+
+def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+    cfg = cfg_factory({"py": _github("Python"), "s": _synthetic(), "lim": _github("Java", check_limit=5)})
+    with pytest.raises(ValueError, match="github_code sources without check_limit"):
+        download_github_code_group(cfg, ["py", "s"], layout, rows_needed={"py": 1, "s": 1})
+    with pytest.raises(ValueError, match="github_code sources without check_limit"):
+        download_github_code_group(cfg, ["py", "lim"], layout, rows_needed={"py": 1, "lim": 1})

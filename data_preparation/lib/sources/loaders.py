@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,7 +32,9 @@ from data_preparation.lib.sources.hub_files import (
     FileIndex,
     HubFetcher,
     OnFile,
+    ReadRequest,
     read_rows,
+    read_rows_multi,
 )
 from data_preparation.lib.sources.synthetic import synthetic_row
 
@@ -227,26 +230,85 @@ def load_github_code(
     files) are stored in the shared file index, so all language sources read the same cached files and skip files
     and row groups they have already consumed. A remote row group is kept whole like in `hf_files`, so the
     language offset it leaves behind is a row-group boundary in source rows. `columns` always includes `language`.
+    Several languages of one repo are read together by :func:`read_github_code_group`.
     """
     _check_offset_count(offset, count)
     if count == 0:
         return
-    if source.language is None:  # validated by SourceConfig; repeated for the type checker
-        raise ValueError("github_code loader requires source.language")
-    language = source.language
-    index = hub_file_index(source, GITHUB_CODE_DATA_FILES, index_dir, token)
+    request = GithubCodeRequest(name="", source=source, offset=offset, count=count)
+    for _, row in read_github_code_group(
+        [request], token=token, index_dir=index_dir, on_file=on_file, stats=stats, columns=columns,
+        align_to_row_group=align_to_row_group,
+    ):
+        yield row
+
+
+@dataclass(frozen=True)
+class GithubCodeRequest:
+    """One member of :func:`read_github_code_group`: rows of ``source.language`` from ``offset`` (in rows of that
+    language) on, at least ``count`` of them."""
+
+    name: str
+    source: SourceConfig
+    offset: int
+    count: int
+
+
+def github_code_repo_key(source: SourceConfig) -> tuple[str | None, str | None, str]:
+    """What `github_code` sources must share to be read in one pass: ``(hf_id, revision, data_files)``."""
+    return (source.hf_id, source.revision, str(source.load_kwargs.get("data_files", GITHUB_CODE_DATA_FILES)))
+
+
+def read_github_code_group(
+    requests: list[GithubCodeRequest],
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+    stats: FetchStats | None = None,
+    columns: list[str] | None = None,
+    align_to_row_group: bool = True,
+) -> Iterator[tuple[str, Row]]:
+    """Serve several `github_code` sources of **one repo** in a single pass over its files (every row group read
+    at most once), yielding ``(request.name, row)``; per source exactly what `load_github_code` yields for the same
+    ``offset`` / ``count``, including the shared index bookkeeping. The sources must agree on `hf_id`, `revision`
+    and `data_files` (:func:`github_code_repo_key`) and have distinct languages; the first request's
+    `max_cached_file_mb` decides cache vs. remote reading for all of them.
+    """
+    if not requests:
+        return
+    first = requests[0].source
+    for request in requests:
+        _check_offset_count(request.offset, request.count)
+        if github_code_repo_key(request.source) != github_code_repo_key(first):
+            raise ValueError(f"{request.name}: github_code group members must share hf_id, revision and data_files")
+        if request.source.language is None:  # validated by SourceConfig; repeated for the type checker
+            raise ValueError(f"{request.name}: github_code loader requires source.language")
+    languages = [str(r.source.language) for r in requests]
+    if len(set(languages)) != len(languages):
+        raise ValueError(f"github_code group members must have distinct languages, got {languages}")
+
+    index = hub_file_index(first, GITHUB_CODE_DATA_FILES, index_dir, token)
     if columns is not None and "language" not in columns:
-        columns = [*columns, "language"]  # the `match` filter below needs it even under a projection
-    yield from read_rows(
+        columns = [*columns, "language"]
+    yield from read_rows_multi(
         index,
-        offset,
-        count,
+        [_language_request(r) for r in requests],
         on_file=on_file,
-        fetcher=hub_fetcher(source, token, stats),
-        key=f"language={language}",
-        match=lambda row: bool(row["language"] == language),
+        fetcher=hub_fetcher(first, token, stats),
         columns=columns,
         align_to_row_group=align_to_row_group,
+    )
+
+
+def _language_request(request: GithubCodeRequest) -> ReadRequest:
+    language = str(request.source.language)
+    return ReadRequest(
+        name=request.name,
+        offset=request.offset,
+        count=request.count,
+        key=f"language={language}",
+        match=lambda row: bool(row["language"] == language),
     )
 
 
