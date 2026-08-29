@@ -93,6 +93,17 @@ def test_plan_after_build_is_complete_and_uses_measured_tokens(layout: DatasetLa
     assert row_a.split()[6] == "-"  # fetch column: nothing to fetch for a complete source
 
 
+def test_plan_uses_raw_token_counts_right_after_download(layout: DatasetLayout) -> None:
+    cfg = two_stage_cfg()
+    result = build(cfg, layout, steps={"tokenizer", "download"})
+    a = next(s for s in result.sources if s.name == "a")
+    raw = Manifest.load(layout.source_dir("a", "raw"))
+    assert raw is not None and raw.tokens() is not None
+    assert a.tokens_per_row == (raw.tokens() or 0) / raw.rows() and a.tokens_per_row != 100  # measured, not the estimate
+    assert not a.complete and a.reason == "processed: manifest missing"
+    assert f"{a.tokens_per_row:.1f}" in result.summary()
+
+
 def test_rows_to_fetch_is_clamped_at_zero(layout: DatasetLayout) -> None:
     build(two_stage_cfg(), layout)
     smaller = two_stage_cfg(tokens_a=100, tokens_b=100)  # same source hashes, a tenth of the budget

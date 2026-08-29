@@ -54,7 +54,7 @@ builds in seconds, used by the tests and `config/tiny.yaml`).
 ```
 dataset/
 ├── sources/<source>/
-│   ├── raw/          MANIFEST.json + data-*.parquet     rows as fetched (converter applied), append-only
+│   ├── raw/          MANIFEST.json + data-*.parquet     rows as fetched (converter applied) + `tokens`, append-only
 │   ├── processed/    MANIFEST.json + data-*.parquet     length filter / dedup / filters / token counts, append-only   <- training reads this
 │   └── validation/      MANIFEST.json + data-*.parquet     `validation` sources only            <- validation reads this
 ├── instruct_mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
@@ -215,8 +215,8 @@ decontamination → token counting → fuzzy dedup. Each is configured in the
 - Token counting (`token_count`) is done with the real tokenizer, capped at `max_seq_length`, **without rewriting
   the text** (training truncates); `estimate` uses chars / 4.
 
-Instruct mixtures (`lib/stages/instruct.py`) take `ceil(budget × share ÷ measured tokens/row)` rows per source,
-drop examples longer than `max_tokens`, apply input inversions on a seeded sample, the same normalized exact dedup,
+Instruct mixtures (`lib/stages/instruct.py`) read each source in order until its kept rows hold `budget × share`
+tokens (the `tokens` column is counted at download time, so only that prefix is read), drop examples longer than `max_tokens`, apply input inversions on a seeded sample, the same normalized exact dedup,
 remove rows with empty fields, shuffle and split.
 
 ## Differences from the thesis run

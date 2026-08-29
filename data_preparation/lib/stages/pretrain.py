@@ -29,9 +29,9 @@ from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     current_manifest,
+    ensure_raw_tokens,
     new_manifest,
     record_new_shards,
-    require_manifest,
     shard_list,
 )
 
@@ -70,7 +70,9 @@ def process(
     source_hash = cfg.source_hash(name)
     raw_dir = layout.source_dir(name, "raw")
     out = layout.source_dir(name, "processed")
-    raw = require_manifest(raw_dir, source_hash, "raw", name)
+    raw = ensure_raw_tokens(cfg, name, layout)  # upgrades a raw dir from before the tokens column in place
+    if raw is None:
+        raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
 
     full_pass = processing.dedup.mode == "minhash"
     manifest = _resumable_processed_manifest(cfg, name, source_hash, out, raw, full_pass)
@@ -86,6 +88,7 @@ def process(
 
     # build the lazy pipeline: nothing runs until the shard writer pulls rows through it
     rows: Iterator[Row] = _length_filtered_rows(raw_dir, pending, source.text_field, name, processing, shard_size, stats["length_filter"])
+    stats["tokens_recounted"] = 0
     rows = _with_hashes(rows, processing.dedup.normalize)
     if processing.dedup.mode == "exact":
         rows = _exact_dedup(rows, seen, stats["dedup"])
@@ -97,7 +100,7 @@ def process(
     start_shard = len(manifest.shards)
     tokens_per_new_shard: list[int] = []
     with progress(total=pending_rows, desc=f"{name}: process", unit="row", leave=False) as bar:
-        rows = _count_tokens(rows, TokenCounter(cfg, layout), name, shard_size, bar)
+        rows = _count_tokens(rows, TokenCounter(cfg, layout), name, processing.max_chars, shard_size, bar, stats)
         if full_pass:
             rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
         rows = _accumulate_tokens(rows, tokens_per_new_shard, shard_size)
@@ -133,6 +136,7 @@ def _resumable_processed_manifest(
         "columns": list(PROCESSED_COLUMNS),
         "stats": {
             "input_rows": 0,
+            "tokens_recounted": 0,
             "length_filter": {"input_samples": 0, "removed_too_short": 0, "removed_invalid": 0, "truncated": 0, "output_samples": 0},
             "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
             "quality_filter": {"enabled": processing.quality_filter, "filtered_count": 0, "rejection_reasons": {}},
@@ -165,12 +169,12 @@ def _length_filtered_rows(
     batch_size: int,
     stats: dict[str, int],
 ) -> Iterator[Row]:
-    """``{text, source, original_length}`` rows of the given raw shards, in order, through the length filter
+    """``{text, source, original_length, tokens}`` rows of the given raw shards, in order, through the length filter
     (``preprocess_batch`` per Arrow batch: null / shorter than ``min_chars`` dropped, truncated to ``max_chars``);
-    the per-batch statistics are summed into ``stats``."""
+    ``tokens`` is the raw count (of the untruncated text) and the per-batch statistics are summed into ``stats``."""
     for shard in shards:
         parquet = pq.ParquetFile(directory / shard.name)
-        for batch in parquet.iter_batches(batch_size=batch_size, columns=[text_field]):
+        for batch in parquet.iter_batches(batch_size=batch_size, columns=[text_field, "tokens"]):
             kept, batch_stats = preprocess_batch(batch, text_field, name, processing.min_chars, processing.max_chars)
             for key, value in batch_stats.items():
                 stats[key] += value
@@ -268,17 +272,24 @@ def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
         yield chunk
 
 
-def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_size: int, bar: Progress) -> Iterator[Row]:
-    """Token-count ``rows`` in batches; ``bar`` advances per input row (input rows, not survivors, since the dedup /
-    quality / decontamination generators upstream drop rows silently) with the running token sum as postfix."""
+def _count_tokens(
+    rows: Iterator[Row], counter: TokenCounter, name: str, max_chars: int, batch_size: int, bar: Progress, stats: dict[str, Any]
+) -> Iterator[Row]:
+    """The processed ``{text, source, tokens, hash}`` rows: the raw ``tokens`` count is reused, only rows the length
+    filter truncated (``original_length > max_chars``) are recounted (``stats["tokens_recounted"]``). ``bar``
+    advances per input row (input rows, not survivors, since the dedup / quality / decontamination generators
+    upstream drop rows silently) with the running token sum as postfix."""
     total = 0
     for chunk in _chunks(rows, batch_size):
-        tokens = counter.count_many([row["text"] for row in chunk])
-        total += sum(tokens)
+        truncated = [row for row in chunk if row["original_length"] > max_chars]
+        for row, n in zip(truncated, counter.count_many([row["text"] for row in truncated])):
+            row["tokens"] = n
+        stats["tokens_recounted"] += len(truncated)
+        total += sum(int(row["tokens"]) for row in chunk)
         bar.update(len(chunk))
         bar.set_postfix({"tokens": total}, refresh=False)
-        for row, n in zip(chunk, tokens):
-            yield {"text": row["text"], "source": name, "tokens": n, "hash": row["hash"]}
+        for row in chunk:
+            yield {"text": row["text"], "source": name, "tokens": int(row["tokens"]), "hash": row["hash"]}
 
 
 def _accumulate_tokens(rows: Iterator[Row], sums: list[int], shard_size: int) -> Iterator[Row]:

@@ -17,12 +17,23 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from data_preparation.lib.storage.parquet import ShardWriter, estimate_tokens, list_parquet_files, shard_index, write_dict_rows
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from data_preparation.lib.storage.parquet import (
+    SHARD_COMPRESSION,
+    ShardWriter,
+    estimate_tokens,
+    list_parquet_files,
+    shard_index,
+    write_dict_rows,
+)
 from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress, progress
-from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows
+from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows, shard_tokens
+from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.sources import (
     FetchStats,
@@ -64,6 +75,8 @@ class TokenCounter:
         return min(len(self._tokenizer.encode(text, add_special_tokens=False)), self.cap)
 
     def count_many(self, texts: list[str]) -> list[int]:
+        if not texts:
+            return []  # HF fast tokenizers choke on an empty batch
         if self._tokenizer is None:
             return [min(estimate_tokens(t), self.cap) for t in texts]
         encoded = self._tokenizer(texts, add_special_tokens=False)["input_ids"]
@@ -212,11 +225,16 @@ def download(
     boundary, so a later call with a ``rows_needed`` at or below the rows on disk is a no-op and a top-up beyond it
     starts at the boundary — the same bytes are never downloaded twice. Sources without a converter are read with
     only ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
+
+    Every stored row gets a ``tokens`` column (:class:`TokenCounter` over ``text_field``, or instruction + input +
+    output for instruct rows), counted once here and reused by ``process`` and the instruct mixtures; the manifest
+    records the mode / tokenizer and per-shard sums. A raw directory from before this column is upgraded in place
+    (:func:`ensure_raw_tokens`), never re-downloaded.
     """
     source = fetch_source(cfg, cfg.sources[name])
     source_hash = cfg.source_hash(name)
     out = layout.source_dir(name, "raw")
-    manifest = current_manifest(out, source_hash, "raw") or new_manifest(cfg, name, source_hash, "raw")
+    manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
 
     # nothing to do?
     if manifest.extra.get("exhausted"):
@@ -235,13 +253,15 @@ def download(
     log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
     counters = _FetchCounters()
     start_shard = len(manifest.shards)
+    counter = TokenCounter(cfg, layout)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar)
+        rows = _with_tokens(rows, counter, raw_text_of(source))
         write_dict_rows(rows, out, shard_size, start_shard=start_shard)
 
     # record the increment
-    record_new_shards(manifest, out, start_shard)
+    record_new_shards(manifest, out, start_shard, tokens=_shard_token_sums(out, start_shard))
     manifest.rows_fetched += counters.consumed  # source rows consumed: a row-group boundary after an over-read
     manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + counters.skipped_malformed
     if counters.exhausted:
@@ -357,7 +377,7 @@ def download_github_code_group(
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
         source_hash = cfg.source_hash(name)
         out = layout.source_dir(name, "raw")
-        manifest = current_manifest(out, source_hash, "raw") or new_manifest(cfg, name, source_hash, "raw")
+        manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
         results[name] = manifest
         if manifest.extra.get("exhausted"):
             log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
@@ -368,10 +388,11 @@ def download_github_code_group(
     if not members:
         return results
 
-    _fetch_group(members, layout, shard_size, hf_token)
+    _fetch_group(members, layout, TokenCounter(cfg, layout), shard_size, hf_token)
     for member in members:
         manifest, counters = member.manifest, member.counters
-        record_new_shards(manifest, member.out, len(manifest.shards))
+        start_shard = len(manifest.shards)
+        record_new_shards(manifest, member.out, start_shard, tokens=_shard_token_sums(member.out, start_shard))
         manifest.rows_fetched += counters.consumed
         if counters.exhausted:
             manifest.extra["exhausted"] = True
@@ -380,8 +401,11 @@ def download_github_code_group(
     return results
 
 
-def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size: int, hf_token: str | None) -> None:
-    """Run the group pass and append every member's rows to its raw directory (one shard writer per member)."""
+def _fetch_group(
+    members: list[_GroupMember], layout: DatasetLayout, counter: TokenCounter, shard_size: int, hf_token: str | None
+) -> None:
+    """Run the group pass and append every member's rows (token-counted) to its raw directory, one shard writer
+    per member."""
     for member in members:
         log.info("%s: fetching %d rows from offset %d -> %s", member.name, member.wanted, member.manifest.rows_fetched, member.out)
     requests = [GithubCodeRequest(m.name, m.source, m.manifest.rows_fetched, m.wanted) for m in members]
@@ -394,8 +418,13 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
     with ExitStack() as stack:
         bar = stack.enter_context(progress(total=total, desc=f"{repo}: download ({len(members)} languages)", unit="row"))
         postfix = _DownloadPostfix(bar, fetch_stats)
-        writers = {
-            m.name: stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards))) for m in members
+        sinks = {
+            m.name: _TokenizingSink(
+                stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards))),
+                counter,
+                raw_text_of(m.source),
+            )
+            for m in members
         }
         rows = read_github_code_group(
             requests, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns, on_file=postfix.on_file,
@@ -403,11 +432,13 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
         )
         for consumed_total, (name, raw) in enumerate(rows, start=1):
             member = by_name[name]
-            writers[name].add(text_row(member.source, raw, name))
+            sinks[name].add(text_row(member.source, raw, name))
             member.counters.consumed += 1
             member.counters.kept += 1
             postfix.consumed(consumed_total)
             bar.update(1)
+        for sink in sinks.values():
+            sink.flush()
     for member in members:
         if member.counters.kept < member.wanted:
             member.counters.exhausted = True
@@ -421,6 +452,101 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
             return None
         union.extend(c for c in columns if c not in union)
     return union
+
+
+TOKEN_BATCH = 256  # rows tokenized per `count_many` call while downloading
+
+
+def raw_text_of(source: SourceConfig) -> Callable[[Row], str]:
+    """What the ``tokens`` column of a raw row counts: ``text_field`` for pretrain / validation sources, instruction +
+    input + output for instruct rows."""
+    if source.kind == "instruct":
+        return instruct_text
+    text_field = source.text_field
+    return lambda row: str(row[text_field])
+
+
+def _with_tokens(rows: Iterator[Row], counter: TokenCounter, text_of: Callable[[Row], str]) -> Iterator[Row]:
+    """Add ``tokens`` to every row, counting ``TOKEN_BATCH`` rows per tokenizer call."""
+    batch: list[Row] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= TOKEN_BATCH:
+            yield from _tokenized(batch, counter, text_of)
+            batch = []
+    if batch:
+        yield from _tokenized(batch, counter, text_of)
+
+
+def _tokenized(batch: list[Row], counter: TokenCounter, text_of: Callable[[Row], str]) -> list[Row]:
+    for row, tokens in zip(batch, counter.count_many([text_of(row) for row in batch])):
+        row["tokens"] = tokens
+    return batch
+
+
+class _TokenizingSink:
+    """``add(row)`` for a :class:`ShardWriter`: rows are token-counted in batches of ``TOKEN_BATCH`` before they
+    reach the writer; ``flush()`` counts and hands over the rest."""
+
+    def __init__(self, writer: ShardWriter, counter: TokenCounter, text_of: Callable[[Row], str]) -> None:
+        self._writer = writer
+        self._counter = counter
+        self._text_of = text_of
+        self._batch: list[Row] = []
+
+    def add(self, row: Row) -> None:
+        self._batch.append(row)
+        if len(self._batch) >= TOKEN_BATCH:
+            self.flush()
+
+    def flush(self) -> None:
+        for row in _tokenized(self._batch, self._counter, self._text_of):
+            self._writer.add(row)
+        self._batch = []
+
+
+def _shard_token_sums(directory: Path, start_shard: int) -> dict[str, int]:
+    """``{shard name: sum of its tokens column}`` for the shards with index >= ``start_shard``."""
+    sums: dict[str, int] = {}
+    for path in list_parquet_files(directory):
+        index = shard_index(path)
+        if index is not None and index >= start_shard:
+            sums[path.name] = shard_tokens(path)
+    return sums
+
+
+def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:
+    """Whether a raw manifest's ``tokens`` column was counted the way ``cfg`` counts (mode and tokenizer)."""
+    tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
+    return manifest.token_count == cfg.token_count and manifest.tokenizer == tokenizer and manifest.tokens() is not None
+
+
+def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
+    """The current raw manifest of ``name`` with a ``tokens`` column in every shard, or None if there is no current
+    raw manifest. A raw directory from before the column (or counted differently) is upgraded **in place**: every
+    shard is rewritten with the same rows and name plus ``tokens``; ``rows_fetched`` and the shard numbering do not
+    change and nothing is downloaded."""
+    source = cfg.sources[name]
+    out = layout.source_dir(name, "raw")
+    manifest = current_manifest(out, cfg.source_hash(name), "raw")
+    if manifest is None or raw_has_tokens(cfg, manifest):
+        return manifest
+
+    log.info("%s: adding the tokens column to %d raw shard(s) in place -> %s", name, len(manifest.shards), out)
+    counter = TokenCounter(cfg, layout)
+    text_of = raw_text_of(source)
+    for shard in progress(list(manifest.shards), desc=f"{name}: count_tokens", unit="shard", leave=False):
+        path = out / shard.name
+        rows = pq.read_table(path).to_pylist()
+        _tokenized(rows, counter, text_of)  # no batching needed: a shard is one batch
+        tmp = path.with_suffix(".parquet.tmp")
+        pq.write_table(pa.Table.from_pylist(rows), tmp, compression=SHARD_COMPRESSION)
+        tmp.replace(path)
+        shard.tokens = sum(int(row["tokens"]) for row in rows)
+    manifest.token_count = cfg.token_count
+    manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
+    manifest.save(out)
+    return manifest
 
 
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:

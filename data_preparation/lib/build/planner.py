@@ -263,10 +263,9 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     tokens_present = (processed.tokens() or 0) if processed is not None else 0
 
     tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))  # counts are capped there
-    if raw is not None and processed is not None:
-        measured = _measured_tokens_per_row(raw, processed)
-        if measured is not None:
-            tokens_per_row = measured
+    measured = _measured_tokens_per_row(raw, processed)
+    if measured is not None:
+        tokens_per_row = measured
     rows_needed = rows_for_budget(budget, tokens_per_row)
     rows_to_fetch = max(0, rows_needed - rows_present)
 
@@ -326,15 +325,22 @@ def _pipeline_problem(raw: Manifest, processed: Manifest, budget: int, exhausted
     return None
 
 
-def _measured_tokens_per_row(raw: Manifest, processed: Manifest) -> float | None:
-    """Processed tokens per **raw** row over the raw shards the processed manifest covers, or None without usable
-    counts."""
-    tokens = processed.tokens()
-    covered = len(processed.extra.get("input_shards", []))
-    raw_rows = sum(shard.rows for shard in raw.shards[:covered])
-    if tokens is None or tokens <= 0 or raw_rows <= 0:
+def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -> float | None:
+    """Processed tokens per **raw** row over the raw shards the processed manifest covers (this includes what the
+    length filter and dedup drop); before anything is processed, the raw manifest's own token counts per raw row
+    (available right after the download); None without usable counts."""
+    if raw is None:
         return None
-    return tokens / raw_rows
+    if processed is not None:
+        tokens = processed.tokens()
+        covered = len(processed.extra.get("input_shards", []))
+        raw_rows = sum(shard.rows for shard in raw.shards[:covered])
+        if tokens is not None and tokens > 0 and raw_rows > 0:
+            return tokens / raw_rows
+    raw_tokens = raw.tokens()
+    if raw_tokens is not None and raw_tokens > 0 and raw.rows() > 0:
+        return raw_tokens / raw.rows()
+    return None
 
 
 # --- validation sources ------------------------------------------------------------------------------------------------

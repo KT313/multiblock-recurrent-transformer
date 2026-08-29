@@ -15,6 +15,7 @@ dependencies = [
   "jsonargparse[signatures]>=4.27.6",
   "wandb",
   "tqdm",
+  "rich>=13",
 ]
 
 [project.optional-dependencies]

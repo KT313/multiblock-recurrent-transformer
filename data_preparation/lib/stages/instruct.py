@@ -2,17 +2,17 @@
 """``build_instruct_mixture``: the per-config instruct mixture (``dataset/instruct_mixtures/<config>/<mixture>/{train,validation}/``)
 built from the standardized raw shards of its ``instruct`` sources.
 
-Per source: measure tokens per row with the tokenizer, take ``ceil(budget_tokens × share ÷ tokens_per_row)`` rows,
-drop rows longer than ``mixture.max_tokens``; then input inversions on a seeded sample, normalized exact dedup,
-empty-field removal, seeded shuffle, train/validation split. Rebuilt whenever the mixture hash, ``budget_tokens`` or
-any input source's raw shard list changed; otherwise a no-op returning the stored manifests.
+Per source: read the raw rows in order with their ``tokens`` column (counted at download time), skip rows longer
+than ``mixture.max_tokens`` and stop as soon as the kept rows hold ``budget_tokens × share`` tokens — a source is
+read only as far as needed; then input inversions on a seeded sample, normalized exact dedup, empty-field removal,
+seeded shuffle, train/validation split. Rebuilt whenever the mixture hash, ``budget_tokens`` or any input source's
+raw shard list changed; otherwise a no-op returning the stored manifests.
 """
 
 from __future__ import annotations
 
 import random
 from collections.abc import Iterator
-from itertools import islice
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -30,9 +30,9 @@ from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     current_manifest,
+    ensure_raw_tokens,
     new_manifest,
     record_new_shards,
-    require_manifest,
     shard_list,
 )
 
@@ -53,17 +53,21 @@ def build_instruct_mixture(
     """Build (or return) the ``train`` / ``validation`` splits of a mixture; returns ``{split: Manifest}``.
 
     Columns: ``instruction``, ``input``, ``output``, ``tokens``. ``extra`` records per-source counts, the measured
-    ``tokens_per_row``, ``short_sources`` (sources with fewer raw rows than needed — the planner tops them up),
+    ``tokens_per_row``, ``short_sources`` (sources whose raw rows ran out before their share — the planner tops them up),
     ``input_shards`` (raw shard lists) and the build ``metadata``.
     """
     mixture = cfg.instruct_mixtures[instruct_mixture_name]
     mixture_hash = cfg.instruct_mixture_hash(instruct_mixture_name)
     split_dirs = {split: layout.instruct_mixture_dir(cfg.name, instruct_mixture_name, split) for split in INSTRUCT_MIXTURE_SPLITS}
 
-    # The inputs: one raw manifest per instruct source (an error if a source has not been downloaded yet).
-    raw_manifests = {
-        src: require_manifest(layout.source_dir(src, "raw"), cfg.source_hash(src), "raw", src) for src in mixture.sources
-    }
+    # The inputs: one raw manifest per instruct source (an error if a source has not been downloaded yet); a raw
+    # directory from before the tokens column is upgraded in place.
+    raw_manifests: dict[str, Manifest] = {}
+    for src in mixture.sources:
+        raw = ensure_raw_tokens(cfg, src, layout)
+        if raw is None:
+            raise FileNotFoundError(f"{src}: no current raw manifest in {layout.source_dir(src, 'raw')}; run the download stage first")
+        raw_manifests[src] = raw
     input_shards = {src: shard_list(manifest) for src, manifest in raw_manifests.items()}
 
     existing = _existing_manifests(split_dirs, mixture_hash, input_shards=input_shards, budget_tokens=budget_tokens)
@@ -77,12 +81,12 @@ def build_instruct_mixture(
     rows: list[Row] = []
     counts: dict[str, dict[str, Any]] = {}
     for src, share in mixture.sources.items():
-        taken, info = _take_source_rows(layout, src, raw_manifests[src], share * budget_tokens, mixture.max_tokens, counter)
+        taken, info = _take_source_rows(layout, src, raw_manifests[src], share * budget_tokens, mixture.max_tokens)
         rows.extend(taken)
         counts[src] = info
         log.info(
-            "  %s: %d of %d needed rows (%.1f tokens/row), %d kept after length check",
-            src, info["available_rows"], info["needed_rows"], info["tokens_per_row"], info["kept_rows"],
+            "  %s: read %d of %d rows (%.1f tokens/row), %d kept after length check",
+            src, info["taken_rows"], info["available_rows"], info["tokens_per_row"], info["kept_rows"],
         )
     tokens_per_row = {src: info["tokens_per_row"] for src, info in counts.items()}
     short_sources = {
@@ -181,53 +185,54 @@ def _apply_input_inversions(rows: list[Row], mixture: InstructMixtureConfig, rng
     return inverted
 
 
-def _iter_raw_batches(raw_dir: Path, raw: Manifest) -> Iterator[list[Row]]:
-    """The standardized rows of every raw shard, batch by batch in shard order (only the instruct columns are read)."""
+def _iter_raw_rows(raw_dir: Path, raw: Manifest) -> Iterator[Row]:
+    """The standardized rows of every raw shard with their ``tokens``, one by one in shard order; a consumer that
+    stops early never opens the remaining shards."""
     for shard in raw.shards:
         parquet_file = pq.ParquetFile(raw_dir / shard.name)
-        for batch in parquet_file.iter_batches(columns=list(INSTRUCT_COLUMNS)):
-            yield batch.to_pylist()
-
-
-def _iter_raw_rows(raw_dir: Path, raw: Manifest) -> Iterator[Row]:
-    """The standardized rows of every raw shard, one by one in shard order."""
-    for batch in _iter_raw_batches(raw_dir, raw):
-        yield from batch
+        for batch in parquet_file.iter_batches(columns=[*INSTRUCT_COLUMNS, "tokens"]):
+            yield from batch.to_pylist()
 
 
 def _take_source_rows(
-    layout: DatasetLayout, src: str, raw: Manifest, target_tokens: float, max_tokens: int, counter: TokenCounter
+    layout: DatasetLayout, src: str, raw: Manifest, target_tokens: float, max_tokens: int
 ) -> tuple[list[Row], dict[str, Any]]:
-    """The first ``ceil(target_tokens / tokens_per_row)`` standardized rows of a source (token-counted, length-checked).
+    """The standardized rows of a source read in order until the kept rows (those within ``max_tokens``) hold
+    ``target_tokens`` tokens; rows beyond that are not read.
 
-    Pass 1 measures the token count of every raw row (ints only), pass 2 re-reads just the rows that are taken.
+    ``info``: ``available_rows`` (raw rows on disk), ``taken_rows`` (rows read), ``needed_rows`` (rows read when the
+    target was reached, else the estimate ``ceil(target ÷ tokens/row)`` — larger than ``available_rows`` marks the
+    source short), ``dropped_too_long``, ``kept_rows``, ``tokens_per_row`` (measured over the rows read),
+    ``target_tokens``.
     """
-    raw_dir = layout.source_dir(src, "raw")
-
-    # Pass 1: token count of every row -> how many rows this source needs to contribute.
-    tokens: list[int] = []
-    with progress(total=raw.rows(), desc=f"{src}: count_tokens", unit="row", leave=False) as bar:
-        for batch in _iter_raw_batches(raw_dir, raw):
-            tokens.extend(counter.count_many([instruct_text(row) for row in batch]))
-            bar.update(len(batch))
-    available = len(tokens)
-    tokens_per_row = sum(tokens) / available if available else 0.0
-    needed = ceil(target_tokens / tokens_per_row) if tokens_per_row > 0 else 0
-    take = min(needed, available)
-
-    # Pass 2: re-read the first `take` rows and keep those within the length limit.
     taken: list[Row] = []
+    rows_read = 0
+    tokens_read = 0
+    kept_tokens = 0
     dropped_long = 0
-    for row, n_tokens in zip(islice(_iter_raw_rows(raw_dir, raw), take), tokens):
-        if not check_length(n_tokens, max_tokens):
-            dropped_long += 1
-            continue
-        taken.append({"instruction": row["instruction"], "input": row["input"] or "", "output": row["output"], "tokens": n_tokens})
+    with progress(total=raw.rows(), desc=f"{src}: take_rows", unit="row", leave=False) as bar:
+        for row in _iter_raw_rows(layout.source_dir(src, "raw"), raw):
+            rows_read += 1
+            bar.update(1)
+            n_tokens = int(row["tokens"])
+            tokens_read += n_tokens
+            if not check_length(n_tokens, max_tokens):
+                dropped_long += 1
+                continue
+            taken.append({"instruction": row["instruction"], "input": row["input"] or "", "output": row["output"], "tokens": n_tokens})
+            kept_tokens += n_tokens
+            if kept_tokens >= target_tokens:
+                break
 
+    tokens_per_row = tokens_read / rows_read if rows_read else 0.0
+    if kept_tokens >= target_tokens:
+        needed = rows_read
+    else:
+        needed = ceil(target_tokens / tokens_per_row) if tokens_per_row > 0 else 0
     info = {
-        "available_rows": available,
+        "available_rows": raw.rows(),
         "needed_rows": needed,
-        "taken_rows": take,
+        "taken_rows": rows_read,
         "dropped_too_long": dropped_long,
         "kept_rows": len(taken),
         "tokens_per_row": tokens_per_row,

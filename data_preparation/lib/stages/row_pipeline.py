@@ -21,6 +21,7 @@ _OUTPUT_FIELDS: list[tuple[str, pa.DataType]] = [
     ("original_length", pa.int64()),
 ]
 FILTERED_SCHEMA = pa.schema(_OUTPUT_FIELDS)
+FILTERED_SCHEMA_WITH_TOKENS = pa.schema([*_OUTPUT_FIELDS, ("tokens", pa.int64())])
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -32,7 +33,9 @@ def preprocess_batch(
 ) -> tuple[pa.RecordBatch, dict[str, int]]:
     """Drop null / shorter-than-``min_chars`` texts, truncate to ``max_chars`` characters.
 
-    Returns a ``FILTERED_SCHEMA`` batch (``text``, ``source``, ``original_length``) and per-batch statistics.
+    Returns a ``FILTERED_SCHEMA`` batch (``text``, ``source``, ``original_length``) and per-batch statistics. A
+    ``tokens`` column of the input batch (the raw token counts) is carried through as a fourth column, so the
+    caller only has to recount the truncated rows (``original_length > max_chars``).
     """
     if text_field not in batch.schema.names:
         raise ValueError(f"{source_name}: text_field {text_field!r} not in columns {batch.schema.names}")
@@ -67,14 +70,16 @@ def preprocess_batch(
     truncated_texts = [text[:max_chars] for text in texts]
     stats["truncated"] = sum(1 for text in texts if len(text) > max_chars)
 
-    output = pa.RecordBatch.from_arrays(
-        [
-            pa.array(truncated_texts, type=pa.string()),
-            pa.array([source_name] * len(truncated_texts), type=pa.string()),
-            pc.cast(original_lengths, pa.int64()),
-        ],
-        schema=FILTERED_SCHEMA,
-    )
+    arrays: list[pa.Array[Any]] = [
+        pa.array(truncated_texts, type=pa.string()),
+        pa.array([source_name] * len(truncated_texts), type=pa.string()),
+        pc.cast(original_lengths, pa.int64()),
+    ]
+    schema = FILTERED_SCHEMA
+    if "tokens" in batch.schema.names:
+        arrays.append(pc.cast(batch["tokens"], pa.int64()))
+        schema = FILTERED_SCHEMA_WITH_TOKENS
+    output = pa.RecordBatch.from_arrays(arrays, schema=schema)
     stats["output_samples"] = len(output)
     return output, stats
 

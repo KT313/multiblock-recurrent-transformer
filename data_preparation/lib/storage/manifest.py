@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
@@ -135,6 +136,13 @@ def shard_rows(path: Path) -> int:
     return pq.read_metadata(path).num_rows
 
 
+def shard_tokens(path: Path) -> int:
+    """Sum of a shard's ``tokens`` column (one column read)."""
+    column = pq.read_table(path, columns=["tokens"]).column("tokens")
+    total = pc.sum(column).as_py()
+    return 0 if total is None else int(total)
+
+
 def verify_shards(directory: Path, manifest: Manifest) -> list[str]:
     """Problems between ``manifest`` and the files in ``directory``: missing shards, row-count mismatches."""
     problems: list[str] = []
@@ -186,5 +194,6 @@ __all__ = [
     "Stage",
     "library_versions",
     "shard_rows",
+    "shard_tokens",
     "verify_shards",
 ]

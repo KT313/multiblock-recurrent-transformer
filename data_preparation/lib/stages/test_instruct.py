@@ -13,6 +13,8 @@ import pytest
 from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
+import pyarrow.parquet as pq
+
 from data_preparation.lib.stages.instruct import build_instruct_mixture
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.shared import TokenCounter, download
@@ -76,6 +78,30 @@ def test_build_instruct_mixture_counts_split_and_columns(
     assert again == result
     assert {split: mtimes(layout.instruct_mixture_dir("t", "m", split)) for split in result} == before
     assert Manifest.load(layout.instruct_mixture_dir("t", "m", "validation")) == val
+
+
+def test_build_instruct_mixture_reads_only_the_rows_it_needs(
+    cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, two_sources: dict[str, SourceConfig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows carry their token count from the download, so a source is read shard by shard only until its share
+    of the budget is reached: with 16-row shards a 60-token share (10 rows of `a`) opens one shard of three."""
+    mixture = InstructMixtureConfig(sources={"a": 0.6, "b": 0.4}, max_tokens=64, input_inversions=0.0, val_split=0.0, seed=1)
+    cfg = _build(cfg_factory, layout, with_tokenizer, two_sources, mixture)  # 40 rows per source in 16-row shards
+    opened: list[str] = []
+    original = pq.ParquetFile
+
+    def spy(path: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(Path(path).parent.parent.name + "/" + Path(path).name)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", spy)  # `instruct.py` looks it up on the module at call time
+    train = build_instruct_mixture(cfg, "m", layout, budget_tokens=100, shard_size=8)["train"]
+    assert train.extra["counts"]["a"] == {
+        "available_rows": 40, "needed_rows": 10, "taken_rows": 10, "dropped_too_long": 0, "kept_rows": 10,
+        "tokens_per_row": 6.0, "target_tokens": 60.0,
+    }  # fmt: skip
+    assert train.extra["counts"]["b"]["taken_rows"] == 4 and train.extra["short_sources"] == {}
+    assert opened == ["a/data-00000.parquet", "b/data-00000.parquet"]
 
 
 def test_build_instruct_mixture_short_sources_and_length_check(
