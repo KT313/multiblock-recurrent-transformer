@@ -1,13 +1,14 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Row loaders: `LOADERS[name](source, offset, count) -> Iterator[Row]` yields at most `count` raw rows starting at
-row `offset` of the source's deterministic order (`hf_split`, `hf_stream`, `github_code`, `local`, `synthetic`).
-`datasets` is imported lazily so the HF cache environment can be configured before import."""
+"""Row loaders: `LOADERS[name](source, offset, count, *, token, index_dir, on_file) -> Iterator[Row]` yields at most
+`count` raw rows starting at row `offset` of the source's deterministic order (`hf_files`, `hf_split`, `hf_stream`,
+`github_code`, `local`, `synthetic`). `index_dir` is where `hf_files` / `github_code` persist their file index
+(None: in memory), `on_file` is called with every repo file they open (progress display). `datasets` is imported
+lazily so the HF cache environment can be configured before import."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator
-from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,13 +16,23 @@ from typing import Any, Protocol
 import pyarrow.parquet as pq
 
 from data_preparation.lib.schema.dataset_config import SourceConfig
+from data_preparation.lib.sources.hub_files import FileIndex, OnFile, read_rows
 from data_preparation.lib.sources.synthetic import synthetic_row
 
 Row = dict[str, Any]
 
 
 class Loader(Protocol):
-    def __call__(self, source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]: ...
+    def __call__(
+        self,
+        source: SourceConfig,
+        offset: int,
+        count: int,
+        *,
+        token: str | None = None,
+        index_dir: Path | None = None,
+        on_file: OnFile | None = None,
+    ) -> Iterator[Row]: ...
 
 
 GITHUB_CODE_DATA_FILES = "data/*.parquet"
@@ -66,7 +77,15 @@ def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> di
     return kwargs
 
 
-def load_hf_split(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
+def load_hf_split(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via `split[a:b]` slicing (materialised download, deterministic order)."""
     _check_offset_count(offset, count)
     if count == 0:
@@ -75,7 +94,15 @@ def load_hf_split(source: SourceConfig, offset: int, count: int, *, token: str |
     yield from _take(dataset, count)
 
 
-def load_hf_stream(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
+def load_hf_stream(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via streaming with `skip(offset)` (used for instruct sources)."""
     _check_offset_count(offset, count)
     if count == 0:
@@ -104,23 +131,69 @@ def iter_language(rows: Iterable[Row], language: str, limit: int, offset: int = 
             return
 
 
-def load_github_code(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
-    """Stream `hf_id` (codeparrot/github-code-clean) and keep rows of `source.language`.
+def hub_file_index(source: SourceConfig, default_pattern: str | None, index_dir: Path | None, token: str | None) -> FileIndex:
+    """The :class:`FileIndex` of a `hf_files` / `github_code` source (`load_kwargs.data_files` or `default_pattern`)."""
+    if not source.hf_id:  # validated by SourceConfig; repeated for the type checker
+        raise ValueError(f"loader {source.loader} requires hf_id")
+    pattern = source.load_kwargs.get("data_files", default_pattern)
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError(f"loader {source.loader} requires load_kwargs.data_files (a glob relative to the repo root)")
+    return FileIndex.open(source.hf_id, source.revision, pattern, index_dir, token)
+
+
+def load_hf_files(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
+    """Rows `offset..offset+count` of the repo files matching `load_kwargs.data_files`, sorted by path.
+
+    Files are downloaded one at a time into the Hub cache (never twice) and read locally; the per-(repo, revision,
+    glob) file index under `index_dir` lets a later fetch skip whole files (see `sources/hub_files.py`).
+    """
+    _check_offset_count(offset, count)
+    if count == 0:
+        return
+    index = hub_file_index(source, None, index_dir, token)
+    yield from read_rows(index, offset, count, token=token, on_file=on_file)
+
+
+def load_github_code(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
+    """`hf_files` over `hf_id` (codeparrot/github-code-clean, default `data_files: data/*.parquet`) keeping rows of
+    `source.language`.
 
     `offset` counts rows *of that language* already consumed, so an incremental fetch continues where the previous
-    one stopped (the stream is re-read from the start; the pinned `revision` keeps its order stable).
+    one stopped. The per-language row counts of fully read files are stored in the shared file index, so all
+    language sources read the same cached files and skip files they have already consumed.
     """
     _check_offset_count(offset, count)
     if count == 0:
         return
     if source.language is None:  # validated by SourceConfig; repeated for the type checker
         raise ValueError("github_code loader requires source.language")
-    # the repo ships a loading script, so its parquet files are read through the generic builder
-    load_kwargs = {"builder": "parquet", "data_files": GITHUB_CODE_DATA_FILES, **source.load_kwargs}
-    stream = _load_dataset(
-        **hub_load_kwargs(replace(source, load_kwargs=load_kwargs), token, split=source.split, streaming=True)
+    language = source.language
+    index = hub_file_index(source, GITHUB_CODE_DATA_FILES, index_dir, token)
+    yield from read_rows(
+        index,
+        offset,
+        count,
+        token=token,
+        on_file=on_file,
+        key=f"language={language}",
+        match=lambda row: bool(row["language"] == language),
     )
-    yield from iter_language(stream, source.language, count, offset)
 
 
 def list_local_files(directory: Path) -> list[Path]:
@@ -141,7 +214,15 @@ def _iter_local_file(path: Path) -> Iterator[Row]:
                     yield json.loads(line)
 
 
-def load_local(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
+def load_local(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
     """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order)."""
     _check_offset_count(offset, count)
     if count == 0:
@@ -159,7 +240,15 @@ def load_local(source: SourceConfig, offset: int, count: int, *, token: str | No
     yield from islice(all_rows(), offset, offset + count)
 
 
-def load_synthetic(source: SourceConfig, offset: int, count: int, *, token: str | None = None) -> Iterator[Row]:
+def load_synthetic(
+    source: SourceConfig,
+    offset: int,
+    count: int,
+    *,
+    token: str | None = None,
+    index_dir: Path | None = None,
+    on_file: OnFile | None = None,
+) -> Iterator[Row]:
     """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/holdout, instruct triple)."""
     _check_offset_count(offset, count)
     for index in range(offset, offset + count):
@@ -167,6 +256,7 @@ def load_synthetic(source: SourceConfig, offset: int, count: int, *, token: str 
 
 
 LOADERS: dict[str, Loader] = {
+    "hf_files": load_hf_files,
     "hf_split": load_hf_split,
     "hf_stream": load_hf_stream,
     "github_code": load_github_code,

@@ -19,6 +19,7 @@ from pathlib import Path
 from data_preparation.lib.schema.dataset_config import DatasetConfig
 from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.progress import progress
 from data_preparation.lib.build.planner import MixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
 from data_preparation.lib.stages import build_mixture, download, holdout, length_filter, prepare_tokenizer, process
 
@@ -66,15 +67,16 @@ def build(
         return current
     log.info("building %s under %s (%d item(s) missing)", cfg.name, layout.root, len(current.missing()))
 
+    items: list[tuple[str, str, Callable[[], object]]] = []
     if "tokenizer" in active and not current.tokenizer_complete:
-        _run("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout))
+        items.append(("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout)))
     for source_plan in current.sources:
         if selected is not None and source_plan.name not in selected:
             continue
         if source_plan.complete:
             log.info("%s: complete, skipping", source_plan.name)
             continue
-        _run("source", source_plan.name, partial(_build_pretrain_source, cfg, source_plan, layout, active, num_workers, hf_token, max_rounds))
+        items.append(("source", source_plan.name, partial(_build_pretrain_source, cfg, source_plan, layout, active, num_workers, hf_token, max_rounds)))
     if "holdout" in active:
         for holdout_plan in current.holdouts:
             if selected is not None and holdout_plan.name not in selected:
@@ -82,7 +84,7 @@ def build(
             if holdout_plan.complete:
                 log.info("%s: complete, skipping", holdout_plan.name)
                 continue
-            _run("holdout", holdout_plan.name, partial(_build_holdout, cfg, holdout_plan, layout))
+            items.append(("holdout", holdout_plan.name, partial(_build_holdout, cfg, holdout_plan, layout)))
     if "mixtures" in active:
         for mixture_plan in current.mixtures:
             if selected is not None and mixture_plan.name not in selected:
@@ -90,7 +92,12 @@ def build(
             if mixture_plan.complete:
                 log.info("%s: complete, skipping", mixture_plan.name)
                 continue
-            _run("mixture", mixture_plan.name, partial(_build_mixture, cfg, mixture_plan, layout, hf_token, max_rounds))
+            items.append(("mixture", mixture_plan.name, partial(_build_mixture, cfg, mixture_plan, layout, hf_token, max_rounds)))
+    with progress(total=len(items), desc="sources", unit="item") as bar:
+        for position, (what, name, action) in enumerate(items, start=1):
+            bar.set_description(f"sources {position}/{len(items)}: {name}")
+            _run(what, name, action)
+            bar.update(1)
 
     final = plan(cfg, layout)
     _log_plan(final)

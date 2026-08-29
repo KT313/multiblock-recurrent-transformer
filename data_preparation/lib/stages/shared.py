@@ -19,6 +19,7 @@ from data_preparation.lib.storage.parquet import estimate_tokens, list_parquet_f
 from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.progress import Progress, progress
 from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows
 from data_preparation.lib.sources import (
     Row,
@@ -196,9 +197,10 @@ def download(
 
     log.info("%s: fetching %s rows from offset %d -> %s", name, "all" if wanted == WHOLE_SOURCE else wanted, manifest.rows_fetched, out)
     stats = {"consumed": 0, "kept": 0, "skipped_malformed": 0, "exhausted": False}
-    rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, stats)
     start_shard = len(manifest.shards)
-    write_dict_rows(rows, out, shard_size, start_shard=start_shard)
+    with progress(total=None if wanted == WHOLE_SOURCE else wanted, desc=f"{name}: download", unit="row") as bar:
+        rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, stats, layout, bar)
+        write_dict_rows(rows, out, shard_size, start_shard=start_shard)
     record_new_shards(manifest, out, start_shard)
     manifest.rows_fetched += stats["consumed"]
     manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + stats["skipped_malformed"]
@@ -217,10 +219,12 @@ def _fetch_rows(
     max_consume: int | None,
     hf_token: str | None,
     stats: dict[str, Any],
+    layout: DatasetLayout,
+    bar: Progress,
 ) -> Iterator[Row]:
     """Rows to store for one download increment; keeps calling the loader until ``wanted`` rows are kept, the
     source is exhausted or ``max_consume`` source rows were inspected (instruct filters may drop rows, so one loader
-    call may not be enough)."""
+    call may not be enough). ``bar`` tracks kept rows (postfix: source rows consumed, current repo file)."""
     loader = get_loader(source.loader)
     converter = get_converter(source) if source.kind == "instruct" else None
     row_filter = get_filter(source.filter) if source.filter is not None else None
@@ -228,6 +232,12 @@ def _fetch_rows(
         raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
     if source.repeat_to_budget and source.loader == "synthetic":
         raise ValueError(f"{name}: repeat_to_budget needs a finite source, the synthetic loader is unbounded")
+    postfix: dict[str, Any] = {"consumed": 0}
+
+    def on_file(file: str) -> None:
+        postfix["file"] = file.rsplit("/", 1)[-1]
+        bar.set_postfix(postfix, refresh=False)
+
     while stats["kept"] < wanted:
         count = wanted - stats["kept"]
         if max_consume is not None:
@@ -236,12 +246,19 @@ def _fetch_rows(
                 stats["exhausted"] = True
                 return
         yielded = 0
-        for raw in loader(source, offset + stats["consumed"], count, token=hf_token):
+        rows = loader(
+            source, offset + stats["consumed"], count, token=hf_token, index_dir=layout.hub_index_dir(), on_file=on_file
+        )
+        for raw in rows:
             yielded += 1
             stats["consumed"] += 1
+            postfix["consumed"] = stats["consumed"]
+            if stats["consumed"] % 100 == 0:
+                bar.set_postfix(postfix, refresh=False)
             if source.kind != "instruct":
                 yield text_row(source, raw, name)
                 stats["kept"] += 1
+                bar.update(1)
                 continue
             if row_filter is not None and not row_filter(raw):
                 continue
@@ -253,6 +270,7 @@ def _fetch_rows(
                 continue
             yield {"instruction": row["instruction"], "input": row.get("input", ""), "output": row["output"]}
             stats["kept"] += 1
+            bar.update(1)
         if yielded < count:
             stats["exhausted"] = True
             return
@@ -274,7 +292,8 @@ def holdout(
     * ``synthetic``: the source's own ``seed`` (different from the training source) generates different rows.
     * ``local``: the **last** ``rows`` rows of the directory, so a training source reading the first rows of the
       same directory stays disjoint as long as it needs fewer than ``total - rows`` rows.
-    * ``hf_stream``: the loader cannot tell the size of a stream, so the **first** ``rows`` rows are taken.
+    * ``hf_files`` / ``hf_stream``: the **first** ``rows`` rows of the configured files / stream are taken, so the
+      config must point them at files disjoint from every training source (a different ``data_files`` glob).
     """
     source = cfg.sources[name]
     if source.kind != "holdout" or source.rows is None:
@@ -290,7 +309,12 @@ def holdout(
         total = _local_row_count(Path(str(source.path)))
         offset = max(total - source.rows, 0)
     log.info("%s: holding out %d rows from offset %d -> %s", name, source.rows, offset, out)
-    rows = [text_row(source, r, name) for r in get_loader(source.loader)(source, offset, source.rows)]
+    loader = get_loader(source.loader)
+    with progress(total=source.rows, desc=f"{name}: holdout", unit="row", leave=False) as bar:
+        rows = [
+            text_row(source, r, name)
+            for r in bar_rows(bar, loader(source, offset, source.rows, index_dir=layout.hub_index_dir()))
+        ]
     if len(rows) < source.rows:
         log.warning("%s: only %d of %d requested holdout rows available", name, len(rows), source.rows)
     random.Random(source.seed).shuffle(rows)
@@ -305,6 +329,13 @@ def holdout(
     manifest.extra = {"offset": offset, "requested_rows": source.rows, "seed": source.seed}
     manifest.save(out)
     return manifest
+
+
+def bar_rows(bar: Progress, rows: Iterator[Row]) -> Iterator[Row]:
+    """Pass ``rows`` through, advancing ``bar`` by one per row."""
+    for row in rows:
+        bar.update(1)
+        yield row
 
 
 def _local_row_count(directory: Path) -> int:

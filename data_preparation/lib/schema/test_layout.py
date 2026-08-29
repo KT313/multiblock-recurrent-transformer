@@ -27,6 +27,7 @@ def test_mixture_tokenizer_benchmark_dirs() -> None:
     assert layout.mixture_dir("crow", "flan", "validation") == Path("root/mixtures/crow/flan/validation")
     assert layout.tokenizer_dir("llama-32k") == Path("root/tokenizers/llama-32k")
     assert layout.benchmark_cache_dir() == Path("root/benchmarks")
+    assert layout.hub_index_dir() == Path("root/hub_index")
     assert MIXTURE_SPLITS == ("train", "validation")
 
 

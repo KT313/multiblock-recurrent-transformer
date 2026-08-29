@@ -6,6 +6,7 @@
     <root>/mixtures/<config name>/<mixture>/{train,validation}/
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination
+    <root>/hub_index/<repo>@<revision>/<glob hash>.json  file lists + row counts of `hf_files` / `github_code` repos
 """
 
 from __future__ import annotations
@@ -42,3 +43,6 @@ class DatasetLayout:
 
     def benchmark_cache_dir(self) -> Path:
         return self.root / "benchmarks"
+
+    def hub_index_dir(self) -> Path:
+        return self.root / "hub_index"

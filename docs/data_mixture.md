@@ -120,20 +120,20 @@ Validation: `flan_mixture/validation` (mixture) at 100%
 
 | Source | Rows | Seed | Loader | Origin |
 |---|---:|---:|---|---|
-| `fineweb_val` | 50,000 | 42 | `hf_split` | `HuggingFaceFW/fineweb-edu` name=sample-10BT |
+| `fineweb_val` | 50,000 | 42 | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet |
 
 ## Sources
 
 | Source | Kind | Loader | Origin | Revision | Details |
 |---|---|---|---|---|---|
-| `fineweb_edu` | pretrain | `hf_split` | `HuggingFaceFW/fineweb-edu` name=CC-MAIN-2013-20 | `87f09149ef47` | budget 2.15B |
-| `wikipedia` | pretrain | `hf_split` | `wikimedia/wikipedia` name=20231101.en | `b04c8d1ceb2f` | budget 297.0M |
-| `books_gutenberg` | pretrain | `hf_split` | `sedthh/gutenberg_english` | `28973b04f28f` | text_field `TEXT`, budget 198.0M |
-| `peso` | pretrain | `hf_split` | `nampdn-ai/mini-peS2o` | `18a60ef8d79f` | budget 135.0M |
-| `arxiv` | pretrain | `hf_split` | `common-pile/arxiv_papers_filtered` | `033cf7f53f9b` | budget 90.0M |
-| `openwebmath` | pretrain | `hf_split` | `open-web-math/open-web-math` | `fde8ef8de230` | budget 132.0M |
-| `tinygsm` | pretrain | `hf_split` | `ostapeno/tinygsm-mind` | `f5ecf416b715` | budget 99.0M |
-| `algebraic_stack` | pretrain | `hf_split` | `EleutherAI/proof-pile-2` data_files=algebraic-stack/train/*.jsonl.zst | `901a9273a770` | budget 66.0M |
+| `fineweb_edu` | pretrain | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=data/CC-MAIN-2013-20/*.parquet | `87f09149ef47` | budget 2.15B |
+| `wikipedia` | pretrain | `hf_files` | `wikimedia/wikipedia` data_files=20231101.en/*.parquet | `b04c8d1ceb2f` | budget 297.0M |
+| `books_gutenberg` | pretrain | `hf_files` | `sedthh/gutenberg_english` data_files=data/*.parquet | `28973b04f28f` | text_field `TEXT`, budget 198.0M |
+| `peso` | pretrain | `hf_files` | `nampdn-ai/mini-peS2o` data_files=train-*.parquet | `18a60ef8d79f` | budget 135.0M |
+| `arxiv` | pretrain | `hf_files` | `common-pile/arxiv_papers_filtered` data_files=arxiv-papers-*.json.gz | `033cf7f53f9b` | budget 90.0M |
+| `openwebmath` | pretrain | `hf_files` | `open-web-math/open-web-math` data_files=data/*.parquet | `fde8ef8de230` | budget 132.0M |
+| `tinygsm` | pretrain | `hf_files` | `ostapeno/tinygsm-mind` data_files=data/*.parquet | `f5ecf416b715` | budget 99.0M |
+| `algebraic_stack` | pretrain | `hf_files` | `EleutherAI/proof-pile-2` data_files=algebraic-stack/train/*.jsonl.zst | `901a9273a770` | budget 66.0M |
 | `gsm8k` | pretrain | `hf_split` | `openai/gsm8k` name=main | `740312add88f` | converter `gsm8k_question_answer`, repeated to budget, budget 33.0M |
 | `github_code_clean_python` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Python, text_field `code`, budget 126.0M |
 | `github_code_clean_javascript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language JavaScript, text_field `code`, budget 84.0M |
@@ -145,12 +145,12 @@ Validation: `flan_mixture/validation` (mixture) at 100%
 | `github_code_clean_shell` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Shell, text_field `code`, budget 16.8M |
 | `github_code_clean_sql` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language SQL, text_field `code`, budget 12.6M |
 | `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 12.6M |
-| `fineweb_val` | holdout | `hf_split` | `HuggingFaceFW/fineweb-edu` name=sample-10BT | `87f09149ef47` | - |
-| `flan` | instruct | `hf_stream` | `Open-Orca/FLAN` | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets` |
-| `metamath` | instruct | `hf_stream` | `meta-math/MetaMathQA` | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
-| `orca_math` | instruct | `hf_stream` | `microsoft/orca-math-word-problems-200k` | `29255d1770cc` | fields instruction←`question`, output←`answer` |
-| `evol_code` | instruct | `hf_stream` | `nickrosh/Evol-Instruct-Code-80k-v1` | `3ae930c20d54` | fields instruction←`instruction`, output←`output` |
-| `code_alpaca` | instruct | `hf_stream` | `sahil2801/CodeAlpaca-20k` | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output` |
-| `slimorca` | instruct | `hf_stream` | `Open-Orca/SlimOrca-Dedup` | `bd7d445aa1ff` | converter `sharegpt_conversations` |
-| `sharegpt` | instruct | `hf_stream` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000 |
-| `wizardlm` | instruct | `hf_stream` | `WizardLM/WizardLM_evol_instruct_V2_196k` | `8a7d15a83028` | converter `first_two_turns` |
+| `fineweb_val` | holdout | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet | `87f09149ef47` | - |
+| `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets` |
+| `metamath` | instruct | `hf_split` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
+| `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer` |
+| `evol_code` | instruct | `hf_split` | `nickrosh/Evol-Instruct-Code-80k-v1` data_files=EvolInstruct-Code-80k.json | `3ae930c20d54` | fields instruction←`instruction`, output←`output` |
+| `code_alpaca` | instruct | `hf_split` | `sahil2801/CodeAlpaca-20k` data_files=code_alpaca_20k.json | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output` |
+| `slimorca` | instruct | `hf_files` | `Open-Orca/SlimOrca-Dedup` data_files=data/*.parquet | `bd7d445aa1ff` | converter `sharegpt_conversations` |
+| `sharegpt` | instruct | `hf_split` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000 |
+| `wizardlm` | instruct | `hf_split` | `WizardLM/WizardLM_evol_instruct_V2_196k` data_files=WizardLM_evol_instruct_V2_143k.json | `8a7d15a83028` | converter `first_two_turns` |

@@ -22,9 +22,11 @@ from data_preparation.lib.sources.loaders import (
     Loader,
     Row,
     get_loader,
+    hub_file_index,
     iter_language,
     list_local_files,
     load_github_code,
+    load_hf_files,
     load_hf_split,
     load_hf_stream,
     load_local,
@@ -45,8 +47,8 @@ from data_preparation.lib.sources.synthetic import (
 __all__ = [
     "CONVERTERS", "FILTERS", "Converter", "Filter", "fields_converter", "first_two_turns", "get_converter",
     "get_filter", "gsm8k_question_answer", "instruction_input_output", "sharegpt_conversations", "sharegpt_quality",
-    "GITHUB_CODE_DATA_FILES", "LOADERS", "Loader", "Row", "get_loader", "iter_language", "list_local_files", "load_github_code",
-    "load_hf_split", "load_hf_stream", "load_local", "load_synthetic", "repeat_indices",
+    "GITHUB_CODE_DATA_FILES", "LOADERS", "Loader", "Row", "get_loader", "hub_file_index", "iter_language", "list_local_files", "load_github_code",
+    "load_hf_files", "load_hf_split", "load_hf_stream", "load_local", "load_synthetic", "repeat_indices",
     "N_WORD_TOKENS", "SPECIALS", "SYNTHETIC_DOC_WORDS", "SYNTHETIC_INSTRUCTION_WORDS", "SYNTHETIC_OUTPUT_WORDS",
     "VOCAB_SIZE", "synthetic_row", "write_synthetic_tokenizer",
 ]

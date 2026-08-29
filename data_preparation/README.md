@@ -56,6 +56,7 @@ dataset/
 │   └── holdout/      MANIFEST.json + data-*.parquet     `holdout` sources only            <- validation reads this
 ├── mixtures/<config name>/<mixture>/{train,validation}/   MANIFEST.json + shards           <- finetune stage
 ├── tokenizers/<tokenizer name>/                            MANIFEST.json + tokenizer files
+├── hub_index/<repo>@<revision>/<glob hash>.json            file lists + row counts of `hf_files` / `github_code` repos
 └── benchmarks/                                             cached benchmark test sets (decontamination only)
 ```
 
@@ -101,12 +102,33 @@ value and fetches another increment — at most 5 rounds, then an error. A loade
 `exhausted`; the build completes with a warning. `repeat_to_budget` sources (gsm8k) are fetched whole once and
 their rows repeated at process time.
 
-Sources are append-only and deterministic: loaders fetch `train[offset:offset+count]` at a pinned `revision`
-(`hf_split`), stream with `skip(offset)` (`hf_stream`, `github_code`) or read files in sorted order (`local`), so a
-config or stage that needs more rows appends the next slice and one that needs fewer reads a prefix. `filter`
+Sources are append-only and deterministic: loaders read the repo's files in sorted order, one file at a time
+(`hf_files`, `github_code`), fetch `train[offset:offset+count]` at a pinned `revision` (`hf_split`), stream with
+`skip(offset)` (`hf_stream`) or read local files in sorted order (`local`), so a config or stage that needs more
+rows appends the next slice and one that needs fewer reads a prefix. `filter`
 processes only raw shards newer than its manifest; `process` re-runs the streaming exact dedup over old + new
 shards (first occurrence wins, so old rows are kept unchanged). Mixtures are rebuilt whenever their definition, their
 budget or any input source's raw shard list changed.
+
+## Where things are cached
+
+Two caches, with different lifetimes:
+
+* **Hub cache** (`~/.cache/huggingface/hub`, or `HF_HOME` / `--cache_dir`): the original repo files fetched by
+  `hf_files` / `github_code` (`hf_hub_download`, one file at a time, never twice) and the `datasets` cache of
+  `hf_split` sources. Deleting it costs a re-download; nothing else depends on it.
+* **`dataset/sources/<source>/raw/`**: the rows this pipeline kept, in shards, with a manifest — the append-only
+  source cache that `filter` / `process` / mixtures are built from. `dataset/hub_index/` holds the small JSON file
+  indexes (file list per glob, rows per file) that let `hf_files` fetch at an offset without opening earlier files;
+  it is safe to delete (rebuilt on demand from the repo listing and the cached files).
+
+## Progress bars
+
+`build` shows a bar over the plan items and every stage shows its own (`<source>: download` with the rows kept,
+source rows consumed and the current repo file; `length_filter` per shard; `process` per row with the running token
+count; `holdout`; `build_mixture` per source and per step). Bars go to stderr and are disabled automatically when
+stderr is not a terminal or when `DATA_PREP_PROGRESS=0` is set; log lines are written through `tqdm.write` so they
+do not garble the bars. `hf_hub_download` prints its own byte-level bar per file.
 
 ## Training auto-prepares
 
@@ -127,9 +149,10 @@ Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -
 
 | Loader | Use for | Notes |
 |---|---|---|
-| `hf_split` | Hub datasets with parquet/jsonl files | `train[a:b]` slicing; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
-| `hf_stream` | large Hub datasets, instruct sources | streaming with `skip(offset)`; cannot tell the dataset size |
-| `github_code` | `codeparrot/github-code-clean` | streams the shards and keeps rows of `language:`; `text_field: code` |
+| `hf_files` | **default for Hub repos with many files** | `load_kwargs: {data_files: <glob>}` (required, relative to the repo root); files sorted by path, downloaded one at a time into the Hub cache on demand and read locally (`.parquet`, `.jsonl`, `.jsonl.zst`, `.jsonl.gz`/`.json.gz`, small `.json` arrays); a file index under `dataset/hub_index/` lets a top-up skip files already consumed |
+| `hf_split` | small single-file repos (one `.json`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
+| `hf_stream` | fallback | `datasets` streaming with `skip(offset)`; **caches nothing** — every fetch re-streams from the start, so avoid it for anything large |
+| `github_code` | `codeparrot/github-code-clean` | `hf_files` over `data/*.parquet` keeping rows of `language:` (`text_field: code`); all language sources read the same cached files and the shared index stores per-language row counts |
 | `local` | your own data | `path:` directory of `*.parquet` / `*.jsonl` files, read in sorted file order |
 | `synthetic` | tests / smoke runs | random-word rows from `seed:` |
 

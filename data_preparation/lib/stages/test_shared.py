@@ -143,6 +143,27 @@ def test_download_synthetic_appends_incrementally(
     assert [r["text"] for r in rows] == [synthetic_row("pretrain", 3, i)["text"] for i in range(40)]
 
 
+def test_download_passes_index_dir_and_on_file_to_the_loader(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hub-file loaders get `index_dir=<dataset>/hub_index` and an `on_file` callback from the download stage."""
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    seen: dict[str, Any] = {}
+
+    def fake_loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        on_file = kwargs["on_file"]
+        on_file("data/x.parquet")
+        return iter([{"text": "a"}, {"text": "b"}][:count])
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", fake_loader)
+    cfg = cfg_factory({"p": _synthetic()})
+    manifest = download(cfg, "p", layout, rows_needed=2, hf_token="tok")
+    assert manifest.rows() == 2
+    assert seen["index_dir"] == layout.hub_index_dir() and seen["token"] == "tok" and callable(seen["on_file"])
+
+
 def test_download_local_applies_converter_and_flags_exhaustion(
     cfg_factory: CfgFactory, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:

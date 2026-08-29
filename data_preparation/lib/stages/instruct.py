@@ -20,6 +20,7 @@ from data_preparation.lib.storage.parquet import normalized_hash, write_dict_row
 from data_preparation.lib.schema.dataset_config import DatasetConfig
 from data_preparation.lib.schema.layout import MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.progress import progress
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.stages.row_pipeline import check_length, create_input_inversion, has_required_fields, instruct_text
 from data_preparation.lib.stages.shared import (
@@ -81,8 +82,10 @@ def build_mixture(
             short_sources[src] = {"available_rows": info["available_rows"], "needed_rows": info["needed_rows"]}
         log.info("  %s: %d of %d needed rows (%.1f tokens/row), %d kept after length check", src, info["available_rows"], info["needed_rows"], info["tokens_per_row"], info["kept_rows"])
 
+    steps = progress(total=4, desc=f"{mixture_name}: build_mixture", unit="step", leave=False)
     rng = random.Random(mixture.seed)
     inverted = 0
+    steps.set_postfix({"step": "input_inversions"}, refresh=False)
     if mixture.input_inversions > 0 and rows:
         for index in rng.sample(range(len(rows)), int(len(rows) * mixture.input_inversions)):
             new_row = create_input_inversion(rows[index])
@@ -90,15 +93,21 @@ def build_mixture(
                 new_row["tokens"] = counter.count(instruct_text(new_row))
                 rows[index] = new_row
                 inverted += 1
+    steps.update(1)
+    steps.set_postfix({"step": "dedup"}, refresh=False)
     before = len(rows)
     rows = _dedup(rows)
     duplicates = before - len(rows)
     before = len(rows)
     rows = [r for r in rows if has_required_fields(r)]
     empty = before - len(rows)
+    steps.update(1)
+    steps.set_postfix({"step": "shuffle_split"}, refresh=False)
     rng.shuffle(rows)
     split_at = int(len(rows) * (1 - mixture.val_split))
     splits = {"train": rows[:split_at], "validation": rows[split_at:]}
+    steps.update(1)
+    steps.set_postfix({"step": "write"}, refresh=False)
 
     metadata = {
         "total_examples": len(rows),
@@ -127,6 +136,8 @@ def build_mixture(
         }
         manifest.save(out)
         manifests[split] = manifest
+    steps.update(1)
+    steps.close()
     return manifests
 
 
@@ -139,9 +150,11 @@ def _take_source_rows(
     """
     raw_dir = layout.source_dir(src, "raw")
     tokens: list[int] = []
-    for shard in raw.shards:
-        for batch in pq.ParquetFile(raw_dir / shard.name).iter_batches(columns=list(INSTRUCT_COLUMNS)):
-            tokens.extend(counter.count_many([instruct_text(r) for r in batch.to_pylist()]))
+    with progress(total=raw.rows(), desc=f"{src}: count_tokens", unit="row", leave=False) as bar:
+        for shard in raw.shards:
+            for batch in pq.ParquetFile(raw_dir / shard.name).iter_batches(columns=list(INSTRUCT_COLUMNS)):
+                tokens.extend(counter.count_many([instruct_text(r) for r in batch.to_pylist()]))
+                bar.update(batch.num_rows)
     available = len(tokens)
     per_row = sum(tokens) / available if available else 0.0
     needed = ceil(target_tokens / per_row) if per_row > 0 else 0

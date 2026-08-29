@@ -33,6 +33,7 @@ from data_preparation.lib.schema.dataset_config import DatasetConfig, Decontamin
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.progress import Progress, progress
 from data_preparation.lib.storage.manifest import Manifest, shard_rows
 from data_preparation.lib.stages.row_pipeline import (
     FILTERED_SCHEMA,
@@ -88,7 +89,7 @@ def length_filter(cfg: DatasetConfig, name: str, layout: DatasetLayout, *, batch
         return manifest
 
     log.info("%s: length-filtering %d raw shard(s) -> %s", name, len(pending), out)
-    for shard in pending:
+    for shard in progress(pending, desc=f"{name}: length_filter", unit="shard", leave=False):
         index = int(shard.name[len("data-") : -len(".parquet")])
         stats: Counter[str] = Counter()
 
@@ -168,14 +169,15 @@ def process(
         rows = _quality_filter(rows, stats["quality_filter"])
     if processing.decontamination.enabled:
         rows = _decontaminate(rows, processing.decontamination, num_workers, layout, stats["decontamination"])
-    rows = _count_tokens(rows, counter, name, shard_size)
-    if processing.dedup.mode == "minhash":
-        rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
     token_sums: list[int] = []
-    if source.repeat_to_budget:
-        rows = _repeat_to_budget(list(rows), target_tokens, stats)
-    rows = _accumulate_tokens(rows, token_sums, shard_size)
-    write_dict_rows(rows, out, shard_size, start_shard=0)
+    with progress(total=filtered.rows(), desc=f"{name}: process", unit="row", leave=False) as bar:
+        rows = _count_tokens(rows, counter, name, shard_size, bar)
+        if processing.dedup.mode == "minhash":
+            rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
+        if source.repeat_to_budget:
+            rows = _repeat_to_budget(list(rows), target_tokens, stats)
+        rows = _accumulate_tokens(rows, token_sums, shard_size)
+        write_dict_rows(rows, out, shard_size, start_shard=0)
 
     manifest = new_manifest(cfg, name, source_hash, "processed", tokens=True)
     manifest.rows_fetched = filtered.rows_fetched
@@ -278,9 +280,17 @@ def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
         yield chunk
 
 
-def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_size: int) -> Iterator[Row]:
+def _count_tokens(rows: Iterator[Row], counter: TokenCounter, name: str, batch_size: int, bar: Progress) -> Iterator[Row]:
+    """Token-count ``rows`` in batches; ``bar`` advances per input row (input rows, not survivors, since the dedup /
+    quality / decontamination generators upstream drop rows silently) with the running token sum as postfix."""
+    total = 0
+    consumed = 0
     for chunk in _chunks(rows, batch_size):
         tokens = counter.count_many([row["text"] for row in chunk])
+        total += sum(tokens)
+        consumed += len(chunk)
+        bar.update(len(chunk))
+        bar.set_postfix({"tokens": total}, refresh=False)
         for row, n in zip(chunk, tokens):
             yield {"text": row["text"], "source": name, "tokens": n}
 

@@ -23,7 +23,7 @@ from typing import Any, Literal, Optional
 from jsonargparse import ArgumentParser, Namespace
 
 SourceKind = Literal["pretrain", "holdout", "instruct"]
-LoaderName = Literal["hf_split", "hf_stream", "github_code", "local", "synthetic"]
+LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
 DedupMode = Literal["none", "exact", "minhash"]
 TokenCountMode = Literal["tokenizer", "estimate"]
 
@@ -102,9 +102,9 @@ class SourceConfig:
 
     kind: SourceKind
     loader: LoaderName = "hf_split"
-    hf_id: Optional[str] = None  # Hub dataset id (hf_split / hf_stream / github_code)
+    hf_id: Optional[str] = None  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
     revision: Optional[str] = None  # Hub commit sha; pin it so row order is stable across increments
-    load_kwargs: dict[str, Any] = field(default_factory=dict)  # extra `load_dataset` kwargs (name, data_files, ...)
+    load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files: {data_files: <glob>}; else `load_dataset` kwargs
     split: str = "train"
     text_field: str = "text"  # pretrain/holdout: column holding the document
     language: Optional[str] = None  # github_code: language label of codeparrot/github-code-clean
@@ -120,10 +120,12 @@ class SourceConfig:
     processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
 
     def __post_init__(self) -> None:
-        if self.loader in ("hf_split", "hf_stream") and not self.hf_id:
-            raise ValueError(f"loader {self.loader} requires hf_id")
         if self.loader == "github_code" and not self.language:
             raise ValueError("loader github_code requires language")
+        if self.loader in ("hf_files", "hf_split", "hf_stream", "github_code") and not self.hf_id:
+            raise ValueError(f"loader {self.loader} requires hf_id")
+        if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
+            raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
         if self.loader == "local" and not self.path:
             raise ValueError("loader local requires path")
         if self.kind == "holdout" and (self.rows is None or self.rows <= 0):
