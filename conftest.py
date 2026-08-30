@@ -13,6 +13,7 @@ from model import RecurrentGPT
 
 REPO_ROOT = Path(__file__).resolve().parent
 TINY_DATASET_CONFIG = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
+TINY_MODEL_ARCHITECTURE = REPO_ROOT / "config" / "model_architecture" / "tiny.yaml"
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -61,8 +62,8 @@ def tiny_tokenizer_dir(tiny_layout: DatasetLayout) -> Path:
 
 @pytest.fixture
 def tiny_model() -> RecurrentGPT:
-    """Fresh, seeded `tiny` preset model on the CPU (~256K parameters)."""
+    """Fresh, seeded `tiny` model (config/model_architecture/tiny.yaml) on the CPU (~256K parameters)."""
     from model import build_model
 
     torch.manual_seed(0)
-    return build_model("tiny")
+    return build_model(TINY_MODEL_ARCHITECTURE)

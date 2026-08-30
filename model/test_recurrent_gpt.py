@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from model import build_model
-from model.config import RecurrentConfig
+from model.test_config import TINY_ARCHITECTURE, tiny_config
 from model.attention import precompute_freqs_cis
 from model.blocks import SandwichBlock
 import model.recurrent_gpt as recurrent_gpt_module
@@ -38,7 +38,7 @@ def per_block(values: int | list[int]) -> list[int]:
 
 def seeded_tiny(seed: int = 0, **kwargs: Any) -> RecurrentGPT:
     torch.manual_seed(seed)
-    return build_model("tiny", **kwargs)
+    return build_model(TINY_ARCHITECTURE, **kwargs)
 
 
 # --- structure -------------------------------------------------------------------------------------------------------
@@ -62,7 +62,7 @@ def test_build_model_kwargs_routing() -> None:
     m = seeded_tiny(ignore_index=-1, gradient_checkpointing=True, n_layers_in_coda=3)
     assert m.ignore_index == -1 and m.gradient_checkpointing is True
     assert len(m.transformer.coda) == 3
-    cfg = RecurrentConfig.from_name("tiny")
+    cfg = tiny_config()
     with pytest.raises(ValueError, match="overrides"):
         build_model(cfg, n_embd=32)
     assert isinstance(build_model(cfg), RecurrentGPT)

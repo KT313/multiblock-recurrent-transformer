@@ -26,10 +26,14 @@ class DataEntry:
 
 @dataclass
 class Settings:
-    # Data: everything about the data (sources, stages, token budgets, weights, tokenizer) lives in the dataset
-    # config; the run config only references it. `training/train.py` verifies the prepared data and, with
-    # `auto_prepare`, builds what is missing (`python data_preparation/prepare.py build --dataset_config ...`).
-    dataset_config: str  # path to config/datasets/<name>.yaml (required)
+    # Config references (required): everything about the data (sources, stages, token budgets, weights, tokenizer)
+    # lives in the dataset config and everything about the model architecture (sizes, depth, recurrence) in the
+    # model architecture config; the run config only references both.
+    dataset_config: str  # path to config/datasets/<name>.yaml
+    model_architecture_config: str  # path to config/model_architecture/<name>.yaml
+
+    # Data: `training/train.py` verifies the prepared data and, with `auto_prepare`, builds what is missing
+    # (`python data_preparation/prepare.py build --dataset_config ...`).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
     prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers); also the
@@ -46,9 +50,10 @@ class Settings:
     seed: int = 1337
 
     # Model
-    model_name: str = "crow-300m-final"  # preset name from model/presets.py
-    model_overwrite: dict[str, Any] = field(default_factory=dict)  # overrides passed to the preset
-    block_size: int = 2048  # sequence length; must match the model preset and be <= the dataset's max_seq_length
+    model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
+    # config, e.g. `--model_overwrite '{"n_embd": 512}'` for a CLI sweep; {} = the file as is
+    block_size: int = 2048  # sequence length; must equal the architecture config's block_size and be <= the
+    # dataset config's max_seq_length
 
     # Data loading
     dataloader_num_workers: int = 4
@@ -95,6 +100,8 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.dataset_config:
             raise ValueError("dataset_config is required (path to config/datasets/<name>.yaml)")
+        if not self.model_architecture_config:
+            raise ValueError("model_architecture_config is required (path to config/model_architecture/<name>.yaml)")
         if not self.stage_base_lrs:
             raise ValueError("stage_base_lrs must list one base LR per stage of the dataset config")
         if any(lr < 0 for lr in self.stage_base_lrs):

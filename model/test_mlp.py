@@ -7,11 +7,12 @@ import pytest
 import torch
 
 from model.config import RecurrentConfig
+from model.test_config import tiny_config
 from model.mlp import GatedMLP
 
 
 def make_mlp(**overrides: Any) -> tuple[GatedMLP, RecurrentConfig]:
-    cfg = RecurrentConfig.from_name("tiny", **overrides)
+    cfg = tiny_config(**overrides)
     torch.manual_seed(0)
     return GatedMLP(cfg), cfg
 

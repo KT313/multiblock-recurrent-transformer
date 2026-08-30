@@ -3,12 +3,13 @@
 """Architecture configuration of the multi-block recurrent transformer (the `crow-300m-final` code path only)."""
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
+import yaml
+
 from .init import Init
-from .presets import PRESETS
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -108,11 +109,18 @@ class RecurrentConfig:
         return values
 
     @classmethod
-    def from_name(cls, name: str, **overrides: Any) -> "RecurrentConfig":
-        """Build a config from a preset in `presets.PRESETS`, with keyword overrides applied on top."""
-        if name not in PRESETS:
-            raise ValueError(f"{name!r} is not a known preset, choose from {sorted(PRESETS)}")
-        return cls(**{**PRESETS[name], **overrides})
+    def from_yaml(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
+        """Build a config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
+        dataclass fields, nested settings as nested mappings), with keyword overrides applied on top."""
+        with open(path, encoding="utf-8") as fp:
+            loaded = yaml.safe_load(fp)
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{path}: expected a mapping of RecurrentConfig fields, got {type(loaded).__name__}")
+        kwargs: dict[str, Any] = dict(loaded)
+        unknown = sorted(set(kwargs) - {f.name for f in fields(cls)})
+        if unknown:
+            raise ValueError(f"{path}: unknown RecurrentConfig key(s) {unknown}")
+        return cls(**{**kwargs, **overrides})
 
     @classmethod
     def from_json(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":

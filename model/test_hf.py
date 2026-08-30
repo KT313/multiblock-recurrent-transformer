@@ -14,6 +14,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
+from model.test_config import TINY_ARCHITECTURE, tiny_config
 from model.hf import RecurrentGPTConfig, RecurrentGPTForCausalLM, export_to_hf, parse_recurrence_steps
 
 
@@ -42,7 +43,7 @@ def test_parse_recurrence_steps_length_mismatch() -> None:
 
 
 def test_config_round_trip() -> None:
-    cfg = RecurrentConfig.from_name("tiny", rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5])
+    cfg = tiny_config(rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5])
     hf_cfg = RecurrentGPTConfig.from_recurrent_config(cfg)
     assert hf_cfg.model_type == "recurrent_gpt"
     assert hf_cfg.rope_base == 12_345
@@ -51,21 +52,24 @@ def test_config_round_trip() -> None:
     assert hf_cfg.tie_word_embeddings is True
     back = hf_cfg.to_recurrent_config()
     expected = cfg.to_dict()
-    expected["name"] = ""  # the preset name is not an HF field
+    expected["name"] = ""  # the architecture label is not an HF field
     assert back.to_dict() == expected
     assert back.head_size == cfg.head_size and back.n_layer == cfg.n_layer
 
 
-def test_hf_config_defaults_to_crow_preset() -> None:
+def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
+    """Keys missing from a config.json fall back to `RecurrentConfig()` (the export has no access to config/)."""
     hf_cfg = RecurrentGPTConfig()
-    crow = RecurrentConfig.from_name("crow-300m-final")
-    assert hf_cfg.n_layers_in_recurrent_block == [4, 4, 4]
-    assert hf_cfg.num_hidden_layers == crow.effective_expected_depth
+    defaults = RecurrentConfig()
+    assert hf_cfg.n_layers_in_recurrent_block == defaults.n_layers_in_recurrent_block == [4]
+    assert hf_cfg.num_hidden_layers == defaults.effective_expected_depth
+    assert hf_cfg.n_embd == defaults.n_embd == 1024 and hf_cfg.vocab_size == 32000
     assert hf_cfg.rope_base == 50_000
+    assert hf_cfg.to_recurrent_config() == defaults
 
 
 def test_hf_config_survives_json_round_trip(tmp_path: Path) -> None:
-    hf_cfg = RecurrentGPTConfig.from_recurrent_config(RecurrentConfig.from_name("tiny"))
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config())
     hf_cfg.save_pretrained(tmp_path)
     loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
     assert loaded.to_recurrent_config() == hf_cfg.to_recurrent_config()
@@ -73,7 +77,7 @@ def test_hf_config_survives_json_round_trip(tmp_path: Path) -> None:
 
 def tiny_hf_model() -> RecurrentGPTForCausalLM:
     torch.manual_seed(0)
-    return RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(RecurrentConfig.from_name("tiny")))
+    return RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(tiny_config()))
 
 
 def test_wrapper_forward_matches_inner_model_in_eval() -> None:
@@ -160,7 +164,7 @@ def test_prepare_inputs_for_generation_forwards_only_input_ids() -> None:
 
 def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir: Path) -> None:
     torch.manual_seed(0)
-    model = build_model("tiny")
+    model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_dir=tiny_tokenizer_dir)
     assert out_dir == tmp_path / "a" / "b"
     tok = AutoTokenizer.from_pretrained(out_dir)
@@ -170,7 +174,7 @@ def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir
 
 def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = build_model("tiny")
+    model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     names = {p.name for p in out_dir.iterdir()}
     assert {"config.json", "model.safetensors", "hf.py", "recurrent_gpt.py", "config.py"} <= names
@@ -200,7 +204,7 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
 
 def test_generate_runs(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = build_model("tiny")
+    model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     loaded = load_exported(out_dir)
     prompt = ids(1, 8)
@@ -217,7 +221,7 @@ def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> No
     """The copied sources must work without `model` importable: load in a subprocess whose cwd is the temp dir and
     whose only `sys.path` entries are the interpreter's own, then compare logits with the un-exported model."""
     torch.manual_seed(0)
-    model = build_model("tiny")
+    model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     model.eval()
     x = ids()

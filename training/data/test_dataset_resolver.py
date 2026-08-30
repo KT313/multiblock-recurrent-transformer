@@ -116,6 +116,7 @@ def _triples(entries: list[DataEntry]) -> list[tuple[str, float, dict[str, Any] 
 def _settings(dataset_config: Path, dataset_dir: Path, **overrides: Any) -> Settings:
     base: dict[str, Any] = {
         "dataset_config": str(dataset_config),
+        "model_architecture_config": "config/model_architecture/tiny.yaml",
         "dataset_dir": str(dataset_dir),
         "stage_base_lrs": [3e-4, 1e-4, 5e-5],
         "block_size": 256,

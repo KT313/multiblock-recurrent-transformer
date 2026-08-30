@@ -232,7 +232,7 @@ def test_main_parses_argv_and_trains(monkeypatch: pytest.MonkeyPatch, tiny_datas
 
 def test_block_size_mismatch_raises(tmp_path: Path, tiny_dataset_dir: Path) -> None:
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", block_size="128")
-    with pytest.raises(ValueError, match="block_size 128 does not match"):
+    with pytest.raises(ValueError, match="block_size 128 of the run config does not match"):
         train_module.train(parse_settings(["--config", str(yaml_path)]))
 
 

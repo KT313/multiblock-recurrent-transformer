@@ -64,7 +64,9 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
     model_type = "recurrent_gpt"
 
     def __init__(self, rope_base: int = 50_000, **kwargs: Any) -> None:
-        defaults = RecurrentConfig.from_name("crow-300m-final")
+        # Defaults only fill keys missing from a config.json (export_to_hf writes every field); the exported folder
+        # is standalone and has no access to config/model_architecture/, so the dataclass defaults are used.
+        defaults = RecurrentConfig()
         for name in _MODEL_FIELDS:
             setattr(self, name, kwargs.pop(name, getattr(defaults, name)))
         self.rope_base = rope_base

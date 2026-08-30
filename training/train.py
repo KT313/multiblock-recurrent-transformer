@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python training/train.py` from the repo root
 
-from model import RecurrentGPT, build_model
+from model import RecurrentConfig, RecurrentGPT, build_model
 from model.hf import export_to_hf
 from training.backend import Backend, get_backend
 from training.checkpoint import (
@@ -175,11 +175,13 @@ def train(cfg: Settings) -> None:
     print(f"Total training steps: {max_steps:,} ({cfg.gradient_accumulation_steps} micro-batches each)")
     loaders = build_stage_dataloaders(cfg, resolved, tokenizer, backend)
 
-    raw_model = build_model(
-        cfg.model_name, **cfg.model_overwrite, ignore_index=IGNORE_INDEX, gradient_checkpointing=cfg.gradient_checkpointing
-    )
-    if raw_model.config.block_size != cfg.block_size:
-        raise ValueError(f"block_size {cfg.block_size} does not match the model's {raw_model.config.block_size}")
+    model_config = RecurrentConfig.from_yaml(cfg.model_architecture_config, **cfg.model_overwrite)
+    if model_config.block_size != cfg.block_size:
+        raise ValueError(
+            f"block_size {cfg.block_size} of the run config does not match block_size {model_config.block_size} of the "
+            f"model architecture config {cfg.model_architecture_config} (with model_overwrite applied)"
+        )
+    raw_model = build_model(model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=cfg.gradient_checkpointing)
     with open(out_dir / "run_config.json", "w") as f:
         json.dump(asdict(cfg), f, indent=4)
     raw_model.config.to_json(out_dir / "model_config.json")

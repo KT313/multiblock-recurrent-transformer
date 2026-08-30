@@ -10,12 +10,13 @@ from torch import Tensor
 from model.attention import precompute_freqs_cis
 from model.blocks import SandwichBlock
 from model.config import RecurrentConfig
+from model.test_config import tiny_config
 from model.mlp import GatedMLP
 from model.norms import RMSNorm
 
 
 def make_block(**overrides: Any) -> tuple[SandwichBlock, RecurrentConfig, Tensor]:
-    cfg = RecurrentConfig.from_name("tiny", **overrides)
+    cfg = tiny_config(**overrides)
     torch.manual_seed(0)
     block = SandwichBlock(cfg)
     freqs = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)

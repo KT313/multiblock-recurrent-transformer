@@ -1,9 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the settings schema: YAML loading (`config/tiny.yaml`), CLI overrides, validation, derived values."""
+"""Tests for the settings schema: YAML loading (`config/tiny.yaml`, the complete `config/crow_300m_final.yaml`), CLI
+overrides, validation, derived values."""
 
+from dataclasses import MISSING, asdict, fields
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
 from training.settings import DataEntry, Settings, parse_settings
 
@@ -11,11 +15,76 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
 CROW_YAML = REPO_ROOT / "config" / "crow_300m_final.yaml"
 TINY_DATASET_CONFIG = "config/datasets/tiny.yaml"
+TINY_MODEL_ARCHITECTURE = "config/model_architecture/tiny.yaml"
+
+# The values config/crow_300m_final.yaml set explicitly before it listed every key; every other key = the default.
+CROW_EXPLICIT: dict[str, Any] = {
+    "run_name": "crow-300m-final",
+    "out_dir": "outputs",
+    "resume": True,
+    "seed": 233,
+    "model_architecture_config": "config/model_architecture/crow_300m_final.yaml",
+    "block_size": 2048,
+    "dataset_config": "config/datasets/crow_300m_final.yaml",
+    "dataset_dir": "dataset",
+    "auto_prepare": True,
+    "prepare_num_workers": 4,
+    "stage_base_lrs": [3e-4, 1e-4, 5e-5],
+    "backend": "single_device",
+    "precision": "bf16-mixed",
+    "compile_model": True,
+    "gradient_checkpointing": False,
+    "micro_batch_size": 4,
+    "world_batch_size": 1024,
+    "dataloader_num_workers": 8,
+    "sort_batches_by_length": True,
+    "sequence_padding_multiple": 128,
+    "optimizer": "ELLISAdam",
+    "optim_config": {
+        "lr": 1e-4,
+        "weight_decay": 4e-5,
+        "betas": [0.9, 0.95],
+        "update_clipping": True,
+        "atan_adam": True,
+        "running_init": True,
+        "decouple_wd": True,
+    },
+    "no_weight_decay_for_bias_and_norm_params": True,
+    "grad_clip": 1.0,
+    "lr_schedule": "trapezoid",
+    "warmup_steps": 64,
+    "cooldown_steps": 64,
+    "min_lr": 0.0,
+    "resume_warmup_steps": 8,
+    "log_step_interval": 1,
+    "log_gradient_metrics": True,
+    "eval_step_interval": 16,
+    "eval_iters": 50,
+    "partial_depth_eval": [1, 2, 4, 8, 16],
+    "save_step_interval": 128,
+    "save_last_step": True,
+    "logger_project": "recurtrain-baseline",
+    "wandb_offline": True,
+}
 
 
 def _settings(**overrides: object) -> Settings:
-    base: dict[str, object] = {"dataset_config": TINY_DATASET_CONFIG, "stage_base_lrs": [1e-3]}
+    base: dict[str, object] = {
+        "dataset_config": TINY_DATASET_CONFIG,
+        "model_architecture_config": TINY_MODEL_ARCHITECTURE,
+        "stage_base_lrs": [1e-3],
+    }
     return Settings(**(base | overrides))  # type: ignore[arg-type]  # heterogeneous kwargs for a test helper
+
+
+def _field_defaults() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for f in fields(Settings):
+        if f.default is not MISSING:
+            out[f.name] = f.default
+        elif f.default_factory is not MISSING:
+            out[f.name] = f.default_factory()
+    return out
 
 
 def test_data_entry_defaults() -> None:
@@ -26,7 +95,8 @@ def test_data_entry_defaults() -> None:
 def test_parse_tiny_yaml() -> None:
     cfg = parse_settings(["--config", str(TINY_YAML)])
     assert isinstance(cfg, Settings)
-    assert cfg.run_name == "tiny" and cfg.model_name == "tiny" and cfg.block_size == 256
+    assert cfg.run_name == "tiny" and cfg.block_size == 256
+    assert cfg.model_architecture_config == TINY_MODEL_ARCHITECTURE and cfg.model_overwrite == {}
     assert cfg.dataset_config == TINY_DATASET_CONFIG and cfg.dataset_dir == "dataset"
     assert cfg.auto_prepare is True and cfg.prepare_num_workers == 1 and cfg.allow_dataset_change is False
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
@@ -43,9 +113,46 @@ def test_parse_crow_yaml() -> None:
     cfg = parse_settings(["--config", str(CROW_YAML)])
     assert cfg.dataset_config == "config/datasets/crow_300m_final.yaml"
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
-    assert cfg.block_size == 2048 and cfg.model_name == "crow-300m-final" and cfg.optimizer == "ELLISAdam"
+    assert cfg.block_size == 2048 and cfg.optimizer == "ELLISAdam"
+    assert cfg.model_architecture_config == "config/model_architecture/crow_300m_final.yaml"
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.save_step_interval, cfg.eval_step_interval) == (64, 64, 128, 16)
     assert not hasattr(cfg, "tokenizer_path") and not hasattr(cfg, "training_stages")
+
+
+def test_crow_yaml_lists_every_settings_field() -> None:
+    """The thesis run config is the template: exactly the set of `Settings` fields, nothing stale, nothing missing."""
+    with open(CROW_YAML, encoding="utf-8") as fp:
+        keys = set(yaml.safe_load(fp))
+    assert keys == {f.name for f in fields(Settings)}
+
+
+def test_crow_yaml_effective_values_are_unchanged() -> None:
+    """Listing every key must not change the run: explicit values as before, every other key at its default."""
+    cfg = parse_settings(["--config", str(CROW_YAML)])
+    expected = _field_defaults() | CROW_EXPLICIT
+    assert set(expected) == {f.name for f in fields(Settings)}
+    assert asdict(cfg) == expected
+    assert cfg.model_overwrite == {} and cfg.wandb_enabled is True and cfg.export_to_hf is False
+    assert cfg.prepare_max_parallel_downloads == 2 and cfg.allow_dataset_change is False
+    assert cfg.resume_checkpoint_path is None and cfg.export_hf_path is None
+
+
+def test_run_configs_reference_existing_architecture_and_dataset_configs() -> None:
+    for path in (TINY_YAML, CROW_YAML):
+        cfg = parse_settings(["--config", str(path)])
+        assert (REPO_ROOT / cfg.model_architecture_config).is_file(), cfg.model_architecture_config
+        assert (REPO_ROOT / cfg.dataset_config).is_file(), cfg.dataset_config
+        assert cfg.model_architecture_config.startswith("config/model_architecture/")
+
+
+def test_parse_without_model_architecture_config_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_settings(["--dataset_config", TINY_DATASET_CONFIG, "--stage_base_lrs", "[1e-3]"])
+
+
+def test_validation_empty_model_architecture_config() -> None:
+    with pytest.raises(ValueError, match="model_architecture_config is required"):
+        _settings(model_architecture_config="")
 
 
 def test_cli_overrides_win_over_yaml() -> None:
@@ -95,7 +202,9 @@ def test_parse_without_config_requires_dataset_config() -> None:
 
 def test_parse_without_stage_base_lrs_is_rejected() -> None:
     with pytest.raises(ValueError, match="stage_base_lrs"):
-        parse_settings(["--dataset_config", TINY_DATASET_CONFIG])
+        parse_settings(
+            ["--dataset_config", TINY_DATASET_CONFIG, "--model_architecture_config", TINY_MODEL_ARCHITECTURE]
+        )
 
 
 def test_unknown_cli_key_is_rejected() -> None:
@@ -106,7 +215,7 @@ def test_unknown_cli_key_is_rejected() -> None:
 def test_defaults_are_a_single_gpu_config() -> None:
     cfg = _settings()
     assert cfg.backend == "single_device" and cfg.world_batch_size % cfg.micro_batch_size == 0
-    assert cfg.model_name == "crow-300m-final" and cfg.optimizer == "ELLISAdam"
+    assert cfg.model_overwrite == {} and cfg.optimizer == "ELLISAdam"
     assert cfg.optim_config == {"lr": 1e-4, "weight_decay": 4e-5, "betas": (0.9, 0.95)}
     assert cfg.out_dir == "outputs" and cfg.resume is True
     assert cfg.export_to_hf is False and cfg.export_hf_path is None

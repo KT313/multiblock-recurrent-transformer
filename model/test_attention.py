@@ -10,10 +10,11 @@ from torch import Tensor
 
 from model.attention import CausalSelfAttention, apply_rotary_emb_complex_like, attention_sdpa, precompute_freqs_cis
 from model.config import RecurrentConfig
+from model.test_config import tiny_config
 
 
 def make_attn(**overrides: Any) -> tuple[CausalSelfAttention, RecurrentConfig, Tensor]:
-    cfg = RecurrentConfig.from_name("tiny", **overrides)
+    cfg = tiny_config(**overrides)
     torch.manual_seed(0)
     attn = CausalSelfAttention(cfg)
     freqs = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)

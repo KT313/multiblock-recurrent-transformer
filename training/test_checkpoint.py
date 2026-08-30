@@ -25,6 +25,8 @@ from training.checkpoint import (
 )
 from training.optim import ELLISAdam, get_param_groups
 
+TINY_MODEL_ARCHITECTURE = Path(__file__).resolve().parent.parent / "config" / "model_architecture" / "tiny.yaml"
+
 
 @pytest.fixture
 def backend() -> SingleDeviceBackend:
@@ -126,7 +128,7 @@ def test_save_load_forward_bit_identical(
     assert path.exists()
 
     torch.manual_seed(999)
-    fresh = build_model("tiny")
+    fresh = build_model(TINY_MODEL_ARCHITECTURE)
     fresh_opt = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
     rest = load_checkpoint(backend, path, fresh, fresh_opt)
     assert rest["step"] == 1 and rest["stage"] == 0 and rest["config"] == {"seed": 42}
@@ -166,7 +168,7 @@ def test_load_without_optimizer(tmp_path: Path, backend: SingleDeviceBackend, ti
     opt, _ = _train_one_step(tiny_model)
     path = tmp_path / "c.pth"
     save_checkpoint(backend, path, tiny_model, opt, {"step": 1})
-    fresh = build_model("tiny")
+    fresh = build_model(TINY_MODEL_ARCHITECTURE)
     rest = load_checkpoint(backend, path, fresh)
     assert rest == {"step": 1}
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
@@ -187,7 +189,7 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     save_checkpoint(backend, path, Wrapper(tiny_model), opt, {"step": 1})
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
-    fresh = build_model("tiny")
+    fresh = build_model(TINY_MODEL_ARCHITECTURE)
     load_checkpoint(backend, path, Wrapper(fresh))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
 

@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.config`: per-block broadcasting, derived sizes, presets and JSON round trip."""
+"""Tests for `model.config`: per-block broadcasting, derived sizes, the shipped architecture YAMLs and the JSON
+round trip. `tiny_config` / `TINY_ARCHITECTURE` are the shared helpers of the other `model/test_*.py` files."""
 
 from pathlib import Path
 from typing import Any
@@ -7,11 +8,19 @@ from typing import Any
 import pytest
 
 from model.config import RecurrentConfig, RoPESettings, find_multiple
-from model.presets import PRESETS
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ARCHITECTURE_DIR = REPO_ROOT / "config" / "model_architecture"
+TINY_ARCHITECTURE = ARCHITECTURE_DIR / "tiny.yaml"
+CROW_ARCHITECTURE = ARCHITECTURE_DIR / "crow_300m_final.yaml"
 
 
-def tiny(**overrides: Any) -> RecurrentConfig:
-    return RecurrentConfig.from_name("tiny", **overrides)
+def tiny_config(**overrides: Any) -> RecurrentConfig:
+    """`config/model_architecture/tiny.yaml` with overrides applied (the test-suite model)."""
+    return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **overrides)
+
+
+tiny = tiny_config
 
 
 @pytest.mark.parametrize(("n", "k", "expected"), [(512, 512, 512), (500, 128, 512), (1, 8, 8), (32000, 2048, 32768)])
@@ -46,8 +55,9 @@ def test_per_block_lists_are_kept() -> None:
 
 @pytest.mark.parametrize("field", ["mean_recurrence", "mean_backprop_depth"])
 def test_length_mismatch_raises(field: str) -> None:
+    per_block: dict[str, Any] = {"mean_recurrence": 1, "mean_backprop_depth": 1, field: [1, 2]}
     with pytest.raises(ValueError, match=f"{field} has 2 entries but there are 3"):
-        tiny(n_layers_in_recurrent_block=[1, 1, 1], **{field: [1, 2]})
+        tiny(n_layers_in_recurrent_block=[1, 1, 1], **per_block)
 
 
 def test_broadcast_helper_directly() -> None:
@@ -100,33 +110,101 @@ def test_depth_arithmetic() -> None:
     assert cfg.init.num_layers == cfg.effective_expected_depth
 
 
-def test_crow_preset_depths() -> None:
-    cfg = RecurrentConfig.from_name("crow-300m-final")
+# --- the shipped architecture YAMLs ----------------------------------------------------------------------------------
+
+
+def test_crow_architecture_yaml() -> None:
+    cfg = RecurrentConfig.from_yaml(CROW_ARCHITECTURE)
+    assert cfg.name == "crow-300m-final"
     assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
+    assert cfg.mean_recurrence == [12, 12, 12] and cfg.mean_backprop_depth == [8, 8, 8]
     assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
     assert cfg.n_layer == 3 * 4 * 8
     assert cfg.padded_vocab_size == 32768
     assert cfg.head_size == 64
+    assert cfg.intermediate_size == 4096 and cfg.block_size == 2048 and cfg.vocab_size == 32000
+    assert isinstance(cfg.norm_eps, float) and cfg.norm_eps == 1e-6  # YAML floats need a dot: 1e-6 would be a str
+    assert cfg.rope_settings == RoPESettings(rope_base=50_000)
+    assert cfg.qk_bias is True and cfg.tie_embeddings is True
 
 
-def test_from_name_applies_overrides() -> None:
+def test_tiny_architecture_yaml() -> None:
+    cfg = tiny()
+    assert cfg.name == "tiny"
+    assert (cfg.block_size, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
+    assert (cfg.vocab_size, cfg.padded_vocab_size, cfg.head_size) == (512, 512, 16)
+    assert cfg.n_layers_in_prelude == 2 and cfg.n_layers_in_coda == 1
+    assert cfg.n_layers_in_recurrent_block == [1, 1]
+    assert cfg.mean_recurrence == [2, 2] and cfg.mean_backprop_depth == [2, 2]
+    assert isinstance(cfg.norm_eps, float) and cfg.norm_eps == 1e-6
+
+
+def test_architecture_yamls_list_every_tunable_field() -> None:
+    """Both files list the same keys: every dataclass field except the fixed single-value ones."""
+    import yaml
+
+    fixed = {
+        "attn_impl",
+        "init_strategy",
+        "init_orthogonal",
+        "activation_checkpoint_impl",
+        "injection_type",
+        "state_init",
+        "sampling_scheme",
+    }
+    expected = {f.name for f in RecurrentConfig.__dataclass_fields__.values()} - fixed
+    for path in (TINY_ARCHITECTURE, CROW_ARCHITECTURE):
+        with open(path, encoding="utf-8") as fp:
+            keys = set(yaml.safe_load(fp))
+        assert keys == expected, path
+    assert {"rope_settings", "n_layers_in_recurrent_block", "mean_recurrence", "mean_backprop_depth"} <= expected
+
+
+def test_from_yaml_applies_overrides() -> None:
     cfg = tiny(n_embd=32, num_attention_heads=2, mean_recurrence=[7, 9])
     assert cfg.name == "tiny"
     assert cfg.n_embd == 32
     assert cfg.head_size == 16
     assert cfg.mean_recurrence == [7, 9]
-    assert tiny().n_embd == PRESETS["tiny"]["n_embd"]
+    assert tiny().n_embd == 64
 
 
-def test_from_name_unknown_preset_raises() -> None:
-    with pytest.raises(ValueError, match="not a known preset"):
-        RecurrentConfig.from_name("does-not-exist")
+def test_from_yaml_does_not_share_state_between_loads() -> None:
+    a = tiny(rope_settings={"rope_base": 1})
+    b = tiny(n_layers_in_recurrent_block=3, mean_recurrence=99, mean_backprop_depth=9)
+    c = tiny()
+    assert a.rope_settings.rope_base == 1 and b.rope_settings.rope_base == 50_000
+    assert b.n_layers_in_recurrent_block == [3] and b.mean_recurrence == [99] and b.mean_backprop_depth == [9]
+    assert c == tiny() and c.n_layers_in_recurrent_block == [1, 1] and c.mean_recurrence == [2, 2]
+    assert c.rope_settings is not tiny().rope_settings
+    assert c.mean_recurrence is not tiny().mean_recurrence
 
 
-def test_from_name_does_not_mutate_preset() -> None:
-    before = dict(PRESETS["tiny"])
-    tiny(n_layers_in_recurrent_block=3, mean_recurrence=99)
-    assert PRESETS["tiny"] == before
+def test_from_yaml_unknown_key_raises(tmp_path: Path) -> None:
+    path = tmp_path / "arch.yaml"
+    path.write_text(TINY_ARCHITECTURE.read_text() + "\nn_heads: 4\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"arch\.yaml: unknown RecurrentConfig key\(s\) \['n_heads'\]"):
+        RecurrentConfig.from_yaml(path)
+
+
+def test_from_yaml_requires_a_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "arch.yaml"
+    path.write_text("- 1\n- 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected a mapping"):
+        RecurrentConfig.from_yaml(path)
+
+
+def test_from_yaml_accepts_str_path_and_nested_rope_settings(tmp_path: Path) -> None:
+    path = tmp_path / "arch.yaml"
+    path.write_text("n_embd: 32\nnum_attention_heads: 2\nrope_settings:\n  rope_base: 123\n", encoding="utf-8")
+    cfg = RecurrentConfig.from_yaml(str(path))
+    assert cfg.n_embd == 32 and cfg.rope_settings == RoPESettings(rope_base=123)
+    assert cfg.n_layers_in_recurrent_block == [4]  # dataclass defaults fill the rest
+
+
+def test_from_yaml_missing_file_raises() -> None:
+    with pytest.raises(FileNotFoundError):
+        RecurrentConfig.from_yaml(ARCHITECTURE_DIR / "does-not-exist.yaml")
 
 
 def test_json_round_trip(tmp_path: Path) -> None:

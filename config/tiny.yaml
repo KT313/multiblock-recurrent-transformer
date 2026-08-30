@@ -1,16 +1,18 @@
-# Tiny smoke-run config: the real train.py code path with a ~240K-parameter model on synthetic data.
+# Tiny smoke-run config: the real train.py code path with a ~256K-parameter model on synthetic data.
 # Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
-# a few seconds on CPU or GPU. The data (stages, token budgets, weights, tokenizer) is defined by
-# config/datasets/tiny.yaml; training builds it under dataset/ (sources/, processed/, tokenizers/) when missing
-# (`auto_prepare`), or run `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
+# a few seconds on CPU or GPU. The model is defined by config/model_architecture/tiny.yaml, the data (stages, token
+# budgets, weights, tokenizer) by config/datasets/tiny.yaml; training builds the data under dataset/ (sources/,
+# processed/, tokenizers/) when missing (`auto_prepare`), or run
+# `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
+# This file stays short; config/crow_300m_final.yaml lists every `Settings` key with a comment.
 
 run_name: tiny
 out_dir: outputs/tiny
 resume: false
 seed: 42
 
-model_name: tiny
-block_size: 256              # <= max_seq_length of the dataset config
+model_architecture_config: config/model_architecture/tiny.yaml
+block_size: 256              # = block_size of the architecture config, <= max_seq_length of the dataset config
 
 dataset_config: config/datasets/tiny.yaml
 dataset_dir: dataset
