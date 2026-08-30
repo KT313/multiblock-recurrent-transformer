@@ -20,6 +20,8 @@ class DataEntry:
     data_dir: str  # directory with *.parquet files
     weight: float = 1.0  # sampling weight relative to the other entries of the same stage
     data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
+    skip_rows: int = 0  # rows of the directory to skip from the start (shard order data-00000, data-00001, ...)
+    max_rows: Optional[int] = None  # at most this many rows after the skip; None = up to the last row
 
 
 @dataclass

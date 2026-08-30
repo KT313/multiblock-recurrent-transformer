@@ -8,6 +8,7 @@ from typing import Iterator
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from torch.utils.data import DataLoader
 
 from training.data import datasets as datasets_module
 from training.data.datasets import DEFAULT_DATA_SIGNATURE, ParquetTextDataset, WeightedMixtureDataset
@@ -126,6 +127,149 @@ def test_sharding_counts_across_read_batches_and_files(small_dir: Path, monkeypa
 def test_iteration_is_repeatable(pretrain_dir: Path) -> None:
     ds = ParquetTextDataset(pretrain_dir, "pre")
     assert [r["text"] for r in ds] == [r["text"] for r in ds]
+
+
+# --- row range (skip_rows / max_rows) ---------------------------------------------------------------------------------
+
+SHARD_SIZES = [7, 12, 5]  # data-00000 .. data-00002, unequal, several row groups each (row_group_size=4)
+TOTAL = sum(SHARD_SIZES)
+
+
+@pytest.fixture
+def ranged_dir(tmp_path: Path) -> Path:
+    """Three unequal shards in the build's naming scheme; rows carry their directory index as unique text."""
+    d = tmp_path / "ranged"
+    d.mkdir()
+    first = 0
+    for shard, size in enumerate(SHARD_SIZES):
+        texts = [f"doc {i}" for i in range(first, first + size)]
+        pq.write_table(pa.table({"text": texts}), d / f"data-{shard:05d}.parquet", row_group_size=4)
+        first += size
+    return d
+
+
+def _texts(ds: ParquetTextDataset) -> list[str]:
+    return [str(r["text"]) for r in ds]
+
+
+def _docs(start: int, stop: int) -> list[str]:
+    return [f"doc {i}" for i in range(start, stop)]
+
+
+def test_default_range_is_every_row_in_order(ranged_dir: Path) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p")
+    assert (ds.start, ds.stop, len(ds)) == (0, TOTAL, TOTAL)
+    assert _texts(ds) == _docs(0, TOTAL)
+
+
+def test_skip_rows_inside_first_shard(ranged_dir: Path) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=3)
+    assert len(ds) == TOTAL - 3
+    assert _texts(ds) == _docs(3, TOTAL)
+
+
+def test_skip_rows_spanning_whole_shards(ranged_dir: Path) -> None:
+    # skip the first shard exactly, and the first shard plus part of the second
+    for skip in (SHARD_SIZES[0], SHARD_SIZES[0] + 5, SHARD_SIZES[0] + SHARD_SIZES[1]):
+        ds = ParquetTextDataset(ranged_dir, "p", skip_rows=skip)
+        assert len(ds) == TOTAL - skip
+        assert _texts(ds) == _docs(skip, TOTAL)
+
+
+def test_max_rows_ending_mid_shard(ranged_dir: Path) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p", max_rows=10)  # ends inside data-00001
+    assert len(ds) == 10
+    assert _texts(ds) == _docs(0, 10)
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=2, max_rows=3)  # both ends inside data-00000
+    assert _texts(ds) == _docs(2, 5)
+
+
+def test_skip_plus_max_beyond_total_yields_remainder(ranged_dir: Path) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=20, max_rows=1000)
+    assert len(ds) == TOTAL - 20
+    assert _texts(ds) == _docs(20, TOTAL)
+
+
+def test_skip_at_or_beyond_total_yields_nothing(ranged_dir: Path) -> None:
+    for skip in (TOTAL, TOTAL + 1, 10 * TOTAL):
+        ds = ParquetTextDataset(ranged_dir, "p", skip_rows=skip)
+        assert len(ds) == 0
+        assert _texts(ds) == []
+    assert _texts(ParquetTextDataset(ranged_dir, "p", max_rows=0)) == []
+
+
+def test_negative_range_raises(ranged_dir: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ParquetTextDataset(ranged_dir, "p", skip_rows=-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        ParquetTextDataset(ranged_dir, "p", max_rows=-1)
+
+
+@pytest.mark.parametrize("k", [0, 3, SHARD_SIZES[0], SHARD_SIZES[0] + 4, SHARD_SIZES[0] + SHARD_SIZES[1], TOTAL])
+@pytest.mark.parametrize("read_batch", [1024, 3])
+def test_split_at_k_is_disjoint_and_complete(
+    ranged_dir: Path, monkeypatch: pytest.MonkeyPatch, k: int, read_batch: int
+) -> None:
+    """[0, k) as validation and [k, end) as training tile the directory, for k inside shards and on boundaries,
+    with read batches larger than the whole directory and smaller than a row group."""
+    monkeypatch.setattr(datasets_module, "PARQUET_READ_BATCH_ROWS", read_batch)
+    val = ParquetTextDataset(ranged_dir, "val", max_rows=k)
+    train = ParquetTextDataset(ranged_dir, "train", skip_rows=k)
+    assert _texts(val) == _docs(0, k)
+    assert _texts(train) == _docs(k, TOTAL)
+    assert len(val) + len(train) == TOTAL
+
+
+@pytest.mark.parametrize(("world", "num_workers"), [(1, 2), (2, 2), (2, 3)])
+def test_shards_partition_the_range_only(
+    ranged_dir: Path, monkeypatch: pytest.MonkeyPatch, world: int, num_workers: int
+) -> None:
+    """Shard `shard_id` takes range_rows[shard_id::num_shards]; shards tile the range and never leave it."""
+    skip, max_rows = 5, 13
+    expected = _docs(skip, skip + max_rows)
+    seen: list[str] = []
+    for rank in range(world):
+        for worker_id in range(num_workers):
+            monkeypatch.setattr(
+                datasets_module, "get_worker_info", lambda w=worker_id: SimpleNamespace(id=w, num_workers=num_workers)
+            )
+            ds = ParquetTextDataset(ranged_dir, "p", shard=(rank, world), skip_rows=skip, max_rows=max_rows)
+            rows = _texts(ds)
+            assert rows == expected[rank * num_workers + worker_id :: world * num_workers]
+            seen.extend(rows)
+    assert sorted(seen) == sorted(expected)
+
+
+def test_dataloader_workers_yield_the_range_once(ranged_dir: Path) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=4, max_rows=15)
+    single = Counter(_texts(ds))
+    loader: DataLoader[dict[str, str]] = DataLoader(ds, batch_size=None, num_workers=2)
+    multi = Counter(str(r["text"]) for r in loader)
+    assert multi == single == Counter(_docs(4, 19))
+
+
+def test_files_and_row_groups_outside_range_are_not_read(ranged_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=SHARD_SIZES[0] + 9, max_rows=1)  # last group of data-00001
+    opened: list[str] = []
+    real = pq.ParquetFile
+
+    def spy(path: Path) -> pq.ParquetFile:  # datasets.py only ever passes the path
+        opened.append(path.name)
+        return real(path)
+
+    monkeypatch.setattr(pq, "ParquetFile", spy)  # datasets.py calls it through the same module object
+    assert _texts(ds) == _docs(SHARD_SIZES[0] + 9, SHARD_SIZES[0] + 10)
+    assert opened == ["data-00001.parquet"]
+
+
+def test_range_length_is_the_epoch_and_mixture_cycles_inside_it(ranged_dir: Path) -> None:
+    """The class does not cycle itself: one __iter__ is one epoch over the range. WeightedMixtureDataset restarts
+    an exhausted member, which replays the range from its start and never leaves it."""
+    ds = ParquetTextDataset(ranged_dir, "p", skip_rows=6, max_rows=4)
+    assert _texts(ds) == _texts(ds) == _docs(6, 10)
+    mixture = WeightedMixtureDataset([ds], [1.0], seed=0)
+    rows = [str(r["text"]) for r in itertools.islice(iter(mixture), 10)]
+    assert rows == _docs(6, 10) + _docs(6, 10) + _docs(6, 8)
 
 
 # --- WeightedMixtureDataset -------------------------------------------------------------------------------------------
