@@ -37,7 +37,8 @@ uv run python data_preparation/prepare.py build  --dataset_config config/dataset
 ```
 
 `crow_300m_mini.yaml` is the thesis config with tiny budgets — it touches every real source (minutes, a few MB) and
-is the quickest way to check that the data path works end to end; `tools/capped_download.sh 500 <command>` runs any
+is the quickest way to check that the data path works end to end (it is a dataset config only; there is no
+`config/crow_300m_mini.yaml` run config, point a run at it with `--dataset_config` if you want to train on it); `tools/capped_download.sh 500 <command>` runs any
 command under a hard download cap (see `tools/README.md`).
 
 See `data_preparation/README.md` for the dataset config, `docs/data_mixture.md` for the thesis mixture (generated

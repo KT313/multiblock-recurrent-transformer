@@ -3,7 +3,7 @@
 
     python data_preparation/prepare.py build  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                               [--sources S ...] [--steps tokenizer download process validation instruct_mixtures]
-                                              [--num_workers N] [--hf_token T] [--dry_run]
+                                              [--num_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR] [--dry_run]
     python data_preparation/prepare.py status --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny   # = build --dataset_config config/datasets/tiny.yaml
