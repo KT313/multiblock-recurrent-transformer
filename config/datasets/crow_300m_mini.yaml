@@ -1,5 +1,5 @@
-# Real-source smoke config: `crow_300m_final.yaml` with tiny budgets (300k / 150k / 60k tokens, 40 validation rows) and
-# everything else identical, so a build exercises every source, loader and file format of the thesis config with a
+# Real-source smoke config: `crow_300m_final.yaml` with tiny budgets (300k / 150k / 60k tokens) and everything else
+# identical, so a build exercises every source, loader and file format of the thesis config with a
 # few MB of data in minutes. `nampdn-ai/mini-peS2o` is gated: export `HF_TOKEN` (or `huggingface-cli login`) before
 # building. Build with
 #     uv run python data_preparation/prepare.py build --dataset_config config/datasets/crow_300m_mini.yaml
@@ -12,13 +12,16 @@ tokenizer:
   hf_id: hf-internal-testing/llama-tokenizer
   revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
 
-max_seq_length: 2048
+max_seq_length: 2048            # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
+                                # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
+                                # costs nothing
+block_size: 2048                # training sequence length; the planner counts sequences with it; the run config must match
 token_count: tokenizer          # or: estimate (chars / 4)
+validation_fraction: 0.05       # share of a source's rows held out when it is used for training AND validation
 
-processing:                     # defaults for every pretrain source; a source may override with its own block
-  min_chars: 50
-  max_chars: 20000
-  dedup: {mode: exact, normalize: true}   # minhash: {mode: minhash, threshold: 0.95, num_perm: 256}
+processing:                     # defaults for every source; a pretrain source may override with its own block
+  min_chars: 50                 # pretrain only; the upper bound is max_seq_length at download
+  dedup: {mode: exact, normalize: true, bloom_memory_mb: 1024}   # minhash (not for scale): {mode: minhash, threshold: 0.95, num_perm: 256}
   quality_filter: false
   decontamination: {enabled: false}
 
@@ -30,18 +33,16 @@ sources:
     hf_id: HuggingFaceFW/fineweb-edu
     revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
     load_kwargs: {data_files: "data/CC-MAIN-2013-20/*.parquet"}   # 14 files
-    tokens_per_row_estimate: 2000
-    validation_tokens: 40_000   # held-out split (~40 documents, replaces the old fineweb_val source): the first processed rows
-                                 # worth this many tokens go to sources/fineweb_edu/validation (stage key
-                                 # fineweb_edu/validation), deduplicated with the training rows; append-only, so the
-                                 # boundary never moves on a top-up
+    describe_tokens_per_row: 2000
+    # used for training and validation: the first 5 % of its processed rows (validation_fraction) are the held-out
+    # set of both pretraining stages
   wikipedia:
     kind: pretrain
     loader: hf_files
     hf_id: wikimedia/wikipedia                     # replaces the removed `wikipedia` script dataset (20220301.en)
     revision: b04c8d1ceb2f5cd4588862100d08de323dccfbaa
     load_kwargs: {data_files: "20231101.en/*.parquet"}   # 41 files
-    tokens_per_row_estimate: 1500
+    describe_tokens_per_row: 1500
   books_gutenberg:
     kind: pretrain
     loader: hf_files
@@ -49,42 +50,42 @@ sources:
     revision: 28973b04f28fd7be4a6186a042bc26159d4366ca
     load_kwargs: {data_files: "data/*.parquet"}   # 37 files
     text_field: TEXT
-    tokens_per_row_estimate: 3000
+    describe_tokens_per_row: 3000
   peso:
     kind: pretrain
     loader: hf_files
     hf_id: nampdn-ai/mini-peS2o                    # gated: needs HF_TOKEN / --hf_token
     revision: 18a60ef8d79fdcae1494469845b0cbcb7e88b8b2
     load_kwargs: {data_files: "train-*.parquet"}   # 20 files at the repo root
-    tokens_per_row_estimate: 1500
+    describe_tokens_per_row: 1500
   arxiv:
     kind: pretrain
     loader: hf_files
     hf_id: common-pile/arxiv_papers_filtered
     revision: 033cf7f53f9b348deec868c1a5a48484f3ee9e52
     load_kwargs: {data_files: "arxiv-papers-*.json.gz"}   # 8 gzipped json-lines files at the repo root
-    tokens_per_row_estimate: 1500
+    describe_tokens_per_row: 1500
   openwebmath:
     kind: pretrain
     loader: hf_files
     hf_id: open-web-math/open-web-math
     revision: fde8ef8de2300f5e778f56261843dab89f230815
     load_kwargs: {data_files: "data/*.parquet"}   # 114 files
-    tokens_per_row_estimate: 750
+    describe_tokens_per_row: 750
   tinygsm:
     kind: pretrain
     loader: hf_files
     hf_id: ostapeno/tinygsm-mind
     revision: f5ecf416b71547b454cb9f4b06e769c2650ca33b
     load_kwargs: {data_files: "data/*.parquet"}   # 50 files
-    tokens_per_row_estimate: 300
+    describe_tokens_per_row: 300
   algebraic_stack:
     kind: pretrain
     loader: hf_files
     hf_id: EleutherAI/proof-pile-2                 # ships a loading script; the jsonl.zst files are read directly
     revision: 901a9273a770e9d4138c5ddd91802f9c5c6cdc4b
     load_kwargs: {data_files: "algebraic-stack/train/*.jsonl.zst"}   # 79 files
-    tokens_per_row_estimate: 750
+    describe_tokens_per_row: 750
   gsm8k:
     kind: pretrain
     loader: hf_split
@@ -94,42 +95,37 @@ sources:
     converter: gsm8k_question_answer               # question + answer -> text
     # 7.5k rows in total: smaller than its budget in the full run, so the training sampler cycles it (see `epochs`
     # in the status table)
-    tokens_per_row_estimate: 300
+    describe_tokens_per_row: 300
   # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). All
   # language sources of the repo are downloaded in one pass over its 880 `data/*.parquet` files (every row group is
   # fetched once and its rows go to the language that wants them); the shared file index (`dataset/hub_index/`)
   # remembers per-language row counts so a top-up skips files and row groups it has already consumed.
-  github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_java:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Java,       text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_cpp:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: C++,        text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_go:         {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: GO,         text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_rust:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Rust,       text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_shell:      {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Shell,      text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, tokens_per_row_estimate: 500}
-  github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, tokens_per_row_estimate: 500}
+  github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_java:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Java,       text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_cpp:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: C++,        text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_go:         {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: GO,         text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_rust:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Rust,       text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_shell:      {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Shell,      text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, describe_tokens_per_row: 500}
 
-  # --- instruction tuning (kind: instruct), consumed through the flan_instruct below ----------------------------------
+  # --- instruction tuning (kind: instruct), mixed by weight in the finetune stage below ------------------------------
+  # `input_inversions: 0.05`: 5 % of the rows are turned into "given the output, what was the instruction?" at build
+  # time (seeded, per row). Instruct sources are written to processed/ in a seeded shuffled order (the default for
+  # kind instruct), because their repos are sorted by task and the training loader reads a source's shards in order.
   # Every repo uses `hf_files`: multi-file parquet repos one file at a time through the Hub cache, the single-file
   # JSON-array repos (metamath 396 MB, wizardlm 375 MB, sharegpt 671 MB, evol_code 122 MB) streamed incrementally
   # from the start with `ijson` so a build reads only the prefix it needs instead of downloading the whole file.
-  flan:        {kind: instruct, loader: hf_files, hf_id: Open-Orca/FLAN,                            revision: 6845b1b3b53c6d5c5b1e49767ed759df3fc246cc, load_kwargs: {data_files: "flan_zsopt_data/*.parquet"}, fields: {instruction: inputs, output: targets}, tokens_per_row_estimate: 300}
-  metamath:    {kind: instruct, loader: hf_files, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, load_kwargs: {data_files: "MetaMathQA-395K.json"}, fields: {instruction: query, output: response}, tokens_per_row_estimate: 300}
-  orca_math:   {kind: instruct, loader: hf_files, hf_id: microsoft/orca-math-word-problems-200k,    revision: 29255d1770cc4eac66e5e7fa378cba542c026350, load_kwargs: {data_files: "data/*.parquet"}, fields: {instruction: question, output: answer}, tokens_per_row_estimate: 300}
-  evol_code:   {kind: instruct, loader: hf_files, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, load_kwargs: {data_files: "EvolInstruct-Code-80k.json"}, fields: {instruction: instruction, output: output}, tokens_per_row_estimate: 400}
-  code_alpaca: {kind: instruct, loader: hf_files, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, load_kwargs: {data_files: "code_alpaca_20k.json"}, fields: {instruction: instruction, input: input, output: output}, tokens_per_row_estimate: 200}
-  slimorca:    {kind: instruct, loader: hf_files, hf_id: Open-Orca/SlimOrca-Dedup,                  revision: bd7d445aa1ff695fb7e223bf3b5b321e075f244e, load_kwargs: {data_files: "data/*.parquet"}, converter: sharegpt_conversations, tokens_per_row_estimate: 300}
-  sharegpt:    {kind: instruct, loader: hf_files, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, tokens_per_row_estimate: 400}
-  wizardlm:    {kind: instruct, loader: hf_files, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, tokens_per_row_estimate: 400}
-
-instruct_mixtures:
-  flan_instruct:
-    sources: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
-    max_tokens: 2048
-    input_inversions: 0.05
-    val_split: 0.05
-    seed: 42
+  flan:        {kind: instruct, loader: hf_files, hf_id: Open-Orca/FLAN,                            revision: 6845b1b3b53c6d5c5b1e49767ed759df3fc246cc, load_kwargs: {data_files: "flan_zsopt_data/*.parquet"}, fields: {instruction: inputs, output: targets}, input_inversions: 0.05, describe_tokens_per_row: 300}
+  metamath:    {kind: instruct, loader: hf_files, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, load_kwargs: {data_files: "MetaMathQA-395K.json"}, fields: {instruction: query, output: response}, input_inversions: 0.05, describe_tokens_per_row: 300}
+  orca_math:   {kind: instruct, loader: hf_files, hf_id: microsoft/orca-math-word-problems-200k,    revision: 29255d1770cc4eac66e5e7fa378cba542c026350, load_kwargs: {data_files: "data/*.parquet"}, fields: {instruction: question, output: answer}, input_inversions: 0.05, describe_tokens_per_row: 300}
+  evol_code:   {kind: instruct, loader: hf_files, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, load_kwargs: {data_files: "EvolInstruct-Code-80k.json"}, fields: {instruction: instruction, output: output}, input_inversions: 0.05, describe_tokens_per_row: 400}
+  code_alpaca: {kind: instruct, loader: hf_files, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, load_kwargs: {data_files: "code_alpaca_20k.json"}, fields: {instruction: instruction, input: input, output: output}, input_inversions: 0.05, describe_tokens_per_row: 200}
+  slimorca:    {kind: instruct, loader: hf_files, hf_id: Open-Orca/SlimOrca-Dedup,                  revision: bd7d445aa1ff695fb7e223bf3b5b321e075f244e, load_kwargs: {data_files: "data/*.parquet"}, converter: sharegpt_conversations, input_inversions: 0.05, describe_tokens_per_row: 300}
+  sharegpt:    {kind: instruct, loader: hf_files, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, input_inversions: 0.05, describe_tokens_per_row: 400}
+  wizardlm:    {kind: instruct, loader: hf_files, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, input_inversions: 0.05, describe_tokens_per_row: 400}
 
 stages:
   - name: pretrain_phase1
@@ -152,7 +148,7 @@ stages:
       peso: 0.03
       arxiv: 0.02
       openwebmath: 0.03
-    val: {fineweb_edu/validation: 1.0}
+    val: {fineweb_edu: 1.0}             # split off the training rows by validation_fraction (5 %)
 
   - name: pretrain_phase2
     tokens: 150_000
@@ -175,10 +171,12 @@ stages:
       gsm8k: 0.022
       peso: 0.09
       arxiv: 0.06
-    val: {fineweb_edu/validation: 1.0}
+    val: {fineweb_edu: 1.0}             # split off the training rows by validation_fraction (5 %)
 
   - name: finetune
     tokens: 60_000
     transition_pct: 0.0
-    train: {flan_instruct: 1.0}
-    val: {flan_instruct/validation: 1.0}
+    # the former flan_instruct mixture shares, now stage weights; the same eight sources validate with the same shares
+    # (each is split by validation_fraction, so train and val rows never share a document)
+    train: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
+    val:   {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}

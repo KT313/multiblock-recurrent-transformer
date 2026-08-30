@@ -2,11 +2,12 @@
 """``prepare.py describe``: render a dataset config as a Markdown document (``docs/data_mixture.md`` is generated
 with it, so the documentation of the thesis mixture cannot drift from ``config/datasets/crow_300m_final.yaml``).
 
-Pure function of the config file: tokenizer and processing defaults, one table per stage (weights and derived
-token budgets), one per mixture (shares and derived example counts), validation sources and the source registry. The leading
+Pure function of the config file: tokenizer, sequence length and processing defaults, one table per stage (weights,
+derived token budgets and sequence counts), the validation split per source and the source registry. The leading
 comment block of the YAML file (the lines starting with ``#`` before the first key) is rendered as the "Notes"
-section, so config-specific remarks live next to the config. Numbers are the same arithmetic the planner uses
-(``DatasetConfig.source_budget_tokens`` / ``instruct_mixture_budget_tokens``); estimates use ``tokens_per_row_estimate``.
+section, so config-specific remarks live next to the config. Sequence counts are the planner's arithmetic
+(``DatasetConfig.sequence_budget``); tokens are ``stage.tokens × weight``; the rows-per-stage column is an estimate
+from ``describe_tokens_per_row`` (which nothing else uses).
 """
 
 from __future__ import annotations
@@ -33,16 +34,16 @@ def describe(cfg: DatasetConfig, config_path: str | Path, notes: str = "") -> st
         "```",
         "",
         "Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the",
-        "config times the mixture weights; row and example counts are estimates from `tokens_per_row_estimate` (the",
-        "planner refines them with measured token counts once a source has been processed).",
+        "config times the stage weights; sequences are those tokens divided by `block_size` (what the training loader",
+        "draws and what the planner sizes downloads with); rows are an estimate from `describe_tokens_per_row`, which",
+        "nothing but this document uses.",
         "",
     ]
     if notes.strip():
         lines += ["## Notes", "", notes.strip(), ""]
     lines += _general(cfg)
     lines += _stages(cfg)
-    lines += _instruct_mixtures(cfg)
-    lines += _validations(cfg)
+    lines += _validation_split(cfg)
     lines += _sources(cfg)
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -71,14 +72,16 @@ def _general(cfg: DatasetConfig) -> list[str]:
     else:
         token_count = f"`{cfg.token_count}` (chars / 4)"
     return [
-        "## Tokenizer and token counting",
+        "## Tokenizer, sequence length and token counting",
         "",
         f"- tokenizer: {_tokenizer_label(cfg.tokenizer)}",
-        f"- `max_seq_length`: {cfg.max_seq_length} (token-count cap per document; the run config's `block_size` must not exceed it)",
+        f"- `max_seq_length`: {cfg.max_seq_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
+        f"- `block_size`: {cfg.block_size} (training sequence length; the run config must use the same value)",
         f"- `token_count`: {token_count}",
-        f"- training tokens over all stages: {_tokens(total_tokens)}",
+        f"- `validation_fraction`: {cfg.validation_fraction:.0%} of a source used for training and validation is held out",
+        f"- training tokens over all stages: {_tokens(total_tokens)} ({_sequences(total_tokens, cfg.block_size)} sequences)",
         "",
-        "## Processing defaults (`pretrain` sources)",
+        "## Processing defaults",
         "",
         *_processing_lines(cfg.processing),
         "",
@@ -97,7 +100,7 @@ def _tokenizer_label(tok: TokenizerConfig) -> str:
 
 def _processing_lines(p: ProcessingConfig) -> list[str]:
     return [
-        f"- length filter: {p.min_chars} <= chars, truncated at {p.max_chars} chars",
+        f"- length filter: {p.min_chars} <= chars (pretrain only; rows are cut at `max_seq_length` tokens when downloaded)",
         f"- dedup: {_dedup_label(p)}",
         f"- quality filter: {_yn(p.quality_filter)}",
         f"- decontamination: {_decontamination_label(p)}",
@@ -107,7 +110,7 @@ def _processing_lines(p: ProcessingConfig) -> list[str]:
 def _dedup_label(p: ProcessingConfig) -> str:
     label = f"`{p.dedup.mode}`"
     if p.dedup.mode == "exact":
-        label += f" (normalize: {_yn(p.dedup.normalize)})"
+        label += f" (normalize: {_yn(p.dedup.normalize)}, Bloom filter {p.dedup.bloom_memory_mb} MB per source)"
     elif p.dedup.mode == "minhash":
         label += f" (threshold {p.dedup.threshold}, {p.dedup.num_perm} permutations, {p.dedup.ngram}-grams)"
     return label
@@ -127,61 +130,52 @@ def _stages(cfg: DatasetConfig) -> list[str]:
         lines += [
             f"### Stage {index + 1}: `{stage.name}` ({_tokens(stage.tokens)} tokens, transition {stage.transition_pct:.0%})",
             "",
-            "| Train source | Weight | Tokens | Tokens/row (est.) |",
-            "|---|---:|---:|---:|",
+            "| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |",
+            "|---|---:|---:|---:|---:|---:|",
         ]
-        for key, weight in stage.train.items():
-            lines.append(f"| {_key(cfg, key)} | {weight:.2%} | {_tokens(int(stage.tokens * weight))} | {_estimate(cfg, key)} |")
-        validation = ", ".join(f"{_key(cfg, key)} at {weight:.0%}" for key, weight in stage.val.items())
+        for name, weight in stage.train.items():
+            tokens = stage.tokens * weight
+            tokens_per_row = cfg.sources[name].describe_tokens_per_row
+            lines.append(
+                f"| `{name}` | {weight:.2%} | {_tokens(int(tokens))} | {_sequences(tokens, cfg.block_size)} | "
+                f"{tokens_per_row} | {ceil(tokens / tokens_per_row):,} |"
+            )
+        validation = ", ".join(f"`{name}` at {weight:.0%}" for name, weight in stage.val.items())
         lines += ["", f"Validation: {validation}", ""]
     return lines
 
 
-def _instruct_mixtures(cfg: DatasetConfig) -> list[str]:
-    if not cfg.instruct_mixtures:
-        return []
-    lines = ["## Instruct mixtures", ""]
-    for name, mixture in cfg.instruct_mixtures.items():
-        budget = cfg.instruct_mixture_budget_tokens(name)
-        lines += [
-            f"### `{name}` ({_tokens(budget)} tokens budget)",
-            "",
-            f"`max_tokens` {mixture.max_tokens}, input inversions {mixture.input_inversions:.0%}, validation split "
-            f"{mixture.val_split:.0%}, seed {mixture.seed}. Examples = budget × share ÷ `tokens_per_row_estimate`.",
-            "",
-            "| Source | Share | Tokens | Examples (est.) |",
-            "|---|---:|---:|---:|",
-        ]
-        for src, share in mixture.sources.items():
-            share_tokens = budget * share
-            examples = ceil(share_tokens / cfg.sources[src].tokens_per_row_estimate)
-            lines.append(f"| `{src}` | {share:.1%} | {_tokens(int(share_tokens))} | {examples:,} |")
-        lines.append("")
-    return lines
+def _validation_split(cfg: DatasetConfig) -> list[str]:
+    """One line per source: how the training resolver splits its processed rows."""
+    lines = [
+        "## Validation split",
+        "",
+        "Decided at training time, never on disk: a source used only for training is all training rows, one used only",
+        "for validation is all validation rows (`rows` says how many are downloaded), one used for both gives its first",
+        "`validation_fraction` of processed rows to validation (deduplicated as one set, so the two never share a document).",
+        "",
+        "| Source | Used in | Held out |",
+        "|---|---|---|",
+    ]
+    for name in cfg.sources:
+        lines.append(f"| `{name}` | {_usage(cfg, name)} | {_held_out(cfg, name)} |")
+    return lines + [""]
 
 
-def _validations(cfg: DatasetConfig) -> list[str]:
-    splits = [name for name in cfg.sources_of_kind("pretrain") if cfg.sources[name].validation_tokens]
-    names = cfg.sources_of_kind("validation")
-    if not names and not splits:
-        return []
-    lines = ["## Held-out validation sets", ""]
-    if splits:
-        lines += ["| Split | Tokens | From |", "|---|---:|---|"]
-        for name in splits:
-            src = cfg.sources[name]
-            lines.append(
-                f"| `{name}/validation` | {_tokens(src.validation_tokens)} | the first processed rows of `{name}` "
-                "(deduplicated together with the training rows, never part of `processed/`) |"
-            )
-        lines.append("")
-    if names:
-        lines += ["| Source | Rows | Seed | Loader | Origin |", "|---|---:|---:|---|---|"]
-        for name in names:
-            src = cfg.sources[name]
-            lines.append(f"| `{name}` | {src.rows:,} | {src.seed} | `{src.loader}` | {_origin(src)} |")
-        lines.append("")
-    return lines
+def _usage(cfg: DatasetConfig, name: str) -> str:
+    in_train, in_val = cfg.used_in_train(name), cfg.used_in_val(name)
+    if in_train and in_val:
+        return "train + val"
+    return "train only" if in_train else "val only"
+
+
+def _held_out(cfg: DatasetConfig, name: str) -> str:
+    if cfg.used_in_train(name) and cfg.used_in_val(name):
+        return f"{cfg.validation_fraction_of(name):.0%} held out (the first rows of `processed/{name}`)"
+    if cfg.used_in_val(name):
+        rows = cfg.sources[name].rows
+        return f"all rows ({rows:,} downloaded)" if rows is not None else "all rows"
+    return "none"
 
 
 def _sources(cfg: DatasetConfig) -> list[str]:
@@ -194,24 +188,6 @@ def _sources(cfg: DatasetConfig) -> list[str]:
 
 
 # --- formatting helpers ------------------------------------------------------------------------------------------------
-
-
-def _base_name(key: str) -> str:
-    """Stage keys name a source or a mixture, optionally with a ``/split`` suffix (``flan_instruct/validation``)."""
-    return key.partition("/")[0]
-
-
-def _key(cfg: DatasetConfig, key: str) -> str:
-    if _base_name(key) in cfg.instruct_mixtures:
-        return f"`{key}` (instruct_mixture)"
-    return f"`{key}`"
-
-
-def _estimate(cfg: DatasetConfig, key: str) -> str:
-    base = _base_name(key)
-    if base in cfg.instruct_mixtures:
-        return "-"
-    return str(cfg.sources[base].tokens_per_row_estimate)
 
 
 def _origin(src: SourceConfig) -> str:
@@ -242,14 +218,24 @@ def _details(cfg: DatasetConfig, name: str) -> str:
         parts.append(f"filter `{src.filter}`")
     if src.check_limit is not None:
         parts.append(f"check_limit {src.check_limit:,}")
-    if src.kind == "pretrain":
-        parts.append(f"budget {_tokens(cfg.source_budget_tokens(name))}")
-        if src.validation_tokens:
-            parts.append(f"validation split {_tokens(src.validation_tokens)}")
-        if src.processing is not None:
-            override_lines = _processing_lines(src.processing)
-            parts.append("processing override: " + "; ".join(line.removeprefix("- ") for line in override_lines))
+    if cfg.used_in_train(name):
+        budget = cfg.sequence_budget(name)
+        parts.append(f"budget {budget:,} sequences ({_tokens(budget * cfg.block_size)} tokens)")
+    else:
+        parts.append(f"rows {src.rows:,} (validation only)")
+    if src.kind == "instruct":
+        parts.append(f"input inversions {src.input_inversions:.0%}")
+    if cfg.shuffle_of(name):
+        parts.append(f"shuffled (seed {src.seed})")
+    if src.processing is not None:
+        override_lines = _processing_lines(src.processing)
+        parts.append("processing override: " + "; ".join(line.removeprefix("- ") for line in override_lines))
     return ", ".join(parts)
+
+
+def _sequences(tokens: float, block_size: int) -> str:
+    """Sequences of ``block_size`` tokens, rounded up like the planner does: 1,611,329."""
+    return f"{ceil(tokens / block_size):,}"
 
 
 def _tokens(n: int) -> str:
