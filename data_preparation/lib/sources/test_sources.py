@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.lib import sources
-from data_preparation.lib.schema.dataset_config import SourceConfig, SourceKind, load_dataset_config
+from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources import (
     CONVERTERS,
     FILTERS,

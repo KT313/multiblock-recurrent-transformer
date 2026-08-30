@@ -46,8 +46,8 @@ SAFETY_MARGIN = 1.2  # rows downloaded = rows needed × this (task 5 planner)
 class TokenizerConfig:
     """Which tokenizer defines "a token" for this dataset; saved to `dataset/tokenizers/<name>/`."""
 
-    name: str
-    kind: Literal["hf", "synthetic"] = "hf"
+    name: str  # directory name under `dataset/tokenizers/`
+    kind: Literal["hf", "synthetic"] = "hf"  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
     hf_id: Optional[str] = None  # required for kind=hf
     revision: Optional[str] = None  # Hub commit sha; pin it
 
@@ -77,9 +77,9 @@ class DedupConfig:
 class DecontaminationConfig:
     """Drop documents overlapping benchmark test sets (off by default; the thesis run skipped it)."""
 
-    enabled: bool = False
-    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS))
-    ngram: int = 13
+    enabled: bool = False  # off: documents are kept regardless of benchmark overlap
+    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS))  # benchmark test sets to check against (lib/stages/benchmarks.py)
+    ngram: int = 13  # word n-gram size compared between a document and the benchmarks
     threshold: float = 0.1  # share of a document's n-grams found in one benchmark
 
 
@@ -89,9 +89,9 @@ class ProcessingConfig:
 
     min_chars: int = 50  # drop shorter texts
     max_chars: int = 20000  # truncate longer texts (characters)
-    dedup: DedupConfig = field(default_factory=DedupConfig)
+    dedup: DedupConfig = field(default_factory=DedupConfig)  # exact / minhash / none, see DedupConfig
     quality_filter: bool = False  # prose heuristics (sentences, caps ratio, repetition); thesis run: off
-    decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig)
+    decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig)  # benchmark overlap filter, see DecontaminationConfig
 
     def __post_init__(self) -> None:
         if self.min_chars < 0 or self.max_chars <= 0 or self.max_chars < self.min_chars:
@@ -102,12 +102,12 @@ class ProcessingConfig:
 class SourceConfig:
     """One data source. `kind` selects the pipeline, `loader` how rows are fetched (see `lib/sources.py`)."""
 
-    kind: SourceKind
-    loader: LoaderName = "hf_split"
+    kind: SourceKind  # pretrain (documents, processed + optional validation split) | validation (external held-out rows) | instruct (rows for mixtures)
+    loader: LoaderName = "hf_split"  # how rows are fetched: hf_files | hf_split | hf_stream | github_code | local | synthetic (lib/sources/loaders.py)
     hf_id: Optional[str] = None  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
     revision: Optional[str] = None  # Hub commit sha; pin it so row order is stable across increments
     load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
-    split: str = "train"
+    split: str = "train"  # Hub split to read (hf_split / hf_stream)
     text_field: str = "text"  # pretrain/validation: column holding the document
     language: Optional[str] = None  # github_code: language label of codeparrot/github-code-clean
     path: Optional[str] = None  # local: directory of parquet/jsonl files
@@ -164,8 +164,8 @@ class InstructMixtureConfig:
     sources: dict[str, float]  # instruct source name -> share of the mixture
     max_tokens: int = 2048  # drop examples longer than this (full token count of instruction + input + output)
     input_inversions: float = 0.0  # share of examples turned into "given the output, what was the instruction?"
-    val_split: float = 0.05
-    seed: int = 42
+    val_split: float = 0.05  # share of the mixture held out as `<mixture>/validation`
+    seed: int = 42  # shuffle / inversion / split seed
 
     def __post_init__(self) -> None:
         _check_weights("mixture.sources", self.sources)
@@ -182,10 +182,10 @@ class InstructMixtureConfig:
 class StageConfig:
     """One training stage: token budget and the train/val mixtures over sources (or `<mixture>[/validation]`)."""
 
-    name: str
-    tokens: int
-    train: dict[str, float]
-    val: dict[str, float]
+    name: str  # stage label (checkpoints, logs); unique per config
+    tokens: int  # training tokens of this stage (steps = tokens // (world_batch_size × block_size))
+    train: dict[str, float]  # stage key -> sampling weight (sum 1): `<source>` or `<mixture>[/train]`
+    val: dict[str, float]  # stage key -> weight (sum 1): `<source>`, `<pretrain source>/validation` or `<mixture>/validation`
     transition_pct: float = 0.0  # fraction of this stage (at its end) blending into the next stage's data/LR
 
     def __post_init__(self) -> None:
@@ -199,19 +199,32 @@ class StageConfig:
 
 @dataclass
 class DatasetConfig:
-    """The whole dataset definition."""
+    """The whole dataset definition (`config/datasets/<name>.yaml`); this class is the config reference.
 
-    name: str
-    tokenizer: TokenizerConfig
-    sources: dict[str, SourceConfig]
-    stages: list[StageConfig]
-    instruct_mixtures: dict[str, InstructMixtureConfig] = field(default_factory=dict)
+    Top-level keys:
+
+    - `name`: dataset name; names the per-config directory `dataset/instruct_mixtures/<name>/`.
+    - `tokenizer`: which tokenizer defines "a token" (`TokenizerConfig`); saved to `dataset/tokenizers/<name>/`.
+    - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/`.
+    - `stages`: the training stages in order (`StageConfig`): token budget, train/val mixtures, transition.
+    - `instruct_mixtures`: named mixtures of `instruct` sources (`InstructMixtureConfig`), built per config.
+    - `max_seq_length`: token-count cap per stored document; the run config's `block_size` must be <= this.
+    - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
+    - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
+    - `processing`: dataset-level processing defaults for pretrain sources (`ProcessingConfig`); a source may override.
+    """
+
+    name: str  # non-empty path component; `dataset/instruct_mixtures/<name>/`
+    tokenizer: TokenizerConfig  # see TokenizerConfig
+    sources: dict[str, SourceConfig]  # source name -> SourceConfig; the names are the stage keys
+    stages: list[StageConfig]  # in training order; at least one, unique names
+    instruct_mixtures: dict[str, InstructMixtureConfig] = field(default_factory=dict)  # mixture name -> InstructMixtureConfig; names must not clash with sources
     max_seq_length: int = 2048  # token-count cap per document; the run config's block_size must be <= this
     always_range_requests: bool = True  # read every Hub file remotely by piece (row groups / stream prefix); False: files
     # up to load_kwargs.max_cached_file_mb are downloaded whole into the Hub cache instead. Traffic only, not part of
     # source hashes.
     token_count: TokenCountMode = "tokenizer"  # "estimate" = chars / 4
-    processing: ProcessingConfig = field(default_factory=ProcessingConfig)
+    processing: ProcessingConfig = field(default_factory=ProcessingConfig)  # defaults for every pretrain source; see ProcessingConfig
 
     # --- validation ------------------------------------------------------------------------------------------------
 

@@ -15,14 +15,14 @@ from typing import Any
 import pytest
 
 from data_preparation.lib.stages import pretrain as stages_pretrain
-from data_preparation.lib.schema.dataset_config import (
+from data_preparation.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
     DedupConfig,
     ProcessingConfig,
     SourceConfig,
 )
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.stages.row_pipeline import get_ngram_set
 from data_preparation.lib.stages.pretrain import process

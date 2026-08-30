@@ -7,7 +7,7 @@ from math import ceil
 from pathlib import Path
 
 from data_preparation.lib.build.describe import GENERATED_WITH, describe, leading_comment
-from data_preparation.lib.schema.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CROW = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"

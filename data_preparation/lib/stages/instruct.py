@@ -22,8 +22,8 @@ import pyarrow.parquet as pq
 
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.storage.parquet import normalized_hash, write_dict_rows
-from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig
-from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, InstructMixtureConfig
+from data_preparation.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import progress
 from data_preparation.lib.storage.manifest import Manifest

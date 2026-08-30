@@ -26,8 +26,8 @@ if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without
 
 from data_preparation.lib.build import DEFAULT_MAX_PARALLEL_DOWNLOADS, DEFAULT_NUM_WORKERS, STEPS, build, describe, leading_comment, status  # noqa: E402
 from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
-from data_preparation.lib.schema.dataset_config import load_dataset_config  # noqa: E402
-from data_preparation.lib.schema.layout import DatasetLayout  # noqa: E402
+from data_preparation.dataset_config import load_dataset_config  # noqa: E402
+from data_preparation.layout import DatasetLayout  # noqa: E402
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger  # noqa: E402
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard  # noqa: E402
 

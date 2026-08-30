@@ -9,6 +9,10 @@ with `uv run ...`; the implementation lives in `lib/` (tests beside every module
 
 ## The dataset config
 
+Config reference: `data_preparation/dataset_config.py` itself (the `DatasetConfig` docstring lists the top-level keys,
+every field carries a `# ...` comment, `__post_init__` holds the validation rules); `layout.py` beside it maps a config
+to its directories under `dataset/`.
+
 ```yaml
 name: crow-300m-final                    # -> dataset/instruct_mixtures/crow-300m-final/
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
@@ -46,7 +50,7 @@ by the append-only layout, so a later top-up never moves the boundary; this is h
 every training source, the planner warns when one reads the same Hub repo and file prefix as a pretrain source)
 and `instruct` (`instruction/input/output` rows, only usable through a mixture; `<mixture>/train` in `train` and
 `<mixture>/validation` in `val` are the stage keys; a bare `<mixture>` means `/train`). The schema with every field
-and the validation rules is `lib/schema/dataset_config.py`; loading fails on unknown loader/converter names,
+and the validation rules is `data_preparation/dataset_config.py`; loading fails on unknown loader/converter names,
 weights that do not sum to 1, validation sources or splits in `train`, a mixture's train split in `val`, a pretrain
 source that only appears in `val` (it would never be prepared), and so on. The configs in the tree are
 `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is generated from it),

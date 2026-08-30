@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.layout import DatasetLayout
 from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
     INSTRUCT_DATA_SIGNATURE,

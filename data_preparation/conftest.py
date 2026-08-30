@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 import zstandard
 
-from data_preparation.lib.schema.dataset_config import (
+from data_preparation.dataset_config import (
     DatasetConfig,
     InstructMixtureConfig,
     ProcessingConfig,
@@ -27,7 +27,7 @@ from data_preparation.lib.schema.dataset_config import (
     StageConfig,
     TokenizerConfig,
 )
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import file_format
 from data_preparation.lib.stages.shared import prepare_tokenizer

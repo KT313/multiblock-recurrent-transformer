@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build import build
 from model import RecurrentGPT
 

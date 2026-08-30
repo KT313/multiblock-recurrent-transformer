@@ -25,9 +25,9 @@ import pyarrow.parquet as pq
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.storage.parquet import ShardWriter, list_parquet_files, publish_shard, shard_index, shard_name, text_hash64
-from data_preparation.lib.schema.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
+from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
-from data_preparation.lib.schema.layout import PROCESSED_COLUMNS, DatasetLayout
+from data_preparation.layout import PROCESSED_COLUMNS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.ui.dashboard import progress

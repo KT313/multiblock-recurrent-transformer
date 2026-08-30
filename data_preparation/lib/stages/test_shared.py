@@ -13,8 +13,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.sources import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
@@ -487,7 +487,7 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
 def test_fetch_source_forces_range_requests_by_default() -> None:
     from dataclasses import replace
 
-    from data_preparation.lib.schema.dataset_config import SourceConfig
+    from data_preparation.dataset_config import SourceConfig
     from data_preparation.lib.stages.shared import fetch_source
 
     cfg = load_dataset_config(Path("config/datasets/crow_300m_mini.yaml"))
@@ -748,7 +748,7 @@ def test_truncate_raw_to_good_prefix(
 def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_in_place(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from data_preparation.lib.schema.dataset_config import ProcessingConfig
+    from data_preparation.dataset_config import ProcessingConfig
     from data_preparation.lib.stages import shared
 
     src_dir = layout.root.parent / "long"

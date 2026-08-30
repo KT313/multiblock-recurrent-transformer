@@ -25,7 +25,7 @@ from typing import Any, Protocol
 
 import pyarrow.parquet as pq
 
-from data_preparation.lib.schema.dataset_config import SourceConfig
+from data_preparation.dataset_config import SourceConfig
 from data_preparation.lib.sources.hub_files import (
     DEFAULT_MAX_CACHED_FILE_MB,
     FetchStats,

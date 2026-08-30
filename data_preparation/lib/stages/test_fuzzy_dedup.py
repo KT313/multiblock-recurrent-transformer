@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.schema.dataset_config import DedupConfig
+from data_preparation.dataset_config import DedupConfig
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 
 

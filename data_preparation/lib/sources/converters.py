@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from data_preparation.lib.schema.dataset_config import SourceConfig
+from data_preparation.dataset_config import SourceConfig
 
 Row = dict[str, Any]
 Converter = Callable[[Row], Row]

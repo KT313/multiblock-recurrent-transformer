@@ -14,7 +14,7 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, TokenizerConfig
+from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, TokenizerConfig
 
 GENERATED_WITH = "uv run python data_preparation/prepare.py describe --dataset_config {config}"
 

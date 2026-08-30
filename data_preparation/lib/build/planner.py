@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
 
-from data_preparation.lib.schema.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, PROCESSED_COLUMNS, SOURCE_STAGES, DatasetLayout
+from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
+from data_preparation.layout import INSTRUCT_MIXTURE_SPLITS, PROCESSED_COLUMNS, SOURCE_STAGES, DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 
 

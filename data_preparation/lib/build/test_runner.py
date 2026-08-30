@@ -17,8 +17,8 @@ from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
 from data_preparation.lib.build.planner import plan, rows_for_budget
-from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 from data_preparation.lib.stages.pretrain import process as real_process
 from data_preparation.lib.stages.shared import download as real_download
@@ -129,7 +129,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
 
 def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     """The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them."""
-    from data_preparation.lib.schema.dataset_config import ProcessingConfig
+    from data_preparation.dataset_config import ProcessingConfig
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     build(cfg, layout)

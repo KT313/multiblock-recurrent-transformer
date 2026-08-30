@@ -11,8 +11,8 @@ import pytest
 
 from data_preparation import prepare
 from data_preparation.lib.build import STEPS
-from data_preparation.lib.schema.dataset_config import DatasetConfig
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig
+from data_preparation.layout import DatasetLayout
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"

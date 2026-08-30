@@ -31,8 +31,8 @@ from typing import Any
 
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build.lock import build_lock
-from data_preparation.lib.schema.dataset_config import DatasetConfig
-from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
+from data_preparation.dataset_config import DatasetConfig
+from data_preparation.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import progress
 from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems

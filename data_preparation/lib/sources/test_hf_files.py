@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.conftest import REPO, REV, FakeHub, RecordingFile
-from data_preparation.lib.schema.dataset_config import SourceConfig
+from data_preparation.dataset_config import SourceConfig
 from data_preparation.lib.sources import LOADERS, GithubCodeRequest, Row, hub_file_index, read_github_code_group
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import (

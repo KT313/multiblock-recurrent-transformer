@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 import pyarrow.parquet as pq
 

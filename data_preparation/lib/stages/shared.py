@@ -30,8 +30,8 @@ from data_preparation.lib.storage.parquet import (
     shard_index,
     write_dict_rows,
 )
-from data_preparation.lib.schema.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.ui.dashboard import progress

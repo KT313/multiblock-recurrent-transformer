@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from data_preparation.lib.build import build, plan as compute_plan, status
-from data_preparation.lib.schema.dataset_config import DatasetConfig, StageConfig, load_dataset_config
-from data_preparation.lib.schema.layout import DatasetLayout
+from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
 from training.settings import DataEntry, Settings
