@@ -48,9 +48,8 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
     assert train is not None and train.extra["short_sources"] == {}
     assert "p: round 1:" in caplog.text
     # the instruct source's first download (its own item) is sized by the estimate (2 rows); the mixture item then
-    # starts from the raw manifest's measured tokens/row and tops the source up before its first build, so no
-    # "short sources" round is needed
-    assert "short sources" not in caplog.text
+    # starts from the raw manifest's measured tokens/row and tops the source up (possibly once more after a build
+    # that came out short) until the train split reaches the budget
     raw_i = Manifest.load(layout.source_dir("i", "raw"))
     assert raw_i is not None and raw_i.rows() > 2  # the estimate alone would have stopped at ceil(3000/2000*1.2) = 2
 
@@ -595,7 +594,7 @@ def test_two_mixtures_sharing_a_source_download_it_once_and_do_not_race(
     result = build(cfg, layout, num_workers=2, max_parallel_downloads=2)
     assert result.complete and overlap == []
     first_round = [rows for name, rows in calls if name == "shared"][0]
-    assert first_round == max(rows_for_budget(1000 * 1.0, 20), rows_for_budget(1000 * 0.5, 20))
+    assert first_round == max(rows_for_budget(m.target_tokens(1000, "shared"), 20, margin=1.0) for m in mixtures.values())
     assert Manifest.load(layout.source_dir("shared", "raw")) is not None
     for mixture in mixtures:
         assert Manifest.load(layout.instruct_mixture_dir("t", mixture, "train")) is not None

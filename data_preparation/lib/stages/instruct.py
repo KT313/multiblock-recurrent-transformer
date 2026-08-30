@@ -3,8 +3,9 @@
 built from the standardized raw shards of its ``instruct`` sources.
 
 Per source: read the raw rows in order with their ``tokens`` column (counted at download time), skip rows longer
-than ``mixture.max_tokens`` and stop as soon as the kept rows hold ``budget_tokens × share`` tokens — a source is
-read only as far as needed; then input inversions on a seeded sample, normalized exact dedup, empty-field removal,
+than ``mixture.max_tokens`` and stop as soon as the kept rows hold ``budget_tokens × share × SAFETY_MARGIN ÷
+(1 − val_split)`` tokens (the margin covers dedup and empty-row removal, the split its share) — a source is read
+only as far as needed; then input inversions on a seeded sample, normalized exact dedup, empty-field removal,
 seeded shuffle, train/validation split. Rebuilt whenever the mixture hash, ``budget_tokens`` or any input source's
 raw shard list changed; otherwise a no-op returning the stored manifests.
 """
@@ -55,7 +56,7 @@ def build_instruct_mixture(
     """Build (or return) the ``train`` / ``validation`` splits of a mixture; returns ``{split: Manifest}``.
 
     Columns: ``instruction``, ``input``, ``output``, ``tokens``. ``extra`` records per-source counts, the measured
-    ``tokens_per_row``, ``short_sources`` (sources whose raw rows ran out before their share — the planner tops them up),
+    ``tokens_per_row`` (kept tokens per row read — the rate a top-up is sized with), ``short_sources`` (sources whose raw rows ran out before their share — the planner tops them up),
     ``input_shards`` (raw shard lists) and the build ``metadata``. The build is all-or-nothing (the splits are
     rewritten as a whole); ``should_stop`` is checked between raw shards while reading and before writing.
     """
@@ -80,18 +81,19 @@ def build_instruct_mixture(
     log.info("building mixture %s (%d tokens) -> %s", instruct_mixture_name, budget_tokens, split_dirs["train"].parent)
     counter = TokenCounter(cfg, layout)  # instruct examples: uncapped, like their raw `tokens`
 
-    # Step 0: take the budgeted rows of every source.
+    # Step 0: take the budgeted rows of every source — with the safety margin and the validation split on top, so
+    # the train split reaches the budget after dedup, empty-row removal and the split.
     rows: list[Row] = []
     counts: dict[str, dict[str, Any]] = {}
-    for src, share in mixture.sources.items():
-        taken, info = _take_source_rows(layout, src, raw_manifests[src], share * budget_tokens, mixture.max_tokens, should_stop)
+    for src in mixture.sources:
+        taken, info = _take_source_rows(layout, src, raw_manifests[src], mixture.target_tokens(budget_tokens, src), mixture.max_tokens, should_stop)
         rows.extend(taken)
         counts[src] = info
         log.info(
             "  %s: read %d of %d rows (%.1f tokens/row), %d kept after length check",
             src, info["taken_rows"], info["available_rows"], info["tokens_per_row"], info["kept_rows"],
         )
-    tokens_per_row = {src: info["tokens_per_row"] for src, info in counts.items()}
+    tokens_per_row = {src: info["kept_tokens_per_row"] or info["tokens_per_row"] for src, info in counts.items()}
     short_sources = {
         src: {"available_rows": info["available_rows"], "needed_rows": info["needed_rows"]}
         for src, info in counts.items()
@@ -205,8 +207,10 @@ def _take_source_rows(
     ``target_tokens`` tokens; rows beyond that are not read.
 
     ``info``: ``available_rows`` (raw rows on disk), ``taken_rows`` (rows read), ``needed_rows`` (rows read when the
-    target was reached, else the estimate ``ceil(target ÷ tokens/row)`` — larger than ``available_rows`` marks the
-    source short), ``dropped_too_long``, ``kept_rows``, ``tokens_per_row`` (measured over the rows read),
+    target was reached, else the estimate ``ceil(target ÷ kept tokens per row read)`` — larger than
+    ``available_rows`` marks the source short; a source whose rows all fail the length check asks for twice its
+    rows until the loader is exhausted), ``dropped_too_long``, ``kept_rows``, ``kept_tokens``, ``tokens_per_row`` (measured over
+    the rows read), ``kept_tokens_per_row`` (kept tokens per row read — what a further row is worth to the target),
     ``target_tokens``.
     """
     taken: list[Row] = []
@@ -229,17 +233,22 @@ def _take_source_rows(
                 break
 
     tokens_per_row = tokens_read / rows_read if rows_read else 0.0
+    kept_per_row_read = kept_tokens / rows_read if rows_read else 0.0  # what a row read contributes to the target
     if kept_tokens >= target_tokens:
         needed = rows_read
+    elif kept_per_row_read > 0:
+        needed = ceil(target_tokens / kept_per_row_read)
     else:
-        needed = ceil(target_tokens / tokens_per_row) if tokens_per_row > 0 else 0
+        needed = 2 * raw.rows() + 1  # nothing usable so far: ask for twice as much until the loader is exhausted
     info = {
         "available_rows": raw.rows(),
         "needed_rows": needed,
         "taken_rows": rows_read,
         "dropped_too_long": dropped_long,
         "kept_rows": len(taken),
+        "kept_tokens": kept_tokens,
         "tokens_per_row": tokens_per_row,
+        "kept_tokens_per_row": kept_per_row_read,  # per row *read*: sizes the next download when the source is short
         "target_tokens": target_tokens,
     }
     return taken, info

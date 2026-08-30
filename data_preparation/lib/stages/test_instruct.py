@@ -61,16 +61,17 @@ def test_build_instruct_mixture_counts_split_and_columns(
     result = build_instruct_mixture(cfg, "m", layout, budget_tokens=200, shard_size=8)
     train, val = result["train"], result["validation"]
     assert train.stage == val.stage == "instruct_mixture" and train.source_hash == cfg.instruct_mixture_hash("m")
-    # a: 120 tokens / 6 per row -> 20 rows; b: 80 / 10 -> 8 rows
-    assert train.extra["counts"]["a"]["needed_rows"] == ceil(120 / 6) == 20 and train.extra["counts"]["b"]["needed_rows"] == 8
+    # targets carry the safety margin over the train share: 200 × 0.6 × 1.2 / 0.75 = 192 tokens of `a` (6/row), 128 of `b` (10/row)
+    assert train.extra["counts"]["a"]["needed_rows"] == ceil(192 / 6) == 32 and train.extra["counts"]["b"]["needed_rows"] == 13
     assert train.extra["tokens_per_row"] == {"a": 6.0, "b": 10.0} and train.extra["short_sources"] == {}
-    assert train.rows() == 21 and val.rows() == 7 and train.extra["metadata"]["total_examples"] == 28
+    assert train.rows() == 33 and val.rows() == 12 and train.extra["metadata"]["total_examples"] == 45
+    assert (train.tokens() or 0) >= 200, "the train split reaches the budget despite the validation split"
     rows = read_rows(layout.instruct_mixture_dir("t", "m", "train")) + read_rows(layout.instruct_mixture_dir("t", "m", "validation"))
-    assert [set(r) for r in rows] == [{"instruction", "input", "output", "tokens"}] * 28
-    assert sum(r["output"].startswith("tok_a") for r in rows) == 20 and sum(r["output"].startswith("tok_b") for r in rows) == 8
+    assert [set(r) for r in rows] == [{"instruction", "input", "output", "tokens"}] * 45
+    assert sum(r["output"].startswith("tok_a") for r in rows) == 32 and sum(r["output"].startswith("tok_b") for r in rows) == 13
     assert all(r["tokens"] in (6, 10) for r in rows)
     assert train.tokens() == sum(r["tokens"] for r in read_rows(layout.instruct_mixture_dir("t", "m", "train")))
-    assert [s.rows for s in train.shards] == [8, 8, 5]
+    assert [s.rows for s in train.shards] == [8, 8, 8, 8, 1]
     # deterministic shuffle: not the source order
     assert [r["instruction"] for r in rows] != sorted(r["instruction"] for r in rows)
     before = {split: mtimes(layout.instruct_mixture_dir("t", "m", split)) for split in result}
@@ -84,7 +85,8 @@ def test_build_instruct_mixture_reads_only_the_rows_it_needs(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, two_sources: dict[str, SourceConfig], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rows carry their token count from the download, so a source is read shard by shard only until its share
-    of the budget is reached: with 16-row shards a 60-token share (10 rows of `a`) opens one shard of three."""
+    of the budget is reached: with 16-row shards a 72-token target (60 × 1.2 margin; 12 rows of `a`) opens one
+    shard of three."""
     mixture = InstructMixtureConfig(sources={"a": 0.6, "b": 0.4}, max_tokens=64, input_inversions=0.0, val_split=0.0, seed=1)
     cfg = _build(cfg_factory, layout, with_tokenizer, two_sources, mixture)  # 40 rows per source in 16-row shards
     opened: list[str] = []
@@ -97,10 +99,10 @@ def test_build_instruct_mixture_reads_only_the_rows_it_needs(
     monkeypatch.setattr(pq, "ParquetFile", spy)  # `instruct.py` looks it up on the module at call time
     train = build_instruct_mixture(cfg, "m", layout, budget_tokens=100, shard_size=8)["train"]
     assert train.extra["counts"]["a"] == {
-        "available_rows": 40, "needed_rows": 10, "taken_rows": 10, "dropped_too_long": 0, "kept_rows": 10,
-        "tokens_per_row": 6.0, "target_tokens": 60.0,
+        "available_rows": 40, "needed_rows": 12, "taken_rows": 12, "dropped_too_long": 0, "kept_rows": 12, "kept_tokens": 72,
+        "tokens_per_row": 6.0, "kept_tokens_per_row": 6.0, "target_tokens": 72.0,
     }  # fmt: skip
-    assert train.extra["counts"]["b"]["taken_rows"] == 4 and train.extra["short_sources"] == {}
+    assert train.extra["counts"]["b"]["taken_rows"] == 5 and train.extra["short_sources"] == {}
     assert opened == ["a/data-00000.parquet", "b/data-00000.parquet"]
 
 
@@ -112,8 +114,8 @@ def test_build_instruct_mixture_short_sources_and_length_check(
     result = build_instruct_mixture(cfg, "m", layout, budget_tokens=600)
     train = result["train"]
     assert train.extra["short_sources"] == {
-        "a": {"available_rows": 5, "needed_rows": 50},
-        "b": {"available_rows": 5, "needed_rows": 30},
+        "a": {"available_rows": 5, "needed_rows": 60},  # target 300 × 1.2 = 360 tokens at 6 kept tokens per row read
+        "b": {"available_rows": 5, "needed_rows": 11},  # every row too long: asks for twice its rows until exhausted
     }
     assert train.extra["counts"]["b"]["dropped_too_long"] == 5 and train.extra["counts"]["b"]["kept_rows"] == 0
     assert train.rows() == 5 and result["validation"].rows() == 0

@@ -172,6 +172,11 @@ class InstructMixtureConfig:
         if not 0.0 <= self.input_inversions <= 1.0 or not 0.0 <= self.val_split < 1.0:
             raise ValueError("mixture: input_inversions in [0, 1], val_split in [0, 1)")
 
+    def target_tokens(self, budget_tokens: float, source_name: str) -> float:
+        """Tokens to take from ``source_name`` so the *train* split reaches its share of ``budget_tokens``: the
+        share times ``SAFETY_MARGIN`` (dedup and empty-row removal) over ``1 − val_split`` (the validation split)."""
+        return budget_tokens * self.sources[source_name] * SAFETY_MARGIN / (1.0 - self.val_split)
+
 
 @dataclass
 class StageConfig:
@@ -229,6 +234,7 @@ class DatasetConfig:
                 self._check_stage_key(stage.name, key, is_val=False)
             for key in stage.val:
                 self._check_stage_key(stage.name, key, is_val=True)
+        self._check_val_only_pretrain_sources()
 
     def _check_mixture_sources(self, mixture_name: str, mixture: InstructMixtureConfig) -> None:
         """A mixture may only draw from declared sources of kind instruct."""
@@ -245,6 +251,8 @@ class DatasetConfig:
         if base in self.instruct_mixtures:
             if split not in ("", "train", "validation"):
                 raise ValueError(f"stage {stage_name}: {key!r} must be <mixture>, <mixture>/train or /validation")
+            if is_val and split != "validation":
+                raise ValueError(f"stage {stage_name}: {key!r} in val would validate on the train split; use {base}/validation")
             return
         if base not in self.sources:
             raise ValueError(f"stage {stage_name}: unknown source or mixture {key!r}")
@@ -262,6 +270,19 @@ class DatasetConfig:
             raise ValueError(f"stage {stage_name}: instruct source {key!r} can only be used through a mixture")
         if kind == "validation" and not is_val:
             raise ValueError(f"stage {stage_name}: validation source {key!r} cannot be used for training")
+
+    def _check_val_only_pretrain_sources(self) -> None:
+        """A pretrain source only ever used in `val` would get no budget (never downloaded or processed) while
+        training expects its directory; hold out a split of a trained source or use `kind: validation` instead."""
+        trained = {key.partition("/")[0] for stage in self.stages for key in stage.train}
+        for stage in self.stages:
+            for key in stage.val:
+                base = key.partition("/")[0]
+                if base in self.sources and self.sources[base].kind == "pretrain" and base not in trained:
+                    raise ValueError(
+                        f"stage {stage.name}: pretrain source {base!r} is used for validation but never for training "
+                        "(it would never be prepared); use `kind: validation` or a trained source's `/validation` split"
+                    )
 
     # --- derived views ---------------------------------------------------------------------------------------------
 

@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build.lock import build_lock
@@ -227,8 +228,10 @@ def _work_items(
         # two mixtures is downloaded once, not raced), then the mixtures, each after its sources
         rows_needed: dict[str, int] = {}
         for mixture_plan in wanted_mixtures:
-            for src, share in cfg.instruct_mixtures[mixture_plan.name].sources.items():
-                rows = rows_for_budget(mixture_plan.budget_tokens * share, _instruct_tokens_per_row(cfg, src, layout))
+            mixture = cfg.instruct_mixtures[mixture_plan.name]
+            for src in mixture.sources:
+                # the mixture's target already carries the safety margin (`InstructMixtureConfig.target_tokens`)
+                rows = rows_for_budget(mixture.target_tokens(mixture_plan.budget_tokens, src), _instruct_tokens_per_row(cfg, src, layout), margin=1.0)
                 rows_needed[src] = max(rows_needed.get(src, 0), rows)
         for src, rows in rows_needed.items():
             action = partial(_download_instruct_source, cfg, src, layout, rows, hf_token, slots)
@@ -531,12 +534,14 @@ def _build_instruct_mixture(
         _remove_stale_mixture_splits(cfg, name, layout)
 
     tokens_per_row = {src: _instruct_tokens_per_row(cfg, src, layout) for src in mixture.sources}
-    short: dict[str, object] = {}
+    short: dict[str, Any] = {}
     for round_index in range(max_rounds):
         exhausted: set[str] = set()
         with slots.downloading():
-            for src, share in mixture.sources.items():
-                rows_needed = rows_for_budget(budget * share, tokens_per_row[src])
+            for src in mixture.sources:
+                rows_needed = rows_for_budget(mixture.target_tokens(budget, src), tokens_per_row[src], margin=1.0)
+                if src in short:
+                    rows_needed = max(rows_needed, int(short[src]["needed_rows"]))  # what the last build said it needs
                 with slots.source_lock(src):
                     raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
                 if raw.extra.get("exhausted"):

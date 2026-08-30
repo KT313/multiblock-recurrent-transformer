@@ -259,3 +259,16 @@ def test_validation_split_is_planned_and_sized(layout: DatasetLayout) -> None:
     a = next(s for s in result.sources if s.name == "a")
     assert not a.complete and a.reason == "validation: manifest missing"
     assert build(cfg, layout).complete  # rebuilt from raw
+
+
+def test_mixture_whose_examples_are_all_too_long_is_not_complete(layout: DatasetLayout) -> None:
+    """Every example dropped by `max_tokens`: the build stops when the source is exhausted, but an empty train
+    split is never reported complete (training could not load it)."""
+    from dataclasses import replace
+
+    cfg = two_stage_cfg()
+    cfg.instruct_mixtures["m"] = InstructMixtureConfig(sources={"i": 1.0}, max_tokens=1)
+    cfg.sources["i"] = replace(cfg.sources["i"], check_limit=20)  # the synthetic loader is endless: cap it
+    result = build(cfg, layout)
+    m = next(x for x in result.instruct_mixtures if x.name == "m")
+    assert not result.complete and not m.complete and "empty" in m.reason

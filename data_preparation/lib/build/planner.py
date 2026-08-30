@@ -515,6 +515,8 @@ def _check_mixture_sources(
         problem = f"built for {train.extra.get('budget_tokens')} tokens, budget is {budget}"
     if problem is None and short:
         problem = f"short sources {short}"
+    if problem is None and (train.tokens() or 0) == 0:
+        problem = "train split is empty (every example dropped or too long)"
     return short, problem
 
 
