@@ -86,7 +86,7 @@ def process(
         raise ValueError(f"{name}: process() applies to pretrain sources only (kind={source.kind})")
     processing = cfg.source_processing(name)
     source_hash = cfg.processed_hash(name)
-    raw_dir = layout.source_dir(name, "raw")
+    raw_dir = layout.raw_dir(name)
     raw = ensure_raw_tokens(cfg, name, layout)  # upgrades a raw dir from before the tokens column in place
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
@@ -130,7 +130,7 @@ class _Outputs:
     @classmethod
     def resume(cls, cfg: DatasetConfig, name: str, source_hash: str, layout: DatasetLayout, raw: Manifest, full_pass: bool) -> _Outputs:
         validation_tokens = cfg.sources[name].validation_tokens
-        processed_dir, validation_dir = layout.source_dir(name, "processed"), layout.validation_dir(name)
+        processed_dir, validation_dir = layout.processed_dir(name), layout.validation_dir(name)
         processed = _resumable_processed_manifest(cfg, name, source_hash, processed_dir, raw, full_pass)
         validation = None
         if validation_tokens:

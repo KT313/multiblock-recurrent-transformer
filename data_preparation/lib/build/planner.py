@@ -500,7 +500,7 @@ def _check_mixture_sources(
     raw_shards: dict[str, list[list[object]]] = {}
     built_from_short_sources = train.extra.get("short_sources", {})
     for src in cfg.instruct_mixtures[name].sources:
-        raw, raw_problem = _current(layout.source_dir(src, "raw"), cfg.raw_hash(src), "raw")
+        raw, raw_problem = _current(layout.raw_dir(src), cfg.raw_hash(src), "raw")
         if raw is None:
             if problem is None:
                 problem = f"source {src} {raw_problem}"

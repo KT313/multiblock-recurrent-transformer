@@ -10,6 +10,7 @@ import pytest
 
 from data_preparation.lib.storage.manifest import (
     MANIFEST_NAME,
+    STAGES,
     Manifest,
     ShardInfo,
     library_versions,
@@ -20,7 +21,7 @@ from data_preparation.lib.storage.manifest import (
 
 def _manifest() -> Manifest:
     m = Manifest(source="src", source_hash="abc", stage="raw", rows_fetched=30, token_count="tokenizer",
-                 tokenizer="llama-32k", versions={"python": "3.11"}, extra={"note": 1})  # fmt: skip
+                 tokenizer="llama-32k", truncated_at_tokens=2048, versions={"python": "3.11"}, extra={"note": 1})  # fmt: skip
     m.add_shard("data-00000.parquet", 10, 100)
     m.add_shard("data-00001.parquet", 20, 250)
     return m
@@ -37,6 +38,25 @@ def test_round_trip_and_unknown_keys(tmp_path: Path) -> None:
     payload["shards"][0]["future_shard_field"] = 2
     path.write_text(json.dumps(payload))
     assert Manifest.load(tmp_path) == m
+    assert json.loads(path.read_text())["truncated_at_tokens"] == 2048
+
+
+def test_legacy_token_cap_key_ignored_on_load(tmp_path: Path) -> None:
+    payload = _manifest().to_dict()
+    del payload["truncated_at_tokens"]
+    payload["token_cap"] = 2048  # manifests written before the field was renamed
+    (tmp_path / MANIFEST_NAME).write_text(json.dumps(payload))
+    loaded = Manifest.load(tmp_path)
+    assert loaded is not None and loaded.truncated_at_tokens is None and not hasattr(loaded, "token_cap")
+    assert loaded.rows() == 30 and loaded.tokenizer == "llama-32k"
+
+
+def test_is_outdated_only_when_the_cap_is_raised() -> None:
+    m = Manifest(source="s", source_hash="h", stage="raw", truncated_at_tokens=2048)
+    assert m.is_outdated(4096), "raising the cap outdates raw"
+    assert not m.is_outdated(2048) and not m.is_outdated(512), "the same or a lower cap never does"
+    assert not Manifest(source="s", source_hash="h", stage="raw").is_outdated(4096), "no recorded cap: never outdated"
+    assert not Manifest(source="s", source_hash="h", stage="processed").is_outdated(4096)
 
 
 def test_load_absent_or_unparsable(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -55,8 +75,12 @@ def test_load_absent_or_unparsable(tmp_path: Path, caplog: pytest.LogCaptureFixt
 
 
 def test_stage_validated() -> None:
-    with pytest.raises(ValueError, match="stage"):
-        Manifest(source="s", source_hash="h", stage="bogus")
+    assert STAGES == ("raw", "processed", "tokenizer")
+    for stage in STAGES:
+        assert Manifest(source="s", source_hash="h", stage=stage).stage == stage
+    for stage in ("bogus", "validation", "instruct_mixture"):  # validation and mixtures no longer exist on disk
+        with pytest.raises(ValueError, match="unknown manifest stage"):
+            Manifest(source="s", source_hash="h", stage=stage)
 
 
 def test_rows_tokens_is_current() -> None:

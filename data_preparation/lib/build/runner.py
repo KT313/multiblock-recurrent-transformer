@@ -508,7 +508,7 @@ def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: D
 def _instruct_tokens_per_row(cfg: DatasetConfig, src: str, layout: DatasetLayout) -> float:
     """Measured tokens/row of an instruct source's raw manifest when it is current and counted, else the config's
     estimate."""
-    raw = Manifest.load(layout.source_dir(src, "raw"))
+    raw = Manifest.load(layout.raw_dir(src))
     if raw is not None and raw.is_current(cfg.raw_hash(src)) and raw.rows() > 0 and (raw.tokens() or 0) > 0:
         return max((raw.tokens() or 0) / raw.rows(), 1.0)
     return float(cfg.sources[src].tokens_per_row_estimate)

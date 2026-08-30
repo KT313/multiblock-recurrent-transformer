@@ -166,7 +166,7 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert [s.base_lr for s in resolved.stages] == pytest.approx([3e-4, 1e-4, 5e-5])
     assert [s.tokens for s in resolved.stages] == [8192, 8192, 4096]
     assert all(isinstance(s, ResolvedStage) for s in resolved.stages)
-    assert resolved.stages[0].train_data[0].data_dir == str(tiny_layout.source_dir("synthetic_pretrain", "processed"))
+    assert resolved.stages[0].train_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_pretrain"))
     assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.instruct_mixture_dir("tiny", "tiny_instruct", "validation"))
     for stage in resolved.stages:
         for entry in stage.train_data + stage.val_data:
@@ -204,7 +204,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     assert "preparing missing data" in caplog.text
     assert caplog.text.count("dataset status:") == 2  # once before the build (incomplete), once after it (complete)
     layout = DatasetLayout(empty)
-    assert list(layout.source_dir("synthetic_pretrain", "processed").glob("*.parquet"))
+    assert list(layout.processed_dir("synthetic_pretrain").glob("*.parquet"))
     assert list(layout.validation_dir("synthetic_val").glob("*.parquet"))
     assert list(layout.instruct_mixture_dir("tiny", "tiny_instruct", "validation").glob("*.parquet"))
     assert Path(resolved.tokenizer_dir).is_dir()

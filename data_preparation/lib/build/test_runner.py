@@ -42,7 +42,7 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         result = build(cfg, layout, max_rounds=3)
     assert result.complete
-    processed = Manifest.load(layout.source_dir("p", "processed"))
+    processed = Manifest.load(layout.processed_dir("p"))
     assert processed is not None and (processed.tokens() or 0) >= 3000
     train = Manifest.load(layout.instruct_mixture_dir("t", "m", "train"))
     assert train is not None and train.extra["short_sources"] == {}
@@ -50,7 +50,7 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
     # the instruct source's first download (its own item) is sized by the estimate (2 rows); the mixture item then
     # starts from the raw manifest's measured tokens/row and tops the source up (possibly once more after a build
     # that came out short) until the train split reaches the budget
-    raw_i = Manifest.load(layout.source_dir("i", "raw"))
+    raw_i = Manifest.load(layout.raw_dir("i"))
     assert raw_i is not None and raw_i.rows() > 2  # the estimate alone would have stopped at ceil(3000/2000*1.2) = 2
 
 
@@ -79,7 +79,7 @@ def test_build_exhausted_source_warns_and_is_complete(cfg_factory: CfgFactory, l
         result = build(cfg, layout)
     assert "s: exhausted at 5 tokens, budget is 1000" in caplog.text
     assert result.complete and result.sources[0].exhausted
-    processed = Manifest.load(layout.source_dir("s", "processed"))
+    processed = Manifest.load(layout.processed_dir("s"))
     assert processed is not None and processed.rows() == 2
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
@@ -111,7 +111,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
     cfg = cfg_factory(sources, tokens=500)
     build(cfg, layout)
     victims = [
-        next(layout.source_dir("p", "processed").glob("data-*.parquet")),
+        next(layout.processed_dir("p").glob("data-*.parquet")),
         next(layout.validation_dir("h").glob("data-*.parquet")),
         next(layout.instruct_mixture_dir("t", "auto", "train").glob("data-*.parquet")),
     ]
@@ -122,7 +122,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
         result = build(cfg, layout)
     assert result.complete and all(v.is_file() for v in victims)
     assert "missing shard" in caplog.text and "removing" in caplog.text
-    for directory in (layout.source_dir("p", "processed"), layout.validation_dir("h"), layout.instruct_mixture_dir("t", "auto", "train")):
+    for directory in (layout.processed_dir("p"), layout.validation_dir("h"), layout.instruct_mixture_dir("t", "auto", "train")):
         manifest = Manifest.load(directory)
         assert manifest is not None and verify_shards(directory, manifest) == []
 
@@ -133,7 +133,7 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     build(cfg, layout)
-    raw_dir, processed_dir = layout.source_dir("p", "raw"), layout.source_dir("p", "processed")
+    raw_dir, processed_dir = layout.raw_dir("p"), layout.processed_dir("p")
     raw_before = {f.name: (f.stat().st_mtime_ns, f.stat().st_size) for f in raw_dir.iterdir()}
     processed_before = Manifest.load(processed_dir)
     assert processed_before is not None
@@ -156,7 +156,7 @@ def test_token_mode_change_recounts_raw_in_place_without_downloading(
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, max_seq_length=4096)
     build(cfg, layout)
-    raw_dir = layout.source_dir("p", "raw")
+    raw_dir = layout.raw_dir("p")
     before = Manifest.load(raw_dir)
     assert before is not None and before.token_count == "tokenizer"
 
@@ -193,11 +193,11 @@ def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> N
     )
     result = build(cfg, layout, steps={"tokenizer", "download"})
     assert not result.complete and result.tokenizer_complete
-    assert (layout.source_dir("p", "raw") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("p", "processed").exists() and not layout.validation_dir("h").exists()
+    assert (layout.raw_dir("p") / "MANIFEST.json").is_file()
+    assert not layout.processed_dir("p").exists() and not layout.validation_dir("h").exists()
     result = build(cfg, layout, steps={"process", "validation"})
     (p,) = result.sources
-    assert (layout.source_dir("p", "processed") / "MANIFEST.json").is_file() and result.validations[0].complete
+    assert (layout.processed_dir("p") / "MANIFEST.json").is_file() and result.validations[0].complete
     assert not p.complete and p.reason.startswith("tokens ")  # the estimate-sized download cannot be topped up without `download`
     assert build(cfg, layout).complete
     with pytest.raises(ValueError, match="unknown steps"):
@@ -208,8 +208,8 @@ def test_build_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout) ->
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
     cfg = cfg_factory(sources, tokens=500)
     result = build(cfg, layout, sources=["a"])
-    assert not result.complete and (layout.source_dir("a", "processed") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("b", "raw").exists()
+    assert not result.complete and (layout.processed_dir("a") / "MANIFEST.json").is_file()
+    assert not layout.raw_dir("b").exists()
     assert build(cfg, layout, sources=["b"]).complete
     with pytest.raises(ValueError, match="unknown sources"):
         build(cfg, layout, sources=["c"])
@@ -220,8 +220,8 @@ def test_build_skips_unused_sources(cfg_factory: CfgFactory, layout: DatasetLayo
     cfg = cfg_factory(sources, tokens=500)
     cfg.stages = [StageConfig(name="s", tokens=500, train={"used": 1.0}, val={"used": 1.0})]
     assert build(cfg, layout).complete
-    assert (layout.source_dir("used", "processed") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("unused", "raw").exists()
+    assert (layout.processed_dir("used") / "MANIFEST.json").is_file()
+    assert not layout.raw_dir("unused").exists()
 
 
 def test_build_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
@@ -280,7 +280,7 @@ def test_build_downloads_github_code_languages_in_one_pass(hub: FakeHub, cfg_fac
     assert result.complete and single == []  # the group pass replaced the per-source downloads
     assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
     for name in ("code_python", "code_java", "code_go"):
-        processed = Manifest.load(layout.source_dir(name, "processed"))
+        processed = Manifest.load(layout.processed_dir(name))
         assert processed is not None and (processed.tokens() or 0) >= cfg.source_budget_tokens(name)  # a third of the stage
 
     # `--sources` with one language uses the ordinary per-source path
@@ -434,7 +434,7 @@ def test_failing_item_aborts_the_build_and_stops_the_others(
     assert started <= {("download", "s0"), ("process", "s0"), ("download", "s1")}
     failed_at = trace.span("download", "s1")[1]
     assert all(t <= failed_at + 0.01 for s, n, kind, t in trace.events if kind == "start")
-    assert not layout.source_dir("s2", "raw").exists()
+    assert not layout.raw_dir("s2").exists()
 
 
 def test_the_original_error_wins_over_items_that_merely_stopped(
@@ -495,7 +495,7 @@ def test_interrupt_stops_running_items_within_a_shard_and_keeps_their_shards(
         build(cfg, layout)
     assert 1 <= len(shards_done) < 50, "stopped within a shard of the interrupt, not at the end"
     assert "source p stopped: build interrupted" in caplog.text
-    assert not layout.source_dir("p", "processed").exists()
+    assert not layout.processed_dir("p").exists()
     monkeypatch.setattr(build_mod, "as_completed", concurrent.futures.as_completed)
     assert build(cfg, layout).complete  # resumes and finishes; nothing was lost
 
@@ -535,7 +535,7 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     monkeypatch.setattr(build_mod, "download", partial(real_download, shard_size=10))
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=100)}, tokens=2000)
     build(cfg, layout)
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     manifest = Manifest.load(raw)
     assert manifest is not None and len(manifest.shards) >= 2, "the test needs several raw shards"
     last = manifest.shards[-1]
@@ -595,6 +595,6 @@ def test_two_mixtures_sharing_a_source_download_it_once_and_do_not_race(
     assert result.complete and overlap == []
     first_round = [rows for name, rows in calls if name == "shared"][0]
     assert first_round == max(rows_for_budget(m.target_tokens(1000, "shared"), 20, margin=1.0) for m in mixtures.values())
-    assert Manifest.load(layout.source_dir("shared", "raw")) is not None
+    assert Manifest.load(layout.raw_dir("shared")) is not None
     for mixture in mixtures:
         assert Manifest.load(layout.instruct_mixture_dir("t", mixture, "train")) is not None

@@ -83,10 +83,10 @@ def test_process_length_filter_drops_short_truncates_and_keeps_stats(
     texts = ["ok " * 5, "tiny", None, _words(6), "y" * 7, "z" * 8]  # _words(6) is 35 chars: truncated to 3 words
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local,
                    processing=ProcessingConfig(min_chars=5, max_chars=20), shard_size=4)  # fmt: skip
-    raw_tokens = [r["tokens"] for r in read_rows(layout.source_dir("s", "raw"))]
+    raw_tokens = [r["tokens"] for r in read_rows(layout.raw_dir("s"))]
     assert raw_tokens[3] == 4, "raw shards count the max_chars prefix the length filter keeps (3 words + a cut one)"
     m = process(cfg, "s", layout)
-    rows = read_rows(layout.source_dir("s", "processed"))
+    rows = read_rows(layout.processed_dir("s"))
     assert [r["text"] for r in rows] == ["ok " * 5, _words(6)[:20], "y" * 7, "z" * 8], "short / null dropped, long truncated"
     assert [r["tokens"] for r in rows] == [5, 4, 1, 1], "the raw counts are reused as they are"
     assert m.extra["stats"]["length_filter"] == {
@@ -112,7 +112,7 @@ def test_process_exact_dedup_tokens_and_idempotence(
     texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(70)]
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, max_seq_length=64)
     m = process(cfg, "s", layout, shard_size=2)
-    processed = layout.source_dir("s", "processed")
+    processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
     rows = read_rows(processed)
     assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(70)], "normalized duplicates dropped, text untouched"
@@ -133,8 +133,8 @@ def test_process_estimate_mode_caps_too(
                    token_count="estimate", max_seq_length=50)  # fmt: skip
     m = process(cfg, "s", layout)
     assert m.token_count == "estimate" and m.tokenizer is None
-    assert [r["tokens"] for r in read_rows(layout.source_dir("s", "processed"))] == [10, 50]
-    assert [len(r["text"]) for r in read_rows(layout.source_dir("s", "processed"))] == [40, 400]
+    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [10, 50]
+    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 400]
 
 
 def test_process_appends_only_the_new_shards(
@@ -146,7 +146,7 @@ def test_process_appends_only_the_new_shards(
     first = [_words(6, i) for i in range(6)] + [_words(6, 0)]  # one duplicate inside
     cfg = _prepare(cfg_factory, layout, source_dir, first, with_tokenizer, write=write_local, shard_size=3)
     m1 = process(cfg, "s", layout, shard_size=4)
-    processed = layout.source_dir("s", "processed")
+    processed = layout.processed_dir("s")
     old_rows = read_rows(processed)
     assert len(old_rows) == 6 and m1.extra["stats"]["input_rows"] == 7 and m1.extra["columns"] == ["text", "source", "tokens", "hash"]
     before = mtimes(processed)
@@ -184,7 +184,7 @@ def test_process_appends_only_the_new_shards(
     prepare_tokenizer(cfg, fresh)
     download(cfg, "s", fresh, rows_needed=11, shard_size=3)
     m_fresh = process(cfg, "s", fresh, shard_size=4)
-    assert read_rows(fresh.source_dir("s", "processed")) == new_rows
+    assert read_rows(fresh.processed_dir("s")) == new_rows
     assert m_fresh.tokens() == m2.tokens() and m_fresh.extra["stats"] == m2.extra["stats"]
     assert [sh.rows for sh in m_fresh.shards] == [3, 3, 1, 1], "same layout: one processed shard per raw shard"
 
@@ -204,7 +204,7 @@ def test_incremental_process_with_quality_filter_equals_a_full_pass(
     write_local(source_dir, [{"text": GOOD}], "parquet")
     download(cfg, "s", layout, rows_needed=3, shard_size=2)
     m2 = process(cfg, "s", layout)
-    incremental = read_rows(layout.source_dir("s", "processed"))
+    incremental = read_rows(layout.processed_dir("s"))
     assert [r["text"] for r in incremental][-1] == GOOD and m2.extra["stats"]["dedup"]["duplicates_removed"] == 0
 
     fresh = DatasetLayout(tmp_path / "fresh")
@@ -213,7 +213,7 @@ def test_incremental_process_with_quality_filter_equals_a_full_pass(
     prepare_tokenizer(cfg, fresh)
     download(cfg, "s", fresh, rows_needed=3, shard_size=2)
     m_fresh = process(cfg, "s", fresh)
-    assert read_rows(fresh.source_dir("s", "processed")) == incremental and m_fresh.extra["stats"] == m2.extra["stats"]
+    assert read_rows(fresh.processed_dir("s")) == incremental and m_fresh.extra["stats"] == m2.extra["stats"]
 
 
 def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
@@ -222,7 +222,7 @@ def test_process_rebuilds_when_shards_predate_the_hash_column_or_changed(
 ) -> None:  # fmt: skip
     cfg = _prepare(cfg_factory, layout, source_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local)
     m = process(cfg, "s", layout)
-    processed = layout.source_dir("s", "processed")
+    processed = layout.processed_dir("s")
     rows = read_rows(processed)
 
     # a processed directory from before the hash column: rebuilt from the raw shards (no download)
@@ -253,12 +253,12 @@ def test_process_no_dedup_mode_keeps_duplicates(
     proc = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="none"))
     cfg = _prepare(cfg_factory, layout, source_dir, ["dup", "dup", "DUP"], with_tokenizer, write=write_local, processing=proc)
     process(cfg, "s", layout)
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == ["dup", "dup", "DUP"]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == ["dup", "dup", "DUP"]
     exact_raw = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="exact", normalize=False))
     cfg2 = with_tokenizer(_cfg(cfg_factory, source_dir, exact_raw))
     download(cfg2, "s", layout, rows_needed=3)
     process(cfg2, "s", layout)
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == ["dup", "DUP"]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == ["dup", "DUP"]
 
 
 def test_process_quality_filter_only_when_enabled(
@@ -267,11 +267,11 @@ def test_process_quality_filter_only_when_enabled(
     texts = [GOOD, "This is one sentence. Another one here."]
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
     process(cfg, "s", layout)
-    assert len(read_rows(layout.source_dir("s", "processed"))) == 2
+    assert len(read_rows(layout.processed_dir("s"))) == 2
     on = with_tokenizer(_cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5, quality_filter=True), max_seq_length=500))
     download(on, "s", layout, rows_needed=2)
     m = process(on, "s", layout)
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [GOOD]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
     assert m.extra["stats"]["quality_filter"] == {
         "enabled": True, "filtered_count": 1, "rejection_reasons": {"too_few_sentences": 1},
     }  # fmt: skip
@@ -293,12 +293,12 @@ def test_process_decontamination_only_when_enabled(
     texts = [planted, GOOD, planted + " tail"]
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
     process(cfg, "s", layout, num_workers=num_workers)
-    assert len(read_rows(layout.source_dir("s", "processed"))) == 3 and calls == []
+    assert len(read_rows(layout.processed_dir("s"))) == 3 and calls == []
     decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test", "mmlu_test"])
     on = with_tokenizer(_cfg(cfg_factory, source_dir, ProcessingConfig(min_chars=5, decontamination=decon), max_seq_length=500))
     download(on, "s", layout, rows_needed=3)
     m = process(on, "s", layout, num_workers=num_workers)
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [GOOD]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
     assert m.extra["stats"]["decontamination"] == {
         "enabled": True, "contaminated_count": 2, "contaminated_by_benchmark": {"gsm8k_test": 2},
     }  # fmt: skip
@@ -318,7 +318,7 @@ def test_process_benchmark_load_failure_is_an_error(
     cfg = _prepare(cfg_factory, layout, source_dir, [GOOD], with_tokenizer, write=write_local, processing=proc, max_seq_length=500)
     with pytest.raises(OSError, match="hub unreachable"):
         process(cfg, "s", layout)
-    assert not (layout.source_dir("s", "processed") / "MANIFEST.json").exists()
+    assert not (layout.processed_dir("s") / "MANIFEST.json").exists()
 
 
 def test_process_minhash_removes_near_duplicates(
@@ -336,7 +336,7 @@ def test_process_minhash_removes_near_duplicates(
     m = process(cfg, "s", layout)
     # minhash mode = the normalized exact pass first (second `base`, the case variant of `short_a`), then the fuzzy
     # one (`near`); rows too short for an n-gram are not all collapsed onto the first of them
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial, short_a, short_b]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [base, other, partial, short_a, short_b]
     m2 = process(cfg, "s", layout)  # fuzzy dedup: always a full pass (a fresh manifest, not the stored one)
     assert m2 is not m and m2.extra["stats"]["input_rows"] == 8 and m2.shards == m.shards
     dedup_stats = m.extra["stats"]["dedup"]
@@ -375,7 +375,7 @@ def test_process_publishes_per_raw_shard_and_resumes_after_a_stop(
 
     texts = [_words(6, i) for i in range(9)] + [_words(6, 1)]  # 10 rows, one duplicate in the last raw shard
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, shard_size=3)
-    processed = layout.source_dir("s", "processed")
+    processed = layout.processed_dir("s")
     calls = {"n": 0}
 
     def stop_after_two() -> bool:
@@ -406,7 +406,7 @@ def test_validation_split_takes_the_first_rows_dedups_across_dirs_and_keeps_its_
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, shard_size=3)
     cfg.sources["s"] = replace(cfg.sources["s"], validation_tokens=14)  # 6 + 6 + 6 >= 14: the first three rows
     m = process(cfg, "s", layout, shard_size=2)
-    validation_dir, processed_dir = layout.validation_dir("s"), layout.source_dir("s", "processed")
+    validation_dir, processed_dir = layout.validation_dir("s"), layout.processed_dir("s")
     val = Manifest.load(validation_dir)
     assert val is not None and val.stage == "validation" and val.is_current(cfg.processed_hash("s"))
     assert [r["text"] for r in read_rows(validation_dir)] == texts[:3] and val.tokens() == 18
@@ -439,4 +439,4 @@ def test_validation_split_in_minhash_mode(
     cfg.sources["s"] = replace(cfg.sources["s"], validation_tokens=45)  # 30 tokens per row: the first two rows
     process(cfg, "s", layout)
     assert [r["text"] for r in read_rows(layout.validation_dir("s"))] == texts[:2]
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == texts[2:]
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == texts[2:]

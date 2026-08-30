@@ -1,28 +1,40 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
-    <root>/sources/<source>/{raw,processed}/            shared by every dataset config (append-only source cache)
-    <root>/sources/<source>/validation/                 held-out rows: of a `validation` source, or the first processed
-                                                        rows of a pretrain source with `validation_tokens` (append-only,
-                                                        so the train/validation boundary never moves on top-ups)
-    <root>/instruct_mixtures/<config name>/<mixture>/{train,validation}/
+The tree shows the download/build boundary: ``sources/`` holds only downloaded data, ``processed/`` only derived data.
+
+    <root>/sources/<source>/raw/                         downloaded rows (text truncated to `max_seq_length` tokens,
+                                                         + `tokens` column); append-only, shared by every dataset config;
+                                                         deleted only when the source identity changes or the cap is
+                                                         raised, after the user confirmed
+    <root>/processed/<source>/                           cleaned rows (one flat folder per source, derived from raw,
+                                                         cheap to rebuild, shared); what training reads
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination
     <root>/hub_index/<repo>@<revision>/<glob hash>.json  file lists + row counts of `hf_files` / `github_code` repos
+    <root>/.build.lock                                   one build per directory
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
-SourceStage = Literal["raw", "processed"]
-InstructMixtureSplit = Literal["train", "validation"]
-SOURCE_STAGES: tuple[str, ...] = ("raw", "processed")
-INSTRUCT_MIXTURE_SPLITS: tuple[str, ...] = ("train", "validation")
-# columns of a processed shard; `hash` (int64 exact-dedup key) lets `process` append new shards instead of rewriting
-PROCESSED_COLUMNS: tuple[str, ...] = ("text", "source", "tokens", "hash")
+# columns of a processed shard per source kind; `hash` (int64 exact-dedup key) lets the build append new shards
+# instead of rewriting, and refills the dedup filter from disk
+PRETRAIN_PROCESSED_COLUMNS: tuple[str, ...] = ("text", "source", "tokens", "hash")
+INSTRUCT_PROCESSED_COLUMNS: tuple[str, ...] = ("instruction", "input", "output", "tokens", "hash")
+# alias for the pretrain columns; callers that predate per-kind columns use it until the build is per kind (task 4)
+PROCESSED_COLUMNS: tuple[str, ...] = PRETRAIN_PROCESSED_COLUMNS
+
+
+def processed_columns(kind: str) -> tuple[str, ...]:
+    """Columns of a processed shard of a source of ``kind`` (``pretrain`` or ``instruct``)."""
+    if kind == "pretrain":
+        return PRETRAIN_PROCESSED_COLUMNS
+    if kind == "instruct":
+        return INSTRUCT_PROCESSED_COLUMNS
+    raise ValueError(f"unknown source kind {kind!r}; expected 'pretrain' or 'instruct'")
 
 
 @dataclass(frozen=True)
@@ -31,18 +43,13 @@ class DatasetLayout:
 
     root: Path = Path("dataset")
 
-    def source_dir(self, name: str, stage: str) -> Path:
-        if stage not in SOURCE_STAGES:
-            raise ValueError(f"unknown source stage {stage!r}; expected one of {SOURCE_STAGES}")
-        return self.root / "sources" / name / stage
+    def raw_dir(self, name: str) -> Path:
+        """Downloaded rows of source ``name`` (the only tree the download step writes)."""
+        return self.root / "sources" / name / "raw"
 
-    def validation_dir(self, name: str) -> Path:
-        return self.root / "sources" / name / "validation"
-
-    def instruct_mixture_dir(self, config_name: str, mixture: str, split: str) -> Path:
-        if split not in INSTRUCT_MIXTURE_SPLITS:
-            raise ValueError(f"unknown mixture split {split!r}; expected one of {INSTRUCT_MIXTURE_SPLITS}")
-        return self.root / "instruct_mixtures" / config_name / mixture / split
+    def processed_dir(self, name: str) -> Path:
+        """Cleaned rows of source ``name`` (the only tree the build step writes)."""
+        return self.root / "processed" / name
 
     def tokenizer_dir(self, name: str) -> Path:
         return self.root / "tokenizers" / name

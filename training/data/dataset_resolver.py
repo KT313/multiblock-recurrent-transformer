@@ -97,7 +97,7 @@ def _data_entry(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key:
     if kind == "pretrain" and split == "validation":
         source_dir = layout.validation_dir(base)  # the source's own held-out split (`validation_tokens`)
     elif kind == "pretrain":
-        source_dir = layout.source_dir(base, "processed")
+        source_dir = layout.processed_dir(base)
     elif kind == "validation":
         source_dir = layout.validation_dir(base)
     else:  # unreachable: DatasetConfig rejects instruct sources outside instruct mixtures

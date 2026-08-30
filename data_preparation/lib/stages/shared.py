@@ -262,7 +262,7 @@ def download(
     """
     source = fetch_source(cfg, cfg.sources[name])
     source_hash = cfg.raw_hash(name)
-    out = layout.source_dir(name, "raw")
+    out = layout.raw_dir(name)
     manifest = ensure_raw_tokens(cfg, name, layout) or _fresh_raw_manifest(cfg, name, source_hash, out)
 
     # nothing to do?
@@ -474,7 +474,7 @@ def download_github_code_group(
         if members and github_code_repo_key(source) != github_code_repo_key(members[0].source):
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
         source_hash = cfg.raw_hash(name)
-        out = layout.source_dir(name, "raw")
+        out = layout.raw_dir(name)
         manifest = ensure_raw_tokens(cfg, name, layout) or _fresh_raw_manifest(cfg, name, source_hash, out)
         results[name] = manifest
         if manifest.extra.get("exhausted"):
@@ -660,7 +660,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
     raw manifest. A raw directory from before the column (or counted differently) is upgraded **in place**: every
     shard is rewritten with the same rows and name plus ``tokens``; ``rows_fetched`` and the shard numbering do not
     change and nothing is downloaded."""
-    out = layout.source_dir(name, "raw")
+    out = layout.raw_dir(name)
     manifest = current_manifest(out, cfg.raw_hash(name), "raw")
     if manifest is None or raw_has_tokens(cfg, manifest):
         return manifest

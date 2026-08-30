@@ -78,7 +78,7 @@ def test_plan_after_build_is_complete_and_uses_measured_tokens(layout: DatasetLa
     result = build(cfg, layout)
     assert result.complete and result.tokenizer_complete and result.missing() == []
     a = next(s for s in result.sources if s.name == "a")
-    raw, processed = Manifest.load(layout.source_dir("a", "raw")), Manifest.load(layout.source_dir("a", "processed"))
+    raw, processed = Manifest.load(layout.raw_dir("a")), Manifest.load(layout.processed_dir("a"))
     assert raw is not None and processed is not None
     assert a.tokens_per_row == (processed.tokens() or 0) / raw.rows() and a.tokens_per_row != 100
     assert a.tokens_present >= 1000 and a.rows_present == raw.rows() and a.rows_to_fetch == 0 and a.manifest_current
@@ -98,7 +98,7 @@ def test_plan_uses_raw_token_counts_right_after_download(layout: DatasetLayout) 
     cfg = two_stage_cfg()
     result = build(cfg, layout, steps={"tokenizer", "download"})
     a = next(s for s in result.sources if s.name == "a")
-    raw = Manifest.load(layout.source_dir("a", "raw"))
+    raw = Manifest.load(layout.raw_dir("a"))
     assert raw is not None and raw.tokens() is not None
     assert a.tokens_per_row == (raw.tokens() or 0) / raw.rows() and a.tokens_per_row != 100  # measured, not the estimate
     assert not a.complete and a.reason == "processed: manifest missing"
@@ -121,7 +121,7 @@ def test_over_fetched_raw_rows_are_fine(layout: DatasetLayout) -> None:
     once the processed tokens cover the budget."""
     cfg = two_stage_cfg()
     build(cfg, layout)
-    raw_dir = layout.source_dir("a", "raw")
+    raw_dir = layout.raw_dir("a")
     raw = Manifest.load(raw_dir)
     assert raw is not None
     before = plan(cfg, layout)
@@ -147,7 +147,7 @@ def test_stale_hash_is_not_complete(layout: DatasetLayout) -> None:
 def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)
-    shard = next(layout.source_dir("a", "processed").glob("data-*.parquet"))
+    shard = next(layout.processed_dir("a").glob("data-*.parquet"))
     shard.unlink()
     result = plan(cfg, layout)
     a = next(s for s in result.sources if s.name == "a")
@@ -166,10 +166,10 @@ def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:
 def test_processed_without_hash_column_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)
-    processed = Manifest.load(layout.source_dir("a", "processed"))
+    processed = Manifest.load(layout.processed_dir("a"))
     assert processed is not None
     del processed.extra["columns"]
-    processed.save(layout.source_dir("a", "processed"))
+    processed.save(layout.processed_dir("a"))
     a = next(s for s in plan(cfg, layout).sources if s.name == "a")
     assert not a.complete and a.manifest_current and a.reason == "processed: predates the hash column"
     assert a.rows_to_fetch == 0  # the rebuild needs no download

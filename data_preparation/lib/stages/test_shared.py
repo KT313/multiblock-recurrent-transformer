@@ -140,7 +140,7 @@ def test_download_synthetic_appends_incrementally(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, mtimes: Mtimes, read_rows: Reader
 ) -> None:
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}))
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     m1 = download(cfg, "p", layout, rows_needed=25, shard_size=10)
     assert [s.rows for s in m1.shards] == [10, 10, 5] and m1.rows_fetched == 25 and m1.stage == "raw"
     assert m1.source_hash == cfg.raw_hash("p") and not m1.extra.get("exhausted")
@@ -189,7 +189,7 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     cfg = with_tokenizer(cfg_factory({"g": _local(src_dir, converter="gsm8k_question_answer")}))
     m = download(cfg, "g", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 7 and m.rows_fetched == 7 and m.extra["exhausted"] is True
-    rows = read_rows(layout.source_dir("g", "raw"))
+    rows = read_rows(layout.raw_dir("g"))
     assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6}
     assert m.token_count == "tokenizer" and m.tokenizer == "synthetic" and m.tokens() == sum(r["tokens"] for r in rows)
     # exhausted: a larger request is a no-op
@@ -203,7 +203,7 @@ def test_download_keeps_extra_columns_and_requires_text_field(
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
     download(cfg, "c", layout, rows_needed=1)
-    assert read_rows(layout.source_dir("c", "raw")) == [{"code": "print(1)" * 10, "lang": "py", "tokens": 40}]  # tokens of `code`
+    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "lang": "py", "tokens": 40}]  # tokens of `code`
     bad = cfg_factory({"c": _local(src_dir, text_field="text")})
     other = DatasetLayout(layout.root / "other")
     prepare_tokenizer(bad, other)
@@ -222,7 +222,7 @@ def test_download_rebuilds_on_stale_hash(
         m = download(changed, "p", layout, rows_needed=7, shard_size=5)
     assert "rebuilding from scratch" in caplog.text
     assert m.rows_fetched == 7 and [s.rows for s in m.shards] == [5, 2]
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     assert sorted(p.name for p in raw.glob("*.parquet")) == ["data-00000.parquet", "data-00001.parquet"]
     assert [r["text"] for r in read_rows(raw)] == [synthetic_row("pretrain", 9, i)["text"] for i in range(7)]
 
@@ -232,7 +232,7 @@ def test_download_refuses_to_restart_over_shards_without_a_manifest(
 ) -> None:
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
     download(cfg, "p", layout, rows_needed=3)
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     (raw / "MANIFEST.json").unlink()
     with pytest.raises(RuntimeError, match="holds shards but no manifest"):
         download(cfg, "p", layout, rows_needed=3)
@@ -257,7 +257,7 @@ def test_download_keeps_every_row_a_loader_yields_beyond_rows_needed(
     m = download(cfg, "p", layout, rows_needed=11, shard_size=8)
     assert m.rows() == 20 and m.rows_fetched == 20 and [s.rows for s in m.shards] == [8, 8, 4]
     assert calls == [(0, 11, ["text"], True)]
-    assert [r["text"] for r in read_rows(layout.source_dir("p", "raw"))] == [f"row {i}" for i in range(20)]
+    assert [r["text"] for r in read_rows(layout.raw_dir("p"))] == [f"row {i}" for i in range(20)]
     assert download(cfg, "p", layout, rows_needed=15, shard_size=8) == m and len(calls) == 1  # below the boundary: no-op
     m2 = download(cfg, "p", layout, rows_needed=21, shard_size=8)
     assert calls[-1] == (20, 1, ["text"], True) and m2.rows_fetched == 40 and m2.rows() == 40
@@ -326,7 +326,7 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     cfg = with_tokenizer(cfg_factory({"i": src}))
     m = download(cfg, "i", layout, rows_needed=3, shard_size=10)
     assert m.rows() == 3 and m.rows_fetched == 5 and m.extra["skipped_malformed"] == 2
-    assert read_rows(layout.source_dir("i", "raw")) == [
+    assert read_rows(layout.raw_dir("i")) == [
         {"instruction": "what", "input": "", "output": "that", "tokens": 2},
         {"instruction": "how", "input": "background", "output": "so", "tokens": 3},
         {"instruction": "why", "input": "", "output": "because", "tokens": 2},
@@ -344,7 +344,7 @@ def test_download_instruct_filter_reads_the_source_once(
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
     # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
     assert m.rows() == 3 and m.rows_fetched == 6 and not m.extra.get("exhausted")
-    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.source_dir("s", "raw")))
+    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.raw_dir("s")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
     assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.extra["exhausted"] is True
 
@@ -376,7 +376,7 @@ def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenize
     cfg = with_tokenizer(cfg_factory({"i": _synthetic(kind="instruct", seed=2)}))
     m = download(cfg, "i", layout, rows_needed=3)
     assert m.rows() == 3
-    rows = read_rows(layout.source_dir("i", "raw"))
+    rows = read_rows(layout.raw_dir("i"))
     assert rows == [{**synthetic_row("instruct", 2, i), "tokens": r["tokens"]} for i, r in enumerate(rows)]
     counter = TokenCounter(cfg, layout)
     assert all(r["tokens"] == counter.count(instruct_text(r)) for r in rows)
@@ -402,7 +402,7 @@ def test_validation_synthetic_disjoint_shuffled_and_idempotent(
     rows = read_rows(out)
     assert [set(r) for r in rows] == [{"text", "source", "tokens"}] * 20
     assert {r["source"] for r in rows} == {"val"}
-    train_texts = {r["text"] for r in read_rows(layout.source_dir("train", "raw"))}
+    train_texts = {r["text"] for r in read_rows(layout.raw_dir("train"))}
     assert not train_texts & {r["text"] for r in rows}, "validation rows must not appear in the training source"
     generated = [synthetic_row("validation", 1, i)["text"] for i in range(20)]
     assert sorted(r["text"] for r in rows) == sorted(generated) and [r["text"] for r in rows] != generated
@@ -511,13 +511,13 @@ def test_fetch_source_forces_range_requests_by_default() -> None:
 def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> dict[str, Any]:
     state: dict[str, Any] = {}
     for name in names:
-        manifest = Manifest.load(layout.source_dir(name, "raw"))
+        manifest = Manifest.load(layout.raw_dir(name))
         assert manifest is not None
         state[name] = {
             "rows_fetched": manifest.rows_fetched,
             "exhausted": manifest.extra.get("exhausted", False),
             "shards": [(s.name, s.rows) for s in manifest.shards],
-            "rows": read_rows(layout.source_dir(name, "raw")),
+            "rows": read_rows(layout.raw_dir(name)),
         }
     return state
 
@@ -555,7 +555,7 @@ def test_download_github_code_group_equals_separate_downloads(
     again = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
     assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 4, "java": 2, "rust": 0}
     topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "java": 4}, shard_size=3)
-    assert [r["text"] for r in read_rows(grouped.source_dir("java", "raw"))] == ["a code 1", "a code 4", "a code 7", "b code 1"]
+    assert [r["text"] for r in read_rows(grouped.raw_dir("java"))] == ["a code 1", "a code 4", "a code 7", "b code 1"]
     assert topped["java"].rows_fetched == 4 and topped["py"].rows() == 4
     download(cfg, "java", separate, rows_needed=4, shard_size=3)
     assert _raw_state(grouped, ["java"], read_rows) == _raw_state(separate, ["java"], read_rows)
@@ -591,7 +591,7 @@ def test_ensure_raw_tokens_upgrades_in_place_without_downloading(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}))
-    raw_dir = layout.source_dir("p", "raw")
+    raw_dir = layout.raw_dir("p")
     fresh = download(cfg, "p", layout, rows_needed=25, shard_size=10)
     rows_with_tokens = read_rows(raw_dir)
     _strip_tokens(raw_dir)
@@ -618,7 +618,7 @@ def test_download_upgrades_a_legacy_raw_dir_before_topping_up(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}))
-    raw_dir = layout.source_dir("p", "raw")
+    raw_dir = layout.raw_dir("p")
     download(cfg, "p", layout, rows_needed=10, shard_size=10)
     _strip_tokens(raw_dir)
     m = download(cfg, "p", layout, rows_needed=15, shard_size=10)
@@ -658,7 +658,7 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     offsets = _failing_loader(monkeypatch, fail_at=27)
     with pytest.raises(OSError, match="connection reset"):
         download(cfg, "p", layout, rows_needed=40, shard_size=10)
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     m = Manifest.load(raw)
     assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
     assert m.rows() == 20 and not m.extra.get("exhausted") and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
@@ -677,7 +677,7 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
     assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m2.shards]
-    assert read_rows(other.source_dir("p", "raw")) == read_rows(raw)
+    assert read_rows(other.raw_dir("p")) == read_rows(raw)
 
 
 def test_download_instruct_shard_offsets_count_consumed_source_rows(
@@ -711,7 +711,7 @@ def test_download_stops_within_one_shard_when_asked(
 
     with pytest.raises(BuildAborted):
         download(cfg, "p", layout, rows_needed=100, shard_size=10, should_stop=should_stop)
-    m = Manifest.load(layout.source_dir("p", "raw"))
+    m = Manifest.load(layout.raw_dir("p"))
     assert m is not None and m.rows() == 20 and m.rows_fetched == 20 and calls["n"] == 2
     assert download(cfg, "p", layout, rows_needed=100, shard_size=10).rows() == 100  # resumes to completion
 
@@ -724,7 +724,7 @@ def test_truncate_raw_to_good_prefix(
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     _failing_loader(monkeypatch, fail_at=None)
     download(cfg, "p", layout, rows_needed=40, shard_size=10)
-    raw = layout.source_dir("p", "raw")
+    raw = layout.raw_dir("p")
     m = Manifest.load(raw)
     assert m is not None and truncate_raw_to_good_prefix(raw, m) and len(m.shards) == 4  # nothing wrong: untouched
 
@@ -755,7 +755,7 @@ def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_
     write_local(src_dir, [{"text": " ".join(["tok_1"] * 50)}], "parquet")  # 299 chars, 50 tokens
     cfg = with_tokenizer(cfg_factory({"p": _local(src_dir)}, processing=ProcessingConfig(min_chars=1, max_chars=59), max_seq_length=4096))
     m = download(cfg, "p", layout, rows_needed=1)
-    assert [r["tokens"] for r in read_rows(layout.source_dir("p", "raw"))] == [10], "only the first max_chars are counted"
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("p"))] == [10], "only the first max_chars are counted"
     assert m.extra["counted_chars"] == 59 and m.tokens() == 10
 
     def no_fetch(*args: object, **kwargs: object) -> object:
@@ -765,7 +765,7 @@ def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_
     cfg.processing = ProcessingConfig(min_chars=1, max_chars=119)
     m2 = download(cfg, "p", layout, rows_needed=1)  # the raw hash is unchanged: recounted in place
     assert m2.rows_fetched == 1 and m2.extra["counted_chars"] == 119 and m2.tokens() == 20
-    assert [r["tokens"] for r in read_rows(layout.source_dir("p", "raw"))] == [20]
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("p"))] == [20]
 
 
 def test_download_instruct_filter_calls_the_loader_once_and_closes_it(

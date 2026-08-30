@@ -1,12 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``MANIFEST.json`` beside a shard directory: what a source/mixture directory contains and which config built it.
+"""``MANIFEST.json`` beside a shard directory: what the directory contains and which config built it.
 
-Every stage directory (``dataset/sources/<source>/{raw,processed}/``, instruct mixtures, validation sources,
-tokenizers) carries one manifest. ``source_hash`` is the stage's key from the config that produced it
-(:meth:`DatasetConfig.raw_hash` for ``raw/`` — loader identity only, so processing/token-setting changes never
-invalidate downloads —, :meth:`DatasetConfig.processed_hash` / ``validation_hash`` / ``instruct_mixture_hash`` /
-``tokenizer_hash`` for the others); a manifest whose hash differs from the current config is stale and its stage
-is rebuilt. Verification is cheap (parquet metadata only).
+Every stage directory (``dataset/sources/<source>/raw/``, ``dataset/processed/<source>/``, tokenizers) carries one
+manifest. ``source_hash`` is the stage's key from the config that produced it (:meth:`DatasetConfig.raw_hash` for
+``raw/`` — loader identity plus token settings, so processing changes never invalidate downloads —,
+:meth:`DatasetConfig.processed_hash` for ``processed/``, ``tokenizer_hash`` for tokenizers); a manifest whose hash
+differs from the current config is stale and its stage is rebuilt. A raw manifest also records
+``truncated_at_tokens`` (the ``max_seq_length`` its texts were cut at): raising the cap above it makes the folder
+*outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification is cheap (parquet metadata only).
 """
 
 from __future__ import annotations
@@ -30,8 +31,8 @@ from data_preparation.lib.log import get_logger
 log = get_logger(__name__)
 
 MANIFEST_NAME = "MANIFEST.json"
-Stage = Literal["raw", "processed", "instruct_mixture", "validation", "tokenizer"]
-STAGES: tuple[str, ...] = ("raw", "processed", "instruct_mixture", "validation", "tokenizer")
+Stage = Literal["raw", "processed", "tokenizer"]
+STAGES: tuple[str, ...] = ("raw", "processed", "tokenizer")
 
 
 def _utc_now_iso() -> str:
@@ -55,7 +56,9 @@ class Manifest:
     shards: list[ShardInfo] = field(default_factory=list)
     token_count: str | None = None
     tokenizer: str | None = None
-    token_cap: int | None = None  # counts were capped at this many tokens (max_seq_length)
+    # raw manifests: texts were truncated to this many tokens at download time (the config's `max_seq_length` then);
+    # None for processed / tokenizer manifests and for raw folders downloaded before truncation existed
+    truncated_at_tokens: int | None = None
     versions: dict[str, str] = field(default_factory=dict)
     created: str = field(default_factory=_utc_now_iso)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -80,6 +83,15 @@ class Manifest:
 
     def is_current(self, source_hash: str) -> bool:
         return self.source_hash == source_hash
+
+    def is_outdated(self, max_seq_length: int) -> bool:
+        """Whether a raw folder was stored with a smaller cap than the config asks for now.
+
+        Cap rule: rows are at most ``truncated_at_tokens`` long, so raising ``max_seq_length`` above it outdates the
+        folder (its texts are missing tokens the config now wants; it is re-downloaded after confirmation), while
+        lowering it never does (the build clamps stored counts, training truncates at ``block_size`` anyway). A
+        manifest without ``truncated_at_tokens`` is never outdated by this rule."""
+        return self.truncated_at_tokens is not None and max_seq_length > self.truncated_at_tokens
 
     def add_shard(self, name: str, rows: int, tokens: int | None = None, offset: int | None = None) -> None:
         """Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name."""

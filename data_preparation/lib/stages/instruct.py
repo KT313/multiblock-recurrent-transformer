@@ -71,7 +71,7 @@ def build_instruct_mixture(
     for src in mixture.sources:
         raw = ensure_raw_tokens(cfg, src, layout)
         if raw is None:
-            raise FileNotFoundError(f"{src}: no current raw manifest in {layout.source_dir(src, 'raw')}; run the download stage first")
+            raise FileNotFoundError(f"{src}: no current raw manifest in {layout.raw_dir(src)}; run the download stage first")
         raw_manifests[src] = raw
     input_shards = {src: shard_list(manifest) for src, manifest in raw_manifests.items()}
 
@@ -220,7 +220,7 @@ def _take_source_rows(
     kept_tokens = 0
     dropped_long = 0
     with progress(total=raw.rows(), desc=f"{src}: take_rows", unit="row", leave=False) as bar:
-        for row in _iter_raw_rows(layout.source_dir(src, "raw"), raw, should_stop):
+        for row in _iter_raw_rows(layout.raw_dir(src), raw, should_stop):
             rows_read += 1
             bar.update(1)
             n_tokens = int(row["tokens"])

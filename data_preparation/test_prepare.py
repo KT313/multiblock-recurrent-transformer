@@ -79,10 +79,10 @@ def test_build_sources_and_steps_filters(tmp_path: Path) -> None:
     layout = DatasetLayout(root)
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
     assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
-    assert (layout.source_dir("synthetic_pretrain", "raw") / "MANIFEST.json").is_file()
-    assert not layout.source_dir("synthetic_pretrain", "processed").exists() and not layout.validation_dir("synthetic_val").exists()
+    assert (layout.raw_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
+    assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.validation_dir("synthetic_val").exists()
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_val"])
-    assert layout.validation_dir("synthetic_val").is_dir() and not layout.source_dir("synthetic_pretrain", "processed").exists()
+    assert layout.validation_dir("synthetic_val").is_dir() and not layout.processed_dir("synthetic_pretrain").exists()
     with pytest.raises(SystemExit) as exc:
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == 1
@@ -120,7 +120,7 @@ def test_tiny_end_to_end(tmp_path: Path, tiny_dataset_config: DatasetConfig) -> 
     prepare.main(["tiny", "--dataset_dir", str(root)])
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     layout = DatasetLayout(root)
-    assert (layout.source_dir("synthetic_pretrain", "processed") / "MANIFEST.json").is_file()
+    assert (layout.processed_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
     assert all((layout.instruct_mixture_dir(tiny_dataset_config.name, "tiny_instruct", s) / "MANIFEST.json").is_file() for s in ("train", "validation"))
     shutil.rmtree(layout.validation_dir("synthetic_val"))
     with pytest.raises(SystemExit):
