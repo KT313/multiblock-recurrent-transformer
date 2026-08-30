@@ -161,14 +161,27 @@ def _instruct_mixtures(cfg: DatasetConfig) -> list[str]:
 
 
 def _validations(cfg: DatasetConfig) -> list[str]:
+    splits = [name for name in cfg.sources_of_kind("pretrain") if cfg.sources[name].validation_tokens]
     names = cfg.sources_of_kind("validation")
-    if not names:
+    if not names and not splits:
         return []
-    lines = ["## Held-out validation sets", "", "| Source | Rows | Seed | Loader | Origin |", "|---|---:|---:|---|---|"]
-    for name in names:
-        src = cfg.sources[name]
-        lines.append(f"| `{name}` | {src.rows:,} | {src.seed} | `{src.loader}` | {_origin(src)} |")
-    return lines + [""]
+    lines = ["## Held-out validation sets", ""]
+    if splits:
+        lines += ["| Split | Tokens | From |", "|---|---:|---|"]
+        for name in splits:
+            src = cfg.sources[name]
+            lines.append(
+                f"| `{name}/validation` | {_tokens(src.validation_tokens)} | the first processed rows of `{name}` "
+                "(deduplicated together with the training rows, never part of `processed/`) |"
+            )
+        lines.append("")
+    if names:
+        lines += ["| Source | Rows | Seed | Loader | Origin |", "|---|---:|---:|---|---|"]
+        for name in names:
+            src = cfg.sources[name]
+            lines.append(f"| `{name}` | {src.rows:,} | {src.seed} | `{src.loader}` | {_origin(src)} |")
+        lines.append("")
+    return lines
 
 
 def _sources(cfg: DatasetConfig) -> list[str]:
@@ -231,6 +244,8 @@ def _details(cfg: DatasetConfig, name: str) -> str:
         parts.append(f"check_limit {src.check_limit:,}")
     if src.kind == "pretrain":
         parts.append(f"budget {_tokens(cfg.source_budget_tokens(name))}")
+        if src.validation_tokens:
+            parts.append(f"validation split {_tokens(src.validation_tokens)}")
         if src.processing is not None:
             override_lines = _processing_lines(src.processing)
             parts.append("processing override: " + "; ".join(line.removeprefix("- ") for line in override_lines))

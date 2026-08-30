@@ -110,7 +110,13 @@ def status(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
     """The plan for ``cfg`` under ``layout``, logged as a summary (warnings for exhausted sources)."""
     result = plan(cfg, layout)
     _log_plan(result)
+    _warn_overlaps(cfg)
     return result
+
+
+def _warn_overlaps(cfg: DatasetConfig) -> None:
+    for warning in cfg.overlap_warnings():
+        log.warning(warning)
 
 
 def build(
@@ -139,6 +145,7 @@ def build(
     selected = None if sources is None else set(sources)
 
     current = plan(cfg, layout)
+    _warn_overlaps(cfg)
     if dry_run:
         log.info("dry run, plan for %s under %s:\n%s", cfg.name, layout.root, current.summary(), extra={"keep": True})
         return current
@@ -208,6 +215,8 @@ def _work_items(
 
     if "validation" in active_steps:
         for validation_plan in current.validations:
+            if "/" in validation_plan.name:
+                continue  # a pretrain source's `<name>/validation` split: built by the source's own `process` item
             if _wanted(validation_plan.name, validation_plan.complete, selected):
                 action = partial(_build_validation, cfg, validation_plan, layout, slots)
                 items.append(_WorkItem("validation", validation_plan.name, action))
@@ -387,11 +396,12 @@ def _build_pretrain_source(
     name, budget = source_plan.name, source_plan.budget_tokens
     _remove_broken_stages(cfg, name, layout)
     tokens_per_row = source_plan.tokens_per_row
+    total_tokens = budget + cfg.sources[name].validation_tokens  # the validation split comes off the top
 
     for round_index in range(max_rounds):
         raw = None
         if "download" in active_steps:
-            rows_needed = rows_for_budget(budget, tokens_per_row)
+            rows_needed = rows_for_budget(total_tokens, tokens_per_row)
             with slots.downloading():
                 raw = download(cfg, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
         refined = _process_round(cfg, name, layout, active_steps, num_workers, raw, budget, round_index, slots)
@@ -423,7 +433,7 @@ def _build_github_code_group(
     for round_index in range(max_rounds):
         raws: dict[str, Manifest] = {}
         if "download" in active_steps:
-            rows_needed = {name: rows_for_budget(budgets[name], tokens_per_row[name]) for name in pending}
+            rows_needed = {name: rows_for_budget(budgets[name] + cfg.sources[name].validation_tokens, tokens_per_row[name]) for name in pending}
             with slots.downloading():
                 raws = download_github_code_group(cfg, pending, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
         still_pending: list[str] = []
@@ -459,7 +469,8 @@ def _process_round(
         processed = process(cfg, name, layout, num_workers=num_workers, should_stop=slots.should_stop)
 
     tokens = processed.tokens() or 0
-    if tokens >= budget:
+    validation_tokens = _validation_split_tokens(cfg, name, layout)
+    if tokens >= budget and validation_tokens >= cfg.sources[name].validation_tokens:
         return None
     exhausted = raw is not None and bool(raw.extra.get("exhausted"))
     if exhausted or raw is None:
@@ -468,9 +479,17 @@ def _process_round(
         log.warning("%s: %s at %d tokens, budget is %d", name, why, tokens, budget)
         return None
 
-    tokens_per_row = max(tokens / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
+    tokens_per_row = max((tokens + validation_tokens) / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
     log.info("%s: round %d: %d of %d tokens after processing, refining to %.1f tokens/row", name, round_index + 1, tokens, budget, tokens_per_row)
     return tokens_per_row
+
+
+def _validation_split_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> int:
+    """Tokens in a pretrain source's validation split (0 without one)."""
+    if cfg.sources[name].validation_tokens == 0:
+        return 0
+    manifest = Manifest.load(layout.validation_dir(name))
+    return (manifest.tokens() or 0) if manifest is not None else 0
 
 
 def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout, slots: _Slots) -> None:

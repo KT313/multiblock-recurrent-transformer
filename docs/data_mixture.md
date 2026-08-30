@@ -65,7 +65,7 @@ gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every so
 | `arxiv` | 2.00% | 66.0M | 1500 |
 | `openwebmath` | 3.00% | 99.0M | 750 |
 
-Validation: `fineweb_val` at 100%
+Validation: `fineweb_edu/validation` at 100%
 
 ### Stage 2: `pretrain_phase2` (1.50B tokens, transition 10%)
 
@@ -89,7 +89,7 @@ Validation: `fineweb_val` at 100%
 | `peso` | 9.00% | 135.0M | 1500 |
 | `arxiv` | 6.00% | 90.0M | 1500 |
 
-Validation: `fineweb_val` at 100%
+Validation: `fineweb_edu/validation` at 100%
 
 ### Stage 3: `finetune` (150.0M tokens, transition 0%)
 
@@ -118,15 +118,15 @@ Validation: `flan_instruct/validation` (instruct_mixture) at 100%
 
 ## Held-out validation sets
 
-| Source | Rows | Seed | Loader | Origin |
-|---|---:|---:|---|---|
-| `fineweb_val` | 50,000 | 42 | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet |
+| Split | Tokens | From |
+|---|---:|---|
+| `fineweb_edu/validation` | 50.0M | the first processed rows of `fineweb_edu` (deduplicated together with the training rows, never part of `processed/`) |
 
 ## Sources
 
 | Source | Kind | Loader | Origin | Revision | Details |
 |---|---|---|---|---|---|
-| `fineweb_edu` | pretrain | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=data/CC-MAIN-2013-20/*.parquet | `87f09149ef47` | budget 2.15B |
+| `fineweb_edu` | pretrain | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=data/CC-MAIN-2013-20/*.parquet | `87f09149ef47` | budget 2.15B, validation split 50.0M |
 | `wikipedia` | pretrain | `hf_files` | `wikimedia/wikipedia` data_files=20231101.en/*.parquet | `b04c8d1ceb2f` | budget 297.0M |
 | `books_gutenberg` | pretrain | `hf_files` | `sedthh/gutenberg_english` data_files=data/*.parquet | `28973b04f28f` | text_field `TEXT`, budget 198.0M |
 | `peso` | pretrain | `hf_files` | `nampdn-ai/mini-peS2o` data_files=train-*.parquet | `18a60ef8d79f` | budget 135.0M |
@@ -145,7 +145,6 @@ Validation: `flan_instruct/validation` (instruct_mixture) at 100%
 | `github_code_clean_shell` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Shell, text_field `code`, budget 16.8M |
 | `github_code_clean_sql` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language SQL, text_field `code`, budget 12.6M |
 | `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 12.6M |
-| `fineweb_val` | validation | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=sample/10BT/*.parquet | `87f09149ef47` | - |
 | `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets` |
 | `metamath` | instruct | `hf_files` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response` |
 | `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer` |

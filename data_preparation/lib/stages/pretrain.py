@@ -13,6 +13,8 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.pool
 from collections.abc import Iterator
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,14 +23,14 @@ import pyarrow.parquet as pq
 
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
 from data_preparation.lib.abort import StopCheck, check_stop
-from data_preparation.lib.storage.parquet import list_parquet_files, publish_shard, shard_index, shard_name, text_hash64, write_dict_rows
+from data_preparation.lib.storage.parquet import ShardWriter, list_parquet_files, publish_shard, shard_index, shard_name, text_hash64
 from data_preparation.lib.schema.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.schema.layout import PROCESSED_COLUMNS, DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.ui.dashboard import progress
-from data_preparation.lib.storage.manifest import Manifest, ShardInfo
+from data_preparation.lib.storage.manifest import Manifest, ShardInfo, shard_tokens
 from data_preparation.lib.stages.row_pipeline import check_contamination, check_quality, preprocess_batch
 from data_preparation.lib.stages.shared import (
     DEFAULT_SHARD_SIZE,
@@ -64,6 +66,10 @@ def process(
     rows kept are exactly those of a full pass over every shard. Every kept row is written once; a source smaller
     than its budget is cycled by the training sampler, not repeated on disk.
 
+    With ``source.validation_tokens > 0`` the **first** surviving rows — until they hold that many tokens — go to
+    ``sources/<name>/validation/`` (the ``<name>/validation`` stage key) instead of ``processed/``; both directories
+    are append-only and deduplicated together, so the boundary never moves on a top-up and no document is in both.
+
     Raw shards are processed **one at a time**: the survivors of a raw shard are published (in chunks of
     ``shard_size``) and the manifest records the raw shard as covered before the next one starts, so a failure or
     a stop request (``should_stop``, checked between raw shards) loses at most one raw shard of work and the next
@@ -71,8 +77,9 @@ def process(
 
     A no-op when the processed manifest already covers every raw shard (``extra["input_shards"]``). The directory
     is rebuilt from scratch when its manifest is stale, when the covered shards are no longer a prefix of the raw
-    shards, when it predates the ``hash`` column, and — always — with ``dedup.mode: minhash`` (fuzzy dedup needs
-    every signature in one LSH index, so it is a single all-or-nothing pass over everything).
+    shards, when it predates the ``hash`` column, when the validation split is missing, and — always — with
+    ``dedup.mode: minhash`` (fuzzy dedup needs every signature in one LSH index, so it is a single all-or-nothing
+    pass over everything). Returns the processed manifest.
     """
     source = cfg.sources[name]
     if source.kind != "pretrain":
@@ -80,66 +87,154 @@ def process(
     processing = cfg.source_processing(name)
     source_hash = cfg.processed_hash(name)
     raw_dir = layout.source_dir(name, "raw")
-    out = layout.source_dir(name, "processed")
     raw = ensure_raw_tokens(cfg, name, layout)  # upgrades a raw dir from before the tokens column in place
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
 
     full_pass = processing.dedup.mode == "minhash"
-    manifest = _resumable_processed_manifest(cfg, name, source_hash, out, raw, full_pass)
-    covered = len(manifest.extra["input_shards"])
+    outputs = _Outputs.resume(cfg, name, source_hash, layout, raw, full_pass)
+    covered = len(outputs.processed.extra["input_shards"])
     pending = raw.shards[covered:]
     if not pending:
-        return manifest
+        return outputs.processed
 
-    log.info("%s: processing %d raw shard(s) (%d already covered) -> %s", name, len(pending), covered, out)
-    stats: dict[str, Any] = manifest.extra["stats"]
+    log.info("%s: processing %d raw shard(s) (%d already covered) -> %s", name, len(pending), covered, outputs.processed_dir)
+    stats: dict[str, Any] = outputs.processed.extra["stats"]
     stats["tokens_recounted"] = 0
-    pipeline = _Pipeline(cfg, name, layout, processing, num_workers, shard_size, stats, seen=_stored_hashes(out, manifest))
+    pipeline = _Pipeline(cfg, name, layout, processing, num_workers, shard_size, stats, seen=outputs.stored_hashes())
     pending_rows = sum(shard.rows for shard in pending)
     with pipeline, progress(total=pending_rows, desc=f"{name}: process", unit="row", leave=False) as bar:
         pipeline.bar = bar
         if full_pass:
-            _process_full_pass(pipeline, raw_dir, pending, raw, manifest, out, shard_size)
+            _process_full_pass(pipeline, raw_dir, pending, raw, outputs, shard_size)
         else:
             for shard in pending:
-                _process_raw_shard(pipeline, raw_dir, shard, raw, manifest, out, shard_size)
+                _process_raw_shard(pipeline, raw_dir, shard, raw, outputs, shard_size)
                 check_stop(should_stop)
-    log.info("%s: %d rows, %s tokens", name, manifest.rows(), manifest.tokens())
-    return manifest
+    log.info("%s: %d rows, %s tokens%s", name, outputs.processed.rows(), outputs.processed.tokens(), outputs.validation_summary())
+    return outputs.processed
+
+
+@dataclass
+class _Outputs:
+    """The processed directory of a source plus, with ``validation_tokens``, its validation split: the manifests,
+    where they live and how many tokens the split still needs. ``save`` writes the validation manifest first — if a
+    crash separates the two saves, the raw shard is re-processed and its validation rows are then dropped as
+    duplicates, never duplicated."""
+
+    processed: Manifest
+    processed_dir: Path
+    validation: Manifest | None
+    validation_dir: Path
+    validation_tokens: int
+
+    @classmethod
+    def resume(cls, cfg: DatasetConfig, name: str, source_hash: str, layout: DatasetLayout, raw: Manifest, full_pass: bool) -> _Outputs:
+        validation_tokens = cfg.sources[name].validation_tokens
+        processed_dir, validation_dir = layout.source_dir(name, "processed"), layout.validation_dir(name)
+        processed = _resumable_processed_manifest(cfg, name, source_hash, processed_dir, raw, full_pass)
+        validation = None
+        if validation_tokens:
+            validation = current_manifest(validation_dir, source_hash, "validation") if processed.extra["input_shards"] else None
+            if validation is None:
+                if processed.extra["input_shards"]:
+                    log.warning("%s: validation split missing or stale, reprocessing everything", name)
+                    processed = _resumable_processed_manifest(cfg, name, source_hash, processed_dir, raw, full_pass=True)
+                validation = new_manifest(cfg, name, source_hash, "validation", tokens=True)
+                validation.extra = {"validation_tokens": validation_tokens, "from": "processed"}
+        return cls(processed, processed_dir, validation, validation_dir, validation_tokens)
+
+    def stored_hashes(self) -> set[int]:
+        """The exact-dedup keys of every row already on disk, in both directories."""
+        seen = _stored_hashes(self.processed_dir, self.processed)
+        if self.validation is not None:
+            seen |= _stored_hashes(self.validation_dir, self.validation)
+        return seen
+
+    def validation_short(self) -> int:
+        """Tokens the validation split still needs (0 without a split or when it is full)."""
+        if self.validation is None:
+            return 0
+        return max(self.validation_tokens - (self.validation.tokens() or 0), 0)
+
+    def route(self, rows: list[Row]) -> tuple[list[Row], list[Row]]:
+        """Split survivors into (validation rows, processed rows): the validation split takes rows until it holds
+        ``validation_tokens`` tokens, everything after goes to ``processed/``."""
+        short = self.validation_short()
+        if short <= 0:
+            return [], rows
+        taken = 0
+        for index, row in enumerate(rows):
+            taken += int(row["tokens"])
+            if taken >= short:
+                return rows[: index + 1], rows[index + 1 :]
+        return rows, []
+
+    def publish(self, validation_rows: list[Row], processed_rows: list[Row], shard_size: int) -> None:
+        if validation_rows and self.validation is not None:
+            _publish_chunks(validation_rows, self.validation, self.validation_dir, shard_size)
+        _publish_chunks(processed_rows, self.processed, self.processed_dir, shard_size)
+
+    def save(self, raw: Manifest, covered: list[list[Any]]) -> None:
+        if self.validation is not None:
+            self.validation.rows_fetched = raw.rows_fetched
+            self.validation.extra["input_shards"] = list(covered)
+            self.validation.save(self.validation_dir)
+        self.processed.extra["input_shards"] = list(covered)
+        self.processed.rows_fetched = raw.rows_fetched
+        self.processed.save(self.processed_dir)
+
+    def validation_summary(self) -> str:
+        if self.validation is None:
+            return ""
+        return f" (+ validation split: {self.validation.rows()} rows, {self.validation.tokens()} of {self.validation_tokens} tokens)"
+
+
+def _publish_chunks(rows: list[Row], manifest: Manifest, directory: Path, shard_size: int) -> None:
+    """Append ``rows`` to ``directory`` as shard(s) of at most ``shard_size`` rows, recorded in ``manifest``."""
+    for start in range(0, len(rows), shard_size):
+        chunk = rows[start : start + shard_size]
+        path = publish_shard(pa.Table.from_pylist(chunk), directory / shard_name(len(manifest.shards)))
+        manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
 
 
 def _process_raw_shard(
-    pipeline: _Pipeline, raw_dir: Path, shard: ShardInfo, raw: Manifest, manifest: Manifest, out: Path, shard_size: int
+    pipeline: _Pipeline, raw_dir: Path, shard: ShardInfo, raw: Manifest, outputs: _Outputs, shard_size: int
 ) -> None:
-    """One raw shard through the pipeline; its survivors become the next processed shard(s), published and
-    recorded (with the raw shard as covered) before returning."""
+    """One raw shard through the pipeline; its survivors become the next processed (or validation) shard(s),
+    published and recorded (with the raw shard as covered) before returning."""
     pipeline.stats["input_rows"] += shard.rows
     survivors = list(pipeline.run(raw_dir, [shard]))
-    for start in range(0, len(survivors), shard_size):
-        chunk = survivors[start : start + shard_size]
-        path = publish_shard(pa.Table.from_pylist(chunk), out / shard_name(len(manifest.shards)))
-        manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
-    manifest.extra["input_shards"].append([shard.name, shard.rows])
-    manifest.rows_fetched = raw.rows_fetched
-    manifest.save(out)
+    validation_rows, processed_rows = outputs.route(survivors)
+    outputs.publish(validation_rows, processed_rows, shard_size)
+    outputs.save(raw, [*outputs.processed.extra["input_shards"], [shard.name, shard.rows]])
 
 
 def _process_full_pass(
-    pipeline: _Pipeline, raw_dir: Path, pending: list[ShardInfo], raw: Manifest, manifest: Manifest, out: Path, shard_size: int
+    pipeline: _Pipeline, raw_dir: Path, pending: list[ShardInfo], raw: Manifest, outputs: _Outputs, shard_size: int
 ) -> None:
     """Every pending raw shard through the pipeline plus fuzzy dedup in one all-or-nothing write."""
     pipeline.stats["input_rows"] += sum(shard.rows for shard in pending)
-    start_shard = len(manifest.shards)
-    tokens_per_new_shard: list[int] = []
     rows = fuzzy_dedup(pipeline.run(raw_dir, pending), pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.num_workers)
-    rows = _accumulate_tokens(rows, tokens_per_new_shard, shard_size)
-    write_dict_rows(rows, out, shard_size, start_shard=start_shard)
-    new_names = _shard_names(out)[start_shard:]
-    record_new_shards(manifest, out, start_shard, tokens=dict(zip(new_names, tokens_per_new_shard)))
-    manifest.extra["input_shards"] = shard_list(raw)
-    manifest.rows_fetched = raw.rows_fetched
-    manifest.save(out)
+    targets = [(outputs.processed, outputs.processed_dir)]
+    if outputs.validation is not None:
+        targets.insert(0, (outputs.validation, outputs.validation_dir))
+    with ExitStack() as stack:
+        writers = {
+            manifest.stage: (stack.enter_context(ShardWriter(directory, shard_size, start_shard=len(manifest.shards))), manifest, directory)
+            for manifest, directory in targets
+        }
+        short = outputs.validation_short()
+        for row in rows:
+            stage = "processed"
+            if short > 0:
+                stage = "validation"
+                short -= int(row["tokens"])
+            writers[stage][0].add(row)
+    for writer, manifest, directory in writers.values():
+        new_names = _shard_names(directory)[writer.start_shard :]
+        record_new_shards(manifest, directory, writer.start_shard, tokens={n: shard_tokens(directory / n) for n in new_names})
+    outputs.save(raw, shard_list(raw))
 
 
 class _Pipeline:
@@ -388,10 +483,3 @@ def _count_tokens(
             yield {"text": row["text"], "source": name, "tokens": int(row["tokens"]), "hash": row["hash"]}
 
 
-def _accumulate_tokens(rows: Iterator[Row], sums: list[int], shard_size: int) -> Iterator[Row]:
-    """Track the token sum per output shard (``write_dict_rows`` cuts exactly every ``shard_size`` rows)."""
-    for count, row in enumerate(rows):
-        if count % shard_size == 0:
-            sums.append(0)
-        sums[-1] += int(row["tokens"])
-        yield row

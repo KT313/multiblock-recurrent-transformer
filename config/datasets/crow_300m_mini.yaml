@@ -31,6 +31,10 @@ sources:
     revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
     load_kwargs: {data_files: "data/CC-MAIN-2013-20/*.parquet"}   # 14 files
     tokens_per_row_estimate: 2000
+    validation_tokens: 40_000   # held-out split (~40 documents, replaces the old fineweb_val source): the first processed rows
+                                 # worth this many tokens go to sources/fineweb_edu/validation (stage key
+                                 # fineweb_edu/validation), deduplicated with the training rows; append-only, so the
+                                 # boundary never moves on a top-up
   wikipedia:
     kind: pretrain
     loader: hf_files
@@ -106,17 +110,6 @@ sources:
   github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, tokens_per_row_estimate: 500}
   github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, tokens_per_row_estimate: 500}
 
-  # --- held-out validation (kind: validation) --------------------------------------------------------------------------
-  fineweb_val:
-    kind: validation
-    loader: hf_files
-    hf_id: HuggingFaceFW/fineweb-edu
-    revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
-    load_kwargs: {data_files: "sample/10BT/*.parquet"}   # the 10BT sample (14 files), not a CC-MAIN dump -> disjoint
-    rows: 40
-    seed: 42
-    tokens_per_row_estimate: 2000
-
   # --- instruction tuning (kind: instruct), consumed through the flan_instruct below ----------------------------------
   # Every repo uses `hf_files`: multi-file parquet repos one file at a time through the Hub cache, the single-file
   # JSON-array repos (metamath 396 MB, wizardlm 375 MB, sharegpt 671 MB, evol_code 122 MB) streamed incrementally
@@ -159,7 +152,7 @@ stages:
       peso: 0.03
       arxiv: 0.02
       openwebmath: 0.03
-    val: {fineweb_val: 1.0}
+    val: {fineweb_edu/validation: 1.0}
 
   - name: pretrain_phase2
     tokens: 150_000
@@ -182,7 +175,7 @@ stages:
       gsm8k: 0.022
       peso: 0.09
       arxiv: 0.06
-    val: {fineweb_val: 1.0}
+    val: {fineweb_edu/validation: 1.0}
 
   - name: finetune
     tokens: 60_000

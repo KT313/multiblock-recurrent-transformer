@@ -184,8 +184,11 @@ def plan(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
     result = Plan(tokenizer_complete=tokenizer_complete)
 
     for name in cfg.sources_of_kind("pretrain"):
-        if cfg.source_budget_tokens(name) > 0:
-            result.sources.append(_plan_pretrain(cfg, name, layout, tokenizer_complete))
+        if cfg.source_budget_tokens(name) > 0 or cfg.sources[name].validation_tokens > 0:
+            source_plan = _plan_pretrain(cfg, name, layout, tokenizer_complete)
+            result.sources.append(source_plan)
+            if cfg.sources[name].validation_tokens > 0:
+                result.validations.append(_plan_validation_split(cfg, name, layout, source_plan))
 
     used_validations = {key for stage in cfg.stages for key in stage.val}
     for name in cfg.sources_of_kind("validation"):
@@ -236,7 +239,7 @@ def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict
     """``{stage: problem}`` for the source stage directories whose manifest is present but stale or unverifiable
     (the build removes those directories before rerunning the stage)."""
     problems: dict[str, str] = {}
-    stages = ("validation",) if cfg.sources[name].kind == "validation" else SOURCE_STAGES
+    stages = _source_stages(cfg, name)
     for stage in stages:
         directory = _stage_dir(layout, name, stage)
         if Manifest.load(directory) is None:
@@ -245,6 +248,17 @@ def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict
         if problem is not None:
             problems[stage] = problem
     return problems
+
+
+def _source_stages(cfg: DatasetConfig, name: str) -> tuple[str, ...]:
+    """The stage directories a source has: ``validation`` for a validation source, ``raw`` + ``processed`` for a
+    pretrain source, plus ``validation`` when it holds out a split (``validation_tokens``)."""
+    source = cfg.sources[name]
+    if source.kind == "validation":
+        return ("validation",)
+    if source.validation_tokens > 0:
+        return (*SOURCE_STAGES, "validation")
+    return SOURCE_STAGES
 
 
 # --- pretrain sources --------------------------------------------------------------------------------------------------
@@ -256,20 +270,23 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
     manifests, problem = _current_stage_manifests(cfg, name, layout)
     raw = manifests.get("raw")
     processed = manifests.get("processed")
+    validation = manifests.get("validation")
 
     exhausted = raw is not None and bool(raw.extra.get("exhausted"))
     rows_present = raw.rows() if raw is not None else 0
     tokens_present = (processed.tokens() or 0) if processed is not None else 0
 
     tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))  # counts are capped there
-    measured = _measured_tokens_per_row(raw, processed)
+    measured = _measured_tokens_per_row(raw, processed, validation)
     if measured is not None:
         tokens_per_row = measured
-    rows_needed = rows_for_budget(budget, tokens_per_row)
+    rows_needed = rows_for_budget(budget + source.validation_tokens, tokens_per_row)  # the split comes off the top
     rows_to_fetch = max(0, rows_needed - rows_present)
 
     if problem is None and raw is not None and processed is not None:
         problem = _pipeline_problem(raw, processed, budget, exhausted)
+    if problem is None and raw is not None and source.validation_tokens > 0:
+        problem = _validation_split_problem(validation, source.validation_tokens, exhausted)
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
 
@@ -289,7 +306,7 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
         rows_present=rows_present,
         rows_to_fetch=rows_to_fetch,
         tokens_present=tokens_present,
-        manifest_current=len(manifests) == len(SOURCE_STAGES),
+        manifest_current=len(manifests) == len(_source_stages(cfg, name)),
         exhausted=exhausted,
         complete=problem is None,
         reason=reason,
@@ -301,8 +318,8 @@ def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayou
     of the first stage that has none (None if every stage is fine)."""
     manifests: dict[str, Manifest] = {}
     first_problem: str | None = None
-    for stage in SOURCE_STAGES:
-        manifest, stage_problem = _current(layout.source_dir(name, stage), cfg.stage_hash(name, stage), stage)
+    for stage in _source_stages(cfg, name):
+        manifest, stage_problem = _current(_stage_dir(layout, name, stage), cfg.stage_hash(name, stage), stage)
         if manifest is not None:
             manifests[stage] = manifest
         elif first_problem is None:
@@ -323,17 +340,27 @@ def _pipeline_problem(raw: Manifest, processed: Manifest, budget: int, exhausted
     return None
 
 
-def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -> float | None:
-    """Processed tokens per **raw** row over the raw shards the processed manifest covers (this includes what the
-    length filter and dedup drop); before anything is processed, the raw manifest's own token counts per raw row
-    (available right after the download); None without usable counts."""
+def _validation_split_problem(validation: Manifest | None, validation_tokens: int, exhausted: bool) -> str | None:
+    """Why a pretrain source's validation split is not finished, or None."""
+    if validation is None:
+        return "validation: split missing"
+    tokens = validation.tokens() or 0
+    if tokens < validation_tokens and not exhausted:
+        return f"validation: tokens {tokens} < {validation_tokens}"
+    return None
+
+
+def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None, validation: Manifest | None = None) -> float | None:
+    """Processed (plus validation-split) tokens per **raw** row over the raw shards the processed manifest covers
+    (this includes what the length filter and dedup drop); before anything is processed, the raw manifest's own
+    token counts per raw row (available right after the download); None without usable counts."""
     if raw is None:
         return None
     if processed is not None:
-        tokens = processed.tokens()
+        tokens = (processed.tokens() or 0) + ((validation.tokens() or 0) if validation is not None else 0)
         covered = len(processed.extra.get("input_shards", []))
         raw_rows = sum(shard.rows for shard in raw.shards[:covered])
-        if tokens is not None and tokens > 0 and raw_rows > 0:
+        if tokens > 0 and raw_rows > 0:
             return tokens / raw_rows
     raw_tokens = raw.tokens()
     if raw_tokens is not None and raw_tokens > 0 and raw.rows() > 0:
@@ -342,6 +369,32 @@ def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -
 
 
 # --- validation sources ------------------------------------------------------------------------------------------------
+
+
+def _plan_validation_split(cfg: DatasetConfig, name: str, layout: DatasetLayout, source_plan: SourcePlan) -> SourcePlan:
+    """The status row of a pretrain source's held-out split (``<name>/validation``); its completeness is part of
+    the source's own plan (``process`` builds both), this row only reports it."""
+    wanted = cfg.sources[name].validation_tokens
+    manifest, problem = _current(layout.validation_dir(name), cfg.stage_hash(name, "validation"), "validation")
+    tokens_present = (manifest.tokens() or 0) if manifest is not None else 0
+    rows_present = manifest.rows() if manifest is not None else 0
+    if problem is None:
+        problem = _validation_split_problem(manifest, wanted, source_plan.exhausted)
+    complete = problem is None and source_plan.complete
+    return SourcePlan(
+        name=f"{name}/validation",
+        kind="validation",
+        budget_tokens=wanted,
+        tokens_per_row=tokens_present / rows_present if rows_present else source_plan.tokens_per_row,
+        rows_needed=0,
+        rows_present=rows_present,
+        rows_to_fetch=0,
+        tokens_present=tokens_present,
+        manifest_current=manifest is not None,
+        exhausted=source_plan.exhausted and tokens_present < wanted,
+        complete=complete,
+        reason=problem or ("ok" if complete else f"source {name}: {source_plan.reason}"),
+    )
 
 
 def _plan_validation(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:

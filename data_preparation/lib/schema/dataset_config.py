@@ -119,6 +119,7 @@ class SourceConfig:
     rows: Optional[int] = None  # validation: number of rows to hold out
     seed: int = 42  # validation shuffle / synthetic generator seed
     processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
+    validation_tokens: int = 0  # pretrain: hold out the first processed rows worth this many tokens as `<source>/validation`
 
     def __post_init__(self) -> None:
         self._check_loader_fields()
@@ -152,6 +153,8 @@ class SourceConfig:
                 raise ValueError("kind instruct requires fields or converter")
         if self.kind != "pretrain" and self.processing is not None:
             raise ValueError("processing overrides only apply to kind pretrain")
+        if self.validation_tokens < 0 or (self.kind != "pretrain" and self.validation_tokens):
+            raise ValueError("validation_tokens must be >= 0 and only applies to kind pretrain")
 
 
 @dataclass
@@ -236,16 +239,24 @@ class DatasetConfig:
                 raise ValueError(f"mixture {mixture_name}: source {source_name!r} is not kind instruct")
 
     def _check_stage_key(self, stage_name: str, key: str, is_val: bool) -> None:
-        """A stage key is `<source>`, `<mixture>`, `<mixture>/train` or `<mixture>/validation`."""
+        """A stage key is `<source>`, `<mixture>`, `<mixture>/train`, `<mixture>/validation` or — in `val` only —
+        `<pretrain source>/validation` (the source's held-out split, needs `validation_tokens > 0`)."""
         base, _, split = key.partition("/")
         if base in self.instruct_mixtures:
             if split not in ("", "train", "validation"):
                 raise ValueError(f"stage {stage_name}: {key!r} must be <mixture>, <mixture>/train or /validation")
             return
-        if split:
-            raise ValueError(f"stage {stage_name}: {key!r} has a split but {base!r} is not a mixture")
         if base not in self.sources:
             raise ValueError(f"stage {stage_name}: unknown source or mixture {key!r}")
+        if split:
+            source = self.sources[base]
+            if split != "validation" or source.kind != "pretrain":
+                raise ValueError(f"stage {stage_name}: {key!r}: only <mixture>/... and <pretrain source>/validation take a split")
+            if not source.validation_tokens:
+                raise ValueError(f"stage {stage_name}: {key!r} needs validation_tokens > 0 on source {base!r}")
+            if not is_val:
+                raise ValueError(f"stage {stage_name}: {key!r} is a validation split and cannot be used for training")
+            return
         kind = self.sources[base].kind
         if kind == "instruct":
             raise ValueError(f"stage {stage_name}: instruct source {key!r} can only be used through a mixture")
@@ -276,7 +287,7 @@ class DatasetConfig:
         of a dataset; nothing but a real change of the source may invalidate them.
         """
         source_fields = hash_fields(self.sources[source_name])
-        for key in ("tokens_per_row_estimate", "processing", "check_limit"):
+        for key in ("tokens_per_row_estimate", "processing", "check_limit", "validation_tokens"):
             source_fields.pop(key, None)
         load_kwargs = source_fields.get("load_kwargs")
         if load_kwargs is not None:
@@ -300,11 +311,14 @@ class DatasetConfig:
     def processed_hash(self, source_name: str) -> str:
         """Hash of a pretrain source's ``processed/`` directory: the raw hash plus the effective processing block
         and the token settings. A change rebuilds ``processed/`` from the raw shards (no download)."""
-        payload = {
+        payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
             "processing": hash_fields(self.source_processing(source_name)),
             "tokens": self.token_settings(source_name),
         }
+        validation_tokens = self.sources[source_name].validation_tokens
+        if validation_tokens:
+            payload["validation_tokens"] = validation_tokens  # the first rows go to the validation split instead
         return _stable_hash(payload)
 
     def validation_hash(self, source_name: str) -> str:
@@ -313,14 +327,39 @@ class DatasetConfig:
         return _stable_hash({"raw": self.raw_hash(source_name), "tokens": self.token_settings(source_name)})
 
     def stage_hash(self, source_name: str, stage: str) -> str:
-        """The manifest key of one source stage directory (``raw`` / ``processed`` / ``validation``)."""
+        """The manifest key of one source stage directory (``raw`` / ``processed`` / ``validation``; the validation
+        split of a pretrain source is a product of ``process`` and shares its hash)."""
         if stage == "raw":
             return self.raw_hash(source_name)
         if stage == "processed":
             return self.processed_hash(source_name)
         if stage == "validation":
+            if self.sources[source_name].kind == "pretrain":
+                return self.processed_hash(source_name)
             return self.validation_hash(source_name)
         raise ValueError(f"unknown source stage {stage!r}")
+
+    def overlap_warnings(self) -> list[str]:
+        """Validation sources that read the same Hub repo as a pretrain source with the same or a nested
+        ``data_files`` glob prefix — such a held-out set is likely not disjoint from the training data (prefer the
+        pretrain source's own ``validation_tokens`` split)."""
+        warnings: list[str] = []
+        for val_name in self.sources_of_kind("validation"):
+            val = self.sources[val_name]
+            if val.hf_id is None:
+                continue
+            for train_name in self.sources_of_kind("pretrain"):
+                train = self.sources[train_name]
+                if train.hf_id != val.hf_id:
+                    continue
+                a, b = _glob_prefix(val.load_kwargs.get("data_files")), _glob_prefix(train.load_kwargs.get("data_files"))
+                if a.startswith(b) or b.startswith(a):
+                    warnings.append(
+                        f"validation source {val_name!r} reads {val.hf_id} like pretrain source {train_name!r} "
+                        f"(data_files {val.load_kwargs.get('data_files')!r} vs {train.load_kwargs.get('data_files')!r}): "
+                        "the held-out rows may overlap the training data; consider validation_tokens on the pretrain source"
+                    )
+        return warnings
 
     def instruct_mixture_hash(self, instruct_mixture_name: str) -> str:
         """Hash of a mixture definition plus the raw hashes and token settings of the sources it draws from."""
@@ -384,6 +423,15 @@ def _check_weights(what: str, weights: dict[str, float]) -> None:
     total = sum(weights.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f"{what}: weights sum to {total:.6f}, expected 1")
+
+
+def _glob_prefix(pattern: Any) -> str:
+    """The literal directory prefix of a ``data_files`` glob (``data/CC-MAIN-2013-20/*.parquet`` -> ``data/CC-MAIN-2013-20/``)."""
+    text = "" if pattern is None else str(pattern)
+    for i, char in enumerate(text):
+        if char in "*?[":
+            return text[:i]
+    return text
 
 
 def _stable_hash(payload: Any) -> str:

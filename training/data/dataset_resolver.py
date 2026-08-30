@@ -82,7 +82,8 @@ def build_command(dataset_config: str, dataset_dir: str) -> str:
 
 
 def _data_entry(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float) -> DataEntry:
-    """The `DataEntry` for one stage key (`<source>`, `<mixture>`, `<mixture>/train` or `<mixture>/validation`)."""
+    """The `DataEntry` for one stage key (`<source>`, `<source>/validation`, `<mixture>`, `<mixture>/train` or
+    `<mixture>/validation`)."""
     base, _, split = key.partition("/")
     prefix = f"{stage_name}-{key.replace('/', '-')}"
 
@@ -93,7 +94,9 @@ def _data_entry(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key:
         )
 
     kind = cfg.sources[base].kind
-    if kind == "pretrain":
+    if kind == "pretrain" and split == "validation":
+        source_dir = layout.validation_dir(base)  # the source's own held-out split (`validation_tokens`)
+    elif kind == "pretrain":
         source_dir = layout.source_dir(base, "processed")
     elif kind == "validation":
         source_dir = layout.validation_dir(base)

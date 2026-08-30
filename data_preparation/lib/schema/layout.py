@@ -2,7 +2,9 @@
 """Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
     <root>/sources/<source>/{raw,processed}/            shared by every dataset config (append-only source cache)
-    <root>/sources/<source>/validation/                 held-out validation rows of a `validation` source
+    <root>/sources/<source>/validation/                 held-out rows: of a `validation` source, or the first processed
+                                                        rows of a pretrain source with `validation_tokens` (append-only,
+                                                        so the train/validation boundary never moves on top-ups)
     <root>/instruct_mixtures/<config name>/<mixture>/{train,validation}/
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination

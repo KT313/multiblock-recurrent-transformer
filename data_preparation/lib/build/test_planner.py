@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -232,3 +233,29 @@ def test_estimate_is_clamped_to_max_seq_length(tmp_path: Path) -> None:
     entry = next(s for s in result.sources if s.name == "a")
     assert entry.tokens_per_row == cfg.max_seq_length
     assert entry.rows_needed == rows_for_budget(entry.budget_tokens, cfg.max_seq_length)
+
+
+def test_validation_split_is_planned_and_sized(layout: DatasetLayout) -> None:
+    from dataclasses import replace
+
+    cfg = two_stage_cfg()
+    cfg.sources["a"] = replace(cfg.sources["a"], validation_tokens=300)
+    cfg.stages[0].val = {"a/validation": 1.0}
+    empty = plan(cfg, layout)
+    a = next(s for s in empty.sources if s.name == "a")
+    assert a.rows_needed == rows_for_budget(a.budget_tokens + 300, a.tokens_per_row), "the split comes off the top"
+    split = next(v for v in empty.validations if v.name == "a/validation")
+    assert not split.complete and split.budget_tokens == 300 and split.kind == "validation"
+
+    build(cfg, layout)
+    result = plan(cfg, layout)
+    a = next(s for s in result.sources if s.name == "a")
+    split = next(v for v in result.validations if v.name == "a/validation")
+    assert result.complete and a.complete and split.complete and split.tokens_present >= 300
+    assert stage_problems(cfg, "a", layout) == {}
+
+    shutil.rmtree(layout.validation_dir("a"))
+    result = plan(cfg, layout)
+    a = next(s for s in result.sources if s.name == "a")
+    assert not a.complete and a.reason == "validation: manifest missing"
+    assert build(cfg, layout).complete  # rebuilt from raw

@@ -94,9 +94,9 @@ def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
     ]
     assert set(mini.sources) == set(final.sources)
     for name, source in final.sources.items():
-        expected = replace(source, rows=40) if source.kind == "validation" else source
+        expected = replace(source, validation_tokens=40_000) if source.validation_tokens else source
         assert mini.sources[name] == expected, name
-    assert mini.sources["fineweb_val"].rows == 40
+    assert mini.sources["fineweb_edu"].validation_tokens == 40_000
     assert mini.instruct_mixtures == final.instruct_mixtures and mini.tokenizer == final.tokenizer
     assert (mini.processing, mini.max_seq_length, mini.token_count) == (final.processing, final.max_seq_length, final.token_count)
 
@@ -107,7 +107,9 @@ def test_crow_config_matches_thesis_run() -> None:
     assert [s.tokens for s in cfg.stages] == [3_300_000_000, 1_500_000_000, 150_000_000]
     assert len(cfg.sources_of_kind("pretrain")) == 19
     assert len(cfg.sources_of_kind("instruct")) == 8
-    assert cfg.sources_of_kind("validation") == ["fineweb_val"]
+    assert cfg.sources_of_kind("validation") == []
+    assert cfg.sources["fineweb_edu"].validation_tokens == 50_000_000
+    assert all(stage.val == {"fineweb_edu/validation": 1.0} for stage in cfg.stages[:2])
     assert cfg.token_count == "tokenizer" and cfg.max_seq_length == 2048
     assert cfg.processing.dedup.mode == "exact" and not cfg.processing.quality_filter
     assert not cfg.processing.decontamination.enabled
@@ -150,7 +152,11 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0]["train"].update({"nope": 0.0}), "unknown source"),
         (lambda d: d["stages"][0]["train"].update({"hold": 0.0}), "validation"),
         (lambda d: d["stages"][0]["train"].update({"ins": 0.0}), "instruct source"),
-        (lambda d: d["stages"][0]["train"].update({"pre/train": 0.0}), "not a mixture"),
+        (lambda d: d["stages"][0]["train"].update({"pre/train": 0.0}), "take a split"),
+        (lambda d: d["stages"][0]["val"].update({"pre/validation": 0.0}), "needs validation_tokens > 0"),
+        (lambda d: (d["sources"]["pre"].__setitem__("validation_tokens", 10), d["stages"][0]["train"].update({"pre/validation": 0.0})), "cannot be used for training"),
+        (lambda d: d["sources"]["hold"].__setitem__("validation_tokens", 10), "only applies to kind pretrain"),
+        (lambda d: d["sources"]["pre"].__setitem__("validation_tokens", -1), "validation_tokens must be >= 0"),
         (lambda d: d["stages"][1]["val"].update({"mix/test": 0.0}), "/validation"),
         (lambda d: d["instruct_mixtures"]["mix"]["sources"].update({"pre": 0.0}), "not kind instruct"),
         (lambda d: d["instruct_mixtures"]["mix"]["sources"].update({"zzz": 0.0}), "unknown source"),
@@ -419,3 +425,25 @@ def test_dataset_config_fields_and_asdict_roundtrip() -> None:
     assert {"name", "tokenizer", "sources", "stages", "instruct_mixtures", "processing"} <= set(dc.dataset_config_fields())
     cfg = _build(_minimal())
     assert asdict(cfg)["sources"]["pre"]["kind"] == "pretrain"
+
+
+def test_validation_split_key_hash_and_overlap_warning() -> None:
+    d = _minimal()
+    d["sources"]["pre"]["validation_tokens"] = 100
+    d["stages"][0]["val"] = {"pre/validation": 1.0}
+    cfg = _build(d)
+    assert cfg.stages[0].val == {"pre/validation": 1.0}
+    base = _build(_minimal())
+    assert cfg.raw_hash("pre") == base.raw_hash("pre"), "the split is a product of processing, raw is untouched"
+    assert cfg.processed_hash("pre") != base.processed_hash("pre")
+    assert cfg.stage_hash("pre", "validation") == cfg.processed_hash("pre")
+    assert cfg.overlap_warnings() == []
+
+    d = _minimal()
+    d["sources"]["pre"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "org/repo", "load_kwargs": {"data_files": "data/*.parquet"}}
+    d["sources"]["hold"] = {"kind": "validation", "loader": "hf_files", "hf_id": "org/repo", "load_kwargs": {"data_files": "data/sample/*.parquet"}, "rows": 5}
+    (warning,) = _build(d).overlap_warnings()
+    assert "'hold'" in warning and "'pre'" in warning and "may overlap" in warning
+    d["sources"]["hold"]["load_kwargs"] = {"data_files": "other/*.parquet"}
+    assert _build(d).overlap_warnings() == []
+    assert dc._glob_prefix("data/CC-MAIN-2013-20/*.parquet") == "data/CC-MAIN-2013-20/" and dc._glob_prefix(None) == ""

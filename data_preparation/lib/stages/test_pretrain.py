@@ -4,6 +4,8 @@ quality, decontamination, token counting, fuzzy dedup) on local parquet sources.
 
 from __future__ import annotations
 
+import shutil
+from dataclasses import replace
 import logging
 import sys
 from collections.abc import Callable, Sequence
@@ -389,3 +391,49 @@ def test_process_publishes_per_raw_shard_and_resumes_after_a_stop(
     assert [s.rows for s in m.shards] == [3, 3, 3] and m.extra["stats"]["input_rows"] == 10
     assert m.extra["stats"]["dedup"]["duplicates_removed"] == 1
     assert [r["text"] for r in read_rows(processed)] == texts[:9]
+
+
+def test_validation_split_takes_the_first_rows_dedups_across_dirs_and_keeps_its_boundary(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    """`validation_tokens`: the first processed rows (6 tokens each here) fill `validation/` until the target, the rest
+    go to `processed/`; a duplicate of a validation row never lands in `processed/`; a top-up appends to
+    `processed/` only, so the split is byte-identical afterwards."""
+    texts = [_words(6, i) for i in range(8)] + [_words(6, 0)]  # last one duplicates validation row 0
+    cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, shard_size=3)
+    cfg.sources["s"] = replace(cfg.sources["s"], validation_tokens=14)  # 6 + 6 + 6 >= 14: the first three rows
+    m = process(cfg, "s", layout, shard_size=2)
+    validation_dir, processed_dir = layout.validation_dir("s"), layout.source_dir("s", "processed")
+    val = Manifest.load(validation_dir)
+    assert val is not None and val.stage == "validation" and val.is_current(cfg.processed_hash("s"))
+    assert [r["text"] for r in read_rows(validation_dir)] == texts[:3] and val.tokens() == 18
+    assert [r["text"] for r in read_rows(processed_dir)] == texts[3:8], "the duplicate of validation row 0 is dropped"
+    assert m.extra["stats"]["dedup"]["duplicates_removed"] == 1 and val.extra["input_shards"] == m.extra["input_shards"]
+    assert [s.rows for s in val.shards] == [2, 1], "the split boundary falls inside raw shard 0 (3 rows)"
+
+    before = {f.name: f.stat().st_mtime_ns for f in validation_dir.glob("data-*.parquet")}
+    write_local(source_dir, [{"text": _words(6, 1)}, {"text": _words(6, 50)}], "parquet")  # a duplicate + a new row
+    download(cfg, "s", layout, rows_needed=11, shard_size=3)
+    m2 = process(cfg, "s", layout, shard_size=2)
+    assert {f.name: f.stat().st_mtime_ns for f in validation_dir.glob("data-*.parquet")} == before, "the split's shards are untouched by a top-up"
+    assert [r["text"] for r in read_rows(processed_dir)] == texts[3:8] + [_words(6, 50)]
+    assert m2.extra["stats"]["dedup"]["duplicates_removed"] == 2
+
+    # a missing split makes the source rebuild from raw; the result is identical
+    shutil.rmtree(validation_dir)
+    m3 = process(cfg, "s", layout, shard_size=2)
+    assert [r["text"] for r in read_rows(validation_dir)] == texts[:3] and [r["text"] for r in read_rows(processed_dir)] == texts[3:8] + [_words(6, 50)]
+    assert m3.extra["input_shards"] == m2.extra["input_shards"]
+
+
+def test_validation_split_in_minhash_mode(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    pytest.importorskip("datasketch")
+    texts = [" ".join(f"w{i}_{j}" for j in range(30)) for i in range(6)]
+    proc = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="minhash", threshold=0.8, num_perm=64))
+    cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, processing=proc, max_seq_length=500)
+    cfg.sources["s"] = replace(cfg.sources["s"], validation_tokens=45)  # 30 tokens per row: the first two rows
+    process(cfg, "s", layout)
+    assert [r["text"] for r in read_rows(layout.validation_dir("s"))] == texts[:2]
+    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == texts[2:]

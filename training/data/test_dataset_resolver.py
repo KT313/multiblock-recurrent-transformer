@@ -30,7 +30,7 @@ TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 # The last hand-written run config (git history before the dataset-config restructure, `config/crow_300m_final.yaml`)
 # as (data_dir, weight, data_signature) per stage, with its per-stage data directories mapped onto the new layout
-# (pretrain source -> sources/<src>/processed, the fineweb validation set -> sources/fineweb_val/validation, the
+# (pretrain source -> sources/<src>/processed, fineweb's held-out split -> sources/fineweb_edu/validation, the
 # finetune mixture -> instruct_mixtures/crow-300m-final/flan_instruct/{train,validation}).
 _P = "dataset/sources/{}/processed"
 _INSTRUCT = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
@@ -58,7 +58,7 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
             (_P.format("arxiv"), 0.02, None),
             (_P.format("openwebmath"), 0.03, None),
         ],
-        "val": [("dataset/sources/fineweb_val/validation", 1.0, None)],
+        "val": [("dataset/sources/fineweb_edu/validation", 1.0, None)],
     },
     {
         "name": "pretrain_phase2",
@@ -84,7 +84,7 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
             (_P.format("peso"), 0.09, None),
             (_P.format("arxiv"), 0.06, None),
         ],
-        "val": [("dataset/sources/fineweb_val/validation", 1.0, None)],
+        "val": [("dataset/sources/fineweb_edu/validation", 1.0, None)],
     },
     {
         "name": "finetune",
@@ -142,7 +142,7 @@ def test_entry_prefixes_and_signatures(crow_cfg: DatasetConfig) -> None:
     assert train[0].data_signature == INSTRUCT_DATA_SIGNATURE and train[0].data_signature is not INSTRUCT_DATA_SIGNATURE
     train1, val1 = resolve_entries(crow_cfg, layout, crow_cfg.stages[0])
     assert train1[0].prefix == "pretrain_phase1-fineweb_edu" and train1[0].data_signature is None
-    assert val1[0].prefix == "pretrain_phase1-fineweb_val" and val1[0].data_dir == "/data/sources/fineweb_val/validation"
+    assert val1[0].prefix == "pretrain_phase1-fineweb_edu-validation" and val1[0].data_dir == "/data/sources/fineweb_edu/validation"
 
 
 def test_instruct_mixture_train_split_is_explicit_or_default(crow_cfg: DatasetConfig) -> None:
@@ -277,3 +277,15 @@ def test_checkpoint_hash_check(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         check_checkpoint_dataset_hash({"step": 3}, "xyz", allow_change=False)  # older checkpoint format
     assert "older format" in caplog.text
+
+
+def test_pretrain_source_validation_split_resolves_to_its_validation_dir() -> None:
+    from dataclasses import replace
+
+    cfg = load_dataset_config(TINY_DATASET_YAML)
+    cfg.sources["synthetic_pretrain"] = replace(cfg.sources["synthetic_pretrain"], validation_tokens=512)
+    cfg.stages[0].val = {"synthetic_pretrain/validation": 1.0}
+    layout = DatasetLayout(Path("/data"))
+    _, (entry,) = resolve_entries(cfg, layout, cfg.stages[0])
+    assert entry.data_dir == "/data/sources/synthetic_pretrain/validation" and entry.prefix == "pretrain_a-synthetic_pretrain-validation"
+    assert entry.data_signature is None
