@@ -122,16 +122,50 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
         assert manifest is not None and verify_shards(directory, manifest) == []
 
 
-def test_build_rebuilds_stale_hash(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+    """The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them."""
     from data_preparation.lib.schema.dataset_config import ProcessingConfig
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     build(cfg, layout)
+    raw_dir, processed_dir = layout.source_dir("p", "raw"), layout.source_dir("p", "processed")
+    raw_before = {f.name: (f.stat().st_mtime_ns, f.stat().st_size) for f in raw_dir.iterdir()}
+    processed_before = Manifest.load(processed_dir)
+    assert processed_before is not None
+
     cfg.processing = ProcessingConfig(min_chars=2)
     result = build(cfg, layout)
     assert result.complete
-    raw = Manifest.load(layout.source_dir("p", "raw"))
-    assert raw is not None and raw.is_current(cfg.source_hash("p"))
+    raw = Manifest.load(raw_dir)
+    assert raw is not None and raw.is_current(cfg.raw_hash("p"))
+    assert {f.name: (f.stat().st_mtime_ns, f.stat().st_size) for f in raw_dir.iterdir()} == raw_before
+    processed = Manifest.load(processed_dir)
+    assert processed is not None and processed.is_current(cfg.processed_hash("p"))
+    assert not processed.is_current(processed_before.source_hash)
+
+
+def test_token_mode_change_recounts_raw_in_place_without_downloading(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data_preparation.lib.stages import shared
+
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    build(cfg, layout)
+    raw_dir = layout.source_dir("p", "raw")
+    before = Manifest.load(raw_dir)
+    assert before is not None and before.token_count == "tokenizer"
+
+    def no_fetch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the loader must not be called for a token-mode change")
+
+    monkeypatch.setattr(shared, "_fetch_rows", no_fetch)
+    cfg.token_count = "estimate"
+    result = build(cfg, layout)
+    assert result.complete
+    raw = Manifest.load(raw_dir)
+    assert raw is not None and raw.token_count == "estimate" and raw.tokenizer is None
+    assert [s.rows for s in raw.shards] == [s.rows for s in before.shards] and raw.rows_fetched == before.rows_fetched
+    assert raw.tokens() != before.tokens()  # chars/4 differs from the tokenizer count
 
 
 def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:

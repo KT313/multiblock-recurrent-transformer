@@ -65,11 +65,15 @@ dataset/
 
 `sources/` is shared by every dataset config and by every stage that uses the source (stages 1 and 2 of the thesis
 config draw from the same `fineweb_edu/processed`, only with different weights). Only instruct mixtures are per config.
-Every directory carries a `MANIFEST.json` (`lib/storage/manifest.py`): the `source_hash` of the config that built
-it (loader settings + processing + token-count mode; budgets and weights are *not* part of it), rows and tokens per
-shard, the loader offset reached, tokenizer and library versions. A manifest whose hash differs from the current
-config is stale and its directory is rebuilt; shard writes go to a `.tmp` directory first and are renamed into
-place, so an interrupted build never leaves a half-written stage behind.
+Every directory carries a `MANIFEST.json` (`lib/storage/manifest.py`): the hash of the config that built it, rows
+and tokens per shard, the loader offset reached, how tokens were counted (mode, tokenizer, cap), tokenizer and
+library versions. `raw/` is keyed on `DatasetConfig.raw_hash` — the loader identity only (repo, revision, files,
+split, converter, seed, ...), so processing options, `max_seq_length`, `token_count`, the tokenizer, `check_limit`,
+budgets and weights never invalidate downloaded shards (a changed token setting recounts the `tokens` column in
+place). `processed/` is keyed on `processed_hash` (raw hash + processing block + token settings) and is rebuilt
+from the raw shards when it changes; validation dirs and mixtures likewise on the raw hashes of their sources plus
+the token settings. Shard writes go to a `.tmp` directory first and are renamed into place, so an interrupted
+build never leaves a half-written stage behind.
 
 ## Commands
 

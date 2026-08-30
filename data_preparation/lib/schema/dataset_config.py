@@ -264,35 +264,66 @@ class DatasetConfig:
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
-    def source_hash(self, source_name: str) -> str:
-        """Hash of everything that determines a source's rows on disk (loader settings + processing + token mode).
+    def raw_hash(self, source_name: str) -> str:
+        """Hash of the loader identity of a source: everything that determines **which rows** its ``raw/`` directory
+        holds and in what order (loader, repo, revision, files, split, converter/fields/filter, seed, ...).
 
-        Manifests key on this; a change means the source directory must be rebuilt. Budgets/weights are NOT part of
-        it — they only change how many rows are needed, not what the rows are.
+        The raw manifest keys on this. Deliberately NOT part of it: processing options, ``max_seq_length``,
+        ``token_count`` and the tokenizer (they change derived data — the raw ``tokens`` column is recounted in
+        place, see ``stages/shared.py:ensure_raw_tokens``), ``check_limit`` (bounds how far to read, not what is
+        read), ``tokens_per_row_estimate`` (planner prior), ``load_kwargs.max_cached_file_mb`` (how a file is
+        fetched). Budgets/weights only change how many rows are needed. Raw shards are the bandwidth-expensive part
+        of a dataset; nothing but a real change of the source may invalidate them.
         """
-        source = self.sources[source_name]
-
-        source_fields = hash_fields(source)
-        source_fields.pop("tokens_per_row_estimate", None)  # planner prior only
-        source_fields.pop("processing", None)  # the effective processing block is added below instead
+        source_fields = hash_fields(self.sources[source_name])
+        for key in ("tokens_per_row_estimate", "processing", "check_limit"):
+            source_fields.pop(key, None)
         load_kwargs = source_fields.get("load_kwargs")
         if load_kwargs is not None:
-            load_kwargs.pop("max_cached_file_mb", None)  # how a file is fetched, not what it holds
+            load_kwargs.pop("max_cached_file_mb", None)
+        return _stable_hash({"source": source_fields})
 
-        payload: dict[str, Any] = {"source": source_fields, "token_count": self.token_count}
-        if source.kind == "pretrain":
-            payload["processing"] = hash_fields(self.source_processing(source_name))
-            payload["max_seq_length"] = self.max_seq_length
+    def token_settings(self, source_name: str) -> dict[str, Any]:
+        """How the ``tokens`` column of a source is counted: mode, tokenizer (when counting with it) and the cap
+        (``max_seq_length``; recorded in the manifests so a change recounts in place instead of re-downloading)."""
+        source = self.sources[source_name]
+        settings: dict[str, Any] = {"token_count": self.token_count, "max_seq_length": self.max_seq_length}
         if self.token_count == "tokenizer" or source.kind == "instruct":
-            payload["tokenizer"] = hash_fields(self.tokenizer)
+            settings["tokenizer"] = hash_fields(self.tokenizer)
+        return settings
+
+    def processed_hash(self, source_name: str) -> str:
+        """Hash of a pretrain source's ``processed/`` directory: the raw hash plus the effective processing block
+        and the token settings. A change rebuilds ``processed/`` from the raw shards (no download)."""
+        payload = {
+            "raw": self.raw_hash(source_name),
+            "processing": hash_fields(self.source_processing(source_name)),
+            "tokens": self.token_settings(source_name),
+        }
         return _stable_hash(payload)
 
+    def validation_hash(self, source_name: str) -> str:
+        """Hash of a validation source's directory: the raw hash (which includes ``rows`` and ``seed``) plus the
+        token settings; validation sets are small and fetched again when either changes."""
+        return _stable_hash({"raw": self.raw_hash(source_name), "tokens": self.token_settings(source_name)})
+
+    def stage_hash(self, source_name: str, stage: str) -> str:
+        """The manifest key of one source stage directory (``raw`` / ``processed`` / ``validation``)."""
+        if stage == "raw":
+            return self.raw_hash(source_name)
+        if stage == "processed":
+            return self.processed_hash(source_name)
+        if stage == "validation":
+            return self.validation_hash(source_name)
+        raise ValueError(f"unknown source stage {stage!r}")
+
     def instruct_mixture_hash(self, instruct_mixture_name: str) -> str:
-        """Hash of a mixture definition plus the hashes of the sources it draws from."""
+        """Hash of a mixture definition plus the raw hashes and token settings of the sources it draws from."""
         mixture = self.instruct_mixtures[instruct_mixture_name]
         payload = {
             "instruct_mixture": hash_fields(mixture),
-            "sources": {name: self.source_hash(name) for name in mixture.sources},
+            "sources": {name: self.raw_hash(name) for name in mixture.sources},
+            "tokens": {name: self.token_settings(name) for name in mixture.sources},
             "budget_tokens": self.instruct_mixture_budget_tokens(instruct_mixture_name),
         }
         return _stable_hash(payload)

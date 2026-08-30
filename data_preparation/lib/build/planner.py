@@ -236,13 +236,12 @@ def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict
     """``{stage: problem}`` for the source stage directories whose manifest is present but stale or unverifiable
     (the build removes those directories before rerunning the stage)."""
     problems: dict[str, str] = {}
-    source_hash = cfg.source_hash(name)
     stages = ("validation",) if cfg.sources[name].kind == "validation" else SOURCE_STAGES
     for stage in stages:
         directory = _stage_dir(layout, name, stage)
         if Manifest.load(directory) is None:
             continue  # nothing present is not a problem, only stale or broken directories are
-        _, problem = _current(directory, source_hash, stage)
+        _, problem = _current(directory, cfg.stage_hash(name, stage), stage)
         if problem is not None:
             problems[stage] = problem
     return problems
@@ -300,11 +299,10 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
 def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> tuple[dict[str, Manifest], str | None]:
     """The current, verified manifests of the source's stages (``raw``/``processed``) plus the problem
     of the first stage that has none (None if every stage is fine)."""
-    source_hash = cfg.source_hash(name)
     manifests: dict[str, Manifest] = {}
     first_problem: str | None = None
     for stage in SOURCE_STAGES:
-        manifest, stage_problem = _current(layout.source_dir(name, stage), source_hash, stage)
+        manifest, stage_problem = _current(layout.source_dir(name, stage), cfg.stage_hash(name, stage), stage)
         if manifest is not None:
             manifests[stage] = manifest
         elif first_problem is None:
@@ -349,7 +347,7 @@ def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -
 def _plan_validation(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
     source = cfg.sources[name]
     wanted = int(source.rows or 0)
-    manifest, problem = _current(layout.validation_dir(name), cfg.source_hash(name), "validation")
+    manifest, problem = _current(layout.validation_dir(name), cfg.validation_hash(name), "validation")
 
     rows_present = manifest.rows() if manifest is not None else 0
     tokens_present = (manifest.tokens() or 0) if manifest is not None else 0
@@ -449,7 +447,7 @@ def _check_mixture_sources(
     raw_shards: dict[str, list[list[object]]] = {}
     built_from_short_sources = train.extra.get("short_sources", {})
     for src in cfg.instruct_mixtures[name].sources:
-        raw, raw_problem = _current(layout.source_dir(src, "raw"), cfg.source_hash(src), "raw")
+        raw, raw_problem = _current(layout.source_dir(src, "raw"), cfg.raw_hash(src), "raw")
         if raw is None:
             if problem is None:
                 problem = f"source {src} {raw_problem}"

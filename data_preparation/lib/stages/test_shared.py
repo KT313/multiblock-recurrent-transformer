@@ -140,7 +140,7 @@ def test_download_synthetic_appends_incrementally(
     raw = layout.source_dir("p", "raw")
     m1 = download(cfg, "p", layout, rows_needed=25, shard_size=10)
     assert [s.rows for s in m1.shards] == [10, 10, 5] and m1.rows_fetched == 25 and m1.stage == "raw"
-    assert m1.source_hash == cfg.source_hash("p") and not m1.extra.get("exhausted")
+    assert m1.source_hash == cfg.raw_hash("p") and not m1.extra.get("exhausted")
     assert Manifest.load(raw) == m1
     first = mtimes(raw)
 
@@ -344,8 +344,17 @@ def test_download_instruct_check_limit_bounds_inspected_rows(
     m = download(cfg, "l", layout, rows_needed=3, shard_size=10)
     assert m.rows() == 3 and m.rows_fetched == 3 and not m.extra.get("exhausted")
     m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
-    assert m.rows() == 4 and m.rows_fetched == 4 and m.extra["exhausted"] is True
+    assert m.rows() == 4 and m.rows_fetched == 4 and m.extra["exhausted"] is True and m.extra["check_limit"] == 4
     assert download(cfg, "l", layout, rows_needed=8, shard_size=10) == m
+
+    # check_limit is not part of the raw hash: a grown limit reads further instead of re-downloading
+    cfg.sources["l"] = _local(src_dir, kind="instruct", converter="instruction_input_output", check_limit=6)
+    m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
+    assert m.rows() == 6 and m.rows_fetched == 6 and m.extra["exhausted"] is True and m.extra["check_limit"] == 6
+    assert [s.rows for s in m.shards] == [3, 1, 2]  # appended, nothing rewritten
+    cfg.sources["l"] = _local(src_dir, kind="instruct", converter="instruction_input_output")
+    m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
+    assert m.rows() == 8 and not m.extra.get("exhausted") and "check_limit" not in m.extra
 
 
 def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader) -> None:

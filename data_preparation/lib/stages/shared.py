@@ -4,8 +4,9 @@ manifest helpers used by ``stages/pretrain.py`` / ``stages/instruct.py``.
 
 Every stage is a function ``(cfg, name, layout, *options) -> Manifest`` that is **idempotent via the manifest**
 (a second call with nothing new returns the stored manifest without touching the shards) and **incremental** where
-the data allow it. A stored manifest whose ``source_hash`` differs from the current config is stale: the stage logs
-a warning and rebuilds the directory from scratch.
+the data allow it. A stored manifest whose hash differs from the stage's current key (``DatasetConfig.raw_hash`` for
+``raw/``: loader identity only; ``processed_hash`` / ``validation_hash`` for the derived directories) is stale: the
+stage logs a warning and rebuilds the directory from scratch.
 """
 
 from __future__ import annotations
@@ -131,6 +132,7 @@ def new_manifest(cfg: DatasetConfig, source: str, source_hash: str, stage: str, 
         stage=stage,
         token_count=cfg.token_count if tokens else None,
         tokenizer=cfg.tokenizer.name if tokens and cfg.token_count == "tokenizer" else None,
+        token_cap=cfg.max_seq_length if tokens else None,
         versions=library_versions(),
     )
 
@@ -243,11 +245,12 @@ def download(
     (:func:`ensure_raw_tokens`), never re-downloaded.
     """
     source = fetch_source(cfg, cfg.sources[name])
-    source_hash = cfg.source_hash(name)
+    source_hash = cfg.raw_hash(name)
     out = layout.source_dir(name, "raw")
     manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
 
     # nothing to do?
+    _reset_check_limit_exhaustion(manifest, source, name)
     if manifest.extra.get("exhausted"):
         log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
         return manifest
@@ -257,6 +260,7 @@ def download(
     max_consume = None if source.check_limit is None else source.check_limit - manifest.rows_fetched
     if max_consume is not None and max_consume <= 0:
         manifest.extra["exhausted"] = True
+        manifest.extra["check_limit"] = source.check_limit
         manifest.save(out)
         return manifest
 
@@ -277,9 +281,23 @@ def download(
     manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + counters.skipped_malformed
     if counters.exhausted:
         manifest.extra["exhausted"] = True
+        if source.check_limit is not None and manifest.rows_fetched >= source.check_limit:
+            manifest.extra["check_limit"] = source.check_limit  # exhausted by the limit, not by the loader
     manifest.save(out)
     log.info("%s: kept %d of %d fetched rows (%d rows on disk)", name, counters.kept, counters.consumed, manifest.rows())
     return manifest
+
+
+def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
+    """A source marked exhausted because its ``check_limit`` was reached may be read further when the limit grew
+    (or was removed): ``check_limit`` is not part of the raw hash, so the manifest is not stale, only its flag."""
+    reached = manifest.extra.get("check_limit")
+    if not manifest.extra.get("exhausted") or reached is None:
+        return
+    if source.check_limit is None or source.check_limit > int(reached):
+        log.info("%s: check_limit grew from %s to %s, source no longer exhausted", name, reached, source.check_limit)
+        manifest.extra["exhausted"] = False
+        del manifest.extra["check_limit"]
 
 
 def _fetch_rows(
@@ -386,7 +404,7 @@ def download_github_code_group(
             raise ValueError(f"{name}: download_github_code_group needs github_code sources without check_limit")
         if members and github_code_repo_key(source) != github_code_repo_key(members[0].source):
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
-        source_hash = cfg.source_hash(name)
+        source_hash = cfg.raw_hash(name)
         out = layout.source_dir(name, "raw")
         manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
         results[name] = manifest
@@ -527,9 +545,14 @@ def _shard_token_sums(directory: Path, start_shard: int) -> dict[str, int]:
 
 
 def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:
-    """Whether a raw manifest's ``tokens`` column was counted the way ``cfg`` counts (mode and tokenizer)."""
+    """Whether a raw manifest's ``tokens`` column was counted the way ``cfg`` counts (mode, tokenizer and cap)."""
     tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
-    return manifest.token_count == cfg.token_count and manifest.tokenizer == tokenizer and manifest.tokens() is not None
+    return (
+        manifest.token_count == cfg.token_count
+        and manifest.tokenizer == tokenizer
+        and manifest.token_cap == cfg.max_seq_length
+        and manifest.tokens() is not None
+    )
 
 
 def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
@@ -539,7 +562,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
     change and nothing is downloaded."""
     source = cfg.sources[name]
     out = layout.source_dir(name, "raw")
-    manifest = current_manifest(out, cfg.source_hash(name), "raw")
+    manifest = current_manifest(out, cfg.raw_hash(name), "raw")
     if manifest is None or raw_has_tokens(cfg, manifest):
         return manifest
 
@@ -559,6 +582,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
         shard.tokens = sum(tokens)
     manifest.token_count = cfg.token_count
     manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
+    manifest.token_cap = cfg.max_seq_length
     manifest.save(out)
     return manifest
 
@@ -645,7 +669,7 @@ def validation(
     source = fetch_source(cfg, cfg.sources[name])
     if source.kind != "validation" or source.rows is None:
         raise ValueError(f"{name}: validation() needs a source of kind validation with rows > 0")
-    source_hash = cfg.source_hash(name)
+    source_hash = cfg.validation_hash(name)
     out = layout.validation_dir(name)
     existing = current_manifest(out, source_hash, "validation")
     if existing is not None:

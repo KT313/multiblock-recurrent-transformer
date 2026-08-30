@@ -2,9 +2,11 @@
 """``MANIFEST.json`` beside a shard directory: what a source/mixture directory contains and which config built it.
 
 Every stage directory (``dataset/sources/<source>/{raw,processed}/``, instruct mixtures, validation sources,
-tokenizers) carries one manifest. ``source_hash`` is :meth:`DatasetConfig.source_hash` of the config that produced
-it; a manifest whose hash differs from the current config is stale and its stage is rebuilt. Verification is cheap
-(parquet metadata only).
+tokenizers) carries one manifest. ``source_hash`` is the stage's key from the config that produced it
+(:meth:`DatasetConfig.raw_hash` for ``raw/`` — loader identity only, so processing/token-setting changes never
+invalidate downloads —, :meth:`DatasetConfig.processed_hash` / ``validation_hash`` / ``instruct_mixture_hash`` /
+``tokenizer_hash`` for the others); a manifest whose hash differs from the current config is stale and its stage
+is rebuilt. Verification is cheap (parquet metadata only).
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ class Manifest:
     shards: list[ShardInfo] = field(default_factory=list)
     token_count: str | None = None
     tokenizer: str | None = None
+    token_cap: int | None = None  # counts were capped at this many tokens (max_seq_length)
     versions: dict[str, str] = field(default_factory=dict)
     created: str = field(default_factory=_utc_now_iso)
     extra: dict[str, Any] = field(default_factory=dict)

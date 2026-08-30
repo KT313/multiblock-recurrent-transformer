@@ -68,7 +68,7 @@ def process(
     if source.kind != "pretrain":
         raise ValueError(f"{name}: process() applies to pretrain sources only (kind={source.kind})")
     processing = cfg.source_processing(name)
-    source_hash = cfg.source_hash(name)
+    source_hash = cfg.processed_hash(name)
     raw_dir = layout.source_dir(name, "raw")
     out = layout.source_dir(name, "processed")
     raw = ensure_raw_tokens(cfg, name, layout)  # upgrades a raw dir from before the tokens column in place

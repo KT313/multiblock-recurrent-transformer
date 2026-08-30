@@ -330,7 +330,8 @@ def test_process_minhash_removes_near_duplicates(
                    write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
     m = process(cfg, "s", layout)
     assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial]
-    assert process(cfg, "s", layout) != m and m.extra["stats"]["input_rows"] == 5  # fuzzy dedup: always a full pass
+    m2 = process(cfg, "s", layout)  # fuzzy dedup: always a full pass (a fresh manifest, not the stored one)
+    assert m2 is not m and m2.extra["stats"]["input_rows"] == 5 and m2.shards == m.shards
     dedup_stats = m.extra["stats"]["dedup"]
     assert dedup_stats.pop("seconds") >= 0
     assert dedup_stats == {

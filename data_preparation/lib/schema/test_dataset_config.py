@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, replace
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -58,8 +59,19 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
         sources=sources,
         instruct_mixtures={k: InstructMixtureConfig(**v) for k, v in d.get("instruct_mixtures", {}).items()},
         stages=[StageConfig(**s) for s in d["stages"]],
-        **{k: v for k, v in d.items() if k in ("max_seq_length", "token_count")},
+        max_seq_length=d.get("max_seq_length", 2048),
+        token_count=d.get("token_count", "tokenizer"),
+        processing=_processing(d["processing"]) if d.get("processing") else ProcessingConfig(),
     )
+
+
+def _processing(d: dict[str, Any]) -> ProcessingConfig:
+    d = dict(d)
+    if "dedup" in d:
+        d["dedup"] = DedupConfig(**d["dedup"])
+    if "decontamination" in d:
+        d["decontamination"] = dc.DecontaminationConfig(**d["decontamination"])
+    return ProcessingConfig(**d)
 
 
 # --- shipped files ----------------------------------------------------------------------------------------------------
@@ -250,11 +262,11 @@ def test_sources_of_kind() -> None:
 def test_max_cached_file_mb_validated_and_not_hashed() -> None:
     d = _minimal()
     d["sources"]["files"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
-    h = _build(d).source_hash("files")
+    h = _build(d).raw_hash("files")
     d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 1.5
-    assert _build(d).source_hash("files") == h  # how a file is fetched does not change its rows
+    assert _build(d).raw_hash("files") == h  # how a file is fetched does not change its rows
     d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 0
-    assert _build(d).source_hash("files") == h
+    assert _build(d).raw_hash("files") == h
     for bad in (-1, "big", True):
         d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = bad
         with pytest.raises(ValueError, match="max_cached_file_mb"):
@@ -264,7 +276,8 @@ def test_max_cached_file_mb_validated_and_not_hashed() -> None:
 def test_source_hash_stable_across_key_order_and_reloads() -> None:
     a = load_dataset_config(TINY)
     b = load_dataset_config(TINY)
-    assert a.source_hash("synthetic_pretrain") == b.source_hash("synthetic_pretrain")
+    assert a.raw_hash("synthetic_pretrain") == b.raw_hash("synthetic_pretrain")
+    assert a.processed_hash("synthetic_pretrain") == b.processed_hash("synthetic_pretrain")
     assert a.config_hash() == b.config_hash()
     assert dc._stable_hash({"x": 1, "y": [1, 2]}) == dc._stable_hash({"y": [1, 2], "x": 1})
 
@@ -279,43 +292,105 @@ def test_hash_fields_drops_defaults_recursively() -> None:
     assert dc.hash_fields(src) == {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
 
 
-def test_source_hash_ignores_budget_but_tracks_processing_and_token_mode() -> None:
+def test_raw_hash_only_tracks_the_loader_identity() -> None:
+    """The raw shards are the bandwidth-expensive part: nothing but a real change of the source may invalidate them."""
     base = _build(_minimal())
-    h = base.source_hash("pre")
+    h = base.raw_hash("pre")
+
+    changes: list[Callable[[dict[str, Any]], None]] = [
+        lambda d: d["stages"][0].__setitem__("tokens", 999_999),  # budget: same rows on disk
+        lambda d: d["sources"]["pre"].__setitem__("tokens_per_row_estimate", 3),  # planner prior
+        lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),  # processing → processed only
+        lambda d: d["sources"]["pre"].__setitem__("processing", {"dedup": {"mode": "minhash"}}),
+        lambda d: d.__setitem__("processing", {"quality_filter": True, "decontamination": {"enabled": True}}),
+        lambda d: d.__setitem__("token_count", "estimate"),  # tokens column is recounted in place
+        lambda d: d.__setitem__("max_seq_length", 64),
+        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),
+        lambda d: d["sources"]["pre"].__setitem__("check_limit", 5),  # bounds how far to read, not what is read
+    ]
+    for change in changes:
+        d = _minimal()
+        change(d)
+        assert _build(d).raw_hash("pre") == h, change
+
+    invalidating: list[Callable[[dict[str, Any]], None]] = [
+        lambda d: d["sources"]["pre"].__setitem__("seed", 5),
+        lambda d: d["sources"]["pre"].__setitem__("text_field", "body"),
+        lambda d: d["sources"]["pre"].__setitem__("converter", "gsm8k_question_answer"),
+        lambda d: d["sources"]["pre"].__setitem__("split", "test"),
+    ]
+    for change in invalidating:
+        d = _minimal()
+        change(d)
+        assert _build(d).raw_hash("pre") != h, change
+
+
+def test_processed_hash_tracks_processing_and_token_settings() -> None:
+    base = _build(_minimal())
+    h = base.processed_hash("pre")
+    assert h != base.raw_hash("pre")
 
     d = _minimal()
-    d["stages"][0]["tokens"] = 999_999  # budget change: same rows on disk
-    d["sources"]["pre"]["tokens_per_row_estimate"] = 3  # planner prior: same rows on disk
-    assert _build(d).source_hash("pre") == h
+    d["stages"][0]["tokens"] = 999_999
+    d["sources"]["pre"]["tokens_per_row_estimate"] = 3
+    assert _build(d).processed_hash("pre") == h
 
-    d = _minimal()
-    d["sources"]["pre"]["processing"] = {"min_chars": 99}
-    assert _build(d).source_hash("pre") != h
-
-    d = _minimal()
-    d["token_count"] = "estimate"
-    assert _build(d).source_hash("pre") != h
+    changes: list[Callable[[dict[str, Any]], None]] = [
+        lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),
+        lambda d: d.__setitem__("processing", {"max_chars": 99}),
+        lambda d: d.__setitem__("token_count", "estimate"),
+        lambda d: d.__setitem__("max_seq_length", 64),
+        lambda d: d["sources"]["pre"].__setitem__("seed", 5),
+    ]
+    for change in changes:
+        d = _minimal()
+        change(d)
+        assert _build(d).processed_hash("pre") != h, change
 
     d = _minimal()
     d["max_seq_length"] = 64
-    assert _build(d).source_hash("pre") != h
-    assert _build(d).source_hash("hold") == base.source_hash("hold")  # cap only affects pretrain counting
+    assert _build(d).validation_hash("hold") != base.validation_hash("hold")  # the cap changes the stored counts
+    assert _build(d).raw_hash("hold") == base.raw_hash("hold")
 
-    d = _minimal()
-    d["sources"]["pre"]["seed"] = 5
-    assert _build(d).source_hash("pre") != h
+
+def test_stage_hash_dispatches() -> None:
+    cfg = _build(_minimal())
+    assert cfg.stage_hash("pre", "raw") == cfg.raw_hash("pre")
+    assert cfg.stage_hash("pre", "processed") == cfg.processed_hash("pre")
+    assert cfg.stage_hash("hold", "validation") == cfg.validation_hash("hold")
+    with pytest.raises(ValueError, match="unknown source stage"):
+        cfg.stage_hash("pre", "filtered")
+
+
+def test_hash_fields_golden_defaults() -> None:
+    """`hash_fields` drops default-valued fields, so a changed *default* re-labels data built under the old one.
+    Changing any of these defaults must be a conscious, hash-breaking commit: update this golden dict with it."""
+    assert asdict(ProcessingConfig()) == {
+        "min_chars": 50,
+        "max_chars": 20000,
+        "dedup": {"mode": "exact", "normalize": True, "threshold": 0.95, "num_perm": 256, "ngram": 5},
+        "quality_filter": False,
+        "decontamination": {"enabled": False, "benchmarks": list(dc.DEFAULT_BENCHMARKS), "ngram": 13, "threshold": 0.1},
+    }
+    src = SourceConfig(kind="pretrain", loader="synthetic")
+    assert {f: getattr(src, f) for f in ("split", "text_field", "seed", "tokens_per_row_estimate")} == {
+        "split": "train", "text_field": "text", "seed": 42, "tokens_per_row_estimate": 500,
+    }  # fmt: skip
+    cfg = _build(_minimal())
+    assert (cfg.max_seq_length, cfg.token_count, cfg.always_range_requests) == (2048, "tokenizer", True)
 
 
 def test_tokenizer_change_affects_hash_only_when_counting_with_it() -> None:
     d = _minimal()
     base = _build(d)
     d["tokenizer"] = {"name": "other", "kind": "hf", "hf_id": "a/b"}
-    assert _build(d).source_hash("pre") != base.source_hash("pre")
+    assert _build(d).processed_hash("pre") != base.processed_hash("pre")
     d["token_count"] = "estimate"
     d2 = copy.deepcopy(d)
     d2["tokenizer"] = {"name": "third", "kind": "hf", "hf_id": "c/d"}
-    assert _build(d).source_hash("pre") == _build(d2).source_hash("pre")
-    assert _build(d).source_hash("ins") != _build(d2).source_hash("ins")  # instruct always tokenizes
+    assert _build(d).processed_hash("pre") == _build(d2).processed_hash("pre")
+    assert _build(d).instruct_mixture_hash("mix") != _build(d2).instruct_mixture_hash("mix")  # instruct always tokenizes
+    assert _build(d).raw_hash("ins") == _build(d2).raw_hash("ins")
 
 
 def test_instruct_mixture_hash_tracks_sources_and_budget() -> None:
