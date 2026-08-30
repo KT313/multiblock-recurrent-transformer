@@ -288,7 +288,7 @@ def download(
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar)
-        rows = _with_tokens(rows, counter, raw_text_of(source))
+        rows = _with_tokens(rows, counter, raw_text_of(cfg, name))
         with ShardWriter(out, shard_size, start_shard=len(manifest.shards), on_shard=increment.record_shard) as writer:
             for row in rows:
                 increment.add(writer, row)
@@ -304,7 +304,9 @@ def _fresh_raw_manifest(cfg: DatasetConfig, name: str, source_hash: str, out: Pa
     manifest (the source itself changed) is a rebuild, see ``current_manifest``."""
     if Manifest.load(out) is None and has_shards(out):
         raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
-    return new_manifest(cfg, name, source_hash, "raw", tokens=True)
+    manifest = new_manifest(cfg, name, source_hash, "raw", tokens=True)
+    manifest.extra["counted_chars"] = cfg.counted_chars(name)
+    return manifest
 
 
 def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
@@ -485,7 +487,7 @@ def download_github_code_group(
     if not members:
         return results
 
-    _fetch_group(members, layout, TokenCounter(cfg, layout, cap=cfg.max_seq_length), shard_size, hf_token)  # all pretrain
+    _fetch_group(cfg, members, layout, TokenCounter(cfg, layout, cap=cfg.max_seq_length), shard_size, hf_token)  # all pretrain
     for member in members:
         member.increment.finish(member.source)
         counters = member.counters
@@ -494,7 +496,7 @@ def download_github_code_group(
 
 
 def _fetch_group(
-    members: list[_GroupMember], layout: DatasetLayout, counter: TokenCounter, shard_size: int, hf_token: str | None
+    cfg: DatasetConfig, members: list[_GroupMember], layout: DatasetLayout, counter: TokenCounter, shard_size: int, hf_token: str | None
 ) -> None:
     """Run the group pass and append every member's rows (token-counted) to its raw directory, one shard writer
     per member."""
@@ -517,7 +519,7 @@ def _fetch_group(
                 ),
                 m.increment,
                 counter,
-                raw_text_of(m.source),
+                raw_text_of(cfg, m.name),
             )
             for m in members
         }
@@ -554,13 +556,22 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
 TOKEN_BATCH = 256  # rows tokenized per `count_many` call while downloading
 
 
-def raw_text_of(source: SourceConfig) -> Callable[[Row], str]:
-    """What the ``tokens`` column of a raw row counts: ``text_field`` for pretrain / validation sources, instruction +
-    input + output for instruct rows."""
+def raw_text_of(cfg: DatasetConfig, name: str) -> Callable[[Row], str]:
+    """What the ``tokens`` column of a raw row counts: the first ``max_chars`` characters of ``text_field`` for
+    pretrain documents (exactly what the length filter keeps, so ``process`` reuses the count), the whole
+    ``text_field`` for validation sources, instruction + input + output for instruct rows."""
+    source = cfg.sources[name]
     if source.kind == "instruct":
         return instruct_text
     text_field = source.text_field
-    return lambda row: str(row[text_field])
+    max_chars = cfg.counted_chars(name)
+    if max_chars is None:
+        return lambda row: _text_or_empty(row.get(text_field))
+    return lambda row: _text_or_empty(row.get(text_field))[:max_chars]
+
+
+def _text_or_empty(value: object) -> str:
+    return "" if value is None else str(value)
 
 
 def _with_tokens(rows: Iterator[Row], counter: TokenCounter, text_of: Callable[[Row], str]) -> Iterator[Row]:
@@ -639,6 +650,7 @@ def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:
         manifest.token_count == cfg.token_count
         and manifest.tokenizer == tokenizer
         and manifest.token_cap == cfg.token_cap(manifest.source)
+        and manifest.extra.get("counted_chars") == cfg.counted_chars(manifest.source)
         and manifest.tokens() is not None
     )
 
@@ -648,7 +660,6 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
     raw manifest. A raw directory from before the column (or counted differently) is upgraded **in place**: every
     shard is rewritten with the same rows and name plus ``tokens``; ``rows_fetched`` and the shard numbering do not
     change and nothing is downloaded."""
-    source = cfg.sources[name]
     out = layout.source_dir(name, "raw")
     manifest = current_manifest(out, cfg.raw_hash(name), "raw")
     if manifest is None or raw_has_tokens(cfg, manifest):
@@ -656,7 +667,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
 
     log.info("%s: adding the tokens column to %d raw shard(s) in place -> %s", name, len(manifest.shards), out)
     counter = TokenCounter.for_source(cfg, layout, name)
-    text_of = raw_text_of(source)
+    text_of = raw_text_of(cfg, name)
     for shard in progress(list(manifest.shards), desc=f"{name}: count_tokens", unit="shard", leave=False):
         path = out / shard.name
         table = pq.read_table(path)
@@ -671,6 +682,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
     manifest.token_count = cfg.token_count
     manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
     manifest.token_cap = cfg.token_cap(name)
+    manifest.extra["counted_chars"] = cfg.counted_chars(name)
     manifest.save(out)
     return manifest
 

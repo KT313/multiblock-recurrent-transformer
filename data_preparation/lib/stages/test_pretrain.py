@@ -84,11 +84,11 @@ def test_process_length_filter_drops_short_truncates_and_keeps_stats(
     cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local,
                    processing=ProcessingConfig(min_chars=5, max_chars=20), shard_size=4)  # fmt: skip
     raw_tokens = [r["tokens"] for r in read_rows(layout.source_dir("s", "raw"))]
-    assert raw_tokens[3] == 6, "raw shards count the untruncated text"
+    assert raw_tokens[3] == 4, "raw shards count the max_chars prefix the length filter keeps (3 words + a cut one)"
     m = process(cfg, "s", layout)
     rows = read_rows(layout.source_dir("s", "processed"))
     assert [r["text"] for r in rows] == ["ok " * 5, _words(6)[:20], "y" * 7, "z" * 8], "short / null dropped, long truncated"
-    assert [r["tokens"] for r in rows] == [5, 4, 1, 1] and m.extra["stats"]["tokens_recounted"] == 1, "only the truncated row is recounted (3 words + a cut one)"
+    assert [r["tokens"] for r in rows] == [5, 4, 1, 1], "the raw counts are reused as they are"
     assert m.extra["stats"]["length_filter"] == {
         "input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "truncated": 1, "output_samples": 4,
     }  # fmt: skip
@@ -163,7 +163,7 @@ def test_process_appends_only_the_new_shards(
 
     monkeypatch.setattr(TokenCounter, "count_many", spy)
     m2 = process(cfg, "s", layout, shard_size=4)
-    assert sum(counted) == 0 and m2.extra["stats"]["tokens_recounted"] == 0, "raw token counts reused, nothing tokenized"
+    assert sum(counted) == 0, "raw token counts reused, nothing tokenized"
     assert m2.extra["stats"]["dedup"]["duplicates_removed"] == 3 and m2.extra["stats"]["input_rows"] == 11
     assert m2.extra["input_shards"] == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 1, 3, 1])]
     after = mtimes(processed)

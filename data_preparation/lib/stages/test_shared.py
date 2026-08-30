@@ -743,3 +743,26 @@ def test_truncate_raw_to_good_prefix(
     m3.shards[0].offset = None  # a legacy manifest without offsets: no safe resume point
     (raw / "data-00000.parquet").write_bytes(b"x")
     assert not truncate_raw_to_good_prefix(raw, m3)
+
+
+def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_in_place(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data_preparation.lib.schema.dataset_config import ProcessingConfig
+    from data_preparation.lib.stages import shared
+
+    src_dir = layout.root.parent / "long"
+    write_local(src_dir, [{"text": " ".join(["tok_1"] * 50)}], "parquet")  # 299 chars, 50 tokens
+    cfg = with_tokenizer(cfg_factory({"p": _local(src_dir)}, processing=ProcessingConfig(min_chars=1, max_chars=59), max_seq_length=4096))
+    m = download(cfg, "p", layout, rows_needed=1)
+    assert [r["tokens"] for r in read_rows(layout.source_dir("p", "raw"))] == [10], "only the first max_chars are counted"
+    assert m.extra["counted_chars"] == 59 and m.tokens() == 10
+
+    def no_fetch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a max_chars change must not download")
+
+    monkeypatch.setattr(shared, "_fetch_rows", no_fetch)
+    cfg.processing = ProcessingConfig(min_chars=1, max_chars=119)
+    m2 = download(cfg, "p", layout, rows_needed=1)  # the raw hash is unchanged: recounted in place
+    assert m2.rows_fetched == 1 and m2.extra["counted_chars"] == 119 and m2.tokens() == 20
+    assert [r["tokens"] for r in read_rows(layout.source_dir("p", "raw"))] == [20]

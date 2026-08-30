@@ -321,13 +321,24 @@ class DatasetConfig:
         return None if self.sources[source_name].kind == "instruct" else self.max_seq_length
 
     def token_settings(self, source_name: str) -> dict[str, Any]:
-        """How the ``tokens`` column of a source is counted: mode, tokenizer (when counting with it) and the cap
-        (recorded in the manifests so a change recounts in place instead of re-downloading)."""
+        """How the ``tokens`` column of a source is counted: mode, tokenizer (when counting with it), the cap and —
+        pretrain documents — the ``max_chars`` prefix that is counted (what the length filter keeps, so ``process``
+        can reuse every count). Recorded in the manifests so a change recounts in place instead of re-downloading."""
         source = self.sources[source_name]
         settings: dict[str, Any] = {"token_count": self.token_count, "cap": self.token_cap(source_name)}
         if self.token_count == "tokenizer" or source.kind == "instruct":
             settings["tokenizer"] = hash_fields(self.tokenizer)
+        max_chars = self.counted_chars(source_name)
+        if max_chars is not None:
+            settings["max_chars"] = max_chars
         return settings
+
+    def counted_chars(self, source_name: str) -> Optional[int]:
+        """Characters of a pretrain document that are token-counted: the source's ``max_chars`` (the length filter
+        truncates there, so counting more would be wasted — whole books are common); None for other kinds."""
+        if self.sources[source_name].kind != "pretrain":
+            return None
+        return self.source_processing(source_name).max_chars
 
     def processed_hash(self, source_name: str) -> str:
         """Hash of a pretrain source's ``processed/`` directory: the raw hash plus the effective processing block
