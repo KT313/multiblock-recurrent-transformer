@@ -30,7 +30,6 @@ from data_preparation.lib.sources import (
     get_loader,
     gsm8k_question_answer,
     instruction_input_output,
-    iter_language,
     sharegpt_conversations,
     sharegpt_quality,
     synthetic_row,
@@ -154,13 +153,6 @@ def test_hf_stream_count_zero_does_not_load(fake_datasets: FakeDatasets) -> None
 
 
 # --- github_code (the loader itself is tested in test_hf_files.py) ------------------------------------------------
-
-
-def test_iter_language() -> None:
-    rows = [{"language": lang, "i": i} for i, lang in enumerate("abab")]
-    assert [r["i"] for r in iter_language(rows, "a", 5)] == [0, 2]
-    assert [r["i"] for r in iter_language(rows, "a", 1, offset=1)] == [2]
-    assert list(iter_language(rows, "a", 0)) == []
 
 
 # --- local ------------------------------------------------------------------------------------------------------------
@@ -355,3 +347,10 @@ def test_hub_load_kwargs_routes_script_repos_through_generic_builder() -> None:
     assert hub_load_kwargs(unpinned, None)["data_files"] == "hf://datasets/org/name/data/*.parquet"
     with pytest.raises(ValueError, match="requires load_kwargs.data_files"):
         hub_load_kwargs(_src(load_kwargs={"builder": "json"}), None)
+
+
+def test_fields_converter_turns_null_values_into_empty_strings() -> None:
+    from data_preparation.lib.sources.converters import fields_converter
+
+    convert = fields_converter({"instruction": "q", "input": "ctx", "output": "a"})
+    assert convert({"q": None, "ctx": None, "a": "x"}) == {"instruction": "", "input": "", "output": "x"}

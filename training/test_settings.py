@@ -110,7 +110,7 @@ def test_defaults_are_a_single_gpu_config() -> None:
     assert cfg.optim_config == {"lr": 1e-4, "weight_decay": 4e-5, "betas": (0.9, 0.95)}
     assert cfg.out_dir == "outputs" and cfg.resume is True
     assert cfg.export_to_hf is False and cfg.export_hf_path is None
-    assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 4
+    assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 2
     assert cfg.prepare_max_parallel_downloads == 2
     assert cfg.allow_dataset_change is False
     assert cfg.gradient_accumulation_steps == 1024 // 4

@@ -610,3 +610,17 @@ def test_group_rejects_mixed_repos_and_duplicate_languages(hub: FakeHub) -> None
     with pytest.raises(ValueError, match="distinct languages"):
         list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("q", python, 0, 1)]))
     assert list(read_github_code_group([])) == []
+
+
+def test_glob_regex_does_not_cross_directories() -> None:
+    from data_preparation.lib.sources.hub_files import glob_regex
+
+    assert glob_regex("data/*.parquet").fullmatch("data/x.parquet")
+    assert not glob_regex("data/*.parquet").fullmatch("data/sub/x.parquet"), "fnmatch would match this"
+    assert not glob_regex("*.parquet").fullmatch("data/x.parquet") and glob_regex("*.parquet").fullmatch("x.parquet")
+    assert glob_regex("**/*.parquet").fullmatch("data/sub/x.parquet") and glob_regex("**/*.parquet").fullmatch("x.parquet")
+    assert glob_regex("data/**").fullmatch("data/sub/x.parquet")
+    assert glob_regex("sample/10BT/0?0_00000.parquet").fullmatch("sample/10BT/000_00000.parquet")
+    assert not glob_regex("sample/10BT/0?0_00000.parquet").fullmatch("sample/10BT/0/0_00000.parquet")
+    assert glob_regex("MetaMathQA-395K.json").fullmatch("MetaMathQA-395K.json") and not glob_regex("a.json").fullmatch("a_json")
+    assert glob_regex("data/[ab]*.parquet").fullmatch("data/b1.parquet") and not glob_regex("data/[ab]*.parquet").fullmatch("data/c1.parquet")

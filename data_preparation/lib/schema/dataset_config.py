@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import MISSING, Field, asdict, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -409,8 +409,17 @@ class DatasetConfig:
         return _stable_hash(hash_fields(self.tokenizer))
 
     def config_hash(self) -> str:
-        """Hash of the complete config (recorded in checkpoints so a resume with different data is detected)."""
-        return _stable_hash(asdict(self))
+        """Hash of everything that defines the training data (recorded in checkpoints so a resume with different
+        data is detected): the config minus the knobs that only change how it is fetched or planned
+        (``always_range_requests``, ``load_kwargs.max_cached_file_mb``, ``tokens_per_row_estimate``)."""
+        payload = hash_fields(self)
+        payload.pop("always_range_requests", None)
+        for source_fields in payload.get("sources", {}).values():
+            source_fields.pop("tokens_per_row_estimate", None)
+            load_kwargs = source_fields.get("load_kwargs")
+            if load_kwargs is not None:
+                load_kwargs.pop("max_cached_file_mb", None)
+        return _stable_hash(payload)
 
     # --- token budgets ---------------------------------------------------------------------------------------------
 

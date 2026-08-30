@@ -145,24 +145,6 @@ def load_hf_stream(
     yield from _take(stream, count)
 
 
-def iter_language(rows: Iterable[Row], language: str, limit: int, offset: int = 0) -> Iterator[Row]:
-    """Yield up to `limit` rows whose `language` column equals `language`, skipping the first `offset` matches."""
-    if limit <= 0:
-        return
-    seen = 0
-    taken = 0
-    for row in rows:
-        if row["language"] != language:
-            continue
-        if seen < offset:
-            seen += 1
-            continue
-        taken += 1
-        yield dict(row)
-        if taken >= limit:
-            return
-
-
 def hub_file_index(source: SourceConfig, default_pattern: str | None, index_dir: Path | None, token: str | None) -> FileIndex:
     """The :class:`FileIndex` of a `hf_files` / `github_code` source (`load_kwargs.data_files` or `default_pattern`)."""
     if not source.hf_id:  # validated by SourceConfig; repeated for the type checker

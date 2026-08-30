@@ -53,6 +53,7 @@ log = get_logger(__name__)
 STEPS: tuple[str, ...] = ("tokenizer", "download", "process", "validation", "instruct_mixtures")
 DEFAULT_MAX_ROUNDS = 5
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
+DEFAULT_NUM_WORKERS = 2  # items processed at a time; also the pool size of each decontamination / minhash pass
 
 
 @dataclass
@@ -107,10 +108,11 @@ class _Slots:
             yield
 
 
-def status(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
-    """The plan for ``cfg`` under ``layout``, logged as a summary (warnings for exhausted sources)."""
+def status(cfg: DatasetConfig, layout: DatasetLayout, *, log_summary: bool = True) -> Plan:
+    """The plan for ``cfg`` under ``layout``, logged as a summary (warnings for exhausted sources); ``log_summary``
+    False logs only the warnings (``prepare.py status`` prints the table itself)."""
     result = plan(cfg, layout)
-    _log_plan(result)
+    _log_plan(result, summary=log_summary)
     _warn_overlaps(cfg)
     return result
 
@@ -126,7 +128,7 @@ def build(
     *,
     sources: list[str] | None = None,
     steps: set[str] | None = None,
-    num_workers: int = 1,
+    num_workers: int = DEFAULT_NUM_WORKERS,
     hf_token: str | None = None,
     dry_run: bool = False,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
@@ -219,7 +221,7 @@ def _work_items(
             if "/" in validation_plan.name:
                 continue  # a pretrain source's `<name>/validation` split: built by the source's own `process` item
             if _wanted(validation_plan.name, validation_plan.complete, selected):
-                action = partial(_build_validation, cfg, validation_plan, layout, slots)
+                action = partial(_build_validation, cfg, validation_plan, layout, hf_token, slots)
                 items.append(_WorkItem("validation", validation_plan.name, action))
 
     if "instruct_mixtures" in active_steps:
@@ -353,7 +355,7 @@ def _wait_for_dependencies(item: _WorkItem, by_name: dict[str, Future[None]]) ->
             raise BuildAborted(f"{name} did not finish") from err
 
 
-def _log_plan(result: Plan) -> None:
+def _log_plan(result: Plan, *, summary: bool = True) -> None:
     for item in result.sources + result.validations:
         if not (item.complete and item.exhausted):
             continue
@@ -364,7 +366,8 @@ def _log_plan(result: Plan) -> None:
             )
         else:
             log.warning("%s: %s", item.name, item.reason)
-    log.info("dataset status:\n%s", result.summary(), extra={"keep": True})  # keep: printed unwrapped into the scrollback
+    if summary:
+        log.info("dataset status:\n%s", result.summary(), extra={"keep": True})  # keep: printed unwrapped into the scrollback
 
 
 # --- building the individual items ----------------------------------------------------------------------------------
@@ -495,11 +498,11 @@ def _validation_split_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayou
     return (manifest.tokens() or 0) if manifest is not None else 0
 
 
-def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout, slots: _Slots) -> None:
+def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout, hf_token: str | None, slots: _Slots) -> None:
     name = validation_plan.name
     _remove_broken_stages(cfg, name, layout)  # `rows` is part of the source hash, so a stale manifest covers row changes
     with slots.downloading():
-        validation(cfg, name, layout)
+        validation(cfg, name, layout, hf_token=hf_token)
 
 
 def _instruct_tokens_per_row(cfg: DatasetConfig, src: str, layout: DatasetLayout) -> float:

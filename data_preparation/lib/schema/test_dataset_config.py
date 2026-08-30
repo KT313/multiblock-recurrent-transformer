@@ -450,3 +450,16 @@ def test_validation_split_key_hash_and_overlap_warning() -> None:
     d["sources"]["hold"]["load_kwargs"] = {"data_files": "other/*.parquet"}
     assert _build(d).overlap_warnings() == []
     assert dc._glob_prefix("data/CC-MAIN-2013-20/*.parquet") == "data/CC-MAIN-2013-20/" and dc._glob_prefix(None) == ""
+
+
+def test_config_hash_ignores_fetch_and_planner_knobs() -> None:
+    d = _minimal()
+    d["sources"]["files"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
+    base = _build(d).config_hash()
+    d["sources"]["files"]["tokens_per_row_estimate"] = 7
+    d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 3
+    cfg = _build(d)
+    cfg.always_range_requests = False
+    assert cfg.config_hash() == base
+    d["sources"]["files"]["revision"] = "abc"
+    assert _build(d).config_hash() != base

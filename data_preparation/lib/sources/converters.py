@@ -87,9 +87,9 @@ def fields_converter(fields: dict[str, str]) -> Converter:
         _require(row, instruction_col, output_col)
         input_value = row.get(input_col, "") if input_col is not None else ""
         return {
-            "instruction": str(row[instruction_col]),
+            "instruction": _text_or_empty(row[instruction_col]),
             "input": _text_or_empty(input_value),
-            "output": str(row[output_col]),
+            "output": _text_or_empty(row[output_col]),
         }
 
     return convert

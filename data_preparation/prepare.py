@@ -24,7 +24,7 @@ from pathlib import Path
 if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without installing the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data_preparation.lib.build import DEFAULT_MAX_PARALLEL_DOWNLOADS, STEPS, build, describe, leading_comment, status  # noqa: E402
+from data_preparation.lib.build import DEFAULT_MAX_PARALLEL_DOWNLOADS, DEFAULT_NUM_WORKERS, STEPS, build, describe, leading_comment, status  # noqa: E402
 from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
 from data_preparation.lib.schema.dataset_config import load_dataset_config  # noqa: E402
 from data_preparation.lib.schema.layout import DatasetLayout  # noqa: E402
@@ -75,7 +75,7 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
 def _add_build_options(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / instruct mixtures")
     sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
-    sub.add_argument("--num_workers", type=int, default=1, help="worker processes for processing stages (and sources processed at a time)")
+    sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources processed at a time (and worker processes per decontamination / minhash pass)")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")
     sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")
     sub.add_argument("--dry_run", action="store_true", help="print the plan, write nothing")
@@ -113,7 +113,7 @@ def run_build(args: argparse.Namespace) -> None:
 def run_status(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
     cfg = load_dataset_config(args.dataset_config)
-    result = status(cfg, DatasetLayout(args.dataset_dir))
+    result = status(cfg, DatasetLayout(args.dataset_dir), log_summary=False)
     print(result.summary())
     if not result.complete:
         for line in result.missing():

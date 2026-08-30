@@ -36,6 +36,7 @@ from data_preparation.lib.stages.shared import (
     new_manifest,
     record_new_shards,
     shard_list,
+    tokens_per_shard,
 )
 
 log = get_logger(__name__)
@@ -140,7 +141,7 @@ def build_instruct_mixture(
             out_dir = split_dirs[split]
             write_dict_rows(_ordered(split_rows), out_dir, shard_size, start_shard=0)
             manifest = new_manifest(cfg, instruct_mixture_name, mixture_hash, "instruct_mixture", tokens=True)
-            record_new_shards(manifest, out_dir, 0, tokens=_tokens_per_shard(split_rows, shard_size))
+            record_new_shards(manifest, out_dir, 0, tokens=tokens_per_shard(out_dir, [int(r["tokens"]) for r in split_rows]))
             manifest.extra = {
                 "split": split,
                 "budget_tokens": budget_tokens,
@@ -270,12 +271,3 @@ def _dedup(rows: list[Row]) -> list[Row]:
 def _ordered(rows: list[Row]) -> list[Row]:
     """The rows with their columns in the fixed output order."""
     return [{"instruction": r["instruction"], "input": r["input"], "output": r["output"], "tokens": r["tokens"]} for r in rows]
-
-
-def _tokens_per_shard(rows: list[Row], shard_size: int) -> dict[str, int]:
-    """Token sum per output shard (``data-00000.parquet``, ...) for rows written in chunks of ``shard_size``."""
-    sums: dict[str, int] = {}
-    for start in range(0, len(rows), shard_size):
-        shard_name = f"data-{start // shard_size:05d}.parquet"
-        sums[shard_name] = sum(int(r["tokens"]) for r in rows[start : start + shard_size])
-    return sums

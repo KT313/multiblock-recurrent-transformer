@@ -113,7 +113,7 @@ def _source_summary_row(source: SourcePlan) -> tuple[str, ...]:
         _fmt(source.rows_needed),
         "-" if source.complete else _fmt(source.rows_to_fetch),
         f"{source.tokens_per_row:.1f}",
-        _fmt_epochs(source.epochs),
+        _fmt_epochs(source.epochs if source.complete else None),  # meaningless before the source is built
         _source_state(source),
         source.reason,
     )
@@ -137,7 +137,7 @@ def _instruct_mixture_summary_row(mixture: InstructMixturePlan) -> tuple[str, ..
         "",  # needed
         "",  # fetch
         "",  # tok/row
-        _fmt_epochs(mixture.epochs),
+        _fmt_epochs(mixture.epochs if mixture.complete else None),
         "complete" if mixture.complete else "incomplete",
         mixture.reason,
     )

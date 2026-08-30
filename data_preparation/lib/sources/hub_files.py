@@ -42,12 +42,12 @@ by the remote file objects, files downloaded / streamed).
 
 from __future__ import annotations
 
-import fnmatch
 import gzip
 import hashlib
 import io
 import itertools
 import json
+import re
 import threading
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -195,7 +195,8 @@ class FileIndex:
     ) -> FileIndex:
         """A fresh index: list the repo once and keep the files matching ``pattern``, sorted by path."""
         all_files = list_repo_files(repo_id, revision, token)
-        files = sorted(f for f in all_files if fnmatch.fnmatchcase(f, pattern))
+        matcher = glob_regex(pattern)
+        files = sorted(f for f in all_files if matcher.fullmatch(f))
         if not files:
             raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no files match data_files={pattern!r}")
         return cls(repo_id, revision, pattern, files, path=path)
@@ -265,10 +266,43 @@ class FileIndex:
         return self.group_counts.get(key, {}).get(file, [])
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
-        """Store the matching rows per row group read so far under ``key`` (a prefix of the file's groups) and save."""
+        """Store (a copy of) the matching rows per row group read so far under ``key`` (a prefix of the file's
+        groups) in memory; the index is written when a file is finished (``record``) and when a read ends
+        (``save``) — not once per row group, which for a repo of hundreds of files and thousands of row groups
+        would rewrite the whole JSON thousands of times."""
         with self._lock:
-            self.group_counts.setdefault(key, {})[file] = groups
-            self._write()
+            self.group_counts.setdefault(key, {})[file] = list(groups)
+
+
+def glob_regex(pattern: str) -> re.Pattern[str]:
+    """``data_files`` glob as an anchored regex with Hub semantics: ``*`` and ``?`` do not cross ``/``, ``**`` does
+    (``data/*.parquet`` matches ``data/x.parquet`` but not ``data/sub/x.parquet``; ``fnmatch`` would match both)."""
+    parts: list[str] = []
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if pattern.startswith("**", i):
+            parts.append(".*")
+            i += 2
+            if i < len(pattern) and pattern[i] == "/":
+                parts[-1] = "(?:.*/)?"
+                i += 1
+            continue
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        elif char == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                parts.append(re.escape(char))
+            else:
+                parts.append("[" + pattern[i + 1 : end].replace("\\", "\\\\") + "]")
+                i = end
+        else:
+            parts.append(re.escape(char))
+        i += 1
+    return re.compile("".join(parts))
 
 
 # --- fetching -----------------------------------------------------------------------------------------------------------
@@ -613,30 +647,33 @@ def read_rows_multi(
         fetcher = HubFetcher(token=token)
     cursors = [_Cursor(request=r, remaining_skip=r.offset) for r in requests if r.count > 0]
 
-    for file in index.files:
-        readers = [c for c in cursors if not c.satisfied]
-        if not readers:
-            return
-        readers = [c for c in readers if not _skip_file_if_count_known(index, c, file)]
-        if not readers:
-            continue
-        fmt = file_format(file)
-        if on_file is not None:
-            on_file(file)
-        with fetcher.open(index, file, fmt) as handle:
-            if fmt == ".parquet":
-                parquet = pq.ParquetFile(handle)
-                if index.row_groups.get(file) is None:
-                    index.record_row_groups(file, parquet_row_groups(parquet))  # the footer told us the row count
-                # a plain request may find that the whole file lies before its offset after all (footer only)
-                readers = [c for c in readers if c.match is not None or not _skip_file_if_count_known(index, c, file)]
-                if not readers:
-                    continue
-                is_remote = not fetcher.uses_cache(index.sizes[file])
-                finish_group = align_to_row_group and is_remote
-                yield from _parquet_rows(parquet, index, file, readers, columns, finish_group)
-            else:
-                yield from _stream_rows(handle, index, file, readers)
+    try:
+        for file in index.files:
+            readers = [c for c in cursors if not c.satisfied]
+            if not readers:
+                return
+            readers = [c for c in readers if not _skip_file_if_count_known(index, c, file)]
+            if not readers:
+                continue
+            fmt = file_format(file)
+            if on_file is not None:
+                on_file(file)
+            with fetcher.open(index, file, fmt) as handle:
+                if fmt == ".parquet":
+                    parquet = pq.ParquetFile(handle)
+                    if index.row_groups.get(file) is None:
+                        index.record_row_groups(file, parquet_row_groups(parquet))  # the footer told us the row count
+                    # a plain request may find that the whole file lies before its offset after all (footer only)
+                    readers = [c for c in readers if c.match is not None or not _skip_file_if_count_known(index, c, file)]
+                    if not readers:
+                        continue
+                    is_remote = not fetcher.uses_cache(index.sizes[file])
+                    finish_group = align_to_row_group and is_remote
+                    yield from _parquet_rows(parquet, index, file, readers, columns, finish_group)
+                else:
+                    yield from _stream_rows(handle, index, file, readers)
+    finally:
+        index.save()  # the row-group counts recorded in memory while reading
 
 
 def _skip_file_if_count_known(index: FileIndex, cursor: _Cursor, file: str) -> bool:

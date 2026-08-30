@@ -751,7 +751,7 @@ def _bounded(rows: Iterator[Row], limit: int | None) -> Generator[Row, None, Non
 
 
 def validation(
-    cfg: DatasetConfig, name: str, layout: DatasetLayout, *, shard_size: int = DEFAULT_SHARD_SIZE
+    cfg: DatasetConfig, name: str, layout: DatasetLayout, *, shard_size: int = DEFAULT_SHARD_SIZE, hf_token: str | None = None
 ) -> Manifest:
     """Write the held-out validation rows of a ``validation`` source: ``source.rows`` rows, shuffled with
     ``random.Random(source.seed)``, token-counted like ``process`` — no dedup and no filters.
@@ -781,7 +781,7 @@ def validation(
     loader = get_loader(source.loader)
     with progress(total=source.rows, desc=f"{name}: validation", unit="row", leave=False) as bar:
         fetched = loader(  # exact: a validation is fetched once, its row count is part of its identity
-            source, offset, source.rows, index_dir=layout.hub_index_dir(), columns=loader_columns(source),
+            source, offset, source.rows, token=hf_token, index_dir=layout.hub_index_dir(), columns=loader_columns(source),
             align_to_row_group=False,
         )
         rows = [text_row(source, r, name) for r in bar_rows(bar, fetched)]
@@ -797,7 +797,7 @@ def validation(
 
     manifest = new_manifest(cfg, name, source_hash, "validation", tokens=True)
     manifest.rows_fetched = offset + len(rows)
-    record_new_shards(manifest, out, 0, tokens=_tokens_per_shard(out, tokens))
+    record_new_shards(manifest, out, 0, tokens=tokens_per_shard(out, tokens))
     manifest.extra = {"offset": offset, "requested_rows": source.rows, "seed": source.seed}
     manifest.save(out)
     return manifest
@@ -830,7 +830,7 @@ def _local_row_count(directory: Path) -> int:
     return total
 
 
-def _tokens_per_shard(directory: Path, tokens: list[int]) -> dict[str, int]:
+def tokens_per_shard(directory: Path, tokens: list[int]) -> dict[str, int]:
     """Split a per-row token list into per-shard sums following the shard row counts on disk."""
     per_shard: dict[str, int] = {}
     position = 0
