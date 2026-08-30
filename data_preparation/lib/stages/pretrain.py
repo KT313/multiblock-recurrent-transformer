@@ -166,7 +166,7 @@ class _Pipeline:
         self.batch_size = batch_size
         self.stats = stats
         self.seen = seen
-        self.counter = TokenCounter(cfg, layout)
+        self.counter = TokenCounter.for_source(cfg, layout, name)
         self.decontaminator = _Decontaminator(processing.decontamination, num_workers, layout, stats["decontamination"])
         self.bar: Progress | None = None
 

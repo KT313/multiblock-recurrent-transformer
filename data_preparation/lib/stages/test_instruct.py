@@ -169,3 +169,16 @@ def test_build_instruct_mixture_requires_raw_manifests(cfg_factory: CfgFactory, 
     cfg = cfg_factory({"a": two_sources["a"]}, instruct_mixtures={"m": mixture})
     with pytest.raises(FileNotFoundError, match="no current raw manifest"):
         build_instruct_mixture(cfg, "m", layout, budget_tokens=10)
+
+
+def test_max_tokens_equal_to_max_seq_length_still_drops_long_examples(
+    cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, two_sources: dict[str, SourceConfig], read_rows: Reader
+) -> None:
+    """Instruct token counts are not capped at `max_seq_length` (documents are), so with `max_tokens ==
+    max_seq_length` — the crow config — an example longer than both is still dropped."""
+    mixture = InstructMixtureConfig(sources={"a": 0.5, "b": 0.5}, max_tokens=8, val_split=0.0, seed=0)
+    cfg = _build(cfg_factory, layout, with_tokenizer, two_sources, mixture, rows_needed=5, max_seq_length=8)
+    raw_b = Manifest.load(layout.source_dir("b", "raw"))
+    assert raw_b is not None and raw_b.token_cap is None and [r["tokens"] for r in read_rows(layout.source_dir("b", "raw"))] == [10] * 5
+    train = build_instruct_mixture(cfg, "m", layout, budget_tokens=600)["train"]
+    assert train.extra["counts"]["b"]["dropped_too_long"] == 5 and train.extra["counts"]["a"]["kept_rows"] == 5

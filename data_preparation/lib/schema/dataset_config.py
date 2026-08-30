@@ -159,7 +159,7 @@ class InstructMixtureConfig:
     """An instruct mixture built per dataset config from `instruct` sources (counts derived from the stage budget)."""
 
     sources: dict[str, float]  # instruct source name -> share of the mixture
-    max_tokens: int = 2048  # drop examples whose word-based token estimate exceeds this
+    max_tokens: int = 2048  # drop examples longer than this (full token count of instruction + input + output)
     input_inversions: float = 0.0  # share of examples turned into "given the output, what was the instruction?"
     val_split: float = 0.05
     seed: int = 42
@@ -283,11 +283,16 @@ class DatasetConfig:
             load_kwargs.pop("max_cached_file_mb", None)
         return _stable_hash({"source": source_fields})
 
+    def token_cap(self, source_name: str) -> Optional[int]:
+        """The cap of a source's stored token counts: ``max_seq_length`` for pretrain / validation documents (training
+        truncates them there), None for instruct examples (their full length decides ``mixture.max_tokens``)."""
+        return None if self.sources[source_name].kind == "instruct" else self.max_seq_length
+
     def token_settings(self, source_name: str) -> dict[str, Any]:
         """How the ``tokens`` column of a source is counted: mode, tokenizer (when counting with it) and the cap
-        (``max_seq_length``; recorded in the manifests so a change recounts in place instead of re-downloading)."""
+        (recorded in the manifests so a change recounts in place instead of re-downloading)."""
         source = self.sources[source_name]
-        settings: dict[str, Any] = {"token_count": self.token_count, "max_seq_length": self.max_seq_length}
+        settings: dict[str, Any] = {"token_count": self.token_count, "cap": self.token_cap(source_name)}
         if self.token_count == "tokenizer" or source.kind == "instruct":
             settings["tokenizer"] = hash_fields(self.tokenizer)
         return settings

@@ -60,31 +60,40 @@ DEFAULT_SHARD_SIZE = 10_000
 
 
 class TokenCounter:
-    """``min(tokens(text), max_seq_length)`` with the config's tokenizer (``token_count: tokenizer``) or chars/4.
+    """``min(tokens(text), cap)`` with the config's tokenizer (``token_count: tokenizer``) or chars/4.
 
-    The text itself is never rewritten; training's own truncation cuts at ``block_size``.
+    ``cap`` defaults to ``max_seq_length`` (pretrain / validation documents: training truncates them there; the text
+    itself is never rewritten) and is None for instruct examples (:meth:`DatasetConfig.token_cap`), whose full
+    length decides whether ``mixture.max_tokens`` drops them. Use :meth:`for_source` to pick the source's cap.
     """
 
-    def __init__(self, cfg: DatasetConfig, layout: DatasetLayout) -> None:
+    def __init__(self, cfg: DatasetConfig, layout: DatasetLayout, *, cap: int | None = None) -> None:
         self.mode = cfg.token_count
-        self.cap = cfg.max_seq_length
+        self.cap = cap
         self.tokenizer_name = cfg.tokenizer.name
         self._tokenizer: Any = None
         if self.mode == "tokenizer":
             self._tokenizer = _load_tokenizer(layout.tokenizer_dir(cfg.tokenizer.name), cfg.tokenizer.name)
 
+    @classmethod
+    def for_source(cls, cfg: DatasetConfig, layout: DatasetLayout, source_name: str) -> TokenCounter:
+        return cls(cfg, layout, cap=cfg.token_cap(source_name))
+
+    def _capped(self, n: int) -> int:
+        return n if self.cap is None else min(n, self.cap)
+
     def count(self, text: str) -> int:
         if self._tokenizer is None:
-            return min(estimate_tokens(text), self.cap)
-        return min(len(self._tokenizer.encode(text, add_special_tokens=False)), self.cap)
+            return self._capped(estimate_tokens(text))
+        return self._capped(len(self._tokenizer.encode(text, add_special_tokens=False)))
 
     def count_many(self, texts: list[str]) -> list[int]:
         if not texts:
             return []  # HF fast tokenizers choke on an empty batch
         if self._tokenizer is None:
-            return [min(estimate_tokens(t), self.cap) for t in texts]
+            return [self._capped(estimate_tokens(t)) for t in texts]
         encoded = self._tokenizer(texts, add_special_tokens=False)["input_ids"]
-        return [min(len(ids), self.cap) for ids in encoded]
+        return [self._capped(len(ids)) for ids in encoded]
 
 
 def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
@@ -126,14 +135,15 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
 
 
 def new_manifest(cfg: DatasetConfig, source: str, source_hash: str, stage: str, *, tokens: bool = False) -> Manifest:
-    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured."""
+    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured (the cap is the
+    source's, see :meth:`DatasetConfig.token_cap`; mixtures are named like no source and carry no cap)."""
     return Manifest(
         source=source,
         source_hash=source_hash,
         stage=stage,
         token_count=cfg.token_count if tokens else None,
         tokenizer=cfg.tokenizer.name if tokens and cfg.token_count == "tokenizer" else None,
-        token_cap=cfg.max_seq_length if tokens else None,
+        token_cap=cfg.token_cap(source) if tokens and source in cfg.sources else None,
         versions=library_versions(),
     )
 
@@ -274,7 +284,7 @@ def download(
     log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
     counters = _FetchCounters()
     increment = _Increment(manifest, out, counters, should_stop)
-    counter = TokenCounter(cfg, layout)
+    counter = TokenCounter.for_source(cfg, layout, name)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar)
@@ -475,7 +485,7 @@ def download_github_code_group(
     if not members:
         return results
 
-    _fetch_group(members, layout, TokenCounter(cfg, layout), shard_size, hf_token)
+    _fetch_group(members, layout, TokenCounter(cfg, layout, cap=cfg.max_seq_length), shard_size, hf_token)  # all pretrain
     for member in members:
         member.increment.finish(member.source)
         counters = member.counters
@@ -628,7 +638,7 @@ def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:
     return (
         manifest.token_count == cfg.token_count
         and manifest.tokenizer == tokenizer
-        and manifest.token_cap == cfg.max_seq_length
+        and manifest.token_cap == cfg.token_cap(manifest.source)
         and manifest.tokens() is not None
     )
 
@@ -645,7 +655,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
         return manifest
 
     log.info("%s: adding the tokens column to %d raw shard(s) in place -> %s", name, len(manifest.shards), out)
-    counter = TokenCounter(cfg, layout)
+    counter = TokenCounter.for_source(cfg, layout, name)
     text_of = raw_text_of(source)
     for shard in progress(list(manifest.shards), desc=f"{name}: count_tokens", unit="shard", leave=False):
         path = out / shard.name
@@ -660,7 +670,7 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
         shard.tokens = sum(tokens)
     manifest.token_count = cfg.token_count
     manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
-    manifest.token_cap = cfg.max_seq_length
+    manifest.token_cap = cfg.token_cap(name)
     manifest.save(out)
     return manifest
 
@@ -769,7 +779,7 @@ def validation(
     # shuffle, count tokens, write
     random.Random(source.seed).shuffle(rows)
     texts = [str(r[source.text_field]) for r in rows]
-    tokens = TokenCounter(cfg, layout).count_many(texts)
+    tokens = TokenCounter.for_source(cfg, layout, name).count_many(texts)
     out_rows = ({"text": t, "source": name, "tokens": n} for t, n in zip(texts, tokens))
     write_dict_rows(out_rows, out, shard_size, start_shard=0)
 

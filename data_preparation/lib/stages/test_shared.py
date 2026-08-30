@@ -110,16 +110,19 @@ def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
 def test_token_counter_tokenizer_mode_caps_at_max_seq_length(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Callable[[DatasetConfig], DatasetConfig]
 ) -> None:
-    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}, max_seq_length=5))
-    counter = TokenCounter(cfg, layout)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(), "i": _synthetic(kind="instruct")}, max_seq_length=5))
+    counter = TokenCounter.for_source(cfg, layout, "p")
     assert counter.count("tok_1 tok_2 tok_3") == 3
     assert counter.count(" ".join(["tok_1"] * 9)) == 5
     assert counter.count_many(["tok_1", " ".join(["tok_2"] * 7), ""]) == [1, 5, 0]
+    uncapped = TokenCounter.for_source(cfg, layout, "i")  # instruct examples: the full length
+    assert uncapped.cap is None and uncapped.count(" ".join(["tok_1"] * 9)) == 9
+    assert uncapped.count_many([" ".join(["tok_2"] * 7)]) == [7] and TokenCounter(cfg, layout).cap is None
 
 
 def test_token_counter_estimate_mode_caps_and_needs_no_tokenizer(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     cfg = cfg_factory({"p": _synthetic()}, token_count="estimate", max_seq_length=10)
-    counter = TokenCounter(cfg, layout)  # tokenizer dir does not exist
+    counter = TokenCounter.for_source(cfg, layout, "p")  # tokenizer dir does not exist
     assert counter.count("a" * 8) == 2 and counter.count("a" * 400) == 10
     assert counter.count_many(["a" * 8, "a" * 400]) == [2, 10]
 

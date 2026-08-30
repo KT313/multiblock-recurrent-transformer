@@ -78,7 +78,7 @@ def build_instruct_mixture(
         return existing
 
     log.info("building mixture %s (%d tokens) -> %s", instruct_mixture_name, budget_tokens, split_dirs["train"].parent)
-    counter = TokenCounter(cfg, layout)
+    counter = TokenCounter(cfg, layout)  # instruct examples: uncapped, like their raw `tokens`
 
     # Step 0: take the budgeted rows of every source.
     rows: list[Row] = []
