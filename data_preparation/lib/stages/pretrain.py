@@ -4,20 +4,24 @@ decontamination, token counting, fuzzy dedup (see the ``fuzzy_dedup`` module).
 
 Idempotent and incremental via the manifests (see ``stages/shared.py``): the processed manifest records the raw
 shards it covers and every processed row carries its exact-dedup key (``hash`` column), so new raw shards are
-deduplicated against the rows already on disk and only they are filtered and tokenized.
+deduplicated against the rows already on disk and only they are filtered and tokenized — one raw shard at a time,
+each published before the next starts (resumable, cancellable between shards).
 """
 
 from __future__ import annotations
 
 import multiprocessing
+import multiprocessing.pool
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
-from data_preparation.lib.storage.parquet import list_parquet_files, shard_index, text_hash64, write_dict_rows
+from data_preparation.lib.abort import StopCheck, check_stop
+from data_preparation.lib.storage.parquet import list_parquet_files, publish_shard, shard_index, shard_name, text_hash64, write_dict_rows
 from data_preparation.lib.schema.dataset_config import DatasetConfig, DecontaminationConfig, ProcessingConfig
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.schema.layout import PROCESSED_COLUMNS, DatasetLayout
@@ -50,6 +54,7 @@ def process(
     *,
     shard_size: int = DEFAULT_SHARD_SIZE,
     num_workers: int = 1,
+    should_stop: StopCheck | None = None,
 ) -> Manifest:
     """Stream the raw shards not yet covered by the processed manifest, in order, through the length filter
     (``preprocess_batch``: drop null / short texts, truncate to ``max_chars``) -> quality filter -> decontamination
@@ -59,10 +64,15 @@ def process(
     rows kept are exactly those of a full pass over every shard. Every kept row is written once; a source smaller
     than its budget is cycled by the training sampler, not repeated on disk.
 
+    Raw shards are processed **one at a time**: the survivors of a raw shard are published (in chunks of
+    ``shard_size``) and the manifest records the raw shard as covered before the next one starts, so a failure or
+    a stop request (``should_stop``, checked between raw shards) loses at most one raw shard of work and the next
+    call resumes behind the last covered one.
+
     A no-op when the processed manifest already covers every raw shard (``extra["input_shards"]``). The directory
     is rebuilt from scratch when its manifest is stale, when the covered shards are no longer a prefix of the raw
     shards, when it predates the ``hash`` column, and — always — with ``dedup.mode: minhash`` (fuzzy dedup needs
-    every signature in one LSH index, so it is a full pass over everything).
+    every signature in one LSH index, so it is a single all-or-nothing pass over everything).
     """
     source = cfg.sources[name]
     if source.kind != "pretrain":
@@ -84,38 +94,103 @@ def process(
 
     log.info("%s: processing %d raw shard(s) (%d already covered) -> %s", name, len(pending), covered, out)
     stats: dict[str, Any] = manifest.extra["stats"]
-    stats["input_rows"] += sum(shard.rows for shard in pending)
-    seen = _stored_hashes(out, manifest)
-
-    # build the lazy pipeline: nothing runs until the shard writer pulls rows through it
-    rows: Iterator[Row] = _length_filtered_rows(raw_dir, pending, source.text_field, name, processing, shard_size, stats["length_filter"])
     stats["tokens_recounted"] = 0
-    # the row filters run before the dedup, so the hashes stored on disk are exactly the dedup's "seen" set and an
-    # incremental run keeps the same rows as a full pass (a filtered-out row never claims a hash)
-    if processing.quality_filter:
-        rows = _quality_filter(rows, stats["quality_filter"])
-    if processing.decontamination.enabled:
-        rows = _decontaminate(rows, processing.decontamination, num_workers, layout, stats["decontamination"])
-    rows = _with_hashes(rows, processing.dedup.normalize)
-    if processing.dedup.mode == "exact":
-        rows = _exact_dedup(rows, seen, stats["dedup"])
+    pipeline = _Pipeline(cfg, name, layout, processing, num_workers, shard_size, stats, seen=_stored_hashes(out, manifest))
     pending_rows = sum(shard.rows for shard in pending)
+    with pipeline, progress(total=pending_rows, desc=f"{name}: process", unit="row", leave=False) as bar:
+        pipeline.bar = bar
+        if full_pass:
+            _process_full_pass(pipeline, raw_dir, pending, raw, manifest, out, shard_size)
+        else:
+            for shard in pending:
+                _process_raw_shard(pipeline, raw_dir, shard, raw, manifest, out, shard_size)
+                check_stop(should_stop)
+    log.info("%s: %d rows, %s tokens", name, manifest.rows(), manifest.tokens())
+    return manifest
+
+
+def _process_raw_shard(
+    pipeline: _Pipeline, raw_dir: Path, shard: ShardInfo, raw: Manifest, manifest: Manifest, out: Path, shard_size: int
+) -> None:
+    """One raw shard through the pipeline; its survivors become the next processed shard(s), published and
+    recorded (with the raw shard as covered) before returning."""
+    pipeline.stats["input_rows"] += shard.rows
+    survivors = list(pipeline.run(raw_dir, [shard]))
+    for start in range(0, len(survivors), shard_size):
+        chunk = survivors[start : start + shard_size]
+        path = publish_shard(pa.Table.from_pylist(chunk), out / shard_name(len(manifest.shards)))
+        manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
+    manifest.extra["input_shards"].append([shard.name, shard.rows])
+    manifest.rows_fetched = raw.rows_fetched
+    manifest.save(out)
+
+
+def _process_full_pass(
+    pipeline: _Pipeline, raw_dir: Path, pending: list[ShardInfo], raw: Manifest, manifest: Manifest, out: Path, shard_size: int
+) -> None:
+    """Every pending raw shard through the pipeline plus fuzzy dedup in one all-or-nothing write."""
+    pipeline.stats["input_rows"] += sum(shard.rows for shard in pending)
     start_shard = len(manifest.shards)
     tokens_per_new_shard: list[int] = []
-    with progress(total=pending_rows, desc=f"{name}: process", unit="row", leave=False) as bar:
-        rows = _count_tokens(rows, TokenCounter(cfg, layout), name, processing.max_chars, shard_size, bar, stats)
-        if full_pass:
-            rows = fuzzy_dedup(rows, processing.dedup, stats["dedup"], num_workers)
-        rows = _accumulate_tokens(rows, tokens_per_new_shard, shard_size)
-        write_dict_rows(rows, out, shard_size, start_shard=start_shard)
-
-    manifest.rows_fetched = raw.rows_fetched
+    rows = fuzzy_dedup(pipeline.run(raw_dir, pending), pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.num_workers)
+    rows = _accumulate_tokens(rows, tokens_per_new_shard, shard_size)
+    write_dict_rows(rows, out, shard_size, start_shard=start_shard)
     new_names = _shard_names(out)[start_shard:]
     record_new_shards(manifest, out, start_shard, tokens=dict(zip(new_names, tokens_per_new_shard)))
     manifest.extra["input_shards"] = shard_list(raw)
+    manifest.rows_fetched = raw.rows_fetched
     manifest.save(out)
-    log.info("%s: %d rows, %s tokens", name, manifest.rows(), manifest.tokens())
-    return manifest
+
+
+class _Pipeline:
+    """The row pipeline of one ``process`` call (length filter -> quality filter -> decontamination -> hash ->
+    exact dedup -> token count), reusable per raw shard: the exact-dedup ``seen`` set, the statistics, the
+    tokenizer and the decontamination worker pool (a ``with`` resource) persist across ``run`` calls."""
+
+    def __init__(
+        self,
+        cfg: DatasetConfig,
+        name: str,
+        layout: DatasetLayout,
+        processing: ProcessingConfig,
+        num_workers: int,
+        batch_size: int,
+        stats: dict[str, Any],
+        *,
+        seen: set[int],
+    ) -> None:
+        self.name = name
+        self.text_field = cfg.sources[name].text_field
+        self.processing = processing
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.stats = stats
+        self.seen = seen
+        self.counter = TokenCounter(cfg, layout)
+        self.decontaminator = _Decontaminator(processing.decontamination, num_workers, layout, stats["decontamination"])
+        self.bar: Progress | None = None
+
+    def __enter__(self) -> _Pipeline:
+        self.decontaminator.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.decontaminator.__exit__(exc_type, exc, tb)
+
+    def run(self, raw_dir: Path, shards: list[ShardInfo]) -> Iterator[Row]:
+        """The processed ``{text, source, tokens, hash}`` rows of ``shards`` (lazy)."""
+        processing = self.processing
+        rows = _length_filtered_rows(raw_dir, shards, self.text_field, self.name, processing, self.batch_size, self.stats["length_filter"])
+        # the row filters run before the dedup, so the hashes stored on disk are exactly the dedup's "seen" set and
+        # an incremental run keeps the same rows as a full pass (a filtered-out row never claims a hash)
+        if processing.quality_filter:
+            rows = _quality_filter(rows, self.stats["quality_filter"])
+        if processing.decontamination.enabled:
+            rows = self.decontaminator(rows)
+        rows = _with_hashes(rows, processing.dedup.normalize)
+        if processing.dedup.mode == "exact":
+            rows = _exact_dedup(rows, self.seen, self.stats["dedup"])
+        return _count_tokens(rows, self.counter, self.name, processing.max_chars, self.batch_size, self.bar, self.stats)
 
 
 def _resumable_processed_manifest(
@@ -234,33 +309,50 @@ def _contaminated_by(text: str) -> list[str]:
     return check_contamination(text, _BENCHMARK_NGRAMS, _DECONTAM["n"], _DECONTAM["threshold"])[1]
 
 
-def _decontaminate(
-    rows: Iterator[Row], config: DecontaminationConfig, num_workers: int, layout: DatasetLayout, stats: dict[str, Any]
-) -> Iterator[Row]:
-    """Drop rows contaminated by a benchmark; counts hits per benchmark in ``stats``."""
-    init_args = (list(config.benchmarks), config.ngram, config.threshold, str(layout.benchmark_cache_dir()))
-    for row, contaminated in _contamination_checks(rows, init_args, num_workers):
-        if contaminated:
-            stats["contaminated_count"] += 1
-            for benchmark in contaminated:
-                _increment(stats["contaminated_by_benchmark"], benchmark)
-            continue
-        yield row
+class _Decontaminator:
+    """Drops rows contaminated by a benchmark (counts hits per benchmark in ``stats``); the benchmark n-grams are
+    loaded once — in this process, or in a pool of ``num_workers`` that lives for the whole ``with`` block."""
 
+    def __init__(self, config: DecontaminationConfig, num_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
+        self.config = config
+        self.num_workers = num_workers
+        self.stats = stats
+        self.init_args = (list(config.benchmarks), config.ngram, config.threshold, str(layout.benchmark_cache_dir()))
+        self._pool: multiprocessing.pool.Pool | None = None
 
-def _contamination_checks(
-    rows: Iterator[Row], init_args: tuple[list[str], int, float, str], num_workers: int
-) -> Iterator[tuple[Row, list[str]]]:
-    """``(row, contaminating benchmarks)`` for every row, checked in this process or in a pool of ``num_workers``."""
-    if num_workers <= 1:
-        _init_decontamination(*init_args)
-        for row in rows:
-            yield row, _contaminated_by(row["text"])
-        return
-    with multiprocessing.Pool(num_workers, initializer=_init_decontamination, initargs=init_args) as pool:
+    def __enter__(self) -> _Decontaminator:
+        if not self.config.enabled:
+            return self
+        if self.num_workers <= 1:
+            _init_decontamination(*self.init_args)
+        else:
+            self._pool = multiprocessing.Pool(self.num_workers, initializer=_init_decontamination, initargs=self.init_args)
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._pool is not None:
+            self._pool.terminate()
+            self._pool.join()
+            self._pool = None
+
+    def __call__(self, rows: Iterator[Row]) -> Iterator[Row]:
+        for row, contaminated in self._checks(rows):
+            if contaminated:
+                self.stats["contaminated_count"] += 1
+                for benchmark in contaminated:
+                    _increment(self.stats["contaminated_by_benchmark"], benchmark)
+                continue
+            yield row
+
+    def _checks(self, rows: Iterator[Row]) -> Iterator[tuple[Row, list[str]]]:
+        """``(row, contaminating benchmarks)`` for every row."""
+        if self._pool is None:
+            for row in rows:
+                yield row, _contaminated_by(row["text"])
+            return
         for chunk in _chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
-            yield from zip(chunk, pool.map(_contaminated_by, texts, chunksize=64))
+            yield from zip(chunk, self._pool.map(_contaminated_by, texts, chunksize=64))
 
 
 def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
@@ -276,7 +368,7 @@ def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
 
 
 def _count_tokens(
-    rows: Iterator[Row], counter: TokenCounter, name: str, max_chars: int, batch_size: int, bar: Progress, stats: dict[str, Any]
+    rows: Iterator[Row], counter: TokenCounter, name: str, max_chars: int, batch_size: int, bar: Progress | None, stats: dict[str, Any]
 ) -> Iterator[Row]:
     """The processed ``{text, source, tokens, hash}`` rows: the raw ``tokens`` count is reused, only rows the length
     filter truncated (``original_length > max_chars``) are recounted (``stats["tokens_recounted"]``). ``bar``
@@ -289,8 +381,9 @@ def _count_tokens(
             row["tokens"] = n
         stats["tokens_recounted"] += len(truncated)
         total += sum(int(row["tokens"]) for row in chunk)
-        bar.update(len(chunk))
-        bar.set_postfix({"tokens": total}, refresh=False)
+        if bar is not None:
+            bar.update(len(chunk))
+            bar.set_postfix({"tokens": total}, refresh=False)
         for row in chunk:
             yield {"text": row["text"], "source": name, "tokens": int(row["tokens"]), "hash": row["hash"]}
 

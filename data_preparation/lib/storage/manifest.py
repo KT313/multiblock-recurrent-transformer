@@ -43,6 +43,7 @@ class ShardInfo:
     name: str
     rows: int
     tokens: int | None = None
+    offset: int | None = None  # raw shards: the loader offset (source rows consumed) right after this shard's last row
 
 
 @dataclass
@@ -80,10 +81,10 @@ class Manifest:
     def is_current(self, source_hash: str) -> bool:
         return self.source_hash == source_hash
 
-    def add_shard(self, name: str, rows: int, tokens: int | None = None) -> None:
+    def add_shard(self, name: str, rows: int, tokens: int | None = None, offset: int | None = None) -> None:
         """Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name."""
         self.shards = [shard for shard in self.shards if shard.name != name]
-        self.shards.append(ShardInfo(name=name, rows=rows, tokens=tokens))
+        self.shards.append(ShardInfo(name=name, rows=rows, tokens=tokens, offset=offset))
         self.shards.sort(key=lambda shard: shard.name)
 
     # --- (de)serialisation -------------------------------------------------------------------------------------------
@@ -159,18 +160,24 @@ def verify_shards(directory: Path, manifest: Manifest) -> list[str]:
     """Problems between ``manifest`` and the files in ``directory``: missing shards, row-count mismatches."""
     problems: list[str] = []
     for shard in manifest.shards:
-        path = directory / shard.name
-        if not path.is_file():
-            problems.append(f"missing shard {shard.name}")
-            continue
-        try:
-            rows = shard_rows(path)
-        except (OSError, pa.ArrowException) as err:
-            problems.append(f"unreadable shard {shard.name}: {err}")
-            continue
-        if rows != shard.rows:
-            problems.append(f"shard {shard.name}: manifest says {shard.rows} rows, file has {rows}")
+        problem = shard_problem(directory, shard)
+        if problem is not None:
+            problems.append(problem)
     return problems
+
+
+def shard_problem(directory: Path, shard: ShardInfo) -> str | None:
+    """Why ``shard`` does not match its file in ``directory`` (missing, unreadable, row count), or None."""
+    path = directory / shard.name
+    if not path.is_file():
+        return f"missing shard {shard.name}"
+    try:
+        rows = shard_rows(path)
+    except (OSError, pa.ArrowException) as err:
+        return f"unreadable shard {shard.name}: {err}"
+    if rows != shard.rows:
+        return f"shard {shard.name}: manifest says {shard.rows} rows, file has {rows}"
+    return None
 
 
 def library_versions() -> dict[str, str]:
@@ -205,6 +212,8 @@ __all__ = [
     "ShardInfo",
     "Stage",
     "library_versions",
+    "has_shards",
+    "shard_problem",
     "shard_rows",
     "shard_tokens",
     "verify_shards",

@@ -253,3 +253,30 @@ def test_shard_writer_failure_leaves_out_dir_untouched(tmp_path: Path) -> None:
     assert _read_all(tmp_path / "out")[0].num_rows == 3 and not (tmp_path / "out.tmp").exists()
     with pytest.raises(ValueError, match="shard_size"):
         ShardWriter(tmp_path / "out", shard_size=0)
+
+
+def test_shard_writer_per_shard_mode_publishes_each_shard_and_keeps_them_on_failure(tmp_path: Path) -> None:
+    published: list[str] = []
+    out = tmp_path / "out"
+    write_dict_rows(({"n": i} for i in range(7)), out, shard_size=2)  # 4 shards; the writer appends at 2
+    (out / "data-00003.parquet.tmp").write_bytes(b"leftover")
+
+    def on_shard(path: Path) -> None:
+        published.append(path.name)
+        assert path.is_file() and 1 <= pq.read_table(path).num_rows <= 2
+
+    with pytest.raises(RuntimeError, match="boom"), ShardWriter(out, shard_size=2, start_shard=2, on_shard=on_shard) as writer:
+        assert writer.per_shard
+        for i in range(5):
+            writer.add({"m": i})
+            if i == 3:
+                assert published == ["data-00002.parquet", "data-00003.parquet"], "each full shard published at once"
+        raise RuntimeError("boom")  # the buffered 5th row is discarded, the published shards stay
+    assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(4)]
+    assert [t.to_pylist() for t in _read_all(out)][2:] == [[{"m": 0}, {"m": 1}], [{"m": 2}, {"m": 3}]]
+    assert not (tmp_path / "out.tmp").exists() and not list(out.glob("*.tmp"))
+
+    with ShardWriter(out, shard_size=2, start_shard=2, on_shard=on_shard) as writer:  # stale shards >= 2 cleared
+        writer.add({"m": 9})
+    assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(3)]
+    assert _read_all(out)[2].to_pylist() == [{"m": 9}] and published[-1] == "data-00002.parquet"

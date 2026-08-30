@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 import shutil
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -106,12 +106,25 @@ def write_parquet_shards(
 
 
 class ShardWriter:
-    """Incremental version of :func:`write_parquet_shards` (same atomicity, numbering and stale-shard cleanup):
-    ``add(row)`` buffers dict rows and writes a shard every ``shard_size`` rows, the last partial shard and the
-    move into ``out_dir`` happen when the ``with`` block exits normally; an exception leaves ``out_dir`` unchanged.
-    Several writers (one per output directory) can be fed from one input stream."""
+    """Incremental version of :func:`write_parquet_shards` (same numbering and stale-shard cleanup): ``add(row)``
+    buffers dict rows and writes a shard every ``shard_size`` rows. Several writers (one per output directory) can
+    be fed from one input stream.
 
-    def __init__(self, out_dir: Path, shard_size: int, *, start_shard: int = 0) -> None:
+    Two publishing modes:
+
+    * default (``on_shard=None``): all-or-nothing like :func:`write_parquet_shards` — shards go to ``<out_dir>.tmp/``
+      and are moved into ``out_dir`` when the ``with`` block exits normally; an exception leaves ``out_dir`` unchanged.
+      For directories that are rewritten as a whole.
+    * per shard (``on_shard`` given): every full shard is published into ``out_dir`` as soon as it is written
+      (``data-NNNNN.parquet.tmp`` → ``os.replace``) and ``on_shard(path)`` is called right after, so the caller can
+      record it in a manifest; an exception leaves the published shards in place and discards only the buffered
+      partial shard. For append-only directories (raw downloads), where losing a whole increment to a network error
+      or an interrupt would throw away hours of transfer. Stale shards ≥ ``start_shard`` are removed on enter.
+    """
+
+    def __init__(
+        self, out_dir: Path, shard_size: int, *, start_shard: int = 0, on_shard: Callable[[Path], None] | None = None
+    ) -> None:
         if shard_size <= 0:
             raise ValueError(f"shard_size must be positive, got {shard_size}")
         if start_shard < 0:
@@ -120,24 +133,37 @@ class ShardWriter:
         self.shard_size = shard_size
         self.start_shard = start_shard
         self.written = 0
+        self._on_shard = on_shard
         self._buffer: list[dict[str, Any]] = []
         self._tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
+
+    @property
+    def per_shard(self) -> bool:
+        return self._on_shard is not None
 
     def __enter__(self) -> ShardWriter:
         if self._tmp_dir.exists():
             log.warning("removing leftover temp dir %s", self._tmp_dir)
             shutil.rmtree(self._tmp_dir)
-        self._tmp_dir.mkdir(parents=True)
+        if self.per_shard:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self._remove_stale_shards()
+            for leftover in self.out_dir.glob("*.parquet.tmp"):
+                leftover.unlink()
+        else:
+            self._tmp_dir.mkdir(parents=True)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if exc_type is not None:
+            self._buffer = []
             shutil.rmtree(self._tmp_dir, ignore_errors=True)
             return
         if self._buffer:
             self.write_shard(pa.Table.from_pylist(self._buffer))
             self._buffer = []
-        self._publish()
+        if not self.per_shard:
+            self._publish()
 
     def add(self, row: dict[str, Any]) -> None:
         self._buffer.append(row)
@@ -146,22 +172,41 @@ class ShardWriter:
             self._buffer = []
 
     def write_shard(self, table: pa.Table) -> None:
-        """Write ``table`` as the next shard into the temp dir (the caller sizes it)."""
-        pq.write_table(table, self._tmp_dir / shard_name(self.start_shard + self.written), compression=SHARD_COMPRESSION)
+        """Write ``table`` as the next shard (the caller sizes it): into the temp dir, or — per-shard mode — straight
+        into ``out_dir`` followed by the ``on_shard`` callback."""
+        name = shard_name(self.start_shard + self.written)
+        if self._on_shard is None:
+            pq.write_table(table, self._tmp_dir / name, compression=SHARD_COMPRESSION)
+            self.written += 1
+            return
+        path = publish_shard(table, self.out_dir / name)
         self.written += 1
+        self._on_shard(path)
 
-    def _publish(self) -> None:
-        """Drop the shards the new ones replace, then move the new ones into place."""
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+    def _remove_stale_shards(self) -> None:
         for existing in list_parquet_files(self.out_dir):
             index = shard_index(existing)
             if index is not None and index >= self.start_shard:
                 log.info("removing stale shard %s", existing)
                 existing.unlink()
+
+    def _publish(self) -> None:
+        """Drop the shards the new ones replace, then move the new ones into place."""
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._remove_stale_shards()
         for shard in sorted(self._tmp_dir.glob("data-*.parquet")):
             shard.replace(self.out_dir / shard.name)
         shutil.rmtree(self._tmp_dir)
         log.info("wrote %d shard(s) to %s (starting at %d)", self.written, self.out_dir, self.start_shard)
+
+
+def publish_shard(table: pa.Table, path: Path) -> Path:
+    """Write ``table`` to ``path`` atomically (``<path>.tmp`` then ``os.replace``) and return ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
+    tmp.replace(path)
+    return path
 
 
 def _rechunk(batches: Iterable[pa.RecordBatch | pa.Table], shard_size: int) -> Iterator[pa.Table]:

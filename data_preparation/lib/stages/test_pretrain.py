@@ -170,7 +170,9 @@ def test_process_appends_only_the_new_shards(
     new_rows = read_rows(processed)
     assert new_rows[: len(old_rows)] == old_rows, "old rows byte-identical and in place"
     assert [r["text"] for r in new_rows[len(old_rows) :]] == [_words(6, 50), _words(6, 51)]
-    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(4, 24), (2, 12), (2, 12)]
+    # one processed shard per raw shard with survivors (raw shard 2 is a single duplicate → no shard; raw shard 3 =
+    # two duplicates + one new row → 1 row)
+    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(3, 18), (3, 18), (1, 6), (1, 6)]
 
     # golden: a fresh full pass over the same raw data keeps exactly the same rows
     fresh = DatasetLayout(tmp_path / "fresh")
@@ -182,7 +184,7 @@ def test_process_appends_only_the_new_shards(
     m_fresh = process(cfg, "s", fresh, shard_size=4)
     assert read_rows(fresh.source_dir("s", "processed")) == new_rows
     assert m_fresh.tokens() == m2.tokens() and m_fresh.extra["stats"] == m2.extra["stats"]
-    assert [sh.rows for sh in m_fresh.shards] == [4, 4], "only the shard boundaries differ from the appended layout"
+    assert [sh.rows for sh in m_fresh.shards] == [3, 3, 1, 1], "same layout: one processed shard per raw shard"
 
 
 def test_incremental_process_with_quality_filter_equals_a_full_pass(
@@ -359,3 +361,31 @@ def test_process_requires_raw_manifest_and_pretrain_kind(cfg_factory: CfgFactory
     hold = cfg_factory({"h": SourceConfig(kind="validation", loader="synthetic", rows=1)})
     with pytest.raises(ValueError, match="pretrain sources only"):
         process(hold, "h", layout)
+
+
+def test_process_publishes_per_raw_shard_and_resumes_after_a_stop(
+    cfg_factory: CfgFactory, layout: DatasetLayout, source_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader, tmp_path: Path
+) -> None:
+    from data_preparation.lib.abort import BuildAborted
+
+    texts = [_words(6, i) for i in range(9)] + [_words(6, 1)]  # 10 rows, one duplicate in the last raw shard
+    cfg = _prepare(cfg_factory, layout, source_dir, texts, with_tokenizer, write=write_local, shard_size=3)
+    processed = layout.source_dir("s", "processed")
+    calls = {"n": 0}
+
+    def stop_after_two() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    with pytest.raises(BuildAborted):
+        process(cfg, "s", layout, should_stop=stop_after_two)
+    partial = Manifest.load(processed)
+    assert partial is not None and partial.extra["input_shards"] == [["data-00000.parquet", 3], ["data-00001.parquet", 3]]
+    assert [s.rows for s in partial.shards] == [3, 3] and partial.extra["stats"]["input_rows"] == 6
+    assert len(read_rows(processed)) == 6
+
+    m = process(cfg, "s", layout)  # resumes behind the covered raw shards
+    assert m.extra["input_shards"] == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])]
+    assert [s.rows for s in m.shards] == [3, 3, 3] and m.extra["stats"]["input_rows"] == 10
+    assert m.extra["stats"]["dedup"]["duplicates_removed"] == 1
+    assert [r["text"] for r in read_rows(processed)] == texts[:9]

@@ -35,7 +35,8 @@ from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.ui.dashboard import progress
-from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions, shard_rows, shard_tokens
+from data_preparation.lib.abort import StopCheck, check_stop
+from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions, shard_problem, shard_rows, shard_tokens
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.sources import (
@@ -223,6 +224,7 @@ def download(
     rows_needed: int,
     shard_size: int = DEFAULT_SHARD_SIZE,
     hf_token: str | None = None,
+    should_stop: StopCheck | None = None,
 ) -> Manifest:
     """Append raw shards until ``rows_needed`` rows are on disk (no-op if they already are).
 
@@ -243,6 +245,10 @@ def download(
     output for instruct rows), counted once here and reused by ``process`` and the instruct mixtures; the manifest
     records the mode / tokenizer and per-shard sums. A raw directory from before this column is upgraded in place
     (:func:`ensure_raw_tokens`), never re-downloaded.
+
+    Every shard is published and recorded in the manifest (with the loader offset after its last row,
+    ``ShardInfo.offset``) as soon as it is written, so a failure or a stop request (``should_stop``, checked after
+    every shard) keeps everything fetched so far and the next call resumes from the last complete shard.
     """
     source = fetch_source(cfg, cfg.sources[name])
     source_hash = cfg.raw_hash(name)
@@ -264,26 +270,20 @@ def download(
         manifest.save(out)
         return manifest
 
-    # fetch one increment and append it as new shards
+    # fetch one increment and append it shard by shard
     log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
     counters = _FetchCounters()
-    start_shard = len(manifest.shards)
+    increment = _Increment(manifest, out, counters, should_stop)
     counter = TokenCounter(cfg, layout)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar)
         rows = _with_tokens(rows, counter, raw_text_of(source))
-        write_dict_rows(rows, out, shard_size, start_shard=start_shard)
+        with ShardWriter(out, shard_size, start_shard=len(manifest.shards), on_shard=increment.record_shard) as writer:
+            for row in rows:
+                increment.add(writer, row)
 
-    # record the increment
-    record_new_shards(manifest, out, start_shard, tokens=_shard_token_sums(out, start_shard))
-    manifest.rows_fetched += counters.consumed  # source rows consumed: a row-group boundary after an over-read
-    manifest.extra["skipped_malformed"] = manifest.extra.get("skipped_malformed", 0) + counters.skipped_malformed
-    if counters.exhausted:
-        manifest.extra["exhausted"] = True
-        if source.check_limit is not None and manifest.rows_fetched >= source.check_limit:
-            manifest.extra["check_limit"] = source.check_limit  # exhausted by the limit, not by the loader
-    manifest.save(out)
+    increment.finish(source)
     log.info("%s: kept %d of %d fetched rows (%d rows on disk)", name, counters.kept, counters.consumed, manifest.rows())
     return manifest
 
@@ -307,6 +307,48 @@ def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name
         log.info("%s: check_limit grew from %s to %s, source no longer exhausted", name, reached, source.check_limit)
         manifest.extra["exhausted"] = False
         del manifest.extra["check_limit"]
+
+
+CONSUMED_KEY = "_consumed"  # private row key: loader offset after this row (stripped before the row is written)
+
+
+class _Increment:
+    """Bookkeeping of one download increment of a raw directory: every published shard is recorded in the manifest
+    with the loader offset after its last row and the manifest is saved, so the increment is resumable at shard
+    granularity; then the stop request is checked."""
+
+    def __init__(self, manifest: Manifest, out: Path, counters: _FetchCounters, should_stop: StopCheck | None) -> None:
+        self.manifest = manifest
+        self.out = out
+        self.counters = counters
+        self.should_stop = should_stop
+        self.start_offset = manifest.rows_fetched
+        self.skipped_before = int(manifest.extra.get("skipped_malformed", 0))
+        self.last_consumed = 0  # consumed count of the row most recently handed to the writer
+
+    def add(self, writer: ShardWriter, row: Row) -> None:
+        """Hand ``row`` (tagged with :data:`CONSUMED_KEY` by ``_fetch_rows``) to ``writer``."""
+        self.last_consumed = int(row.pop(CONSUMED_KEY))
+        writer.add(row)
+
+    def record_shard(self, path: Path) -> None:
+        self.manifest.add_shard(path.name, shard_rows(path), shard_tokens(path), offset=self.start_offset + self.last_consumed)
+        self._save()
+        check_stop(self.should_stop)
+
+    def finish(self, source: SourceConfig) -> None:
+        """After the loader ran dry / the target was reached: the final offset and the exhaustion flag."""
+        if self.counters.exhausted:
+            self.manifest.extra["exhausted"] = True
+            if source.check_limit is not None and self.start_offset + self.counters.consumed >= source.check_limit:
+                self.manifest.extra["check_limit"] = source.check_limit  # exhausted by the limit, not by the loader
+        self.last_consumed = self.counters.consumed
+        self._save()
+
+    def _save(self) -> None:
+        self.manifest.rows_fetched = self.start_offset + self.last_consumed
+        self.manifest.extra["skipped_malformed"] = self.skipped_before + self.counters.skipped_malformed
+        self.manifest.save(self.out)
 
 
 def _fetch_rows(
@@ -356,7 +398,9 @@ def _fetch_rows(
             postfix.consumed(counters.consumed)
 
             if not is_instruct:
-                yield text_row(source, raw, name)
+                row = text_row(source, raw, name)
+                row[CONSUMED_KEY] = counters.consumed
+                yield row
                 counters.kept += 1
                 bar.update(1)
                 continue
@@ -369,6 +413,7 @@ def _fetch_rows(
                 counters.skipped_malformed += 1
                 log.debug("%s: skipping malformed row: %s", name, err)
                 continue
+            row[CONSUMED_KEY] = counters.consumed
             yield row
             counters.kept += 1
             bar.update(1)
@@ -388,6 +433,7 @@ class _GroupMember:
     manifest: Manifest
     wanted: int
     counters: _FetchCounters
+    increment: _Increment
 
 
 def download_github_code_group(
@@ -398,12 +444,14 @@ def download_github_code_group(
     rows_needed: dict[str, int],
     shard_size: int = DEFAULT_SHARD_SIZE,
     hf_token: str | None = None,
+    should_stop: StopCheck | None = None,
 ) -> dict[str, Manifest]:
     """:func:`download` for several `github_code` sources of one repo in a **single pass** over its files: every
     row group is fetched once and its rows are dispatched to the language source that wants them (a source that
     has its ``rows_needed[name]`` stops taking rows, the others read on). The raw shards, ``rows_fetched`` and
-    ``extra["exhausted"]`` of every source are exactly what separate ``download`` calls would produce. Returns the
-    raw manifest of every source in ``names``.
+    ``extra["exhausted"]`` of every source are exactly what separate ``download`` calls would produce; shards are
+    published and recorded per member as they fill (see :func:`download`). Returns the raw manifest of every
+    source in ``names``.
     """
     results: dict[str, Manifest] = {}
     members: list[_GroupMember] = []
@@ -422,20 +470,16 @@ def download_github_code_group(
             continue
         wanted = rows_needed[name] - manifest.rows()
         if wanted > 0:
-            members.append(_GroupMember(name, source, out, manifest, wanted, _FetchCounters()))
+            counters = _FetchCounters()
+            members.append(_GroupMember(name, source, out, manifest, wanted, counters, _Increment(manifest, out, counters, should_stop)))
     if not members:
         return results
 
     _fetch_group(members, layout, TokenCounter(cfg, layout), shard_size, hf_token)
     for member in members:
-        manifest, counters = member.manifest, member.counters
-        start_shard = len(manifest.shards)
-        record_new_shards(manifest, member.out, start_shard, tokens=_shard_token_sums(member.out, start_shard))
-        manifest.rows_fetched += counters.consumed
-        if counters.exhausted:
-            manifest.extra["exhausted"] = True
-        manifest.save(member.out)
-        log.info("%s: kept %d of %d fetched rows (%d rows on disk)", member.name, counters.kept, counters.consumed, manifest.rows())
+        member.increment.finish(member.source)
+        counters = member.counters
+        log.info("%s: kept %d of %d fetched rows (%d rows on disk)", member.name, counters.kept, counters.consumed, member.manifest.rows())
     return results
 
 
@@ -458,7 +502,10 @@ def _fetch_group(
         postfix = _DownloadPostfix(bar, fetch_stats)
         sinks = {
             m.name: _TokenizingSink(
-                stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards))),
+                stack.enter_context(
+                    ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards), on_shard=m.increment.record_shard)
+                ),
+                m.increment,
                 counter,
                 raw_text_of(m.source),
             )
@@ -470,8 +517,10 @@ def _fetch_group(
         )
         for consumed_total, (name, raw) in enumerate(rows, start=1):
             member = by_name[name]
-            sinks[name].add(text_row(member.source, raw, name))
             member.counters.consumed += 1
+            row = text_row(member.source, raw, name)
+            row[CONSUMED_KEY] = member.counters.consumed
+            sinks[name].add(row)
             member.counters.kept += 1
             postfix.consumed(consumed_total)
             bar.update(1)
@@ -526,8 +575,9 @@ class _TokenizingSink:
     """``add(row)`` for a :class:`ShardWriter`: rows are token-counted in batches of ``TOKEN_BATCH`` before they
     reach the writer; ``flush()`` counts and hands over the rest."""
 
-    def __init__(self, writer: ShardWriter, counter: TokenCounter, text_of: Callable[[Row], str]) -> None:
+    def __init__(self, writer: ShardWriter, increment: _Increment, counter: TokenCounter, text_of: Callable[[Row], str]) -> None:
         self._writer = writer
+        self._increment = increment
         self._counter = counter
         self._text_of = text_of
         self._batch: list[Row] = []
@@ -539,18 +589,37 @@ class _TokenizingSink:
 
     def flush(self) -> None:
         for row in _tokenized(self._batch, self._counter, self._text_of):
-            self._writer.add(row)
+            self._increment.add(self._writer, row)
         self._batch = []
 
 
-def _shard_token_sums(directory: Path, start_shard: int) -> dict[str, int]:
-    """``{shard name: sum of its tokens column}`` for the shards with index >= ``start_shard``."""
-    sums: dict[str, int] = {}
+def truncate_raw_to_good_prefix(directory: Path, manifest: Manifest) -> bool:
+    """Repair a raw directory with a missing / unreadable / mismatching shard by dropping that shard and everything
+    after it: the manifest keeps the good prefix, ``rows_fetched`` becomes the offset after its last shard (so the
+    next download resumes there) and the exhaustion flag is cleared. Returns False — nothing changed — when no
+    prefix can be kept (the first shard is bad, or a kept shard has no recorded offset).
+    """
+    good = 0
+    for shard in manifest.shards:
+        if shard_problem(directory, shard) is not None:
+            break
+        good += 1
+    if good == len(manifest.shards):
+        return True  # nothing wrong
+    if good == 0 or manifest.shards[good - 1].offset is None:
+        return False
+    dropped = manifest.shards[good:]
+    log.warning("%s: dropping %d shard(s) from %s (%s and after)", manifest.source, len(dropped), directory, dropped[0].name)
+    manifest.shards = manifest.shards[:good]
+    manifest.rows_fetched = int(manifest.shards[-1].offset or 0)
+    manifest.extra.pop("exhausted", None)
+    manifest.extra.pop("check_limit", None)
     for path in list_parquet_files(directory):
         index = shard_index(path)
-        if index is not None and index >= start_shard:
-            sums[path.name] = shard_tokens(path)
-    return sums
+        if index is not None and index >= good:
+            path.unlink()
+    manifest.save(directory)
+    return True
 
 
 def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:

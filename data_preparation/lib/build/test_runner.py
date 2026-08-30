@@ -149,7 +149,7 @@ def test_token_mode_change_recounts_raw_in_place_without_downloading(
 ) -> None:
     from data_preparation.lib.stages import shared
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, max_seq_length=4096)
     build(cfg, layout)
     raw_dir = layout.source_dir("p", "raw")
     before = Manifest.load(raw_dir)
@@ -449,3 +449,94 @@ def test_build_removes_orphaned_filtered_dirs(cfg_factory: CfgFactory, layout: D
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         assert build(cfg, layout).complete
     assert not orphan.exists() and "removing orphaned" in caplog.text
+
+
+def test_interrupt_stops_running_items_within_a_shard_and_keeps_their_shards(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ctrl-C while `_run_all` waits: the request reaches the running download through `should_stop`, it stops at
+    its next shard (published), the build re-raises the interrupt and logs the reason."""
+    import concurrent.futures
+
+    from data_preparation.lib.abort import check_stop
+
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    shards_done: list[int] = []
+
+    def slow_download(cfg_: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        for i in range(50):  # a long download: one "shard" per tick, stop checked after each
+            time.sleep(0.02)
+            shards_done.append(i)
+            check_stop(should_stop)
+        return real_download(cfg_, name, *args, **kwargs)
+
+    def interrupted_wait(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0.1)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(build_mod, "download", slow_download)
+    monkeypatch.setattr(build_mod, "as_completed", interrupted_wait)
+    with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(KeyboardInterrupt):
+        build(cfg, layout)
+    assert 1 <= len(shards_done) < 50, "stopped within a shard of the interrupt, not at the end"
+    assert "source p stopped: build interrupted" in caplog.text
+    assert not layout.source_dir("p", "processed").exists()
+    monkeypatch.setattr(build_mod, "as_completed", concurrent.futures.as_completed)
+    assert build(cfg, layout).complete  # resumes and finishes; nothing was lost
+
+
+def test_failure_stops_a_running_download_within_a_shard(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from data_preparation.lib.abort import check_stop
+
+    cfg = _three_sources(cfg_factory)
+    ticks: dict[str, int] = {}
+
+    def download_stub(cfg_: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        if name == "s1":
+            time.sleep(0.05)
+            raise OSError("s1: network down")
+        for i in range(100):
+            time.sleep(0.01)
+            ticks[name] = i + 1
+            check_stop(should_stop)
+        return real_download(cfg_, name, *args, **kwargs)
+
+    monkeypatch.setattr(build_mod, "download", download_stub)
+    with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(OSError, match="s1: network down"):
+        build(cfg, layout, num_workers=1, max_parallel_downloads=3)
+    assert 0 < ticks["s0"] < 100 and 0 < ticks["s2"] < 100, "the running downloads stopped within a shard"
+    assert "source s0 stopped: source s1 failed" in caplog.text
+
+
+def test_broken_raw_shard_is_truncated_not_redownloaded(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from data_preparation.lib.stages import shared
+
+    from functools import partial
+
+    monkeypatch.setattr(build_mod, "download", partial(real_download, shard_size=10))
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=100)}, tokens=2000)
+    build(cfg, layout)
+    raw = layout.source_dir("p", "raw")
+    manifest = Manifest.load(raw)
+    assert manifest is not None and len(manifest.shards) >= 2, "the test needs several raw shards"
+    last = manifest.shards[-1]
+    (raw / last.name).write_bytes(b"corrupt")
+    offsets: list[int] = []
+    original = shared._fetch_rows
+
+    def spy(source: Any, name: str, offset: int, *args: Any, **kwargs: Any) -> Any:
+        offsets.append(offset)
+        return original(source, name, offset, *args, **kwargs)
+
+    monkeypatch.setattr(shared, "_fetch_rows", spy)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        result = build(cfg, layout)
+    assert result.complete and "kept the" in caplog.text and "removing" not in caplog.text
+    kept_offset = manifest.shards[-2].offset
+    assert offsets == [kept_offset], "resumed behind the last good shard instead of from 0"
+    repaired = Manifest.load(raw)
+    assert repaired is not None and repaired.rows() == manifest.rows() and [s.rows for s in repaired.shards] == [s.rows for s in manifest.shards]

@@ -13,7 +13,8 @@ bounded pool so that downloads (network) and processing (CPU) of *different* ite
 ``max_parallel_downloads`` items download and at most ``num_workers`` items process at any time (:class:`_Slots`).
 Each item is still its own download -> process sequence writing only its own directories, so the files on disk do
 not depend on the interleaving. Every stage failure propagates after logging which item failed; the other items
-stop at their next stage boundary and nothing is swallowed.
+stop at their next shard (``_Slots.should_stop`` is handed to the stages) and nothing is swallowed; the same
+happens on Ctrl-C, with everything published so far kept on disk.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.schema.dataset_config import DatasetConfig
 from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
@@ -39,6 +41,7 @@ from data_preparation.lib.stages import (
     download_github_code_group,
     prepare_tokenizer,
     process,
+    truncate_raw_to_good_prefix,
     validation,
 )
 from data_preparation.lib.storage.manifest import Manifest
@@ -50,24 +53,31 @@ DEFAULT_MAX_ROUNDS = 5
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
 
 
-class BuildAborted(RuntimeError):
-    """Raised inside a work item that stops because another item failed."""
-
-
 @dataclass
 class _Slots:
     """The bounded concurrency of one ``build``: a download slot and a processing slot are held for the duration
-    of a stage; ``abort`` makes every item stop at its next stage boundary."""
+    of a stage; ``stop(reason)`` makes every item stop — at its next stage boundary, and inside a running stage at
+    its next shard (the stages take ``should_stop``)."""
 
     download: threading.BoundedSemaphore
     process: threading.BoundedSemaphore
     abort: threading.Event
+    reason: str = "another item failed"
 
     @classmethod
     def create(cls, max_parallel_downloads: int, num_workers: int) -> _Slots:
         if max_parallel_downloads < 1 or num_workers < 1:
             raise ValueError(f"max_parallel_downloads and num_workers must be >= 1, got {max_parallel_downloads} and {num_workers}")
         return cls(threading.BoundedSemaphore(max_parallel_downloads), threading.BoundedSemaphore(num_workers), threading.Event())
+
+    def stop(self, reason: str) -> None:
+        """Request every item to stop (the first reason wins)."""
+        if not self.abort.is_set():
+            self.reason = reason
+            self.abort.set()
+
+    def should_stop(self) -> bool:
+        return self.abort.is_set()
 
     @contextmanager
     def downloading(self) -> Iterator[None]:
@@ -81,11 +91,9 @@ class _Slots:
 
     @contextmanager
     def _held(self, slot: threading.BoundedSemaphore) -> Iterator[None]:
-        if self.abort.is_set():
-            raise BuildAborted("another item failed")
+        check_stop(self.should_stop)
         with slot:
-            if self.abort.is_set():
-                raise BuildAborted("another item failed")
+            check_stop(self.should_stop)
             yield
 
 
@@ -235,18 +243,18 @@ def _run(item: _WorkItem, slots: _Slots) -> None:
     try:
         item.action()
     except BuildAborted:
-        log.info("%s %s stopped: another item failed", item.what, item.name)
+        log.info("%s %s stopped: %s", item.what, item.name, slots.reason)
         raise
     except BaseException:
-        slots.abort.set()
+        slots.stop(f"{item.what} {item.name} failed")
         log.exception("%s %s failed", item.what, item.name)
         raise
 
 
 def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None:
     """Run every item in a thread pool of ``max_workers`` (the stage slots bound the real concurrency); the first
-    failure cancels the items not started yet, lets the running ones stop at their next stage boundary and is
-    re-raised."""
+    failure (or an interrupt) cancels the items not started yet, lets the running ones stop at their next shard
+    and is re-raised."""
     if not items:
         return
     running: list[str] = []
@@ -275,12 +283,12 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
                     if error is None:
                         bar.update(1)
                         continue
-                    slots.abort.set()
+                    slots.stop(f"{futures[future].what} {futures[future].name} failed")
                     for other in futures:
                         other.cancel()
                     failures.append(error)
-            except BaseException:  # e.g. KeyboardInterrupt while waiting
-                slots.abort.set()
+            except BaseException:  # KeyboardInterrupt while waiting: the running items stop at their next shard
+                slots.stop("build interrupted")
                 for future in futures:
                     future.cancel()
                 raise
@@ -311,9 +319,16 @@ def _log_plan(result: Plan) -> None:
 
 
 def _remove_broken_stages(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> None:
-    """Delete stage directories whose manifest is stale or whose shards do not verify, so the stage rebuilds."""
+    """Delete stage directories whose manifest is stale or whose shards do not verify, so the stage rebuilds — except
+    a raw directory with a broken shard, which is truncated to its good prefix (the next download resumes there)
+    rather than downloaded again."""
     for stage, problem in stage_problems(cfg, name, layout).items():
         directory = layout.validation_dir(name) if stage == "validation" else layout.source_dir(name, stage)
+        if stage == "raw" and not problem.endswith("manifest stale"):
+            manifest = Manifest.load(directory)
+            if manifest is not None and truncate_raw_to_good_prefix(directory, manifest):
+                log.warning("%s: %s; kept the %d good shard(s) of %s", name, problem, len(manifest.shards), directory)
+                continue
         log.warning("%s: %s; removing %s", name, problem, directory)
         shutil.rmtree(directory)
 
@@ -338,7 +353,7 @@ def _build_pretrain_source(
         if "download" in active_steps:
             rows_needed = rows_for_budget(budget, tokens_per_row)
             with slots.downloading():
-                raw = download(cfg, name, layout, rows_needed=rows_needed, hf_token=hf_token)
+                raw = download(cfg, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
         refined = _process_round(cfg, name, layout, active_steps, num_workers, raw, budget, round_index, slots)
         if refined is None:
             return
@@ -370,7 +385,7 @@ def _build_github_code_group(
         if "download" in active_steps:
             rows_needed = {name: rows_for_budget(budgets[name], tokens_per_row[name]) for name in pending}
             with slots.downloading():
-                raws = download_github_code_group(cfg, pending, layout, rows_needed=rows_needed, hf_token=hf_token)
+                raws = download_github_code_group(cfg, pending, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
         still_pending: list[str] = []
         for name in pending:
             refined = _process_round(cfg, name, layout, active_steps, num_workers, raws.get(name), budgets[name], round_index, slots)
@@ -401,7 +416,7 @@ def _process_round(
     if "process" not in active_steps:
         return None
     with slots.processing():
-        processed = process(cfg, name, layout, num_workers=num_workers)
+        processed = process(cfg, name, layout, num_workers=num_workers, should_stop=slots.should_stop)
 
     tokens = processed.tokens() or 0
     if tokens >= budget:
@@ -444,12 +459,12 @@ def _build_instruct_mixture(
         with slots.downloading():
             for src, share in mixture.sources.items():
                 rows_needed = rows_for_budget(budget * share, tokens_per_row[src])
-                raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token)
+                raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
                 if raw.extra.get("exhausted"):
                     exhausted.add(src)
 
         with slots.processing():
-            train = build_instruct_mixture(cfg, name, layout, budget_tokens=budget)["train"]
+            train = build_instruct_mixture(cfg, name, layout, budget_tokens=budget, should_stop=slots.should_stop)["train"]
         short_sources = train.extra["short_sources"]
         short = {src: info for src, info in short_sources.items() if src not in exhausted}
         if not short:

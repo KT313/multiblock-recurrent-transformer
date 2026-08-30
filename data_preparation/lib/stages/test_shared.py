@@ -622,3 +622,121 @@ def test_download_upgrades_a_legacy_raw_dir_before_topping_up(
     assert [(s.name, s.rows) for s in m.shards] == [("data-00000.parquet", 10), ("data-00001.parquet", 5)] and m.rows_fetched == 15
     rows = read_rows(raw_dir)
     assert all("tokens" in r for r in rows) and m.tokens() == sum(r["tokens"] for r in rows)
+
+
+# --- per-shard publishing, crash safety, cancellation ---------------------------------------------------------------
+
+
+def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total: int = 40) -> list[int]:
+    """Stub the synthetic loader with one that yields ``total`` rows from ``offset`` and raises after the
+    ``fail_at``-th row of the whole source (None: never); returns the list of offsets it was called with."""
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    offsets: list[int] = []
+
+    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        offsets.append(offset)
+        for i in range(offset, min(offset + count, total)):
+            if fail_at is not None and i == fail_at:
+                raise OSError("connection reset")
+            yield {"text": f"row {i}"}
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    return offsets
+
+
+def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path
+) -> None:
+    from data_preparation.lib.stages import shared
+
+    monkeypatch.setattr(shared, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (256 in production)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    offsets = _failing_loader(monkeypatch, fail_at=27)
+    with pytest.raises(OSError, match="connection reset"):
+        download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    raw = layout.source_dir("p", "raw")
+    m = Manifest.load(raw)
+    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
+    assert m.rows() == 20 and not m.extra.get("exhausted") and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
+
+    # the next call resumes at the last complete shard; the loader is asked from offset 20 and nothing is lost
+    _failing_loader(monkeypatch, fail_at=None)
+    m2 = download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    assert offsets == [0] and m2.rows() == 40 and m2.rows_fetched == 40
+    assert [(s.name, s.rows, s.offset) for s in m2.shards] == [(f"data-{i:05d}.parquet", 10, 10 * (i + 1)) for i in range(4)]
+    assert [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(40)]
+
+    # golden: identical to one uninterrupted download
+    other = DatasetLayout(tmp_path / "other")
+    from data_preparation.lib.stages.shared import prepare_tokenizer
+
+    prepare_tokenizer(cfg, other)
+    reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
+    assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m2.shards]
+    assert read_rows(other.source_dir("p", "raw")) == read_rows(raw)
+
+
+def test_download_instruct_shard_offsets_count_consumed_source_rows(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer
+) -> None:
+    """Instruct rows are filtered while downloading: a shard's offset is the number of *source* rows consumed up to
+    its last kept row (what a resume must skip), not the number of rows kept."""
+    src_dir = layout.root.parent / "ins"
+    rows = [{"instruction": f"i{i}", "output": f"o{i}"} if i % 2 else {"instruction": f"i{i}"} for i in range(12)]  # even: malformed
+    write_local(src_dir, rows, "jsonl")
+    cfg = with_tokenizer(cfg_factory({"l": _local(src_dir, kind="instruct", converter="instruction_input_output")}))
+    m = download(cfg, "l", layout, rows_needed=6, shard_size=2)
+    assert [(s.rows, s.offset) for s in m.shards] == [(2, 4), (2, 8), (2, 12)] and m.rows_fetched == 12
+    assert m.extra["skipped_malformed"] == 6
+
+
+def test_download_stops_within_one_shard_when_asked(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data_preparation.lib.abort import BuildAborted
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    _failing_loader(monkeypatch, fail_at=None, total=100)
+    stop = {"now": False}
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        stop["now"] = calls["n"] >= 2  # requested after the second shard was published
+        return stop["now"]
+
+    with pytest.raises(BuildAborted):
+        download(cfg, "p", layout, rows_needed=100, shard_size=10, should_stop=should_stop)
+    m = Manifest.load(layout.source_dir("p", "raw"))
+    assert m is not None and m.rows() == 20 and m.rows_fetched == 20 and calls["n"] == 2
+    assert download(cfg, "p", layout, rows_needed=100, shard_size=10).rows() == 100  # resumes to completion
+
+
+def test_truncate_raw_to_good_prefix(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    from data_preparation.lib.stages.shared import truncate_raw_to_good_prefix
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    _failing_loader(monkeypatch, fail_at=None)
+    download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    raw = layout.source_dir("p", "raw")
+    m = Manifest.load(raw)
+    assert m is not None and truncate_raw_to_good_prefix(raw, m) and len(m.shards) == 4  # nothing wrong: untouched
+
+    (raw / "data-00002.parquet").write_bytes(b"corrupt")
+    assert truncate_raw_to_good_prefix(raw, m)
+    assert [s.name for s in m.shards] == ["data-00000.parquet", "data-00001.parquet"] and m.rows_fetched == 20
+    assert sorted(p.name for p in raw.glob("*.parquet")) == ["data-00000.parquet", "data-00001.parquet"]
+    stored = Manifest.load(raw)
+    assert stored is not None and stored.rows_fetched == 20
+    m2 = download(cfg, "p", layout, rows_needed=40, shard_size=10)  # resumes from the kept prefix
+    assert m2.rows() == 40 and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(40)]
+
+    (raw / "data-00000.parquet").unlink()  # nothing to keep
+    m3 = Manifest.load(raw)
+    assert m3 is not None and not truncate_raw_to_good_prefix(raw, m3)
+    m3.shards[0].offset = None  # a legacy manifest without offsets: no safe resume point
+    (raw / "data-00000.parquet").write_bytes(b"x")
+    assert not truncate_raw_to_good_prefix(raw, m3)

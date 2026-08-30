@@ -72,8 +72,12 @@ split, converter, seed, ...), so processing options, `max_seq_length`, `token_co
 budgets and weights never invalidate downloaded shards (a changed token setting recounts the `tokens` column in
 place). `processed/` is keyed on `processed_hash` (raw hash + processing block + token settings) and is rebuilt
 from the raw shards when it changes; validation dirs and mixtures likewise on the raw hashes of their sources plus
-the token settings. Shard writes go to a `.tmp` directory first and are renamed into place, so an interrupted
-build never leaves a half-written stage behind.
+the token settings. Raw downloads and `processed/` are append-only and publish **shard by shard** (each shard is
+written to a `.tmp` file, renamed into place and recorded in the manifest — raw shards with the loader offset
+after their last row), so a network error, a crash or Ctrl-C keeps everything fetched so far and the next run
+resumes behind the last complete shard; a corrupt raw shard only drops that shard and the ones after it. Stages
+that rewrite a directory as a whole (validation sets, instruct mixtures, `processed/` in minhash mode) write into
+a `.tmp` directory and rename it into place. Ctrl-C stops every running stage at its next shard.
 
 ## Commands
 

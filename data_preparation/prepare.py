@@ -134,6 +134,9 @@ def main(argv: list[str] | None = None) -> None:
         args.run(args)
     except SystemExit:
         raise
+    except KeyboardInterrupt:
+        log.warning("%s interrupted; everything published so far is kept, rerun to resume", args.command)
+        raise SystemExit(130) from None
     except Exception:
         log.exception("%s failed", args.command)
         raise SystemExit(1) from None

@@ -19,6 +19,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
+from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.storage.parquet import normalized_hash, write_dict_rows
 from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig
 from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
@@ -49,12 +50,14 @@ def build_instruct_mixture(
     *,
     budget_tokens: int,
     shard_size: int = DEFAULT_SHARD_SIZE,
+    should_stop: StopCheck | None = None,
 ) -> dict[str, Manifest]:
     """Build (or return) the ``train`` / ``validation`` splits of a mixture; returns ``{split: Manifest}``.
 
     Columns: ``instruction``, ``input``, ``output``, ``tokens``. ``extra`` records per-source counts, the measured
     ``tokens_per_row``, ``short_sources`` (sources whose raw rows ran out before their share — the planner tops them up),
-    ``input_shards`` (raw shard lists) and the build ``metadata``.
+    ``input_shards`` (raw shard lists) and the build ``metadata``. The build is all-or-nothing (the splits are
+    rewritten as a whole); ``should_stop`` is checked between raw shards while reading and before writing.
     """
     mixture = cfg.instruct_mixtures[instruct_mixture_name]
     mixture_hash = cfg.instruct_mixture_hash(instruct_mixture_name)
@@ -81,7 +84,7 @@ def build_instruct_mixture(
     rows: list[Row] = []
     counts: dict[str, dict[str, Any]] = {}
     for src, share in mixture.sources.items():
-        taken, info = _take_source_rows(layout, src, raw_manifests[src], share * budget_tokens, mixture.max_tokens)
+        taken, info = _take_source_rows(layout, src, raw_manifests[src], share * budget_tokens, mixture.max_tokens, should_stop)
         rows.extend(taken)
         counts[src] = info
         log.info(
@@ -96,6 +99,7 @@ def build_instruct_mixture(
     }
 
     # Steps 1-4: inversions -> dedup + empty removal -> shuffle + split -> write. One seeded RNG drives steps 1 and 3.
+    check_stop(should_stop)
     with progress(total=4, desc=f"{instruct_mixture_name}: build_instruct_mixture", unit="step", leave=False) as steps:
         rng = random.Random(mixture.seed)
 
@@ -184,17 +188,18 @@ def _apply_input_inversions(rows: list[Row], mixture: InstructMixtureConfig, rng
     return inverted
 
 
-def _iter_raw_rows(raw_dir: Path, raw: Manifest) -> Iterator[Row]:
+def _iter_raw_rows(raw_dir: Path, raw: Manifest, should_stop: StopCheck | None = None) -> Iterator[Row]:
     """The standardized rows of every raw shard with their ``tokens``, one by one in shard order; a consumer that
-    stops early never opens the remaining shards."""
+    stops early never opens the remaining shards. ``should_stop`` is checked before every shard."""
     for shard in raw.shards:
+        check_stop(should_stop)
         parquet_file = pq.ParquetFile(raw_dir / shard.name)
         for batch in parquet_file.iter_batches(columns=[*INSTRUCT_COLUMNS, "tokens"]):
             yield from batch.to_pylist()
 
 
 def _take_source_rows(
-    layout: DatasetLayout, src: str, raw: Manifest, target_tokens: float, max_tokens: int
+    layout: DatasetLayout, src: str, raw: Manifest, target_tokens: float, max_tokens: int, should_stop: StopCheck | None = None
 ) -> tuple[list[Row], dict[str, Any]]:
     """The standardized rows of a source read in order until the kept rows (those within ``max_tokens``) hold
     ``target_tokens`` tokens; rows beyond that are not read.
@@ -210,7 +215,7 @@ def _take_source_rows(
     kept_tokens = 0
     dropped_long = 0
     with progress(total=raw.rows(), desc=f"{src}: take_rows", unit="row", leave=False) as bar:
-        for row in _iter_raw_rows(layout.source_dir(src, "raw"), raw):
+        for row in _iter_raw_rows(layout.source_dir(src, "raw"), raw, should_stop):
             rows_read += 1
             bar.update(1)
             n_tokens = int(row["tokens"])

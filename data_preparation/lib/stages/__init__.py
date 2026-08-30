@@ -15,6 +15,7 @@ from data_preparation.lib.stages.shared import (
     download,
     download_github_code_group,
     prepare_tokenizer,
+    truncate_raw_to_good_prefix,
     validation,
 )
 
@@ -27,4 +28,5 @@ __all__ = [
     "validation",
     "prepare_tokenizer",
     "process",
+    "truncate_raw_to_good_prefix",
 ]
