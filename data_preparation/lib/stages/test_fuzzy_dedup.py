@@ -102,6 +102,14 @@ def test_rows_stream_before_input_is_exhausted(num_workers: int) -> None:
 
 
 @needs_datasketch
+def test_rows_too_short_for_an_ngram_are_not_collapsed() -> None:
+    rows = [{"text": t} for t in ("int main() {}", "SELECT * FROM users;", "hello world", "another short doc")]
+    stats: dict[str, Any] = {}
+    kept = list(fuzzy_dedup(iter(rows), DedupConfig(mode="minhash", ngram=5), stats))
+    assert kept == rows and stats["too_short_passed"] == 4 and stats["near_duplicates_removed"] == 0
+
+
+@needs_datasketch
 def test_stats_and_empty_input() -> None:
     stats: dict[str, Any] = {}
     assert list(fuzzy_dedup(iter([]), DedupConfig(mode="minhash"), stats)) == []

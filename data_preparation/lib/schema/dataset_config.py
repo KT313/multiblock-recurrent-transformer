@@ -60,7 +60,7 @@ class TokenizerConfig:
 class DedupConfig:
     """Deduplication of pretrain sources and instruct mixtures."""
 
-    mode: DedupMode = "exact"
+    mode: DedupMode = "exact"  # minhash = exact dedup first, then MinHash/LSH near-duplicate removal
     normalize: bool = True  # exact mode: hash lowercased, whitespace-collapsed text
     threshold: float = 0.95  # minhash mode: Jaccard threshold
     num_perm: int = 256  # minhash mode: permutations

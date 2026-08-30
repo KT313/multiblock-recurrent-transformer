@@ -70,10 +70,15 @@ def _init_worker(num_perm: int, ngram: int) -> None:
 
 
 def _signature(text: str) -> Signature:
-    """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle)."""
+    """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle); an **empty** array
+    for a text with fewer than ``ngram`` words — such texts have no n-grams, and the empty-set signature would make
+    every one of them a near-duplicate of the first."""
     MinHash, _ = _import_datasketch()
+    ngrams = get_ngrams(text, n=_NGRAM)
+    if not ngrams:
+        return np.empty(0, dtype=np.uint64)
     minhash = MinHash(**_MINHASH_KWARGS)
-    for ngram in get_ngrams(text, n=_NGRAM):
+    for ngram in ngrams:
         minhash.update(ngram.encode("utf-8"))
     return np.asarray(minhash.hashvalues, dtype=np.uint64)
 
@@ -131,10 +136,11 @@ def fuzzy_dedup(
     rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], num_workers: int = 1, chunk_size: int = CHUNK_SIZE
 ) -> Iterator[Row]:
     """Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= ``dedup.threshold``) among the rows
-    yielded before; ``stats`` gets ``threshold``, ``num_perm``, ``near_duplicates_removed``, ``near_duplicate_rate``
-    and ``seconds``. See the module docstring for the memory footprint."""
+    yielded before; rows too short for a single n-gram pass through untouched (``stats["too_short_passed"]``, they
+    are only deduplicated exactly). ``stats`` gets ``threshold``, ``num_perm``, ``near_duplicates_removed``,
+    ``near_duplicate_rate`` and ``seconds``. See the module docstring for the memory footprint."""
     MinHash, MinHashLSH = _import_datasketch()
-    stats.update({"threshold": dedup.threshold, "num_perm": dedup.num_perm, "near_duplicates_removed": 0})
+    stats.update({"threshold": dedup.threshold, "num_perm": dedup.num_perm, "near_duplicates_removed": 0, "too_short_passed": 0})
     lsh = MinHashLSH(threshold=dedup.threshold, num_perm=dedup.num_perm)
     minhash_kwargs = _minhash_kwargs(dedup.num_perm)
 
@@ -145,6 +151,10 @@ def fuzzy_dedup(
 
     start = time.monotonic()
     for index, (row, signature) in enumerate(signatures):
+        if signature.size == 0:
+            stats["too_short_passed"] += 1
+            yield row
+            continue
         minhash = MinHash(hashvalues=signature, **minhash_kwargs)
         if lsh.query(minhash):
             stats["near_duplicates_removed"] += 1

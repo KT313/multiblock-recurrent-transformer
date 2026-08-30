@@ -329,18 +329,21 @@ def test_process_minhash_removes_near_duplicates(
     near = base.replace("word100", "changed")
     other = " ".join(f"other{i}" for i in range(200))
     partial = " ".join(f"word{i}" for i in range(100)) + " " + " ".join(f"new{i}" for i in range(100))
+    short_a, short_b, short_a_variant = "hello world", "SELECT * FROM users;", "Hello   World"  # < 5 words: no n-grams
     proc = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="minhash", threshold=0.8, num_perm=64))
-    cfg = _prepare(cfg_factory, layout, source_dir, [base, near, other, base, partial], with_tokenizer,
+    cfg = _prepare(cfg_factory, layout, source_dir, [base, near, other, base, partial, short_a, short_b, short_a_variant], with_tokenizer,
                    write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
     m = process(cfg, "s", layout)
-    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial]
+    # minhash mode = the normalized exact pass first (second `base`, the case variant of `short_a`), then the fuzzy
+    # one (`near`); rows too short for an n-gram are not all collapsed onto the first of them
+    assert [r["text"] for r in read_rows(layout.source_dir("s", "processed"))] == [base, other, partial, short_a, short_b]
     m2 = process(cfg, "s", layout)  # fuzzy dedup: always a full pass (a fresh manifest, not the stored one)
-    assert m2 is not m and m2.extra["stats"]["input_rows"] == 5 and m2.shards == m.shards
+    assert m2 is not m and m2.extra["stats"]["input_rows"] == 8 and m2.shards == m.shards
     dedup_stats = m.extra["stats"]["dedup"]
     assert dedup_stats.pop("seconds") >= 0
     assert dedup_stats == {
-        "mode": "minhash", "duplicates_removed": 0, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 2,
-        "near_duplicate_rate": 0.4,
+        "mode": "minhash", "duplicates_removed": 2, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 1,
+        "near_duplicate_rate": 0.25, "too_short_passed": 2,  # rate over the rows that went through the LSH
     }  # fmt: skip
 
 

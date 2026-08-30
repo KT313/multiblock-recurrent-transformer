@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The ``process`` stage of ``pretrain`` sources (raw -> processed): length filter, exact dedup, quality filter,
-decontamination, token counting, fuzzy dedup (see the ``fuzzy_dedup`` module).
+"""The ``process`` stage of ``pretrain`` sources (raw -> processed): length filter, quality filter, decontamination,
+exact dedup, token counting, fuzzy dedup (``dedup.mode: minhash`` runs the exact pass first, then the fuzzy one; see
+the ``fuzzy_dedup`` module).
 
 Idempotent and incremental via the manifests (see ``stages/shared.py``): the processed manifest records the raw
 shards it covers and every processed row carries its exact-dedup key (``hash`` column), so new raw shards are
@@ -283,7 +284,7 @@ class _Pipeline:
         if processing.decontamination.enabled:
             rows = self.decontaminator(rows)
         rows = _with_hashes(rows, processing.dedup.normalize)
-        if processing.dedup.mode == "exact":
+        if processing.dedup.mode in ("exact", "minhash"):  # minhash = the cheap exact pass first, then fuzzy
             rows = _exact_dedup(rows, self.seen, self.stats["dedup"])
         return _count_tokens(rows, self.counter, self.name, processing.max_chars, self.batch_size, self.bar, self.stats)
 
