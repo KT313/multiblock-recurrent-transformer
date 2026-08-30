@@ -68,7 +68,7 @@ def test_plan_on_empty_dir_by_hand(layout: DatasetLayout) -> None:
     assert m.name == "m" and m.budget_tokens == 400 and not m.present and not m.current and not m.complete
     missing = result.missing()
     assert missing[0] == "tokenizer: missing or stale" and any(line.startswith("source a:") for line in missing)
-    assert any(line.startswith("validation h:") for line in missing) and any(line.startswith("mixture m:") for line in missing)
+    assert any(line.startswith("validation h:") for line in missing) and any(line.startswith("instruct_mixture m:") for line in missing)
     assert "INCOMPLETE" in result.summary() and "unused" not in result.summary()
 
 
@@ -135,12 +135,12 @@ def test_over_fetched_raw_rows_are_fine(layout: DatasetLayout) -> None:
 def test_stale_hash_is_not_complete(layout: DatasetLayout) -> None:
     cfg = two_stage_cfg()
     build(cfg, layout)
-    cfg.processing = ProcessingConfig(min_chars=2)  # changes every pretrain source hash
+    cfg.processing = ProcessingConfig(min_chars=2)  # changes every processed hash; the raw dirs stay current
     result = plan(cfg, layout)
     a = next(s for s in result.sources if s.name == "a")
-    assert not a.complete and not a.manifest_current and a.reason == "raw: manifest stale"
-    assert a.rows_present == 0 and a.rows_to_fetch == a.rows_needed and a.tokens_per_row == 100  # back to the estimate
-    assert stage_problems(cfg, "a", layout) == {s: f"{s}: manifest stale" for s in ("raw", "processed")}
+    assert not a.complete and not a.manifest_current and a.reason == "processed: manifest stale"
+    assert a.rows_present > 0 and a.rows_to_fetch == 0, "the raw rows are kept and only reprocessed"
+    assert stage_problems(cfg, "a", layout) == {"processed": "processed: manifest stale"}
 
 
 def test_missing_shard_is_not_complete(layout: DatasetLayout) -> None:

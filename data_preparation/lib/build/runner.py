@@ -24,7 +24,7 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
@@ -64,6 +64,8 @@ class _Slots:
     process: threading.BoundedSemaphore
     abort: threading.Event
     reason: str = "another item failed"
+    _source_locks: dict[str, threading.Lock] = field(default_factory=dict)
+    _registry_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @classmethod
     def create(cls, max_parallel_downloads: int, num_workers: int) -> _Slots:
@@ -79,6 +81,12 @@ class _Slots:
 
     def should_stop(self) -> bool:
         return self.abort.is_set()
+
+    def source_lock(self, name: str) -> threading.Lock:
+        """One lock per source directory: items that may write the same ``sources/<name>/raw`` (an instruct source
+        shared by several mixtures) serialise on it."""
+        with self._registry_lock:
+            return self._source_locks.setdefault(name, threading.Lock())
 
     @contextmanager
     def downloading(self) -> Iterator[None]:
@@ -171,6 +179,7 @@ class _WorkItem:
     what: str  # "tokenizer" | "source" | "validation" | "instruct_mixture" (for the log line on failure)
     name: str
     action: Callable[[], object]
+    after: list[str] = field(default_factory=list)  # names of items that must have finished first (listed earlier)
 
 
 def _work_items(
@@ -204,10 +213,20 @@ def _work_items(
                 items.append(_WorkItem("validation", validation_plan.name, action))
 
     if "instruct_mixtures" in active_steps:
-        for mixture_plan in current.instruct_mixtures:
-            if _wanted(mixture_plan.name, mixture_plan.complete, selected):
-                action = partial(_build_instruct_mixture, cfg, mixture_plan, layout, hf_token, max_rounds, slots)
-                items.append(_WorkItem("instruct_mixture", mixture_plan.name, action))
+        wanted_mixtures = [p for p in current.instruct_mixtures if _wanted(p.name, p.complete, selected)]
+        # the instruct sources first, one item each with the largest share any mixture needs (a source shared by
+        # two mixtures is downloaded once, not raced), then the mixtures, each after its sources
+        rows_needed: dict[str, int] = {}
+        for mixture_plan in wanted_mixtures:
+            for src, share in cfg.instruct_mixtures[mixture_plan.name].sources.items():
+                rows = rows_for_budget(mixture_plan.budget_tokens * share, _instruct_tokens_per_row(cfg, src, layout))
+                rows_needed[src] = max(rows_needed.get(src, 0), rows)
+        for src, rows in rows_needed.items():
+            action = partial(_download_instruct_source, cfg, src, layout, rows, hf_token, slots)
+            items.append(_WorkItem("source", src, action))
+        for mixture_plan in wanted_mixtures:
+            action = partial(_build_instruct_mixture, cfg, mixture_plan, layout, hf_token, max_rounds, slots)
+            items.append(_WorkItem("instruct_mixture", mixture_plan.name, action, after=list(cfg.instruct_mixtures[mixture_plan.name].sources)))
 
     return items
 
@@ -263,9 +282,13 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
         return
     running: list[str] = []
     lock = threading.Lock()
+    by_name: dict[str, Future[None]] = {}
+    submitted = threading.Event()
     with progress(total=len(items), desc="items", unit="item") as bar:
 
         def run_and_track(item: _WorkItem) -> None:
+            submitted.wait()
+            _wait_for_dependencies(item, by_name)
             with lock:
                 running.append(item.name)
                 bar.set_postfix({"running": ", ".join(running)}, refresh=False)
@@ -277,7 +300,10 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
                     bar.set_postfix({"running": ", ".join(running)}, refresh=False)
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="build") as pool:
+            # items are started in submission order, so an item's dependencies (listed earlier) never wait on it
             futures: dict[Future[None], _WorkItem] = {pool.submit(run_and_track, item): item for item in items}
+            by_name.update({item.name: future for future, item in futures.items()})
+            submitted.set()
             failures: list[BaseException] = []
             try:
                 for future in as_completed(futures):
@@ -303,6 +329,16 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
             raise error
     if failures:
         raise failures[0]
+
+
+def _wait_for_dependencies(item: _WorkItem, by_name: dict[str, Future[None]]) -> None:
+    """Block until every item in ``item.after`` has finished; one that failed or was cancelled stops this item."""
+    for name in item.after:
+        future = by_name[name]
+        try:
+            future.result()
+        except BaseException as err:
+            raise BuildAborted(f"{name} did not finish") from err
 
 
 def _log_plan(result: Plan) -> None:
@@ -444,26 +480,46 @@ def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: D
         validation(cfg, name, layout)
 
 
+def _instruct_tokens_per_row(cfg: DatasetConfig, src: str, layout: DatasetLayout) -> float:
+    """Measured tokens/row of an instruct source's raw manifest when it is current and counted, else the config's
+    estimate."""
+    raw = Manifest.load(layout.source_dir(src, "raw"))
+    if raw is not None and raw.is_current(cfg.raw_hash(src)) and raw.rows() > 0 and (raw.tokens() or 0) > 0:
+        return max((raw.tokens() or 0) / raw.rows(), 1.0)
+    return float(cfg.sources[src].tokens_per_row_estimate)
+
+
+def _download_instruct_source(
+    cfg: DatasetConfig, src: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None, slots: _Slots
+) -> None:
+    """The first download of an instruct source (its own work item; the mixtures that use it run afterwards)."""
+    with slots.source_lock(src):
+        _remove_broken_stages(cfg, src, layout)
+        with slots.downloading():
+            download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
+
+
 def _build_instruct_mixture(
     cfg: DatasetConfig, mixture_plan: InstructMixturePlan, layout: DatasetLayout, hf_token: str | None, max_rounds: int, slots: _Slots
 ) -> None:
-    """Download every source's share, build the mixture, and repeat with refined tokens/row while a source is short."""
+    """Build the mixture from its (already downloaded) sources and repeat — topping the short sources up with a
+    refined tokens/row — while a source is short. Top-ups take the source's lock: another mixture sharing the
+    source may top it up at the same time."""
     name, budget = mixture_plan.name, mixture_plan.budget_tokens
     mixture = cfg.instruct_mixtures[name]
 
-    for src in mixture.sources:
-        _remove_broken_stages(cfg, src, layout)
     if not mixture_plan.current:
         _remove_stale_mixture_splits(cfg, name, layout)
 
-    tokens_per_row = {src: float(cfg.sources[src].tokens_per_row_estimate) for src in mixture.sources}
+    tokens_per_row = {src: _instruct_tokens_per_row(cfg, src, layout) for src in mixture.sources}
     short: dict[str, object] = {}
     for round_index in range(max_rounds):
         exhausted: set[str] = set()
         with slots.downloading():
             for src, share in mixture.sources.items():
                 rows_needed = rows_for_budget(budget * share, tokens_per_row[src])
-                raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
+                with slots.source_lock(src):
+                    raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
                 if raw.extra.get("exhausted"):
                     exhausted.add(src)
 

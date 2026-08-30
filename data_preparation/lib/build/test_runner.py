@@ -16,7 +16,7 @@ import pytest
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
-from data_preparation.lib.build.planner import plan
+from data_preparation.lib.build.planner import plan, rows_for_budget
 from data_preparation.lib.schema.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
 from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
@@ -28,12 +28,12 @@ Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 
 def all_mtimes(root: Path) -> dict[Path, int]:
-    return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file()}
+    return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file() and p.name != ".build.lock"}
 
 
 def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
-    """Estimates are ~10x too high (but below the max_seq_length cap, which would otherwise clamp them); the measured
-    tokens/row of round 1 sizes the second download correctly."""
+    """Estimates are ~10x too high (but below the max_seq_length cap, which would otherwise clamp them): the first
+    download is too small; the tokens/row measured from it sizes the second one correctly."""
     sources = {
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=3_000),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, tokens_per_row_estimate=2_000),
@@ -46,7 +46,13 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
     assert processed is not None and (processed.tokens() or 0) >= 3000
     train = Manifest.load(layout.instruct_mixture_dir("t", "m", "train"))
     assert train is not None and train.extra["short_sources"] == {}
-    assert "p: round 1:" in caplog.text and "m: round 1: short sources ['i']" in caplog.text
+    assert "p: round 1:" in caplog.text
+    # the instruct source's first download (its own item) is sized by the estimate (2 rows); the mixture item then
+    # starts from the raw manifest's measured tokens/row and tops the source up before its first build, so no
+    # "short sources" round is needed
+    assert "short sources" not in caplog.text
+    raw_i = Manifest.load(layout.source_dir("i", "raw"))
+    assert raw_i is not None and raw_i.rows() > 2  # the estimate alone would have stopped at ceil(3000/2000*1.2) = 2
 
 
 def test_build_raises_after_max_rounds(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -155,17 +161,27 @@ def test_token_mode_change_recounts_raw_in_place_without_downloading(
     before = Manifest.load(raw_dir)
     assert before is not None and before.token_count == "tokenizer"
 
-    def no_fetch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("the loader must not be called for a token-mode change")
+    offsets: list[int] = []
+    original = shared._fetch_rows
 
-    monkeypatch.setattr(shared, "_fetch_rows", no_fetch)
+    def spy(source: Any, name: str, offset: int, *args: Any, **kwargs: Any) -> Any:
+        offsets.append(offset)
+        return original(source, name, offset, *args, **kwargs)
+
+    monkeypatch.setattr(shared, "_fetch_rows", spy)
+    old_shards = {f.name: f.stat().st_mtime_ns for f in raw_dir.glob("data-*.parquet")}
     cfg.token_count = "estimate"
     result = build(cfg, layout)
     assert result.complete
     raw = Manifest.load(raw_dir)
     assert raw is not None and raw.token_count == "estimate" and raw.tokenizer is None
-    assert [s.rows for s in raw.shards] == [s.rows for s in before.shards] and raw.rows_fetched == before.rows_fetched
+    assert [s.rows for s in raw.shards][: len(before.shards)] == [s.rows for s in before.shards]
     assert raw.tokens() != before.tokens()  # chars/4 differs from the tokenizer count
+    # chars/4 measures fewer tokens per row than the tokenizer, so the planner may top the source up — but only
+    # ever from the offset already reached, never from 0, and the rows on disk were recounted in place
+    assert all(offset >= before.rows_fetched for offset in offsets)
+    for name, mtime in old_shards.items():
+        assert (raw_dir / name).stat().st_mtime_ns != mtime, "rewritten in place with the new tokens column"
 
 
 def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
@@ -540,3 +556,46 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     assert offsets == [kept_offset], "resumed behind the last good shard instead of from 0"
     repaired = Manifest.load(raw)
     assert repaired is not None and repaired.rows() == manifest.rows() and [s.rows for s in repaired.shards] == [s.rows for s in manifest.shards]
+
+
+def test_two_mixtures_sharing_a_source_download_it_once_and_do_not_race(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Instruct sources are their own work items (largest share over the mixtures), the mixtures run after them
+    and top-ups take the source's lock — two mixtures over one source never write `raw/` concurrently."""
+    calls: list[tuple[str, int]] = []
+    in_flight: dict[str, int] = {}
+    overlap: list[str] = []
+    lock = threading.Lock()
+
+    def spying_download(cfg_: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
+        with lock:
+            calls.append((name, rows_needed))
+            in_flight[name] = in_flight.get(name, 0) + 1
+            if in_flight[name] > 1:
+                overlap.append(name)
+        try:
+            time.sleep(0.02)
+            return real_download(cfg_, name, *args, rows_needed=rows_needed, **kwargs)
+        finally:
+            with lock:
+                in_flight[name] -= 1
+
+    monkeypatch.setattr(build_mod, "download", spying_download)
+    shared = SourceConfig(kind="instruct", loader="synthetic", seed=3, tokens_per_row_estimate=20)
+    mixtures = {
+        "mix_a": InstructMixtureConfig(sources={"shared": 1.0}, max_tokens=4096),
+        "mix_b": InstructMixtureConfig(sources={"shared": 0.5, "own": 0.5}, max_tokens=4096),
+    }
+    cfg = cfg_factory(
+        {"shared": shared, "own": SourceConfig(kind="instruct", loader="synthetic", seed=4, tokens_per_row_estimate=20)},
+        instruct_mixtures=mixtures, tokens=2000, max_seq_length=4096,
+    )
+    cfg.stages = [StageConfig(name="ft", tokens=2000, train={"mix_a": 0.5, "mix_b": 0.5}, val={"mix_a/validation": 1.0})]
+    result = build(cfg, layout, num_workers=2, max_parallel_downloads=2)
+    assert result.complete and overlap == []
+    first_round = [rows for name, rows in calls if name == "shared"][0]
+    assert first_round == max(rows_for_budget(1000 * 1.0, 20), rows_for_budget(1000 * 0.5, 20))
+    assert Manifest.load(layout.source_dir("shared", "raw")) is not None
+    for mixture in mixtures:
+        assert Manifest.load(layout.instruct_mixture_dir("t", mixture, "train")) is not None

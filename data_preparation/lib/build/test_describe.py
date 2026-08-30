@@ -70,7 +70,7 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
     budget = cfg.instruct_mixture_budget_tokens("flan_instruct")
     assert f"| `flan` | 40.0% | {_tokens(int(budget * 0.4))} | {ceil(budget * 0.4 / 300):,} |" in text
     assert "converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000" in text
-    assert "repeated to budget" in text and "language Python" in text and "text_field `TEXT`" in text
+    assert "language Python" in text and "text_field `TEXT`" in text
     assert "`nampdn-ai/mini-peS2o`" in text
 
 
