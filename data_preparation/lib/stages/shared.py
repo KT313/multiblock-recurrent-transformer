@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import random
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -321,6 +321,7 @@ def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name
         del manifest.extra["check_limit"]
 
 
+UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop consuming once `wanted` rows are kept
 CONSUMED_KEY = "_consumed"  # private row key: loader offset after this row (stripped before the row is written)
 
 
@@ -374,11 +375,13 @@ def _fetch_rows(
     layout: DatasetLayout,
     bar: Progress,
 ) -> Iterator[Row]:
-    """Rows to store for one download increment; keeps calling the loader until at least ``wanted`` rows are kept,
-    the source is exhausted or ``max_consume`` source rows were inspected (instruct filters may drop rows, so one
-    loader call may not be enough). Everything a loader yields is kept — it may finish a remote row group beyond
-    ``count`` — except that consumption stops at ``max_consume``. ``bar`` tracks kept rows (postfix: source rows
-    consumed, current repo file, MB read remotely)."""
+    """Rows to store for one download increment from **one** loader call: pretrain / validation rows are all kept,
+    so the loader is asked for exactly ``wanted``; instruct rows may be dropped by the filter or the converter, so
+    the loader is asked for everything up to ``max_consume`` (or without bound) and consumption stops — closing the
+    loader's generator — as soon as ``wanted`` rows are kept (a second call would re-stream the file prefix).
+    Everything a loader yields is kept — it may finish a remote row group beyond ``count``. The source is
+    exhausted when the loader ran dry before ``wanted`` was reached, or ``max_consume`` was. ``bar`` tracks kept
+    rows (postfix: source rows consumed, current repo file, MB read remotely)."""
     loader = get_loader(source.loader)
     is_instruct = source.kind == "instruct"
     converter = get_converter(source) if is_instruct else None
@@ -389,50 +392,47 @@ def _fetch_rows(
     fetch_stats = FetchStats()
     postfix = _DownloadPostfix(bar, fetch_stats)
 
-    while counters.kept < wanted:
-        # how many rows to ask the loader for in this round
-        count = wanted - counters.kept
-        if max_consume is not None:
-            count = min(count, max_consume - counters.consumed)
-            if count <= 0:
-                counters.exhausted = True
-                return
-        consume_budget = None if max_consume is None else max_consume - counters.consumed
-
-        rows = loader(
+    consume_budget = None if max_consume is None else max_consume - counters.consumed
+    if consume_budget is not None and consume_budget <= 0:
+        counters.exhausted = True
+        return
+    if is_instruct:
+        count = UNBOUNDED_COUNT if consume_budget is None else consume_budget
+    else:
+        count = wanted
+    rows: Generator[Row, None, None] = _bounded(
+        loader(
             source, offset + counters.consumed, count, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns,
             on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
-        )
-        yielded = 0
-        for raw in _bounded(rows, consume_budget):
-            yielded += 1
+        ),
+        consume_budget,
+    )
+    try:
+        for raw in rows:
             counters.consumed += 1
             postfix.consumed(counters.consumed)
 
-            if not is_instruct:
+            if is_instruct:
+                if row_filter is not None and not row_filter(raw):
+                    continue
+                try:
+                    row = _instruct_row(raw, converter)
+                except ValueError as err:
+                    counters.skipped_malformed += 1
+                    log.debug("%s: skipping malformed row: %s", name, err)
+                    continue
+            else:
                 row = text_row(source, raw, name)
-                row[CONSUMED_KEY] = counters.consumed
-                yield row
-                counters.kept += 1
-                bar.update(1)
-                continue
-
-            if row_filter is not None and not row_filter(raw):
-                continue
-            try:
-                row = _instruct_row(raw, converter)
-            except ValueError as err:
-                counters.skipped_malformed += 1
-                log.debug("%s: skipping malformed row: %s", name, err)
-                continue
             row[CONSUMED_KEY] = counters.consumed
             yield row
             counters.kept += 1
             bar.update(1)
-
-        if yielded < count:
-            counters.exhausted = True
-            return
+            if is_instruct and counters.kept >= wanted:
+                return  # enough: stop pulling (the finally closes the loader)
+        if counters.kept < wanted:
+            counters.exhausted = True  # the loader ran dry (or `max_consume` was reached) before `wanted` rows were kept
+    finally:
+        rows.close()
 
 
 @dataclass
@@ -729,7 +729,7 @@ def loader_columns(source: SourceConfig) -> list[str] | None:
     return [source.text_field]
 
 
-def _bounded(rows: Iterator[Row], limit: int | None) -> Iterator[Row]:
+def _bounded(rows: Iterator[Row], limit: int | None) -> Generator[Row, None, None]:
     """``rows`` up to ``limit`` (None: all), closing the loader's generator when stopping early."""
     if limit is None:
         yield from rows

@@ -333,7 +333,7 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     ]  # tokens: instruction + input + output
 
 
-def test_download_instruct_filter_and_multiple_loader_calls(
+def test_download_instruct_filter_reads_the_source_once(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:
     good, bad = _sharegpt("h" * 60, "g" * 60), _sharegpt("short", "g" * 60)
@@ -342,7 +342,7 @@ def test_download_instruct_filter_and_multiple_loader_calls(
     src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
     cfg = with_tokenizer(cfg_factory({"s": src}))
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
-    # 3 kept rows need 6 source rows: first call (3) yields 1 kept, second (2) yields 1, third (1) yields 1
+    # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
     assert m.rows() == 3 and m.rows_fetched == 6 and not m.extra.get("exhausted")
     assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.source_dir("s", "raw")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
@@ -766,3 +766,37 @@ def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_
     m2 = download(cfg, "p", layout, rows_needed=1)  # the raw hash is unchanged: recounted in place
     assert m2.rows_fetched == 1 and m2.extra["counted_chars"] == 119 and m2.tokens() == 20
     assert [r["tokens"] for r in read_rows(layout.source_dir("p", "raw"))] == [20]
+
+
+def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filtered instruct download must not re-open the source per iteration (a remote JSON file would be
+    re-streamed from byte 0 every time): one loader call, closed as soon as enough rows are kept."""
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    calls: list[tuple[int, int]] = []
+    closed: list[bool] = []
+
+    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+        calls.append((offset, count))
+        try:
+            for i in range(offset, offset + count):
+                yield {"instruction": f"i{i}", "output": f"o{i}" if i % 4 == 0 else "x"}  # the filter keeps 1 in 4
+        finally:
+            closed.append(True)
+
+    def keep_every_fourth(row: dict[str, Any]) -> bool:
+        return bool(row["output"] != "x")
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    from data_preparation.lib.sources import converters as converters_mod
+
+    monkeypatch.setitem(converters_mod.FILTERS, "every_fourth", keep_every_fourth)
+    src = _synthetic(kind="instruct", converter="instruction_input_output", filter="every_fourth")
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    m = download(cfg, "s", layout, rows_needed=20, shard_size=10)
+    assert m.rows() == 20 and m.rows_fetched == 77 and not m.extra.get("exhausted")
+    assert calls == [(0, 2**62)] and closed == [True], "one call, closed after the 20th kept row"
+    m2 = download(cfg, "s", layout, rows_needed=25, shard_size=10)
+    assert m2.rows() == 25 and calls[1] == (77, 2**62)
