@@ -16,6 +16,7 @@ dependencies = [
   "wandb",
   "tqdm",
   "rich>=13",
+  "rbloom>=1.5.4",
 ]
 
 [project.optional-dependencies]
