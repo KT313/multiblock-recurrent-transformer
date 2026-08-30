@@ -111,7 +111,9 @@ class Manifest:
 
     @classmethod
     def load(cls, directory: Path) -> Manifest | None:
-        """The manifest in ``directory``, or None if absent or unparsable (logged as a warning)."""
+        """The manifest in ``directory``, or None if absent. An unparsable manifest is only ignored (with a warning)
+        when the directory holds no shards; next to shards it is an error — treating it as absent would make the
+        next build start from shard 0 and delete data that may have been expensive to download."""
         path = directory / MANIFEST_NAME
         if not path.is_file():
             return None
@@ -121,8 +123,15 @@ class Manifest:
                 raise TypeError("manifest is not a JSON object")
             return cls.from_dict(payload)
         except (ValueError, TypeError) as err:  # json errors are ValueErrors; bad fields raise TypeError/ValueError
+            if has_shards(directory):
+                raise RuntimeError(f"unreadable manifest {path} next to shards ({err}); fix it or delete the directory") from err
             log.warning("ignoring unparsable manifest %s: %s", path, err)
             return None
+
+
+def has_shards(directory: Path) -> bool:
+    """Whether ``directory`` holds any ``data-*.parquet`` shard."""
+    return any(directory.glob("data-*.parquet"))
 
 
 def _known_fields_only(payload: dict[str, Any], dataclass_type: type) -> dict[str, Any]:

@@ -35,7 +35,7 @@ from data_preparation.lib.schema.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.ui.dashboard import progress
-from data_preparation.lib.storage.manifest import Manifest, library_versions, shard_rows, shard_tokens
+from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions, shard_rows, shard_tokens
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.sources import (
@@ -247,7 +247,7 @@ def download(
     source = fetch_source(cfg, cfg.sources[name])
     source_hash = cfg.raw_hash(name)
     out = layout.source_dir(name, "raw")
-    manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
+    manifest = ensure_raw_tokens(cfg, name, layout) or _fresh_raw_manifest(cfg, name, source_hash, out)
 
     # nothing to do?
     _reset_check_limit_exhaustion(manifest, source, name)
@@ -286,6 +286,15 @@ def download(
     manifest.save(out)
     log.info("%s: kept %d of %d fetched rows (%d rows on disk)", name, counters.kept, counters.consumed, manifest.rows())
     return manifest
+
+
+def _fresh_raw_manifest(cfg: DatasetConfig, name: str, source_hash: str, out: Path) -> Manifest:
+    """An empty raw manifest to start the directory from shard 0 — refused when ``out`` holds shards without any
+    manifest: nothing would say where those rows came from, and starting over would delete them. A *stale*
+    manifest (the source itself changed) is a rebuild, see ``current_manifest``."""
+    if Manifest.load(out) is None and has_shards(out):
+        raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
+    return new_manifest(cfg, name, source_hash, "raw", tokens=True)
 
 
 def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
@@ -406,7 +415,7 @@ def download_github_code_group(
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
         source_hash = cfg.raw_hash(name)
         out = layout.source_dir(name, "raw")
-        manifest = ensure_raw_tokens(cfg, name, layout) or new_manifest(cfg, name, source_hash, "raw", tokens=True)
+        manifest = ensure_raw_tokens(cfg, name, layout) or _fresh_raw_manifest(cfg, name, source_hash, out)
         results[name] = manifest
         if manifest.extra.get("exhausted"):
             log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)

@@ -224,6 +224,18 @@ def test_download_rebuilds_on_stale_hash(
     assert [r["text"] for r in read_rows(raw)] == [synthetic_row("pretrain", 9, i)["text"] for i in range(7)]
 
 
+def test_download_refuses_to_restart_over_shards_without_a_manifest(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout
+) -> None:
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
+    download(cfg, "p", layout, rows_needed=3)
+    raw = layout.source_dir("p", "raw")
+    (raw / "MANIFEST.json").unlink()
+    with pytest.raises(RuntimeError, match="holds shards but no manifest"):
+        download(cfg, "p", layout, rows_needed=3)
+    assert (raw / "data-00000.parquet").is_file()
+
+
 def test_download_keeps_every_row_a_loader_yields_beyond_rows_needed(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
 ) -> None:

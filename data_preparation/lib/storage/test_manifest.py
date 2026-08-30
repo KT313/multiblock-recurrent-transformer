@@ -48,6 +48,10 @@ def test_load_absent_or_unparsable(tmp_path: Path, caplog: pytest.LogCaptureFixt
     (tmp_path / MANIFEST_NAME).write_text(json.dumps({"source": "s"}))  # missing required fields
     assert Manifest.load(tmp_path) is None
     assert sum("unparsable manifest" in r.message for r in caplog.records) == 3
+    # next to shards an unreadable manifest is an error, never "absent" (that would restart the directory at shard 0)
+    pq.write_table(pa.table({"text": ["a"]}), tmp_path / "data-00000.parquet")
+    with pytest.raises(RuntimeError, match="unreadable manifest .* next to shards"):
+        Manifest.load(tmp_path)
 
 
 def test_stage_validated() -> None:
