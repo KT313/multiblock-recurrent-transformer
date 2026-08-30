@@ -29,6 +29,7 @@ from functools import partial
 from pathlib import Path
 
 from data_preparation.lib.abort import BuildAborted, check_stop
+from data_preparation.lib.build.lock import build_lock
 from data_preparation.lib.schema.dataset_config import DatasetConfig
 from data_preparation.lib.schema.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
 from data_preparation.lib.log import get_logger
@@ -120,7 +121,9 @@ def build(
 
     ``steps`` (subset of :data:`STEPS`) limits which stages run, ``sources`` limits to the named sources / mixtures.
     ``dry_run`` logs the plan and returns it without writing anything. ``max_parallel_downloads`` items download
-    and ``num_workers`` items process concurrently (see the module docstring).
+    and ``num_workers`` items process concurrently (see the module docstring). Holds the dataset directory's build
+    lock (``lib/build/lock.py``): a concurrent ``prepare.py build`` / ``train.py`` auto-prepare on the same
+    directory fails fast with :class:`BuildLocked`.
     """
     active_steps = set(STEPS) if steps is None else set(steps)
     _check_steps(active_steps)
@@ -133,14 +136,15 @@ def build(
         return current
     log.info("building %s under %s (%d item(s) missing)", cfg.name, layout.root, len(current.missing()))
 
-    _remove_orphaned_filtered_dirs(layout)
-    slots = _Slots.create(max_parallel_downloads, num_workers)
-    if "tokenizer" in active_steps and not current.tokenizer_complete:
-        _run(_WorkItem("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout)), slots)
-    items = _work_items(cfg, layout, current, active_steps, selected, num_workers, hf_token, max_rounds, slots)
-    _run_all(items, slots, max_workers=max_parallel_downloads + num_workers)
+    with build_lock(layout.root):  # one build per dataset directory, across processes
+        _remove_orphaned_filtered_dirs(layout)
+        slots = _Slots.create(max_parallel_downloads, num_workers)
+        if "tokenizer" in active_steps and not current.tokenizer_complete:
+            _run(_WorkItem("tokenizer", cfg.tokenizer.name, lambda: prepare_tokenizer(cfg, layout)), slots)
+        items = _work_items(cfg, layout, current, active_steps, selected, num_workers, hf_token, max_rounds, slots)
+        _run_all(items, slots, max_workers=max_parallel_downloads + num_workers)
 
-    final = plan(cfg, layout)
+        final = plan(cfg, layout)
     _log_plan(final)
     return final
 
