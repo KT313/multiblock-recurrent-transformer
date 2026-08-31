@@ -29,12 +29,12 @@ from .layers.init import Linear
 class TransformerModules(torch.nn.ModuleDict):
     """`ModuleDict` of the model parts; the annotations only give `model.transformer.<name>` a precise static type."""
 
-    wte: torch.nn.Embedding
-    prelude: torch.nn.ModuleList
-    adapters: torch.nn.ModuleList
-    core_blocks: torch.nn.ModuleList
-    coda: torch.nn.ModuleList
-    ln_fs: torch.nn.ModuleList
+    wte: torch.nn.Embedding  # token embedding
+    prelude: torch.nn.ModuleList  # SandwichBlocks run once before the recurrence
+    adapters: torch.nn.ModuleList  # one Linear per core block: [latent, block input] -> latent
+    core_blocks: torch.nn.ModuleList  # one ModuleList of SandwichBlocks per core block
+    coda: torch.nn.ModuleList  # SandwichBlocks run once after the recurrence
+    ln_fs: torch.nn.ModuleList  # one LayerNorm per core block, applied to the block input
     ln_final: torch.nn.LayerNorm
 
 
@@ -56,17 +56,30 @@ class RecurrentGPT(torch.nn.Module):
         assert padded_vocab_size is not None
 
         # Construction order matters: it fixes the RNG consumption of the parameter init.
-        prelude = torch.nn.ModuleList(SandwichBlock(config) for _ in range(config.n_layers_in_prelude))
-        core_blocks = torch.nn.ModuleList(
-            torch.nn.ModuleList(SandwichBlock(config) for _ in range(n_layers)) for n_layers in n_layers_per_block
-        )
-        adapters = torch.nn.ModuleList(
-            Linear(config.n_embd * 2, config.n_embd, bias=False, init_method=config.init.fn("in_proj"))
-            for _ in n_layers_per_block
-        )
-        coda = torch.nn.ModuleList(SandwichBlock(config) for _ in range(config.n_layers_in_coda))
-        ln_fs = torch.nn.ModuleList(torch.nn.LayerNorm(config.n_embd, eps=config.norm_eps) for _ in n_layers_per_block)
+        prelude = torch.nn.ModuleList()
+        for _ in range(config.n_layers_in_prelude):
+            prelude.append(SandwichBlock(config))
+
+        core_blocks = torch.nn.ModuleList()
+        for n_layers in n_layers_per_block:
+            layers = torch.nn.ModuleList()
+            for _ in range(n_layers):
+                layers.append(SandwichBlock(config))
+            core_blocks.append(layers)
+
+        adapters = torch.nn.ModuleList()
+        for _ in n_layers_per_block:
+            adapters.append(Linear(config.n_embd * 2, config.n_embd, bias=False, init_method=config.init.fn("in_proj")))
+
+        coda = torch.nn.ModuleList()
+        for _ in range(config.n_layers_in_coda):
+            coda.append(SandwichBlock(config))
+
+        ln_fs = torch.nn.ModuleList()
+        for _ in n_layers_per_block:
+            ln_fs.append(torch.nn.LayerNorm(config.n_embd, eps=config.norm_eps))
         ln_final = torch.nn.LayerNorm(config.n_embd, eps=config.norm_eps)
+
         self.transformer = TransformerModules(
             dict(
                 wte=torch.nn.Embedding(padded_vocab_size, config.n_embd),
@@ -90,13 +103,11 @@ class RecurrentGPT(torch.nn.Module):
         self.reset_parameters()
 
     def _precompute_freqs_cis(self) -> Tensor:
-        return precompute_freqs_cis(
-            self.config.n_embd // self.config.num_attention_heads,
-            self.config.block_size,
-            self.config.rope_settings.rope_base,
-        )
+        """The RoPE table for every position up to `block_size`."""
+        return precompute_freqs_cis(self.config.head_size, self.config.block_size, self.config.rope_settings.rope_base)
 
     def reset_parameters(self) -> None:
+        """Re-initialize the modules that are not `Linear` (those init themselves): embedding and LayerNorms."""
         self.config.init.apply(self.transformer.wte, "embedding")
         for ln_f in self.transformer.ln_fs:
             self.config.init.apply(ln_f, "normalization")
@@ -113,28 +124,37 @@ class RecurrentGPT(torch.nn.Module):
     ) -> dict[str, Tensor | None]:
         """`num_steps_pair`: None (sample per block), one (n_no_grad, k_with_grad) pair for all blocks, or a list of
         pairs with one entry per core block."""
+        # RoPE rows for the positions of this batch: the first S rows, or the rows selected by `position_ids`.
         if position_ids is None:
             freqs_cis = self.freqs_cis[:, : input_ids.shape[1]]
         else:
             freqs_cis = self.freqs_cis.index_select(1, position_ids)
 
-        x = self.transformer.wte(input_ids)
+        x = self.transformer.wte(input_ids)  # (B, S, E)
         if self.emb_scale != 1:
             x = x * self.emb_scale
         for block in self.transformer.prelude:
             x = block(x, freqs_cis, attention_mask)
 
+        # Each core block is iterated on its input and added back onto it (residual around the whole block).
         num_steps = normalize_num_steps(num_steps_pair, len(self.transformer.core_blocks))
         for block_idx, block_steps in enumerate(num_steps):
-            x = self.iterate_forward(x, freqs_cis, attention_mask, block_steps, block_idx) + x
+            block_out = self.iterate_forward(x, freqs_cis, attention_mask, block_steps, block_idx)
+            x = block_out + x
 
         for block in self.transformer.coda:
             x = block(x, freqs_cis, attention_mask)
         x = self.transformer.ln_final(x)
 
-        logits = self.lm_head(x).float() * self.config.init.logit_scale
-        loss = self.loss(logits, labels) if labels is not None else torch.as_tensor(0.0)
-        return {"loss": loss, "logits": logits if return_logits else None, "log_ppl": loss.clone().detach()}
+        logits = self.lm_head(x).float() * self.config.init.logit_scale  # (B, S, padded_vocab), float32
+        if labels is not None:
+            loss = self.loss(logits, labels)
+        else:
+            loss = torch.as_tensor(0.0)
+        returned_logits: Tensor | None = None
+        if return_logits:
+            returned_logits = logits
+        return {"loss": loss, "logits": returned_logits, "log_ppl": loss.clone().detach()}
 
     def loss(self, logits: Tensor, labels: Tensor) -> Tensor:
         """Cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`."""
@@ -152,26 +172,29 @@ class RecurrentGPT(torch.nn.Module):
     ) -> Tensor:
         """Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, then iterate
         the block n times without and k times with gradient — `num_steps`, or the sampler's draw when None."""
-        t = self.transformer
-        x_base = t.ln_fs[block_idx](x)
-        x_latent = initialize_state(x)
+        transformer = self.transformer
+        x_base = transformer.ln_fs[block_idx](x)
+        x_latent = initialize_state(x)  # consumes the global RNG first, then (if sampling) the sampler's draw
 
-        num_steps_no_grad: int | Tensor
-        num_steps_with_grad: int | Tensor
+        steps: tuple[int, int] | tuple[Tensor, Tensor]
         if num_steps is None:
-            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler(block_idx)
+            steps = self.randomized_iteration_sampler(block_idx)
         else:
-            num_steps_no_grad, num_steps_with_grad = num_steps
+            steps = num_steps
+        num_steps_no_grad, num_steps_with_grad = steps
 
-        x_out: Tensor = iterate_core_block(  # the dynamo-disabled functions are untyped for mypy
+        # ModuleList is not generic in the torch stubs, so indexing `core_blocks` needs the cast.
+        layers = cast(torch.nn.ModuleList, transformer.core_blocks[block_idx])
+        # `iterate_core_block` is dynamo-disabled, which makes it untyped for mypy; hence the explicit annotation.
+        x_out: Tensor = iterate_core_block(
             x_latent,
             x_base,
             freqs_cis,
             mask,
             num_steps_no_grad,
             num_steps_with_grad,
-            adapter=t.adapters[block_idx],
-            layers=cast(torch.nn.ModuleList, t.core_blocks[block_idx]),  # ModuleList is not generic in the torch stubs
+            adapter=transformer.adapters[block_idx],
+            layers=layers,
             gradient_checkpointing=self.gradient_checkpointing,
         )
         return x_out
@@ -182,6 +205,7 @@ class RecurrentGPT(torch.nn.Module):
         `self.step` in training, (`mean_recurrence`, 0) in eval mode."""
         assert isinstance(self.config.mean_recurrence, list)  # normalized by RecurrentConfig.__post_init__
         assert isinstance(self.config.mean_backprop_depth, list)
+        # `sample_recurrence_steps` is dynamo-disabled, which makes it untyped for mypy; hence the explicit annotation.
         steps: tuple[Tensor, Tensor] = sample_recurrence_steps(
             self.config.mean_recurrence[block_idx],
             self.config.mean_backprop_depth[block_idx],

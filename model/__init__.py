@@ -7,13 +7,20 @@ from typing import Any
 from .config import RecurrentConfig, RoPESettings
 from .model import RecurrentGPT
 
+# `build_model` keyword arguments that belong to `RecurrentGPT`, not to the config.
+_MODEL_KWARGS = ("ignore_index", "gradient_checkpointing")
+
 
 def build_model(config: RecurrentConfig | str | Path, **overrides: Any) -> RecurrentGPT:
     """Instantiate `RecurrentGPT` from a model architecture YAML (`config/model_architecture/<name>.yaml`, with
     config overrides applied on top) or from an existing `RecurrentConfig`.
 
     Keyword arguments `ignore_index` and `gradient_checkpointing` go to the model, everything else to the config."""
-    model_kwargs = {k: overrides.pop(k) for k in ("ignore_index", "gradient_checkpointing") if k in overrides}
+    model_kwargs: dict[str, Any] = {}
+    for name in _MODEL_KWARGS:
+        if name in overrides:
+            model_kwargs[name] = overrides.pop(name)
+
     if isinstance(config, (str, Path)):
         config = RecurrentConfig.from_yaml(config, **overrides)
     elif overrides:

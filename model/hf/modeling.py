@@ -23,6 +23,7 @@ from ..config import RecurrentConfig, RoPESettings
 from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
 from ..model import RecurrentGPT
 
+# The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
     "block_size",
     "n_embd",
@@ -54,12 +55,15 @@ def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[
     steps_str = steps_str.strip()
     if not steps_str:
         return None
-    if "," in steps_str:
-        steps = [int(s.strip()) for s in steps_str.split(",")]
-        if len(steps) != num_blocks:
-            raise ValueError(f"got {len(steps)} recurrence values but the model has {num_blocks} recurrent blocks")
-        return [(s, 0) for s in steps]
-    return (int(steps_str), 0)
+    if "," not in steps_str:
+        return (int(steps_str), 0)
+
+    per_block: list[StepsSpec] = []
+    for value in steps_str.split(","):
+        per_block.append((int(value.strip()), 0))
+    if len(per_block) != num_blocks:
+        raise ValueError(f"got {len(per_block)} recurrence values but the model has {num_blocks} recurrent blocks")
+    return per_block
 
 
 class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # transformers' __init_subclass__ is untyped
@@ -74,23 +78,29 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         for name in _MODEL_FIELDS:
             setattr(self, name, kwargs.pop(name, getattr(defaults, name)))
         self.rope_base = rope_base
+
+        # Standard HF attribute names, derived from ours (`num_hidden_layers` = the expected unrolled depth).
         self.hidden_size = self.n_embd
-        self.num_hidden_layers = (
-            self.n_layers_in_prelude
-            + self.n_layers_in_coda
-            + sum(n * m for n, m in zip(self.n_layers_in_recurrent_block, self.mean_recurrence))
-        )
+        recurrent_depth = 0
+        for n_layers, mean_recurrence in zip(self.n_layers_in_recurrent_block, self.mean_recurrence):
+            recurrent_depth += n_layers * mean_recurrence
+        self.num_hidden_layers = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
+
         kwargs.setdefault("tie_word_embeddings", self.tie_embeddings)
         super().__init__(**kwargs)
 
     @classmethod
     def from_recurrent_config(cls, config: RecurrentConfig, **kwargs: Any) -> "RecurrentGPTConfig":
-        fields = {name: getattr(config, name) for name in _MODEL_FIELDS}
-        return cls(rope_base=config.rope_settings.rope_base, **fields, **kwargs)
+        field_values: dict[str, Any] = {}
+        for name in _MODEL_FIELDS:
+            field_values[name] = getattr(config, name)
+        return cls(rope_base=config.rope_settings.rope_base, **field_values, **kwargs)
 
     def to_recurrent_config(self) -> RecurrentConfig:
-        fields = {name: getattr(self, name) for name in _MODEL_FIELDS}
-        return RecurrentConfig(rope_settings=RoPESettings(rope_base=int(self.rope_base)), **fields)
+        field_values: dict[str, Any] = {}
+        for name in _MODEL_FIELDS:
+            field_values[name] = getattr(self, name)
+        return RecurrentConfig(rope_settings=RoPESettings(rope_base=int(self.rope_base)), **field_values)
 
 
 class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore[no-untyped-call]  # see above
@@ -123,14 +133,18 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
     ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
         """`num_steps_pair` as in `RecurrentGPT.forward`; if None, `EVAL_RECURRENCE_STEPS` ("12" or "4,12,4") is used,
         else in eval mode the config's `mean_recurrence` per block, else (training) the sampler."""
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        if return_dict is None:
+            return_dict = self.config.return_dict
 
         if num_steps_pair is None:
             env_steps = os.environ.get("EVAL_RECURRENCE_STEPS", "").strip()
             if env_steps:
                 num_steps_pair = parse_recurrence_steps(env_steps, self.num_recurrent_blocks)
             elif not self.training:
-                num_steps_pair = [(n, 0) for n in self.config.mean_recurrence]
+                per_block: list[StepsSpec] = []
+                for mean_recurrence in self.config.mean_recurrence:
+                    per_block.append((mean_recurrence, 0))
+                num_steps_pair = per_block
 
         outputs = self.model(
             input_ids=input_ids,
@@ -140,12 +154,16 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
             return_logits=True,
             num_steps_pair=num_steps_pair,
         )
-        loss = outputs["loss"] if labels is not None else None
         logits = outputs["logits"]
+        loss = None
+        if labels is not None:
+            loss = outputs["loss"]
 
-        if not return_dict:
-            return (loss, logits) if loss is not None else (logits,)
-        return CausalLMOutputWithPast(loss=loss, logits=logits)
+        if return_dict:
+            return CausalLMOutputWithPast(loss=loss, logits=logits)
+        if loss is None:
+            return (logits,)
+        return (loss, logits)
 
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Attention is always causal over the full (unpadded) sequence; the HF padding mask is not forwarded."""
@@ -172,6 +190,7 @@ AutoModelForCausalLM.register(RecurrentGPTConfig, RecurrentGPTForCausalLM)
 # --- export ----------------------------------------------------------------------------------------------------------
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]  # the `model/` package (this file is `model/hf/modeling.py`)
+# One `from .x import` / `from ..x.y import` line: leading whitespace, the dots, the dotted module name.
 _RELATIVE_IMPORT = re.compile(r"^(?P<indent>[ \t]*)from[ \t]+(?P<dots>\.+)(?P<name>[\w.]*)[ \t]+import\b", re.MULTILINE)
 
 
@@ -188,17 +207,23 @@ def flatten_relative_imports(source: str, module: Path, package_dir: Path) -> st
     (`from .layers import X`, served by an `__init__.py`, or `from . import x`) raises, because `__init__.py` files
     are not exported.
     """
-    package = module.parent.parts
+    # Directory of `module` inside the package, e.g. ("hf",) for hf/modeling.py or () for a top-level module.
+    module_package = module.parent.parts
 
     def rewrite(match: re.Match[str]) -> str:
         line = match[0].strip()
-        level = len(match["dots"])
-        if not match["name"] or level - 1 > len(package):
+        num_dots = len(match["dots"])
+        levels_up = num_dots - 1  # `.` = same package, `..` = one package up, ...
+        if not match["name"] or levels_up > len(module_package):
+            # `from . import x` names no module; more dots than packages would leave the package.
             raise ValueError(f"{module}: {line!r} cannot be flattened (import from the defining module)")
-        target = (*package[: len(package) - (level - 1)], *match["name"].split("."))
-        if not package_dir.joinpath(*target).with_suffix(".py").is_file():
+
+        base_package = module_package[: len(module_package) - levels_up]
+        target_module = (*base_package, *match["name"].split("."))
+        if not package_dir.joinpath(*target_module).with_suffix(".py").is_file():
             raise ValueError(f"{module}: {line!r} does not name a module file (import from the defining module)")
-        return f"{match['indent']}from .{'_'.join(target)} import"
+        flat_name = "_".join(target_module)
+        return f"{match['indent']}from .{flat_name} import"
 
     return _RELATIVE_IMPORT.sub(rewrite, source)
 
@@ -232,9 +257,14 @@ def export_to_hf(
         "AutoConfig": f"{this_module}.RecurrentGPTConfig",
         "AutoModelForCausalLM": f"{this_module}.RecurrentGPTForCausalLM",
     }
+
+    # Build the wrapper without allocating weights, then hand it `model`'s tensors (prefixed with `model.`, the
+    # wrapper's attribute name).
     with torch.device("meta"):
         hf_model = RecurrentGPTForCausalLM(hf_config)
-    state_dict = {f"model.{k}": v.detach().cpu() for k, v in model.state_dict().items()}
+    state_dict: dict[str, torch.Tensor] = {}
+    for name, tensor in model.state_dict().items():
+        state_dict[f"model.{name}"] = tensor.detach().cpu()
     hf_model.load_state_dict(state_dict, assign=True)
     hf_model.save_pretrained(out_dir, safe_serialization=True)
     export_sources(_PACKAGE_DIR, out_dir)
