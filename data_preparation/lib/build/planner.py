@@ -1,313 +1,359 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Budget planner: what a dataset config needs on disk versus what the manifests say is there (pure arithmetic).
+"""Planner: what a dataset config needs on disk versus what the manifests say is there, counted in **sequences**.
 
-Every source (both kinds) has a ``raw`` and a ``processed`` folder and is planned the same way. A source used for
-training is sized by its sequence budget (``DatasetConfig.sequence_budget``, the largest per-stage demand — stages
-share the folders, so max, not sum); a source used only for validation by its ``rows``. ``plan`` only reads
-manifests and parquet footers (``verify_shards``); ``lib/build/runner.py`` executes a plan, ``prepare.py status``
-prints it.
+The trainer draws *rows* from a source with the stage weight and pads or truncates every row to ``block_size``, so a
+stage consumes ``stage.tokens × weight ÷ block_size`` rows of a source — its :meth:`DatasetConfig.sequence_budget`.
+That is the planner's unit: :func:`rows_needed` turns it into a download target, :func:`plan_downloads` into the
+rows still missing per source, :func:`every_source_satisfies_its_budget` / :func:`summarize_dataset_state` decide
+whether the processed folders serve the budget (the status table). There is no tokens-per-row estimate anywhere
+in this arithmetic any more: a source whose rows are shorter than ``block_size`` is no longer over-downloaded, and
+the realised **token** mix of a stage is ``weight × mean_tokens_per_row ÷ block_size``-weighted (the README says
+so; ``describe.py`` prints an estimate from ``describe_tokens_per_row`` for the token table only).
 
-Interim budget arithmetic (task 8 replaces it with a sequences formula): the token budget of a trained source is
-``sequence_budget × block_size`` and it is turned into rows with the measured tokens per raw row of the processed
-manifest when it is current, else the source's ``describe_tokens_per_row``, times ``SAFETY_MARGIN``.
+Everything here reads manifests only (no parquet footers): broken shards are the repair step's business
+(``lib/build/repair.py``) and the training resolver checks the folders on disk independently. Pure functions of
+``(config, layout)``; ``lib/build/runner.py`` executes them.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from fractions import Fraction
 from math import ceil
-from pathlib import Path
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
-from data_preparation.lib.storage.manifest import Manifest, verify_shards
+from data_preparation.lib.stages.download import current_raw_manifest, raw_manifest_state
+from data_preparation.lib.storage.manifest import Manifest
 
-SOURCE_STAGES: tuple[str, ...] = ("raw", "processed")  # the folders of every source, in build order
+_MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not 60.000000000000007
 
-
-def rows_for_budget(budget_tokens: float, tokens_per_row: float, margin: float = SAFETY_MARGIN) -> int:
-    """Rows to fetch for ``budget_tokens`` at ``tokens_per_row`` (× safety ``margin``), at least 1."""
-    return max(1, ceil(budget_tokens / max(tokens_per_row, 1e-9) * margin))
+# --- rows -----------------------------------------------------------------------------------------------------------
 
 
-# --- plan dataclasses --------------------------------------------------------------------------------------------------
+def rows_needed(config: DatasetConfig, name: str) -> int:
+    """Raw rows to download for source ``name``.
+
+    A source used for training (and maybe validation): ``ceil(sequence_budget × SAFETY_MARGIN ÷ (1 −
+    validation_fraction_of(name)))`` — the margin covers what the length filter and the dedup drop, the division
+    keeps the *training* part at the sequence budget after the training resolver holds ``validation_fraction`` of
+    the processed rows out. A source used only for validation: its ``rows``. No tokens-per-row estimate is involved
+    (see the module docstring): the trainer draws rows, so rows are what is counted.
+    """
+    source = config.sources[name]
+    if not config.used_in_train(name):
+        return int(source.rows or 0)
+    held_out = Fraction(str(config.validation_fraction_of(name)))
+    return ceil(config.sequence_budget(name) * _MARGIN / (1 - held_out))
+
+
+def rows_sufficient(config: DatasetConfig, name: str) -> int:
+    """Processed rows at which a source serves its budget: ``rows_needed ÷ SAFETY_MARGIN`` (= the sequence budget
+    over the training share of the rows, or the ``rows`` of a validation-only source, less the download margin)."""
+    return ceil(rows_needed(config, name) / _MARGIN)
+
+
+def training_rows_after_split(config: DatasetConfig, name: str, processed_rows: int) -> int:
+    """Rows of ``processed/<name>`` the trainer trains on: all but the first ``ceil(validation_fraction × rows)``
+    (the training resolver's split; the fraction is multiplied as the decimal written in the YAML)."""
+    held_out = Fraction(str(config.validation_fraction_of(name)))
+    return processed_rows - ceil(held_out * processed_rows)
+
+
+# --- manifests -------------------------------------------------------------------------------------------------------
+
+
+def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
+    """Whether ``tokenizers/<name>`` carries the current tokenizer manifest and the tokenizer files."""
+    directory = layout.tokenizer_dir(config.tokenizer.name)
+    manifest = Manifest.load(directory)
+    if manifest is None:
+        return False
+    return manifest.is_current(config.tokenizer_hash()) and (directory / "tokenizer_config.json").is_file()
+
+
+def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
+    """Whether the loader of ``name`` has nothing more to give: the raw manifest says exhausted — unless it was
+    exhausted by a ``check_limit`` that has since grown or been removed (``download`` reads on then)."""
+    if not raw.extra.get("exhausted"):
+        return False
+    reached = raw.extra.get("check_limit")
+    if reached is None:
+        return True
+    limit = config.sources[name].check_limit
+    return limit is not None and limit <= int(reached)
+
+
+def current_processed_manifest(config: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
+    """The processed manifest of ``name`` when it carries the current ``processed_hash`` and the current columns."""
+    manifest = Manifest.load(layout.processed_dir(name))
+    if manifest is None or manifest.stage != "processed" or not manifest.is_current(config.processed_hash(name)):
+        return None
+    if manifest.extra.get("columns") != list(processed_columns(config.sources[name].kind)):
+        return None
+    return manifest
+
+
+def processed_covers_raw(processed: Manifest, raw: Manifest) -> bool:
+    """Whether every raw shard has been built into ``processed`` (``extra["input_shards"]`` lists them all)."""
+    return processed.extra.get("input_shards") == [[shard.name, shard.rows] for shard in raw.shards]
+
+
+def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
+    """Whether ``name`` has raw shards its processed folder does not cover yet (or no current processed manifest);
+    False without a current raw manifest — there is nothing to build from."""
+    raw = current_raw_manifest(config, name, layout)
+    if raw is None:
+        return False
+    processed = current_processed_manifest(config, name, layout)
+    return processed is None or not processed_covers_raw(processed, raw)
+
+
+def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
+    """The sources (all, or ``sources``) whose build has raw shards left to process, in config order."""
+    return [name for name in _selected(config, sources) if build_is_pending(config, name, layout)]
+
+
+# --- the download plan -----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SourceDownload:
+    """Rows of one source: on disk (raw manifest), needed, and the difference still to fetch."""
+
+    name: str
+    rows_present: int  # rows in the raw manifest (0 when missing)
+    rows_needed: int  # :func:`rows_needed`
+    rows_to_fetch: int  # max(0, needed − present); 0 when the loader is exhausted
+    reason: str  # "raw missing" | "rows N < M" | "exhausted" | "enough rows"
 
 
 @dataclass
-class SourcePlan:
-    """State of one source. A source used only for validation has ``budget_tokens`` 0 and ``rows_needed`` = its
-    ``rows``."""
+class DownloadPlan:
+    """One :class:`SourceDownload` per planned source."""
+
+    sources: list[SourceDownload] = field(default_factory=list)
+
+    def to_fetch(self) -> list[SourceDownload]:
+        """The sources with rows to fetch."""
+        return [source for source in self.sources if source.rows_to_fetch > 0]
+
+    def total_rows_to_fetch(self) -> int:
+        return sum(source.rows_to_fetch for source in self.sources)
+
+    def summary(self) -> str:
+        """One line: ``"3 source(s) short, downloading 12,000 rows (a 4,000, b 8,000, c 0)"`` or ``"nothing to
+        download"``."""
+        short = self.to_fetch()
+        if not short:
+            return "nothing to download"
+        per_source = ", ".join(f"{source.name} {source.rows_to_fetch:,}" for source in short)
+        return f"{len(short)} source(s) short, downloading {self.total_rows_to_fetch():,} rows ({per_source})"
+
+    def describe(self) -> str:
+        """A fixed-width table: source, rows present, rows needed, rows to fetch, reason."""
+        header = ("source", "present", "needed", "fetch", "reason")
+        rows = [(s.name, f"{s.rows_present:,}", f"{s.rows_needed:,}", f"{s.rows_to_fetch:,}", s.reason) for s in self.sources]
+        return format_table(header, rows)
+
+
+def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> DownloadPlan:
+    """Rows still missing per source (all, or ``sources``) against the raw manifests.
+
+    A raw folder that is stale or outdated must have been handled by the repair step before: such a state is an
+    error here (``RuntimeError`` naming the source), never "download more" — the download never appends to a
+    folder whose rows the current config would not have produced.
+    """
+    plan = DownloadPlan()
+    for name in _selected(config, sources):
+        plan.sources.append(_plan_source_download(config, name, layout))
+    return plan
+
+
+def _plan_source_download(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceDownload:
+    state = raw_manifest_state(config, name, layout)
+    if state not in ("missing", "current"):
+        raise RuntimeError(
+            f"{name}: raw folder {layout.raw_dir(name)} is {state}; it has to be deleted and downloaded again — "
+            "run the repair step (prepare asks for confirmation) before planning downloads"
+        )
+    needed = rows_needed(config, name)
+    raw = current_raw_manifest(config, name, layout)
+    if raw is None:
+        return SourceDownload(name, 0, needed, needed, "raw missing")
+    present = raw.rows()
+    if raw_is_exhausted(config, name, raw):
+        return SourceDownload(name, present, needed, 0, "exhausted")
+    if present >= needed:
+        return SourceDownload(name, present, needed, 0, "enough rows")
+    return SourceDownload(name, present, needed, needed - present, f"rows {present:,} < {needed:,}")
+
+
+# --- satisfaction and the status table -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SourceState:
+    """Where one source stands: satisfied when its processed folder serves the budget (see :func:`source_state`)."""
 
     name: str
     kind: str
-    budget_tokens: int
-    tokens_per_row: float  # measured from the manifests if present, else the config's describe estimate (task 8 drops it)
     rows_needed: int
-    rows_present: int
-    rows_to_fetch: int
-    tokens_present: int
-    manifest_current: bool  # both folder manifests of the source exist and carry the current hashes
-    exhausted: bool  # the loader ran dry before the budget was reached (complete with a warning)
-    complete: bool
+    raw_rows: int
+    processed_rows: int
+    exhausted: bool  # the loader ran dry before `rows_needed` (complete with a warning when built)
+    satisfied: bool
     reason: str  # "ok", or what is missing
+    epochs: float | None = None  # sequence budget ÷ training rows after the split; only when satisfied and trained on
 
-    @property
-    def epochs(self) -> float | None:
-        """How often the rows on disk are cycled by the training sampler to serve ``budget_tokens`` (the largest
-        single-stage demand): ``budget ÷ tokens``; < 1 means only part of the data is seen. None without tokens or
-        budget (validation-only sources)."""
-        return _epochs(self.budget_tokens, self.tokens_present)
+    def state(self) -> str:
+        if not self.satisfied:
+            return "incomplete"
+        return "exhausted" if self.exhausted else "complete"
 
 
 @dataclass
-class Plan:
-    sources: list[SourcePlan] = field(default_factory=list)
+class DatasetReport:
+    """The status of a whole dataset config: one :class:`SourceState` per source plus the tokenizer."""
+
+    sources: list[SourceState] = field(default_factory=list)
     tokenizer_complete: bool = False
-    complete: bool = False
+    needs_repair: list[str] = field(default_factory=list)  # sources the repair step would touch (`status` only; `prepare` repaired first)
+
+    @property
+    def complete(self) -> bool:
+        return self.tokenizer_complete and not self.needs_repair and all(source.satisfied for source in self.sources)
 
     def missing(self) -> list[str]:
-        """Human-readable one-liners, one per incomplete item (empty iff ``complete``)."""
-        lines: list[str] = []
+        """Names of the items that are not satisfied or need a repair: the sources, plus ``"tokenizer"`` when it
+        is missing (empty iff :attr:`complete`)."""
+        names = [source.name for source in self.sources if not source.satisfied or source.name in self.needs_repair]
         if not self.tokenizer_complete:
-            lines.append("tokenizer: missing or stale")
-        lines.extend(f"source {s.name}: {s.reason}" for s in self.sources if not s.complete)
-        return lines
+            names.append("tokenizer")
+        return names
 
-    def summary(self) -> str:
-        """A fixed-width table of every source plus the tokenizer and overall state (``epochs``: how often the
-        training sampler cycles the rows on disk to serve the budget, see :attr:`SourcePlan.epochs`)."""
-        header = ("item", "kind", "budget", "tokens", "rows", "needed", "fetch", "tok/row", "epochs", "state", "reason")
-        rows: list[tuple[str, ...]] = [_source_summary_row(source) for source in self.sources]
-        rows.append(_tokenizer_summary_row(self.tokenizer_complete))
-        table = _format_table(header, rows)
-        return table + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
+    def unsatisfied(self) -> list[SourceState]:
+        """The sources that do not serve their budget yet (the runner names them after its rounds)."""
+        return [source for source in self.sources if not source.satisfied]
+
+    def table(self) -> str:
+        """A fixed-width table: source, kind, rows needed, raw rows, processed rows, epochs, state, reason."""
+        header = ("source", "kind", "needed", "raw", "processed", "epochs", "state", "reason")
+        rows = [
+            (
+                s.name, s.kind, f"{s.rows_needed:,}", f"{s.raw_rows:,}", f"{s.processed_rows:,}",
+                "-" if s.epochs is None else f"{s.epochs:.2f}", "needs repair" if s.name in self.needs_repair else s.state(), s.reason,
+            )
+            for s in self.sources
+        ]  # fmt: skip
+        rows.append(("tokenizer", "tokenizer", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
+        return format_table(header, rows)
+
+    def describe(self) -> str:
+        """The table plus the overall verdict line (``dataset complete`` / ``dataset INCOMPLETE``)."""
+        return self.table() + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
 
 
-# --- summary table formatting ------------------------------------------------------------------------------------------
+def source_state(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceState:
+    """Satisfied = the processed manifest is current, covers every raw shard and holds at least
+    :func:`rows_sufficient` rows (so the training part after the split reaches the sequence budget) — or the raw
+    folder is exhausted and every raw shard is built. A stale / outdated raw folder is reported (the repair step
+    deletes it after confirmation), never counted."""
+    kind = config.sources[name].kind
+    needed = rows_needed(config, name)
+    state = raw_manifest_state(config, name, layout)
+    if state not in ("missing", "current"):
+        return SourceState(name, kind, needed, 0, 0, False, False, f"raw {state}: the repair step deletes it after confirmation")
+    raw = current_raw_manifest(config, name, layout)
+    if raw is None:
+        return SourceState(name, kind, needed, 0, 0, False, False, "raw missing")
+    exhausted = raw_is_exhausted(config, name, raw)
+    processed = current_processed_manifest(config, name, layout)
+    if processed is None:
+        why = "processed missing" if Manifest.load(layout.processed_dir(name)) is None else "processed stale"
+        return SourceState(name, kind, needed, raw.rows(), 0, exhausted, False, why)
+    processed_rows = processed.rows()
+    if not processed_covers_raw(processed, raw):
+        return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, False, "processed behind raw")
+    sufficient = rows_sufficient(config, name)
+    if processed_rows >= sufficient:
+        reason = "ok"
+    elif exhausted:
+        reason = f"exhausted at {processed_rows:,} of {sufficient:,} rows"
+    else:
+        return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, False, f"processed rows {processed_rows:,} < {sufficient:,}")
+    return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, True, reason, _epochs(config, name, processed_rows))
 
 
-def _source_summary_row(source: SourcePlan) -> tuple[str, ...]:
-    return (
-        source.name,
-        source.kind,
-        _fmt(source.budget_tokens),
-        _fmt(source.tokens_present),
-        _fmt(source.rows_present),
-        _fmt(source.rows_needed),
-        "-" if source.complete else _fmt(source.rows_to_fetch),
-        f"{source.tokens_per_row:.1f}",
-        _fmt_epochs(source.epochs if source.complete else None),  # meaningless before the source is built
-        _source_state(source),
-        source.reason,
+def _epochs(config: DatasetConfig, name: str, processed_rows: int) -> float | None:
+    """How often the trainer cycles the training rows of a satisfied source to serve its sequence budget (the
+    largest single-stage demand); None for a source it does not train on or without training rows."""
+    budget = config.sequence_budget(name)
+    training_rows = training_rows_after_split(config, name, processed_rows)
+    if budget <= 0 or training_rows <= 0:
+        return None
+    return budget / training_rows
+
+
+def every_source_satisfies_its_budget(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> bool:
+    """Whether every source (all, or ``sources``) is satisfied (:func:`source_state`)."""
+    return all(source_state(config, name, layout).satisfied for name in _selected(config, sources))
+
+
+def summarize_dataset_state(config: DatasetConfig, layout: DatasetLayout, *, needs_repair: Iterable[str] = ()) -> DatasetReport:
+    """The :class:`DatasetReport` of every source of ``config`` under ``layout`` plus the tokenizer.
+    ``needs_repair`` names the sources a repair dry run would touch (``status``): they count as incomplete."""
+    return DatasetReport(
+        sources=[source_state(config, name, layout) for name in config.sources],
+        tokenizer_complete=tokenizer_is_prepared(config, layout),
+        needs_repair=sorted(set(needs_repair)),
     )
 
 
-def _source_state(source: SourcePlan) -> str:
-    if not source.complete:
-        return "incomplete"
-    if source.exhausted:
-        return "exhausted"
-    return "complete"
+# --- helpers ---------------------------------------------------------------------------------------------------------
 
 
-def _tokenizer_summary_row(tokenizer_complete: bool) -> tuple[str, ...]:
-    state = "complete" if tokenizer_complete else "incomplete"
-    return ("tokenizer", "tokenizer", "", "", "", "", "", "", "", state, "")
+def _selected(config: DatasetConfig, sources: Iterable[str] | None) -> list[str]:
+    """``sources`` in config order (every source when None); unknown names are an error."""
+    if sources is None:
+        return list(config.sources)
+    wanted = set(sources)
+    unknown = wanted - set(config.sources)
+    if unknown:
+        raise ValueError(f"unknown sources {sorted(unknown)}")
+    return [name for name in config.sources if name in wanted]
 
 
-def _format_table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+def format_table(header: tuple[str, ...], rows: Sequence[tuple[str, ...]]) -> str:
     """Left-aligned columns, two spaces apart, each as wide as its widest cell (header included)."""
     widths = [max(len(header[column]), *(len(row[column]) for row in rows)) for column in range(len(header))]
-    lines = [_format_table_line(header, widths)]
-    for row in rows:
-        lines.append(_format_table_line(row, widths))
+    lines = [_table_line(header, widths)]
+    lines.extend(_table_line(row, widths) for row in rows)
     return "\n".join(lines)
 
 
-def _format_table_line(cells: tuple[str, ...], widths: list[int]) -> str:
-    return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths))
+def _table_line(cells: tuple[str, ...], widths: list[int]) -> str:
+    return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths)).rstrip()
 
 
-def _fmt(n: int) -> str:
-    return f"{n:,}"
-
-
-def _epochs(budget_tokens: int, tokens_present: int) -> float | None:
-    if tokens_present <= 0 or budget_tokens <= 0:
-        return None
-    return budget_tokens / tokens_present
-
-
-def _fmt_epochs(epochs: float | None) -> str:
-    return "-" if epochs is None else f"{epochs:.2f}"
-
-
-# --- planning ----------------------------------------------------------------------------------------------------------
-
-
-def plan(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
-    """Compare ``cfg`` with the manifests under ``layout`` (the config rejects sources no stage uses)."""
-    tokenizer_complete = _tokenizer_complete(cfg, layout)
-    result = Plan(tokenizer_complete=tokenizer_complete)
-    for name in cfg.sources:
-        result.sources.append(_plan_source(cfg, name, layout, tokenizer_complete))
-    result.complete = tokenizer_complete and all(source.complete for source in result.sources)
-    return result
-
-
-def _tokenizer_complete(cfg: DatasetConfig, layout: DatasetLayout) -> bool:
-    out = layout.tokenizer_dir(cfg.tokenizer.name)
-    manifest = Manifest.load(out)
-    if manifest is None:
-        return False
-    return manifest.is_current(cfg.tokenizer_hash()) and (out / "tokenizer_config.json").is_file()
-
-
-def _current(directory: Path, source_hash: str, stage: str) -> tuple[Manifest | None, str | None]:
-    """(manifest, problem): the manifest if it is current and its shards verify, else None and why."""
-    manifest = Manifest.load(directory)
-    if manifest is None:
-        return None, f"{stage}: manifest missing"
-    if manifest.stage != stage or not manifest.is_current(source_hash):
-        return None, f"{stage}: manifest stale"
-    problems = verify_shards(directory, manifest)
-    if problems:
-        return None, f"{stage}: {problems[0]}"
-    return manifest, None
-
-
-def stage_dir(layout: DatasetLayout, name: str, stage: str) -> Path:
-    """The folder of ``stage`` (``raw`` / ``processed``) of source ``name``."""
-    return layout.raw_dir(name) if stage == "raw" else layout.processed_dir(name)
-
-
-def stage_hash(cfg: DatasetConfig, name: str, stage: str) -> str:
-    """The manifest key of ``stage`` of source ``name``."""
-    return cfg.raw_hash(name) if stage == "raw" else cfg.processed_hash(name)
-
-
-def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict[str, str]:
-    """``{stage: problem}`` for the source folders whose manifest is present but stale or unverifiable (the build
-    removes or repairs those folders before rerunning the step)."""
-    problems: dict[str, str] = {}
-    for stage in SOURCE_STAGES:
-        directory = stage_dir(layout, name, stage)
-        if Manifest.load(directory) is None:
-            continue  # nothing present is not a problem, only stale or broken folders are
-        _, problem = _current(directory, stage_hash(cfg, name, stage), stage)
-        if problem is not None:
-            problems[stage] = problem
-    return problems
-
-
-# --- one source --------------------------------------------------------------------------------------------------------
-
-
-def budget_tokens_of(cfg: DatasetConfig, name: str) -> int:
-    """Interim token budget of a source: ``sequence_budget × block_size`` (0 for a source used only for validation).
-    task 8: the planner counts sequences and this disappears."""
-    return cfg.sequence_budget(name) * cfg.block_size
-
-
-def _plan_source(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
-    source = cfg.sources[name]
-    trained = cfg.used_in_train(name)
-    budget = budget_tokens_of(cfg, name)
-    manifests, problem = _current_stage_manifests(cfg, name, layout)
-    raw = manifests.get("raw")
-    processed = manifests.get("processed")
-
-    exhausted = raw is not None and bool(raw.extra.get("exhausted"))
-    rows_present = raw.rows() if raw is not None else 0
-    tokens_present = (processed.tokens() or 0) if processed is not None else 0
-
-    tokens_per_row = float(min(source.describe_tokens_per_row, cfg.max_seq_length))  # pretrain counts are capped there
-    measured = _measured_tokens_per_row(raw, processed)
-    if measured is not None:
-        tokens_per_row = measured
-    # task 8: rows_needed = ceil(sequence_budget × SAFETY_MARGIN ÷ (1 − validation_fraction)); no tokens per row
-    rows_needed = rows_for_budget(budget, tokens_per_row) if trained else int(source.rows or 0)
-    rows_to_fetch = max(0, rows_needed - rows_present)
-
-    if problem is None and raw is not None and processed is not None:
-        problem = _pipeline_problem(source.kind, raw, processed, budget, rows_needed, trained, exhausted)
-    if problem is None and not tokenizer_complete:
-        problem = "tokenizer missing"
-
-    if problem is not None:
-        reason = problem
-    elif trained and tokens_present < budget:
-        reason = f"exhausted at {tokens_present} of {budget} tokens"
-    elif not trained and rows_present < rows_needed:
-        reason = f"exhausted at {rows_present} of {rows_needed} rows"
-    else:
-        reason = "ok"
-
-    return SourcePlan(
-        name=name,
-        kind=source.kind,
-        budget_tokens=budget,
-        tokens_per_row=tokens_per_row,
-        rows_needed=rows_needed,
-        rows_present=rows_present,
-        rows_to_fetch=rows_to_fetch,
-        tokens_present=tokens_present,
-        manifest_current=len(manifests) == len(SOURCE_STAGES),
-        exhausted=exhausted,
-        complete=problem is None,
-        reason=reason,
-    )
-
-
-def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> tuple[dict[str, Manifest], str | None]:
-    """The current, verified manifests of the source's folders (``raw`` / ``processed``) plus the problem of the
-    first folder that has none (None if both are fine)."""
-    manifests: dict[str, Manifest] = {}
-    first_problem: str | None = None
-    for stage in SOURCE_STAGES:
-        manifest, problem = _current(stage_dir(layout, name, stage), stage_hash(cfg, name, stage), stage)
-        if manifest is not None:
-            manifests[stage] = manifest
-        elif first_problem is None:
-            first_problem = problem
-    return manifests, first_problem
-
-
-def _pipeline_problem(
-    kind: str, raw: Manifest, processed: Manifest, budget: int, rows_needed: int, trained: bool, exhausted: bool
-) -> str | None:
-    """Why the folders of a source are not finished even though both manifests are current, or None."""
-    if processed.extra.get("columns") != list(processed_columns(kind)):
-        return "processed: predates the current columns"  # the build rebuilds it from the raw shards, no download
-    if processed.extra.get("input_shards") != [[shard.name, shard.rows] for shard in raw.shards]:
-        return "processed: behind raw"
-    if exhausted:
-        return None
-    if trained:
-        tokens = processed.tokens() or 0
-        if tokens < budget:
-            return f"tokens {tokens} < budget {budget}"
-    elif raw.rows() < rows_needed:
-        return f"rows {raw.rows()} < {rows_needed}"
-    return None
-
-
-def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -> float | None:
-    """Processed tokens per **raw** row over the raw shards the processed manifest covers (this includes what the
-    filters and the dedup drop); before anything is processed, the raw manifest's own token counts per raw row
-    (available right after the download); None without usable counts."""
-    if raw is None:
-        return None
-    if processed is not None:
-        tokens = processed.tokens() or 0
-        covered = len(processed.extra.get("input_shards", []))
-        raw_rows = sum(shard.rows for shard in raw.shards[:covered])
-        if tokens > 0 and raw_rows > 0:
-            return tokens / raw_rows
-    raw_tokens = raw.tokens()
-    if raw_tokens is not None and raw_tokens > 0 and raw.rows() > 0:
-        return raw_tokens / raw.rows()
-    return None
-
-
-__all__ = ["SOURCE_STAGES", "Plan", "SourcePlan", "budget_tokens_of", "plan", "rows_for_budget", "stage_dir", "stage_hash", "stage_problems"]
+__all__ = [
+    "DatasetReport",
+    "DownloadPlan",
+    "SourceDownload",
+    "SourceState",
+    "build_is_pending",
+    "current_processed_manifest",
+    "every_source_satisfies_its_budget",
+    "format_table",
+    "plan_downloads",
+    "processed_covers_raw",
+    "raw_is_exhausted",
+    "rows_needed",
+    "rows_sufficient",
+    "source_state",
+    "sources_with_pending_raw_shards",
+    "summarize_dataset_state",
+    "tokenizer_is_prepared",
+    "training_rows_after_split",
+]
