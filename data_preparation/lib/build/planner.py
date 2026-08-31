@@ -26,6 +26,7 @@ from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.stages.download import current_raw_manifest, raw_manifest_state
 from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted
 
 _MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not 60.000000000000007
 
@@ -76,13 +77,13 @@ def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
 def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
     """Whether the loader of ``name`` has nothing more to give: the raw manifest says exhausted — unless it was
     exhausted by a ``check_limit`` that has since grown or been removed (``download`` reads on then)."""
-    if not raw.extra.get("exhausted"):
+    if not is_exhausted(raw):
         return False
-    reached = raw.extra.get("check_limit")
+    reached = check_limit_reached(raw)
     if reached is None:
         return True
     limit = config.sources[name].check_limit
-    return limit is not None and limit <= int(reached)
+    return limit is not None and limit <= reached
 
 
 def current_processed_manifest(config: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:

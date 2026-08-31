@@ -17,6 +17,7 @@ import pytest
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.storage.raw_folder import RawFolder
 from data_preparation.lib.sources import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.conftest import REPO, REV, FakeHub
@@ -755,17 +756,15 @@ def test_download_stops_within_one_shard_when_asked(
 def test_truncate_raw_to_good_prefix(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
 ) -> None:
-    from data_preparation.lib.stages.download import truncate_raw_to_good_prefix
-
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     _failing_loader(monkeypatch, fail_at=None)
     download(cfg, "p", layout, rows_needed=40, shard_size=10)
     raw = layout.raw_dir("p")
     m = Manifest.load(raw)
-    assert m is not None and truncate_raw_to_good_prefix(raw, m) and len(m.shards) == 4  # nothing wrong: untouched
+    assert m is not None and RawFolder(raw, m).truncate_to_good_prefix() and len(m.shards) == 4  # nothing wrong: untouched
 
     (raw / "data-00002.parquet").write_bytes(b"corrupt")
-    assert truncate_raw_to_good_prefix(raw, m)
+    assert RawFolder(raw, m).truncate_to_good_prefix()
     assert [s.name for s in m.shards] == ["data-00000.parquet", "data-00001.parquet"] and m.rows_fetched == 20
     assert sorted(p.name for p in raw.glob("*.parquet")) == ["data-00000.parquet", "data-00001.parquet"]
     stored = Manifest.load(raw)
@@ -775,10 +774,63 @@ def test_truncate_raw_to_good_prefix(
 
     (raw / "data-00000.parquet").unlink()  # nothing to keep
     m3 = Manifest.load(raw)
-    assert m3 is not None and not truncate_raw_to_good_prefix(raw, m3)
+    assert m3 is not None and not RawFolder(raw, m3).truncate_to_good_prefix()
     m3.shards[0].offset = None  # a legacy manifest without offsets: no safe resume point
     (raw / "data-00000.parquet").write_bytes(b"x")
-    assert not truncate_raw_to_good_prefix(raw, m3)
+    assert not RawFolder(raw, m3).truncate_to_good_prefix()
+
+
+def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resume(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader
+) -> None:
+    """A repair that drops a broken shard restores **every** counter from the last kept shard, so the resume behind
+    it counts each rejected source row exactly once (round-2 finding D-M4: only `rows_fetched` and the exhaustion
+    flag were reset, so the malformed / too-long rows of the dropped shards were counted twice)."""
+    src_dir = layout.root.parent / "retruncate"
+    write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
+    cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, max_seq_length=5))
+    full = download(cfg, "d", layout, rows_needed=10, shard_size=4)
+    assert full.extra == {"skipped_malformed": 10, "dropped_too_long": 10} and full.rows_fetched == 30
+    shards = [(s.rows, s.offset, s.skipped_malformed, s.dropped_too_long) for s in full.shards]
+    assert shards == [(4, 12, 4, 4), (4, 24, 8, 8), (2, 30, 10, 10)]  # per shard: the totals up to its last stored row
+    rows = read_rows(layout.raw_dir("d"))
+
+    raw = layout.raw_dir("d")
+    (raw / "data-00001.parquet").write_bytes(b"corrupt")
+    broken = Manifest.load(raw)
+    assert broken is not None and RawFolder(raw, broken).truncate_to_good_prefix()
+    assert broken.rows_fetched == 12 and broken.extra == {"skipped_malformed": 4, "dropped_too_long": 4}
+
+    resumed = download(cfg, "d", layout, rows_needed=10, shard_size=4)
+    assert resumed.extra == full.extra and resumed.rows_fetched == 30
+    assert [(s.rows, s.offset, s.skipped_malformed, s.dropped_too_long) for s in resumed.shards] == shards
+    assert read_rows(raw) == rows
+
+
+def test_truncating_a_manifest_without_shard_counters_resets_them(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raw folder written before the per-shard counters existed still loads and truncates: the counters restart at
+    0 with a log line instead of crashing or making the folder stale."""
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    _failing_loader(monkeypatch, fail_at=None)
+    download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    raw = layout.raw_dir("p")
+    legacy = Manifest.load(raw)
+    assert legacy is not None
+    for shard in legacy.shards:  # a manifest from before the fields existed
+        shard.skipped_malformed = shard.dropped_too_long = None
+    legacy.extra["skipped_malformed"] = legacy.extra["dropped_too_long"] = 7
+    legacy.save(raw)
+
+    (raw / "data-00002.parquet").write_bytes(b"corrupt")
+    reloaded = Manifest.load(raw)
+    assert reloaded is not None and all(s.skipped_malformed is None for s in reloaded.shards)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        assert RawFolder(raw, reloaded).truncate_to_good_prefix()
+    assert reloaded.rows_fetched == 20 and reloaded.extra["skipped_malformed"] == 0 and reloaded.extra["dropped_too_long"] == 0
+    assert "written before the per-shard reject counters existed" in caplog.text
+    assert raw_manifest_state(cfg, "p", layout) == "current"  # never stale because of the missing fields
 
 
 def test_download_instruct_filter_calls_the_loader_once_and_closes_it(

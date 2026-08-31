@@ -46,6 +46,11 @@ class ShardInfo:
     rows: int
     tokens: int | None = None
     offset: int | None = None  # raw shards: the loader offset (source rows consumed) right after this shard's last row
+    # Raw shards: the folder's reject totals right after this shard's last row, so a truncation to the good prefix
+    # restores them along with `offset` (`lib/storage/raw_folder.py`). None on processed shards and on raw shards
+    # written before these fields existed (a truncation then restarts the counters at 0, with a log line).
+    skipped_malformed: int | None = None
+    dropped_too_long: int | None = None
 
 
 @dataclass
@@ -94,10 +99,23 @@ class Manifest:
         manifest without ``truncated_at_tokens`` is never outdated by this rule."""
         return self.truncated_at_tokens is not None and max_seq_length > self.truncated_at_tokens
 
-    def add_shard(self, name: str, rows: int, tokens: int | None = None, offset: int | None = None) -> None:
+    def add_shard(
+        self,
+        name: str,
+        rows: int,
+        tokens: int | None = None,
+        offset: int | None = None,
+        skipped_malformed: int | None = None,
+        dropped_too_long: int | None = None,
+    ) -> None:
         """Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name."""
         self.shards = [shard for shard in self.shards if shard.name != name]
-        self.shards.append(ShardInfo(name=name, rows=rows, tokens=tokens, offset=offset))
+        self.shards.append(
+            ShardInfo(
+                name=name, rows=rows, tokens=tokens, offset=offset,
+                skipped_malformed=skipped_malformed, dropped_too_long=dropped_too_long,
+            )
+        )
         self.shards.sort(key=lambda shard: shard.name)
 
     # --- (de)serialisation -------------------------------------------------------------------------------------------

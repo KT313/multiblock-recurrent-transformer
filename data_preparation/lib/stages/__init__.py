@@ -20,7 +20,6 @@ from data_preparation.lib.stages.download import (
     prepare_tokenizer,
     raw_manifest_problem,
     raw_manifest_state,
-    truncate_raw_to_good_prefix,
 )
 
 __all__ = [
@@ -35,5 +34,4 @@ __all__ = [
     "prepare_tokenizer",
     "raw_manifest_problem",
     "raw_manifest_state",
-    "truncate_raw_to_good_prefix",
 ]

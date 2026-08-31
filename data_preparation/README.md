@@ -79,8 +79,11 @@ dataset/
 Both trees are shared by every dataset config (stages 1 and 2 of the thesis config draw from the same
 `processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
 (`lib/storage/manifest.py`): the hash of the settings that produced it, rows and tokens per shard, the loader
-offset after each raw shard, how tokens were counted and — for raw — `truncated_at_tokens`, the cap the rows were
-cut or dropped at.
+offset and the rejected-row totals after each raw shard, how tokens were counted and — for raw — `truncated_at_tokens`,
+the cap the rows were cut or dropped at. One object owns a raw folder's bookkeeping (`lib/storage/raw_folder.py`:
+`RawFolder` — the cap, the loader offset, the `skipped_malformed` / `dropped_too_long` counters, the exhaustion flag
+and the truncation to a good prefix); the per-source download, the `github_code` group pass and the repair step all
+go through it, so a repair followed by a resume restores every counter instead of only the offset.
 
 - `raw/` is keyed on `DatasetConfig.raw_hash`: the loader identity (repo, revision, files, split, converter, fields,
   filter, seed, ...) plus `token_count` and the tokenizer. Processing options, `max_seq_length`, budgets, weights,
@@ -90,8 +93,9 @@ cut or dropped at.
   from the raw shards; nothing is downloaded.
 
 Shards are published **one at a time** (written to a `.tmp` file, renamed, recorded in the manifest — raw shards
-with the loader offset after their last row), so a network error, a crash or Ctrl-C keeps everything fetched so far
-and the next run resumes behind the last complete shard. All-at-once builds (shuffled sources, minhash) write into
+with the loader offset **and** the rejected-row totals as of their last row), so a network error, a crash or Ctrl-C
+keeps everything fetched so far and the next run resumes behind the last complete shard without counting a skipped
+or dropped source row twice. All-at-once builds (shuffled sources, minhash) write into
 `processed/<source>.tmp` and rename it into place.
 
 ## Commands

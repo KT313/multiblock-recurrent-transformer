@@ -8,7 +8,8 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   so the source identity or the tokenizer changed) or an *outdated* one (stored with a smaller ``max_seq_length``
   than the config asks for now) is **deleted and downloaded again — after the user confirmed**. A folder with a
   *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix with
-  :func:`truncate_raw_to_good_prefix` (the next download resumes there); when no prefix can be kept it is queued for
+  :meth:`RawFolder.truncate_to_good_prefix` (the next download resumes there, with the offset and the reject
+  counters the last kept shard recorded); when no prefix can be kept it is queued for
   the same confirmed deletion. Shards without a manifest are an error: nothing says where those rows came from, and
   guessing would either delete data or resume from the wrong offset.
 * **processed** (derived, cheap): deleted without confirmation when stale, broken, without a manifest, built from raw
@@ -35,8 +36,8 @@ from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
-from data_preparation.lib.stages.download import truncate_raw_to_good_prefix
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
+from data_preparation.lib.storage.raw_folder import RawFolder
 
 log = get_logger(__name__)
 
@@ -280,7 +281,7 @@ def perform_repairs(report: RepairReport) -> None:
 
 def _truncate_raw(action: RepairAction) -> None:
     manifest = Manifest.load(action.folder)
-    if manifest is None or not truncate_raw_to_good_prefix(action.folder, manifest):
+    if manifest is None or not RawFolder(action.folder, manifest).truncate_to_good_prefix():
         raise RepairError(f"{action.source}: {action.folder} changed while repairing; could not truncate to its good prefix")
 
 

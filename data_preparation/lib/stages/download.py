@@ -24,11 +24,11 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.abort import StopCheck, check_stop
+from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources import (
@@ -45,8 +45,9 @@ from data_preparation.lib.sources import (
 from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.truncation import truncate_many
-from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions, shard_problem, shard_rows, shard_tokens
-from data_preparation.lib.storage.parquet import ShardWriter, estimate_tokens, list_parquet_files, shard_index
+from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
+from data_preparation.lib.storage.parquet import ShardWriter, estimate_tokens
+from data_preparation.lib.storage.raw_folder import ROW_PROGRESS_KEY, RawFolder, RowProgress
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
@@ -299,45 +300,50 @@ def download(
     starts at the boundary — the same bytes are never downloaded twice. Sources without a converter are read with only
     ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
 
-    Every shard is published and recorded in the manifest (with the loader offset after its last row,
-    ``ShardInfo.offset``, and the skipped / dropped totals up to that row) as soon as it is written, so a failure or
-    a stop request (``should_stop``, checked after every shard) keeps everything fetched so far and the next call
-    resumes from the last complete shard without counting anything twice.
+    Every shard is published and recorded in the manifest (with the loader offset after its last row and the
+    skipped / dropped totals up to that row, :class:`RawFolder`) as soon as it is written, so a failure or a stop
+    request (``should_stop``, checked after every shard) keeps everything fetched so far and the next call resumes
+    from the last complete shard without counting anything twice.
     """
     source = fetch_source(cfg, cfg.sources[name])
-    out = layout.raw_dir(name)
-    manifest = _raw_manifest_to_append_to(cfg, name, layout)
+    folder = _raw_folder_to_append_to(cfg, name, layout, should_stop=should_stop)
 
     # nothing to do?
-    _reset_check_limit_exhaustion(manifest, source, name)
-    if manifest.extra.get("exhausted"):
-        log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
-        return manifest
-    wanted = rows_needed - manifest.rows()
+    folder.reopen_if_check_limit_grew(source.check_limit)
+    if folder.exhausted:
+        log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
+        return folder.manifest
+    wanted = rows_needed - folder.rows
     if wanted <= 0:
-        return manifest
-    max_consume = None if source.check_limit is None else source.check_limit - manifest.rows_fetched
+        return folder.manifest
+    max_consume = None if source.check_limit is None else source.check_limit - folder.rows_fetched
     if max_consume is not None and max_consume <= 0:
-        manifest.extra["exhausted"] = True
-        manifest.extra["check_limit"] = source.check_limit
-        manifest.save(out)
-        return manifest
+        folder.mark_exhausted(check_limit=source.check_limit)
+        return folder.manifest
 
     # fetch one increment and append it shard by shard
-    log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
+    log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, folder.rows_fetched, folder.directory)
     counters = _FetchCounters()
-    increment = _Increment(manifest, out, counters, should_stop)
-    token_step = _TokenStep(source, TokenCounter(cfg, layout), _folder_cap(manifest, cfg), counters)
+    token_step = _TokenStep(source, TokenCounter(cfg, layout), folder.cap, counters)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=name, unit="row", panel="downloads") as bar:
-        rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
-        with ShardWriter(out, shard_size, start_shard=len(manifest.shards), on_shard=increment.record_shard) as writer:
+        rows = _fetch_rows(source, name, folder.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
+        with ShardWriter(folder.directory, shard_size, start_shard=folder.shard_count, on_shard=folder.record_shard) as writer:
             for row in rows:
-                increment.add(writer, row)
+                folder.add(writer, row)
 
-    increment.finish(source)
-    _log_increment(name, counters, manifest)
-    return manifest
+    _finish_increment(folder, source, counters)
+    _log_increment(name, counters, folder.manifest)
+    return folder.manifest
+
+
+def _finish_increment(folder: RawFolder, source: SourceConfig, counters: _FetchCounters) -> None:
+    """Hand the increment's totals to the folder; a source stopped by its own ``check_limit`` records that limit
+    (so a later, larger one reopens it) instead of counting as a loader that ran dry."""
+    limit = source.check_limit
+    by_limit = limit if limit is not None and folder.start_offset + counters.consumed >= limit else None
+    progress_now = RowProgress(counters.consumed, counters.skipped_malformed, counters.dropped_too_long)
+    folder.finish(progress_now, exhausted=counters.exhausted, check_limit=by_limit)
 
 
 def _log_increment(name: str, counters: _FetchCounters, manifest: Manifest) -> None:
@@ -347,99 +353,24 @@ def _log_increment(name: str, counters: _FetchCounters, manifest: Manifest) -> N
     )
 
 
-def _raw_manifest_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest:
-    """The current raw manifest of ``name``, or a fresh one (``truncated_at_tokens = max_seq_length``) when the folder
-    has none. Refused when the folder is stale or outdated (:class:`RawFolderError`) — deleting it is the repair
-    step's decision — or holds shards without any manifest: nothing would say where those rows came from, and
-    starting over would delete them."""
+def _raw_folder_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLayout, *, should_stop: StopCheck | None = None) -> RawFolder:
+    """The raw folder of ``name`` around its current manifest, or a fresh one (``truncated_at_tokens =
+    max_seq_length``) when the directory has none. Refused when the folder is stale or outdated
+    (:class:`RawFolderError`) — deleting it is the repair step's decision — or holds shards without any manifest:
+    nothing would say where those rows came from, and starting over would delete them."""
     out = layout.raw_dir(name)
     state, manifest = _inspect_raw(cfg, name, layout)
     if manifest is not None and state != "current":
         problem = raw_manifest_problem(cfg, name, layout)
         raise RawFolderError(name, out, state, problem or state)
-    if manifest is not None:
-        return manifest
-    if has_shards(out):
-        raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
-    return new_manifest(cfg, name, cfg.raw_hash(name), "raw", tokens=True, truncated_at_tokens=cfg.max_seq_length)
-
-
-def _folder_cap(manifest: Manifest, cfg: DatasetConfig) -> int:
-    """The token cap the rows appended to a raw folder are cut at: the folder's recorded ``truncated_at_tokens``.
-    Appending under a *lower* config cap would otherwise leave a folder whose manifest promises longer rows than the
-    appended part holds, and raising the cap back would not be detected (:meth:`Manifest.is_outdated`). Lowering
-    stays free (the build clamps the stored counts). A manifest without the field (never written by this code)
-    falls back to the config's cap."""
-    return manifest.truncated_at_tokens if manifest.truncated_at_tokens is not None else cfg.max_seq_length
-
-
-def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
-    """A source marked exhausted because its ``check_limit`` was reached may be read further when the limit grew
-    (or was removed): ``check_limit`` is not part of the raw hash, so the manifest is not stale, only its flag."""
-    reached = manifest.extra.get("check_limit")
-    if not manifest.extra.get("exhausted") or reached is None:
-        return
-    if source.check_limit is None or source.check_limit > int(reached):
-        log.info("%s: check_limit grew from %s to %s, source no longer exhausted", name, reached, source.check_limit)
-        manifest.extra["exhausted"] = False
-        del manifest.extra["check_limit"]
+    if manifest is None:
+        if has_shards(out):
+            raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
+        manifest = new_manifest(cfg, name, cfg.raw_hash(name), "raw", tokens=True, truncated_at_tokens=cfg.max_seq_length)
+    return RawFolder(out, manifest, config_cap=cfg.max_seq_length, should_stop=should_stop)
 
 
 UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop consuming once `wanted` rows are kept
-PROGRESS_KEY = "_progress"  # private row key: the fetch progress right after this row (stripped before the row is written)
-
-
-class _Progress(NamedTuple):
-    """Where the increment stood when a stored row was produced: the loader offset after it and how many rows
-    before it were skipped / dropped. Persisted with every shard (its last stored row's values), so a resume — which
-    re-reads the source from that offset — counts every rejected row exactly once."""
-
-    consumed: int
-    skipped_malformed: int
-    dropped_too_long: int
-
-
-class _Increment:
-    """Bookkeeping of one download increment of a raw directory: every published shard is recorded in the manifest
-    with the loader offset after its last row (and the skipped / dropped totals up to it) and the manifest is
-    saved, so the increment is resumable at shard granularity; then the stop request is checked."""
-
-    def __init__(self, manifest: Manifest, out: Path, counters: _FetchCounters, should_stop: StopCheck | None) -> None:
-        self.manifest = manifest
-        self.out = out
-        self.counters = counters
-        self.should_stop = should_stop
-        self.start_offset = manifest.rows_fetched
-        self.skipped_before = int(manifest.extra.get("skipped_malformed", 0))
-        self.dropped_before = int(manifest.extra.get("dropped_too_long", 0))
-        self.last = _Progress(0, 0, 0)  # progress at the row most recently handed to the writer
-
-    def add(self, writer: ShardWriter, row: Row) -> None:
-        """Hand ``row`` (tagged with :data:`PROGRESS_KEY` by the token step) to ``writer``."""
-        self.last = row.pop(PROGRESS_KEY)
-        writer.add(row)
-
-    def record_shard(self, path: Path) -> None:
-        self.manifest.add_shard(path.name, shard_rows(path), shard_tokens(path), offset=self.start_offset + self.last.consumed)
-        self._save(self.last)
-        check_stop(self.should_stop)
-
-    def finish(self, source: SourceConfig) -> None:
-        """After the loader ran dry / the target was reached: the final offset, counts and the exhaustion flag."""
-        counters = self.counters
-        if counters.exhausted:
-            self.manifest.extra["exhausted"] = True
-            if source.check_limit is not None and self.start_offset + counters.consumed >= source.check_limit:
-                self.manifest.extra["check_limit"] = source.check_limit  # exhausted by the limit, not by the loader
-        self.last = _Progress(counters.consumed, counters.skipped_malformed, counters.dropped_too_long)
-        self._save(self.last)
-
-    def _save(self, progress: _Progress) -> None:
-        self.manifest.rows_fetched = self.start_offset + progress.consumed
-        self.manifest.extra["skipped_malformed"] = self.skipped_before + progress.skipped_malformed
-        self.manifest.extra["dropped_too_long"] = self.dropped_before + progress.dropped_too_long
-        self.manifest.save(self.out)
-
 
 TOKEN_BATCH = 256  # rows tokenized per tokenizer call while downloading
 
@@ -450,8 +381,9 @@ class _TokenStep:
 
     Pretrain rows: ``text_field`` is truncated at token ``max_tokens`` (``truncation.py``) and ``tokens`` is the
     true count of the stored text. Instruct rows: ``tokens`` counts instruction + input + output uncapped; a row over
-    ``max_tokens`` is dropped (``counters.dropped_too_long``), never cut. Every stored row's :data:`PROGRESS_KEY` gets
-    the drop count of the rows before it (exact per row, so a resume never double counts).
+    ``max_tokens`` is dropped (``counters.dropped_too_long``), never cut. Every stored row's
+    :data:`ROW_PROGRESS_KEY` gets the drop count of the rows before it (exact per row, so a resume never double
+    counts).
     """
 
     def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _FetchCounters) -> None:
@@ -490,8 +422,8 @@ class _TokenStep:
                 self._counters.dropped_too_long += 1
                 continue
             row["tokens"] = tokens
-            progress: _Progress = row[PROGRESS_KEY]
-            row[PROGRESS_KEY] = progress._replace(dropped_too_long=self._counters.dropped_too_long)
+            progress: RowProgress = row[ROW_PROGRESS_KEY]
+            row[ROW_PROGRESS_KEY] = progress._replace(dropped_too_long=self._counters.dropped_too_long)
             stored.append(row)
         return stored
 
@@ -561,7 +493,7 @@ def _fetch_rows(
                     continue
             else:
                 row = text_row(source, raw, name)
-            row[PROGRESS_KEY] = _Progress(counters.consumed, counters.skipped_malformed, 0)
+            row[ROW_PROGRESS_KEY] = RowProgress(counters.consumed, counters.skipped_malformed, 0)
             yield from _kept(token_step.add(row, wanted - counters.kept if is_instruct else None), counters, bar)
             if is_instruct and counters.kept >= wanted:
                 return  # enough: stop pulling (the finally closes the loader)
@@ -586,11 +518,9 @@ class _GroupMember:
 
     name: str
     source: SourceConfig
-    out: Path
-    manifest: Manifest
+    folder: RawFolder
     wanted: int
     counters: _FetchCounters
-    increment: _Increment
     token_step: _TokenStep
 
 
@@ -621,26 +551,24 @@ def download_github_code_group(
             raise ValueError(f"{name}: download_github_code_group needs github_code sources without check_limit")
         if members and github_code_repo_key(source) != github_code_repo_key(members[0].source):
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
-        out = layout.raw_dir(name)
-        manifest = _raw_manifest_to_append_to(cfg, name, layout)
-        results[name] = manifest
-        if manifest.extra.get("exhausted"):
-            log.info("%s: source exhausted after %d rows, nothing more to fetch", name, manifest.rows_fetched)
+        folder = _raw_folder_to_append_to(cfg, name, layout, should_stop=should_stop)
+        results[name] = folder.manifest
+        if folder.exhausted:
+            log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
             continue
-        wanted = rows_needed[name] - manifest.rows()
+        wanted = rows_needed[name] - folder.rows
         if wanted > 0:
             counter = counter or TokenCounter(cfg, layout)
             counters = _FetchCounters()
-            increment = _Increment(manifest, out, counters, should_stop)
-            token_step = _TokenStep(source, counter, _folder_cap(manifest, cfg), counters)
-            members.append(_GroupMember(name, source, out, manifest, wanted, counters, increment, token_step))
+            token_step = _TokenStep(source, counter, folder.cap, counters)
+            members.append(_GroupMember(name, source, folder, wanted, counters, token_step))
     if not members:
         return results
 
     _fetch_group(members, layout, shard_size, hf_token)
     for member in members:
-        member.increment.finish(member.source)
-        _log_increment(member.name, member.counters, member.manifest)
+        _finish_increment(member.folder, member.source, member.counters)
+        _log_increment(member.name, member.counters, member.folder.manifest)
     return results
 
 
@@ -648,8 +576,8 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
     """Run the group pass and append every member's rows (through its token step) to its raw directory, one shard
     writer per member."""
     for member in members:
-        log.info("%s: fetching %d rows from offset %d -> %s", member.name, member.wanted, member.manifest.rows_fetched, member.out)
-    requests = [GithubCodeRequest(m.name, m.source, m.manifest.rows_fetched, m.wanted) for m in members]
+        log.info("%s: fetching %d rows from offset %d -> %s", member.name, member.wanted, member.folder.rows_fetched, member.folder.directory)
+    requests = [GithubCodeRequest(m.name, m.source, m.folder.rows_fetched, m.wanted) for m in members]
     columns = _union_columns([loader_columns(m.source) for m in members])
     fetch_stats = FetchStats()
     by_name = {m.name: m for m in members}
@@ -660,7 +588,7 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
         bar = stack.enter_context(progress(total=total, desc=f"{repo} ({len(members)} languages)", unit="row", panel="downloads"))
         postfix = _DownloadPostfix(bar, fetch_stats)
         writers = {
-            m.name: stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards), on_shard=m.increment.record_shard))
+            m.name: stack.enter_context(ShardWriter(m.folder.directory, shard_size, start_shard=m.folder.shard_count, on_shard=m.folder.record_shard))
             for m in members
         }
         rows = read_github_code_group(
@@ -671,7 +599,7 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
             member = by_name[name]
             member.counters.consumed += 1
             row = text_row(member.source, raw, name)
-            row[PROGRESS_KEY] = _Progress(member.counters.consumed, 0, 0)
+            row[ROW_PROGRESS_KEY] = RowProgress(member.counters.consumed, 0, 0)
             _store(member, writers[name], member.token_step.add(row))
             postfix.consumed(consumed_total)
             bar.update(1)
@@ -684,7 +612,7 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
 
 def _store(member: _GroupMember, writer: ShardWriter, stored: list[Row]) -> None:
     for row in stored:
-        member.increment.add(writer, row)
+        member.folder.add(writer, row)
         member.counters.kept += 1
 
 
@@ -706,35 +634,6 @@ def raw_text_of(cfg: DatasetConfig, name: str) -> Callable[[Row], str]:
         return instruct_text
     text_field = source.text_field
     return lambda row: _text_or_empty(row.get(text_field))
-
-
-def truncate_raw_to_good_prefix(directory: Path, manifest: Manifest) -> bool:
-    """Repair a raw directory with a missing / unreadable / mismatching shard by dropping that shard and everything
-    after it: the manifest keeps the good prefix, ``rows_fetched`` becomes the offset after its last shard (so the
-    next download resumes there) and the exhaustion flag is cleared. Returns False — nothing changed — when no
-    prefix can be kept (the first shard is bad, or a kept shard has no recorded offset).
-    """
-    good = 0
-    for shard in manifest.shards:
-        if shard_problem(directory, shard) is not None:
-            break
-        good += 1
-    if good == len(manifest.shards):
-        return True  # nothing wrong
-    if good == 0 or manifest.shards[good - 1].offset is None:
-        return False
-    dropped = manifest.shards[good:]
-    log.warning("%s: dropping %d shard(s) from %s (%s and after)", manifest.source, len(dropped), directory, dropped[0].name)
-    manifest.shards = manifest.shards[:good]
-    manifest.rows_fetched = int(manifest.shards[-1].offset or 0)
-    manifest.extra.pop("exhausted", None)
-    manifest.extra.pop("check_limit", None)
-    for path in list_parquet_files(directory):
-        index = shard_index(path)
-        if index is not None and index >= good:
-            path.unlink()
-    manifest.save(directory)
-    return True
 
 
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
@@ -816,5 +715,4 @@ __all__ = [
     "require_manifest",
     "shard_list",
     "text_row",
-    "truncate_raw_to_good_prefix",
 ]
