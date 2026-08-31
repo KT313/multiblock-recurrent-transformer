@@ -28,6 +28,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.storage.atomic import write_atomically
 
 log = get_logger(__name__)
 
@@ -132,12 +133,10 @@ class Manifest:
         return cls(**kwargs)
 
     def save(self, directory: Path) -> Path:
-        """Write ``directory/MANIFEST.json`` atomically (via a ``.json.tmp`` sibling) and return its path."""
-        directory.mkdir(parents=True, exist_ok=True)
+        """Write ``directory/MANIFEST.json`` atomically (:func:`write_atomically`) and return its path."""
         path = directory / MANIFEST_NAME
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
-        tmp.replace(path)
+        with write_atomically(path) as tmp:
+            tmp.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
         log.debug("wrote %s (%d shards, %d rows)", path, len(self.shards), self.rows())
         return path
 
