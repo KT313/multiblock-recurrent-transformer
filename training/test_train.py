@@ -2,11 +2,15 @@
 """Tests for the training loop helpers (fast) and end-to-end runs of `training.train.train` on the tiny 3-stage
 config with synthetic data (marked slow)."""
 
+import json
 import math
+import os
 import random
 import shutil
 import sys
+import tempfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +20,7 @@ import torch
 from training.data.collate import find_multiple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from data_preparation.lib.build import prepare
 from model import RecurrentGPT
 from training import train as train_module
 from training.backend import SingleDeviceBackend
@@ -29,6 +34,7 @@ from training.data.dataset_resolver import (
 )
 from training.data.loader import Batch
 from training.logger import Logger
+from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.train import IGNORE_INDEX, LoopState, build_stage_dataloaders, micro_batch_stream, unwrap, validate
@@ -546,3 +552,185 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
     assert sorted(logged) == list(range(15, 21))
     final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final[CHECKPOINT_VALIDATION_ROWS_KEY] == full_run["validation_rows"]  # the new checkpoint stores the current split
+
+
+# --------------------------------------------------------------------------------------------------------------
+# golden run: the numerics oracle of the training-pipeline restructure (tasks/training_pipeline_restructure.md)
+
+GOLDEN_RUN_PATH = Path(__file__).resolve().parent / "golden_tiny_run.json"
+GOLDEN_EXACT_ENV = "GOLDEN_EXACT"  # `GOLDEN_EXACT=1`: compare every float with `==` instead of rel 1e-5
+GOLDEN_PER_STEP_KEYS = ("loss", "grad_norm", "lr")
+GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
+
+
+@contextmanager
+def _single_thread_deterministic() -> Iterator[None]:
+    """One intra-op thread and deterministic algorithms for the block; both restored afterwards, also on failure."""
+    threads = torch.get_num_threads()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.set_num_threads(1)
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(threads)
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+
+def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
+    """The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms), reduced to its numerics.
+
+    `config/tiny.yaml` with `precision: "32"`, `wandb_enabled: false`, `export_to_hf: false`,
+    `dataloader_num_workers: 0`, `resume: false` and `out_dir` in a temporary directory, on a
+    `SingleDeviceBackend(device="cpu", precision="32")` injected through `training.train.get_backend`. Returns
+    `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss, val_loss_<depth>...]}}, "checkpoints": [file names],
+    "optimizer_steps": number of optimizer.step() calls, "parameter_norms": {name: L2 norm in the final checkpoint}}`.
+    """
+    with tempfile.TemporaryDirectory() as tmp, _single_thread_deterministic():
+        tmp_path = Path(tmp)
+        out_dir = tmp_path / "out"
+        yaml_path = _write_yaml(
+            tmp_path,
+            tiny_dataset_dir,
+            out_dir,
+            precision='"32"',
+            wandb_enabled="false",
+            export_to_hf="false",
+            dataloader_num_workers="0",
+            resume="false",
+        )
+        settings = parse_settings(["--config", str(yaml_path)])
+        mp = pytest.MonkeyPatch()
+        optimizer_step_calls = 0
+
+        def cpu_backend(name: str, precision: str) -> SingleDeviceBackend:
+            assert name == settings.backend and precision == "32"
+            return SingleDeviceBackend(device="cpu", precision=precision)
+
+        def counting_build_optimizer(name: str, params: Any, **cfg: Any) -> torch.optim.Optimizer:
+            optimizer = build_optimizer(name, params, **cfg)
+            optimizer_class = type(optimizer)
+            original_step = optimizer_class.step
+
+            def counting_step(self: torch.optim.Optimizer, *args: Any, **kwargs: Any) -> Any:
+                nonlocal optimizer_step_calls
+                optimizer_step_calls += 1
+                return original_step(self, *args, **kwargs)
+
+            mp.setattr(optimizer_class, "step", counting_step)
+            return optimizer
+
+        mp.setattr(train_module, "get_backend", cpu_backend)
+        mp.setattr(train_module, "build_optimizer", counting_build_optimizer)
+        try:
+            logged = _run(yaml_path, mp)
+        finally:
+            mp.undo()
+
+        steps: dict[str, dict[str, float]] = {}
+        for done, metrics in sorted(logged.items()):
+            step_metrics = {key: float(metrics[key]) for key in GOLDEN_PER_STEP_KEYS}
+            step_metrics |= {key: float(value) for key, value in metrics.items() if key.startswith("val_loss")}
+            steps[str(done)] = step_metrics
+        final_checkpoint = find_latest_checkpoint(out_dir, settings.run_name)
+        assert final_checkpoint is not None
+        final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)["model"]
+        return {
+            "steps": steps,
+            "checkpoints": sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")),
+            "optimizer_steps": optimizer_step_calls,
+            "parameter_norms": {
+                name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state.items()
+            },
+        }
+
+
+def golden_run_json(metrics: dict[str, Any]) -> str:
+    """The fixture text: sorted keys, indent 2, floats as `repr` (json's default, round-trips exactly)."""
+    return json.dumps(metrics, sort_keys=True, indent=2) + "\n"
+
+
+def record_golden_run() -> Path:
+    """Re-record `training/golden_tiny_run.json`. ONLY do this in a commit whose purpose is a numerics change of the
+    training loop, or when the tiny dataset changes (the fixture depends on `config/datasets/tiny.yaml` and the data
+    pipeline: the synthetic rows, dedup, the instruct shuffle and input inversions, the 5 % validation split):
+
+        uv run python -c "from training.test_train import record_golden_run; record_golden_run()"
+
+    Builds the tiny dataset into a temporary directory first (as the `tiny_dataset_dir` fixture does). The committed
+    fixture was recorded with torch 2.13.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic
+    algorithms); two consecutive recordings there are byte-identical.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dataset_root = Path(tmp) / "tiny_dataset"
+        prepare(TINY_DATASET_YAML, dataset_root, assume_yes=False)
+        metrics = golden_run_metrics(dataset_root)
+    GOLDEN_RUN_PATH.write_text(golden_run_json(metrics))
+    return GOLDEN_RUN_PATH
+
+
+def golden_mismatches(expected: Any, actual: Any, *, exact: bool, path: str = "") -> list[str]:
+    """Every difference between a recorded golden structure and a fresh one, as `path: expected != actual` lines.
+
+    Floats are compared with `pytest.approx(rel=1e-5, abs=0)`, or with `==` when `exact`; values under a key in
+    `GOLDEN_ALWAYS_EXACT_KEYS` (learning rates, checkpoint names, the optimizer-step count), ints, strings and key
+    sets are always compared exactly.
+    """
+    key = path.rsplit("/", 1)[-1]
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return [f"{path}: expected a mapping, got {type(actual).__name__}"]
+        mismatches = [f"{path}/{k}: missing" for k in sorted(set(expected) - set(actual))]
+        mismatches += [f"{path}/{k}: unexpected" for k in sorted(set(actual) - set(expected))]
+        for k in sorted(set(expected) & set(actual)):
+            mismatches += golden_mismatches(expected[k], actual[k], exact=exact, path=f"{path}/{k}")
+        return mismatches
+    if isinstance(expected, list):
+        return [] if expected == actual else [f"{path}: {expected!r} != {actual!r}"]
+    if isinstance(expected, float) and not exact and key not in GOLDEN_ALWAYS_EXACT_KEYS:
+        return [] if actual == pytest.approx(expected, rel=1e-5, abs=0) else [f"{path}: {expected!r} != {actual!r}"]
+    return [] if expected == actual else [f"{path}: {expected!r} != {actual!r}"]
+
+
+def test_golden_mismatches_reports_every_difference() -> None:
+    expected = {"steps": {"1": {"loss": 1.0, "lr": 2.0}}, "checkpoints": ["a.pth"], "optimizer_steps": 19}
+    assert golden_mismatches(expected, json.loads(golden_run_json(expected)), exact=True) == []
+    # rel 1e-5 on plain floats, but never on the learning rate, the checkpoint names or the step count
+    close = {"steps": {"1": {"loss": 1.0 + 1e-7, "lr": 2.0}}, "checkpoints": ["a.pth"], "optimizer_steps": 19}
+    assert golden_mismatches(expected, close, exact=False) == []
+    assert golden_mismatches(expected, close, exact=True) == ["/steps/1/loss: 1.0 != 1.0000001"]
+    lr_off = {"steps": {"1": {"loss": 1.0, "lr": 2.0 + 1e-7}}, "checkpoints": ["a.pth"], "optimizer_steps": 19}
+    assert golden_mismatches(expected, lr_off, exact=False) == ["/steps/1/lr: 2.0 != 2.0000001"]
+    off = {"steps": {"1": {"loss": 1.1, "grad_norm": 0.0}}, "checkpoints": ["b.pth"], "optimizer_steps": 18}
+    assert golden_mismatches(expected, off, exact=False) == [
+        "/checkpoints: ['a.pth'] != ['b.pth']",
+        "/optimizer_steps: 19 != 18",
+        "/steps/1/lr: missing",
+        "/steps/1/grad_norm: unexpected",
+        "/steps/1/loss: 1.0 != 1.1",
+    ]
+
+
+@pytest.mark.slow
+def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
+    """Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
+
+    The golden is a refactor guard, not a promise about CPU training: it was recorded in fp32 on the CPU with one
+    thread and deterministic algorithms (torch 2.13.0+cu130, see `record_golden_run`), so it catches a changed
+    operation order, an extra RNG draw or a moved forward pass in the loop. It does NOT exercise the bf16 autocast
+    path used for real training (the bf16 "finite / same seed" tests above are the only cover there). Every float
+    is compared with `rel=1e-5`; `GOLDEN_EXACT=1` compares with `==` (bit-identical on the recording machine);
+    learning rates, checkpoint names and the optimizer-step count are always exact. Re-record only in a commit whose
+    purpose is a numerics change or a change of the tiny dataset. If it fails on another machine for float-order
+    reasons only, loosen the tolerance rather than chase it.
+    """
+    assert GOLDEN_RUN_PATH.exists(), "golden run missing; record it with record_golden_run() in a numerics commit"
+    expected = json.loads(GOLDEN_RUN_PATH.read_text())
+    actual = golden_run_metrics(tiny_dataset_dir)
+    assert sorted(actual["steps"], key=int) == [str(s) for s in range(1, 21)]
+    assert actual["optimizer_steps"] == 19  # the very first update (step 0) is skipped
+    assert all("val_loss_1" in actual["steps"][str(s)] for s in (8, 16, 20))
+    exact = os.environ.get(GOLDEN_EXACT_ENV) == "1"
+    mismatches = golden_mismatches(expected, json.loads(golden_run_json(actual)), exact=exact)
+    assert not mismatches, "golden run changed:\n" + "\n".join(mismatches)
