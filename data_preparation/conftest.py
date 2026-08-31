@@ -10,6 +10,7 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, BinaryIO
@@ -21,7 +22,6 @@ import zstandard
 
 from data_preparation.dataset_config import (
     DatasetConfig,
-    InstructMixtureConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
@@ -148,67 +148,65 @@ def layout(tmp_path: Path) -> DatasetLayout:
     return DatasetLayout(tmp_path / "dataset")
 
 
+TEST_BLOOM_MEMORY_MB = 1  # the dedup filter of every test config (the default 1024 MB is for real sources)
+
+
 @pytest.fixture
 def cfg_factory() -> CfgFactory:
-    """`make(sources, instruct_mixtures=..., processing=..., token_count=..., max_seq_length=..., tokens=...)` -> DatasetConfig.
+    """`make(sources, processing=..., token_count=..., max_seq_length=..., block_size=..., tokens=...)` -> DatasetConfig.
 
-    One stage trains on every pretrain source (equal weights) and validates on the validation sources (or, without
-    any, on the pretrain sources); every mixture gets its own finetune stage; instruct sources outside every
-    mixture are wrapped in an `auto` mixture. Without any trainable source a synthetic `_pretrain` source is added
-    so the config validates. `tokens` is the per-stage budget.
+    A `pretrain` stage trains on every pretrain source without `rows` (equal weights) and a `finetune` stage on
+    every instruct source without `rows`; a source with `rows` is used only for validation (in the stage of its
+    kind, or the other one). Without any trainable source a synthetic `_pretrain` source is added so the config
+    validates. `tokens` is the per-stage budget; `block_size` defaults to 1 so the interim token budget
+    (`sequence_budget × block_size`, task 8 replaces it) equals `tokens × weight`. The dedup filter of every config
+    is `TEST_BLOOM_MEMORY_MB` (also when `processing` is given).
     """
 
     def make(
         sources: dict[str, SourceConfig],
         *,
-        instruct_mixtures: dict[str, InstructMixtureConfig] | None = None,
         processing: ProcessingConfig | None = None,
         token_count: str = "tokenizer",
         max_seq_length: int = 64,
+        block_size: int = 1,
         tokens: int = 10_000,
         tokenizer: TokenizerConfig | None = None,
         name: str = "t",
     ) -> DatasetConfig:
         sources = dict(sources)
-        instruct_mixtures = dict(instruct_mixtures or {})
-        in_instruct_mixture = {src for m in instruct_mixtures.values() for src in m.sources}
-        loose = [n for n, s in sources.items() if s.kind == "instruct" and n not in in_instruct_mixture]
-        if loose:
-            instruct_mixtures["auto"] = InstructMixtureConfig(sources={n: 1.0 / len(loose) for n in loose})
-        pretrain = [n for n, s in sources.items() if s.kind == "pretrain"]
-        validations = [n for n, s in sources.items() if s.kind == "validation"]
-        if not pretrain and not instruct_mixtures:
+        trained = {kind: [n for n, s in sources.items() if s.kind == kind and s.rows is None] for kind in ("pretrain", "instruct")}
+        val_only = {kind: [n for n, s in sources.items() if s.kind == kind and s.rows is not None] for kind in ("pretrain", "instruct")}
+        if not trained["pretrain"] and not trained["instruct"]:
             sources["_pretrain"] = SourceConfig(kind="pretrain", loader="synthetic")
-            pretrain = ["_pretrain"]
+            trained["pretrain"] = ["_pretrain"]
         stages: list[StageConfig] = []
-        if pretrain:
-            val_names = validations or pretrain
+        for kind, stage_name in (("pretrain", "pretrain"), ("instruct", "finetune")):
+            if not trained[kind]:
+                continue
+            other = "instruct" if kind == "pretrain" else "pretrain"
+            val_names = val_only[kind] or trained[kind]
+            if not trained[other]:
+                val_names = val_names + val_only[other]  # nowhere else to validate on them
             stages.append(
                 StageConfig(
-                    name="pretrain",
+                    name=stage_name,
                     tokens=tokens,
-                    train={n: 1.0 / len(pretrain) for n in pretrain},
+                    train={n: 1.0 / len(trained[kind]) for n in trained[kind]},
                     val={n: 1.0 / len(val_names) for n in val_names},
                 )
             )
-        for instruct_mixture_name in instruct_mixtures:
-            stages.append(
-                StageConfig(
-                    name=f"finetune_{instruct_mixture_name}",
-                    tokens=tokens,
-                    train={instruct_mixture_name: 1.0},
-                    val={f"{instruct_mixture_name}/validation": 1.0},
-                )
-            )
+        processing = processing or ProcessingConfig(min_chars=1)
+        processing = replace(processing, dedup=replace(processing.dedup, bloom_memory_mb=TEST_BLOOM_MEMORY_MB))
         return DatasetConfig(
             name=name,
             tokenizer=tokenizer or TokenizerConfig(name="synthetic", kind="synthetic"),
             sources=sources,
             stages=stages,
-            instruct_mixtures=instruct_mixtures,
+            block_size=block_size,
             max_seq_length=max_seq_length,
             token_count=token_count,  # type: ignore[arg-type]  # Literal narrowed by the caller
-            processing=processing or ProcessingConfig(min_chars=1),
+            processing=processing,
         )
 
     return make

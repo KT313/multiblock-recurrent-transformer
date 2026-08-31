@@ -1,17 +1,16 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Pipeline stages shared by every source kind: tokenizer, raw download, held-out sets; plus the token counter and
-manifest helpers used by ``stages/pretrain.py`` / ``stages/instruct.py``.
+"""Pipeline steps shared by every source kind: tokenizer and raw download; plus the token counter and manifest
+helpers used by ``stages/build.py``.
 
-Every stage is a function ``(cfg, name, layout, *options) -> Manifest`` that is **idempotent via the manifest**
+Every step is a function ``(cfg, name, layout, *options) -> Manifest`` that is **idempotent via the manifest**
 (a second call with nothing new returns the stored manifest without touching the shards) and **incremental** where
-the data allow it. A stored manifest whose hash differs from the stage's current key (``DatasetConfig.raw_hash`` for
-``raw/``: loader identity only; ``processed_hash`` / ``validation_hash`` for the derived directories) is stale: the
-stage logs a warning and rebuilds the directory from scratch.
+the data allow it. A stored manifest whose hash differs from the step's current key (``DatasetConfig.raw_hash`` for
+``raw/``: loader identity plus token settings; ``processed_hash`` for ``processed/``) is stale: the step logs a
+warning and rebuilds the directory from scratch.
 """
 
 from __future__ import annotations
 
-import random
 import threading
 from collections.abc import Callable, Generator, Iterator
 from contextlib import ExitStack
@@ -28,7 +27,6 @@ from data_preparation.lib.storage.parquet import (
     estimate_tokens,
     list_parquet_files,
     shard_index,
-    write_dict_rows,
 )
 from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
@@ -47,7 +45,6 @@ from data_preparation.lib.sources import (
     get_filter,
     get_loader,
     github_code_repo_key,
-    list_local_files,
     read_github_code_group,
     write_synthetic_tokenizer,
 )
@@ -62,9 +59,9 @@ DEFAULT_SHARD_SIZE = 10_000
 class TokenCounter:
     """``min(tokens(text), cap)`` with the config's tokenizer (``token_count: tokenizer``) or chars/4.
 
-    ``cap`` defaults to ``max_seq_length`` (pretrain / validation documents: training truncates them there; the text
-    itself is never rewritten) and is None for instruct examples (:meth:`DatasetConfig.token_cap`), whose full
-    length decides whether ``mixture.max_tokens`` drops them. Use :meth:`for_source` to pick the source's cap.
+    ``cap`` is ``max_seq_length`` for pretrain documents (until the download truncates the text itself at that
+    boundary — task 6 — the count is what is capped) and None for instruct rows, whose full length decides whether
+    the build drops them. Use :meth:`for_source` to pick the source's cap.
     """
 
     def __init__(self, cfg: DatasetConfig, layout: DatasetLayout, *, cap: int | None = None) -> None:
@@ -77,7 +74,7 @@ class TokenCounter:
 
     @classmethod
     def for_source(cls, cfg: DatasetConfig, layout: DatasetLayout, source_name: str) -> TokenCounter:
-        return cls(cfg, layout, cap=cfg.token_cap(source_name))
+        return cls(cfg, layout, cap=token_count_cap(cfg, source_name))
 
     def _capped(self, n: int) -> int:
         return n if self.cap is None else min(n, self.cap)
@@ -94,6 +91,12 @@ class TokenCounter:
             return [self._capped(estimate_tokens(t)) for t in texts]
         encoded = self._tokenizer(texts, add_special_tokens=False)["input_ids"]
         return [self._capped(len(ids)) for ids in encoded]
+
+
+def token_count_cap(cfg: DatasetConfig, source_name: str) -> int | None:
+    """The cap of a source's ``tokens`` column: ``max_seq_length`` for pretrain rows, None (full length) for
+    instruct rows."""
+    return cfg.max_seq_length if cfg.sources[source_name].kind == "pretrain" else None
 
 
 def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
@@ -135,15 +138,15 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
 
 
 def new_manifest(cfg: DatasetConfig, source: str, source_hash: str, stage: str, *, tokens: bool = False) -> Manifest:
-    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured (the cap is the
-    source's, see :meth:`DatasetConfig.token_cap`; mixtures are named like no source and carry no cap)."""
+    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured.
+    ``truncated_at_tokens`` stays None until the download truncates texts at ``max_seq_length`` (task 6)."""
     return Manifest(
         source=source,
         source_hash=source_hash,
         stage=stage,
         token_count=cfg.token_count if tokens else None,
         tokenizer=cfg.tokenizer.name if tokens and cfg.token_count == "tokenizer" else None,
-        token_cap=cfg.token_cap(source) if tokens and source in cfg.sources else None,
+        truncated_at_tokens=None,
         versions=library_versions(),
     )
 
@@ -172,7 +175,7 @@ def require_manifest(directory: Path, source_hash: str, stage: str, what: str) -
 
 
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
-    """Apply a pretrain/validation source's converter (if any) and check that ``text_field`` is present."""
+    """Apply a pretrain source's converter (if any) and check that ``text_field`` is present."""
     converter = get_converter(source)
     if converter is not None:
         row = converter(row)
@@ -238,7 +241,7 @@ def download(
 ) -> Manifest:
     """Append raw shards until ``rows_needed`` rows are on disk (no-op if they already are).
 
-    ``manifest.rows_fetched`` is the loader offset reached (source rows consumed); for pretrain/validation sources
+    ``manifest.rows_fetched`` is the loader offset reached (source rows consumed); for pretrain sources
     every row is kept (converter applied, ``text_field`` guaranteed), for instruct sources the converter and filter
     run at download time and only standardized ``{instruction, input, output}`` rows are stored — malformed rows
     (converter raises ``ValueError``) are skipped and counted in ``extra["skipped_malformed"]``; ``check_limit``
@@ -252,8 +255,8 @@ def download(
     only ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
 
     Every stored row gets a ``tokens`` column (:class:`TokenCounter` over ``text_field``, or instruction + input +
-    output for instruct rows), counted once here and reused by ``process`` and the instruct mixtures; the manifest
-    records the mode / tokenizer and per-shard sums. A raw directory from before this column is upgraded in place
+    output for instruct rows), counted once here and reused by the build; the manifest records the mode / tokenizer
+    and per-shard sums. A raw directory from before this column is upgraded in place
     (:func:`ensure_raw_tokens`), never re-downloaded.
 
     Every shard is published and recorded in the manifest (with the loader offset after its last row,
@@ -304,9 +307,7 @@ def _fresh_raw_manifest(cfg: DatasetConfig, name: str, source_hash: str, out: Pa
     manifest (the source itself changed) is a rebuild, see ``current_manifest``."""
     if Manifest.load(out) is None and has_shards(out):
         raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
-    manifest = new_manifest(cfg, name, source_hash, "raw", tokens=True)
-    manifest.extra["counted_chars"] = cfg.counted_chars(name)
-    return manifest
+    return new_manifest(cfg, name, source_hash, "raw", tokens=True)
 
 
 def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
@@ -375,7 +376,7 @@ def _fetch_rows(
     layout: DatasetLayout,
     bar: Progress,
 ) -> Iterator[Row]:
-    """Rows to store for one download increment from **one** loader call: pretrain / validation rows are all kept,
+    """Rows to store for one download increment from **one** loader call: pretrain rows are all kept,
     so the loader is asked for exactly ``wanted``; instruct rows may be dropped by the filter or the converter, so
     the loader is asked for everything up to ``max_consume`` (or without bound) and consumption stops — closing the
     loader's generator — as soon as ``wanted`` rows are kept (a second call would re-stream the file prefix).
@@ -557,17 +558,13 @@ TOKEN_BATCH = 256  # rows tokenized per `count_many` call while downloading
 
 
 def raw_text_of(cfg: DatasetConfig, name: str) -> Callable[[Row], str]:
-    """What the ``tokens`` column of a raw row counts: the first ``max_chars`` characters of ``text_field`` for
-    pretrain documents (exactly what the length filter keeps, so ``process`` reuses the count), the whole
-    ``text_field`` for validation sources, instruction + input + output for instruct rows."""
+    """What the ``tokens`` column of a raw row counts: the whole ``text_field`` for pretrain documents (the build
+    reuses the count), instruction + input + output for instruct rows."""
     source = cfg.sources[name]
     if source.kind == "instruct":
         return instruct_text
     text_field = source.text_field
-    max_chars = cfg.counted_chars(name)
-    if max_chars is None:
-        return lambda row: _text_or_empty(row.get(text_field))
-    return lambda row: _text_or_empty(row.get(text_field))[:max_chars]
+    return lambda row: _text_or_empty(row.get(text_field))
 
 
 def _text_or_empty(value: object) -> str:
@@ -644,15 +641,10 @@ def truncate_raw_to_good_prefix(directory: Path, manifest: Manifest) -> bool:
 
 
 def raw_has_tokens(cfg: DatasetConfig, manifest: Manifest) -> bool:
-    """Whether a raw manifest's ``tokens`` column was counted the way ``cfg`` counts (mode, tokenizer and cap)."""
+    """Whether a raw manifest's ``tokens`` column was counted the way ``cfg`` counts (mode and tokenizer; both are
+    part of the raw hash, so a current manifest can only lack the column altogether)."""
     tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
-    return (
-        manifest.token_count == cfg.token_count
-        and manifest.tokenizer == tokenizer
-        and manifest.token_cap == cfg.token_cap(manifest.source)
-        and manifest.extra.get("counted_chars") == cfg.counted_chars(manifest.source)
-        and manifest.tokens() is not None
-    )
+    return manifest.token_count == cfg.token_count and manifest.tokenizer == tokenizer and manifest.tokens() is not None
 
 
 def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
@@ -681,8 +673,6 @@ def ensure_raw_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> M
         shard.tokens = sum(tokens)
     manifest.token_count = cfg.token_count
     manifest.tokenizer = cfg.tokenizer.name if cfg.token_count == "tokenizer" else None
-    manifest.token_cap = cfg.token_cap(name)
-    manifest.extra["counted_chars"] = cfg.counted_chars(name)
     manifest.save(out)
     return manifest
 
@@ -722,7 +712,7 @@ class _DownloadPostfix:
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
-    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain/validation sources read as-is,
+    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain sources read as-is,
     None (every column) when a converter or ``fields`` mapping may need others or the rows are instruct rows."""
     if source.kind == "instruct" or get_converter(source) is not None:
         return None
@@ -745,99 +735,3 @@ def _bounded(rows: Iterator[Row], limit: int | None) -> Generator[Row, None, Non
         close = getattr(rows, "close", None)
         if close is not None:
             close()
-
-
-# --- validation -----------------------------------------------------------------------------------------------------------
-
-
-def validation(
-    cfg: DatasetConfig, name: str, layout: DatasetLayout, *, shard_size: int = DEFAULT_SHARD_SIZE, hf_token: str | None = None
-) -> Manifest:
-    """Write the held-out validation rows of a ``validation`` source: ``source.rows`` rows, shuffled with
-    ``random.Random(source.seed)``, token-counted like ``process`` — no dedup and no filters.
-
-    Disjointness from the training data is the config author's job and depends on the loader:
-
-    * ``hf_split``: the config picks a split / ``load_kwargs`` disjoint from every training source (the crow config
-      uses fineweb-edu's ``sample-10BT`` subset while training reads the ``CC-MAIN-*`` dumps); rows ``[0:rows]``.
-    * ``synthetic``: the source's own ``seed`` (different from the training source) generates different rows.
-    * ``local``: the **last** ``rows`` rows of the directory, so a training source reading the first rows of the
-      same directory stays disjoint as long as it needs fewer than ``total - rows`` rows.
-    * ``hf_files`` / ``hf_stream``: the **first** ``rows`` rows of the configured files / stream are taken, so the
-      config must point them at files disjoint from every training source (a different ``data_files`` glob).
-    """
-    source = fetch_source(cfg, cfg.sources[name])
-    if source.kind != "validation" or source.rows is None:
-        raise ValueError(f"{name}: validation() needs a source of kind validation with rows > 0")
-    source_hash = cfg.validation_hash(name)
-    out = layout.validation_dir(name)
-    existing = current_manifest(out, source_hash, "validation")
-    if existing is not None:
-        return existing
-
-    # fetch the rows
-    offset = _validation_offset(source, source.rows)
-    log.info("%s: holding out %d rows from offset %d -> %s", name, source.rows, offset, out)
-    loader = get_loader(source.loader)
-    with progress(total=source.rows, desc=f"{name}: validation", unit="row", leave=False) as bar:
-        fetched = loader(  # exact: a validation is fetched once, its row count is part of its identity
-            source, offset, source.rows, token=hf_token, index_dir=layout.hub_index_dir(), columns=loader_columns(source),
-            align_to_row_group=False,
-        )
-        rows = [text_row(source, r, name) for r in bar_rows(bar, fetched)]
-    if len(rows) < source.rows:
-        log.warning("%s: only %d of %d requested validation rows available", name, len(rows), source.rows)
-
-    # shuffle, count tokens, write
-    random.Random(source.seed).shuffle(rows)
-    texts = [str(r[source.text_field]) for r in rows]
-    tokens = TokenCounter.for_source(cfg, layout, name).count_many(texts)
-    out_rows = ({"text": t, "source": name, "tokens": n} for t, n in zip(texts, tokens))
-    write_dict_rows(out_rows, out, shard_size, start_shard=0)
-
-    manifest = new_manifest(cfg, name, source_hash, "validation", tokens=True)
-    manifest.rows_fetched = offset + len(rows)
-    record_new_shards(manifest, out, 0, tokens=tokens_per_shard(out, tokens))
-    manifest.extra = {"offset": offset, "requested_rows": source.rows, "seed": source.seed}
-    manifest.save(out)
-    return manifest
-
-
-def _validation_offset(source: SourceConfig, rows: int) -> int:
-    """Where the ``rows`` held-out rows start: the tail of a ``local`` directory, the beginning of everything else."""
-    if source.loader != "local":
-        return 0
-    total = _local_row_count(Path(str(source.path)))
-    return max(total - rows, 0)
-
-
-def bar_rows(bar: Progress, rows: Iterator[Row]) -> Iterator[Row]:
-    """Pass ``rows`` through, advancing ``bar`` by one per row."""
-    for row in rows:
-        bar.update(1)
-        yield row
-
-
-def _local_row_count(directory: Path) -> int:
-    """Rows in a ``local`` source directory: parquet footers plus non-blank lines of every other (jsonl) file."""
-    total = 0
-    for file in list_local_files(directory):
-        if file.suffix == ".parquet":
-            total += shard_rows(file)
-        else:
-            with file.open(encoding="utf-8") as fh:
-                total += sum(1 for line in fh if line.strip())
-    return total
-
-
-def tokens_per_shard(directory: Path, tokens: list[int]) -> dict[str, int]:
-    """Split a per-row token list into per-shard sums following the shard row counts on disk."""
-    per_shard: dict[str, int] = {}
-    position = 0
-    for path in list_parquet_files(directory):
-        if shard_index(path) is None:
-            continue
-        rows = shard_rows(path)
-        per_shard[path.name] = sum(tokens[position : position + rows])
-        position += rows
-    return per_shard

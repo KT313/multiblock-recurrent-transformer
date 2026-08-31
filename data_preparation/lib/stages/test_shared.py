@@ -1,12 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.shared: tokenizer stage, token counter, incremental download, validation."""
+"""Tests for data_preparation.lib.stages.shared: tokenizer step, token counter, incremental download."""
 
 from __future__ import annotations
 
 import json
 import logging
-import sys
-import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -27,7 +25,6 @@ from data_preparation.lib.stages.shared import (
     ensure_raw_tokens,
     prepare_tokenizer,
     require_manifest,
-    validation,
 )
 
 Row = dict[str, Any]
@@ -115,7 +112,7 @@ def test_token_counter_tokenizer_mode_caps_at_max_seq_length(
     assert counter.count("tok_1 tok_2 tok_3") == 3
     assert counter.count(" ".join(["tok_1"] * 9)) == 5
     assert counter.count_many(["tok_1", " ".join(["tok_2"] * 7), ""]) == [1, 5, 0]
-    uncapped = TokenCounter.for_source(cfg, layout, "i")  # instruct examples: the full length
+    uncapped = TokenCounter.for_source(cfg, layout, "i")  # instruct rows: the full length
     assert uncapped.cap is None and uncapped.count(" ".join(["tok_1"] * 9)) == 9
     assert uncapped.count_many([" ".join(["tok_2"] * 7)]) == [7] and TokenCounter(cfg, layout).cap is None
 
@@ -288,21 +285,6 @@ def test_download_columns_follow_the_converter_and_check_limit_bounds_over_reads
     assert download(cfg, "lim", layout, rows_needed=8).extra["exhausted"] is True and len(seen) == 2
 
 
-def test_validation_asks_for_exact_rows(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
-    from data_preparation.lib.sources import loaders as loaders_mod
-
-    seen: dict[str, Any] = {}
-
-    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
-        seen.update(kwargs, count=count)
-        return iter([{"text": f"t{i}"} for i in range(count)])
-
-    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
-    cfg = cfg_factory({"v": _synthetic(kind="validation", rows=4)}, token_count="estimate")
-    m = validation(cfg, "v", layout)
-    assert m.rows() == 4 and seen["count"] == 4 and seen["align_to_row_group"] is False and seen["columns"] == ["text"]
-
-
 # --- download: instruct ------------------------------------------------------------------------------------------------
 
 
@@ -380,92 +362,6 @@ def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenize
     assert rows == [{**synthetic_row("instruct", 2, i), "tokens": r["tokens"]} for i, r in enumerate(rows)]
     counter = TokenCounter(cfg, layout)
     assert all(r["tokens"] == counter.count(instruct_text(r)) for r in rows)
-
-
-# --- validation -----------------------------------------------------------------------------------------------------------
-
-
-def test_validation_synthetic_disjoint_shuffled_and_idempotent(
-    cfg_factory: CfgFactory,
-    layout: DatasetLayout,
-    with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
-    read_rows: Reader,
-    mtimes: Mtimes,
-) -> None:
-    cfg = with_tokenizer(
-        cfg_factory({"train": _synthetic(seed=0), "val": _synthetic(kind="validation", seed=1, rows=20)}, max_seq_length=100)
-    )
-    download(cfg, "train", layout, rows_needed=40)
-    m = validation(cfg, "val", layout, shard_size=8)
-    out = layout.validation_dir("val")
-    assert m.stage == "validation" and [s.rows for s in m.shards] == [8, 8, 4] and m.rows_fetched == 20
-    rows = read_rows(out)
-    assert [set(r) for r in rows] == [{"text", "source", "tokens"}] * 20
-    assert {r["source"] for r in rows} == {"val"}
-    train_texts = {r["text"] for r in read_rows(layout.raw_dir("train"))}
-    assert not train_texts & {r["text"] for r in rows}, "validation rows must not appear in the training source"
-    generated = [synthetic_row("validation", 1, i)["text"] for i in range(20)]
-    assert sorted(r["text"] for r in rows) == sorted(generated) and [r["text"] for r in rows] != generated
-    assert all(r["tokens"] == min(len(r["text"].split()), 100) for r in rows)
-    assert m.tokens() == sum(r["tokens"] for r in rows)
-    before = mtimes(out)
-    assert validation(cfg, "val", layout, shard_size=8) == m and mtimes(out) == before
-    # deterministic: a second root gets the same order
-    other = DatasetLayout(layout.root.parent / "other")
-    prepare_tokenizer(cfg, other)
-    validation(cfg, "val", other, shard_size=8)
-    assert read_rows(other.validation_dir("val")) == rows
-
-
-def test_validation_local_takes_the_last_rows(
-    cfg_factory: CfgFactory,
-    layout: DatasetLayout,
-    with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
-    write_local: Writer,
-    read_rows: Reader,
-) -> None:
-    src_dir = layout.root.parent / "loc"
-    write_local(src_dir, [{"text": f"doc {i}"} for i in range(6)], "parquet")
-    write_local(src_dir, [{"text": f"doc {i}"} for i in range(6, 10)], "jsonl")
-    cfg = with_tokenizer(cfg_factory({"v": _local(src_dir, kind="validation", rows=3)}, token_count="estimate"))
-    m = validation(cfg, "v", layout)
-    assert m.extra["offset"] == 7 and m.rows_fetched == 10
-    assert sorted(r["text"] for r in read_rows(layout.validation_dir("v"))) == ["doc 7", "doc 8", "doc 9"]
-
-
-def test_validation_hf_stream_takes_the_first_rows_and_warns_when_short(
-    cfg_factory: CfgFactory,
-    layout: DatasetLayout,
-    with_tokenizer: Callable[[DatasetConfig], DatasetConfig],
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    read_rows: Reader,
-) -> None:
-    class Stream:
-        def __init__(self, rows: list[Row]) -> None:
-            self.rows = rows
-
-        def skip(self, n: int) -> Stream:
-            return Stream(self.rows[n:])
-
-        def __iter__(self) -> Any:
-            return iter(self.rows)
-
-    module = types.ModuleType("datasets")
-    module.load_dataset = lambda **kw: Stream([{"text": f"s{i}"} for i in range(4)])  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "datasets", module)
-    src = SourceConfig(kind="validation", loader="hf_stream", hf_id="org/x", rows=6)
-    cfg = with_tokenizer(cfg_factory({"v": src}, token_count="estimate"))
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        m = validation(cfg, "v", layout)
-    assert "only 4 of 6" in caplog.text and m.rows() == 4 and m.extra["offset"] == 0
-    assert sorted(r["text"] for r in read_rows(layout.validation_dir("v"))) == ["s0", "s1", "s2", "s3"]
-
-
-def test_validation_rejects_non_validation_source(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    cfg = cfg_factory({"p": _synthetic()})
-    with pytest.raises(ValueError, match="kind validation"):
-        validation(cfg, "p", layout)
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -743,29 +639,6 @@ def test_truncate_raw_to_good_prefix(
     m3.shards[0].offset = None  # a legacy manifest without offsets: no safe resume point
     (raw / "data-00000.parquet").write_bytes(b"x")
     assert not truncate_raw_to_good_prefix(raw, m3)
-
-
-def test_raw_tokens_count_the_max_chars_prefix_and_a_changed_max_chars_recounts_in_place(
-    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from data_preparation.dataset_config import ProcessingConfig
-    from data_preparation.lib.stages import shared
-
-    src_dir = layout.root.parent / "long"
-    write_local(src_dir, [{"text": " ".join(["tok_1"] * 50)}], "parquet")  # 299 chars, 50 tokens
-    cfg = with_tokenizer(cfg_factory({"p": _local(src_dir)}, processing=ProcessingConfig(min_chars=1, max_chars=59), max_seq_length=4096))
-    m = download(cfg, "p", layout, rows_needed=1)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("p"))] == [10], "only the first max_chars are counted"
-    assert m.extra["counted_chars"] == 59 and m.tokens() == 10
-
-    def no_fetch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("a max_chars change must not download")
-
-    monkeypatch.setattr(shared, "_fetch_rows", no_fetch)
-    cfg.processing = ProcessingConfig(min_chars=1, max_chars=119)
-    m2 = download(cfg, "p", layout, rows_needed=1)  # the raw hash is unchanged: recounted in place
-    assert m2.rows_fetched == 1 and m2.extra["counted_chars"] == 119 and m2.tokens() == 20
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("p"))] == [20]
 
 
 def test_download_instruct_filter_calls_the_loader_once_and_closes_it(

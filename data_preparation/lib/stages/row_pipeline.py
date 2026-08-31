@@ -29,17 +29,16 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def preprocess_batch(
-    batch: pa.RecordBatch, text_field: str, source_name: str, min_chars: int, max_chars: int
+    batch: pa.RecordBatch, text_field: str, source_name: str, min_chars: int
 ) -> tuple[pa.RecordBatch, dict[str, int]]:
-    """Drop null / shorter-than-``min_chars`` texts, truncate to ``max_chars`` characters.
+    """Drop null / shorter-than-``min_chars`` texts (the upper bound is the token truncation at download time).
 
     Returns a ``FILTERED_SCHEMA`` batch (``text``, ``source``, ``original_length``) and per-batch statistics. A
-    ``tokens`` column of the input batch (the raw token counts) is carried through as a fourth column, so the
-    caller only has to recount the truncated rows (``original_length > max_chars``).
+    ``tokens`` column of the input batch (the raw token counts) is carried through as a fourth column.
     """
     if text_field not in batch.schema.names:
         raise ValueError(f"{source_name}: text_field {text_field!r} not in columns {batch.schema.names}")
-    stats = {"input_samples": len(batch), "removed_too_short": 0, "removed_invalid": 0, "truncated": 0}
+    stats = {"input_samples": len(batch), "removed_too_short": 0, "removed_invalid": 0}
 
     # 1. drop null texts
     # the raw shards store text as (large_)string; the cast only narrows the stub type, nothing happens at runtime
@@ -65,14 +64,9 @@ def preprocess_batch(
     if len(batch) == 0:
         return _empty_filtered_batch(), stats | {"output_samples": 0}
 
-    # 3. truncate to max_chars (original_length keeps the length before truncation)
-    texts = cast(list[str], text_array.to_pylist())  # nulls were filtered above
-    truncated_texts = [text[:max_chars] for text in texts]
-    stats["truncated"] = sum(1 for text in texts if len(text) > max_chars)
-
     arrays: list[pa.Array[Any]] = [
-        pa.array(truncated_texts, type=pa.string()),
-        pa.array([source_name] * len(truncated_texts), type=pa.string()),
+        pc.cast(text_array, pa.string()),
+        pa.array([source_name] * len(batch), type=pa.string()),
         pc.cast(original_lengths, pa.int64()),
     ]
     schema = FILTERED_SCHEMA
@@ -166,7 +160,7 @@ def instruct_text(row: Row) -> str:
 
 
 def check_length(tokens: int, max_tokens: int) -> bool:
-    """Keep an instruct row whose measured token count does not exceed ``max_tokens``."""
+    """Keep an instruct row whose measured token count does not exceed ``max_tokens`` (``max_seq_length``)."""
     return tokens <= max_tokens
 
 
