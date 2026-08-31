@@ -250,3 +250,21 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
 def test_invalid_single_value_fields_rejected(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"{field}="):
         tiny(**{field: value})
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"n_embd": 66, "num_attention_heads": 6}, "must be even"),
+        ({"n_layers_in_recurrent_block": [1, 0]}, "n_layers_in_recurrent_block must be >= 1"),
+        ({"mean_backprop_depth": 0}, "mean_backprop_depth must be >= 1"),
+        ({"mean_recurrence": 0, "mean_backprop_depth": 0}, "mean_backprop_depth must be >= 1"),
+        ({"mean_recurrence": [4, 8], "mean_backprop_depth": [8, 8], "n_layers_in_recurrent_block": [1, 1]}, "mean_recurrence \\(4\\) must be >= mean_backprop_depth"),
+        ({"n_layers_in_prelude": -1}, "must be >= 0"),
+    ],
+)
+def test_degenerate_recurrence_values_are_rejected_at_config_time(overrides: dict[str, object], match: str) -> None:
+    """These used to pass validation and fail (or silently train without gradient) at the first forward."""
+    with pytest.raises(ValueError, match=match):
+        tiny(**overrides)
+
+

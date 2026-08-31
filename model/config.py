@@ -91,6 +91,8 @@ class RecurrentConfig:
         if self.n_embd % self.num_attention_heads != 0:
             raise ValueError("n_embd must be divisible by num_attention_heads")
         self.head_size = self.n_embd // self.num_attention_heads
+        if self.head_size % 2 != 0:
+            raise ValueError(f"head size n_embd / num_attention_heads = {self.head_size} must be even (RoPE rotates feature pairs)")
         if self.intermediate_size is None:
             self.intermediate_size = 4 * self.n_embd
 
@@ -101,6 +103,7 @@ class RecurrentConfig:
         num_blocks = len(self.n_layers_in_recurrent_block)
         self.mean_recurrence = self._broadcast("mean_recurrence", self.mean_recurrence, num_blocks)
         self.mean_backprop_depth = self._broadcast("mean_backprop_depth", self.mean_backprop_depth, num_blocks)
+        self._validate_recurrence()
 
         # Expected unrolled depth of the model: every core block contributes its layers times its mean recurrence.
         # It scales the output-projection init (see `Init`).
@@ -115,6 +118,27 @@ class RecurrentConfig:
             self.n_layer += n_layers * mean_backprop_depth
 
         self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
+
+    def _validate_recurrence(self) -> None:
+        """Values the sampler and the model would accept silently but that cannot mean what was intended: a block
+        without layers, a block that never receives gradient (`mean_backprop_depth` 0), a zero or negative mean
+        recurrence (`log(0)` at the first forward), or a backprop depth above the mean recurrence (the sampler would
+        target `mean_backprop_depth` in training while eval and the init scaling use `mean_recurrence`)."""
+        if self.n_layers_in_prelude < 0 or self.n_layers_in_coda < 0:
+            raise ValueError("n_layers_in_prelude and n_layers_in_coda must be >= 0")
+        assert isinstance(self.n_layers_in_recurrent_block, list)
+        assert isinstance(self.mean_recurrence, list) and isinstance(self.mean_backprop_depth, list)
+        for block, (n_layers, mean_recurrence, mean_backprop_depth) in enumerate(
+            zip(self.n_layers_in_recurrent_block, self.mean_recurrence, self.mean_backprop_depth)
+        ):
+            if n_layers < 1:
+                raise ValueError(f"core block {block}: n_layers_in_recurrent_block must be >= 1, got {n_layers}")
+            if mean_backprop_depth < 1:
+                raise ValueError(f"core block {block}: mean_backprop_depth must be >= 1, got {mean_backprop_depth} (no gradient would reach the block)")
+            if mean_recurrence < mean_backprop_depth:
+                raise ValueError(
+                    f"core block {block}: mean_recurrence ({mean_recurrence}) must be >= mean_backprop_depth ({mean_backprop_depth})"
+                )
 
     @staticmethod
     def _broadcast(name: str, value: int | list[int], num_blocks: int) -> list[int]:

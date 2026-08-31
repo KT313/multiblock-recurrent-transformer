@@ -202,7 +202,11 @@ class RecurrentGPT(torch.nn.Module):
     @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
     def randomized_iteration_sampler(self, block_idx: int = 0) -> tuple[Tensor, Tensor]:
         """(n no-grad, k backprop) iterations for core block `block_idx`: the poisson-lognormal-filling draw seeded by
-        `self.step` in training, (`mean_recurrence`, 0) in eval mode."""
+        `self.step` in training, (`mean_recurrence`, 0) in eval mode.
+
+        The seed is `self.step` alone (thesis numerics, pinned by the golden test): `block_idx` only selects the
+        block's means, so blocks with equal `(mean_recurrence, mean_backprop_depth)` draw the same `(n, k)` every
+        step. Independent per-block draws would be a numerics change."""
         assert isinstance(self.config.mean_recurrence, list)  # normalized by RecurrentConfig.__post_init__
         assert isinstance(self.config.mean_backprop_depth, list)
         # `sample_recurrence_steps` is dynamo-disabled, which makes it untyped for mypy; hence the explicit annotation.
