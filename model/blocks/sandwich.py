@@ -12,7 +12,11 @@ from ..layers.norms import RMSNorm
 
 
 class SandwichBlock(torch.nn.Module):
-    """Pre- and post-norm around both the attention and the MLP sub-layer."""
+    """Attention and MLP sub-layer, each "sandwiched" between a pre-norm and a post-norm:
+
+        x = norm_2(attn(norm_1(x)) + x)
+        x = norm_4(mlp(norm_3(x)) + x)
+    """
 
     def __init__(self, config: RecurrentConfig) -> None:
         super().__init__()
@@ -24,6 +28,8 @@ class SandwichBlock(torch.nn.Module):
         self.norm_4 = RMSNorm(config.n_embd, eps=config.norm_eps)
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
-        x = self.norm_2(self.attn(self.norm_1(x), freqs_cis, mask) + x)
-        x = self.norm_4(self.mlp(self.norm_3(x)) + x)
+        attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
+        x = self.norm_2(attn_out + x)
+        mlp_out = self.mlp(self.norm_3(x))
+        x = self.norm_4(mlp_out + x)
         return x

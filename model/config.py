@@ -24,6 +24,19 @@ class RoPESettings:
     rope_base: int = 50_000
 
 
+# Fields that only ever had one value in the thesis run. They stay in the config (and in exported config.json files)
+# so that a different value is rejected loudly instead of silently running a different architecture.
+_FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
+    ("attn_impl", "sdpa"),
+    ("init_strategy", "takase"),
+    ("init_orthogonal", True),
+    ("activation_checkpoint_impl", "per-iteration"),
+    ("injection_type", "linear"),
+    ("state_init", "normal"),
+    ("sampling_scheme", "poisson-lognormal-filling"),
+)
+
+
 @dataclass
 class RecurrentConfig:
     """Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block."""
@@ -58,50 +71,58 @@ class RecurrentConfig:
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
+        # Nested settings arrive as plain dicts from YAML / JSON.
         if isinstance(self.rope_settings, dict):
             self.rope_settings = RoPESettings(**self.rope_settings)
-        for name, allowed in (
-            ("attn_impl", "sdpa"),
-            ("init_strategy", "takase"),
-            ("init_orthogonal", True),
-            ("activation_checkpoint_impl", "per-iteration"),
-            ("injection_type", "linear"),
-            ("state_init", "normal"),
-            ("sampling_scheme", "poisson-lognormal-filling"),
-        ):
-            if getattr(self, name) != allowed:
-                raise ValueError(f"{name}={getattr(self, name)!r} is not supported, only {allowed!r}")
 
+        for field_name, allowed_value in _FIXED_FIELD_VALUES:
+            actual_value = getattr(self, field_name)
+            if actual_value != allowed_value:
+                raise ValueError(f"{field_name}={actual_value!r} is not supported, only {allowed_value!r}")
+
+        # Vocabulary: pad the embedding table up to a multiple of `padding_multiple`, unless the padded size is given
+        # explicitly, in which case the vocabulary must fit into it.
         if self.padded_vocab_size is None:
             self.padded_vocab_size = find_multiple(self.vocab_size, self.padding_multiple)
         else:
             self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
 
+        # Derived sizes.
         if self.n_embd % self.num_attention_heads != 0:
             raise ValueError("n_embd must be divisible by num_attention_heads")
         self.head_size = self.n_embd // self.num_attention_heads
         if self.intermediate_size is None:
             self.intermediate_size = 4 * self.n_embd
 
-        # Normalize per-block fields to lists of equal length.
+        # Per-block fields become lists with one entry per core block; the number of blocks is the length of
+        # `n_layers_in_recurrent_block`.
         if isinstance(self.n_layers_in_recurrent_block, int):
             self.n_layers_in_recurrent_block = [self.n_layers_in_recurrent_block]
         num_blocks = len(self.n_layers_in_recurrent_block)
         self.mean_recurrence = self._broadcast("mean_recurrence", self.mean_recurrence, num_blocks)
         self.mean_backprop_depth = self._broadcast("mean_backprop_depth", self.mean_backprop_depth, num_blocks)
 
-        # Expected unrolled depth (used to scale the output-projection init) and the mean backprop depth.
-        self.effective_expected_depth = (
-            self.n_layers_in_prelude
-            + self.n_layers_in_coda
-            + sum(n * r for n, r in zip(self.n_layers_in_recurrent_block, self.mean_recurrence))
-        )
-        self.n_layer = sum(n * d for n, d in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth))
+        # Expected unrolled depth of the model: every core block contributes its layers times its mean recurrence.
+        # It scales the output-projection init (see `Init`).
+        recurrent_depth = 0
+        for n_layers, mean_recurrence in zip(self.n_layers_in_recurrent_block, self.mean_recurrence):
+            recurrent_depth += n_layers * mean_recurrence
+        self.effective_expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
+
+        # Mean number of core-block layers the gradient flows through (layers times backprop depth, summed).
+        self.n_layer = 0
+        for n_layers, mean_backprop_depth in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth):
+            self.n_layer += n_layers * mean_backprop_depth
+
         self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
 
     @staticmethod
     def _broadcast(name: str, value: int | list[int], num_blocks: int) -> list[int]:
-        values = [value] if isinstance(value, int) else list(value)
+        """An int (or a one-element list) is repeated for every block; a longer list must have one entry per block."""
+        if isinstance(value, int):
+            values = [value]
+        else:
+            values = list(value)
         if len(values) == 1 and num_blocks > 1:
             values = values * num_blocks
         if len(values) != num_blocks:
@@ -112,26 +133,36 @@ class RecurrentConfig:
     def from_yaml(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
         """Build a config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
         dataclass fields, nested settings as nested mappings), with keyword overrides applied on top."""
-        with open(path, encoding="utf-8") as fp:
-            loaded = yaml.safe_load(fp)
+        with open(path, encoding="utf-8") as yaml_file:
+            loaded = yaml.safe_load(yaml_file)
         if not isinstance(loaded, dict):
             raise ValueError(f"{path}: expected a mapping of RecurrentConfig fields, got {type(loaded).__name__}")
+
+        known_field_names: set[str] = set()
+        for dataclass_field in fields(cls):
+            known_field_names.add(dataclass_field.name)
+        unknown_keys: list[str] = []
+        for key in loaded:
+            if key not in known_field_names:
+                unknown_keys.append(key)
+        if unknown_keys:
+            raise ValueError(f"{path}: unknown RecurrentConfig key(s) {sorted(unknown_keys)}")
+
         kwargs: dict[str, Any] = dict(loaded)
-        unknown = sorted(set(kwargs) - {f.name for f in fields(cls)})
-        if unknown:
-            raise ValueError(f"{path}: unknown RecurrentConfig key(s) {unknown}")
-        return cls(**{**kwargs, **overrides})
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     @classmethod
     def from_json(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
-        with open(path, encoding="utf-8") as fp:
-            kwargs = json.load(fp)
-        return cls(**{**kwargs, **overrides})
+        with open(path, encoding="utf-8") as json_file:
+            kwargs = json.load(json_file)
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
         """Dataclass fields only (derived attributes and the `Init` object are recomputed on load)."""
         return asdict(self)
 
     def to_json(self, path: str | Path) -> None:
-        with open(path, "w", encoding="utf-8") as fp:
-            json.dump(self.to_dict(), fp, indent=2)
+        with open(path, "w", encoding="utf-8") as json_file:
+            json.dump(self.to_dict(), json_file, indent=2)
