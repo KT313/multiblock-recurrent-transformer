@@ -131,8 +131,8 @@ class SourceConfig:
     path: Optional[str] = None  # local: directory of parquet/jsonl files
     converter: Optional[str] = None  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
     fields: Optional[dict[str, str]] = None  # instruct: {instruction: <col>, input: <col>, output: <col>}
-    filter: Optional[str] = None  # named row filter, e.g. sharegpt_quality
-    check_limit: Optional[int] = None  # instruct: stop after inspecting this many source rows even if short of target
+    filter: Optional[str] = None  # instruct: named row filter applied at download, e.g. sharegpt_quality
+    check_limit: Optional[int] = None  # stop after inspecting this many source rows even if short of target (> 0; both kinds)
     rows: Optional[int] = None  # rows to download for a source used only in validation (required there, forbidden for train sources)
     seed: int = 42  # synthetic generator seed; instruct: input-inversion and shuffle seed
     processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
@@ -173,6 +173,10 @@ class SourceConfig:
             has_row_mapping = self.fields is not None or self.converter is not None
             if not has_row_mapping and self.loader != "synthetic":
                 raise ValueError("kind instruct requires fields or converter")
+        if self.kind == "pretrain" and self.filter is not None:
+            raise ValueError("filter only applies to kind instruct (pretrain rows are not filtered at download)")
+        if self.check_limit is not None and self.check_limit <= 0:
+            raise ValueError("check_limit must be positive (omit it to read the whole source)")
         if self.kind != "pretrain" and self.processing is not None:
             raise ValueError("processing overrides only apply to kind pretrain")
         if not 0.0 <= self.input_inversions < 1.0:
@@ -281,6 +285,11 @@ class DatasetConfig:
                 raise ValueError(f"source {name!r} is used for training: it is sized by the sequence budget, drop `rows`")
             if not in_train and source.rows is None:
                 raise ValueError(f"source {name!r} is used only for validation: give `rows` (how many rows to download)")
+            if in_train and in_val and self.validation_fraction_of(name) <= 0.0:
+                raise ValueError(
+                    f"source {name!r} is used in train and val but its validation_fraction is 0: nothing would be held out "
+                    "(list it only in `train`, or give a positive fraction)"
+                )
 
     # --- source usage ----------------------------------------------------------------------------------------------
 
@@ -335,18 +344,23 @@ class DatasetConfig:
     def raw_hash(self, source_name: str) -> str:
         """Hash of a source's ``raw/`` folder: the loader identity — everything that determines **which rows** it
         holds and in what order (kind, loader, repo, revision, files, split, text field, language, path,
-        converter/fields/filter, seed) — plus ``token_count`` and the tokenizer (the stored ``tokens`` column and
-        the token-boundary truncation depend on them).
+        converter/fields/filter; ``seed`` only for ``loader: synthetic``, where it generates the rows) — plus
+        ``token_count`` and the tokenizer (the stored ``tokens`` column and the token-boundary truncation depend on
+        them).
 
         Deliberately NOT part of it: ``max_seq_length`` (the raw manifest records what the rows were truncated at;
         only a raise re-downloads), processing options, budgets / ``rows`` / ``check_limit`` (how many rows are
-        needed or read, not what is read), ``validation_fraction``, ``input_inversions``, ``shuffle``,
-        ``describe_tokens_per_row``, ``load_kwargs.max_cached_file_mb`` (how a file is fetched). Raw shards are the
-        bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
+        needed or read, not what is read), ``validation_fraction``, ``input_inversions``, ``shuffle``, the
+        instruct ``seed`` (inversions and shuffle order are build-time), ``describe_tokens_per_row``,
+        ``load_kwargs.max_cached_file_mb`` (how a file is fetched). Raw shards are the bandwidth-expensive part of a
+        dataset; nothing but a real change of the source may invalidate them.
         """
-        source_fields = hash_fields(self.sources[source_name])
+        source = self.sources[source_name]
+        source_fields = hash_fields(source)
         for key in ("processing", "check_limit", "rows", "validation_fraction", "input_inversions", "shuffle", "describe_tokens_per_row"):
             source_fields.pop(key, None)
+        if source.loader != "synthetic":
+            source_fields.pop("seed", None)
         load_kwargs = source_fields.get("load_kwargs")
         if load_kwargs is not None:
             load_kwargs.pop("max_cached_file_mb", None)
@@ -355,14 +369,15 @@ class DatasetConfig:
     def processed_hash(self, source_name: str) -> str:
         """Hash of a source's ``processed/`` folder: the raw hash, ``max_seq_length`` (stored counts are clamped to
         it), the effective processing block with only the fields of the active dedup mode (a minhash threshold
-        does not change an exact-dedup result), ``input_inversions`` and the resolved ``shuffle``. A change
-        rebuilds ``processed/`` from the raw shards (no download)."""
+        does not change an exact-dedup result), ``input_inversions``, the resolved ``shuffle`` and the ``seed``
+        behind both. A change rebuilds ``processed/`` from the raw shards (no download)."""
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
             "max_seq_length": self.max_seq_length,
             "processing": _processing_hash_fields(self.source_processing(source_name)),
             "input_inversions": self.sources[source_name].input_inversions,
             "shuffle": self.shuffle_of(source_name),
+            "seed": self.sources[source_name].seed,
         }
         return _stable_hash(payload)
 
@@ -373,11 +388,16 @@ class DatasetConfig:
     def config_hash(self) -> str:
         """Hash of everything that defines the training data (recorded in checkpoints so a resume with different
         data is detected): the config minus the knobs that only change how it is fetched or described
-        (``always_range_requests``, ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``)."""
+        (``always_range_requests``, ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``), with every
+        source's processing block reduced to the fields that change its rows (:func:`_processing_hash_fields`, the
+        view ``processed_hash`` uses — a Bloom budget change does not change the data)."""
         payload = hash_fields(self)
         payload.pop("always_range_requests", None)
-        for source_fields in payload.get("sources", {}).values():
+        payload.pop("processing", None)  # folded into every source's effective processing below
+        for name, source_fields in payload.get("sources", {}).items():
             source_fields.pop("describe_tokens_per_row", None)
+            source_fields.pop("processing", None)
+            source_fields["effective_processing"] = _processing_hash_fields(self.source_processing(name))
             load_kwargs = source_fields.get("load_kwargs")
             if load_kwargs is not None:
                 load_kwargs.pop("max_cached_file_mb", None)
@@ -445,7 +465,7 @@ def _glob_prefix(pattern: Any) -> str:
 _DEDUP_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
     "none": ("mode",),
     "exact": ("mode", "normalize"),
-    "minhash": ("mode", "threshold", "num_perm", "ngram"),
+    "minhash": ("mode", "normalize", "threshold", "num_perm", "ngram"),  # the exact pass runs first, keyed on `normalize`
 }
 
 

@@ -369,13 +369,48 @@ def test_hash_fields_drops_defaults_recursively() -> None:
     assert dc.hash_fields(src) == {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
 
 
+def test_the_seed_is_raw_identity_only_for_the_synthetic_loader() -> None:
+    """An instruct source's seed drives inversions and shuffle (build-time): a new seed rebuilds processed, never raw."""
+    d = _minimal()
+    base = _build(d)
+    d["sources"]["ins"]["seed"] = 7
+    reseeded = _build(d)
+    assert reseeded.raw_hash("ins") == base.raw_hash("ins") and reseeded.processed_hash("ins") != base.processed_hash("ins")
+    d["sources"]["pre"]["seed"] = 7  # `pre` is synthetic: the seed generates its rows
+    assert _build(d).raw_hash("pre") != base.raw_hash("pre")
+
+
+def test_config_hash_ignores_the_bloom_budget_like_processed_hash_does() -> None:
+    d = _minimal()
+    base = _build(d).config_hash()
+    d["processing"] = {"dedup": {"bloom_memory_mb": 7}}
+    assert _build(d).config_hash() == base
+    d["processing"] = {"dedup": {"normalize": False}}
+    assert _build(d).config_hash() != base
+
+
+def test_schema_rejects_a_pretrain_filter_a_non_positive_check_limit_and_an_empty_validation_split() -> None:
+    d = _minimal()
+    d["sources"]["pre"]["filter"] = "sharegpt_quality"
+    with pytest.raises(ValueError, match="filter only applies to kind instruct"):
+        _build(d)
+    d = _minimal()
+    d["sources"]["pre"]["check_limit"] = 0
+    with pytest.raises(ValueError, match="check_limit must be positive"):
+        _build(d)
+    d = _minimal()
+    d["validation_fraction"] = 0.0
+    with pytest.raises(ValueError, match="validation_fraction is 0"):
+        _build(d)
+
+
 def test_processing_hash_fields_keep_only_the_active_dedup_mode() -> None:
     assert dc._processing_hash_fields(ProcessingConfig()) == {}
     assert dc._processing_hash_fields(ProcessingConfig(dedup=DedupConfig(bloom_memory_mb=1))) == {}  # resource knob
     assert dc._processing_hash_fields(ProcessingConfig(dedup=DedupConfig(threshold=0.5, ngram=3))) == {}  # inactive minhash fields
     assert dc._processing_hash_fields(ProcessingConfig(dedup=DedupConfig(normalize=False))) == {"dedup": {"normalize": False}}
     minhash = ProcessingConfig(min_chars=9, dedup=DedupConfig(mode="minhash", threshold=0.5, normalize=False, bloom_memory_mb=1))
-    assert dc._processing_hash_fields(minhash) == {"min_chars": 9, "dedup": {"mode": "minhash", "threshold": 0.5}}
+    assert dc._processing_hash_fields(minhash) == {"min_chars": 9, "dedup": {"mode": "minhash", "normalize": False, "threshold": 0.5}}
     assert dc._processing_hash_fields(ProcessingConfig(dedup=DedupConfig(mode="none", threshold=0.5))) == {"dedup": {"mode": "none"}}
 
 
