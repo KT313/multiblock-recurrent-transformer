@@ -92,6 +92,13 @@ go through it, so a repair followed by a resume restores every counter instead o
   fields of the active dedup mode, `input_inversions` and the resolved `shuffle`. A change rebuilds `processed/`
   from the raw shards; nothing is downloaded.
 
+Which hash a setting belongs to is declared once, on the field itself: every field of `dataset_config.py` carries a
+`field(metadata={"hash": "raw" | "processed" | "config" | "none"})` annotation (a callable for the two conditional
+cases — `seed` is raw identity only for `loader: synthetic`, and a dedup field only counts for the modes that use
+it). `hash_payload` walks those annotations and the three hash methods assemble their payload from it; a new field
+without an annotation makes hashing raise. Only non-default values enter, so adding or removing a field with a
+default never invalidates data on disk.
+
 Shards are published **one at a time** (written to a `.tmp` file, renamed, recorded in the manifest — raw shards
 with the loader offset **and** the rejected-row totals as of their last row), so a network error, a crash or Ctrl-C
 keeps everything fetched so far and the next run resumes behind the last complete shard without counting a skipped

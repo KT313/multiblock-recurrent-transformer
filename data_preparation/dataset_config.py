@@ -57,14 +57,59 @@ REMOVED_KEYS: dict[str, str] = {
 }
 
 
+# --- hash annotations --------------------------------------------------------------------------------------------------
+#
+# Every field of every config dataclass declares which of the three manifest hashes it belongs to, once, right where
+# it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `config_hash` assemble
+# their payloads from it. Before this, each hash built the dict of all non-default fields and then popped a
+# hand-maintained list of names — a table that drifted from the field list three times.
+#
+#   raw       identity of the downloaded rows: which rows a loader yields, in what order, and how their stored token
+#             counts are made. Keys `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so
+#             it is deleted (after confirmation) and downloaded again.
+#   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder, nothing is downloaded.
+#   config    everything else that defines the training data; only `config_hash` (recorded in checkpoints so a resume
+#             against different data is detected) counts it.
+#   none      not hashed at all: how rows are fetched or described, resource knobs — nothing that changes the data.
+#
+# `raw` and `processed` select exactly their own fields (`processed_hash` folds the raw hash in as one value, so raw
+# fields must not appear a second time); `config` counts every field annotated raw, processed *or* config.
+HashName = Literal["raw", "processed", "config"]
+HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "none")
+
+_RAW: dict[str, Any] = {"hash": "raw"}
+_PROCESSED: dict[str, Any] = {"hash": "processed"}
+_CONFIG: dict[str, Any] = {"hash": "config"}
+_UNHASHED: dict[str, Any] = {"hash": "none"}
+# `max_cached_file_mb` says whether a Hub file is cached whole or read remotely by piece: traffic, not rows.
+_LOAD_KWARGS: dict[str, Any] = {**_RAW, "hash_drop": ("max_cached_file_mb",)}
+
+
+def _seed_hash(source: SourceConfig) -> str:
+    """`seed` is loader identity — it generates the rows themselves — only for `loader: synthetic`; for every other
+    loader it drives the build-time input inversions and the shuffle order, so it belongs to the processed hash."""
+    return "raw" if source.loader == "synthetic" else "processed"
+
+
+def _normalize_hash(dedup: DedupConfig) -> str:
+    """`normalize` changes the hashed text of every mode that hashes at all (`exact` and the exact pass of
+    `minhash`); with `mode: none` nothing is hashed and it cannot change a result."""
+    return "none" if dedup.mode == "none" else "processed"
+
+
+def _minhash_only(dedup: DedupConfig) -> str:
+    """The Jaccard threshold, the permutation count and the n-gram size only change a MinHash/LSH result."""
+    return "processed" if dedup.mode == "minhash" else "none"
+
+
 @dataclass
 class TokenizerConfig:
     """Which tokenizer defines "a token" for this dataset; saved to `dataset/tokenizers/<name>/`."""
 
-    name: str  # directory name under `dataset/tokenizers/`
-    kind: Literal["hf", "synthetic"] = "hf"  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
-    hf_id: Optional[str] = None  # required for kind=hf
-    revision: Optional[str] = None  # Hub commit sha; pin it
+    name: str = field(metadata=_RAW)  # directory name under `dataset/tokenizers/`
+    kind: Literal["hf", "synthetic"] = field(default="hf", metadata=_RAW)  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
+    hf_id: Optional[str] = field(default=None, metadata=_RAW)  # required for kind=hf
+    revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it
 
     def __post_init__(self) -> None:
         if self.kind == "hf" and not self.hf_id:
@@ -75,12 +120,14 @@ class TokenizerConfig:
 class DedupConfig:
     """Deduplication of a source's rows (both kinds; instruct rows are hashed as instruction + input + output)."""
 
-    mode: DedupMode = "exact"  # minhash = exact dedup first, then MinHash/LSH near-duplicate removal (not for scale)
-    normalize: bool = True  # exact mode: hash lowercased, whitespace-collapsed text
-    bloom_memory_mb: int = 1024  # exact mode: memory budget of the Bloom filter holding the seen hashes (per source)
-    threshold: float = 0.95  # minhash mode: Jaccard threshold
-    num_perm: int = 256  # minhash mode: permutations
-    ngram: int = 5  # minhash mode: word n-gram size
+    mode: DedupMode = field(default="exact", metadata=_PROCESSED)  # minhash = exact dedup first, then MinHash/LSH near-duplicate removal (not for scale)
+    normalize: bool = field(default=True, metadata={"hash": _normalize_hash})  # exact mode: hash lowercased, whitespace-collapsed text
+    # A larger filter only lowers an already negligible false-positive rate: a resource knob, never a reason to
+    # rebuild a processed folder, so it is in no hash.
+    bloom_memory_mb: int = field(default=1024, metadata=_UNHASHED)  # exact mode: memory budget of the Bloom filter holding the seen hashes (per source)
+    threshold: float = field(default=0.95, metadata={"hash": _minhash_only})  # minhash mode: Jaccard threshold
+    num_perm: int = field(default=256, metadata={"hash": _minhash_only})  # minhash mode: permutations
+    ngram: int = field(default=5, metadata={"hash": _minhash_only})  # minhash mode: word n-gram size
 
     def __post_init__(self) -> None:
         if not 0.0 < self.threshold <= 1.0:
@@ -95,20 +142,20 @@ class DedupConfig:
 class DecontaminationConfig:
     """Drop documents overlapping benchmark test sets (off by default; the thesis run skipped it)."""
 
-    enabled: bool = False  # off: documents are kept regardless of benchmark overlap
-    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS))  # benchmark test sets to check against (lib/stages/benchmarks.py)
-    ngram: int = 13  # word n-gram size compared between a document and the benchmarks
-    threshold: float = 0.1  # share of a document's n-grams found in one benchmark
+    enabled: bool = field(default=False, metadata=_PROCESSED)  # off: documents are kept regardless of benchmark overlap
+    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS), metadata=_PROCESSED)  # benchmark test sets to check against (lib/stages/benchmarks.py)
+    ngram: int = field(default=13, metadata=_PROCESSED)  # word n-gram size compared between a document and the benchmarks
+    threshold: float = field(default=0.1, metadata=_PROCESSED)  # share of a document's n-grams found in one benchmark
 
 
 @dataclass
 class ProcessingConfig:
     """Per-source processing options; the dataset-level block is the default, a pretrain source may override it."""
 
-    min_chars: int = 50  # drop shorter texts (pretrain only; the upper bound is `max_seq_length` at download)
-    dedup: DedupConfig = field(default_factory=DedupConfig)  # exact / minhash / none, see DedupConfig
-    quality_filter: bool = False  # prose heuristics (sentences, caps ratio, repetition); thesis run: off
-    decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig)  # benchmark overlap filter, see DecontaminationConfig
+    min_chars: int = field(default=50, metadata=_PROCESSED)  # drop shorter texts (pretrain only; the upper bound is `max_seq_length` at download)
+    dedup: DedupConfig = field(default_factory=DedupConfig, metadata=_PROCESSED)  # exact / minhash / none, see DedupConfig
+    quality_filter: bool = field(default=False, metadata=_PROCESSED)  # prose heuristics (sentences, caps ratio, repetition); thesis run: off
+    decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig, metadata=_PROCESSED)  # benchmark overlap filter, see DecontaminationConfig
 
     def __post_init__(self) -> None:
         if self.min_chars < 0:
@@ -189,26 +236,27 @@ class SourceConfig:
 
     Which field belongs to which kind and loader is the `SOURCE_FIELD_SCOPES` table, not a chain of ifs."""
 
-    kind: SourceKind  # pretrain (one text column) | instruct (instruction / input / output)
-    loader: LoaderName = "hf_split"  # how rows are fetched: hf_files | hf_split | hf_stream | github_code | local | synthetic (lib/sources/loaders.py)
-    hf_id: Optional[str] = None  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
-    revision: Optional[str] = None  # Hub commit sha; pin it so row order is stable across increments
-    load_kwargs: dict[str, Any] = field(default_factory=dict)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
-    split: str = "train"  # Hub split to read (hf_split / hf_stream)
-    text_field: str = "text"  # pretrain: column holding the document
-    language: Optional[str] = None  # github_code: language label of codeparrot/github-code-clean
-    path: Optional[str] = None  # local: directory of parquet/jsonl files
-    converter: Optional[str] = None  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
-    fields: Optional[dict[str, str]] = None  # instruct: {instruction: <col>, input: <col>, output: <col>}
-    filter: Optional[str] = None  # instruct: named row filter applied at download, e.g. sharegpt_quality
-    check_limit: Optional[int] = None  # stop after inspecting this many source rows even if short of target (> 0; both kinds)
-    rows: Optional[int] = None  # rows to download for a source used only in validation (required there, forbidden for train sources)
-    seed: int = 42  # synthetic generator seed; instruct: input-inversion and shuffle seed
-    processing: Optional[ProcessingConfig] = None  # pretrain: override of the dataset-level processing block
-    input_inversions: float = 0.0  # instruct: share of rows turned into "given the output, what was the instruction?"
-    shuffle: Optional[bool] = None  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
-    validation_fraction: Optional[float] = None  # override of the dataset-level validation_fraction for this source
-    describe_tokens_per_row: int = 500  # only used by `describe` for its token table; never a planner input
+    kind: SourceKind = field(metadata=_RAW)  # pretrain (one text column) | instruct (instruction / input / output)
+    loader: LoaderName = field(default="hf_split", metadata=_RAW)  # how rows are fetched: hf_files | hf_split | hf_stream | github_code | local | synthetic (lib/sources/loaders.py)
+    hf_id: Optional[str] = field(default=None, metadata=_RAW)  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
+    revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it so row order is stable across increments
+    load_kwargs: dict[str, Any] = field(default_factory=dict, metadata=_LOAD_KWARGS)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
+    split: str = field(default="train", metadata=_RAW)  # Hub split to read (hf_split / hf_stream)
+    text_field: str = field(default="text", metadata=_RAW)  # pretrain: column holding the document
+    language: Optional[str] = field(default=None, metadata=_RAW)  # github_code: language label of codeparrot/github-code-clean
+    path: Optional[str] = field(default=None, metadata=_RAW)  # local: directory of parquet/jsonl files
+    converter: Optional[str] = field(default=None, metadata=_RAW)  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
+    fields: Optional[dict[str, str]] = field(default=None, metadata=_RAW)  # instruct: {instruction: <col>, input: <col>, output: <col>}
+    filter: Optional[str] = field(default=None, metadata=_RAW)  # instruct: named row filter applied at download, e.g. sharegpt_quality
+    check_limit: Optional[int] = field(default=None, metadata=_CONFIG)  # stop after inspecting this many source rows even if short of target (> 0; both kinds)
+    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # rows to download for a source used only in validation (required there, forbidden for train sources)
+    seed: int = field(default=42, metadata={"hash": _seed_hash})  # synthetic generator seed; instruct: input-inversion and shuffle seed
+    # hashed through the source's *effective* processing block (`source_processing`), not as a field of its own
+    processing: Optional[ProcessingConfig] = field(default=None, metadata=_PROCESSED)  # pretrain: override of the dataset-level processing block
+    input_inversions: float = field(default=0.0, metadata=_PROCESSED)  # instruct: share of rows turned into "given the output, what was the instruction?"
+    shuffle: Optional[bool] = field(default=None, metadata=_PROCESSED)  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
+    validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
+    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # only used by `describe` for its token table; never a planner input
 
     def __post_init__(self) -> None:
         self._check_field_scopes()
@@ -254,11 +302,11 @@ class SourceConfig:
 class StageConfig:
     """One training stage: token budget and the train/val weights over sources."""
 
-    name: str  # stage label (checkpoints, logs); unique per config
-    tokens: int  # training tokens of this stage (steps = tokens // (world_batch_size × block_size))
-    train: dict[str, float]  # source name -> sampling weight (> 0, sum 1)
-    val: dict[str, float]  # source name -> validation weight (> 0, sum 1)
-    transition_pct: float = 0.0  # fraction of this stage (at its end) blending into the next stage's data/LR
+    name: str = field(metadata=_CONFIG)  # stage label (checkpoints, logs); unique per config
+    tokens: int = field(metadata=_CONFIG)  # training tokens of this stage (steps = tokens // (world_batch_size × block_size))
+    train: dict[str, float] = field(metadata=_CONFIG)  # source name -> sampling weight (> 0, sum 1)
+    val: dict[str, float] = field(metadata=_CONFIG)  # source name -> validation weight (> 0, sum 1)
+    transition_pct: float = field(default=0.0, metadata=_CONFIG)  # fraction of this stage (at its end) blending into the next stage's data/LR
 
     def __post_init__(self) -> None:
         if self.tokens <= 0:
@@ -295,18 +343,19 @@ class DatasetConfig:
     `ceil(validation_fraction_of(source) × rows)` processed rows are validation, the rest training.
     """
 
-    name: str  # non-empty path component
-    tokenizer: TokenizerConfig  # see TokenizerConfig
-    sources: dict[str, SourceConfig]  # source name -> SourceConfig; the names are the stage keys
-    stages: list[StageConfig]  # in training order; at least one, unique names
-    block_size: int  # training sequence length (sequences per stage = tokens ÷ block_size); <= max_seq_length
-    max_seq_length: int = 2048  # token cap per stored row (pretrain: truncated, instruct: dropped); block_size must be <= this
-    validation_fraction: float = 0.05  # in [0, 1): held-out share of a source used in both train and val
-    always_range_requests: bool = True  # read every Hub file remotely by piece (row groups / stream prefix); False: files
-    # up to load_kwargs.max_cached_file_mb are downloaded whole into the Hub cache instead. Traffic only, not part of
-    # source hashes.
-    token_count: TokenCountMode = "tokenizer"  # "estimate" = chars / 4
-    processing: ProcessingConfig = field(default_factory=ProcessingConfig)  # defaults for every source; see ProcessingConfig
+    name: str = field(metadata=_CONFIG)  # non-empty path component
+    tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
+    sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
+    stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
+    block_size: int = field(metadata=_CONFIG)  # training sequence length (sequences per stage = tokens ÷ block_size); <= max_seq_length
+    max_seq_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); block_size must be <= this
+    validation_fraction: float = field(default=0.05, metadata=_CONFIG)  # in [0, 1): held-out share of a source used in both train and val
+    # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
+    # whole into the Hub cache instead of being read remotely by piece.
+    always_range_requests: bool = field(default=True, metadata=_UNHASHED)  # read every Hub file remotely by piece (row groups / stream prefix)
+    token_count: TokenCountMode = field(default="tokenizer", metadata=_RAW)  # "estimate" = chars / 4
+    # hashed through every source's *effective* processing block, not as a field of its own
+    processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
 
     # --- validation ------------------------------------------------------------------------------------------------
 
@@ -407,65 +456,60 @@ class DatasetConfig:
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
     def raw_hash(self, source_name: str) -> str:
-        """Hash of a source's ``raw/`` folder: the loader identity — everything that determines **which rows** it
-        holds and in what order (kind, loader, repo, revision, files, split, text field, language, path,
-        converter/fields/filter; ``seed`` only for ``loader: synthetic``, where it generates the rows) — plus
-        ``token_count`` and the tokenizer (the stored ``tokens`` column and the token-boundary truncation depend on
-        them).
+        """Hash of a source's ``raw/`` folder: every field annotated ``raw`` — the loader identity (kind, loader,
+        repo, revision, files, split, text field, language, path, converter/fields/filter; ``seed`` only for
+        ``loader: synthetic``, where it generates the rows) plus ``token_count`` and the tokenizer, on which the
+        stored ``tokens`` column and the token-boundary truncation depend.
 
-        Deliberately NOT part of it: ``max_seq_length`` (the raw manifest records what the rows were truncated at;
-        only a raise re-downloads), processing options, budgets / ``rows`` / ``check_limit`` (how many rows are
-        needed or read, not what is read), ``validation_fraction``, ``input_inversions``, ``shuffle``, the
-        instruct ``seed`` (inversions and shuffle order are build-time), ``describe_tokens_per_row``,
-        ``load_kwargs.max_cached_file_mb`` (how a file is fetched). Raw shards are the bandwidth-expensive part of a
-        dataset; nothing but a real change of the source may invalidate them.
+        Everything else is annotated ``processed``, ``config`` or ``none`` and stays out: ``max_seq_length`` (the raw
+        manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
+        ``rows`` / ``check_limit`` (how many rows are needed or read, not what is read), ``validation_fraction``,
+        ``input_inversions``, ``shuffle``, the non-synthetic ``seed`` (inversions and shuffle order are build-time),
+        ``describe_tokens_per_row``, ``load_kwargs.max_cached_file_mb`` (how a file is fetched). Raw shards are the
+        bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
         """
-        source = self.sources[source_name]
-        source_fields = hash_fields(source)
-        for key in ("processing", "check_limit", "rows", "validation_fraction", "input_inversions", "shuffle", "describe_tokens_per_row"):
-            source_fields.pop(key, None)
-        if source.loader != "synthetic":
-            source_fields.pop("seed", None)
-        load_kwargs = source_fields.get("load_kwargs")
-        if load_kwargs is not None:
-            load_kwargs.pop("max_cached_file_mb", None)
-        return _stable_hash({"source": source_fields, "token_count": self.token_count, "tokenizer": hash_fields(self.tokenizer)})
+        payload = {
+            "source": hash_payload(self.sources[source_name], "raw"),
+            "token_count": self.token_count,
+            "tokenizer": hash_payload(self.tokenizer, "raw"),
+        }
+        return _stable_hash(payload)
 
     def processed_hash(self, source_name: str) -> str:
-        """Hash of a source's ``processed/`` folder: the raw hash, ``max_seq_length`` (stored counts are clamped to
-        it), the effective processing block with only the fields of the active dedup mode (a minhash threshold
-        does not change an exact-dedup result), ``input_inversions``, the resolved ``shuffle`` and the ``seed``
-        behind both. A change rebuilds ``processed/`` from the raw shards (no download)."""
+        """Hash of a source's ``processed/`` folder: the raw hash, plus the ``processed`` fields as the build
+        resolves them — ``max_seq_length`` (stored counts are clamped to it), the *effective* processing block (only
+        the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
+        ``input_inversions``, the resolved ``shuffle`` and the ``seed`` behind both. These four are written out
+        rather than taken from :func:`hash_payload`, because the build uses their resolved values (``shuffle_of``,
+        ``source_processing``) whether or not they were spelled in the YAML. A change rebuilds ``processed/`` from
+        the raw shards (no download)."""
+        source = self.sources[source_name]
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
             "max_seq_length": self.max_seq_length,
-            "processing": _processing_hash_fields(self.source_processing(source_name)),
-            "input_inversions": self.sources[source_name].input_inversions,
+            "processing": hash_payload(self.source_processing(source_name), "processed"),
+            "input_inversions": source.input_inversions,
             "shuffle": self.shuffle_of(source_name),
-            "seed": self.sources[source_name].seed,
+            "seed": source.seed,
         }
         return _stable_hash(payload)
 
     def tokenizer_hash(self) -> str:
         """Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`)."""
-        return _stable_hash(hash_fields(self.tokenizer))
+        return _stable_hash(hash_payload(self.tokenizer, "raw"))
 
     def config_hash(self) -> str:
         """Hash of everything that defines the training data (recorded in checkpoints so a resume with different
-        data is detected): the config minus the knobs that only change how it is fetched or described
-        (``always_range_requests``, ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``), with every
-        source's processing block reduced to the fields that change its rows (:func:`_processing_hash_fields`, the
-        view ``processed_hash`` uses — a Bloom budget change does not change the data)."""
-        payload = hash_fields(self)
-        payload.pop("always_range_requests", None)
+        data is detected): every field annotated ``raw``, ``processed`` or ``config``, which leaves out the knobs
+        that only change how the data are fetched or described (``always_range_requests``,
+        ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``). The two processing blocks are replaced by
+        the *effective* block of each source — the view ``processed_hash`` uses, so a Bloom budget change does not
+        change this hash either."""
+        payload = hash_payload(self, "config")
         payload.pop("processing", None)  # folded into every source's effective processing below
-        for name, source_fields in payload.get("sources", {}).items():
-            source_fields.pop("describe_tokens_per_row", None)
+        for name, source_fields in payload["sources"].items():
             source_fields.pop("processing", None)
-            source_fields["effective_processing"] = _processing_hash_fields(self.source_processing(name))
-            load_kwargs = source_fields.get("load_kwargs")
-            if load_kwargs is not None:
-                load_kwargs.pop("max_cached_file_mb", None)
+            source_fields["effective_processing"] = hash_payload(self.source_processing(name), "processed")
         return _stable_hash(payload)
 
     def overlap_warnings(self) -> list[str]:
@@ -524,45 +568,59 @@ def _glob_prefix(pattern: Any) -> str:
     return text
 
 
-# Dedup fields that change the result of each mode. `bloom_memory_mb` (exact) is deliberately absent: it is a
-# resource knob — a larger filter only lowers an already negligible false-positive rate, it does not change which
-# rows a rebuild would keep in any material way — so changing it must not invalidate processed folders.
-_DEDUP_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
-    "none": ("mode",),
-    "exact": ("mode", "normalize"),
-    "minhash": ("mode", "normalize", "threshold", "num_perm", "ngram"),  # the exact pass runs first, keyed on `normalize`
-}
-
-
-def _processing_hash_fields(processing: ProcessingConfig) -> dict[str, Any]:
-    """`hash_fields(processing)` with the dedup block reduced to the fields of the active mode."""
-    out = hash_fields(processing)
-    dedup = {k: v for k, v in hash_fields(processing.dedup).items() if k in _DEDUP_RESULT_FIELDS[processing.dedup.mode]}
-    if dedup:
-        out["dedup"] = dedup
-    else:
-        out.pop("dedup", None)
-    return out
-
-
 def _stable_hash(payload: Any) -> str:
     """First 16 hex chars of the sha256 of the payload as sorted-key JSON (independent of dict insertion order)."""
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def hash_fields(obj: Any) -> dict[str, Any]:
-    """`asdict(obj)` without the fields that still hold their default value (recursively for nested dataclasses).
+def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
+    """The fields of ``obj`` that ``hash_name`` counts, as a JSON-ready dict; the input of the three hashes.
 
-    Manifests key on hashes of this, so adding a field with a default to the schema, or removing one, never
-    invalidates data on disk; only a value that was explicitly set to something else changes the hash.
+    A field is counted when its ``metadata["hash"]`` annotation says so (see "hash annotations" at the top of this
+    file): ``raw`` and ``processed`` select exactly their own fields, ``config`` selects all three kinds. A field
+    still holding its **default** value never enters — so adding a field with a default to the schema, or removing
+    one, never invalidates data on disk; only a value explicitly set to something else changes a hash. A nested
+    dataclass whose counted fields are all defaults is dropped for the same reason, and ``metadata["hash_drop"]``
+    names dict keys of a field's value that are no part of the hash (``load_kwargs.max_cached_file_mb``).
+
+    An unannotated field raises: a new schema field has to say which hash it belongs to.
     """
     out: dict[str, Any] = {}
     for f in fields(obj):
+        if not _counts_for(f, obj, hash_name):
+            continue
         value = getattr(obj, f.name)
         if _holds_default(f, value):
             continue
-        out[f.name] = _hashable(value)
+        hashed = _hashable(value, hash_name)
+        if _is_dataclass_instance(value) and not hashed:
+            continue  # every counted field of the nested block holds its default
+        out[f.name] = _drop_keys(hashed, f.metadata.get("hash_drop", ()))
     return out
+
+
+def field_hash_annotation(f: Field[Any], obj: Any) -> str:
+    """Which hash ``f`` of ``obj`` belongs to: its ``metadata["hash"]``, or what the callable there answers for
+    ``obj`` (the two conditional fields: ``SourceConfig.seed`` and the dedup fields of an inactive mode)."""
+    annotation = f.metadata.get("hash")
+    if annotation is None:
+        raise TypeError(
+            f"{type(obj).__name__}.{f.name} carries no `hash` metadata; annotate it with one of {HASH_ANNOTATIONS} "
+            "(see 'hash annotations' in dataset_config.py) — a schema field must say which hash it belongs to"
+        )
+    name = annotation(obj) if callable(annotation) else annotation
+    if name not in HASH_ANNOTATIONS:
+        raise ValueError(f"{type(obj).__name__}.{f.name}: unknown hash annotation {name!r}; expected one of {HASH_ANNOTATIONS}")
+    return str(name)
+
+
+def _counts_for(f: Field[Any], obj: Any, hash_name: HashName) -> bool:
+    """``config`` counts every hashed field; ``raw`` / ``processed`` count only their own (``processed_hash`` folds
+    the raw hash in as a single value, so raw fields must not appear in it a second time)."""
+    annotation = field_hash_annotation(f, obj)
+    if hash_name == "config":
+        return annotation != "none"
+    return annotation == hash_name
 
 
 def _holds_default(f: Field[Any], value: Any) -> bool:
@@ -573,14 +631,25 @@ def _holds_default(f: Field[Any], value: Any) -> bool:
     return False  # required field: never a default
 
 
-def _hashable(value: Any) -> Any:
-    """Plain dicts/lists/scalars for JSON: nested dataclasses via `hash_fields`, tuples become lists."""
-    if is_dataclass(value) and not isinstance(value, type):
-        return hash_fields(value)
+def _is_dataclass_instance(value: Any) -> bool:
+    return is_dataclass(value) and not isinstance(value, type)
+
+
+def _drop_keys(value: Any, keys: Any) -> Any:
+    """``value`` without the dict keys ``keys`` (``metadata["hash_drop"]``); the emptied dict itself stays."""
+    if not keys or not isinstance(value, dict):
+        return value
+    return {k: v for k, v in value.items() if k not in keys}
+
+
+def _hashable(value: Any, hash_name: HashName) -> Any:
+    """Plain dicts/lists/scalars for JSON: nested dataclasses via `hash_payload`, tuples become lists."""
+    if _is_dataclass_instance(value):
+        return hash_payload(value, hash_name)
     if isinstance(value, dict):
-        return {k: _hashable(v) for k, v in value.items()}
+        return {k: _hashable(v, hash_name) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_hashable(v) for v in value]
+        return [_hashable(v, hash_name) for v in value]
     return value
 
 
