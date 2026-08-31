@@ -1,10 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for the planner: `rows_needed` by hand (sequences, the split, validation-only sources), the download plan
-(clamped, zero when exhausted, stale raw rejected), the satisfaction rules and the status table."""
+(clamped, zero when exhausted, stale raw rejected, topped up when the build drops more than the margin), the
+`SourceLedger` satisfaction cases and the status table."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from fractions import Fraction
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +24,16 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build import prepare
 from data_preparation.lib.build.planner import (
     DatasetReport,
+    Satisfaction,
+    SourceLedger,
     SourceState,
     every_source_satisfies_its_budget,
     plan_downloads,
     raw_is_exhausted,
+    read_ledgers,
     rows_needed,
     rows_sufficient,
+    source_ledger,
     source_state,
     sources_with_pending_raw_shards,
     summarize_dataset_state,
@@ -174,6 +181,66 @@ def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layou
     assert outdated_entry.rows_to_fetch == 0 and outdated_entry.reason.startswith("raw outdated")
     a = source_state(cfg, "a", layout)  # the status table only reports it
     assert not a.satisfied and a.reason == "raw stale: the repair step deletes it after confirmation"
+
+
+
+# --- the ledger -------------------------------------------------------------------------------------------------------
+
+
+def _ledger(**overrides: Any) -> SourceLedger:
+    """A ledger of a trained source with 100 raw rows fully built into 90 processed ones (budget 100 / 84)."""
+    defaults: dict[str, Any] = dict(
+        name="s", kind="pretrain", rows_needed=100, rows_sufficient=84, sequence_budget=70, raw_state="current",
+        raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_state="built",
+        processed_rows=90, training_rows=90,
+    )
+    return SourceLedger(**{**defaults, **overrides})
+
+
+def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """`plan_downloads`, the satisfaction check and the status table are three views of the same object."""
+    cfg = two_stage_cfg()
+    prepare(config_file(cfg), layout.root, assume_yes=False)
+    ledger = source_ledger(cfg, "a", layout)
+    assert (ledger.name, ledger.kind, ledger.raw_state, ledger.processed_state) == ("a", "pretrain", "current", "built")
+    assert (ledger.rows_needed, ledger.rows_sufficient, ledger.raw_rows) == (64, 54, 64)
+    assert ledger.satisfaction() is Satisfaction.OK and ledger.rows_to_fetch() == 0
+    assert ledger.download() == next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
+    assert ledger.state() == source_state(cfg, "a", layout)
+    assert [led.name for led in read_ledgers(cfg, layout, sources=["i", "a"])] == ["a", "i"]  # config order
+
+
+def test_the_satisfaction_cases() -> None:
+    assert _ledger().satisfaction() is Satisfaction.OK
+    assert _ledger(raw_state="stale").satisfaction() is Satisfaction.RAW_BROKEN
+    assert _ledger(raw_state="outdated").satisfaction() is Satisfaction.RAW_BROKEN
+    assert _ledger(raw_state="missing", raw_rows=0).satisfaction() is Satisfaction.RAW_MISSING
+    for processed_state in ("missing", "stale", "behind_raw"):
+        assert _ledger(processed_state=processed_state).satisfaction() is Satisfaction.NOT_BUILT
+    assert _ledger(processed_rows=10).satisfaction() is Satisfaction.SHORT_BUT_FETCHABLE
+    dry_small = _ledger(processed_rows=10, exhausted=True)
+    assert dry_small.satisfaction() is Satisfaction.EXHAUSTED_SMALL and dry_small.satisfaction().satisfied
+    dry_empty = _ledger(processed_rows=0, exhausted=True, skipped_malformed=100)
+    assert dry_empty.satisfaction() is Satisfaction.EXHAUSTED_EMPTY and not dry_empty.satisfaction().satisfied
+    assert "NOT ONE" in dry_empty.reason() and "100 malformed" in dry_empty.reason()
+    assert "check the source's fields / converter / filter / language" in dry_empty.reason()
+    assert dry_empty.epochs() is None and _ledger().epochs() == pytest.approx(70 / 90)
+
+
+def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
+    """Raw is long enough but only 20 of 100 rows survived the build: the shortfall (84 − 20) is divided by the
+    observed yield (0.2) and multiplied by the same 1.2 safety margin the first download uses."""
+    short = _ledger(processed_rows=20, training_rows=20)
+    assert short.rows_to_fetch() == 384 == ceil((84 - 20) * Fraction("1.2") / Fraction(20, 100))
+    assert short.download().rows_target == 100 + 384, "the download takes a target, not an increment"
+    assert "top-up: 20 of 84 rows survived 100 raw" in short.download().reason
+
+    assert _ledger(raw_rows=50, processed_rows=45, training_rows=45).rows_to_fetch() == 50  # raw itself is short
+    assert _ledger(processed_rows=20, exhausted=True).rows_to_fetch() == 0  # nothing left to fetch
+    assert _ledger(processed_rows=20, processed_state="behind_raw").rows_to_fetch() == 0  # build first
+    nothing_survives = _ledger(processed_rows=0)
+    assert nothing_survives.rows_to_fetch() == 0  # no yield to extrapolate from: more raw would be dropped too
+    assert nothing_survives.download().reason == "no row of 100 raw rows survives the build"
 
 
 # --- satisfaction ---------------------------------------------------------------------------------------------------

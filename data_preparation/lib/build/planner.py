@@ -3,12 +3,22 @@
 
 The trainer draws *rows* from a source with the stage weight and pads or truncates every row to ``block_size``, so a
 stage consumes ``stage.tokens × weight ÷ block_size`` rows of a source — its :meth:`DatasetConfig.sequence_budget`.
-That is the planner's unit: :func:`rows_needed` turns it into a download target, :func:`plan_downloads` into the
-rows still missing per source, :func:`every_source_satisfies_its_budget` / :func:`summarize_dataset_state` decide
-whether the processed folders serve the budget (the status table). There is no tokens-per-row estimate anywhere
-in this arithmetic any more: a source whose rows are shorter than ``block_size`` is no longer over-downloaded, and
-the realised **token** mix of a stage is ``weight × mean_tokens_per_row ÷ block_size``-weighted (the README says
-so; ``describe.py`` prints an estimate from ``describe_tokens_per_row`` for the token table only).
+That is the planner's unit: :func:`rows_needed` turns it into a download target and :func:`rows_sufficient` into the
+processed rows that serve it. There is no tokens-per-row estimate anywhere in this arithmetic: a source whose rows
+are shorter than ``block_size`` is no longer over-downloaded, and the realised **token** mix of a stage is
+``weight × mean_tokens_per_row ÷ block_size``-weighted (the README says so; ``describe.py`` prints an estimate from
+``describe_tokens_per_row`` for the token table only).
+
+One :class:`SourceLedger` per source answers **both** questions the pipeline asks — "what is still to download?"
+(:meth:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`) — from one read
+of the config and the manifests. :func:`plan_downloads`, :func:`every_source_satisfies_its_budget`,
+``runner.another_round_can_fetch_more`` and :func:`summarize_dataset_state` all read that object, so they cannot
+disagree. They used to: the plan looked only at *raw* rows and satisfaction only at *processed* rows, so a source
+whose dedup or length filter dropped more than the safety margin was short forever with nothing planned (the round
+loop gave up and ``prepare`` failed with no way forward), and a source that yielded *zero* processed rows but was
+exhausted counted as complete — a wrong ``fields`` / ``converter`` / ``filter`` / ``language`` reported as success.
+Now the ledger sizes a **top-up** from the observed yield (processed ÷ raw) and an exhausted source with no rows is
+a failure, as "a failed source is a failed build" says it must be.
 
 Everything here reads manifests only (no parquet footers): broken shards are the repair step's business
 (``lib/build/repair.py``) and the training resolver checks the folders on disk independently. Pure functions of
@@ -19,14 +29,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from fractions import Fraction
 from math import ceil
+from typing import Literal
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
-from data_preparation.lib.stages.download import current_raw_manifest, raw_manifest_state
+from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
 from data_preparation.lib.storage.manifest import Manifest
-from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted
+from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted, rejected_rows
 
 _MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not 60.000000000000007
 
@@ -121,13 +133,21 @@ def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout
 
 @dataclass(frozen=True)
 class SourceDownload:
-    """Rows of one source: on disk (raw manifest), needed, and the difference still to fetch."""
+    """Rows of one source: on disk (raw manifest), needed, and how many still to fetch
+    (:meth:`SourceLedger.rows_to_fetch`)."""
 
     name: str
     rows_present: int  # rows in the raw manifest (0 when missing)
     rows_needed: int  # :func:`rows_needed`
-    rows_to_fetch: int  # max(0, needed − present); 0 when the loader is exhausted
-    reason: str  # "raw missing" | "rows N < M" | "exhausted" | "enough rows"
+    rows_to_fetch: int  # 0 when the loader is exhausted, when raw is stale, or when the budget is served
+    reason: str  # "raw missing" | "rows N < M" | "top-up: ..." | "exhausted" | "enough rows"
+
+    @property
+    def rows_target(self) -> int:
+        """What :func:`~data_preparation.lib.stages.download.download` is asked for — a **target**, not an increment:
+        the rows already on disk plus the ones missing. Equal to :attr:`rows_needed` on a first pass, larger for a
+        top-up round that scales the shortfall by the observed yield."""
+        return self.rows_present + self.rows_to_fetch
 
 
 @dataclass
@@ -160,32 +180,13 @@ class DownloadPlan:
 
 
 def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> DownloadPlan:
-    """Rows still missing per source (all, or ``sources``) against the raw manifests.
+    """Rows still missing per source (all, or ``sources``), from each source's :class:`SourceLedger`.
 
     A raw folder that is stale or outdated is planned as "nothing to fetch" with the state as its reason: the
     repair step deletes it (after confirmation) before any download runs, and a dry run shows the state instead of
     failing — the download never appends to a folder whose rows the current config would not have produced.
     """
-    plan = DownloadPlan()
-    for name in _selected(config, sources):
-        plan.sources.append(_plan_source_download(config, name, layout))
-    return plan
-
-
-def _plan_source_download(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceDownload:
-    state = raw_manifest_state(config, name, layout)
-    needed = rows_needed(config, name)
-    if state not in ("missing", "current"):
-        return SourceDownload(name, 0, needed, 0, f"raw {state}: the repair step deletes it after confirmation")
-    raw = current_raw_manifest(config, name, layout)
-    if raw is None:
-        return SourceDownload(name, 0, needed, needed, "raw missing")
-    present = raw.rows()
-    if raw_is_exhausted(config, name, raw):
-        return SourceDownload(name, present, needed, 0, "exhausted")
-    if present >= needed:
-        return SourceDownload(name, present, needed, 0, "enough rows")
-    return SourceDownload(name, present, needed, needed - present, f"rows {present:,} < {needed:,}")
+    return DownloadPlan([ledger.download() for ledger in read_ledgers(config, layout, sources=sources)])
 
 
 # --- satisfaction and the status table -----------------------------------------------------------------------------
@@ -193,7 +194,8 @@ def _plan_source_download(config: DatasetConfig, name: str, layout: DatasetLayou
 
 @dataclass(frozen=True)
 class SourceState:
-    """Where one source stands: satisfied when its processed folder serves the budget (see :func:`source_state`)."""
+    """Where one source stands: satisfied when its processed folder serves the budget
+    (:meth:`SourceLedger.satisfaction`)."""
 
     name: str
     kind: str
@@ -253,57 +255,205 @@ class DatasetReport:
         return self.table() + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
 
 
-def source_state(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceState:
-    """Satisfied = the processed manifest is current, covers every raw shard and holds at least
-    :func:`rows_sufficient` rows (so the training part after the split reaches the sequence budget) — or the raw
-    folder is exhausted and every raw shard is built. A stale / outdated raw folder is reported (the repair step
-    deletes it after confirmation), never counted."""
-    kind = config.sources[name].kind
-    needed = rows_needed(config, name)
-    state = raw_manifest_state(config, name, layout)
-    if state not in ("missing", "current"):
-        return SourceState(name, kind, needed, 0, 0, False, False, f"raw {state}: the repair step deletes it after confirmation")
+class Satisfaction(Enum):
+    """Whether a source serves its budget, and why not when it does not — one case per outcome, named, so that the
+    plan, the round loop and the status table all give the same answer."""
+
+    OK = "ok"  # the processed folder holds at least `rows_sufficient` rows
+    EXHAUSTED_SMALL = "exhausted_small"  # the loader ran dry with fewer, but some, rows: served, with a warning
+    EXHAUSTED_EMPTY = "exhausted_empty"  # the loader ran dry and NOT ONE row survived the build: a config mistake
+    RAW_BROKEN = "raw_broken"  # the raw folder is stale / outdated: the repair step deletes it after confirmation
+    RAW_MISSING = "raw_missing"  # nothing downloaded yet
+    NOT_BUILT = "not_built"  # the processed folder is missing, stale, or behind the raw shards
+    SHORT_BUT_FETCHABLE = "short_but_fetchable"  # too few processed rows and the loader still has more to give
+
+    @property
+    def satisfied(self) -> bool:
+        """A source that ran dry with *something* on disk is served (the training sampler cycles what is there); one
+        that ran dry with *nothing* is not — its rows were all rejected, which is a wrong ``fields`` / ``converter``
+        / ``filter`` / ``language``, and a failed source is a failed build, never a silently smaller dataset."""
+        return self in (Satisfaction.OK, Satisfaction.EXHAUSTED_SMALL)
+
+
+ProcessedState = Literal["missing", "stale", "behind_raw", "built"]
+
+_PROCESSED_PROBLEM: dict[str, str] = {"missing": "processed missing", "stale": "processed stale", "behind_raw": "processed behind raw"}
+
+
+@dataclass(frozen=True)
+class SourceLedger:
+    """One source as ``prepare`` sees it: the budget from the config, everything else from the manifests, read once.
+
+    The two questions the pipeline asks are answered from this one object — :meth:`rows_to_fetch` ("what is still to
+    download?") and :meth:`satisfaction` ("is this source done?") — so they cannot contradict each other. See the
+    module docstring for the two bugs that lived in the gap between them.
+    """
+
+    name: str
+    kind: str
+    rows_needed: int  # raw rows to download (:func:`rows_needed`)
+    rows_sufficient: int  # processed rows that serve the budget (:func:`rows_sufficient`)
+    sequence_budget: int  # sequences the largest stage draws (0 when the source is not trained on)
+    raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated"
+    raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
+    exhausted: bool  # the loader has nothing more to give (:func:`raw_is_exhausted`)
+    skipped_malformed: int  # source rows the converter rejected (raw manifest)
+    dropped_too_long: int  # source rows over the token cap (raw manifest)
+    processed_state: ProcessedState
+    processed_rows: int  # rows in the processed manifest (0 unless it is current)
+    training_rows: int  # processed rows left after the training-time validation split
+
+    # --- what to download ------------------------------------------------------------------------------------------
+
+    def download(self) -> SourceDownload:
+        """This source's entry in the download plan."""
+        rows, reason = self._to_fetch()
+        return SourceDownload(self.name, self.raw_rows, self.rows_needed, rows, reason)
+
+    def rows_to_fetch(self) -> int:
+        """Raw rows to add: the difference to :attr:`rows_needed` while raw is short; **a top-up sized by the
+        observed yield** once raw is long enough but the build dropped more than the safety margin covers; 0 when the
+        loader is dry, the raw folder is the repair step's business, or the budget is served."""
+        return self._to_fetch()[0]
+
+    def _to_fetch(self) -> tuple[int, str]:
+        if self.raw_state not in ("missing", "current"):
+            return 0, f"raw {self.raw_state}: the repair step deletes it after confirmation"
+        if self.raw_state == "missing":
+            return self.rows_needed, "raw missing"
+        if self.exhausted:
+            return 0, "exhausted"
+        if self.raw_rows < self.rows_needed:
+            return self.rows_needed - self.raw_rows, f"rows {self.raw_rows:,} < {self.rows_needed:,}"
+        if self.processed_state != "built" or self.processed_rows >= self.rows_sufficient:
+            return 0, "enough rows"  # nothing to top up: either not built yet (build first), or the budget is served
+        top_up = self._top_up_rows()
+        if top_up <= 0:
+            return 0, f"no row of {self.raw_rows:,} raw rows survives the build"  # more raw would be dropped too
+        return top_up, f"top-up: {self.processed_rows:,} of {self.rows_sufficient:,} rows survived {self.raw_rows:,} raw"
+
+    def _top_up_rows(self) -> int:
+        """Raw rows to add when the build dropped more than the ``SAFETY_MARGIN`` covers: the shortfall in processed
+        rows divided by the yield this source actually showed (``processed ÷ raw``) and multiplied by the same margin
+        the first download uses — the yield is one measurement, and overshooting costs a few rows while
+        undershooting costs another round. 0 when there is no yield to extrapolate from."""
+        if self.raw_rows <= 0 or self.processed_rows <= 0:
+            return 0
+        observed_yield = Fraction(self.processed_rows, self.raw_rows)
+        return ceil((self.rows_sufficient - self.processed_rows) * _MARGIN / observed_yield)
+
+    # --- is it done ------------------------------------------------------------------------------------------------
+
+    def satisfaction(self) -> Satisfaction:
+        """Satisfied = the processed manifest is current, covers every raw shard and holds at least
+        :attr:`rows_sufficient` rows (so the training part after the split reaches the sequence budget) — or the
+        loader is dry and left *some* rows behind. A stale / outdated raw folder is reported (the repair step deletes
+        it after confirmation), never counted."""
+        if self.raw_state not in ("missing", "current"):
+            return Satisfaction.RAW_BROKEN
+        if self.raw_state == "missing":
+            return Satisfaction.RAW_MISSING
+        if self.processed_state != "built":
+            return Satisfaction.NOT_BUILT
+        if self.processed_rows >= self.rows_sufficient:
+            return Satisfaction.OK
+        if self.exhausted:
+            return Satisfaction.EXHAUSTED_EMPTY if self.processed_rows == 0 else Satisfaction.EXHAUSTED_SMALL
+        return Satisfaction.SHORT_BUT_FETCHABLE
+
+    def reason(self) -> str:
+        """One line for the status table: ``"ok"``, or what is missing."""
+        case = self.satisfaction()
+        if case is Satisfaction.RAW_BROKEN:
+            return f"raw {self.raw_state}: the repair step deletes it after confirmation"
+        if case is Satisfaction.RAW_MISSING:
+            return "raw missing"
+        if case is Satisfaction.NOT_BUILT:
+            return _PROCESSED_PROBLEM[self.processed_state]
+        if case is Satisfaction.OK:
+            return "ok"
+        if case is Satisfaction.EXHAUSTED_SMALL:
+            return f"exhausted at {self.processed_rows:,} of {self.rows_sufficient:,} rows"
+        if case is Satisfaction.EXHAUSTED_EMPTY:
+            return (
+                f"exhausted and NOT ONE of {self.raw_rows:,} raw rows survived the build "
+                f"({self.skipped_malformed:,} malformed, {self.dropped_too_long:,} too long) — "
+                "check the source's fields / converter / filter / language"
+            )
+        return f"processed rows {self.processed_rows:,} < {self.rows_sufficient:,}"
+
+    def epochs(self) -> float | None:
+        """How often the trainer cycles this source's training rows to serve its sequence budget (the largest
+        single-stage demand); None while it is not satisfied, for a source it does not train on, or without rows."""
+        if not self.satisfaction().satisfied or self.sequence_budget <= 0 or self.training_rows <= 0:
+            return None
+        return self.sequence_budget / self.training_rows
+
+    def state(self) -> SourceState:
+        """This source's row of the status table."""
+        case = self.satisfaction()
+        return SourceState(
+            name=self.name, kind=self.kind, rows_needed=self.rows_needed, raw_rows=self.raw_rows,
+            processed_rows=self.processed_rows, exhausted=self.exhausted, satisfied=case.satisfied,
+            reason=self.reason(), epochs=self.epochs(),
+        )
+
+
+def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceLedger:
+    """Read one source's ledger: the budget from ``config``, the rest from the raw and processed manifests. A raw
+    folder that is not current contributes nothing (its rows are about to be deleted or were never downloaded), so
+    its processed folder is not counted either."""
     raw = current_raw_manifest(config, name, layout)
-    if raw is None:
-        return SourceState(name, kind, needed, 0, 0, False, False, "raw missing")
-    exhausted = raw_is_exhausted(config, name, raw)
+    skipped, dropped = (0, 0) if raw is None else rejected_rows(raw)
+    processed: tuple[ProcessedState, int] = ("missing", 0) if raw is None else _processed_state(config, name, layout, raw)
+    processed_state, processed_rows = processed
+    return SourceLedger(
+        name=name,
+        kind=config.sources[name].kind,
+        rows_needed=rows_needed(config, name),
+        rows_sufficient=rows_sufficient(config, name),
+        sequence_budget=config.sequence_budget(name),
+        raw_state=raw_manifest_state(config, name, layout),
+        raw_rows=0 if raw is None else raw.rows(),
+        exhausted=raw is not None and raw_is_exhausted(config, name, raw),
+        skipped_malformed=skipped,
+        dropped_too_long=dropped,
+        processed_state=processed_state,
+        processed_rows=processed_rows,
+        training_rows=training_rows_after_split(config, name, processed_rows),
+    )
+
+
+def _processed_state(config: DatasetConfig, name: str, layout: DatasetLayout, raw: Manifest) -> tuple[ProcessedState, int]:
+    """The state of ``processed/<name>`` against the current raw shards, and the rows it holds (0 unless current)."""
     processed = current_processed_manifest(config, name, layout)
     if processed is None:
-        why = "processed missing" if Manifest.load(layout.processed_dir(name)) is None else "processed stale"
-        return SourceState(name, kind, needed, raw.rows(), 0, exhausted, False, why)
-    processed_rows = processed.rows()
+        return ("missing" if Manifest.load(layout.processed_dir(name)) is None else "stale"), 0
     if not processed_covers_raw(processed, raw):
-        return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, False, "processed behind raw")
-    sufficient = rows_sufficient(config, name)
-    if processed_rows >= sufficient:
-        reason = "ok"
-    elif exhausted:
-        reason = f"exhausted at {processed_rows:,} of {sufficient:,} rows"
-    else:
-        return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, False, f"processed rows {processed_rows:,} < {sufficient:,}")
-    return SourceState(name, kind, needed, raw.rows(), processed_rows, exhausted, True, reason, _epochs(config, name, processed_rows))
+        return "behind_raw", processed.rows()
+    return "built", processed.rows()
 
 
-def _epochs(config: DatasetConfig, name: str, processed_rows: int) -> float | None:
-    """How often the trainer cycles the training rows of a satisfied source to serve its sequence budget (the
-    largest single-stage demand); None for a source it does not train on or without training rows."""
-    budget = config.sequence_budget(name)
-    training_rows = training_rows_after_split(config, name, processed_rows)
-    if budget <= 0 or training_rows <= 0:
-        return None
-    return budget / training_rows
+def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> list[SourceLedger]:
+    """The ledger of every source (all, or ``sources``), in config order."""
+    return [source_ledger(config, name, layout) for name in _selected(config, sources)]
+
+
+def source_state(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceState:
+    """One source's row of the status table (:meth:`SourceLedger.state`)."""
+    return source_ledger(config, name, layout).state()
 
 
 def every_source_satisfies_its_budget(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> bool:
-    """Whether every source (all, or ``sources``) is satisfied (:func:`source_state`)."""
-    return all(source_state(config, name, layout).satisfied for name in _selected(config, sources))
+    """Whether every source (all, or ``sources``) is satisfied (:meth:`SourceLedger.satisfaction`)."""
+    return all(ledger.satisfaction().satisfied for ledger in read_ledgers(config, layout, sources=sources))
 
 
 def summarize_dataset_state(config: DatasetConfig, layout: DatasetLayout, *, needs_repair: Iterable[str] = ()) -> DatasetReport:
     """The :class:`DatasetReport` of every source of ``config`` under ``layout`` plus the tokenizer.
     ``needs_repair`` names the sources a repair dry run would touch (``status``): they count as incomplete."""
     return DatasetReport(
-        sources=[source_state(config, name, layout) for name in config.sources],
+        sources=[ledger.state() for ledger in read_ledgers(config, layout)],
         tokenizer_complete=tokenizer_is_prepared(config, layout),
         needs_repair=sorted(set(needs_repair)),
     )
@@ -338,7 +488,10 @@ def _table_line(cells: tuple[str, ...], widths: list[int]) -> str:
 __all__ = [
     "DatasetReport",
     "DownloadPlan",
+    "ProcessedState",
+    "Satisfaction",
     "SourceDownload",
+    "SourceLedger",
     "SourceState",
     "build_is_pending",
     "current_processed_manifest",
@@ -347,8 +500,10 @@ __all__ = [
     "plan_downloads",
     "processed_covers_raw",
     "raw_is_exhausted",
+    "read_ledgers",
     "rows_needed",
     "rows_sufficient",
+    "source_ledger",
     "source_state",
     "sources_with_pending_raw_shards",
     "summarize_dataset_state",

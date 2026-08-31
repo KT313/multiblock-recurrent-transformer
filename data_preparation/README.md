@@ -161,8 +161,15 @@ side by side under one stop flag. Sources with nothing to download are built rig
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
 overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
-no longer the larger of the two. A round is normally enough; a second one happens when a loader returned fewer rows than asked without being exhausted, or
-when the length filter and the dedup dropped more than the 20 % safety margin covers.
+no longer the larger of the two.
+
+A round is normally enough. A second one happens when a loader returned fewer rows than asked without being
+exhausted, or when the length filter and the dedup dropped more than the 20 % safety margin covers — and it really
+tops the source up: one `SourceLedger` per source (`lib/build/planner.py`) answers both "what is still to download?"
+and "is this source done?" from one read of the config and the manifests, so the plan sees a folder whose *raw* rows
+suffice but whose *processed* rows do not, and asks for `shortfall ÷ observed yield × 1.2` more raw rows. The loop
+stops when every source serves its budget, when nothing more can be fetched, or after `MAX_ROUNDS` (5) — a source
+still short then is reported, not looped on forever.
 
 ### Download (`lib/stages/download.py`)
 
@@ -246,15 +253,27 @@ The trainer draws **rows** from a source with the stage weight and pads or trunc
 unit, the **sequence budget** (maximised over the stages, since the folders are shared):
 
 ```
-rows_needed(source)   = ceil(sequence_budget × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
-                      = source.rows                                                          # source used only in val
-satisfied             = processed rows ≥ rows_needed ÷ 1.2, or raw exhausted and every raw shard built
-epochs (status table) = sequence_budget ÷ training rows after the split
+rows_needed(source)     = ceil(sequence_budget × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
+                        = source.rows                                                          # source used only in val
+rows_sufficient(source) = rows_needed ÷ 1.2                                                    # processed rows that serve it
+epochs (status table)   = sequence_budget ÷ training rows after the split
 ```
 
 The `× 1.2` covers what the length filter and the dedup drop, the division keeps the *training* part at the
 sequence budget after the resolver holds `validation_fraction` out. There is no tokens-per-row estimate anywhere in
 this arithmetic (`describe_tokens_per_row` on a source feeds only the row column of `describe`).
+
+Whether a source is **satisfied** is one `SourceLedger.satisfaction()` case, and the plan, the round loop and the
+status table all read it:
+
+| case | when | satisfied |
+|---|---|---|
+| `OK` | processed rows ≥ `rows_sufficient` | yes |
+| `EXHAUSTED_SMALL` | the loader ran dry with fewer, but some, rows | yes, with a warning (the sampler cycles them) |
+| `EXHAUSTED_EMPTY` | the loader ran dry and **not one** row survived the build | **no** — a wrong `fields` / `converter` / `filter` / `language`, and a failed source is a failed build |
+| `SHORT_BUT_FETCHABLE` | too few processed rows, the loader has more | no — the next round tops it up |
+| `NOT_BUILT` | `processed/` missing, stale or behind the raw shards | no — build it |
+| `RAW_MISSING` / `RAW_BROKEN` | nothing downloaded / stale or outdated raw | no — download, or let the repair step delete it |
 
 The consequence to keep in mind: **the weights mix rows, not tokens.** The realised token share of a source in a
 stage is proportional to `weight × mean_tokens_per_row` (rows capped at `block_size`), so a stage's token mix is

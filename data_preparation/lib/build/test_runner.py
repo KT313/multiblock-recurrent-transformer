@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow.parquet as pq
 import pytest
 
+from data_preparation import prepare as prepare_cli
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
@@ -139,21 +140,52 @@ def test_a_source_still_short_after_max_rounds_is_reported(
     assert not p.satisfied and p.reason == f"processed rows 5 < {sufficient}" and f"p: processed rows 5 < {sufficient}" in caplog.text
 
 
-def test_rounds_stop_when_nothing_more_can_be_fetched(
+def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_a_second_round(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A source whose dedup drops more than the safety margin stays short although every row asked for is on disk:
-    no second round (nothing to fetch), the report says so instead of looping."""
+    """The 20 % safety margin does not always cover what the build drops — here four of every five rows are exact
+    duplicates. Round 1 downloads `rows_needed` raw rows and lands far short of `rows_sufficient` processed ones;
+    round 2 sees that raw is long enough but *processed* is not and tops the source up by the shortfall scaled with
+    the yield it showed. Before the ledger the plan only looked at raw rows: it planned nothing, the round loop gave
+    up, and `prepare` failed with no way to make progress (open finding H5)."""
     src_dir = layout.root.parent / "dupes"
-    unique = [{"text": f"tok_{i} tok_{i + 1} tok_3"} for i in range(10)]
-    write_local(src_dir, unique + [unique[0]] * 690, "parquet")
+    rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
+    write_local(src_dir, rows, "parquet")
     cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500)
+    needed, sufficient = rows_needed(cfg, "d"), rows_sufficient(cfg, "d")
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (d,) = report.sources
-    assert not report.complete and not d.exhausted and d.raw_rows == rows_needed(cfg, "d") == 632 and d.processed_rows == 10
-    assert d.reason == f"processed rows 10 < {rows_sufficient(cfg, 'd')}" and "round 2" not in caplog.text
+    assert report.complete and d.satisfied and not d.exhausted and d.reason == "ok"
+    assert (needed, sufficient) == (632, 527) and d.processed_rows >= sufficient
+    assert d.raw_rows > needed, "the top-up fetched beyond the budget, sized from the observed yield"
+    assert "round 2: 1 source(s) short" in caplog.text and "round 3" not in caplog.text
     assert plan_downloads(cfg, layout).total_rows_to_fetch() == 0
+
+
+def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
+    with an empty processed folder. That used to count as satisfied — `prepare` and `status` said "dataset complete",
+    exit 0, and the training run failed much later (open finding H2) — but a failed source is a failed build, so it
+    is now unsatisfied with a reason that names the likely mistake."""
+    src_dir = layout.root.parent / "wrong_fields"
+    write_local(src_dir, [{"question": f"q{i}", "answer": f"a{i}"} for i in range(20)], "jsonl")
+    source = SourceConfig(kind="instruct", loader="local", path=str(src_dir), fields={"instruction": "prompt", "output": "completion"})
+    cfg = cfg_factory({"i": source}, tokens=100)
+    path = config_file(cfg)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        report = prepare(path, layout.root, assume_yes=False)
+    (i,) = report.sources
+    assert not report.complete and not i.satisfied and i.exhausted and (i.raw_rows, i.processed_rows) == (0, 0)
+    assert "NOT ONE" in i.reason and "20 malformed" in i.reason
+    assert "check the source's fields / converter / filter / language" in i.reason
+    assert report.missing() == ["i"] and f"i: {i.reason}" in caplog.text
+    assert status(path, layout.root).describe().endswith("dataset INCOMPLETE"), "`status` says the same"
+    with pytest.raises(SystemExit) as exit_code:
+        prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root)])
+    assert exit_code.value.code == 1
 
 
 def test_exhausted_source_is_complete_with_a_warning(

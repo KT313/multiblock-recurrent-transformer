@@ -7,7 +7,9 @@
     repair_broken_and_stale_folders                    truncate broken raw, delete stale processed, confirm before any raw
                                                        folder is deleted (lib/build/repair.py)
     for round in 1..MAX_ROUNDS:
-        plan_downloads                                 rows still missing per source (lib/build/planner.py)
+        plan_downloads                                 rows still missing per source (lib/build/planner.py: one
+                                                       SourceLedger per source answers both "what to download" and
+                                                       "is it done", so a round 2 tops a short source up)
         download_and_build_missing                     downloads (sources/<name>/raw) and builds (processed/<name>) at the
                                                        same time: a source is built as soon as its download finished
         stop when every source serves its budget, or when nothing more can be fetched
@@ -199,9 +201,11 @@ class Job:
 
 
 def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None) -> list[Job]:
-    """One job per source with rows to fetch — the ``github_code`` sources of one repo grouped into one."""
+    """One job per source with rows to fetch — the ``github_code`` sources of one repo grouped into one. The
+    download takes a **target** (``rows_needed=``), so every job is asked for :attr:`SourceDownload.rows_target`:
+    the rows already on disk plus the ones the plan wants added (more than the budget in a top-up round)."""
     to_fetch = download_plan.to_fetch()
-    rows_needed = {source.name: source.rows_needed for source in to_fetch}
+    rows_needed = {source.name: source.rows_target for source in to_fetch}
     jobs: list[Job] = []
     grouped: set[str] = set()
     for names in github_code_groups(config, list(rows_needed)):
@@ -426,8 +430,11 @@ def check_worker_counts(num_workers: int, max_parallel_downloads: int) -> None:
 
 
 def another_round_can_fetch_more(config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None) -> bool:
-    """Whether a further round would download anything: the download step is active and, after this round, some
-    selected source still has rows to fetch (a loader that returned fewer rows than asked without being exhausted)."""
+    """Whether a further round would download anything: the download step is active and the plan — the same
+    :class:`~data_preparation.lib.build.planner.SourceLedger` objects the satisfaction check reads — still has rows
+    to fetch for some selected source. That is a loader that returned fewer rows than asked without being exhausted,
+    or a source whose build dropped more than the safety margin covers: the next round tops it up by the shortfall
+    scaled with the yield it showed, instead of planning nothing and leaving the run stuck."""
     if "download" not in active_steps:
         return False
     return plan_downloads(config, layout, sources=selected).total_rows_to_fetch() > 0
