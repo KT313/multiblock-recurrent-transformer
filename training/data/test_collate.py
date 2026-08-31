@@ -164,8 +164,8 @@ def test_bos_eos_flags(tokenizer: Tokenizer) -> None:
     assert labels.tolist() == [[4, 5, 6]]
 
 
-def test_collate_on_real_tiny_rows(tokenizer: Tokenizer, tiny_validation_dir: Path) -> None:
-    ds = ParquetTextDataset(tiny_validation_dir, "pre")
+def test_collate_on_real_tiny_rows(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    ds = ParquetTextDataset(tiny_pretrain_dir, "pre")
     rows = list(itertools.islice(iter(ds), 4))
     input_ids, labels, data_ids = collate_fn(rows, tokenizer, block_size=128, padding_multiple=16)
     assert input_ids.shape == labels.shape == (4, 128)

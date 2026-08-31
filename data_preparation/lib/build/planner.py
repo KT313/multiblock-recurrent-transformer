@@ -1,11 +1,15 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Budget planner: what a dataset config needs on disk versus what the manifests say is there (pure arithmetic).
 
-Per pretrain source the needed tokens are the **largest** per-stage demand (``DatasetConfig.source_budget_tokens``;
-stages share the files, so max, not sum), turned into rows with the measured tokens/row of the processed manifest
-when it is current, else the config's ``tokens_per_row_estimate``, times ``SAFETY_MARGIN``. ``plan`` only reads
+Every source (both kinds) has a ``raw`` and a ``processed`` folder and is planned the same way. A source used for
+training is sized by its sequence budget (``DatasetConfig.sequence_budget``, the largest per-stage demand — stages
+share the folders, so max, not sum); a source used only for validation by its ``rows``. ``plan`` only reads
 manifests and parquet footers (``verify_shards``); ``lib/build/runner.py`` executes a plan, ``prepare.py status``
 prints it.
+
+Interim budget arithmetic (task 8 replaces it with a sequences formula): the token budget of a trained source is
+``sequence_budget × block_size`` and it is turned into rows with the measured tokens per raw row of the processed
+manifest when it is current, else the source's ``describe_tokens_per_row``, times ``SAFETY_MARGIN``.
 """
 
 from __future__ import annotations
@@ -15,8 +19,10 @@ from math import ceil
 from pathlib import Path
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.layout import INSTRUCT_MIXTURE_SPLITS, PROCESSED_COLUMNS, SOURCE_STAGES, DatasetLayout
+from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
+
+SOURCE_STAGES: tuple[str, ...] = ("raw", "processed")  # the folders of every source, in build order
 
 
 def rows_for_budget(budget_tokens: float, tokens_per_row: float, margin: float = SAFETY_MARGIN) -> int:
@@ -29,17 +35,18 @@ def rows_for_budget(budget_tokens: float, tokens_per_row: float, margin: float =
 
 @dataclass
 class SourcePlan:
-    """State of one pretrain or validation source. ``rows_needed``/``rows_to_fetch`` of a validation are its ``rows``."""
+    """State of one source. A source used only for validation has ``budget_tokens`` 0 and ``rows_needed`` = its
+    ``rows``."""
 
     name: str
     kind: str
     budget_tokens: int
-    tokens_per_row: float  # measured from the processed manifest if current, else the config estimate
+    tokens_per_row: float  # measured from the manifests if present, else the config's describe estimate (task 8 drops it)
     rows_needed: int
     rows_present: int
     rows_to_fetch: int
     tokens_present: int
-    manifest_current: bool  # every stage manifest of the source exists and carries the current source hash
+    manifest_current: bool  # both folder manifests of the source exist and carry the current hashes
     exhausted: bool  # the loader ran dry before the budget was reached (complete with a warning)
     complete: bool
     reason: str  # "ok", or what is missing
@@ -47,32 +54,14 @@ class SourcePlan:
     @property
     def epochs(self) -> float | None:
         """How often the rows on disk are cycled by the training sampler to serve ``budget_tokens`` (the largest
-        single-stage demand): ``budget ÷ tokens``; < 1 means only part of the data is seen. None without tokens."""
-        return _epochs(self.budget_tokens, self.tokens_present)
-
-
-@dataclass
-class InstructMixturePlan:
-    name: str
-    budget_tokens: int
-    present: bool  # both split manifests exist
-    current: bool  # ... and carry the current mixture hash
-    short_sources: list[str]  # sources with fewer raw rows than the mixture needed and not exhausted
-    tokens_present: int  # tokens of the built train split (0 unless current)
-    complete: bool
-    reason: str
-
-    @property
-    def epochs(self) -> float | None:
-        """See :attr:`SourcePlan.epochs` (over the train split)."""
+        single-stage demand): ``budget ÷ tokens``; < 1 means only part of the data is seen. None without tokens or
+        budget (validation-only sources)."""
         return _epochs(self.budget_tokens, self.tokens_present)
 
 
 @dataclass
 class Plan:
     sources: list[SourcePlan] = field(default_factory=list)
-    validations: list[SourcePlan] = field(default_factory=list)
-    instruct_mixtures: list[InstructMixturePlan] = field(default_factory=list)
     tokenizer_complete: bool = False
     complete: bool = False
 
@@ -82,19 +71,13 @@ class Plan:
         if not self.tokenizer_complete:
             lines.append("tokenizer: missing or stale")
         lines.extend(f"source {s.name}: {s.reason}" for s in self.sources if not s.complete)
-        lines.extend(f"validation {s.name}: {s.reason}" for s in self.validations if not s.complete)
-        lines.extend(f"instruct_mixture {m.name}: {m.reason}" for m in self.instruct_mixtures if not m.complete)
         return lines
 
     def summary(self) -> str:
-        """A fixed-width table of every planned item plus the tokenizer and overall state (``epochs``: how often
-        the training sampler cycles the rows on disk to serve the budget, see :attr:`SourcePlan.epochs`)."""
+        """A fixed-width table of every source plus the tokenizer and overall state (``epochs``: how often the
+        training sampler cycles the rows on disk to serve the budget, see :attr:`SourcePlan.epochs`)."""
         header = ("item", "kind", "budget", "tokens", "rows", "needed", "fetch", "tok/row", "epochs", "state", "reason")
-        rows: list[tuple[str, ...]] = []
-        for source in self.sources + self.validations:
-            rows.append(_source_summary_row(source))
-        for mixture in self.instruct_mixtures:
-            rows.append(_instruct_mixture_summary_row(mixture))
+        rows: list[tuple[str, ...]] = [_source_summary_row(source) for source in self.sources]
         rows.append(_tokenizer_summary_row(self.tokenizer_complete))
         table = _format_table(header, rows)
         return table + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
@@ -125,22 +108,6 @@ def _source_state(source: SourcePlan) -> str:
     if source.exhausted:
         return "exhausted"
     return "complete"
-
-
-def _instruct_mixture_summary_row(mixture: InstructMixturePlan) -> tuple[str, ...]:
-    return (
-        mixture.name,
-        "instruct_mixture",
-        _fmt(mixture.budget_tokens),
-        _fmt(mixture.tokens_present),
-        "",  # rows
-        "",  # needed
-        "",  # fetch
-        "",  # tok/row
-        _fmt_epochs(mixture.epochs if mixture.complete else None),
-        "complete" if mixture.complete else "incomplete",
-        mixture.reason,
-    )
 
 
 def _tokenizer_summary_row(tokenizer_complete: bool) -> tuple[str, ...]:
@@ -179,32 +146,12 @@ def _fmt_epochs(epochs: float | None) -> str:
 
 
 def plan(cfg: DatasetConfig, layout: DatasetLayout) -> Plan:
-    """Compare ``cfg`` with the manifests under ``layout``; sources no stage or mixture uses are not part of it."""
+    """Compare ``cfg`` with the manifests under ``layout`` (the config rejects sources no stage uses)."""
     tokenizer_complete = _tokenizer_complete(cfg, layout)
     result = Plan(tokenizer_complete=tokenizer_complete)
-
-    for name in cfg.sources_of_kind("pretrain"):
-        if cfg.source_budget_tokens(name) > 0 or cfg.sources[name].validation_tokens > 0:
-            source_plan = _plan_pretrain(cfg, name, layout, tokenizer_complete)
-            result.sources.append(source_plan)
-            if cfg.sources[name].validation_tokens > 0:
-                result.validations.append(_plan_validation_split(cfg, name, layout, source_plan))
-
-    used_validations = {key for stage in cfg.stages for key in stage.val}
-    for name in cfg.sources_of_kind("validation"):
-        if name in used_validations:
-            result.validations.append(_plan_validation(cfg, name, layout, tokenizer_complete))
-
-    for name in cfg.instruct_mixtures:
-        if cfg.instruct_mixture_budget_tokens(name) > 0:
-            result.instruct_mixtures.append(_plan_instruct_mixture(cfg, name, layout, tokenizer_complete))
-
-    result.complete = (
-        tokenizer_complete
-        and all(source.complete for source in result.sources)
-        and all(validation.complete for validation in result.validations)
-        and all(mixture.complete for mixture in result.instruct_mixtures)
-    )
+    for name in cfg.sources:
+        result.sources.append(_plan_source(cfg, name, layout, tokenizer_complete))
+    result.complete = tokenizer_complete and all(source.complete for source in result.sources)
     return result
 
 
@@ -229,84 +176,83 @@ def _current(directory: Path, source_hash: str, stage: str) -> tuple[Manifest | 
     return manifest, None
 
 
-def _stage_dir(layout: DatasetLayout, name: str, stage: str) -> Path:
-    if stage == "validation":
-        return layout.validation_dir(name)
-    return layout.source_dir(name, stage)
+def stage_dir(layout: DatasetLayout, name: str, stage: str) -> Path:
+    """The folder of ``stage`` (``raw`` / ``processed``) of source ``name``."""
+    return layout.raw_dir(name) if stage == "raw" else layout.processed_dir(name)
+
+
+def stage_hash(cfg: DatasetConfig, name: str, stage: str) -> str:
+    """The manifest key of ``stage`` of source ``name``."""
+    return cfg.raw_hash(name) if stage == "raw" else cfg.processed_hash(name)
 
 
 def stage_problems(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> dict[str, str]:
-    """``{stage: problem}`` for the source stage directories whose manifest is present but stale or unverifiable
-    (the build removes those directories before rerunning the stage)."""
+    """``{stage: problem}`` for the source folders whose manifest is present but stale or unverifiable (the build
+    removes or repairs those folders before rerunning the step)."""
     problems: dict[str, str] = {}
-    stages = _source_stages(cfg, name)
-    for stage in stages:
-        directory = _stage_dir(layout, name, stage)
+    for stage in SOURCE_STAGES:
+        directory = stage_dir(layout, name, stage)
         if Manifest.load(directory) is None:
-            continue  # nothing present is not a problem, only stale or broken directories are
-        _, problem = _current(directory, cfg.stage_hash(name, stage), stage)
+            continue  # nothing present is not a problem, only stale or broken folders are
+        _, problem = _current(directory, stage_hash(cfg, name, stage), stage)
         if problem is not None:
             problems[stage] = problem
     return problems
 
 
-def _source_stages(cfg: DatasetConfig, name: str) -> tuple[str, ...]:
-    """The stage directories a source has: ``validation`` for a validation source, ``raw`` + ``processed`` for a
-    pretrain source, plus ``validation`` when it holds out a split (``validation_tokens``)."""
+# --- one source --------------------------------------------------------------------------------------------------------
+
+
+def budget_tokens_of(cfg: DatasetConfig, name: str) -> int:
+    """Interim token budget of a source: ``sequence_budget × block_size`` (0 for a source used only for validation).
+    task 8: the planner counts sequences and this disappears."""
+    return cfg.sequence_budget(name) * cfg.block_size
+
+
+def _plan_source(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
     source = cfg.sources[name]
-    if source.kind == "validation":
-        return ("validation",)
-    if source.validation_tokens > 0:
-        return (*SOURCE_STAGES, "validation")
-    return SOURCE_STAGES
-
-
-# --- pretrain sources --------------------------------------------------------------------------------------------------
-
-
-def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
-    source = cfg.sources[name]
-    budget = cfg.source_budget_tokens(name)
+    trained = cfg.used_in_train(name)
+    budget = budget_tokens_of(cfg, name)
     manifests, problem = _current_stage_manifests(cfg, name, layout)
     raw = manifests.get("raw")
     processed = manifests.get("processed")
-    validation = manifests.get("validation")
 
     exhausted = raw is not None and bool(raw.extra.get("exhausted"))
     rows_present = raw.rows() if raw is not None else 0
     tokens_present = (processed.tokens() or 0) if processed is not None else 0
 
-    tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))  # counts are capped there
-    measured = _measured_tokens_per_row(raw, processed, validation)
+    tokens_per_row = float(min(source.describe_tokens_per_row, cfg.max_seq_length))  # pretrain counts are capped there
+    measured = _measured_tokens_per_row(raw, processed)
     if measured is not None:
         tokens_per_row = measured
-    rows_needed = rows_for_budget(budget + source.validation_tokens, tokens_per_row)  # the split comes off the top
+    # task 8: rows_needed = ceil(sequence_budget × SAFETY_MARGIN ÷ (1 − validation_fraction)); no tokens per row
+    rows_needed = rows_for_budget(budget, tokens_per_row) if trained else int(source.rows or 0)
     rows_to_fetch = max(0, rows_needed - rows_present)
 
     if problem is None and raw is not None and processed is not None:
-        problem = _pipeline_problem(raw, processed, budget, exhausted)
-    if problem is None and raw is not None and source.validation_tokens > 0:
-        problem = _validation_split_problem(validation, source.validation_tokens, exhausted)
+        problem = _pipeline_problem(source.kind, raw, processed, budget, rows_needed, trained, exhausted)
     if problem is None and not tokenizer_complete:
         problem = "tokenizer missing"
 
     if problem is not None:
         reason = problem
-    elif tokens_present >= budget:
-        reason = "ok"
-    else:
+    elif trained and tokens_present < budget:
         reason = f"exhausted at {tokens_present} of {budget} tokens"
+    elif not trained and rows_present < rows_needed:
+        reason = f"exhausted at {rows_present} of {rows_needed} rows"
+    else:
+        reason = "ok"
 
     return SourcePlan(
         name=name,
-        kind="pretrain",
+        kind=source.kind,
         budget_tokens=budget,
         tokens_per_row=tokens_per_row,
         rows_needed=rows_needed,
         rows_present=rows_present,
         rows_to_fetch=rows_to_fetch,
         tokens_present=tokens_present,
-        manifest_current=len(manifests) == len(_source_stages(cfg, name)),
+        manifest_current=len(manifests) == len(SOURCE_STAGES),
         exhausted=exhausted,
         complete=problem is None,
         reason=reason,
@@ -314,50 +260,46 @@ def _plan_pretrain(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokeniz
 
 
 def _current_stage_manifests(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> tuple[dict[str, Manifest], str | None]:
-    """The current, verified manifests of the source's stages (``raw``/``processed``) plus the problem
-    of the first stage that has none (None if every stage is fine)."""
+    """The current, verified manifests of the source's folders (``raw`` / ``processed``) plus the problem of the
+    first folder that has none (None if both are fine)."""
     manifests: dict[str, Manifest] = {}
     first_problem: str | None = None
-    for stage in _source_stages(cfg, name):
-        manifest, stage_problem = _current(_stage_dir(layout, name, stage), cfg.stage_hash(name, stage), stage)
+    for stage in SOURCE_STAGES:
+        manifest, problem = _current(stage_dir(layout, name, stage), stage_hash(cfg, name, stage), stage)
         if manifest is not None:
             manifests[stage] = manifest
         elif first_problem is None:
-            first_problem = stage_problem
+            first_problem = problem
     return manifests, first_problem
 
 
-def _pipeline_problem(raw: Manifest, processed: Manifest, budget: int, exhausted: bool) -> str | None:
-    """Why the stages of a source are not finished even though every manifest is current, or None."""
-    if processed.extra.get("columns") != list(PROCESSED_COLUMNS):
-        return "processed: predates the hash column"  # `process` rebuilds it from the raw shards, no download
-    processed_inputs = processed.extra.get("input_shards")
-    if processed_inputs != [[shard.name, shard.rows] for shard in raw.shards]:
+def _pipeline_problem(
+    kind: str, raw: Manifest, processed: Manifest, budget: int, rows_needed: int, trained: bool, exhausted: bool
+) -> str | None:
+    """Why the folders of a source are not finished even though both manifests are current, or None."""
+    if processed.extra.get("columns") != list(processed_columns(kind)):
+        return "processed: predates the current columns"  # the build rebuilds it from the raw shards, no download
+    if processed.extra.get("input_shards") != [[shard.name, shard.rows] for shard in raw.shards]:
         return "processed: behind raw"
-    tokens = processed.tokens() or 0
-    if tokens < budget and not exhausted:
-        return f"tokens {tokens} < budget {budget}"
+    if exhausted:
+        return None
+    if trained:
+        tokens = processed.tokens() or 0
+        if tokens < budget:
+            return f"tokens {tokens} < budget {budget}"
+    elif raw.rows() < rows_needed:
+        return f"rows {raw.rows()} < {rows_needed}"
     return None
 
 
-def _validation_split_problem(validation: Manifest | None, validation_tokens: int, exhausted: bool) -> str | None:
-    """Why a pretrain source's validation split is not finished, or None."""
-    if validation is None:
-        return "validation: split missing"
-    tokens = validation.tokens() or 0
-    if tokens < validation_tokens and not exhausted:
-        return f"validation: tokens {tokens} < {validation_tokens}"
-    return None
-
-
-def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None, validation: Manifest | None = None) -> float | None:
-    """Processed (plus validation-split) tokens per **raw** row over the raw shards the processed manifest covers
-    (this includes what the length filter and dedup drop); before anything is processed, the raw manifest's own
-    token counts per raw row (available right after the download); None without usable counts."""
+def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None) -> float | None:
+    """Processed tokens per **raw** row over the raw shards the processed manifest covers (this includes what the
+    filters and the dedup drop); before anything is processed, the raw manifest's own token counts per raw row
+    (available right after the download); None without usable counts."""
     if raw is None:
         return None
     if processed is not None:
-        tokens = (processed.tokens() or 0) + ((validation.tokens() or 0) if validation is not None else 0)
+        tokens = processed.tokens() or 0
         covered = len(processed.extra.get("input_shards", []))
         raw_rows = sum(shard.rows for shard in raw.shards[:covered])
         if tokens > 0 and raw_rows > 0:
@@ -368,156 +310,4 @@ def _measured_tokens_per_row(raw: Manifest | None, processed: Manifest | None, v
     return None
 
 
-# --- validation sources ------------------------------------------------------------------------------------------------
-
-
-def _plan_validation_split(cfg: DatasetConfig, name: str, layout: DatasetLayout, source_plan: SourcePlan) -> SourcePlan:
-    """The status row of a pretrain source's held-out split (``<name>/validation``); its completeness is part of
-    the source's own plan (``process`` builds both), this row only reports it."""
-    wanted = cfg.sources[name].validation_tokens
-    manifest, problem = _current(layout.validation_dir(name), cfg.stage_hash(name, "validation"), "validation")
-    tokens_present = (manifest.tokens() or 0) if manifest is not None else 0
-    rows_present = manifest.rows() if manifest is not None else 0
-    if problem is None:
-        problem = _validation_split_problem(manifest, wanted, source_plan.exhausted)
-    complete = problem is None and source_plan.complete
-    return SourcePlan(
-        name=f"{name}/validation",
-        kind="validation",
-        budget_tokens=wanted,
-        tokens_per_row=tokens_present / rows_present if rows_present else source_plan.tokens_per_row,
-        rows_needed=0,
-        rows_present=rows_present,
-        rows_to_fetch=0,
-        tokens_present=tokens_present,
-        manifest_current=manifest is not None,
-        exhausted=source_plan.exhausted and tokens_present < wanted,
-        complete=complete,
-        reason=problem or ("ok" if complete else f"source {name}: {source_plan.reason}"),
-    )
-
-
-def _plan_validation(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> SourcePlan:
-    source = cfg.sources[name]
-    wanted = int(source.rows or 0)
-    manifest, problem = _current(layout.validation_dir(name), cfg.validation_hash(name), "validation")
-
-    rows_present = manifest.rows() if manifest is not None else 0
-    tokens_present = (manifest.tokens() or 0) if manifest is not None else 0
-    exhausted = manifest is not None and rows_present < wanted
-
-    if problem is None and manifest is not None and manifest.extra.get("requested_rows") != wanted:
-        problem = f"validation: has {rows_present} rows, config wants {wanted}"
-    if problem is None and not tokenizer_complete:
-        problem = "tokenizer missing"
-
-    if rows_present > 0:
-        tokens_per_row = tokens_present / rows_present
-    else:
-        tokens_per_row = float(min(source.tokens_per_row_estimate, cfg.max_seq_length))
-
-    if problem is not None:
-        reason = problem
-    elif exhausted:
-        reason = f"exhausted at {rows_present} of {wanted} rows"
-    else:
-        reason = "ok"
-
-    return SourcePlan(
-        name=name,
-        kind="validation",
-        budget_tokens=0,
-        tokens_per_row=tokens_per_row,
-        rows_needed=wanted,
-        rows_present=rows_present,
-        rows_to_fetch=0 if manifest is not None else wanted,
-        tokens_present=tokens_present,
-        manifest_current=manifest is not None,
-        exhausted=exhausted,
-        complete=problem is None,
-        reason=reason,
-    )
-
-
-# --- instruct mixtures -------------------------------------------------------------------------------------------------
-
-
-def _plan_instruct_mixture(cfg: DatasetConfig, name: str, layout: DatasetLayout, tokenizer_complete: bool) -> InstructMixturePlan:
-    budget = cfg.instruct_mixture_budget_tokens(name)
-    split_dirs = {split: layout.instruct_mixture_dir(cfg.name, name, split) for split in INSTRUCT_MIXTURE_SPLITS}
-    present = all(Manifest.load(directory) is not None for directory in split_dirs.values())
-
-    manifests, problem = _current_split_manifests(cfg, name, split_dirs)
-    current = len(manifests) == len(INSTRUCT_MIXTURE_SPLITS)
-
-    short: list[str] = []
-    tokens_present = 0
-    if current:
-        train = manifests["train"]
-        tokens_present = train.tokens() or 0
-        short, sources_problem = _check_mixture_sources(cfg, name, layout, train, budget)
-        if problem is None:
-            problem = sources_problem
-    if problem is None and not tokenizer_complete:
-        problem = "tokenizer missing"
-
-    return InstructMixturePlan(
-        name=name,
-        budget_tokens=budget,
-        present=present,
-        current=current,
-        short_sources=short,
-        tokens_present=tokens_present,
-        complete=problem is None,
-        reason=problem or "ok",
-    )
-
-
-def _current_split_manifests(cfg: DatasetConfig, name: str, split_dirs: dict[str, Path]) -> tuple[dict[str, Manifest], str | None]:
-    """The current, verified manifests of the mixture's splits plus the problem of the first split that has none."""
-    mixture_hash = cfg.instruct_mixture_hash(name)
-    manifests: dict[str, Manifest] = {}
-    first_problem: str | None = None
-    for split, directory in split_dirs.items():
-        manifest, split_problem = _current(directory, mixture_hash, "instruct_mixture")
-        if manifest is not None:
-            manifests[split] = manifest
-        elif first_problem is None:
-            first_problem = f"{split} {split_problem}"
-    return manifests, first_problem
-
-
-def _check_mixture_sources(
-    cfg: DatasetConfig, name: str, layout: DatasetLayout, train: Manifest, budget: int
-) -> tuple[list[str], str | None]:
-    """Compare a built mixture (its ``train`` manifest) with the raw shards of its sources and the budget.
-
-    Returns the sources that were short when the mixture was built and are not exhausted (a new fetch could help),
-    and the first problem found, or None.
-    """
-    problem: str | None = None
-    short: list[str] = []
-    raw_shards: dict[str, list[list[object]]] = {}
-    built_from_short_sources = train.extra.get("short_sources", {})
-    for src in cfg.instruct_mixtures[name].sources:
-        raw, raw_problem = _current(layout.raw_dir(src), cfg.raw_hash(src), "raw")
-        if raw is None:
-            if problem is None:
-                problem = f"source {src} {raw_problem}"
-            continue
-        raw_shards[src] = [[shard.name, shard.rows] for shard in raw.shards]
-        if src in built_from_short_sources and not raw.extra.get("exhausted"):
-            short.append(src)
-
-    if problem is None and train.extra.get("input_shards") != raw_shards:
-        problem = "sources changed since the mixture was built"
-    if problem is None and train.extra.get("budget_tokens") != budget:
-        problem = f"built for {train.extra.get('budget_tokens')} tokens, budget is {budget}"
-    if problem is None and short:
-        problem = f"short sources {short}"
-    if problem is None and (train.tokens() or 0) == 0:
-        problem = "train split is empty (every example dropped or too long)"
-    return short, problem
-
-
-__all__ = ["InstructMixturePlan", "Plan", "SourcePlan", "plan", "rows_for_budget", "stage_problems"]
+__all__ = ["SOURCE_STAGES", "Plan", "SourcePlan", "budget_tokens_of", "plan", "rows_for_budget", "stage_dir", "stage_hash", "stage_problems"]

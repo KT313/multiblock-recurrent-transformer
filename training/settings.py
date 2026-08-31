@@ -26,11 +26,11 @@ class DataEntry:
 
 @dataclass
 class Settings:
-    # Data: everything about the data (sources, stages, token budgets, mixtures, tokenizer) lives in the dataset
+    # Data: everything about the data (sources, stages, token budgets, weights, tokenizer) lives in the dataset
     # config; the run config only references it. `training/train.py` verifies the prepared data and, with
     # `auto_prepare`, builds what is missing (`python data_preparation/prepare.py build --dataset_config ...`).
     dataset_config: str  # path to config/datasets/<name>.yaml (required)
-    dataset_dir: str = "dataset"  # root of the prepared data (sources/, instruct_mixtures/, tokenizers/)
+    dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
     prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers); also the
     # pool size of each decontamination / minhash pass, so the product is what runs with those toggles on

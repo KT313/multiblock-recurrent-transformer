@@ -82,27 +82,12 @@ def build_command(dataset_config: str, dataset_dir: str) -> str:
 
 
 def _data_entry(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float) -> DataEntry:
-    """The `DataEntry` for one stage key (`<source>`, `<source>/validation`, `<mixture>`, `<mixture>/train` or
-    `<mixture>/validation`)."""
-    base, _, split = key.partition("/")
-    prefix = f"{stage_name}-{key.replace('/', '-')}"
-
-    if base in cfg.instruct_mixtures:
-        mixture_dir = layout.instruct_mixture_dir(cfg.name, base, split or "train")
-        return DataEntry(
-            prefix=prefix, data_dir=str(mixture_dir), weight=weight, data_signature=dict(INSTRUCT_DATA_SIGNATURE)
-        )
-
-    kind = cfg.sources[base].kind
-    if kind == "pretrain" and split == "validation":
-        source_dir = layout.validation_dir(base)  # the source's own held-out split (`validation_tokens`)
-    elif kind == "pretrain":
-        source_dir = layout.processed_dir(base)
-    elif kind == "validation":
-        source_dir = layout.validation_dir(base)
-    else:  # unreachable: DatasetConfig rejects instruct sources outside instruct mixtures
-        raise ValueError(f"stage {stage_name}: source {base!r} of kind {kind!r} cannot be used directly")
-    return DataEntry(prefix=prefix, data_dir=str(source_dir), weight=weight)
+    """The `DataEntry` for one stage key (a source name): its `processed/<source>` folder, read through the text
+    column (pretrain) or the instruction/input/output signature (instruct). The validation split of a source used
+    in both train and val (`skip_rows` / `max_rows`) is task 10."""
+    prefix = f"{stage_name}-{key}"
+    signature = dict(INSTRUCT_DATA_SIGNATURE) if cfg.sources[key].kind == "instruct" else None
+    return DataEntry(prefix=prefix, data_dir=str(layout.processed_dir(key)), weight=weight, data_signature=signature)
 
 
 def _entries(cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, keys: dict[str, float]) -> list[DataEntry]:
@@ -118,9 +103,8 @@ def resolve_entries(
 ) -> tuple[list[DataEntry], list[DataEntry]]:
     """`(train_data, val_data)` of one dataset-config stage.
 
-    A pretrain source maps to `sources/<name>/processed`, a validation source to `sources/<name>/validation` (both read
-    the `text` column); `<mixture>` / `<mixture>/train` / `<mixture>/validation` map to the per-config mixture
-    split with the instruction/input/output signature. Prefixes are `<stage>-<key>` and unique per stage.
+    Every stage key is a source name and maps to `processed/<name>`; pretrain sources read the `text` column,
+    instruct sources use the instruction/input/output signature. Prefixes are `<stage>-<key>` and unique per stage.
     """
     return _entries(cfg, layout, stage.name, stage.train), _entries(cfg, layout, stage.name, stage.val)
 

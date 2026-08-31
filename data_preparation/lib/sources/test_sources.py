@@ -178,15 +178,15 @@ def test_local_missing_directory(tmp_path: Path) -> None:
 # --- synthetic --------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["pretrain", "validation", "instruct"])
+@pytest.mark.parametrize("kind", ["pretrain", "instruct"])
 def test_synthetic_offset_property_and_determinism(kind: SourceKind) -> None:
-    source = SourceConfig(kind=kind, loader="synthetic", seed=7, rows=5 if kind == "validation" else None)
+    source = SourceConfig(kind=kind, loader="synthetic", seed=7)
     load = LOADERS["synthetic"]
     full = list(load(source, 0, 8))
     assert list(load(source, 5, 3)) == full[5:8]
     assert list(load(source, 0, 8)) == full
     assert len(full) == 8 and len({json.dumps(r) for r in full}) == 8
-    other_seed = SourceConfig(kind=kind, loader="synthetic", seed=8, rows=5 if kind == "validation" else None)
+    other_seed = SourceConfig(kind=kind, loader="synthetic", seed=8)
     assert list(load(other_seed, 0, 8)) != full
 
 

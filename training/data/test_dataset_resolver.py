@@ -29,11 +29,22 @@ CROW_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"
 TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 # The last hand-written run config (git history before the dataset-config restructure, `config/crow_300m_final.yaml`)
-# as (data_dir, weight, data_signature) per stage, with its per-stage data directories mapped onto the new layout
-# (pretrain source -> sources/<src>/processed, fineweb's held-out split -> sources/fineweb_edu/validation, the
-# finetune mixture -> instruct_mixtures/crow-300m-final/flan_instruct/{train,validation}).
-_P = "dataset/sources/{}/processed"
+# as (data_dir, weight, data_signature) per stage, with its per-stage data directories mapped onto the new layout:
+# every source -> processed/<source>; fineweb's held-out set is the validation_fraction split of the same folder
+# (task 10 adds the row ranges); the former flan_instruct mixture is the eight instruct sources with the mixture
+# shares as weights, in train and val alike.
+_P = "dataset/processed/{}"
 _INSTRUCT = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
+_FINETUNE = [
+    (_P.format("flan"), 0.40, _INSTRUCT),
+    (_P.format("metamath"), 0.15, _INSTRUCT),
+    (_P.format("orca_math"), 0.10, _INSTRUCT),
+    (_P.format("evol_code"), 0.125, _INSTRUCT),
+    (_P.format("code_alpaca"), 0.025, _INSTRUCT),
+    (_P.format("slimorca"), 0.10, _INSTRUCT),
+    (_P.format("sharegpt"), 0.05, _INSTRUCT),
+    (_P.format("wizardlm"), 0.05, _INSTRUCT),
+]
 GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
     {
         "name": "pretrain_phase1",
@@ -58,7 +69,7 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
             (_P.format("arxiv"), 0.02, None),
             (_P.format("openwebmath"), 0.03, None),
         ],
-        "val": [("dataset/sources/fineweb_edu/validation", 1.0, None)],
+        "val": [(_P.format("fineweb_edu"), 1.0, None)],
     },
     {
         "name": "pretrain_phase2",
@@ -84,15 +95,15 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
             (_P.format("peso"), 0.09, None),
             (_P.format("arxiv"), 0.06, None),
         ],
-        "val": [("dataset/sources/fineweb_edu/validation", 1.0, None)],
+        "val": [(_P.format("fineweb_edu"), 1.0, None)],
     },
     {
         "name": "finetune",
         "tokens": 150_000_000,
         "base_lr": 5e-5,
         "transition_pct": 0.0,
-        "train": [("dataset/instruct_mixtures/crow-300m-final/flan_instruct/train", 1.0, _INSTRUCT)],
-        "val": [("dataset/instruct_mixtures/crow-300m-final/flan_instruct/validation", 1.0, _INSTRUCT)],
+        "train": _FINETUNE,
+        "val": _FINETUNE,
     },
 ]
 CROW_BASE_LRS = [3e-4, 1e-4, 5e-5]
@@ -129,29 +140,22 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
         assert _triples(train) == golden["train"], stage.name
         assert _triples(val) == golden["val"], stage.name
         assert (stage.tokens, stage.transition_pct) == (golden["tokens"], golden["transition_pct"])
-        prefixes = [e.prefix for e in train] + [e.prefix for e in val]
-        assert len(set(prefixes)) == len(prefixes), stage.name
+        for entries in (train, val):  # a source in both train and val has one prefix in each list (task 10 splits the rows)
+            prefixes = [e.prefix for e in entries]
+            assert len(set(prefixes)) == len(prefixes), stage.name
         assert sum(e.weight for e in train) == pytest.approx(1.0)
 
 
 def test_entry_prefixes_and_signatures(crow_cfg: DatasetConfig) -> None:
     layout = DatasetLayout(Path("/data"))
     train, val = resolve_entries(crow_cfg, layout, crow_cfg.stages[2])
-    assert train[0].prefix == "finetune-flan_instruct" and val[0].prefix == "finetune-flan_instruct-validation"
-    assert train[0].data_dir == "/data/instruct_mixtures/crow-300m-final/flan_instruct/train"
+    assert train[0].prefix == "finetune-flan" and val[0].prefix == "finetune-flan"
+    assert train[0].data_dir == val[0].data_dir == "/data/processed/flan"
     assert train[0].data_signature == INSTRUCT_DATA_SIGNATURE and train[0].data_signature is not INSTRUCT_DATA_SIGNATURE
     train1, val1 = resolve_entries(crow_cfg, layout, crow_cfg.stages[0])
     assert train1[0].prefix == "pretrain_phase1-fineweb_edu" and train1[0].data_signature is None
-    assert val1[0].prefix == "pretrain_phase1-fineweb_edu-validation" and val1[0].data_dir == "/data/sources/fineweb_edu/validation"
-
-
-def test_instruct_mixture_train_split_is_explicit_or_default(crow_cfg: DatasetConfig) -> None:
-    layout = DatasetLayout(Path("d"))
-    stage = crow_cfg.stages[2]
-    stage_explicit = type(stage)(name="ft", tokens=1, train={"flan_instruct/train": 1.0}, val={"flan_instruct": 1.0})
-    train, val = resolve_entries(crow_cfg, layout, stage_explicit)
-    assert train[0].data_dir == val[0].data_dir == "d/instruct_mixtures/crow-300m-final/flan_instruct/train"
-    assert train[0].prefix == "ft-flan_instruct-train" and val[0].prefix == "ft-flan_instruct"
+    assert val1[0].prefix == "pretrain_phase1-fineweb_edu" and val1[0].data_dir == "/data/processed/fineweb_edu"
+    assert all(entry.skip_rows == 0 and entry.max_rows is None for entry in train1 + val1)  # the split is task 10
 
 
 # --- resolve_dataset -------------------------------------------------------------------------------------------------
@@ -167,7 +171,7 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert [s.tokens for s in resolved.stages] == [8192, 8192, 4096]
     assert all(isinstance(s, ResolvedStage) for s in resolved.stages)
     assert resolved.stages[0].train_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_pretrain"))
-    assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.instruct_mixture_dir("tiny", "tiny_instruct", "validation"))
+    assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_instruct"))
     for stage in resolved.stages:
         for entry in stage.train_data + stage.val_data:
             assert list(Path(entry.data_dir).glob("*.parquet")), entry
@@ -180,7 +184,7 @@ def test_stage_manager_stages(tiny_dataset_dir: Path) -> None:
     ts = stages[2]
     assert (ts.name, ts.tokens, ts.base_lr, ts.transition_pct) == ("finetune", 4096, 5e-5, 0.0)
     assert ts.train_data == [vars(e) for e in resolved.stages[2].train_data]
-    assert ts.train_data[0]["prefix"] == "finetune-tiny_instruct" and ts.train_data[0]["weight"] == 1.0
+    assert ts.train_data[0]["prefix"] == "finetune-synthetic_instruct" and ts.train_data[0]["weight"] == 1.0
     assert ts.val_data[0]["data_signature"] == INSTRUCT_DATA_SIGNATURE
 
 
@@ -205,8 +209,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     assert caplog.text.count("dataset status:") == 2  # once before the build (incomplete), once after it (complete)
     layout = DatasetLayout(empty)
     assert list(layout.processed_dir("synthetic_pretrain").glob("*.parquet"))
-    assert list(layout.validation_dir("synthetic_val").glob("*.parquet"))
-    assert list(layout.instruct_mixture_dir("tiny", "tiny_instruct", "validation").glob("*.parquet"))
+    assert list(layout.processed_dir("synthetic_instruct").glob("*.parquet"))
     assert Path(resolved.tokenizer_dir).is_dir()
     # a second resolve finds everything complete and does not build again
     caplog.clear()
@@ -277,15 +280,3 @@ def test_checkpoint_hash_check(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         check_checkpoint_dataset_hash({"step": 3}, "xyz", allow_change=False)  # older checkpoint format
     assert "older format" in caplog.text
-
-
-def test_pretrain_source_validation_split_resolves_to_its_validation_dir() -> None:
-    from dataclasses import replace
-
-    cfg = load_dataset_config(TINY_DATASET_YAML)
-    cfg.sources["synthetic_pretrain"] = replace(cfg.sources["synthetic_pretrain"], validation_tokens=512)
-    cfg.stages[0].val = {"synthetic_pretrain/validation": 1.0}
-    layout = DatasetLayout(Path("/data"))
-    _, (entry,) = resolve_entries(cfg, layout, cfg.stages[0])
-    assert entry.data_dir == "/data/sources/synthetic_pretrain/validation" and entry.prefix == "pretrain_a-synthetic_pretrain-validation"
-    assert entry.data_signature is None

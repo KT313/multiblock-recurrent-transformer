@@ -30,7 +30,7 @@ def tiny_dataset_config() -> DatasetConfig:
 
 @pytest.fixture(scope="session")
 def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_config: DatasetConfig) -> Path:
-    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, instruct_mixtures/,
+    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, processed/,
     tokenizers/) that `config/tiny.yaml` expects under `dataset/`."""
     root: Path = tmp_path_factory.mktemp("tiny_dataset")
     build(tiny_dataset_config, DatasetLayout(root))
@@ -44,17 +44,14 @@ def tiny_layout(tiny_dataset_dir: Path) -> DatasetLayout:
 
 @pytest.fixture(scope="session")
 def tiny_pretrain_dir(tiny_layout: DatasetLayout) -> Path:
-    return tiny_layout.source_dir("synthetic_pretrain", "processed")
+    """`processed/synthetic_pretrain`: text rows."""
+    return tiny_layout.processed_dir("synthetic_pretrain")
 
 
 @pytest.fixture(scope="session")
-def tiny_validation_dir(tiny_layout: DatasetLayout) -> Path:
-    return tiny_layout.validation_dir("synthetic_val")
-
-
-@pytest.fixture(scope="session")
-def tiny_instruct_dirs(tiny_layout: DatasetLayout) -> dict[str, Path]:
-    return {split: tiny_layout.instruct_mixture_dir("tiny", "tiny_instruct", split) for split in ("train", "validation")}
+def tiny_instruct_dir(tiny_layout: DatasetLayout) -> Path:
+    """`processed/synthetic_instruct`: instruction / input / output rows."""
+    return tiny_layout.processed_dir("synthetic_instruct")
 
 
 @pytest.fixture(scope="session")

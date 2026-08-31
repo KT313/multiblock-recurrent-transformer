@@ -1,20 +1,21 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``build`` / ``status``: execute a :func:`planner.plan` (tokenizer -> pretrain sources -> validation sources -> instruct mixtures)
-and report it.
+"""``build`` / ``status``: execute a :func:`planner.plan` (tokenizer, then every source: download -> build) and
+report it. Task 9 rewrites this module around a readable top-level ``prepare()``; until then the structure is the
+pre-restructure one minus the mixture and validation items.
 
-Per pretrain source the estimate -> measured refinement loop runs download -> process until the
-processed tokens reach the budget or the loader is exhausted (at most ``max_rounds`` rounds, then an error);
-``github_code`` sources of one repo download together in a single pass over its files (one work item per repo). A
-mixture is rebuilt until none of its sources is short. Stage directories whose manifest is stale or whose shards
-do not verify are removed before their stage reruns.
+Per source (both kinds) the estimate -> measured refinement loop runs download -> build until the processed tokens
+reach the budget or the loader is exhausted (at most ``max_rounds`` rounds, then an error); a source used only for
+validation is downloaded once with its ``rows``. ``github_code`` sources of one repo download together in a single
+pass over its files (one work item per repo). Folders whose manifest is stale or whose shards do not verify are
+removed before their step reruns.
 
 The tokenizer is prepared first (downloads count tokens with it); every other work item then runs in a thread of a
-bounded pool so that downloads (network) and processing (CPU) of *different* items overlap: at most
-``max_parallel_downloads`` items download and at most ``num_workers`` items process at any time (:class:`_Slots`).
-Each item is still its own download -> process sequence writing only its own directories, so the files on disk do
-not depend on the interleaving. Every stage failure propagates after logging which item failed; the other items
-stop at their next shard (``_Slots.should_stop`` is handed to the stages) and nothing is swallowed; the same
-happens on Ctrl-C, with everything published so far kept on disk.
+bounded pool so that downloads (network) and builds (CPU) of *different* items overlap: at most
+``max_parallel_downloads`` items download and at most ``num_workers`` items build at any time (:class:`_Slots`).
+Each item is its own download -> build sequence writing only its own folders, so the files on disk do not depend on
+the interleaving. Every failure propagates after logging which item failed; the other items stop at their next shard
+(``_Slots.should_stop`` is handed to the steps) and nothing is swallowed; the same happens on Ctrl-C, with everything
+published so far kept on disk.
 """
 
 from __future__ import annotations
@@ -24,50 +25,44 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
-from typing import Any
 
+from data_preparation.dataset_config import DatasetConfig
+from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build.lock import build_lock
-from data_preparation.dataset_config import DatasetConfig
-from data_preparation.layout import INSTRUCT_MIXTURE_SPLITS, DatasetLayout
+from data_preparation.lib.build.planner import Plan, SourcePlan, plan, rows_for_budget, stage_dir, stage_problems
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.ui.dashboard import progress
-from data_preparation.lib.build.planner import InstructMixturePlan, Plan, SourcePlan, plan, rows_for_budget, stage_problems
 from data_preparation.lib.sources import github_code_repo_key
 from data_preparation.lib.stages import (
-    build_instruct_mixture,
+    build_source,
     download,
     download_github_code_group,
     prepare_tokenizer,
-    process,
     truncate_raw_to_good_prefix,
-    validation,
 )
 from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
 
-STEPS: tuple[str, ...] = ("tokenizer", "download", "process", "validation", "instruct_mixtures")
+STEPS: tuple[str, ...] = ("tokenizer", "download", "process")  # task 9 renames `process` -> `build`
 DEFAULT_MAX_ROUNDS = 5
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
-DEFAULT_NUM_WORKERS = 2  # items processed at a time; also the pool size of each decontamination / minhash pass
+DEFAULT_NUM_WORKERS = 2  # items built at a time; also the pool size of each decontamination / minhash pass
 
 
 @dataclass
 class _Slots:
-    """The bounded concurrency of one ``build``: a download slot and a processing slot are held for the duration
-    of a stage; ``stop(reason)`` makes every item stop — at its next stage boundary, and inside a running stage at
-    its next shard (the stages take ``should_stop``)."""
+    """The bounded concurrency of one ``build``: a download slot and a build slot are held for the duration of a
+    step; ``stop(reason)`` makes every item stop — at its next step boundary, and inside a running step at its next
+    shard (the steps take ``should_stop``)."""
 
     download: threading.BoundedSemaphore
     process: threading.BoundedSemaphore
     abort: threading.Event
     reason: str = "another item failed"
-    _source_locks: dict[str, threading.Lock] = field(default_factory=dict)
-    _registry_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @classmethod
     def create(cls, max_parallel_downloads: int, num_workers: int) -> _Slots:
@@ -83,12 +78,6 @@ class _Slots:
 
     def should_stop(self) -> bool:
         return self.abort.is_set()
-
-    def source_lock(self, name: str) -> threading.Lock:
-        """One lock per source directory: items that may write the same ``sources/<name>/raw`` (an instruct source
-        shared by several mixtures) serialise on it."""
-        with self._registry_lock:
-            return self._source_locks.setdefault(name, threading.Lock())
 
     @contextmanager
     def downloading(self) -> Iterator[None]:
@@ -136,11 +125,11 @@ def build(
 ) -> Plan:
     """Materialise what the plan says is missing; returns the re-computed plan.
 
-    ``steps`` (subset of :data:`STEPS`) limits which stages run, ``sources`` limits to the named sources / mixtures.
-    ``dry_run`` logs the plan and returns it without writing anything. ``max_parallel_downloads`` items download
-    and ``num_workers`` items process concurrently (see the module docstring). Holds the dataset directory's build
-    lock (``lib/build/lock.py``): a concurrent ``prepare.py build`` / ``train.py`` auto-prepare on the same
-    directory fails fast with :class:`BuildLocked`.
+    ``steps`` (subset of :data:`STEPS`) limits which steps run, ``sources`` limits to the named sources. ``dry_run``
+    logs the plan and returns it without writing anything. ``max_parallel_downloads`` items download and
+    ``num_workers`` items build concurrently (see the module docstring). Holds the dataset directory's build lock
+    (``lib/build/lock.py``): a concurrent ``prepare.py build`` / ``train.py`` auto-prepare on the same directory
+    fails fast with :class:`BuildLocked`.
     """
     active_steps = set(STEPS) if steps is None else set(steps)
     _check_steps(active_steps)
@@ -179,17 +168,16 @@ def _check_steps(active_steps: set[str]) -> None:
 def _check_sources(cfg: DatasetConfig, sources: list[str] | None) -> None:
     if sources is None:
         return
-    unknown = set(sources) - set(cfg.sources) - set(cfg.instruct_mixtures)
+    unknown = set(sources) - set(cfg.sources)
     if unknown:
-        raise ValueError(f"unknown sources/instruct mixtures {sorted(unknown)}")
+        raise ValueError(f"unknown sources {sorted(unknown)}")
 
 
 @dataclass
 class _WorkItem:
-    what: str  # "tokenizer" | "source" | "validation" | "instruct_mixture" (for the log line on failure)
+    what: str  # "tokenizer" | "source" | "github_code group" (for the log line on failure)
     name: str
     action: Callable[[], object]
-    after: list[str] = field(default_factory=list)  # names of items that must have finished first (listed earlier)
 
 
 def _work_items(
@@ -203,51 +191,23 @@ def _work_items(
     max_rounds: int,
     slots: _Slots,
 ) -> list[_WorkItem]:
-    """Every source / validation / instruct mixture that is incomplete, selected and has an active step, in plan
-    order (the tokenizer is not an item: ``build`` prepares it before anything else)."""
+    """Every source that is incomplete and selected, in plan order (the tokenizer is not an item: ``build``
+    prepares it before anything else)."""
     items: list[_WorkItem] = []
-
     wanted_sources = [p for p in current.sources if _wanted(p.name, p.complete, selected)]
     for group in _github_code_groups(cfg, wanted_sources):
         action = partial(_build_github_code_group, cfg, group, layout, active_steps, num_workers, hf_token, max_rounds, slots)
         items.append(_WorkItem("github_code group", ", ".join(p.name for p in group), action))
         wanted_sources = [p for p in wanted_sources if p not in group]
     for source_plan in wanted_sources:
-        action = partial(_build_pretrain_source, cfg, source_plan, layout, active_steps, num_workers, hf_token, max_rounds, slots)
+        action = partial(_download_and_build_source, cfg, source_plan, layout, active_steps, num_workers, hf_token, max_rounds, slots)
         items.append(_WorkItem("source", source_plan.name, action))
-
-    if "validation" in active_steps:
-        for validation_plan in current.validations:
-            if "/" in validation_plan.name:
-                continue  # a pretrain source's `<name>/validation` split: built by the source's own `process` item
-            if _wanted(validation_plan.name, validation_plan.complete, selected):
-                action = partial(_build_validation, cfg, validation_plan, layout, hf_token, slots)
-                items.append(_WorkItem("validation", validation_plan.name, action))
-
-    if "instruct_mixtures" in active_steps:
-        wanted_mixtures = [p for p in current.instruct_mixtures if _wanted(p.name, p.complete, selected)]
-        # the instruct sources first, one item each with the largest share any mixture needs (a source shared by
-        # two mixtures is downloaded once, not raced), then the mixtures, each after its sources
-        rows_needed: dict[str, int] = {}
-        for mixture_plan in wanted_mixtures:
-            mixture = cfg.instruct_mixtures[mixture_plan.name]
-            for src in mixture.sources:
-                # the mixture's target already carries the safety margin (`InstructMixtureConfig.target_tokens`)
-                rows = rows_for_budget(mixture.target_tokens(mixture_plan.budget_tokens, src), _instruct_tokens_per_row(cfg, src, layout), margin=1.0)
-                rows_needed[src] = max(rows_needed.get(src, 0), rows)
-        for src, rows in rows_needed.items():
-            action = partial(_download_instruct_source, cfg, src, layout, rows, hf_token, slots)
-            items.append(_WorkItem("source", src, action))
-        for mixture_plan in wanted_mixtures:
-            action = partial(_build_instruct_mixture, cfg, mixture_plan, layout, hf_token, max_rounds, slots)
-            items.append(_WorkItem("instruct_mixture", mixture_plan.name, action, after=list(cfg.instruct_mixtures[mixture_plan.name].sources)))
-
     return items
 
 
 def _remove_orphaned_filtered_dirs(layout: DatasetLayout) -> None:
     """Delete ``sources/*/filtered/`` directories left behind by builds from before the length filter moved into
-    ``process`` (they were a third copy of the text; raw and processed are the only copies now)."""
+    the build step (they were a third copy of the text; raw and processed are the only copies now)."""
     for directory in sorted((layout.root / "sources").glob("*/filtered")):
         if directory.is_dir():
             log.warning("removing orphaned %s (the filtered stage no longer exists)", directory)
@@ -276,7 +236,7 @@ def _wanted(name: str, complete: bool, selected: set[str] | None) -> bool:
 
 
 def _run(item: _WorkItem, slots: _Slots) -> None:
-    """Run one item; a failure sets ``slots.abort`` (the other items stop at their next stage) and propagates."""
+    """Run one item; a failure sets ``slots.abort`` (the other items stop at their next step) and propagates."""
     try:
         item.action()
     except BuildAborted:
@@ -289,20 +249,16 @@ def _run(item: _WorkItem, slots: _Slots) -> None:
 
 
 def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None:
-    """Run every item in a thread pool of ``max_workers`` (the stage slots bound the real concurrency); the first
+    """Run every item in a thread pool of ``max_workers`` (the step slots bound the real concurrency); the first
     failure (or an interrupt) cancels the items not started yet, lets the running ones stop at their next shard
     and is re-raised."""
     if not items:
         return
     running: list[str] = []
     lock = threading.Lock()
-    by_name: dict[str, Future[None]] = {}
-    submitted = threading.Event()
     with progress(total=len(items), desc="items", unit="item") as bar:
 
         def run_and_track(item: _WorkItem) -> None:
-            submitted.wait()
-            _wait_for_dependencies(item, by_name)
             with lock:
                 running.append(item.name)
                 bar.set_postfix({"running": ", ".join(running)}, refresh=False)
@@ -314,10 +270,7 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
                     bar.set_postfix({"running": ", ".join(running)}, refresh=False)
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="build") as pool:
-            # items are started in submission order, so an item's dependencies (listed earlier) never wait on it
             futures: dict[Future[None], _WorkItem] = {pool.submit(run_and_track, item): item for item in items}
-            by_name.update({item.name: future for future, item in futures.items()})
-            submitted.set()
             failures: list[BaseException] = []
             try:
                 for future in as_completed(futures):
@@ -345,18 +298,8 @@ def _run_all(items: list[_WorkItem], slots: _Slots, *, max_workers: int) -> None
         raise failures[0]
 
 
-def _wait_for_dependencies(item: _WorkItem, by_name: dict[str, Future[None]]) -> None:
-    """Block until every item in ``item.after`` has finished; one that failed or was cancelled stops this item."""
-    for name in item.after:
-        future = by_name[name]
-        try:
-            future.result()
-        except BaseException as err:
-            raise BuildAborted(f"{name} did not finish") from err
-
-
 def _log_plan(result: Plan, *, summary: bool = True) -> None:
-    for item in result.sources + result.validations:
+    for item in result.sources:
         if not (item.complete and item.exhausted):
             continue
         if item.reason == "ok":
@@ -374,11 +317,11 @@ def _log_plan(result: Plan, *, summary: bool = True) -> None:
 
 
 def _remove_broken_stages(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> None:
-    """Delete stage directories whose manifest is stale or whose shards do not verify, so the stage rebuilds — except
-    a raw directory with a broken shard, which is truncated to its good prefix (the next download resumes there)
-    rather than downloaded again."""
+    """Delete folders whose manifest is stale or whose shards do not verify, so the step rebuilds — except a raw
+    folder with a broken shard, which is truncated to its good prefix (the next download resumes there) rather than
+    downloaded again. (Task 7 turns this into the repair step; deleting a raw folder then needs confirmation.)"""
     for stage, problem in stage_problems(cfg, name, layout).items():
-        directory = layout.validation_dir(name) if stage == "validation" else layout.source_dir(name, stage)
+        directory = stage_dir(layout, name, stage)
         if stage == "raw" and not problem.endswith("manifest stale"):
             manifest = Manifest.load(directory)
             if manifest is not None and truncate_raw_to_good_prefix(directory, manifest):
@@ -388,7 +331,7 @@ def _remove_broken_stages(cfg: DatasetConfig, name: str, layout: DatasetLayout) 
         shutil.rmtree(directory)
 
 
-def _build_pretrain_source(
+def _download_and_build_source(
     cfg: DatasetConfig,
     source_plan: SourcePlan,
     layout: DatasetLayout,
@@ -398,22 +341,21 @@ def _build_pretrain_source(
     max_rounds: int,
     slots: _Slots,
 ) -> None:
-    """download -> process, repeated with a refined tokens/row until the processed tokens reach the budget."""
+    """download -> build, repeated with a refined tokens/row until the processed tokens reach the budget (a source
+    used only for validation is downloaded once with its ``rows``)."""
     name, budget = source_plan.name, source_plan.budget_tokens
     _remove_broken_stages(cfg, name, layout)
-    tokens_per_row = source_plan.tokens_per_row
-    total_tokens = budget + cfg.sources[name].validation_tokens  # the validation split comes off the top
+    rows_needed = source_plan.rows_needed
 
     for round_index in range(max_rounds):
         raw = None
         if "download" in active_steps:
-            rows_needed = rows_for_budget(total_tokens, tokens_per_row)
             with slots.downloading():
                 raw = download(cfg, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
-        refined = _process_round(cfg, name, layout, active_steps, num_workers, raw, budget, round_index, slots)
+        refined = _build_round(cfg, name, layout, active_steps, num_workers, raw, budget, round_index, slots)
         if refined is None:
             return
-        tokens_per_row = refined
+        rows_needed = rows_for_budget(budget, refined)
 
     raise RuntimeError(f"{name}: token budget {budget} not reached after {max_rounds} rounds")
 
@@ -428,10 +370,10 @@ def _build_github_code_group(
     max_rounds: int,
     slots: _Slots,
 ) -> None:
-    """`_build_pretrain_source` for the `github_code` sources of one repo: each round downloads every source that
-    still needs rows in one pass over the repo files, then processes them one by one."""
+    """`_download_and_build_source` for the `github_code` sources of one repo: each round downloads every source
+    that still needs rows in one pass over the repo files, then builds them one by one."""
     budgets = {p.name: p.budget_tokens for p in group}
-    tokens_per_row = {p.name: p.tokens_per_row for p in group}
+    rows_needed = {p.name: p.rows_needed for p in group}
     for source_plan in group:
         _remove_broken_stages(cfg, source_plan.name, layout)
     pending = [p.name for p in group]  # sources whose budget is not reached yet
@@ -439,14 +381,14 @@ def _build_github_code_group(
     for round_index in range(max_rounds):
         raws: dict[str, Manifest] = {}
         if "download" in active_steps:
-            rows_needed = {name: rows_for_budget(budgets[name] + cfg.sources[name].validation_tokens, tokens_per_row[name]) for name in pending}
+            wanted = {name: rows_needed[name] for name in pending}
             with slots.downloading():
-                raws = download_github_code_group(cfg, pending, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
+                raws = download_github_code_group(cfg, pending, layout, rows_needed=wanted, hf_token=hf_token, should_stop=slots.should_stop)
         still_pending: list[str] = []
         for name in pending:
-            refined = _process_round(cfg, name, layout, active_steps, num_workers, raws.get(name), budgets[name], round_index, slots)
+            refined = _build_round(cfg, name, layout, active_steps, num_workers, raws.get(name), budgets[name], round_index, slots)
             if refined is not None:
-                tokens_per_row[name] = refined
+                rows_needed[name] = rows_for_budget(budgets[name], refined)
                 still_pending.append(name)
         pending = still_pending
         if not pending:
@@ -455,7 +397,7 @@ def _build_github_code_group(
     raise RuntimeError(f"{', '.join(pending)}: token budget not reached after {max_rounds} rounds")
 
 
-def _process_round(
+def _build_round(
     cfg: DatasetConfig,
     name: str,
     layout: DatasetLayout,
@@ -466,17 +408,18 @@ def _process_round(
     round_index: int,
     slots: _Slots,
 ) -> float | None:
-    """process after one download round of ``name`` (``raw``: its raw manifest, None without a download step).
-    Returns None when the source is done (budget reached, exhausted, or nothing more to do) or the refined
-    tokens/row for the next round."""
+    """The build after one download round of ``name`` (``raw``: its raw manifest, None without a download step).
+    Returns None when the source is done (budget reached, exhausted, used only for validation, or nothing more to
+    do) or the refined tokens/row for the next round."""
     if "process" not in active_steps:
         return None
     with slots.processing():
-        processed = process(cfg, name, layout, num_workers=num_workers, should_stop=slots.should_stop)
+        processed = build_source(cfg, name, layout, num_workers=num_workers, should_stop=slots.should_stop)
+    if not cfg.used_in_train(name):
+        return None  # sized by `rows`, not by a token budget: one round
 
     tokens = processed.tokens() or 0
-    validation_tokens = _validation_split_tokens(cfg, name, layout)
-    if tokens >= budget and validation_tokens >= cfg.sources[name].validation_tokens:
+    if tokens >= budget:
         return None
     exhausted = raw is not None and bool(raw.extra.get("exhausted"))
     if exhausted or raw is None:
@@ -485,97 +428,9 @@ def _process_round(
         log.warning("%s: %s at %d tokens, budget is %d", name, why, tokens, budget)
         return None
 
-    tokens_per_row = max((tokens + validation_tokens) / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
-    log.info("%s: round %d: %d of %d tokens after processing, refining to %.1f tokens/row", name, round_index + 1, tokens, budget, tokens_per_row)
+    tokens_per_row = max(tokens / max(raw.rows(), 1), 1.0)  # floor: never more than `budget` rows per round
+    log.info("%s: round %d: %d of %d tokens after the build, refining to %.1f tokens/row", name, round_index + 1, tokens, budget, tokens_per_row)
     return tokens_per_row
-
-
-def _validation_split_tokens(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> int:
-    """Tokens in a pretrain source's validation split (0 without one)."""
-    if cfg.sources[name].validation_tokens == 0:
-        return 0
-    manifest = Manifest.load(layout.validation_dir(name))
-    return (manifest.tokens() or 0) if manifest is not None else 0
-
-
-def _build_validation(cfg: DatasetConfig, validation_plan: SourcePlan, layout: DatasetLayout, hf_token: str | None, slots: _Slots) -> None:
-    name = validation_plan.name
-    _remove_broken_stages(cfg, name, layout)  # `rows` is part of the source hash, so a stale manifest covers row changes
-    with slots.downloading():
-        validation(cfg, name, layout, hf_token=hf_token)
-
-
-def _instruct_tokens_per_row(cfg: DatasetConfig, src: str, layout: DatasetLayout) -> float:
-    """Measured tokens/row of an instruct source's raw manifest when it is current and counted, else the config's
-    estimate."""
-    raw = Manifest.load(layout.raw_dir(src))
-    if raw is not None and raw.is_current(cfg.raw_hash(src)) and raw.rows() > 0 and (raw.tokens() or 0) > 0:
-        return max((raw.tokens() or 0) / raw.rows(), 1.0)
-    return float(cfg.sources[src].tokens_per_row_estimate)
-
-
-def _download_instruct_source(
-    cfg: DatasetConfig, src: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None, slots: _Slots
-) -> None:
-    """The first download of an instruct source (its own work item; the mixtures that use it run afterwards)."""
-    with slots.source_lock(src):
-        _remove_broken_stages(cfg, src, layout)
-        with slots.downloading():
-            download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
-
-
-def _build_instruct_mixture(
-    cfg: DatasetConfig, mixture_plan: InstructMixturePlan, layout: DatasetLayout, hf_token: str | None, max_rounds: int, slots: _Slots
-) -> None:
-    """Build the mixture from its (already downloaded) sources and repeat — topping the short sources up with a
-    refined tokens/row — while a source is short. Top-ups take the source's lock: another mixture sharing the
-    source may top it up at the same time."""
-    name, budget = mixture_plan.name, mixture_plan.budget_tokens
-    mixture = cfg.instruct_mixtures[name]
-
-    if not mixture_plan.current:
-        _remove_stale_mixture_splits(cfg, name, layout)
-
-    tokens_per_row = {src: _instruct_tokens_per_row(cfg, src, layout) for src in mixture.sources}
-    short: dict[str, Any] = {}
-    for round_index in range(max_rounds):
-        exhausted: set[str] = set()
-        with slots.downloading():
-            for src in mixture.sources:
-                rows_needed = rows_for_budget(mixture.target_tokens(budget, src), tokens_per_row[src], margin=1.0)
-                if src in short:
-                    rows_needed = max(rows_needed, int(short[src]["needed_rows"]))  # what the last build said it needs
-                with slots.source_lock(src):
-                    raw = download(cfg, src, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=slots.should_stop)
-                if raw.extra.get("exhausted"):
-                    exhausted.add(src)
-
-        with slots.processing():
-            train = build_instruct_mixture(cfg, name, layout, budget_tokens=budget, should_stop=slots.should_stop)["train"]
-        short_sources = train.extra["short_sources"]
-        short = {src: info for src, info in short_sources.items() if src not in exhausted}
-        if not short:
-            for src in exhausted & set(short_sources):
-                log.warning("%s: source %s exhausted before its share of the budget", name, src)
-            return
-
-        for src in short:
-            tokens_per_row[src] = max(train.extra["tokens_per_row"][src], 1.0)
-        log.info("%s: round %d: short sources %s, refining tokens/row", name, round_index + 1, sorted(short))
-
-    raise RuntimeError(f"{name}: sources {sorted(short)} still short after {max_rounds} rounds")
-
-
-def _remove_stale_mixture_splits(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> None:
-    for split in INSTRUCT_MIXTURE_SPLITS:
-        directory = layout.instruct_mixture_dir(cfg.name, name, split)
-        if directory.exists():
-            _remove_dir(directory)
-
-
-def _remove_dir(directory: Path) -> None:
-    log.warning("removing stale %s", directory)
-    shutil.rmtree(directory)
 
 
 __all__ = ["DEFAULT_MAX_PARALLEL_DOWNLOADS", "DEFAULT_MAX_ROUNDS", "STEPS", "BuildAborted", "build", "status"]

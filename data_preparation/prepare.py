@@ -2,13 +2,13 @@
 """Entry point for dataset preparation.
 
     python data_preparation/prepare.py build  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-                                              [--sources S ...] [--steps tokenizer download process validation instruct_mixtures]
+                                              [--sources S ...] [--steps tokenizer download process]
                                               [--num_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR] [--dry_run]
     python data_preparation/prepare.py status --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny   # = build --dataset_config config/datasets/tiny.yaml
 
-``build`` materialises a dataset config (tokenizer -> pretrain sources -> validation sources -> instruct mixtures; see
+``build`` materialises a dataset config (tokenizer, then every source: download -> build; see
 ``lib/build/runner.py``), ``status`` prints the plan and exits 0 iff the dataset is complete, ``describe`` renders
 the config as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir`` relocates the HuggingFace
 caches. Any failure logs the exception and exits 1.
@@ -73,7 +73,7 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
 
 
 def _add_build_options(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources / instruct mixtures")
+    sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
     sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources processed at a time (and worker processes per decontamination / minhash pass)")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")

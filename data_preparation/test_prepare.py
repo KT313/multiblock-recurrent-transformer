@@ -38,7 +38,7 @@ def test_commands_are_registered() -> None:
             parser.parse_args([command])  # --dataset_config is required
     with pytest.raises(SystemExit):
         parser.parse_args(["build", "--dataset_config", "x.yaml", "--steps", "nope"])
-    assert set(STEPS) == {"tokenizer", "download", "process", "validation", "instruct_mixtures"}
+    assert set(STEPS) == {"tokenizer", "download", "process"}
 
 
 def test_missing_or_unknown_command_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
@@ -80,9 +80,9 @@ def test_build_sources_and_steps_filters(tmp_path: Path) -> None:
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
     assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
     assert (layout.raw_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
-    assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.validation_dir("synthetic_val").exists()
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_val"])
-    assert layout.validation_dir("synthetic_val").is_dir() and not layout.processed_dir("synthetic_pretrain").exists()
+    assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.processed_dir("synthetic_instruct").exists()
+    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_instruct"])
+    assert layout.processed_dir("synthetic_instruct").is_dir() and not layout.processed_dir("synthetic_pretrain").exists()
     with pytest.raises(SystemExit) as exc:
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == 1
@@ -120,9 +120,8 @@ def test_tiny_end_to_end(tmp_path: Path, tiny_dataset_config: DatasetConfig) -> 
     prepare.main(["tiny", "--dataset_dir", str(root)])
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     layout = DatasetLayout(root)
-    assert (layout.processed_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
-    assert all((layout.instruct_mixture_dir(tiny_dataset_config.name, "tiny_instruct", s) / "MANIFEST.json").is_file() for s in ("train", "validation"))
-    shutil.rmtree(layout.validation_dir("synthetic_val"))
+    assert all((layout.processed_dir(name) / "MANIFEST.json").is_file() for name in tiny_dataset_config.sources)
+    shutil.rmtree(layout.processed_dir("synthetic_instruct"))
     with pytest.raises(SystemExit):
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # repairs

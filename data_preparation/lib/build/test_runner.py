@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `build` / `status`: refinement loop, repair of broken stages, idempotence, step/source filtering."""
+"""Tests for `build` / `status`: refinement loop, repair of broken folders, idempotence, step/source filtering."""
 
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ import pytest
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.build import runner as build_mod
 from data_preparation.lib.build import build, status
-from data_preparation.lib.build.planner import plan, rows_for_budget
-from data_preparation.dataset_config import DatasetConfig, InstructMixtureConfig, SourceConfig, StageConfig
+from data_preparation.lib.build.planner import budget_tokens_of, plan
+from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
-from data_preparation.lib.stages.pretrain import process as real_process
+from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.shared import download as real_download
 
 CfgFactory = Callable[..., DatasetConfig]
@@ -35,37 +35,33 @@ def test_build_refines_a_bad_estimate(cfg_factory: CfgFactory, layout: DatasetLa
     """Estimates are ~10x too high (but below the max_seq_length cap, which would otherwise clamp them): the first
     download is too small; the tokens/row measured from it sizes the second one correctly."""
     sources = {
-        "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=3_000),
-        "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, tokens_per_row_estimate=2_000),
+        "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, describe_tokens_per_row=3_000),
+        "i": SourceConfig(kind="instruct", loader="synthetic", seed=2, describe_tokens_per_row=2_000),
     }
-    cfg = cfg_factory(sources, instruct_mixtures={"m": InstructMixtureConfig(sources={"i": 1.0}, max_tokens=4096)}, tokens=3000, max_seq_length=4096)
+    cfg = cfg_factory(sources, tokens=3000, max_seq_length=4096)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         result = build(cfg, layout, max_rounds=3)
     assert result.complete
-    processed = Manifest.load(layout.processed_dir("p"))
-    assert processed is not None and (processed.tokens() or 0) >= 3000
-    train = Manifest.load(layout.instruct_mixture_dir("t", "m", "train"))
-    assert train is not None and train.extra["short_sources"] == {}
-    assert "p: round 1:" in caplog.text
-    # the instruct source's first download (its own item) is sized by the estimate (2 rows); the mixture item then
-    # starts from the raw manifest's measured tokens/row and tops the source up (possibly once more after a build
-    # that came out short) until the train split reaches the budget
+    for name in ("p", "i"):
+        processed = Manifest.load(layout.processed_dir(name))
+        assert processed is not None and (processed.tokens() or 0) >= 3000
+        assert f"{name}: round 1:" in caplog.text
     raw_i = Manifest.load(layout.raw_dir("i"))
     assert raw_i is not None and raw_i.rows() > 2  # the estimate alone would have stopped at ceil(3000/2000*1.2) = 2
 
 
 def test_build_raises_after_max_rounds(cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", tokens_per_row_estimate=1000)}, tokens=1000)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", describe_tokens_per_row=1000)}, tokens=1000)
     calls: list[int] = []
 
     def never_enough(*args: Any, **kwargs: Any) -> Manifest:
-        manifest = real_process(*args, **kwargs)
+        manifest = real_build(*args, **kwargs)
         calls.append(manifest.rows())
         stub = Manifest(source="p", source_hash=manifest.source_hash, stage="processed")
         stub.add_shard("data-00000.parquet", rows=1, tokens=1)  # never enough tokens
         return stub
 
-    monkeypatch.setattr(build_mod, "process", never_enough)
+    monkeypatch.setattr(build_mod, "build_source", never_enough)
     with pytest.raises(RuntimeError, match="token budget 1000 not reached after 2 rounds"):
         build(cfg, layout, max_rounds=2)
     assert len(calls) == 2
@@ -90,7 +86,7 @@ def test_build_exhausted_source_warns_and_is_complete(cfg_factory: CfgFactory, l
 def test_build_twice_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
     sources = {
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
-        "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4),
+        "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),  # used only for validation
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
     cfg = cfg_factory(sources, tokens=500)
@@ -99,22 +95,18 @@ def test_build_twice_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayo
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         assert build(cfg, layout).complete
     assert all_mtimes(layout.root) == before
-    assert "p: complete, skipping" in caplog.text and "h: complete, skipping" in caplog.text and "auto: complete, skipping" in caplog.text
+    assert "p: complete, skipping" in caplog.text and "h: complete, skipping" in caplog.text and "i: complete, skipping" in caplog.text
 
 
 def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
     sources = {
         "p": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
-        "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4),
+        "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
     cfg = cfg_factory(sources, tokens=500)
     build(cfg, layout)
-    victims = [
-        next(layout.processed_dir("p").glob("data-*.parquet")),
-        next(layout.validation_dir("h").glob("data-*.parquet")),
-        next(layout.instruct_mixture_dir("t", "auto", "train").glob("data-*.parquet")),
-    ]
+    victims = [next(layout.processed_dir(name).glob("data-*.parquet")) for name in ("p", "h", "i")]
     for victim in victims:
         victim.unlink()
     assert not status(cfg, layout).complete
@@ -122,7 +114,7 @@ def test_build_repairs_missing_shards(cfg_factory: CfgFactory, layout: DatasetLa
         result = build(cfg, layout)
     assert result.complete and all(v.is_file() for v in victims)
     assert "missing shard" in caplog.text and "removing" in caplog.text
-    for directory in (layout.processed_dir("p"), layout.validation_dir("h"), layout.instruct_mixture_dir("t", "auto", "train")):
+    for directory in (layout.processed_dir(name) for name in ("p", "h", "i")):
         manifest = Manifest.load(directory)
         assert manifest is not None and verify_shards(directory, manifest) == []
 
@@ -149,9 +141,11 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
     assert not processed.is_current(processed_before.source_hash)
 
 
-def test_token_mode_change_recounts_raw_in_place_without_downloading(
-    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+def test_token_mode_change_makes_raw_stale_and_re_downloads(
+    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """`token_count` (and the tokenizer) are part of the raw hash: the stored counts depend on them, so a change
+    re-downloads the source from offset 0 instead of recounting in place (task 7 asks for confirmation first)."""
     from data_preparation.lib.stages import shared
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, max_seq_length=4096)
@@ -168,36 +162,30 @@ def test_token_mode_change_recounts_raw_in_place_without_downloading(
         return original(source, name, offset, *args, **kwargs)
 
     monkeypatch.setattr(shared, "_fetch_rows", spy)
-    old_shards = {f.name: f.stat().st_mtime_ns for f in raw_dir.glob("data-*.parquet")}
     cfg.token_count = "estimate"
-    result = build(cfg, layout)
-    assert result.complete
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        result = build(cfg, layout)
+    assert result.complete and "raw: manifest stale; removing" in caplog.text
     raw = Manifest.load(raw_dir)
-    assert raw is not None and raw.token_count == "estimate" and raw.tokenizer is None
-    assert [s.rows for s in raw.shards][: len(before.shards)] == [s.rows for s in before.shards]
-    assert raw.tokens() != before.tokens()  # chars/4 differs from the tokenizer count
-    # chars/4 measures fewer tokens per row than the tokenizer, so the planner may top the source up — but only
-    # ever from the offset already reached, never from 0, and the rows on disk were recounted in place
-    assert all(offset >= before.rows_fetched for offset in offsets)
-    for name, mtime in old_shards.items():
-        assert (raw_dir / name).stat().st_mtime_ns != mtime, "rewritten in place with the new tokens column"
+    assert raw is not None and raw.token_count == "estimate" and raw.tokenizer is None and raw.is_current(cfg.raw_hash("p"))
+    assert offsets[0] == 0 and raw.tokens() != before.tokens()  # chars/4 differs from the tokenizer count
 
 
 def test_build_steps_filter(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     # estimate 500 tokens/row vs ~220 real (uncapped: max_seq_length above the document length), so the first
     # estimate-sized download falls short of the budget
     cfg = cfg_factory(
-        {"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="validation", loader="synthetic", seed=1, rows=4)},
+        {"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4)},
         tokens=500,
         max_seq_length=4096,
     )
     result = build(cfg, layout, steps={"tokenizer", "download"})
     assert not result.complete and result.tokenizer_complete
-    assert (layout.raw_dir("p") / "MANIFEST.json").is_file()
-    assert not layout.processed_dir("p").exists() and not layout.validation_dir("h").exists()
-    result = build(cfg, layout, steps={"process", "validation"})
-    (p,) = result.sources
-    assert (layout.processed_dir("p") / "MANIFEST.json").is_file() and result.validations[0].complete
+    assert (layout.raw_dir("p") / "MANIFEST.json").is_file() and (layout.raw_dir("h") / "MANIFEST.json").is_file()
+    assert not layout.processed_dir("p").exists() and not layout.processed_dir("h").exists()
+    result = build(cfg, layout, steps={"process"})
+    p, h = result.sources
+    assert (layout.processed_dir("p") / "MANIFEST.json").is_file() and h.complete
     assert not p.complete and p.reason.startswith("tokens ")  # the estimate-sized download cannot be topped up without `download`
     assert build(cfg, layout).complete
     with pytest.raises(ValueError, match="unknown steps"):
@@ -213,15 +201,6 @@ def test_build_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout) ->
     assert build(cfg, layout, sources=["b"]).complete
     with pytest.raises(ValueError, match="unknown sources"):
         build(cfg, layout, sources=["c"])
-
-
-def test_build_skips_unused_sources(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    sources = {"used": SourceConfig(kind="pretrain", loader="synthetic"), "unused": SourceConfig(kind="pretrain", loader="synthetic", seed=5)}
-    cfg = cfg_factory(sources, tokens=500)
-    cfg.stages = [StageConfig(name="s", tokens=500, train={"used": 1.0}, val={"used": 1.0})]
-    assert build(cfg, layout).complete
-    assert (layout.processed_dir("used") / "MANIFEST.json").is_file()
-    assert not layout.raw_dir("unused").exists()
 
 
 def test_build_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture) -> None:
@@ -250,7 +229,7 @@ def test_build_failure_propagates(cfg_factory: CfgFactory, layout: DatasetLayout
 def _github_cfg(cfg_factory: CfgFactory, languages: list[str], **kwargs: Any) -> DatasetConfig:
     sources = {
         f"code_{lang.lower()}": SourceConfig(
-            kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=lang, tokens_per_row_estimate=2,
+            kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=lang, describe_tokens_per_row=2,
         )
         for lang in languages
     }
@@ -281,7 +260,7 @@ def test_build_downloads_github_code_languages_in_one_pass(hub: FakeHub, cfg_fac
     assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
     for name in ("code_python", "code_java", "code_go"):
         processed = Manifest.load(layout.processed_dir(name))
-        assert processed is not None and (processed.tokens() or 0) >= cfg.source_budget_tokens(name)  # a third of the stage
+        assert processed is not None and (processed.tokens() or 0) >= budget_tokens_of(cfg, name)  # a third of the stage
 
     # `--sources` with one language uses the ordinary per-source path
     hub.streams.clear()
@@ -298,12 +277,12 @@ def test_github_code_group_raises_after_max_rounds(hub: FakeHub, cfg_factory: Cf
     cfg = _github_cfg(cfg_factory, ["Python", "Java"])
 
     def never_enough(*args: Any, **kwargs: Any) -> Manifest:
-        manifest = real_process(*args, **kwargs)
+        manifest = real_build(*args, **kwargs)
         stub = Manifest(source=manifest.source, source_hash=manifest.source_hash, stage="processed")
         stub.add_shard("data-00000.parquet", rows=1, tokens=1)
         return stub
 
-    monkeypatch.setattr(build_mod, "process", never_enough)
+    monkeypatch.setattr(build_mod, "build_source", never_enough)
     with pytest.raises(RuntimeError, match="code_python, code_java: token budget not reached after 2 rounds"):
         build(cfg, layout, max_rounds=2)
 
@@ -338,7 +317,7 @@ class _Trace:
 
 
 def _slow_stages(monkeypatch: pytest.MonkeyPatch, delay: float, fail: str | None = None) -> _Trace:
-    """Stub `download` / `process` in the runner with versions that sleep `delay` around the real stage."""
+    """Stub `download` / `build_source` in the runner with versions that sleep `delay` around the real step."""
     trace = _Trace()
 
     def slow_download(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
@@ -351,21 +330,21 @@ def _slow_stages(monkeypatch: pytest.MonkeyPatch, delay: float, fail: str | None
         finally:
             trace.leave("download", name)
 
-    def slow_process(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+    def slow_build(cfg: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
         trace.enter("process", name)
         try:
             time.sleep(delay)
-            return real_process(cfg, name, *args, **kwargs)
+            return real_build(cfg, name, *args, **kwargs)
         finally:
             trace.leave("process", name)
 
     monkeypatch.setattr(build_mod, "download", slow_download)
-    monkeypatch.setattr(build_mod, "process", slow_process)
+    monkeypatch.setattr(build_mod, "build_source", slow_build)
     return trace
 
 
 def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
-    sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i, tokens_per_row_estimate=200) for i in range(3)}
+    sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i, describe_tokens_per_row=200) for i in range(3)}
     return cfg_factory(sources, tokens=600, max_seq_length=4096)
 
 
@@ -533,7 +512,7 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     from functools import partial
 
     monkeypatch.setattr(build_mod, "download", partial(real_download, shard_size=10))
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, tokens_per_row_estimate=100)}, tokens=2000)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0, describe_tokens_per_row=100)}, tokens=2000)
     build(cfg, layout)
     raw = layout.raw_dir("p")
     manifest = Manifest.load(raw)
@@ -555,46 +534,3 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     assert offsets == [kept_offset], "resumed behind the last good shard instead of from 0"
     repaired = Manifest.load(raw)
     assert repaired is not None and repaired.rows() == manifest.rows() and [s.rows for s in repaired.shards] == [s.rows for s in manifest.shards]
-
-
-def test_two_mixtures_sharing_a_source_download_it_once_and_do_not_race(
-    cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Instruct sources are their own work items (largest share over the mixtures), the mixtures run after them
-    and top-ups take the source's lock — two mixtures over one source never write `raw/` concurrently."""
-    calls: list[tuple[str, int]] = []
-    in_flight: dict[str, int] = {}
-    overlap: list[str] = []
-    lock = threading.Lock()
-
-    def spying_download(cfg_: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
-        with lock:
-            calls.append((name, rows_needed))
-            in_flight[name] = in_flight.get(name, 0) + 1
-            if in_flight[name] > 1:
-                overlap.append(name)
-        try:
-            time.sleep(0.02)
-            return real_download(cfg_, name, *args, rows_needed=rows_needed, **kwargs)
-        finally:
-            with lock:
-                in_flight[name] -= 1
-
-    monkeypatch.setattr(build_mod, "download", spying_download)
-    shared = SourceConfig(kind="instruct", loader="synthetic", seed=3, tokens_per_row_estimate=20)
-    mixtures = {
-        "mix_a": InstructMixtureConfig(sources={"shared": 1.0}, max_tokens=4096),
-        "mix_b": InstructMixtureConfig(sources={"shared": 0.5, "own": 0.5}, max_tokens=4096),
-    }
-    cfg = cfg_factory(
-        {"shared": shared, "own": SourceConfig(kind="instruct", loader="synthetic", seed=4, tokens_per_row_estimate=20)},
-        instruct_mixtures=mixtures, tokens=2000, max_seq_length=4096,
-    )
-    cfg.stages = [StageConfig(name="ft", tokens=2000, train={"mix_a": 0.5, "mix_b": 0.5}, val={"mix_a/validation": 1.0})]
-    result = build(cfg, layout, num_workers=2, max_parallel_downloads=2)
-    assert result.complete and overlap == []
-    first_round = [rows for name, rows in calls if name == "shared"][0]
-    assert first_round == max(rows_for_budget(m.target_tokens(1000, "shared"), 20, margin=1.0) for m in mixtures.values())
-    assert Manifest.load(layout.raw_dir("shared")) is not None
-    for mixture in mixtures:
-        assert Manifest.load(layout.instruct_mixture_dir("t", mixture, "train")) is not None

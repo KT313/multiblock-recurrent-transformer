@@ -1,10 +1,12 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import itertools
+import math
 import random
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, Iterator
 
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -24,10 +26,10 @@ INSTRUCT_SIGNATURE = {"keys": ["instruction", "input", "output"], "format_fn": "
 
 
 @pytest.fixture
-def specs(tiny_validation_dir: Path, tiny_instruct_dirs: dict[str, Path]) -> list[DatasetSpec]:
+def specs(tiny_pretrain_dir: Path, tiny_instruct_dir: Path) -> list[DatasetSpec]:
     return [
-        DatasetSpec("pre", str(tiny_validation_dir), weight=0.7),
-        DatasetSpec("ft", str(tiny_instruct_dirs["validation"]), weight=0.3, data_signature=INSTRUCT_SIGNATURE),
+        DatasetSpec("pre", str(tiny_pretrain_dir), weight=0.7),
+        DatasetSpec("ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE),
     ]
 
 
@@ -43,17 +45,23 @@ def _loader(
     seed: int = 1337,
     shard: tuple[int, int] = (0, 1),
     padding_multiple: int | None = None,
+    block_size: int = 64,
 ) -> Iterable[Batch]:
     return build_dataloader(
         specs,
         tokenizer,
-        64,
+        block_size,
         micro_batch_size,
         num_workers=num_workers,
         seed=seed,
         shard=shard,
         padding_multiple=padding_multiple,
     )
+
+
+def _rows_in(directory: Path) -> int:
+    """Rows of the `data-*.parquet` shards of a processed folder (parquet footers only)."""
+    return sum(pq.read_metadata(path).num_rows for path in sorted(directory.glob("data-*.parquet")))
 
 
 def _same(a: list[Batch], b: list[Batch]) -> bool:
@@ -79,53 +87,58 @@ def test_non_hfds_type_rejected() -> None:
         DatasetSpec("p", "dir", type="jsonl")
 
 
-def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_validation_dir: Path) -> None:
-    d = str(tiny_validation_dir)
+def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    d = str(tiny_pretrain_dir)
     with pytest.raises(ValueError, match="unique"):
         build_dataloader([DatasetSpec("p", d), DatasetSpec("p", d)], tokenizer, 64, 2)
 
 
-def test_single_spec_batches(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
+def test_single_spec_batches(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
     loader = _loader(specs[:1], tokenizer, 4, padding_multiple=16)
     batches = _batches(loader, 3)
     for input_ids, labels, data_ids in batches:
         assert input_ids.shape == labels.shape == (4, 64)
         assert input_ids.dtype == torch.long
         assert data_ids == ["pre"] * 4
-    # single dataset is finite: 2 files x 16 rows / 4 = 8 batches
-    assert len(list(loader)) == 8
+    # a single dataset is finite: one pass over its rows, the last batch may be short
+    assert len(list(loader)) == math.ceil(_rows_in(tiny_pretrain_dir) / 4)
+
+
+# Mixtures with the instruct folder use a block size no instruct prompt can fill: `collate_fn` ends the loader on a
+# batch without a single supervised label, and the processed instruct rows are only bounded by max_seq_length (256).
+MIXTURE_BLOCK_SIZE = 128
 
 
 def test_mixture_loader_mixes_and_is_infinite(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    loader = _loader(specs, tokenizer, 2, seed=0)
+    loader = _loader(specs, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
     ids = Counter(itertools.chain.from_iterable(b[2] for b in _batches(loader, 200)))
     assert set(ids) == {"pre", "ft"}
     assert ids["pre"] / 400 == pytest.approx(0.7, abs=0.06)
 
 
 def test_loader_deterministic_under_seed(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    a = _batches(_loader(specs, tokenizer, 2, seed=5), 10)
-    b = _batches(_loader(specs, tokenizer, 2, seed=5), 10)
-    c = _batches(_loader(specs, tokenizer, 2, seed=6), 10)
+    a = _batches(_loader(specs, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
+    b = _batches(_loader(specs, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
+    c = _batches(_loader(specs, tokenizer, 2, seed=6, block_size=MIXTURE_BLOCK_SIZE), 10)
     assert _same(a, b)
     assert not _same(a, c)
 
 
-def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
+def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
     """Rows are dealt round-robin to workers and DataLoader collects worker batches round-robin, so with
     micro_batch_size=1 the two loaders yield the very same sequence."""
     a = list(_loader(specs[:1], tokenizer, 1, num_workers=0))
     b = list(_loader(specs[:1], tokenizer, 1, num_workers=2))
-    assert len(a) == len(b) == 32
+    assert len(a) == len(b) == _rows_in(tiny_pretrain_dir)
     assert _same(a, b)
 
 
-def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
+def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
     """With micro_batch_size>1 each worker batches *its* rows (0,2,4.. / 1,3,5..), so batches differ from
     num_workers=0 in composition but cover exactly the same rows over an epoch."""
     a = list(_loader(specs[:1], tokenizer, 2, num_workers=0))
     b = list(_loader(specs[:1], tokenizer, 2, num_workers=2))
-    assert len(a) == len(b) == 16
+    assert len(a) == len(b) == math.ceil(_rows_in(tiny_pretrain_dir) / 2)
 
     def rows(batches: list[Batch]) -> list[tuple[int, ...]]:
         return sorted(tuple(r.tolist()) for x in batches for r in x[0])
@@ -136,8 +149,8 @@ def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, spec
 
 
 def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    a = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2), 12)
-    b = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2), 12)
+    a = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
+    b = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
     assert _same(a, b)
 
 

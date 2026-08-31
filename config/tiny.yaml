@@ -1,7 +1,7 @@
 # Tiny smoke-run config: the real train.py code path with a ~240K-parameter model on synthetic data.
 # Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
-# a few seconds on CPU or GPU. The data (stages, token budgets, mixtures, tokenizer) is defined by
-# config/datasets/tiny.yaml; training builds it under dataset/ (sources/, instruct_mixtures/, tokenizers/) when missing
+# a few seconds on CPU or GPU. The data (stages, token budgets, weights, tokenizer) is defined by
+# config/datasets/tiny.yaml; training builds it under dataset/ (sources/, processed/, tokenizers/) when missing
 # (`auto_prepare`), or run `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
 
 run_name: tiny
