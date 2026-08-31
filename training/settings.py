@@ -52,8 +52,8 @@ class Settings:
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
     # config, e.g. `--model_overwrite '{"n_embd": 512}'` for a CLI sweep; {} = the file as is
-    block_size: int = 2048  # sequence length; must equal the architecture config's block_size and be <= the
-    # dataset config's max_seq_length
+    block_size: int = 2048  # sequence length; must equal the block_size of the architecture config and of the
+    # dataset config (the planner sized the data in sequences of it; <= max_seq_length follows from the schema)
 
     # Data loading
     dataloader_num_workers: int = 4

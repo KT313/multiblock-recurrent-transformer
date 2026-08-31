@@ -35,11 +35,13 @@ from training.checkpoint import (
     save_checkpoint,
     should_save_checkpoint,
 )
-from training.data import DatasetSpec, StageDataloaders, Tokenizer, build_dataloader, length_sorted_batches
+from training.data import StageDataloaders, Tokenizer, build_dataloader, length_sorted_batches
 from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
+    CHECKPOINT_VALIDATION_ROWS_KEY,
     ResolvedDataset,
     check_checkpoint_dataset_hash,
+    check_checkpoint_validation_rows,
     resolve_dataset,
 )
 from training.data.loader import Batch, sample_stage_batch
@@ -70,15 +72,8 @@ def build_stage_dataloaders(
     """One train and one validation loader per stage, each mixing its datasets with constant weights."""
 
     def loader(entries: list[DataEntry], num_workers: int) -> Iterable[Batch]:
-        # DatasetSpec is annotated `dict` but ParquetTextDataset falls back to the default signature for None
-        specs = [
-            DatasetSpec(e.prefix, e.data_dir, e.weight, data_signature=e.data_signature)
-            if e.data_signature is not None
-            else DatasetSpec(e.prefix, e.data_dir, e.weight)
-            for e in entries
-        ]
         return build_dataloader(
-            specs,
+            entries,
             tokenizer,
             block_size=cfg.block_size,
             micro_batch_size=cfg.micro_batch_size,
@@ -207,6 +202,7 @@ def train(cfg: Settings) -> None:
     if resume_path is not None:
         extra = load_checkpoint(backend, resume_path, model, optimizer)
         check_checkpoint_dataset_hash(extra, resolved.config_hash, cfg.allow_dataset_change)
+        check_checkpoint_validation_rows(extra, resolved.validation_rows, cfg.allow_dataset_change)
         state["step"] = state["resume_step"] = extra["step"]
         restore_rng_state(extra["rng"])
         print(f"Resumed from {resume_path} at step {state['step']}")
@@ -331,6 +327,7 @@ def train(cfg: Settings) -> None:
                 "rng": collect_rng_state(),
                 "config": asdict(cfg),
                 CHECKPOINT_HASH_KEY: resolved.config_hash,
+                CHECKPOINT_VALIDATION_ROWS_KEY: resolved.validation_rows,
             }
             save_checkpoint(backend, path, model, optimizer, extra)
             print(f"Saved checkpoint {path}")

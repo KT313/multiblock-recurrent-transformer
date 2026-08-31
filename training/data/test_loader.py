@@ -10,26 +10,25 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from training.data.datasets import DEFAULT_DATA_SIGNATURE
 from training.data.collate import find_multiple
 from training.data.loader import (
     Batch,
-    DatasetSpec,
     StageDataloaders,
     build_dataloader,
     length_sorted_batches,
     sample_stage_batch,
 )
 from training.data.tokenizer import Tokenizer
+from training.settings import DataEntry
 
 INSTRUCT_SIGNATURE = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
 
 
 @pytest.fixture
-def specs(tiny_pretrain_dir: Path, tiny_instruct_dir: Path) -> list[DatasetSpec]:
+def entries(tiny_pretrain_dir: Path, tiny_instruct_dir: Path) -> list[DataEntry]:
     return [
-        DatasetSpec("pre", str(tiny_pretrain_dir), weight=0.7),
-        DatasetSpec("ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE),
+        DataEntry("pre", str(tiny_pretrain_dir), weight=0.7),
+        DataEntry("ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE),
     ]
 
 
@@ -38,7 +37,7 @@ def _batches(loader: Iterable[Batch], n: int) -> list[Batch]:
 
 
 def _loader(
-    specs: list[DatasetSpec],
+    entries: list[DataEntry],
     tokenizer: Tokenizer,
     micro_batch_size: int,
     num_workers: int = 0,
@@ -48,7 +47,7 @@ def _loader(
     block_size: int = 64,
 ) -> Iterable[Batch]:
     return build_dataloader(
-        specs,
+        entries,
         tokenizer,
         block_size,
         micro_batch_size,
@@ -68,33 +67,42 @@ def _same(a: list[Batch], b: list[Batch]) -> bool:
     return all(torch.equal(x[0], y[0]) and torch.equal(x[1], y[1]) and x[2] == y[2] for x, y in zip(a, b))
 
 
-# --- DatasetSpec / build_dataloader ------------------------------------------------------------------------------------
+# --- DataEntry / build_dataloader ------------------------------------------------------------------------------------
 
 
-def test_spec_defaults() -> None:
-    s = DatasetSpec("p", "dir")
-    assert s.weight == 1.0 and s.type == "hfds"
-    assert s.data_signature == {"keys": ["text"], "format_fn": "pass_text"}
-    assert s.data_signature is not DEFAULT_DATA_SIGNATURE
+def test_entry_defaults_read_the_whole_text_column(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    entry = DataEntry("p", str(tiny_pretrain_dir))
+    assert (entry.weight, entry.data_signature, entry.skip_rows, entry.max_rows) == (1.0, None, 0, None)
+    assert len(list(_loader([entry], tokenizer, 1))) == _rows_in(tiny_pretrain_dir)  # None = the default text signature
 
 
-def test_spec_default_signature_keys_not_shared() -> None:
-    assert DatasetSpec("p", "dir").data_signature["keys"] is not DEFAULT_DATA_SIGNATURE["keys"]
+def test_row_range_reaches_the_dataset(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    """`skip_rows` / `max_rows` of an entry restrict its dataset (the resolver's validation split): the validation
+    range and the training range of one folder are disjoint and together are the folder, in order."""
+    directory = str(tiny_pretrain_dir)
+    total, k = _rows_in(tiny_pretrain_dir), 3
 
+    def rows(entry: DataEntry) -> list[tuple[int, ...]]:
+        return [tuple(b[0][0].tolist()) for b in _loader([entry], tokenizer, 1)]
 
-def test_non_hfds_type_rejected() -> None:
-    with pytest.raises(ValueError, match="hfds"):
-        DatasetSpec("p", "dir", type="jsonl")
+    val = rows(DataEntry("val", directory, max_rows=k))
+    train = rows(DataEntry("train", directory, skip_rows=k))
+    assert len(val) == k and len(train) == total - k
+    assert not set(val) & set(train)
+    assert val + train == rows(DataEntry("all", directory))
+    both = _loader([DataEntry("val", directory, weight=0.5, max_rows=k), DataEntry("train", directory, weight=0.5, skip_rows=k)], tokenizer, 1)
+    tags = Counter(b[2][0] for b in _batches(both, 100))
+    assert set(tags) == {"val", "train"}  # a mixture keeps every member's range
 
 
 def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
     d = str(tiny_pretrain_dir)
     with pytest.raises(ValueError, match="unique"):
-        build_dataloader([DatasetSpec("p", d), DatasetSpec("p", d)], tokenizer, 64, 2)
+        build_dataloader([DataEntry("p", d), DataEntry("p", d)], tokenizer, 64, 2)
 
 
-def test_single_spec_batches(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
-    loader = _loader(specs[:1], tokenizer, 4, padding_multiple=16)
+def test_single_spec_batches(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
+    loader = _loader(entries[:1], tokenizer, 4, padding_multiple=16)
     batches = _batches(loader, 3)
     for input_ids, labels, data_ids in batches:
         assert input_ids.shape == labels.shape == (4, 64)
@@ -109,35 +117,35 @@ def test_single_spec_batches(tokenizer: Tokenizer, specs: list[DatasetSpec], tin
 MIXTURE_BLOCK_SIZE = 128
 
 
-def test_mixture_loader_mixes_and_is_infinite(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    loader = _loader(specs, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
+def test_mixture_loader_mixes_and_is_infinite(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    loader = _loader(entries, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
     ids = Counter(itertools.chain.from_iterable(b[2] for b in _batches(loader, 200)))
     assert set(ids) == {"pre", "ft"}
     assert ids["pre"] / 400 == pytest.approx(0.7, abs=0.06)
 
 
-def test_loader_deterministic_under_seed(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    a = _batches(_loader(specs, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
-    b = _batches(_loader(specs, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
-    c = _batches(_loader(specs, tokenizer, 2, seed=6, block_size=MIXTURE_BLOCK_SIZE), 10)
+def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    a = _batches(_loader(entries, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
+    b = _batches(_loader(entries, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
+    c = _batches(_loader(entries, tokenizer, 2, seed=6, block_size=MIXTURE_BLOCK_SIZE), 10)
     assert _same(a, b)
     assert not _same(a, c)
 
 
-def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
+def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
     """Rows are dealt round-robin to workers and DataLoader collects worker batches round-robin, so with
     micro_batch_size=1 the two loaders yield the very same sequence."""
-    a = list(_loader(specs[:1], tokenizer, 1, num_workers=0))
-    b = list(_loader(specs[:1], tokenizer, 1, num_workers=2))
+    a = list(_loader(entries[:1], tokenizer, 1, num_workers=0))
+    b = list(_loader(entries[:1], tokenizer, 1, num_workers=2))
     assert len(a) == len(b) == _rows_in(tiny_pretrain_dir)
     assert _same(a, b)
 
 
-def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, specs: list[DatasetSpec], tiny_pretrain_dir: Path) -> None:
+def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
     """With micro_batch_size>1 each worker batches *its* rows (0,2,4.. / 1,3,5..), so batches differ from
     num_workers=0 in composition but cover exactly the same rows over an epoch."""
-    a = list(_loader(specs[:1], tokenizer, 2, num_workers=0))
-    b = list(_loader(specs[:1], tokenizer, 2, num_workers=2))
+    a = list(_loader(entries[:1], tokenizer, 2, num_workers=0))
+    b = list(_loader(entries[:1], tokenizer, 2, num_workers=2))
     assert len(a) == len(b) == math.ceil(_rows_in(tiny_pretrain_dir) / 2)
 
     def rows(batches: list[Batch]) -> list[tuple[int, ...]]:
@@ -148,16 +156,16 @@ def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, spec
     assert [tuple(r.tolist()) for r in b[0][0]] == [tuple(a[0][0][0].tolist()), tuple(a[1][0][0].tolist())]
 
 
-def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    a = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
-    b = _batches(_loader(specs, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
+def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
+    b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
     assert _same(a, b)
 
 
-def test_shard_passed_to_datasets(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    full = [tuple(b[0][0].tolist()) for b in _loader(specs[:1], tokenizer, 1)]
-    r0 = [tuple(b[0][0].tolist()) for b in _loader(specs[:1], tokenizer, 1, shard=(0, 2))]
-    r1 = [tuple(b[0][0].tolist()) for b in _loader(specs[:1], tokenizer, 1, shard=(1, 2))]
+def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    full = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1)]
+    r0 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(0, 2))]
+    r1 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(1, 2))]
     assert r0 == full[0::2] and r1 == full[1::2]
 
 
@@ -332,17 +340,17 @@ def test_length_sorted_ties_keep_arrival_order() -> None:
     assert [o[2] for o in out] == [["d21", "d10"], ["d11", "d20"]]
 
 
-def test_length_sorted_on_real_loader_preserves_samples(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
-    loader = build_dataloader(specs[:1], tokenizer, 512, 4, padding_multiple=128)
+def test_length_sorted_on_real_loader_preserves_samples(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
     raw = _batches(loader, 4)
     out = list(length_sorted_batches(raw, micro_batch_size=4, accumulation_steps=2, ignore_index=-100))
     assert [o[0].shape[0] for o in out] == [4, 4, 4, 4]
     assert sorted(_flatten(out)) == sorted(_flatten(raw))
 
 
-def test_length_sorted_sorts_collated_batches_by_true_length(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
+def test_length_sorted_sorts_collated_batches_by_true_length(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
     """On real collated batches (pads already replaced by EOS) the sort uses the supervised length and trims."""
-    loader = build_dataloader(specs[:1], tokenizer, 512, 4, padding_multiple=128)
+    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
     raw = _batches(loader, 2)  # rows are 64..384 words, so these batches carry real padding
     true_lens = [int((lab != -100).sum()) for b in raw for lab in b[1]]
     assert true_lens != sorted(true_lens), "fixture must start unsorted for the test to mean anything"
@@ -362,9 +370,9 @@ def test_length_sorted_padding_multiple_rounds_width_up() -> None:
     assert sorted(_flatten(out)) == sorted(_flatten(batches))
 
 
-def test_length_sorted_loss_is_unchanged_by_trimming(tokenizer: Tokenizer, specs: list[DatasetSpec]) -> None:
+def test_length_sorted_loss_is_unchanged_by_trimming(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
     """Trimming removes only ignore-index positions, so a per-token loss over the world batch is identical."""
-    loader = build_dataloader(specs[:1], tokenizer, 512, 4, padding_multiple=128)
+    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
     raw = _batches(loader, 2)
     out = list(length_sorted_batches(raw, micro_batch_size=4, accumulation_steps=2, ignore_index=-100, padding_multiple=128))
 

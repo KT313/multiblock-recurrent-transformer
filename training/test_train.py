@@ -2,6 +2,7 @@
 """Tests for the training loop helpers (fast) and end-to-end runs of `training.train.train` on the tiny 3-stage
 config with synthetic data (marked slow)."""
 
+import math
 import random
 import shutil
 import sys
@@ -20,7 +21,12 @@ from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data import StageDataloaders, Tokenizer
-from training.data.dataset_resolver import CHECKPOINT_HASH_KEY, ResolvedDataset, resolve_dataset
+from training.data.dataset_resolver import (
+    CHECKPOINT_HASH_KEY,
+    CHECKPOINT_VALIDATION_ROWS_KEY,
+    ResolvedDataset,
+    resolve_dataset,
+)
 from training.data.loader import Batch
 from training.logger import Logger
 from training.settings import Settings, parse_settings
@@ -113,11 +119,17 @@ def test_build_stage_dataloaders(
     assert len(loaders.train_loaders) == len(loaders.val_loaders) == 3
     input_ids, labels, data_ids = loaders.next_train_batch(0)
     assert input_ids.shape[0] == tiny_settings.micro_batch_size and input_ids.shape == labels.shape
-    assert input_ids.shape[1] % 128 == 0 and input_ids.shape[1] <= tiny_settings.block_size
+    # collate pads to a multiple of sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
+    assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.block_size
+    assert input_ids.shape[1] <= tiny_settings.block_size
     assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
     assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
     assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
+    # the validation loaders read only the held-out first rows of the split (a single dataset is one finite epoch)
+    for stage_idx, source in ((0, "synthetic_pretrain"), (2, "synthetic_instruct")):
+        k = tiny_resolved.validation_rows[source]
+        assert k >= 1 and len(list(loaders.val_loaders[stage_idx])) == math.ceil(k / tiny_settings.micro_batch_size)
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
@@ -230,9 +242,16 @@ def test_main_parses_argv_and_trains(monkeypatch: pytest.MonkeyPatch, tiny_datas
     assert len(seen) == 1 and seen[0].seed == 5 and seen[0].out_dir == str(tmp_path / "out")
 
 
-def test_block_size_mismatch_raises(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_block_size_mismatch_with_the_dataset_config_raises(tmp_path: Path, tiny_dataset_dir: Path) -> None:
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", block_size="128")
-    with pytest.raises(ValueError, match="block_size 128 of the run config does not match"):
+    with pytest.raises(ValueError, match="block_size 128 of the run config does not match block_size 256 of dataset config") as excinfo:
+        train_module.train(parse_settings(["--config", str(yaml_path)]))
+    assert "'config/datasets/tiny.yaml'" in str(excinfo.value)  # the dataset config as the run config names it
+
+
+def test_block_size_mismatch_with_the_model_architecture_raises(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite="{block_size: 128}")
+    with pytest.raises(ValueError, match="block_size 256 of the run config does not match block_size 128 of the model architecture"):
         train_module.train(parse_settings(["--config", str(yaml_path)]))
 
 
@@ -281,13 +300,14 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
         logged = _run(yaml_path, mp)
     finally:
         mp.undo()
-    dataset_hash = resolve_dataset(parse_settings(["--config", str(yaml_path)])).config_hash
+    resolved = resolve_dataset(parse_settings(["--config", str(yaml_path)]))
     return {
         "out_dir": out_dir,
         "yaml": yaml_path,
         "logged": logged,
         "optimizer_steps": len(optimizer_steps),
-        "dataset_hash": dataset_hash,
+        "dataset_hash": resolved.config_hash,
+        "validation_rows": resolved.validation_rows,
     }
 
 
@@ -307,12 +327,16 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
         assert m["step"] == step and m["total_tokens"] == step * 4 * 256
         assert torch.isfinite(torch.tensor(m["loss"])) and m["grad_norm"] >= 0
     assert full_run["optimizer_steps"] == 19  # the very first update (step 0) is skipped
-    # the stage-end checkpoints carry the step they were written at and the stage the run enters next
+    # the stage-end checkpoints carry the step they were written at, the stage the run enters next and the dataset
+    # identity: the config hash and the validation split (the run validates on the held-out first 5 % of each source)
+    validation_rows: dict[str, int] = full_run["validation_rows"]
+    assert set(validation_rows) == {"synthetic_pretrain", "synthetic_instruct"} and min(validation_rows.values()) >= 1
     for name, step, stage in (("step-00000006-tiny-stage-0_end.pth", 6, 1), ("step-00000014-tiny-stage-1_end.pth", 14, 2)):
         extra = torch.load(checkpoint_dir(full_run["out_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
         assert extra["config"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
         assert extra[CHECKPOINT_HASH_KEY] == full_run["dataset_hash"]
+        assert extra[CHECKPOINT_VALIDATION_ROWS_KEY] == validation_rows
 
 
 @pytest.mark.slow
@@ -409,6 +433,8 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert logged[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in logged.items() if "val_loss" in m] == [16, 20]
     assert logged[16]["data_composition/finetune-synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
+    final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    assert final[CHECKPOINT_VALIDATION_ROWS_KEY] == full_run["validation_rows"]  # the resumed run kept the split
 
 
 def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
@@ -495,3 +521,28 @@ def test_resume_with_changed_dataset_config_raises_unless_allowed(
     )
     logged = _run(yaml_path, monkeypatch)
     assert sorted(logged) == list(range(15, 21))
+
+
+@pytest.mark.slow
+def test_resume_with_changed_validation_split_raises_unless_allowed(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint whose stored validation split differs from the freshly resolved one (as if the data had grown
+    since): the error names the source and both numbers; `allow_dataset_change` resumes anyway."""
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
+    latest = checkpoint_dir(out_dir) / "step-00000014-tiny-stage-1_end.pth"
+    state = torch.load(latest, map_location="cpu", weights_only=False)
+    k = state[CHECKPOINT_VALIDATION_ROWS_KEY]["synthetic_pretrain"]
+    state[CHECKPOINT_VALIDATION_ROWS_KEY]["synthetic_pretrain"] = k + 1
+    torch.save(state, latest)
+    yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
+    with pytest.raises(RuntimeError, match=f"validation rows per source: 'synthetic_pretrain': checkpoint {k + 1}, now {k}"):
+        train_module.train(parse_settings(["--config", str(yaml_path)]))
+    (tmp_path / "allowed").mkdir()
+    yaml_path = _write_yaml(tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", allow_dataset_change="true")
+    logged = _run(yaml_path, monkeypatch)
+    assert sorted(logged) == list(range(15, 21))
+    final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    assert final[CHECKPOINT_VALIDATION_ROWS_KEY] == full_run["validation_rows"]  # the new checkpoint stores the current split

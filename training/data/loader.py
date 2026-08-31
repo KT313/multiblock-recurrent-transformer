@@ -1,39 +1,24 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """Dataloader construction and the per-stage batch sampling used by multi-stage training."""
 
-import copy
 import random
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.data.collate import collate_fn, find_multiple
-from training.data.datasets import DEFAULT_DATA_SIGNATURE, ParquetTextDataset, Row, WeightedMixtureDataset
+from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import Tokenizer
+from training.settings import DataEntry
 
 Batch = tuple[torch.Tensor, torch.Tensor, list[str]]
 
 
-@dataclass
-class DatasetSpec:
-    """One entry of a stage's ``train_data`` / ``val_data`` list."""
-
-    prefix: str
-    data_dir: str
-    weight: float = 1.0
-    data_signature: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_DATA_SIGNATURE))
-    type: str = "hfds"
-
-    def __post_init__(self) -> None:
-        if self.type != "hfds":
-            raise ValueError(f"Only 'hfds' parquet datasets are supported, got {self.type!r} for {self.prefix}.")
-
-
 def build_dataloader(
-    specs: list[DatasetSpec],
+    entries: list[DataEntry],
     tokenizer: Tokenizer,
     block_size: int,
     micro_batch_size: int,
@@ -43,16 +28,24 @@ def build_dataloader(
     padding_multiple: int | None = None,
     ignore_index: int = -100,
 ) -> DataLoader[Row]:
-    """Loader over the weighted mixture of ``specs``, yielding ``(input_ids, labels, data_ids)`` batches.
+    """Loader over the weighted mixture of ``entries`` (a stage's ``train_data`` / ``val_data`` as resolved by
+    `training.data.dataset_resolver`), yielding ``(input_ids, labels, data_ids)`` batches.
 
-    Loader state is not checkpointed: on resume, loaders are recreated fresh (as in the thesis runs).
-    ``shard=(rank, world)`` is passed to every dataset; with ``world == 1`` it is a no-op.
+    Every entry becomes one `ParquetTextDataset` over its row range ``[skip_rows, skip_rows + max_rows)`` — the
+    validation split decided by the resolver — with its ``data_signature`` (None = the text column). Loader state
+    is not checkpointed: on resume, loaders are recreated fresh (as in the thesis runs). ``shard=(rank, world)`` is
+    passed to every dataset; with ``world == 1`` it is a no-op.
     """
-    if len({s.prefix for s in specs}) != len(specs):
+    if len({e.prefix for e in entries}) != len(entries):
         raise ValueError("Dataset prefixes within one loader must be unique.")
-    datasets = [ParquetTextDataset(s.data_dir, s.prefix, s.data_signature, shard=shard) for s in specs]
+    datasets = [
+        ParquetTextDataset(
+            e.data_dir, e.prefix, e.data_signature, shard=shard, skip_rows=e.skip_rows, max_rows=e.max_rows
+        )
+        for e in entries
+    ]
     dataset: IterableDataset[Row] = (
-        datasets[0] if len(datasets) == 1 else WeightedMixtureDataset(datasets, [s.weight for s in specs], seed)
+        datasets[0] if len(datasets) == 1 else WeightedMixtureDataset(datasets, [e.weight for e in entries], seed)
     )
     collate = partial(
         collate_fn,

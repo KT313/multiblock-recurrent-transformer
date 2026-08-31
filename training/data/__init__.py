@@ -5,7 +5,6 @@ from training.data.collate import collate_fn, shift_inputs_and_labels
 from training.data.datasets import ParquetTextDataset, WeightedMixtureDataset
 from training.data.formats import FORMAT_FNS, apply_formatting
 from training.data.loader import (
-    DatasetSpec,
     StageDataloaders,
     build_dataloader,
     length_sorted_batches,
@@ -15,7 +14,6 @@ from training.data.tokenizer import Tokenizer
 
 __all__ = [
     "FORMAT_FNS",
-    "DatasetSpec",
     "ParquetTextDataset",
     "StageDataloaders",
     "Tokenizer",
