@@ -14,7 +14,7 @@ nothing but this document uses.
 ## Notes
 
 Dataset definition of the thesis run (crow-300m-final). Referenced from `config/crow_300m_final.yaml` via
-`dataset_config`. Materialise with `python data_preparation/prepare.py build --dataset_config <this file>`;
+`dataset_config`. Materialise with `python data_preparation/prepare.py prepare --dataset_config <this file>`;
 training does it automatically when something is missing (`auto_prepare`). `nampdn-ai/mini-peS2o` is gated:
 export `HF_TOKEN` before building. This comment block is rendered into `docs/data_mixture.md` by
 `prepare.py describe`.

@@ -12,7 +12,7 @@ Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
 - HuggingFace export path (`model/hf/modeling.py`)
-- dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, budgets, mixtures and tokenizer in one YAML, built incrementally and verified before training
+- dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, stages with token budgets and weights, and the tokenizer in one YAML; downloaded and built incrementally and verified before training
 
 The code was restructured and trimmed after the thesis: only the code path of the final run survives, with tests next to every module. The thesis-era tree (SLURM tooling, all upstream model variants) is in git history up to tag `v1.0`.
 
@@ -28,7 +28,7 @@ uv run python training/train.py --config config/crow_300m_final.yaml   # the the
 A run config (`config/<run>.yaml`) holds optimizer, LR and batch settings and points to a model architecture config
 (`config/model_architecture/<name>.yaml`: every `RecurrentConfig` field with its value, overridable per key with
 `model_overwrite`) and a dataset config (`config/datasets/<name>.yaml`) that defines sources, per-stage token
-budgets/mixtures and the tokenizer. Training
+budgets/weights and the tokenizer (mixing and the train/val split happen in the training dataloader). Training
 verifies the prepared data under `dataset/` and builds what is missing (`auto_prepare: true`); to prepare up front
 or inspect the plan:
 
@@ -51,7 +51,7 @@ model/             architecture (RecurrentGPT, config, HF export)
 training/          train.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
 data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
-dataset/           gitignored; prepared data, instruct mixtures and tokenizers
+dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers
 docs/              thesis documentation and figures
 tools/             dev tooling (download-capped command runner)
 ```
