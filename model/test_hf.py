@@ -15,7 +15,15 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
 from model.test_config import TINY_ARCHITECTURE, tiny_config
-from model.hf import RecurrentGPTConfig, RecurrentGPTForCausalLM, export_to_hf, parse_recurrence_steps
+from model.hf import (
+    RecurrentGPTConfig,
+    RecurrentGPTForCausalLM,
+    export_sources,
+    export_to_hf,
+    flat_module_name,
+    flatten_relative_imports,
+    parse_recurrence_steps,
+)
 
 
 def ids(batch: int = 2, seq: int = 16) -> torch.Tensor:
@@ -40,6 +48,85 @@ def test_parse_recurrence_steps(text: str, num_blocks: int, expected: object) ->
 def test_parse_recurrence_steps_length_mismatch() -> None:
     with pytest.raises(ValueError, match="got 2 recurrence values but the model has 3"):
         parse_recurrence_steps("4,4", 3)
+
+
+# --- flat source export ------------------------------------------------------------------------------------------------
+
+
+def fake_package(root: Path) -> Path:
+    """`a.py`, `pkg/{__init__,b,c}.py`, `pkg/sub/d.py`, a test file and a `__pycache__` entry."""
+    pkg = root / "package"
+    for rel, text in {
+        "__init__.py": "from .a import A\n",
+        "a.py": "from .pkg.c import C\n\nA = 1\n",
+        "pkg/__init__.py": "from .b import B\n",
+        "pkg/b.py": (
+            "from typing import TYPE_CHECKING\n\nfrom ..a import A\nfrom .c import (\n    C,\n)\n"
+            "from .sub.d import D\n\nif TYPE_CHECKING:\n    from ..a import A as A2\n\nB = 2\n"
+        ),
+        "pkg/c.py": "import os\n\nC = 3\n",
+        "pkg/sub/d.py": "D = 4\n",
+        "pkg/test_b.py": "from .b import B\n",
+        "__pycache__/a.cpython-311.py": "",
+    }.items():
+        (pkg / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pkg / rel).write_text(text)
+    return pkg
+
+
+def test_flat_module_name() -> None:
+    assert flat_module_name(Path("config.py")) == "config"
+    assert flat_module_name(Path("layers/norms.py")) == "layers_norms"
+    assert flat_module_name(Path("hf/modeling.py")) == "hf_modeling"
+
+
+def test_flatten_relative_imports_rewrites_only_import_lines(tmp_path: Path) -> None:
+    pkg = fake_package(tmp_path)
+    flat = flatten_relative_imports((pkg / "pkg" / "b.py").read_text(), Path("pkg/b.py"), pkg)
+    assert flat == (
+        "from typing import TYPE_CHECKING\n\nfrom .a import A\nfrom .pkg_c import (\n    C,\n)\n"
+        "from .pkg_sub_d import D\n\nif TYPE_CHECKING:\n    from .a import A as A2\n\nB = 2\n"
+    )
+    assert flatten_relative_imports((pkg / "a.py").read_text(), Path("a.py"), pkg) == "from .pkg_c import C\n\nA = 1\n"
+    # same-directory imports of top-level modules are already flat
+    assert flatten_relative_imports("from .a import A\n", Path("e.py"), pkg) == "from .a import A\n"
+    # nothing but relative-import lines is touched
+    text = "import os\nfrom os import path\nx = 'from .a import A'\n# from .a import A\n"
+    assert flatten_relative_imports(text, Path("e.py"), pkg) == text
+
+
+@pytest.mark.parametrize(
+    ("module", "line", "message"),
+    [
+        ("e.py", "from .pkg import B", "does not name a module file"),
+        ("e.py", "from . import a", "cannot be flattened"),
+        ("pkg/b.py", "from ...a import A", "cannot be flattened"),
+        ("e.py", "from .missing import X", "does not name a module file"),
+    ],
+)
+def test_flatten_relative_imports_rejects_package_imports(tmp_path: Path, module: str, line: str, message: str) -> None:
+    pkg = fake_package(tmp_path)
+    with pytest.raises(ValueError, match=message):
+        flatten_relative_imports(line + "\n", Path(module), pkg)
+
+
+def test_export_sources_flattens_the_tree(tmp_path: Path) -> None:
+    pkg = fake_package(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    written = export_sources(pkg, out)
+    assert sorted(p.name for p in written) == ["a.py", "pkg_b.py", "pkg_c.py", "pkg_sub_d.py"]
+    assert sorted(p.name for p in out.iterdir()) == ["a.py", "pkg_b.py", "pkg_c.py", "pkg_sub_d.py"]
+    assert "from .pkg_sub_d import D" in (out / "pkg_b.py").read_text()
+    assert (out / "pkg_c.py").read_text() == "import os\n\nC = 3\n"
+
+
+def test_export_sources_rejects_flat_name_clash(tmp_path: Path) -> None:
+    pkg = fake_package(tmp_path)
+    (pkg / "pkg_c.py").write_text("X = 1\n")
+    (tmp_path / "out").mkdir()
+    with pytest.raises(ValueError, match="both flatten to pkg_c.py"):
+        export_sources(pkg, tmp_path / "out")
 
 
 def test_config_round_trip() -> None:
