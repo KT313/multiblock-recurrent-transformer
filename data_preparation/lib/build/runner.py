@@ -49,7 +49,7 @@ from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources import github_code_repo_key
 from data_preparation.lib.stages import build_source, download, download_github_code_group, prepare_tokenizer
-from data_preparation.lib.ui.dashboard import progress
+from data_preparation.lib.ui.dashboard import progress, set_status
 
 log = get_logger(__name__)
 
@@ -103,14 +103,17 @@ def prepare(
                 log.info("dry run, downloads planned:\n%s", download_plan.describe(), extra={"keep": True})
                 break
             log.info("round %d: %s", round_number, download_plan.summary())
+            set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download")
             if "download" in active_steps:
                 download_all_missing_rows(download_plan, config, layout, max_parallel_downloads=max_parallel_downloads, hf_token=hf_token, should_stop=should_stop)
+            set_status(step="build")
             if "build" in active_steps:
                 build_all_pending_raw_shards(config, layout, num_workers=num_workers, sources=selected, should_stop=should_stop)
             if every_source_satisfies_its_budget(config, layout, sources=selected):
                 break
             if not another_round_can_fetch_more(config, layout, active_steps, selected):
                 break  # still short, but nothing left to download: the report names the sources
+        set_status(step="status")
         report = summarize_dataset_state(config, layout)
     log_report(report)
     return report
@@ -248,13 +251,14 @@ class StopFlag:
 def run_jobs(jobs: list[Job], *, max_workers: int, description: str, should_stop: StopCheck | None = None) -> None:
     """Run ``jobs`` in a thread pool of ``max_workers``. The first failure stops the running jobs at their next
     shard (:class:`StopFlag`), cancels the jobs not started yet and is re-raised once every job has finished; a
-    ``KeyboardInterrupt`` while waiting does the same and raises :class:`BuildAborted` (published shards are kept)."""
+    ``KeyboardInterrupt`` while waiting does the same and raises :class:`BuildAborted` (published shards are kept).
+    The pool's bar is the summary task of the dashboard panel named ``description`` (the jobs' own bars are its rows)."""
     if not jobs:
         return
     flag = StopFlag(should_stop)
     running = RunningJobs()
     with (
-        progress(total=len(jobs), desc=description, unit="job") as bar,
+        progress(total=len(jobs), desc=description, unit="job", panel=description, summary=True) as bar,
         ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=description) as pool,
     ):
         futures = {pool.submit(run_job, job, flag, running, bar): job for job in jobs}

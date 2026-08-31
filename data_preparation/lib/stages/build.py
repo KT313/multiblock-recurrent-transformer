@@ -133,7 +133,7 @@ def build_source(
     # shard before it writes anything, so its readers check between raw shards instead
     pipeline = RowPipeline(config, name, layout, num_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
-    with pipeline, progress(total=pending_rows, desc=f"{name}: build", unit="row", leave=False) as bar:
+    with pipeline, progress(total=pending_rows, desc=name, unit="row", leave=False, panel="builds") as bar:
         pipeline.bar = bar
         if all_at_once:
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
@@ -155,7 +155,9 @@ def _build_per_raw_shard(
     """One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
     raw shard as covered) before the next raw shard starts; the stop request is checked in between."""
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
-    for shard in pending:
+    for index, shard in enumerate(pending, start=1):
+        if pipeline.bar is not None:
+            pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows
         survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
         output.publish(survivors, shard_size)

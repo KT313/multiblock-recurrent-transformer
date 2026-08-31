@@ -293,11 +293,16 @@ Two caches, with different lifetimes:
 
 ## Progress display and logs
 
-On a terminal `prepare` runs inside a live dashboard (`lib/ui/dashboard.py`, `rich`): one bar per pool
-(`downloads`, `builds`, with the running job names) and one per running step — `<source>: download` with the rows
-kept, source rows consumed, current repo file and MB read; `<source>: build` per raw row — above a panel with the
-latest log lines; tables such as the status summary are printed unwrapped into the scrollback. The HuggingFace
-libraries' own bars are silenced for the duration. Every log line also goes to `dataset/build.log`. When stderr is
+On a terminal `prepare` runs inside a live dashboard (`lib/ui/dashboard.py`, `rich`): a header (config, round,
+step, elapsed), a **downloads** panel (one row per running download — rows kept / wanted, rate, elapsed, source rows
+consumed, current repo file, MB read — and a summary line: jobs done, rows of the round, MB, elapsed), a **builds**
+panel (one row per running build — raw rows processed, current raw shard — plus its summary line), the **log**
+panel with the latest lines, and a footer naming `dataset/build.log` (every log line goes there). Finished rows
+disappear into the summary; at most eight rows are shown per panel ("… and k more"). Nothing else reaches the
+terminal while the display is up: every `logging` record (the HuggingFace libraries' included), `warnings` and
+stray prints land in the log panel, the libraries' own bars are silenced. Warnings and the tables (plan, repair,
+status) are *kept* and printed once, unwrapped, after the display closed — the scrollback of a run is those lines
+and the final table, no frame. Ctrl-C leaves the same way. When stderr is
 not a terminal (`nohup`, redirects) or `DATA_PREP_PROGRESS=0` is set, there is no dashboard and plain timestamped
 log lines are written instead.
 

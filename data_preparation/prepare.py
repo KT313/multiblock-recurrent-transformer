@@ -16,7 +16,9 @@ complete. ``describe`` renders the config as Markdown (``docs/data_mixture.md`` 
 relocates the HuggingFace caches.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed raw
-deletion, 130 interrupted (Ctrl-C: every running step stops at its next shard, everything published is kept).
+deletion, 130 interrupted (Ctrl-C: every running step stops at its next shard, everything published is kept). On a
+terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
+the tables) and the final status table are printed once it closed.
 """
 
 from __future__ import annotations
@@ -107,7 +109,7 @@ def run_prepare(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
-    with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
+    with Dashboard(title=f"prepare {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
         log.info("preparing dataset config %s under %s", args.dataset_config, layout.root)
         report = prepare(
             args.dataset_config,
@@ -125,7 +127,7 @@ def run_prepare(args: argparse.Namespace) -> None:
             return  # the dataset is not expected to be complete after a partial run
         if not report.complete:
             raise RuntimeError(f"dataset {args.dataset_config} still incomplete after preparing: {report.missing()}")
-        log.info("done: %s", layout.root)
+        log.info("done: %s", layout.root, extra={"keep": True})
 
 
 def run_status(args: argparse.Namespace) -> None:

@@ -34,6 +34,7 @@ from typing import Any, Literal
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.ui.dashboard import suspended
 from data_preparation.lib.stages.download import truncate_raw_to_good_prefix
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 
@@ -249,7 +250,8 @@ def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, 
     if confirm is not None:
         answered_yes = confirm(message)
     elif sys.stdin is not None and sys.stdin.isatty():
-        answered_yes = input(message).strip().lower() in YES_ANSWERS
+        with suspended():  # the live dashboard is cleared while the question is on the terminal
+            answered_yes = input(message).strip().lower() in YES_ANSWERS
     else:
         raise ConfirmationRequired(planned.as_planned(), message, interactive=False)
     if not answered_yes:

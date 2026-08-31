@@ -329,7 +329,7 @@ def download(
     increment = _Increment(manifest, out, counters, should_stop)
     token_step = _TokenStep(source, TokenCounter(cfg, layout), cfg.max_seq_length, counters)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
-    with progress(total=wanted, desc=f"{name}: download", unit="row") as bar:
+    with progress(total=wanted, desc=name, unit="row", panel="downloads") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
         with ShardWriter(out, shard_size, start_shard=len(manifest.shards), on_shard=increment.record_shard) as writer:
             for row in rows:
@@ -648,7 +648,7 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
     total = sum(m.wanted for m in members)
 
     with ExitStack() as stack:
-        bar = stack.enter_context(progress(total=total, desc=f"{repo}: download ({len(members)} languages)", unit="row"))
+        bar = stack.enter_context(progress(total=total, desc=f"{repo} ({len(members)} languages)", unit="row", panel="downloads"))
         postfix = _DownloadPostfix(bar, fetch_stats)
         writers = {
             m.name: stack.enter_context(ShardWriter(m.out, shard_size, start_shard=len(m.manifest.shards), on_shard=m.increment.record_shard))

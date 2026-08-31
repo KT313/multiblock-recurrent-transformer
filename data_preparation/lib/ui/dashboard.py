@@ -1,56 +1,66 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Terminal dashboard for the preparation stages: several live progress bars plus a scrolling log section.
+"""Terminal dashboard for the preparation stages: one live layout — header, a **downloads** panel, a **builds**
+panel, the **log** panel, a footer — and nothing else on the terminal while it is up.
 
-Built on ``rich`` (the only module that imports it). A :class:`Dashboard` owns one ``rich.live.Live`` display on
-stderr that renders a fixed-height log panel (the last ``log_lines`` records) above the currently running tasks,
-one line per task — so parallel downloads / processing stay readable and log records never garble a bar.
+Built on ``rich`` (the only module that imports it). A :class:`Dashboard` owns exactly one ``rich.live.Live``
+display on stderr. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
+task (bounded: at most ``max_rows`` rows plus "… and k more"), finished rows disappear and are counted in the
+panel's summary line (jobs done, rows done / wanted, MB read, elapsed), which is updated in place. All updates from
+worker threads go through one lock; the display refreshes on its own timer.
+
+While the display is up nothing may print around it (a stray line between two frames shifts the frame and leaves
+its top behind in the scrollback), so ``__enter__`` also
+
+* routes *every* ``logging`` record into the log panel: a handler on the root logger, while the plain
+  ``StreamHandler``\\s that libraries such as ``huggingface_hub`` / ``datasets`` put on their own loggers are
+  detached for the duration (they write to the real stderr behind the display),
+* replaces ``sys.stdout`` / ``sys.stderr`` with line sinks that log what is written to them (``warnings``, stray
+  prints, handlers created later), and
+* silences the tqdm bars of ``huggingface_hub`` / ``datasets``.
+
+Records of WARNING and above, and records logged with ``extra={"keep": True}`` (the plan / status tables), are
+*kept*: shown in the panel like everything else and printed once, unwrapped, after the display closed — so the
+scrollback of a run is exactly the kept lines followed by the final table, never a frozen frame (the display is
+transient). Ctrl-C / an exception leave through the same path.
 
 Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create tasks)::
 
-    with Dashboard() as dashboard:
-        logging.getLogger("data_preparation").addHandler(dashboard.log_handler())
-        with dashboard.task("fineweb_edu: download", total=1000, unit="row") as bar:
-            bar.update(1); bar.set_postfix({"file": "x.parquet"})
+    with Dashboard(title="prepare tiny") as dashboard, dashboard.attach(logging.getLogger("data_preparation")):
+        with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads") as bar:
+            bar.update(1); bar.set_postfix({"file": "x.parquet", "MB": 6})
 
 :class:`Task` implements the same interface as ``lib.progress.Progress`` (``update`` / ``set_postfix`` /
-``set_description`` / ``close`` / iteration / context manager / ``n``), and :func:`progress` has the signature of
-``lib.progress.progress``: it creates a task on the active dashboard, or falls back to the tqdm / no-op bar when
-none is active. Switching a stage over is therefore a one-line import change; nothing else in the stages has to
-know about the dashboard.
+``set_description`` / ``close`` / iteration / context manager / ``n``); :func:`progress` has the signature of
+``lib.progress.progress`` plus ``panel`` (which panel the row belongs to) and ``summary`` (the panel's one summary
+task, e.g. the jobs of a pool): it creates a task on the active dashboard, or falls back to the tqdm / no-op bar
+when none is active. :func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended`
+clears the display around a terminal prompt.
 
 Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal — the same rule as ``lib.progress``): no live display,
-tasks are no-ops and the log handler writes plain lines to stderr. Thread-safe: tasks may be created and updated
-from worker threads; the display refreshes on its own timer.
+no capture, tasks are no-ops and the log handler writes plain lines to stderr.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import sys
 import threading
+import time
 from collections import deque
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Callable, Iterable, Iterator, Sized
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TextIO, TypeVar
+from typing import Any, TextIO, TypeGuard, TypeVar
 
-from rich.console import Console, Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress as RichProgress,
-    ProgressColumn,
-    SpinnerColumn,
-    TaskID,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.progress import Task as RichTask
+from rich.progress_bar import ProgressBar
+from rich.table import Table
 from rich.text import Text
 
 from data_preparation.lib.log import LOG_FORMAT
@@ -60,8 +70,14 @@ from data_preparation.lib.progress import progress as fallback_progress
 T = TypeVar("T")
 
 DEFAULT_LOG_LINES = 12
+DEFAULT_MAX_ROWS = 8  # running tasks shown per panel; the rest is "… and k more"
 DEFAULT_REFRESH_PER_SECOND = 8
+DEFAULT_PANELS: tuple[str, ...] = ("downloads", "builds")  # always shown, in this order; other panel names appear on demand
+DEFAULT_PANEL = "tasks"  # tasks created without a panel name
 BUILD_LOG_NAME = "build.log"  # full log of every build, appended under the dataset root (`Dashboard.attach(log_file=)`)
+STDOUT_LOGGER = "data_preparation.stdout"  # lines written to sys.stdout while the display is up (INFO)
+STDERR_LOGGER = "data_preparation.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
+FOOTER_HINT = "Ctrl-C stops at the next shard; everything published so far is kept"
 
 
 def _format_postfix(values: dict[str, Any]) -> str:
@@ -69,66 +85,90 @@ def _format_postfix(values: dict[str, Any]) -> str:
     return ", ".join(f"{key}={value}" for key, value in values.items())
 
 
-class _RateColumn(ProgressColumn):
-    """Rows (or whatever the task's unit is) per second, ``?`` until the first update."""
-
-    def render(self, task: RichTask) -> Text:
-        speed = task.finished_speed or task.speed
-        unit = str(task.fields.get("unit", "it"))
-        if speed is None:
-            return Text(f"? {unit}/s", style="progress.data.speed")
-        return Text(f"{speed:,.0f} {unit}/s", style="progress.data.speed")
+def _format_elapsed(seconds: float) -> str:
+    return str(timedelta(seconds=int(seconds)))
 
 
-class _PostfixColumn(ProgressColumn):
-    """The task's postfix (``set_postfix``), dimmed, after the timing columns."""
-
-    def render(self, task: RichTask) -> Text:
-        return Text(str(task.fields.get("postfix", "")), style="dim")
+def _megabytes(task: Task) -> float:
+    """The task's ``MB`` postfix value (``_DownloadPostfix`` reports the bytes read remotely there), 0 otherwise."""
+    value = task.postfix.get("MB")
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class Task:
-    """One progress bar of a :class:`Dashboard`; the ``lib.progress.Progress`` interface over a rich task.
+    """One row of a dashboard panel; the ``lib.progress.Progress`` interface.
 
-    ``n`` mirrors tqdm's counter (updates done). ``leave=False`` removes the line on ``close``, ``leave=True`` keeps
-    it (completed) until the dashboard stops. The bar may overshoot its ``total`` like the download bar does (a
-    loader finishing a remote row group); rich renders that as a full bar with ``completed/total`` past 100 %.
+    ``n`` mirrors tqdm's counter (updates done). The row is shown while the task is open and disappears on
+    ``close``; its counts then live on in the panel's summary line until the next summary task (round) starts.
+    ``leave`` is accepted by :func:`progress` for interface compatibility and has no effect here. The bar may
+    overshoot its ``total`` like the download bar does (a loader finishing a remote row group); it renders full,
+    the count shows ``completed/total`` past 100 %.
     """
 
-    def __init__(self, owner: RichProgress, task_id: TaskID, iterable: Iterable[Any] | None, leave: bool) -> None:
-        self._owner = owner
-        self._id = task_id
+    def __init__(
+        self,
+        dashboard: Dashboard,
+        panel: _PanelState,
+        description: str,
+        *,
+        total: int | None,
+        unit: str,
+        summary: bool,
+        iterable: Iterable[Any] | None,
+    ) -> None:
+        self._dashboard = dashboard
+        self._panel = panel
         self._iterable = iterable
-        self._leave = leave
-        self._closed = False
-        self.n = 0
+        self.description = description
+        self.total = total
+        self.unit = unit
+        self.summary = summary
+        self.completed = 0
+        self.postfix: dict[str, Any] = {}
+        self.started = time.monotonic()
+        self.finished: float | None = None
+
+    @property
+    def n(self) -> int:
+        return self.completed
+
+    @property
+    def closed(self) -> bool:
+        return self.finished is not None
 
     def update(self, n: int = 1) -> None:
-        self.n += n
-        if not self._closed:  # like tqdm, a late update is ignored (rich would raise on a removed task)
-            self._owner.update(self._id, advance=n)
+        with self._dashboard._lock:
+            self.completed += n
 
     def set_postfix(self, ordered_dict: Any = None, refresh: bool = True, **kwargs: Any) -> None:
         values: dict[str, Any] = dict(ordered_dict or {})
         values.update(kwargs)
-        if not self._closed:
-            self._owner.update(self._id, postfix=_format_postfix(values))
+        with self._dashboard._lock:
+            self.postfix = values
 
     def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
-        if not self._closed:
-            self._owner.update(self._id, description=desc or "")
+        with self._dashboard._lock:
+            self.description = desc or ""
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._leave:
-            task = self._owner.tasks[self._owner.task_ids.index(self._id)]
-            if task.total is None:
-                self._owner.update(self._id, total=task.completed)  # an indeterminate bar renders as done
-            self._owner.stop_task(self._id)
-        else:
-            self._owner.remove_task(self._id)
+        with self._dashboard._lock:
+            if self.finished is not None:
+                return
+            self.finished = time.monotonic()
+            self._panel.finish(self)
+
+    def elapsed(self, now: float) -> float:
+        return (self.finished if self.finished is not None else now) - self.started
+
+    def speed(self, now: float) -> float | None:
+        """Units per second over the task's lifetime; None before the first update."""
+        elapsed = self.elapsed(now)
+        if self.completed <= 0 or elapsed <= 0:
+            return None
+        return self.completed / elapsed
 
     def __iter__(self) -> Iterator[Any]:
         if self._iterable is None:
@@ -149,21 +189,155 @@ class Task:
         self.close()
 
 
+class _PanelState:
+    """The tasks of one panel: the running rows, the finished ones of the current round, the round's summary task."""
+
+    def __init__(self, name: str, max_rows: int) -> None:
+        self.name = name
+        self.max_rows = max_rows
+        self.active: list[Task] = []
+        self.done: list[Task] = []
+        self.summary: Task | None = None
+
+    def add(self, task: Task) -> None:
+        if task.summary:  # a new round: the finished rows of the previous one are dropped
+            self.summary = task
+            self.done = []
+        else:
+            self.active.append(task)
+
+    def finish(self, task: Task) -> None:
+        if task.summary:
+            return  # the summary stays until the next round's replaces it
+        if task in self.active:
+            self.active.remove(task)
+            self.done.append(task)
+
+    @property
+    def idle(self) -> bool:
+        return not self.active and not self.done and self.summary is None
+
+    def height(self) -> int:
+        """Lines the panel occupies: borders, rows (bounded), the overflow line, the summary line."""
+        rows = min(len(self.active), self.max_rows) or (0 if self.idle else 1)
+        return 2 + rows + (1 if len(self.active) > self.max_rows else 0) + 1
+
+    # --- rendering ----------------------------------------------------------------------------------------------------
+
+    def render(self, now: float) -> Panel:
+        body: list[RenderableType] = []
+        if self.active:
+            body.append(self._rows_table(self.active[: self.max_rows], now))
+            if len(self.active) > self.max_rows:
+                body.append(Text(f"… and {len(self.active) - self.max_rows} more", style="dim"))
+        elif not self.idle:
+            body.append(Text("no running task", style="dim"))
+        body.append(self._summary_line(now))  # "idle" when the panel never had a task
+        return Panel(Group(*body), title=self.name, title_align="left", border_style="dim", padding=(0, 1))
+
+    @staticmethod
+    def _rows_table(tasks: list[Task], now: float) -> Table:
+        table = Table.grid(padding=(0, 1), expand=True)
+        table.add_column(no_wrap=True, overflow="ellipsis", max_width=40, style="bold")  # description
+        table.add_column(ratio=2, min_width=10)  # bar
+        table.add_column(justify="right", no_wrap=True)  # completed/total
+        table.add_column(justify="right", no_wrap=True, style="progress.data.speed")  # rate
+        table.add_column(no_wrap=True, style="progress.elapsed")  # elapsed
+        table.add_column(ratio=3, no_wrap=True, overflow="ellipsis", style="dim")  # postfix
+        for task in tasks:
+            speed = task.speed(now)
+            table.add_row(
+                task.description,
+                ProgressBar(total=task.total, completed=min(task.completed, task.total) if task.total is not None else task.completed, pulse=task.total is None),
+                f"{task.completed:,}/{task.total:,}" if task.total is not None else f"{task.completed:,}",
+                f"? {task.unit}/s" if speed is None else f"{speed:,.0f} {task.unit}/s",
+                _format_elapsed(task.elapsed(now)),
+                _format_postfix(task.postfix),
+            )
+        return table
+
+    def _summary_line(self, now: float) -> Text:
+        """``5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03`` — the round's jobs, every row of every task
+        of the round (running and finished), the MB they reported, the time since the round began."""
+        if self.idle:
+            return Text("idle", style="dim")
+        tasks = [*self.done, *self.active]
+        parts: list[str] = []
+        summary = self.summary
+        if summary is not None:
+            jobs = f"{summary.completed:,}/{summary.total:,}" if summary.total is not None else f"{summary.completed:,}"
+            parts.append(f"{jobs} {summary.unit}s done")
+        if tasks:
+            completed = sum(task.completed for task in tasks)
+            totals = [task.total for task in tasks if task.total is not None]
+            rows = f"{completed:,}/{sum(totals):,}" if len(totals) == len(tasks) else f"{completed:,}"
+            parts.append(f"{rows} {tasks[0].unit}s")
+        megabytes = sum(_megabytes(task) for task in tasks)
+        if megabytes > 0:
+            parts.append(f"{megabytes:,.0f} MB")
+        started = min([task.started for task in tasks] + ([summary.started] if summary is not None else []))
+        running = bool(self.active) or (summary is not None and not summary.closed)
+        end = now if running else max([task.finished or now for task in tasks] + ([summary.finished or now] if summary is not None else []))
+        parts.append(_format_elapsed(end - started))
+        return Text(" · ".join(parts), style="bold" if running else "dim")
+
+
+class _LineSink(io.TextIOBase):
+    """A ``sys.stdout`` / ``sys.stderr`` replacement: complete lines go to ``emit``; a carriage return discards the
+    line so far (a tqdm-style bar only delivers its final state); the rest is emitted on :meth:`close_flush`."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        super().__init__()
+        self._emit = emit
+        self._pending = ""
+        self._lock = threading.Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str, /) -> int:
+        with self._lock:
+            self._pending += s
+            *complete, self._pending = self._pending.split("\n")
+        for line in complete:
+            self._emit(line.rsplit("\r", 1)[-1])
+        return len(s)
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]  # TextIOBase declares a plain attribute; libraries only read it
+        return "utf-8"
+
+    def close_flush(self) -> None:
+        with self._lock:
+            pending, self._pending = self._pending, ""
+        if pending.strip():
+            self._emit(pending.rsplit("\r", 1)[-1])
+
+
 class DashboardLogHandler(logging.Handler):
     """``logging.Handler`` whose records land in the dashboard's log panel (or on ``stream`` when it is disabled).
 
     Records of ``keep_level`` and above (default WARNING), and records logged with ``extra={"keep": True}`` (the
-    plan / status tables), are additionally printed above the live display, unwrapped, where they scroll into the
-    terminal's history and survive the run — the panel only shows the last few lines."""
+    plan / status tables), are *kept*: printed once, unwrapped, after the live display closed, where they survive
+    the run in the terminal's history — the panel only shows the last few lines. The root handler the dashboard
+    installs (``root=True``) skips records of the loggers :meth:`Dashboard.attach` handles directly."""
 
-    def __init__(self, dashboard: Dashboard, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> None:
+    def __init__(
+        self, dashboard: Dashboard, level: int = logging.NOTSET, keep_level: int = logging.WARNING, *, root: bool = False
+    ) -> None:
         super().__init__(level)
         self._dashboard = dashboard
         self._keep_level = keep_level
+        self._root = root
         self.setFormatter(logging.Formatter(LOG_FORMAT))
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if self._root and self._dashboard.is_attached(record.name):
+                return
             text = self.format(record)
             keep = record.levelno >= self._keep_level or bool(getattr(record, "keep", False))
             self._dashboard.write(text, keep=keep)
@@ -172,7 +346,8 @@ class DashboardLogHandler(logging.Handler):
 
 
 class Dashboard:
-    """Live terminal display: a log panel (last ``log_lines`` lines) above one progress line per running task.
+    """Live terminal display: header, one panel per task group (``downloads``, ``builds``, …), the log panel (last
+    ``log_lines`` lines), footer.
 
     ``enabled`` defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); ``console`` is for tests
     (a ``rich.console.Console`` over a ``StringIO``). Only one dashboard can be active at a time (``with`` block);
@@ -185,6 +360,9 @@ class Dashboard:
     def __init__(
         self,
         *,
+        title: str | None = None,
+        panels: Iterable[str] = DEFAULT_PANELS,
+        max_rows: int = DEFAULT_MAX_ROWS,
         log_lines: int = DEFAULT_LOG_LINES,
         refresh_per_second: float = DEFAULT_REFRESH_PER_SECOND,
         enabled: bool | None = None,
@@ -192,28 +370,28 @@ class Dashboard:
         stream: TextIO | None = None,
     ) -> None:
         self.enabled = progress_enabled(stream) if enabled is None else enabled
+        self.title = title or "data preparation"
         self._stream = stream if stream is not None else sys.stderr
         self._console = console if console is not None else Console(file=self._stream)
         self._refresh_per_second = refresh_per_second
+        self._max_rows = max_rows
+        self._log_lines = log_lines
+        self._lock = threading.RLock()  # every task / panel / line mutation and every render
+        self._panels: dict[str, _PanelState] = {name: _PanelState(name, max_rows) for name in panels}
         self._lines: deque[str] = deque(maxlen=log_lines)
-        self._lines_lock = threading.Lock()
-        self._progress = RichProgress(
-            SpinnerColumn(finished_text="[green]✓[/green]"),
-            TextColumn("[bold]{task.description}"),
-            BarColumn(bar_width=None),
-            MofNCompleteColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>4.0f}%"),
-            _RateColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            _PostfixColumn(),
-            console=self._console,
-            expand=True,
-        )
+        self._kept: list[str] = []
+        self._status: dict[str, str] = {}
+        self._log_file: Path | None = None
+        self._started_at = time.monotonic()
         self._live: Live | None = None
         self._depth = 0
+        self._attached: list[str] = []
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
+        self._detached_handlers: list[tuple[logging.Logger, logging.Handler]] = []
+        self._root_handler: DashboardLogHandler | None = None
+        self._saved_streams: tuple[TextIO, TextIO] | None = None
+        self._sinks: tuple[_LineSink, _LineSink] | None = None
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
@@ -226,12 +404,11 @@ class Dashboard:
                 return self
             Dashboard._active = self
         if self.enabled:
+            self._started_at = time.monotonic()
             self._silence_third_party_bars()
-            self._live = Live(
-                self, console=self._console, refresh_per_second=self._refresh_per_second, transient=False, redirect_stderr=False,
-                redirect_stdout=False,
-            )
-            self._live.start()
+            self._capture_logging()
+            self._redirect_streams()
+            self._start_live()
         return self
 
     def __exit__(
@@ -246,18 +423,64 @@ class Dashboard:
             if self._depth > 0:
                 return
             Dashboard._active = None
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+        if not self.enabled:
+            return
+        try:
+            self._stop_live()
+        finally:
+            self._restore_streams()
+            self._release_logging()
             self._restore_third_party_bars()
+        self._print_kept()
+
+    def _start_live(self) -> None:
+        self._live = Live(
+            self, console=self._console, refresh_per_second=self._refresh_per_second, transient=True,
+            redirect_stdout=False, redirect_stderr=False,
+        )
+        self._live.start()
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()  # transient: the frame is erased, the cursor is back where the display began
+            self._live = None
+
+    @contextmanager
+    def suspended(self) -> Iterator[None]:
+        """Clear the display and give the terminal back (a confirmation prompt); it comes back afterwards."""
+        if self._live is None:
+            yield
+            return
+        self._stop_live()
+        self._restore_streams()
+        try:
+            yield
+        finally:
+            self._redirect_streams()
+            self._start_live()
+
+    def _print_kept(self) -> None:
+        """The kept records, unwrapped, once, after the display closed — on the console's own file, plainly."""
+        with self._lock:
+            kept, self._kept = self._kept, []
+        file = self._console.file
+        for text in kept:
+            file.write(text + "\n")
+        file.flush()
+
+    @property
+    def is_active(self) -> bool:
+        return Dashboard._active is self
+
+    # --- what else could reach the terminal ----------------------------------------------------------------------------
 
     _THIRD_PARTY_BAR_ENV = ("HF_HUB_DISABLE_PROGRESS_BARS", "HF_DATASETS_DISABLE_PROGRESS_BARS")
 
     def _silence_third_party_bars(self) -> None:
         """Turn off the tqdm bars of ``huggingface_hub`` / ``datasets`` (file downloads, ``load_dataset``) while
-        the live display is up — their carriage returns would garble it. The env vars cover the not-yet-imported
-        libraries (which then stay silent for the rest of the process: they read the variable once, at import),
-        the function calls the already-imported ones; :meth:`_restore_third_party_bars` undoes both."""
+        the live display is up. The env vars cover the not-yet-imported libraries (which then stay silent for the
+        rest of the process: they read the variable once, at import), the function calls the already-imported
+        ones; :meth:`_restore_third_party_bars` undoes both."""
         self._saved_env = {name: os.environ.get(name) for name in self._THIRD_PARTY_BAR_ENV}
         for name in self._THIRD_PARTY_BAR_ENV:
             os.environ[name] = "1"
@@ -282,11 +505,49 @@ class Dashboard:
         if "datasets" in self._silenced_modules and self._saved_env["HF_DATASETS_DISABLE_PROGRESS_BARS"] is None:
             sys.modules["datasets"].utils.logging.enable_progress_bar()
 
-    @property
-    def is_active(self) -> bool:
-        return Dashboard._active is self
+    def _capture_logging(self) -> None:
+        """Every ``logging`` record into the panel: the dashboard's handler on the root logger, and every plain
+        console ``StreamHandler`` of every logger (``huggingface_hub`` and ``datasets`` install one on theirs at
+        import) detached until :meth:`_release_logging`."""
+        console_streams = {stream for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__) if stream is not None}
+        loggers: list[logging.Logger] = [logging.getLogger()]
+        loggers.extend(logger for logger in logging.root.manager.loggerDict.values() if isinstance(logger, logging.Logger))
+        for logger in loggers:
+            for handler in list(logger.handlers):
+                if _is_console_handler(handler) and handler.stream in console_streams:
+                    logger.removeHandler(handler)
+                    self._detached_handlers.append((logger, handler))
+        self._root_handler = DashboardLogHandler(self, root=True)
+        logging.getLogger().addHandler(self._root_handler)
 
-    # --- tasks and log lines --------------------------------------------------------------------------------------------
+    def _release_logging(self) -> None:
+        if self._root_handler is not None:
+            logging.getLogger().removeHandler(self._root_handler)
+            self._root_handler.close()
+            self._root_handler = None
+        for logger, handler in self._detached_handlers:
+            logger.addHandler(handler)
+        self._detached_handlers = []
+
+    def _redirect_streams(self) -> None:
+        """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""
+        self._saved_streams = (sys.stdout, sys.stderr)
+        stdout_logger, stderr_logger = logging.getLogger(STDOUT_LOGGER), logging.getLogger(STDERR_LOGGER)
+        stdout_logger.setLevel(logging.INFO)  # whatever the package logger is set to, a stray line is never dropped
+        stderr_logger.setLevel(logging.INFO)
+        self._sinks = (_LineSink(stdout_logger.info), _LineSink(stderr_logger.warning))
+        sys.stdout, sys.stderr = self._sinks
+
+    def _restore_streams(self) -> None:
+        if self._saved_streams is not None:
+            sys.stdout, sys.stderr = self._saved_streams
+            self._saved_streams = None
+        if self._sinks is not None:
+            sinks, self._sinks = self._sinks, None
+            for sink in sinks:
+                sink.close_flush()
+
+    # --- tasks, status and log lines ------------------------------------------------------------------------------------
 
     def task(
         self,
@@ -296,40 +557,53 @@ class Dashboard:
         unit: str = "row",
         leave: bool = True,
         iterable: Iterable[T] | None = None,
+        panel: str | None = None,
+        summary: bool = False,
     ) -> Progress:
-        """A new progress line (a no-op bar when the dashboard is disabled)."""
+        """A new row in ``panel`` (a no-op bar when the dashboard is disabled). ``summary`` makes it the panel's
+        summary task (the pool's jobs) and starts a new round of the panel's counts."""
         if not self.enabled:
             return NoProgress(iterable)
         if total is None and iterable is not None and isinstance(iterable, Sized):
             total = len(iterable)  # like tqdm
-        task_id = self._progress.add_task(desc, total=total, unit=unit, postfix="")
-        return Task(self._progress, task_id, iterable, leave)
+        with self._lock:
+            state = self._panels.setdefault(panel or DEFAULT_PANEL, _PanelState(panel or DEFAULT_PANEL, self._max_rows))
+            task = Task(self, state, desc, total=total, unit=unit, summary=summary, iterable=iterable)
+            state.add(task)
+        return task
+
+    def set_status(self, **fields: object) -> None:
+        """Header fields (``round="1/5"``, ``step="download"``), shown as ``key value`` after the title."""
+        with self._lock:
+            self._status.update({key: str(value) for key, value in fields.items()})
 
     def write(self, text: str, *, keep: bool = False) -> None:
         """Append ``text`` (one entry per line, so tracebacks stay readable) to the log panel; plain stderr when
-        disabled. With ``keep`` the text is also printed above the live display, into the terminal's scrollback."""
+        disabled. With ``keep`` the text is also printed, unwrapped, once the display closed."""
         if not self.enabled:
             self._stream.write(text + "\n")
             self._stream.flush()
             return
-        with self._lines_lock:
+        with self._lock:
             self._lines.extend(text.splitlines() or [""])
-        if keep:
-            # rich prints above an active Live display; no wrapping / cropping so tables keep their columns
-            self._console.print(Text(text, no_wrap=True, overflow="ignore"), crop=False, soft_wrap=True)
+            if keep:
+                self._kept.append(text)
 
     def log_handler(self, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> DashboardLogHandler:
         """A logging handler for this dashboard (see :class:`DashboardLogHandler`); :meth:`attach` installs it."""
         return DashboardLogHandler(self, level, keep_level)
 
+    def is_attached(self, logger_name: str) -> bool:
+        """Whether records of ``logger_name`` reach the panel through a handler :meth:`attach` installed."""
+        with self._lock:
+            return any(logger_name == name or logger_name.startswith(name + ".") for name in self._attached)
+
     @contextmanager
     def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> Iterator[None]:
         """Route ``logger`` into this dashboard for the duration of the block: the plain stream handlers that
-        ``lib.log.configure_logging`` installed are detached (their lines would print twice and garble the live
-        display) and restored afterwards; with ``log_file`` every record is also appended to that file."""
-        detached: list[logging.Handler] = [
-            h for h in logger.handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        ]
+        ``lib.log.configure_logging`` installed are detached (their lines would print behind the live display) and
+        restored afterwards; with ``log_file`` every record is also appended to that file (named in the footer)."""
+        detached: list[logging.Handler] = [h for h in logger.handlers if _is_console_handler(h)]
         added: list[logging.Handler] = [self.log_handler()]
         if log_file is not None:
             log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -340,9 +614,15 @@ class Dashboard:
             logger.removeHandler(handler)
         for handler in added:
             logger.addHandler(handler)
+        with self._lock:
+            self._attached.append(logger.name)
+            if log_file is not None:
+                self._log_file = log_file
         try:
             yield
         finally:
+            with self._lock:
+                self._attached.remove(logger.name)
             for handler in added:
                 logger.removeHandler(handler)
                 handler.close()
@@ -351,28 +631,56 @@ class Dashboard:
 
     def lines(self) -> list[str]:
         """The log lines currently shown (newest last)."""
-        with self._lines_lock:
+        with self._lock:
             return list(self._lines)
 
+    def kept(self) -> list[str]:
+        """The kept records not yet printed (they are printed when the display closes)."""
+        with self._lock:
+            return list(self._kept)
+
     @property
-    def tasks(self) -> list[RichTask]:
-        """The rich tasks currently in the display (running and finished-but-left)."""
-        return list(self._progress.tasks)
+    def tasks(self) -> list[Task]:
+        """The open tasks of every panel (summary tasks included)."""
+        with self._lock:
+            tasks: list[Task] = []
+            for state in self._panels.values():
+                if state.summary is not None and not state.summary.closed:
+                    tasks.append(state.summary)
+                tasks.extend(state.active)
+            return tasks
+
+    def panel_names(self) -> list[str]:
+        with self._lock:
+            return list(self._panels)
 
     # --- rendering ------------------------------------------------------------------------------------------------------
 
-    def __rich__(self) -> RenderableType:
-        with self._lines_lock:
-            body = Text("\n".join(self._lines) or "(no log output yet)", no_wrap=True, overflow="ellipsis")
-        # bars first: a terminal too short for both crops the log panel, never the running tasks
-        return Group(self._progress, Panel(body, title="log", title_align="left", border_style="dim"))
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        now = time.monotonic()
+        with self._lock:
+            panels = list(self._panels.values())
+            fixed_height = 2 + sum(state.height() for state in panels)  # header + footer + panels
+            log_height = max(3, min(self._log_lines, options.size.height - fixed_height - 2))
+            lines = list(self._lines)[-log_height:]
+            body = Text("\n".join(lines) or "(no log output yet)", no_wrap=True, overflow="ellipsis")
+            status = "".join(f" · {key} {value}" for key, value in self._status.items())
+            header = Text.assemble((self.title, "bold"), status, (f" · {_format_elapsed(now - self._started_at)}", "dim"), no_wrap=True, overflow="ellipsis")
+            footer = Text(" · ".join(([f"log: {self._log_file}"] if self._log_file is not None else []) + [FOOTER_HINT]), style="dim", no_wrap=True, overflow="ellipsis")
+            rendered = [state.render(now) for state in panels]
+        yield Group(header, *rendered, Panel(body, title="log", title_align="left", border_style="dim", padding=(0, 1)), footer)
 
-    def render_text(self, width: int = 120) -> str:
+    def render_text(self, width: int = 120, height: int = 50) -> str:
         """The current display as plain text (tests, or a snapshot for a log file)."""
-        console = Console(width=width, force_terminal=False, color_system=None)
+        console = Console(width=width, height=height, force_terminal=False, color_system=None)
         with console.capture() as capture:
             console.print(self)
         return capture.get()
+
+
+def _is_console_handler(handler: logging.Handler) -> TypeGuard[logging.StreamHandler[Any]]:
+    """A plain ``StreamHandler`` (not a file handler): what writes log lines to a console stream."""
+    return isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
 
 
 def active_dashboard() -> Dashboard | None:
@@ -387,9 +695,30 @@ def progress(
     desc: str = "",
     unit: str = "row",
     leave: bool = True,
+    panel: str | None = None,
+    summary: bool = False,
 ) -> Progress:
-    """Drop-in for ``lib.progress.progress``: a task on the active dashboard, else the tqdm / no-op bar."""
+    """Drop-in for ``lib.progress.progress``: a task in ``panel`` of the active dashboard, else the tqdm / no-op
+    bar (which ignore ``panel`` / ``summary``)."""
     dashboard = active_dashboard()
     if dashboard is None:
         return fallback_progress(iterable, total=total, desc=desc, unit=unit, leave=leave)
-    return dashboard.task(desc, total=total, unit=unit, leave=leave, iterable=iterable)
+    return dashboard.task(desc, total=total, unit=unit, leave=leave, iterable=iterable, panel=panel, summary=summary)
+
+
+def set_status(**fields: object) -> None:
+    """Header fields of the active dashboard (no-op without one)."""
+    dashboard = active_dashboard()
+    if dashboard is not None:
+        dashboard.set_status(**fields)
+
+
+@contextmanager
+def suspended() -> Iterator[None]:
+    """The active dashboard's display cleared for the block (a terminal prompt); no-op without one."""
+    dashboard = active_dashboard()
+    if dashboard is None:
+        yield
+        return
+    with dashboard.suspended():
+        yield
