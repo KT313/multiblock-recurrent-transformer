@@ -133,8 +133,8 @@ def prepare(config_path, dataset_dir, *, num_workers, max_parallel_downloads, as
         repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm)
         for round_number in range(1, MAX_ROUNDS + 1):                        # MAX_ROUNDS = 5
             download_plan = plan_downloads(config, layout, sources=selected)  # rows still missing per source
-            download_all_missing_rows(download_plan, ...)                     # parallel, per-shard resumable, sources/<s>/raw only
-            build_all_pending_raw_shards(config, layout, ...)                # parallel, per-shard resumable, processed/<s> only
+            download_and_build_missing(download_plan, config, layout, ...)   # downloads (sources/<s>/raw) and builds (processed/<s>)
+                                                                             # side by side; a source is built as soon as its download finished
             if every_source_satisfies_its_budget(config, layout, sources=selected):
                 break
             if not another_round_can_fetch_more(config, layout, active_steps, selected):
@@ -143,10 +143,14 @@ def prepare(config_path, dataset_dir, *, num_workers, max_parallel_downloads, as
     return report
 ```
 
-The two parallel helpers are the only places with thread-pool code: `--max_parallel_downloads` download jobs run at
-a time (the `github_code` sources of one repo form one job and are read in a single pass over the repo's files) and
-`--num_workers` build jobs (`--num_workers` is also the pool size of each decontamination / minhash pass). A round
-is normally enough; a second one happens when a loader returned fewer rows than asked without being exhausted, or
+`download_and_build_missing` is the only place with thread-pool code: a pool of `--max_parallel_downloads` download
+jobs (the `github_code` sources of one repo form one job and are read in a single pass over the repo's files) and a
+pool of `--num_workers` build jobs (`--num_workers` is also the pool size of each decontamination / minhash pass) run
+side by side under one stop flag. Sources with nothing to download are built right away, every other source the
+moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
+built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
+overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
+no longer the larger of the two. A round is normally enough; a second one happens when a loader returned fewer rows than asked without being exhausted, or
 when the length filter and the dedup dropped more than the 20 % safety margin covers.
 
 ### Download (`lib/stages/download.py`)

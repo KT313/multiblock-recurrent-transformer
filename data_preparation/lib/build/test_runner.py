@@ -1,7 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `prepare` / `status`: tiny end to end and idempotent, the download → build rounds, step and source
-filters, failure and interrupt handling of the parallel helpers, the lock, dry runs, the raw-deletion confirmation,
-parallel == sequential, `github_code` groups, repair of broken folders."""
+"""Tests for `prepare` / `status`: tiny end to end and idempotent, the download + build rounds, step and source
+filters, builds overlapping the downloads (a source built as soon as its own download finished, never before),
+failure and interrupt handling across both pools, the lock, dry runs, the raw-deletion confirmation, parallel ==
+sequential, `github_code` groups, repair of broken folders."""
 
 from __future__ import annotations
 
@@ -26,10 +27,11 @@ from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build import prepare, status
 from data_preparation.lib.build.lock import BuildLocked, build_lock
-from data_preparation.lib.build.planner import plan_downloads, rows_needed, rows_sufficient
+from data_preparation.lib.build.planner import DownloadPlan, plan_downloads, rows_needed, rows_sufficient
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.download import download as real_download
+from data_preparation.lib.stages.download import download_github_code_group as real_group
 from data_preparation.lib.storage.manifest import Manifest
 
 CfgFactory = Callable[..., DatasetConfig]
@@ -204,6 +206,7 @@ def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_f
 def test_failing_download_stops_the_other_downloads_within_a_shard_and_is_reraised(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """The other downloads stop at their next shard; a download that stopped is never followed by its build."""
     ticks: dict[str, int] = {}
 
     def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
@@ -274,8 +277,8 @@ def test_the_original_error_wins_over_jobs_that_merely_stopped(
 def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_shards(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Ctrl-C while `run_jobs` waits: the flag reaches the running download through `should_stop`, it stops at its
-    next shard (published), `prepare` raises `BuildAborted` and the next run resumes."""
+    """Ctrl-C while `wait_for_jobs` waits: the flag reaches the running download through `should_stop`, it stops at
+    its next shard (published), `prepare` raises `BuildAborted` and the next run resumes."""
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     shards_done: list[int] = []
 
@@ -292,7 +295,7 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
         raise KeyboardInterrupt
 
     monkeypatch.setattr(runner, "download", slow_download)
-    monkeypatch.setattr(runner, "as_completed", interrupted_wait)
+    monkeypatch.setattr(runner, "wait", interrupted_wait)
     path = config_file(cfg)
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(BuildAborted, match="interrupted"):
         prepare(path, layout.root, assume_yes=False)
@@ -300,7 +303,7 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
     assert "source p stopped: interrupted" in caplog.text
     raw = Manifest.load(layout.raw_dir("p"))
     assert raw is not None and raw.rows() == 100 and not layout.processed_dir("p").exists()
-    monkeypatch.setattr(runner, "as_completed", concurrent.futures.as_completed)
+    monkeypatch.setattr(runner, "wait", concurrent.futures.wait)
     monkeypatch.setattr(runner, "download", real_download)
     assert prepare(path, layout.root, assume_yes=False).complete  # resumes behind the published shard
     raw = Manifest.load(layout.raw_dir("p"))
@@ -313,13 +316,259 @@ def test_an_outer_should_stop_is_honoured(cfg_factory: CfgFactory, layout: Datas
         prepare(path, layout.root, assume_yes=False, should_stop=lambda: True)
 
 
-def test_run_jobs_with_no_jobs_is_a_no_op() -> None:
-    runner.run_jobs([], max_workers=1, description="nothing")
+def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+    cfg = _three_sources(cfg_factory)  # no raw folders: nothing pending, and an empty plan: nothing to download
+    runner.download_and_build_missing(DownloadPlan(), cfg, layout, steps=set(runner.STEPS), sources=None, max_parallel_downloads=1, num_workers=1)
+    assert not layout.root.exists()
     flag = runner.StopFlag()
     assert not flag.should_stop()
     flag.stop("first")
     flag.stop("second")
     assert flag.should_stop() and flag.reason == "first"
+
+
+# --- builds overlap the downloads ---------------------------------------------------------------------------------------
+
+
+class _Events:
+    """A thread-safe ordered log of `(what, name)` events from the stubs of a test."""
+
+    def __init__(self) -> None:
+        self.items: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
+
+    def add(self, what: str, name: str) -> None:
+        with self._lock:
+            self.items.append((what, name))
+
+    def index(self, what: str, name: str) -> int:
+        return self.items.index((what, name))
+
+
+def _wait_for(event: threading.Event, should_stop: Any, what: str, timeout: float = 10.0) -> None:
+    """Block a stub until `event` is set, honouring the stop request; a `TimeoutError` instead of a hanging test."""
+    deadline = time.monotonic() + timeout
+    while not event.wait(0.02):
+        check_stop(should_stop)
+        if time.monotonic() > deadline:
+            raise TimeoutError(what)
+
+
+def test_a_source_is_built_while_other_downloads_still_run(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """s1's download does not return before s0 has been built: the build pool works while the download pool runs."""
+    events = _Events()
+    s0_built = threading.Event()
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        manifest = real_download(config, name, *args, should_stop=should_stop, **kwargs)
+        if name == "s1":
+            _wait_for(s0_built, should_stop, "s0 was not built while s1 was still downloading")
+        events.add("download", name)
+        return manifest
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        manifest = real_build(config, name, *args, **kwargs)
+        events.add("build", name)
+        if name == "s0":
+            assert (layout.processed_dir("s0") / "MANIFEST.json").is_file()
+            s0_built.set()
+        return manifest
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    report = prepare(config_file(_three_sources(cfg_factory)), layout.root, assume_yes=False, num_workers=1, max_parallel_downloads=2)
+    assert report.complete
+    assert events.index("build", "s0") < events.index("download", "s1"), events.items
+    assert sorted(events.items) == sorted([(what, f"s{i}") for what in ("download", "build") for i in range(3)])
+
+
+def test_a_source_is_never_built_before_its_own_download_finished(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _Events()
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        time.sleep(0.03 * int(name[1:]))  # s2 finishes last
+        manifest = real_download(config, name, *args, **kwargs)
+        events.add("download_end", name)
+        return manifest
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        events.add("build_start", name)
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    assert prepare(config_file(_three_sources(cfg_factory)), layout.root, assume_yes=False, num_workers=3, max_parallel_downloads=3).complete
+    for name in ("s0", "s1", "s2"):
+        assert events.index("download_end", name) < events.index("build_start", name), events.items
+    assert events.index("build_start", "s0") < events.index("download_end", "s2"), "s0 waited for the slowest download"
+
+
+def test_github_code_group_members_are_built_after_the_group_pass(
+    hub: FakeHub, cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub.add("data/a.parquet", _code_rows("a", 30))
+    hub.add("data/b.parquet", _code_rows("b", 30))
+    events = _Events()
+
+    def group_stub(config: DatasetConfig, names: list[str], *args: Any, **kwargs: Any) -> dict[str, Manifest]:
+        manifests = real_group(config, names, *args, **kwargs)
+        events.add("group_end", ", ".join(names))
+        return manifests
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        events.add("build_start", name)
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "download_github_code_group", group_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    assert prepare(config_file(_github_cfg(cfg_factory, ["Python", "Java", "Go"])), layout.root, assume_yes=False, num_workers=3).complete
+    group_end = events.index("group_end", "code_python, code_java, code_go")
+    assert all(events.index("build_start", name) > group_end for name in ("code_python", "code_java", "code_go")), events.items
+
+
+def test_a_failing_build_stops_the_running_downloads(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The mirror image of the failing-download test: one stop flag for both pools."""
+    ticks: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        if name != "s0":
+            for i in range(100):
+                time.sleep(0.01)
+                with lock:
+                    ticks[name] = i + 1
+                check_stop(should_stop)
+        return real_download(config, name, *args, should_stop=should_stop, **kwargs)
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        time.sleep(0.05)
+        raise RuntimeError(f"{name}: build exploded")
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    path = config_file(_three_sources(cfg_factory))
+    with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(RuntimeError, match="s0: build exploded"):
+        prepare(path, layout.root, assume_yes=False, num_workers=1, max_parallel_downloads=3)
+    assert 0 < ticks["s1"] < 100 and 0 < ticks["s2"] < 100, "the running downloads stopped within a shard"
+    assert "source s0 failed" in caplog.text and "source s1 stopped: source s0 failed" in caplog.text
+
+
+def test_no_build_is_submitted_after_a_failure(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A download that completes after another job failed (it did not poll the flag) is not followed by its build."""
+    started: list[str] = []
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        if name == "s1":
+            time.sleep(0.05)
+            raise OSError("s1: network down")
+        time.sleep(0.3)  # finishes after the failure without ever looking at the flag
+        return real_download(config, name, *args, **kwargs)
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        started.append(name)
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    with pytest.raises(OSError, match="s1: network down"):
+        prepare(config_file(_three_sources(cfg_factory)), layout.root, assume_yes=False, max_parallel_downloads=3)
+    assert started == [] and not layout.processed_dir("s0").exists() and not layout.processed_dir("s2").exists()
+    assert (layout.raw_dir("s0") / "MANIFEST.json").is_file(), "the download that completed is kept"
+
+
+def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resumes(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ctrl-C while a build (s0) and a download (s1) run side by side: both stop at their next shard, everything
+    published is kept, `prepare` raises `BuildAborted`; the next run resumes both."""
+    cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500)
+    build_started = threading.Event()
+    ticks: dict[str, int] = {}
+
+    def tick(name: str, should_stop: Any) -> None:
+        for i in range(50):
+            time.sleep(0.02)
+            ticks[name] = i + 1
+            check_stop(should_stop)
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, rows_needed: int, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        if name == "s0":
+            return real_download(config, name, *args, rows_needed=rows_needed, should_stop=should_stop, **kwargs)
+        manifest = real_download(config, name, *args, rows_needed=100, should_stop=should_stop, **kwargs)  # one shard on disk first
+        tick(name, should_stop)  # then a long download: one "shard" per tick
+        return manifest
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
+        manifest = real_build(config, name, *args, should_stop=should_stop, **kwargs)  # the whole source, published
+        build_started.set()
+        tick(name, should_stop)  # then a long build
+        return manifest
+
+    def interrupted_wait(futures: Any, *, return_when: str) -> Any:
+        if not build_started.is_set():
+            return concurrent.futures.wait(futures, timeout=0.02, return_when=return_when)  # the loop hands s0 to the build pool
+        time.sleep(0.2)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    monkeypatch.setattr(runner, "wait", interrupted_wait)
+    path = config_file(cfg)
+    with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(BuildAborted, match="interrupted"):
+        prepare(path, layout.root, assume_yes=False, num_workers=1, max_parallel_downloads=2)
+    assert 1 <= ticks["s0"] < 50 and 1 <= ticks["s1"] < 50, f"both stopped within a shard of the interrupt: {ticks}"
+    assert "source s0 stopped: interrupted" in caplog.text and "source s1 stopped: interrupted" in caplog.text
+    raw = Manifest.load(layout.raw_dir("s1"))
+    assert raw is not None and raw.rows() == 100 and (layout.processed_dir("s0") / "MANIFEST.json").is_file()
+
+    monkeypatch.setattr(runner, "wait", concurrent.futures.wait)
+    monkeypatch.setattr(runner, "download", real_download)
+    monkeypatch.setattr(runner, "build_source", real_build)
+    assert prepare(path, layout.root, assume_yes=False).complete
+    raw = Manifest.load(layout.raw_dir("s1"))
+    assert raw is not None and [s.rows for s in raw.shards] == [100, rows_needed(cfg, "s1") - 100]  # resumed, not restarted
+
+
+def test_steps_download_only_never_builds_as_a_follow_up(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[str] = []
+    monkeypatch.setattr(runner, "build_source", lambda config, name, *args, **kwargs: built.append(name))
+    report = prepare(config_file(_three_sources(cfg_factory)), layout.root, assume_yes=False, steps=["tokenizer", "download"])
+    assert built == [] and not report.complete and all(source.reason == "processed missing" for source in report.sources)
+
+
+def test_pending_sources_that_need_no_download_are_built_right_away(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _three_sources(cfg_factory)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=False, steps=["tokenizer", "download"])
+    downloaded: list[str] = []
+    built: list[str] = []
+
+    def download_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        downloaded.append(name)
+        return real_download(config, name, *args, **kwargs)
+
+    def build_stub(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        built.append(name)
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "download", download_stub)
+    monkeypatch.setattr(runner, "build_source", build_stub)
+    plan = plan_downloads(cfg, layout)
+    assert plan.total_rows_to_fetch() == 0
+    runner.download_and_build_missing(plan, cfg, layout, steps={"download", "build"}, sources=None, max_parallel_downloads=2, num_workers=2)
+    assert downloaded == [] and sorted(built) == ["s0", "s1", "s2"] and status(path, layout.root).complete
 
 
 # --- lock, dry run, confirmation -----------------------------------------------------------------------------------------
@@ -447,6 +696,7 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
     monkeypatch.setattr(runner, "download", spy_download)
     jobs = runner.download_jobs(plan_downloads(cfg, layout), cfg, layout, None)
     assert [(job.what, job.name) for job in jobs] == [("github_code group", "code_python, code_java, code_go")]
+    assert jobs[0].sources == ("code_python", "code_java", "code_go")
     report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and single == []  # the group pass replaced the per-source downloads
     assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
@@ -532,24 +782,29 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
 def test_prepare_logs_the_stop_reason_of_a_slow_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The build helper has the same stop semantics as the download helper."""
+    """A failing build stops the other running builds at their next shard (the build pool has the download pool's
+    stop semantics). s1 explodes only once s0 and s2 are building — builds start as their downloads finish, so
+    without the gate s2 might still be downloading and be stopped there instead."""
     ticks: dict[str, int] = {}
     lock = threading.Lock()
+    others_building = threading.Event()
 
     def build_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
         if name == "s1":
-            time.sleep(0.05)
+            _wait_for(others_building, should_stop, "s0 and s2 never started building")
             raise RuntimeError("s1: build exploded")
         for i in range(100):
             time.sleep(0.01)
             with lock:
                 ticks[name] = i + 1
+                if len(ticks) == 2:
+                    others_building.set()
             check_stop(should_stop)
         return real_build(config, name, *args, **kwargs)
 
     monkeypatch.setattr(runner, "build_source", build_stub)
     path = config_file(_three_sources(cfg_factory))
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(RuntimeError, match="s1: build exploded"):
-        prepare(path, layout.root, assume_yes=False, num_workers=3)
+        prepare(path, layout.root, assume_yes=False, num_workers=3, max_parallel_downloads=3)
     assert 0 < ticks["s0"] < 100 and 0 < ticks["s2"] < 100
     assert "source s0 stopped: source s1 failed" in caplog.text

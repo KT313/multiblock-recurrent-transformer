@@ -8,7 +8,7 @@
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 
-``prepare`` materialises a dataset config: tokenizer → repair → (download → build) rounds → status table
+``prepare`` materialises a dataset config: tokenizer → repair → (download + build) rounds → status table
 (``lib/build/runner.py``). Stale or outdated raw folders are deleted and downloaded again only after a confirmation
 on the terminal; ``--yes`` answers it, and without a terminal the command prints the list and exits 2 — nothing is
 changed. ``status`` prints what the repair step would do and the status table and exits 0 iff the dataset is

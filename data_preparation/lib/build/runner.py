@@ -1,24 +1,27 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """``prepare`` / ``status``: the top-level data pipeline, readable top to bottom.
 
-``prepare`` = tokenizer → repair → (download → build) rounds → report, under the dataset directory's build lock::
+``prepare`` = tokenizer → repair → (download + build) rounds → report, under the dataset directory's build lock::
 
     prepare_tokenizer                                  tokenizers/<name>/ (downloads count tokens with it)
     repair_broken_and_stale_folders                    truncate broken raw, delete stale processed, confirm before any raw
                                                        folder is deleted (lib/build/repair.py)
     for round in 1..MAX_ROUNDS:
         plan_downloads                                 rows still missing per source (lib/build/planner.py)
-        download_all_missing_rows                      parallel, per-shard resumable, writes sources/<name>/raw only
-        build_all_pending_raw_shards                   parallel, per-shard resumable, writes processed/<name> only
+        download_and_build_missing                     downloads (sources/<name>/raw) and builds (processed/<name>) at the
+                                                       same time: a source is built as soon as its download finished
         stop when every source serves its budget, or when nothing more can be fetched
     summarize_dataset_state                            the status table
 
-The two parallel helpers are the only places with thread-pool code: ``max_parallel_downloads`` download jobs
-(the ``github_code`` sources of one repo form one job, read in a single pass over the repo files) and
-``num_workers`` build jobs run at a time. A failing job stops every running job at its next shard (the steps take
-``should_stop``; :class:`StopFlag`) and is re-raised after they stopped — a failed source is a failed build, never a
-silently smaller dataset. Ctrl-C while waiting does the same and raises :class:`BuildAborted` (``prepare.py`` exits
-130); everything published so far is kept and the next run resumes at shard granularity.
+:func:`download_and_build_missing` is the only place with thread-pool code: a pool of ``max_parallel_downloads``
+download jobs (the ``github_code`` sources of one repo form one job, read in a single pass over the repo files) and
+a pool of ``num_workers`` build jobs run side by side (:class:`JobPool`); the build of a source is submitted from
+the main thread the moment its download job finished, sources with nothing to download are built right away, and a
+source is never built while its own download runs. A failing job stops every running job of both pools at its next
+shard (the steps take ``should_stop``; :class:`StopFlag`) and is re-raised after they stopped — a failed source is
+a failed build, never a silently smaller dataset. Ctrl-C while waiting does the same and raises
+:class:`BuildAborted` (``prepare.py`` exits 130); everything published so far is kept and the next run resumes at
+shard granularity.
 
 ``status`` is read-only: the repair step's dry report ("would repair: …") plus the same status table.
 """
@@ -27,10 +30,11 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 
 from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
@@ -39,6 +43,7 @@ from data_preparation.lib.build.lock import build_lock
 from data_preparation.lib.build.planner import (
     DatasetReport,
     DownloadPlan,
+    build_is_pending,
     every_source_satisfies_its_budget,
     plan_downloads,
     sources_with_pending_raw_shards,
@@ -103,12 +108,11 @@ def prepare(
                 log.info("dry run, downloads planned:\n%s", download_plan.describe(), extra={"keep": True})
                 break
             log.info("round %d: %s", round_number, download_plan.summary())
-            set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download")
-            if "download" in active_steps:
-                download_all_missing_rows(download_plan, config, layout, max_parallel_downloads=max_parallel_downloads, hf_token=hf_token, should_stop=should_stop)
-            set_status(step="build")
-            if "build" in active_steps:
-                build_all_pending_raw_shards(config, layout, num_workers=num_workers, sources=selected, should_stop=should_stop)
+            set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download + build")
+            download_and_build_missing(
+                download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
+                num_workers=num_workers, hf_token=hf_token, should_stop=should_stop,
+            )
             if every_source_satisfies_its_budget(config, layout, sources=selected):
                 break
             if not another_round_can_fetch_more(config, layout, active_steps, selected):
@@ -133,38 +137,52 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     return report
 
 
-# --- the two parallel helpers --------------------------------------------------------------------------------------------
+# --- one round: downloads and builds side by side --------------------------------------------------------------------
 
 
-def download_all_missing_rows(
+def download_and_build_missing(
     download_plan: DownloadPlan,
     config: DatasetConfig,
     layout: DatasetLayout,
     *,
+    steps: set[str],
+    sources: list[str] | None,
     max_parallel_downloads: int,
+    num_workers: int,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
 ) -> None:
-    """Download the rows :func:`plan_downloads` found missing, ``max_parallel_downloads`` sources at a time. The
-    ``github_code`` sources of one repo are one job (:func:`download_github_code_group`: a single pass over the repo
-    files), every other source its own :func:`download` call. Writes ``sources/<name>/raw`` only."""
-    run_jobs(download_jobs(download_plan, config, layout, hf_token), max_workers=max_parallel_downloads, description="downloads", should_stop=should_stop)
+    """One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
+    not all processed yet — at the same time. A pool of ``max_parallel_downloads`` download jobs (the ``github_code``
+    sources of one repo are one job, :func:`download_github_code_group`) and a pool of ``num_workers`` build jobs
+    (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`. Sources with nothing to download
+    are built right away; every other source is built as soon as its download job finished (the members of a
+    ``github_code`` group after the group pass), so a source is never built while its own download runs. ``steps``
+    restricts the round to its download / build part, ``sources`` to the named sources."""
+    downloads = download_jobs(download_plan, config, layout, hf_token) if "download" in steps else []
+    downloading = {name for job in downloads for name in job.sources}
+    pending = sources_with_pending_raw_shards(config, layout, sources) if "build" in steps else []
+    builds = [build_source_job(config, name, layout, num_workers) for name in pending if name not in downloading]
 
+    flag = StopFlag(should_stop)
+    build_pool = JobPool("builds", max_workers=num_workers, flag=flag, total=len(builds) + len(downloading))
 
-def build_all_pending_raw_shards(
-    config: DatasetConfig,
-    layout: DatasetLayout,
-    *,
-    num_workers: int,
-    sources: Iterable[str] | None = None,
-    should_stop: StopCheck | None = None,
-) -> None:
-    """Build every source (all, or ``sources``) whose raw shards are not all covered by its processed manifest,
-    ``num_workers`` sources at a time (:func:`build_source`, resumable per raw shard). Writes ``processed/<name>``
-    only."""
-    names = sources_with_pending_raw_shards(config, layout, sources)
-    jobs = [build_source_job(config, name, layout, num_workers) for name in names]
-    run_jobs(jobs, max_workers=num_workers, description="builds", should_stop=should_stop)
+    def build_when_downloaded(job: Job) -> None:
+        """The follow-up of a finished download job (called in the main thread): build what it fetched."""
+        for name in job.sources:
+            if "build" in steps and build_is_pending(config, name, layout):
+                build_pool.submit(build_source_job(config, name, layout, num_workers))
+            else:
+                build_pool.bar.update(1)  # nothing to build for this source: it counts as done
+
+    download_pool = JobPool("downloads", max_workers=max_parallel_downloads, flag=flag, total=len(downloads), on_success=build_when_downloaded)
+    with download_pool, build_pool:  # the exits wait for the running jobs to stop
+        for job in builds:
+            build_pool.submit(job)
+        for job in downloads:
+            download_pool.submit(job)
+        failures = wait_for_jobs([download_pool, build_pool], flag)
+    raise_first_failure(failures)
 
 
 # --- jobs --------------------------------------------------------------------------------------------------------------
@@ -176,6 +194,7 @@ class Job:
 
     what: str  # "source" | "github_code group" (for the log line on failure)
     name: str
+    sources: tuple[str, ...]  # the source(s) the job writes; a finished download job's sources are built next
     action: Callable[[StopCheck], object]
 
 
@@ -209,21 +228,21 @@ def download_source_job(config: DatasetConfig, name: str, layout: DatasetLayout,
     def action(should_stop: StopCheck) -> object:
         return download(config, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop)
 
-    return Job("source", name, action)
+    return Job("source", name, (name,), action)
 
 
 def github_code_group_job(config: DatasetConfig, names: list[str], layout: DatasetLayout, rows_needed: dict[str, int], hf_token: str | None) -> Job:
     def action(should_stop: StopCheck) -> object:
         return download_github_code_group(config, names, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop)
 
-    return Job("github_code group", ", ".join(names), action)
+    return Job("github_code group", ", ".join(names), tuple(names), action)
 
 
 def build_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, num_workers: int) -> Job:
     def action(should_stop: StopCheck) -> object:
         return build_source(config, name, layout, num_workers=num_workers, should_stop=should_stop)
 
-    return Job("source", name, action)
+    return Job("source", name, (name,), action)
 
 
 # --- running jobs in a pool ---------------------------------------------------------------------------------------------
@@ -248,22 +267,50 @@ class StopFlag:
         return self._event.is_set() or (self._outer is not None and self._outer())
 
 
-def run_jobs(jobs: list[Job], *, max_workers: int, description: str, should_stop: StopCheck | None = None) -> None:
-    """Run ``jobs`` in a thread pool of ``max_workers``. The first failure stops the running jobs at their next
-    shard (:class:`StopFlag`), cancels the jobs not started yet and is re-raised once every job has finished; a
-    ``KeyboardInterrupt`` while waiting does the same and raises :class:`BuildAborted` (published shards are kept).
-    The pool's bar is the summary task of the dashboard panel named ``description`` (the jobs' own bars are its rows)."""
-    if not jobs:
-        return
-    flag = StopFlag(should_stop)
-    running = RunningJobs()
-    with (
-        progress(total=len(jobs), desc=description, unit="job", panel=description, summary=True) as bar,
-        ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=description) as pool,
-    ):
-        futures = {pool.submit(run_job, job, flag, running, bar): job for job in jobs}
-        failures = wait_for_jobs(futures, flag, bar)  # the pool's exit waits for the running jobs to stop
-    raise_first_failure(failures)
+class JobPool:
+    """A thread pool of ``max_workers`` running :class:`Job` objects under a shared :class:`StopFlag`, with the summary
+    bar of the dashboard panel named ``description`` (the jobs' own bars are its rows; ``total`` = the jobs expected).
+    Jobs may be submitted while the pool runs (:meth:`submit`); :func:`wait_for_jobs` waits on :attr:`futures` and
+    calls ``on_success`` (main thread) for every job that finished without an error — where the download pool
+    submits the build of what it fetched. Leaving the ``with`` block waits for the running jobs (they stop at their
+    next shard once the flag is raised), then closes the bar."""
+
+    def __init__(
+        self, description: str, *, max_workers: int, flag: StopFlag, total: int, on_success: Callable[[Job], None] | None = None
+    ) -> None:
+        self.description = description
+        self.flag = flag
+        self.on_success = on_success
+        self.futures: dict[Future[None], Job] = {}
+        self._running = RunningJobs()
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=description)
+        self._bar: Progress | None = None
+        self._total = total
+
+    @property
+    def bar(self) -> Progress:
+        if self._bar is None:
+            raise RuntimeError(f"{self.description}: the pool is not entered")
+        return self._bar
+
+    def submit(self, job: Job) -> None:
+        self.futures[self._executor.submit(run_job, job, self.flag, self._running, self.bar)] = job
+
+    def cancel_queued(self) -> None:
+        """Cancel the jobs not started yet (the running ones stop at their next shard through the flag)."""
+        for future in self.futures:
+            future.cancel()
+
+    def __enter__(self) -> JobPool:
+        self._bar = progress(total=self._total, desc=self.description, unit="job", panel=self.description, summary=True).__enter__()
+        self._executor.__enter__()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
+        try:
+            self._executor.__exit__(exc_type, exc, tb)  # waits for the running jobs
+        finally:
+            self.bar.__exit__(exc_type, exc, tb)
 
 
 class RunningJobs:
@@ -302,32 +349,42 @@ def run_job(job: Job, flag: StopFlag, running: RunningJobs, bar: Progress) -> No
         bar.set_postfix({"running": running.remove(job.name)}, refresh=False)
 
 
-def wait_for_jobs(futures: dict[Future[None], Job], flag: StopFlag, bar: Progress) -> list[BaseException]:
-    """Wait for every future; returns the failures (a ``KeyboardInterrupt`` becomes a :class:`BuildAborted`). Jobs
-    not started yet are cancelled on the first failure or interrupt; the running ones stop at their next shard."""
+def wait_for_jobs(pools: list[JobPool], flag: StopFlag) -> list[BaseException]:
+    """Wait until every job of every pool finished — including the jobs an ``on_success`` follow-up submits while
+    waiting. Returns the failures (a ``KeyboardInterrupt`` becomes a :class:`BuildAborted`). The first failure or
+    interrupt raises the flag (the running jobs of every pool stop at their next shard), cancels the jobs not started
+    yet and ends the follow-ups; the jobs that merely stopped are not collected (their ``BuildAborted`` is implied)."""
     failures: list[BaseException] = []
+    handled: set[Future[None]] = set()
     try:
-        for future in as_completed(futures):
-            if future.cancelled():
-                continue  # never started: cancelled after another job failed
-            error = future.exception()
-            if error is None:
-                bar.update(1)
-                continue
-            flag.stop(f"{futures[future].what} {futures[future].name} failed")
-            cancel_all(futures)
-            failures.append(error)
+        while unhandled := [future for pool in pools for future in pool.futures if future not in handled]:
+            done, _ = wait(unhandled, return_when=FIRST_COMPLETED)
+            for future in done:
+                handled.add(future)
+                pool = next(pool for pool in pools if future in pool.futures)
+                job = pool.futures[future]
+                if future.cancelled():
+                    continue  # never started: cancelled after another job failed
+                error = future.exception()
+                if error is not None:
+                    flag.stop(f"{job.what} {job.name} failed")
+                    cancel_all(pools)
+                    failures.append(error)
+                    continue
+                pool.bar.update(1)
+                if pool.on_success is not None and not flag.should_stop():
+                    pool.on_success(job)
     except KeyboardInterrupt:
         flag.stop("interrupted")
-        cancel_all(futures)
+        cancel_all(pools)
         log.warning("interrupted; the running jobs stop at their next shard, everything published so far is kept")
         failures.append(BuildAborted("interrupted; everything published so far is kept, rerun to resume"))
     return failures
 
 
-def cancel_all(futures: dict[Future[None], Job]) -> None:
-    for future in futures:
-        future.cancel()
+def cancel_all(pools: list[JobPool]) -> None:
+    for pool in pools:
+        pool.cancel_queued()
 
 
 def raise_first_failure(failures: list[BaseException]) -> None:
@@ -402,10 +459,10 @@ __all__ = [
     "STEPS",
     "BuildAborted",
     "Job",
+    "JobPool",
     "StopFlag",
-    "build_all_pending_raw_shards",
-    "download_all_missing_rows",
+    "download_and_build_missing",
     "prepare",
-    "run_jobs",
     "status",
+    "wait_for_jobs",
 ]
