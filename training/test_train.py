@@ -4,6 +4,7 @@ with synthetic data (marked slow), including the golden 20-step run. One optimiz
 evaluation in `test_evaluation.py`."""
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -20,13 +21,14 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data_preparation.lib.build import prepare
+from data_preparation.lib.log import ProgressStreamHandler
 from model import RecurrentConfig, RecurrentGPT
 from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
-from training.logger import Logger
+from training.logger import Logger, TrainingReport
 from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
@@ -178,13 +180,68 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
     assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))
 
 
-def test_main_parses_argv_and_trains(monkeypatch: pytest.MonkeyPatch, tiny_dataset_dir: Path, tmp_path: Path) -> None:
+@pytest.fixture
+def detached_training_handlers() -> Iterator[logging.Logger]:
+    """The `training` logger without the handlers `configure_console_logging` adds (removed again afterwards, so a
+    handler bound to a captured stderr never outlives its test)."""
+    training_logger = logging.getLogger(train_module.TRAINING_LOGGER_NAME)
+    before = list(training_logger.handlers)
+    level = training_logger.level
+    yield training_logger
+    for handler in training_logger.handlers:
+        if handler not in before:
+            training_logger.removeHandler(handler)
+            handler.close()
+    training_logger.setLevel(level)
+
+
+def test_main_parses_argv_trains_and_prints_the_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_dataset_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    detached_training_handlers: logging.Logger,
+) -> None:
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out")
     seen: list[Settings] = []
-    monkeypatch.setattr(train_module, "train", seen.append)
+    report = TrainingReport(
+        run_directory=tmp_path / "out",
+        steps_completed=3,
+        final_step=3,
+        resumed_from=None,
+        setup_seconds=1.0,
+        train_seconds=2.0,
+        last_loss=1.5,
+        last_validation={},
+        checkpoints_written=[],
+        export_dir=None,
+    )
+
+    def fake_train(settings: Settings) -> TrainingReport:
+        seen.append(settings)
+        return report
+
+    monkeypatch.setattr(train_module, "train", fake_train)
     monkeypatch.setattr(sys, "argv", ["train.py", "--config", str(yaml_path), "--seed", "5"])
     train_module.main()
     assert len(seen) == 1 and seen[0].seed == 5 and seen[0].out_dir == str(tmp_path / "out")
+    assert capsys.readouterr().out.strip() == report.summary()
+    assert any(isinstance(h, ProgressStreamHandler) for h in detached_training_handlers.handlers)  # the CLI configured it
+
+
+def test_configure_console_logging_routes_training_records_to_stderr(
+    capsys: pytest.CaptureFixture[str], detached_training_handlers: logging.Logger
+) -> None:
+    """One stderr handler on the `training` logger (idempotent) at INFO, so `RunLogger`'s `training.logger` records
+    reach the terminal in the formatted line format of the data-prep CLI."""
+    training_logger = train_module.configure_console_logging()
+    train_module.configure_console_logging()
+    assert training_logger is detached_training_handlers and training_logger.level == logging.INFO
+    handlers = [h for h in training_logger.handlers if isinstance(h, ProgressStreamHandler)]
+    assert len(handlers) == 1
+    logging.getLogger("training.logger").info("Total training steps: 20 (2 micro-batches each)")
+    err = capsys.readouterr().err
+    assert err.rstrip().endswith("INFO training.logger: Total training steps: 20 (2 micro-batches each)")
 
 
 def test_block_size_mismatch_with_the_dataset_config_raises(tmp_path: Path, tiny_dataset_dir: Path) -> None:
