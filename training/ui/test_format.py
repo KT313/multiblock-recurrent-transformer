@@ -9,6 +9,7 @@ from training.ui.format import (
     TRANSITION_FLAG_KEY,
     TRANSITION_PROGRESS_KEY,
     as_float,
+    event_line,
     fit_panel_heights,
     floats,
     format_duration,
@@ -16,7 +17,9 @@ from training.ui.format import (
     format_tokens,
     known_metrics,
     line,
+    status_line,
     transition_of,
+    validation_line,
 )
 
 
@@ -46,6 +49,13 @@ def test_format_metric() -> None:
     assert format_metric("seconds/step", 0.5) == "0.50s"
     assert format_metric("total_tokens", 2e9) == "2.00B"
     assert format_metric("other", 0.123456) == "0.1235"
+
+
+def test_log_lines_of_the_fallback_and_the_log_file() -> None:
+    assert validation_line(10, {"val_loss_4": 3.25, "val_loss": 3.125, "bad": "x"}) == "step 10: validation val_loss_4 3.2500, val_loss 3.1250"
+    assert validation_line(3, {}) == "step 3: validation (no losses)"
+    assert event_line("saved checkpoint x.pth") == "event: saved checkpoint x.pth"
+    assert status_line("evaluating") == "status: evaluating"
 
 
 def test_fit_panel_heights_shrinks_the_log_panel_first_then_the_events() -> None:

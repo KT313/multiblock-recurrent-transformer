@@ -14,7 +14,16 @@ from typing import TextIO
 
 from training.ui.capture import attach_logger
 from training.ui.common import TRAINING_LOGGER_NAME, Clock, log
-from training.ui.format import METRIC_COLUMNS, floats, format_duration, format_metric, known_metrics, transition_of
+from training.ui.format import (
+    METRIC_COLUMNS,
+    event_line,
+    format_duration,
+    format_metric,
+    known_metrics,
+    status_line,
+    transition_of,
+    validation_line,
+)
 from training.ui.throughput import Throughput
 
 
@@ -25,6 +34,9 @@ class NoOpDashboard:
     ``note_event`` one line each, ``set_status`` a DEBUG line — all through ``logging`` on the ``training.ui.dashboard``
     logger, so :meth:`attach` (and :meth:`open`) decide where they go: the stream, the log file, or both. It captures
     nothing: a piped or ``nohup`` run keeps its plain console.
+
+    The text of the lines comes from :meth:`step_line` and the ``*_line`` functions of :mod:`training.ui.format`; the
+    live dashboard writes the same lines to the log file, so ``train.log`` reads the same under both.
     """
 
     def __init__(
@@ -49,7 +61,7 @@ class NoOpDashboard:
         self.details = dict(details or {})
         self.log_step_interval = max(int(log_step_interval), 1)
         self._stream = stream if stream is not None else sys.stdout
-        self._throughput = Throughput(total_steps, start_step=start_step, clock=clock)
+        self.throughput = Throughput(total_steps, start_step=start_step, clock=clock)  # the live dashboard shares it
 
     @classmethod
     @contextmanager
@@ -91,7 +103,7 @@ class NoOpDashboard:
     ) -> None:
         return None
 
-    def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> AbstractContextManager[None]:
+    def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> AbstractContextManager[logging.FileHandler | None]:
         """Route ``logger`` to the stream (plain lines) and ``log_file`` for the duration of the block. ``logger``
         must be the ``training`` logger or one of its ancestors for the fallback's own lines to reach it."""
         return attach_logger(self, logger, log_file)
@@ -111,28 +123,34 @@ class NoOpDashboard:
             return self.stage_names[stage_index]
         return "?"
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
-        self._throughput.record(step)
+    def step_line(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> str | None:
+        """Record ``step`` for the throughput estimate and return the step's log line — None at a step that is not
+        logged (every ``log_step_interval``\\ th step and the last one are)."""
+        self.throughput.record(step)
         if step % self.log_step_interval and step < self.total_steps:
-            return
+            return None
         parts = [f"step {step}/{self.total_steps}", f"stage {stage_index} {self._stage_name(stage_index)}"]
         transition = transition_of(metrics)
         if transition is not None:
             parts.append(f"transition {transition:.0%}")
         known = known_metrics(metrics)
         parts += [f"{label} {format_metric(key, known[key])}" for key, label in METRIC_COLUMNS if key in known]
-        if "seconds/step" not in known and self._throughput.seconds_per_step is not None:
-            parts.append(f"s/step {self._throughput.seconds_per_step:.2f}s")
-        parts.append(f"elapsed {format_duration(self._throughput.elapsed)}")
-        parts.append(f"ETA {format_duration(self._throughput.remaining(step))}")
-        log.info(" | ".join(parts))
+        if "seconds/step" not in known and self.throughput.seconds_per_step is not None:
+            parts.append(f"s/step {self.throughput.seconds_per_step:.2f}s")
+        parts.append(f"elapsed {format_duration(self.throughput.elapsed)}")
+        parts.append(f"ETA {format_duration(self.throughput.remaining(step))}")
+        return " | ".join(parts)
+
+    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
+        text = self.step_line(step, stage_index, metrics)
+        if text is not None:
+            log.info(text)
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
-        values = ", ".join(f"{key} {value:.4f}" for key, value in floats(losses).items())
-        log.info("step %d: validation %s", step, values or "(no losses)")
+        log.info(validation_line(step, losses))
 
     def note_event(self, text: str) -> None:
-        log.info("event: %s", text)
+        log.info(event_line(text))
 
     def set_status(self, text: str) -> None:
-        log.debug("status: %s", text)
+        log.debug(status_line(text))

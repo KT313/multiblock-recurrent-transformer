@@ -101,8 +101,9 @@ def test_attach_swaps_the_stream_handler_writes_the_log_file_and_restores(tmp_pa
     logger.addHandler(stream_handler)
     log_file = tmp_path / "out" / "train.log"
     try:
-        with attach_logger(sink, logger, log_file):
+        with attach_logger(sink, logger, log_file) as file_handler:
             assert stream_handler not in logger.handlers and len(logger.handlers) == 2
+            assert isinstance(file_handler, logging.FileHandler) and file_handler.baseFilename == str(log_file)
             assert logger.level == logging.INFO, "lowered to INFO for the block: the dashboard lives on INFO records"
             logger.info("inside %d", 1)
             assert sink.texts()[-1].endswith("inside 1")
@@ -120,8 +121,8 @@ def test_attach_restores_handlers_when_the_body_raises() -> None:
     stream_handler = logging.StreamHandler(io.StringIO())
     logger.addHandler(stream_handler)
     try:
-        with pytest.raises(RuntimeError, match="boom"), attach_logger(RecordingSink(), logger, None):
-            assert stream_handler not in logger.handlers
+        with pytest.raises(RuntimeError, match="boom"), attach_logger(RecordingSink(), logger, None) as file_handler:
+            assert stream_handler not in logger.handlers and file_handler is None
             raise RuntimeError("boom")
         assert logger.handlers == [stream_handler]
     finally:

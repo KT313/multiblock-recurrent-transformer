@@ -77,6 +77,20 @@ def test_stage_transition_moves_the_highlight(board: TrainingDashboard) -> None:
     assert "transition" not in text
 
 
+def test_transition_note_survives_steps_without_transition_keys(board: TrainingDashboard) -> None:
+    """With ``log_step_interval > 1`` the transition keys arrive only with a log step's dict; the note stays until a
+    dict says the transition ended or the stage moved on."""
+    board.update_step(18, 0, metrics(18, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}))
+    board.update_step(19, 0, {})  # a non-log step: an empty dict
+    assert "transition → instruct 50%" in board.render_text()
+    board.update_step(20, 0, metrics(20, **{TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}))
+    assert "transition" not in board.render_text(), "the step dict says the transition is over"
+    board.update_step(20, 0, metrics(20, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 1.0}))
+    assert "transition → instruct 100%" in board.render_text()
+    board.update_step(21, 1, {})  # the stage moved on without a word about the transition
+    assert "transition" not in board.render_text() and "▶ instruct" in board.render_text()
+
+
 def test_last_stage_shows_no_transition_note(board: TrainingDashboard) -> None:
     board.update_step(29, 1, metrics(29, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.9}))
     assert "transition" not in board.render_text()

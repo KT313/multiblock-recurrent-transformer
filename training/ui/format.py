@@ -109,6 +109,22 @@ def transition_of(metrics: Mapping[str, object]) -> float | None:
     return 0.0 if progress is None else progress
 
 
+def validation_line(step: int, losses: Mapping[str, object]) -> str:
+    """The log line of a validation: ``step 10: validation val_loss_4 3.2500, val_loss 3.1250``."""
+    values = ", ".join(f"{key} {value:.4f}" for key, value in floats(losses).items())
+    return f"step {step}: validation {values or '(no losses)'}"
+
+
+def event_line(text: str) -> str:
+    """The log line of an event: ``event: saved checkpoint ...``."""
+    return f"event: {text}"
+
+
+def status_line(text: str) -> str:
+    """The (DEBUG) log line of a status change: ``status: evaluating``."""
+    return f"status: {text}"
+
+
 def line(text: str, style: str = "") -> Text:
     """One terminal row: never wraps, cropped with an ellipsis; markup in ``text`` is not interpreted."""
     return Text(text, style=style, no_wrap=True, overflow="ellipsis")

@@ -17,10 +17,22 @@ from training.ui.dashboard import (
     TRANSITION_FLAG_KEY,
     TRANSITION_PROGRESS_KEY,
     NoOpDashboard,
+    RunDashboard,
     TrainingDashboard,
     training_dashboard,
 )
-from training.ui.testing import BOX_CHARACTERS, LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, metrics, screen_text, string_console
+from training.ui.testing import (
+    BOX_CHARACTERS,
+    LOGGER_NAME,
+    STAGES,
+    STEPS,
+    TOTAL,
+    FakeClock,
+    console_output,
+    metrics,
+    screen_text,
+    string_console,
+)
 
 
 def test_factory_picks_the_fallback_when_disabled(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
@@ -146,6 +158,9 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
     log_text = log_file.read_text()
     assert "Total training steps: 30" in log_text and "Training finished after 30 steps" in log_text
     assert "a stray print from somewhere" in log_text and "a bare stderr write" in log_text
+    assert "step 5/30 | stage 0 pretrain | loss 3.7500" in log_text and "step 20/30 | stage 0 pretrain | transition 100%" in log_text
+    assert "step 30: validation val_loss_4 3.5000, val_loss 3.4000" in log_text and "event: exported HuggingFace model" in log_text
+    assert "step 5/30" not in console_output(console) and "event: " not in console_output(console), "the fallback's lines: the file only"
     assert board._live is None
     screen = screen_text(console, 120)
     assert not any(character in screen for character in BOX_CHARACTERS), screen
@@ -155,3 +170,84 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
     assert screen.count("overall") == 1 and screen.count("grad norm") == 1 and screen.count("30/30") == 1, screen
     assert screen.index("Training finished") < screen.index("overall"), "kept lines first, then the summary"
     assert screen.rstrip().splitlines()[-1].endswith("exported HuggingFace model to outputs/tiny/hf_export")
+
+
+# --- the log file under both dashboards --------------------------------------------------------------------------------------
+
+
+def _drive_scripted_run(board: RunDashboard, clock: FakeClock, logger: logging.Logger) -> None:
+    """The same calls on either dashboard, the way ``RunLogger`` makes them: the metric dict (with the transition
+    keys) at log steps only, ``{}`` at the others, validations, events and two records of the attached logger."""
+    board.note_event("no checkpoint found, starting from scratch")
+    logger.info("Total training steps: %d", TOTAL, extra={"keep": True})
+    board.set_status("training")
+    for step in range(1, TOTAL + 1):
+        clock.advance(0.5)
+        stage_index = 0 if step <= STEPS[0] else 1
+        if step % 5:
+            board.update_step(step, stage_index, {})
+            continue
+        in_transition = 18 <= step <= 20
+        transition = {TRANSITION_FLAG_KEY: float(in_transition), TRANSITION_PROGRESS_KEY: (step - 18) / 2 if in_transition else 0.0}
+        board.update_step(step, stage_index, metrics(step, loss=4.0 - step * 0.05) | transition)
+        if step % 10 == 0:
+            board.update_validation(step, {"val_loss_4": 3.5, "val_loss": 3.4})
+        if step == 20:
+            board.note_event("saved checkpoint outputs/tiny/checkpoints/step-00000020-tiny-stage-0_end.pth")
+    board.note_event("exported HuggingFace model to outputs/tiny/hf_export")
+    logger.warning("Training finished after %d steps", TOTAL)
+
+
+# what the scripted run leaves in `train.log` (message part, in order; the step lines checked by their prefix)
+_EXPECTED_LOG_MESSAGES = [
+    "event: no checkpoint found, starting from scratch",
+    "Total training steps: 30",
+    "step 5/30 | stage 0 pretrain | loss 3.7500 | ppl",
+    "step 10/30 | stage 0 pretrain | loss 3.5000 | ppl",
+    "step 10: validation val_loss_4 3.5000, val_loss 3.4000",
+    "step 15/30 | stage 0 pretrain | loss 3.2500 | ppl",
+    "step 20/30 | stage 0 pretrain | transition 100% | loss 3.0000 | ppl",
+    "step 20: validation val_loss_4 3.5000, val_loss 3.4000",
+    "event: saved checkpoint outputs/tiny/checkpoints/step-00000020-tiny-stage-0_end.pth",
+    "step 25/30 | stage 1 instruct | loss 2.7500 | ppl",
+    "step 30/30 | stage 1 instruct | loss 2.5000 | ppl",
+    "step 30: validation val_loss_4 3.5000, val_loss 3.4000",
+    "event: exported HuggingFace model to outputs/tiny/hf_export",
+    "Training finished after 30 steps",
+]
+
+
+def test_live_dashboard_writes_the_fallback_lines_to_the_log_file_only(tmp_path: Path, clock: FakeClock) -> None:
+    logger = logging.getLogger("training")  # as in a run: the fallback's lines are logged under `training`
+    console = string_console(120, height=40)
+    log_file = tmp_path / "train.log"
+    with training_dashboard("tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, enabled=True, console=console, clock=clock) as board:
+        assert isinstance(board, TrainingDashboard)
+        _drive_scripted_run(board, clock, logger)
+        panel = board.lines()
+    messages = [line.split(": ", 1)[1] for line in log_file.read_text().splitlines() if "training.ui.dashboard: status:" not in line]
+    assert len(messages) == len(_EXPECTED_LOG_MESSAGES), messages
+    for message, expected in zip(messages, _EXPECTED_LOG_MESSAGES):
+        assert message.startswith(expected), (message, expected)
+    assert all("INFO training.ui.dashboard: step 5/30" in line for line in log_file.read_text().splitlines() if "step 5/30" in line)
+    raw = console_output(console)
+    for text in ("step 5/30", "step 30/30", "validation val_loss_4", "event: "):
+        assert text not in raw and not any(text in line for line in panel), f"{text!r} reached the terminal or the panel"
+
+
+def test_live_and_fallback_dashboards_write_identical_log_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(time, "time", lambda: 1_756_000_000.0)  # `logging` stamps records with `time.time`: one asctime in both
+    logger = logging.getLogger("training")
+    files: dict[str, bytes] = {}
+    for name, enabled in (("live", True), ("fallback", False)):
+        clock = FakeClock()
+        log_file = tmp_path / f"{name}.log"
+        with training_dashboard(
+            "tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, enabled=enabled,
+            console=string_console(120, height=40), stream=io.StringIO(), clock=clock,
+        ) as board:
+            assert isinstance(board, TrainingDashboard if enabled else NoOpDashboard)
+            _drive_scripted_run(board, clock, logger)
+        files[name] = log_file.read_bytes()
+    assert files["live"] == files["fallback"]
+    assert files["live"].count(b"\n") >= len(_EXPECTED_LOG_MESSAGES) and b"step 20/30 | stage 0 pretrain | transition 100%" in files["live"]

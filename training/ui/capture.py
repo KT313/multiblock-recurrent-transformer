@@ -94,15 +94,17 @@ class DashboardLogHandler(logging.Handler):
 
 
 @contextmanager
-def attach_logger(sink: LogSink, logger: logging.Logger, log_file: Path | None) -> Iterator[None]:
+def attach_logger(sink: LogSink, logger: logging.Logger, log_file: Path | None) -> Iterator[logging.FileHandler | None]:
     """Route ``logger`` into ``sink`` for the duration of the block (the body of both dashboards' ``attach``).
 
     The plain stream handlers a CLI installed are detached (their lines would print twice and garble the live
     display) and restored afterwards; with ``log_file`` every record is also appended to that file. A logger whose
     effective level is above INFO is lowered to INFO for the block — the dashboard lives on INFO records — and
-    restored afterwards."""
+    restored afterwards. Yields the file handler (None without ``log_file``): the live dashboard hands it the lines
+    the fallback would log (step, validation, event), so they reach the file and only the file."""
     detached: list[logging.Handler] = [h for h in logger.handlers if _is_console_handler(h)]
     added: list[logging.Handler] = [DashboardLogHandler(sink)]
+    file_handler: logging.FileHandler | None = None
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
@@ -116,7 +118,7 @@ def attach_logger(sink: LogSink, logger: logging.Logger, log_file: Path | None) 
     if logger.getEffectiveLevel() > logging.INFO:
         logger.setLevel(logging.INFO)
     try:
-        yield
+        yield file_handler
     finally:
         logger.setLevel(previous_level)
         for handler in added:

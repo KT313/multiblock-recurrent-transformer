@@ -57,6 +57,14 @@ def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
     assert "step 30/30 | stage 5 ?" in output and "step 30: validation (no losses)" in output
 
 
+def test_step_line_is_none_off_the_interval_and_records_the_throughput(clock: FakeClock) -> None:
+    b = NoOpDashboard("r", STAGES, STEPS, TOTAL, log_step_interval=5, clock=clock)
+    clock.advance(2)
+    assert b.step_line(1, 0, {}) is None and b.throughput.seconds_per_step == 2.0
+    clock.advance(8)
+    assert b.step_line(5, 0, {"loss": 2.0}) == "step 5/30 | stage 0 pretrain | loss 2.0000 | s/step 2.00s | elapsed 0:00:10 | ETA 0:00:50"
+
+
 def test_fallback_rejects_mismatched_stage_lists() -> None:
     with pytest.raises(ValueError, match="2 stage names for 1 step counts"):
         NoOpDashboard("r", STAGES, [5], 5)

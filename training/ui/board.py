@@ -30,15 +30,18 @@ from training.ui.common import TRAINING_LOGGER_NAME, Clock, log
 from training.ui.fallback import NoOpDashboard
 from training.ui.format import (
     METRIC_COLUMNS,
+    TRANSITION_FLAG_KEY,
+    event_line,
     fit_panel_heights,
     floats,
     format_duration,
     format_metric,
     known_metrics,
     line,
+    status_line,
     transition_of,
+    validation_line,
 )
-from training.ui.throughput import Throughput
 
 DEFAULT_LOG_LINES = 12
 DEFAULT_EVENT_LINES = 6
@@ -70,6 +73,10 @@ class TrainingDashboard:
     methods delegate to a :class:`NoOpDashboard` built from the same arguments (the console fallback) and
     :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run.
     ``final_frame`` prints the static summary once the display closed.
+
+    The log file :meth:`attach` is given receives the lines the fallback would log (one per ``log_step_interval``
+    steps, one per validation, one per event) through :meth:`_log_line` — the file handler alone, never the panel or
+    the terminal — so ``train.log`` reads the same whichever dashboard the run had.
     """
 
     def __init__(
@@ -111,7 +118,8 @@ class TrainingDashboard:
         self._console = console if console is not None else Console(file=self._stream)
         self._refresh_per_second = refresh_per_second
         self._final_frame = final_frame
-        self._throughput = Throughput(total_steps, start_step=start_step, clock=clock)
+        # one estimate for the bars' ETA and the fallback's lines; it also carries on if the display gets disabled
+        self._throughput = self._fallback.throughput
         self._lock = threading.RLock()  # every mutation (loop thread) and every render (Live thread)
         self._log_lines = log_lines
         self._lines: deque[str] = deque(maxlen=log_lines)
@@ -120,9 +128,11 @@ class TrainingDashboard:
         self._status = "starting"
         self._step = start_step
         self._stage_index = 0
+        self._transition: float | None = None  # progress of the running stage transition (the bar note), else None
         self._latest: dict[str, float] = {}
         self._validation: tuple[int, dict[str, float]] | None = None
         self._log_file: Path | None = None
+        self._file_handler: logging.Handler | None = None  # the log file's handler while attached: `_log_line` feeds it
         self._render_error: BaseException | None = None  # set on the Live thread, handled on the caller's thread
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
@@ -131,7 +141,7 @@ class TrainingDashboard:
         self._open = False
         self._attached: list[str] = []
         self._capture = TerminalCapture(self, skip=self.is_attached)
-        self._refresh_bars(start_step, 0, None)
+        self._refresh_bars(start_step, 0)
 
     @classmethod
     @contextmanager
@@ -315,15 +325,20 @@ class TrainingDashboard:
 
     def _apply_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
         known = known_metrics(metrics)
-        transition = transition_of(metrics)
         with self._lock:
-            self._throughput.record(step)
+            if TRANSITION_FLAG_KEY in metrics:
+                self._transition = transition_of(metrics)  # the step dict says: in a transition (its progress) or not
+            elif stage_index != self._stage_index:
+                self._transition = None  # a step dict without the keys (a non-log step), but the stage moved on
             self._step = step
             self._stage_index = stage_index
             self._latest.update(known)
-            self._refresh_bars(step, stage_index, transition)
+            self._refresh_bars(step, stage_index)
+            file_line = self._fallback.step_line(step, stage_index, metrics)  # also records the throughput
+        if file_line is not None:
+            self._log_line(logging.INFO, file_line)
 
-    def _refresh_bars(self, step: int, stage_index: int, transition: float | None) -> None:
+    def _refresh_bars(self, step: int, stage_index: int) -> None:
         last = len(self._bars) - 1
         for index, (bar, start) in enumerate(zip(self._bars, self._stage_starts)):
             bar.completed = min(max(step - start, 0), bar.total)
@@ -334,22 +349,34 @@ class TrainingDashboard:
             else:
                 bar.marker, bar.style = "  ", "dim"
             bar.note = ""
-            if index == stage_index and transition is not None and index < last:
-                bar.note = f"transition → {self.stage_names[index + 1]} {transition:.0%}"
+            if index == stage_index and self._transition is not None and index < last:
+                bar.note = f"transition → {self.stage_names[index + 1]} {self._transition:.0%}"
         self._overall.completed = min(step, self.total_steps)
 
     def _apply_validation(self, step: int, losses: Mapping[str, object]) -> None:
         with self._lock:
             self._validation = (step, floats(losses))
+        self._log_line(logging.INFO, validation_line(step, losses))
 
     def _apply_event(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         with self._lock:
             self._events.append(f"{stamp}  step {self._step}: {text}")
+        self._log_line(logging.INFO, event_line(text))
 
     def _apply_status(self, text: str) -> None:
         with self._lock:
             self._status = text
+        self._log_line(logging.DEBUG, status_line(text))
+
+    def _log_line(self, level: int, message: str) -> None:
+        """The line the fallback would log, as a record of the ``training.ui.dashboard`` logger handed to the log
+        file's handler directly: it never passes a logger, so no other handler (the panel, the root capture) sees it.
+        Dropped when no log file is attached or the logger would not emit at ``level`` (the DEBUG status lines)."""
+        handler = self._file_handler
+        if handler is None or not log.isEnabledFor(level):
+            return
+        handler.handle(log.makeRecord(log.name, level, __file__, 0, message, (), None))
 
     # --- log lines ----------------------------------------------------------------------------------------------------
 
@@ -380,11 +407,15 @@ class TrainingDashboard:
             if log_file is not None:
                 self._log_file = log_file
         try:
-            with attach_logger(self, logger, log_file):
+            with attach_logger(self, logger, log_file) as file_handler:
+                if file_handler is not None:
+                    self._file_handler = file_handler
                 yield
         finally:
             with self._lock:
                 self._attached.remove(logger.name)
+                if log_file is not None:
+                    self._file_handler = None  # closed by `attach_logger`
 
     # --- state for tests ------------------------------------------------------------------------------------------------
 

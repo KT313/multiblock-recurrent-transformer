@@ -71,6 +71,7 @@ def _run_demo_in_pty(*, width: int, height: int, seconds: float, interrupt_after
     output = bytearray()
     deadline = time.monotonic() + timeout
     interrupt_at: float | None = None
+    interrupted = False  # exactly one SIGINT (as `training/test_train.py`): a second one would end the demo with a traceback
     while True:
         ready, _, _ = select.select([fd], [], [], 0.1)
         if ready:
@@ -81,11 +82,11 @@ def _run_demo_in_pty(*, width: int, height: int, seconds: float, interrupt_after
             if not chunk:
                 break
             output += chunk
-            if interrupt_after is not None and interrupt_at is None and b"overall" in output:  # the first frame is up
-                interrupt_at = time.monotonic() + interrupt_after
+            if interrupt_after is not None and not interrupted and interrupt_at is None and b"overall" in output:
+                interrupt_at = time.monotonic() + interrupt_after  # the first frame is up
         if interrupt_at is not None and time.monotonic() > interrupt_at:
             os.kill(pid, signal.SIGINT)
-            interrupt_at = None
+            interrupt_at, interrupted = None, True
         if time.monotonic() > deadline:
             os.kill(pid, signal.SIGKILL)
             break
