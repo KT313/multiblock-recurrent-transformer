@@ -20,6 +20,7 @@ from training.data.loader import (
     build_stage_dataloaders,
     length_sorted_batches,
     sample_stage_batch,
+    supervised_length,
 )
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings, parse_settings
@@ -421,6 +422,31 @@ def test_length_sorted_loss_is_unchanged_by_trimming(tokenizer: Tokenizer, entri
         return sorted((hash(d), lab[lab != -100].tolist()) for _, labs, ids in batches for lab, d in zip(labs, ids))
 
     assert supervised(out) == supervised(raw)
+
+
+def _prompt_masked_batch(prompt: int, answer: int, width: int, tag: int) -> Batch:
+    """An instruct-shaped row: `prompt` masked positions, then `answer` supervised ones, then padding."""
+    inp = torch.full((1, width), 0)
+    labels = torch.full((1, width), -100)
+    inp[0, : prompt + answer] = tag
+    labels[0, prompt : prompt + answer] = tag + 1000
+    return inp, labels, [f"d{tag}"]
+
+
+def test_supervised_length_is_the_position_after_the_last_label() -> None:
+    assert supervised_length(torch.tensor([-100, -100, 7, 8, -100])) == 4
+    assert supervised_length(torch.tensor([5, 6, -100, -100])) == 2
+    assert supervised_length(torch.tensor([-100, -100])) == 0
+
+
+def test_length_sorted_keeps_the_labels_of_prompt_masked_rows() -> None:
+    """Regression: the width was the *count* of supervised labels, which cut the answers off long-prompt rows."""
+    batches = [_prompt_masked_batch(200, 12, 256, 1), _prompt_masked_batch(150, 30, 256, 2)]
+    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100, padding_multiple=128))
+    assert [o[0].shape for o in out] == [(2, 256)]
+    supervised_before = sorted(int((lab != -100).sum()) for _, labs, _ in batches for lab in labs)
+    supervised_after = sorted(int((lab != -100).sum()) for _, labs, _ in out for lab in labs)
+    assert supervised_after == supervised_before == [12, 30]
 
 
 def test_package_exports_resolve() -> None:

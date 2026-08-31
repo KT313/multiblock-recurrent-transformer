@@ -144,6 +144,13 @@ def _fit(row: torch.Tensor, width: int, fill: int) -> torch.Tensor:
     return torch.cat([row, row.new_full((width - row.shape[0],), fill)])
 
 
+def supervised_length(labels: torch.Tensor, ignore_index: int = IGNORE_INDEX) -> int:
+    """Position after the last supervised label of a 1-D ``labels`` row (0 when every label is ``ignore_index``).
+    Trimming a row here keeps every supervised position, also when a masked prompt precedes them."""
+    supervised = (labels != ignore_index).nonzero()
+    return int(supervised.max()) + 1 if supervised.numel() else 0
+
+
 def length_sorted_batches(
     batches: Iterable[Batch],
     micro_batch_size: int,
@@ -153,10 +160,11 @@ def length_sorted_batches(
 ) -> Iterator[Batch]:
     """Regroup every ``accumulation_steps`` micro-batches (one world batch) into micro-batches sorted by length.
 
-    A sample's length is its number of supervised positions (``labels != ignore_index``); ``input_ids`` cannot be
-    used because ``collate_fn`` has already replaced padding by EOS. Every re-grouped micro-batch is trimmed to its
-    longest sample (rounded up to ``padding_multiple``), which is where the compute saving comes from. Positions
-    beyond a sample's length carry only ignore-index labels, so the loss is unchanged.
+    A sample's length is the position after its last supervised label (``labels != ignore_index``) — not the count
+    of supervised positions: an instruct row masks its prompt, so its labels sit at the end of the row. ``input_ids``
+    cannot be used because ``collate_fn`` has already replaced padding by EOS. Every re-grouped micro-batch is trimmed
+    to its longest sample (rounded up to ``padding_multiple``), which is where the compute saving comes from.
+    Positions beyond a sample's length carry only ignore-index labels, so the loss is unchanged.
     """
     buffer: list[Batch] = []
 
@@ -164,7 +172,7 @@ def length_sorted_batches(
         samples: list[tuple[torch.Tensor, torch.Tensor, str, int]] = []
         for input_ids, labels, data_ids in buffer:
             for i in range(input_ids.shape[0]):
-                samples.append((input_ids[i], labels[i], data_ids[i], int((labels[i] != ignore_index).sum())))
+                samples.append((input_ids[i], labels[i], data_ids[i], supervised_length(labels[i], ignore_index)))
         samples.sort(key=lambda s: s[3])
         for start in range(0, len(samples), micro_batch_size):
             chunk = samples[start : start + micro_batch_size]
