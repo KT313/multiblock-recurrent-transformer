@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 
 class GatedMLP(torch.nn.Module):
+    """`proj(silu(gate(x)) * up(x))`; `fc` computes gate and up in one matmul (gate = first half of its rows)."""
+
     def __init__(self, config: RecurrentConfig) -> None:
         super().__init__()
         intermediate_size = config.intermediate_size
@@ -25,7 +27,7 @@ class GatedMLP(torch.nn.Module):
         self.nonlin = torch.nn.SiLU()
 
     def forward(self, x: Tensor) -> Tensor:
-        x_fc_1, x_fc_2 = self.fc(x).chunk(2, dim=-1)
-        x = self.nonlin(x_fc_1) * x_fc_2
-        y: Tensor = self.proj(x)
-        return y
+        gate, up = self.fc(x).chunk(2, dim=-1)  # each (..., intermediate_size)
+        hidden = self.nonlin(gate) * up
+        out: Tensor = self.proj(hidden)
+        return out

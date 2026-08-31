@@ -6,15 +6,20 @@ import torch
 
 
 class RMSNorm(torch.nn.Module):
+    """`x / rms(x) * weight` over the last dimension, with `rms(x) = sqrt(mean(x^2) + eps)`."""
+
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """The normalization without the learned weight."""
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Normalize in float32 (autocast off, so a half-precision `x` does not underflow in `x^2`), cast back to the
+        # input dtype, then scale by the weight. This op order is part of the pinned numerics.
         with torch.autocast(enabled=False, device_type=x.device.type):
             return self._norm(x.float()).type_as(x) * self.weight
 
