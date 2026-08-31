@@ -4,24 +4,25 @@ import math
 import random
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, TypeVar
 
 import pyarrow.parquet as pq
 import pytest
 import torch
 
 from training.backend import SingleDeviceBackend
-from training.data.collate import IGNORE_INDEX, find_multiple
+from training.data.collate import IGNORE_INDEX, Batch, Sample, collate_samples
 from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
 from training.data.loader import (
-    Batch,
+    SampleBatch,
     StageDataloaders,
     build_dataloader,
     build_stage_dataloaders,
-    length_sorted_batches,
+    sample_length,
     sample_stage_batch,
-    supervised_length,
+    world_batch_micro_batches,
 )
+from training.data.datasets import ParquetTextDataset
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings, parse_settings
 
@@ -38,7 +39,10 @@ def entries(tiny_pretrain_dir: Path, tiny_instruct_dir: Path) -> list[DataEntry]
     ]
 
 
-def _batches(loader: Iterable[Batch], n: int) -> list[Batch]:
+T = TypeVar("T")
+
+
+def _batches(loader: Iterable[T], n: int) -> list[T]:
     return list(itertools.islice(iter(loader), n))
 
 
@@ -124,8 +128,8 @@ def test_single_spec_batches(tokenizer: Tokenizer, entries: list[DataEntry], tin
     assert len(list(loader)) == math.ceil(_rows_in(tiny_pretrain_dir) / 4)
 
 
-# Mixtures with the instruct folder use a block size no instruct prompt can fill: `collate_fn` ends the loader on a
-# batch without a single supervised label, and the processed instruct rows are only bounded by max_seq_length (256).
+# Mixtures with the instruct folder use a block size no instruct prompt can fill, so no row is dropped for lack of a
+# supervised label; the processed instruct rows are only bounded by max_seq_length (256).
 MIXTURE_BLOCK_SIZE = 128
 
 
@@ -174,6 +178,19 @@ def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: lis
     assert _same(a, b)
 
 
+def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
+    """Regression (T-M4): a row with no supervised label used to raise `StopIteration` out of the collate function,
+    which torch's worker loop reads as 'this worker is done' and the single-process loop as 'restart at row 0'. At
+    `block_size` 16 most instruct prompts alone fill the window; the loader still walks its whole epoch."""
+    rows = list(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)))
+    kept = len(collate_samples(rows, tokenizer, block_size=16))
+    assert 0 < kept < len(rows), "the fixture must drop some rows and keep others"
+    entry = DataEntry("ft", str(tiny_instruct_dir), data_signature=INSTRUCT_SIGNATURE)
+    for num_workers in (0, 2):
+        loader = build_dataloader([entry], tokenizer, 16, 4, num_workers=num_workers, padded=False)
+        assert sum(len(batch) for batch in loader) == kept
+
+
 def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
     full = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1)]
     r0 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(0, 2))]
@@ -191,17 +208,24 @@ def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
 
 def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
     """One train and one validation loader per stage of the tiny dataset, tokenizer loaded from the resolved
-    directory, validation loaders restricted to the held-out rows of the split."""
+    directory, train loaders unpadded, validation loaders padded and restricted to the held-out rows of the split."""
     dataset: ResolvedDataset = resolve_dataset(tiny_settings)
     loaders = build_stage_dataloaders(tiny_settings, dataset, SingleDeviceBackend(device="cpu", precision="32"))
     assert isinstance(loaders, StageDataloaders)
     assert len(loaders.train_loaders) == len(loaders.val_loaders) == len(dataset.stages) == 3
-    input_ids, labels, data_ids = loaders.next_train_batch(0)
-    assert input_ids.shape[0] == tiny_settings.micro_batch_size and input_ids.shape == labels.shape
-    # collate pads to a multiple of sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
+    assert loaders.tokenizer.path == Path(dataset.tokenizer_dir)
+    samples = loaders.next_train_batch(0)
+    assert len(samples) == tiny_settings.micro_batch_size
+    assert [s[2] for s in samples] == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
+    for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
+        assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
+    input_ids, labels, _ = world_batch_micro_batches(
+        samples, tiny_settings.micro_batch_size, tokenizer, tiny_settings.block_size, sort_by_length=True,
+        padding_multiple=tiny_settings.sequence_padding_multiple,
+    )[0]
+    # padding rounds up to sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
     assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.block_size
     assert input_ids.shape[1] <= tiny_settings.block_size
-    assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
     assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
     assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
@@ -214,47 +238,51 @@ def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) 
 # --- StageDataloaders / sample_stage_batch ---------------------------------------------------------------------------
 
 
-def _tagged(tag: str, n: int) -> list[Batch]:
-    """A finite 'loader' yielding n batches tagged with `tag`."""
-    return [(torch.full((1, 2), i), torch.full((1, 2), i), [tag]) for i in range(n)]
+def _tagged(tag: str, n: int) -> list[SampleBatch]:
+    """A finite 'loader' yielding n one-sample worker batches tagged with `tag`."""
+    return [[(torch.full((2,), i), torch.full((2,), i), tag)] for i in range(n)]
 
 
-def test_next_train_batch_cycles_on_exhaustion() -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 3), _tagged("s1", 2)], val_loaders=[])
-    got = [sd.next_train_batch(0)[0][0, 0].item() for _ in range(7)]
-    assert got == [0, 1, 2, 0, 1, 2, 0]
-    assert sd.next_train_batch(1)[2] == ["s1"]
+def _first(batch: SampleBatch) -> int:
+    """The counter value of a `_tagged` worker batch."""
+    return int(batch[0][0][0])
+
+
+def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 3), _tagged("s1", 2)], [], tokenizer)
+    assert [_first(sd.next_train_batch(0)) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
+    assert [s[2] for s in sd.next_train_batch(1)] == ["s1"]
     assert sd._train_iterators[0] is not None and sd._train_iterators[1] is not None
 
 
-def test_post_init_creates_one_slot_per_train_loader() -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 1), _tagged("s1", 1), _tagged("s2", 1)], val_loaders=[])
+def test_post_init_creates_one_slot_per_train_loader(tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 1), _tagged("s1", 1), _tagged("s2", 1)], [], tokenizer)
     assert sd._train_iterators == [None, None, None]
-    assert StageDataloaders(train_loaders=[], val_loaders=[])._train_iterators == []
+    assert StageDataloaders([], [], tokenizer)._train_iterators == []
 
 
-def test_iterators_are_lazy_and_independent() -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 3), _tagged("s1", 3)], val_loaders=[])
+def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 3), _tagged("s1", 3)], [], tokenizer)
     assert sd._train_iterators == [None, None]
     sd.next_train_batch(1)
     assert sd._train_iterators[0] is None
-    assert sd.next_train_batch(1)[0][0, 0].item() == 1
-    assert sd.next_train_batch(0)[0][0, 0].item() == 0
+    assert _first(sd.next_train_batch(1)) == 1
+    assert _first(sd.next_train_batch(0)) == 0
 
 
-def test_sample_stage_batch_outside_transition_is_current() -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 5), _tagged("s1", 5)], val_loaders=[])
+def test_sample_stage_batch_outside_transition_is_current(tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
     rng = random.Random(0)
     for p in (0.0, 0.5, 1.0):
-        assert sample_stage_batch(sd, 1, None, p, rng)[2] == ["s1"]
+        assert [s[2] for s in sample_stage_batch(sd, 1, None, p, rng)] == ["s1"]
 
 
 @pytest.mark.parametrize("progress", [0.0, 0.25, 0.8, 1.0])
-def test_sample_stage_batch_bernoulli_frequency(progress: float) -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 5), _tagged("s1", 5)], val_loaders=[])
+def test_sample_stage_batch_bernoulli_frequency(progress: float, tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
     rng = random.Random(123)
     n = 4000
-    tags = Counter(sample_stage_batch(sd, 1, 0, progress, rng)[2][0] for _ in range(n))
+    tags = Counter(sample_stage_batch(sd, 1, 0, progress, rng)[0][2] for _ in range(n))
     assert tags["s1"] / n == pytest.approx(progress, abs=0.03)
     if progress in (0.0, 1.0):
         assert len(tags) == 1
@@ -271,182 +299,141 @@ class _ScriptedRandom(random.Random):
         return next(self._values)
 
 
-def test_sample_stage_batch_bernoulli_exact_boundary() -> None:
+def test_sample_stage_batch_bernoulli_exact_boundary(tokenizer: Tokenizer) -> None:
     """Draw u; next stage iff u < progress (so u == progress stays on the previous stage)."""
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 9), _tagged("s1", 9)], val_loaders=[])
+    sd = StageDataloaders([_tagged("s0", 9), _tagged("s1", 9)], [], tokenizer)
     rng = _ScriptedRandom([0.1, 0.5, 0.49999, 0.9, 0.0])
-    tags = [sample_stage_batch(sd, 1, 0, 0.5, rng)[2][0] for _ in range(5)]
+    tags = [sample_stage_batch(sd, 1, 0, 0.5, rng)[0][2] for _ in range(5)]
     assert tags == ["s1", "s0", "s1", "s0", "s1"]
 
 
-def test_sample_stage_batch_consumes_rng_only_in_transition() -> None:
-    sd = StageDataloaders(train_loaders=[_tagged("s0", 5), _tagged("s1", 5)], val_loaders=[])
+def test_sample_stage_batch_consumes_rng_only_in_transition(tokenizer: Tokenizer) -> None:
+    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
     rng = random.Random(0)
     state = rng.getstate()
     sample_stage_batch(sd, 1, None, 0.5, rng)
     assert rng.getstate() == state
 
 
-# --- length_sorted_batches ---------------------------------------------------------------------------------------------
+# --- world_batch_micro_batches ----------------------------------------------------------------------------------------
+
+BLOCK = 64  # cap of the fake-sample tests: block_size + 1 = 65 tokens
 
 
-def _padded_batch(lengths: list[int], width: int, pad: int, tag_start: int) -> Batch:
-    """Micro-batch where row i has `lengths[i]` non-pad positions (values tag_start+i) then pad."""
-    inp = torch.full((len(lengths), width), pad)
-    labels = torch.full((len(lengths), width), -100)
-    for i, n in enumerate(lengths):
-        inp[i, :n] = tag_start + i
-        labels[i, :n] = tag_start + i + 1000
-    data_ids = [f"d{tag_start + i}" for i in range(len(lengths))]
-    return inp, labels, data_ids
+def _sample(length: int, tag: str) -> Sample:
+    """An unpadded sample of `length` valid (non-pad, in-vocab) tokens; every position is supervised."""
+    ids = torch.full((length,), 3, dtype=torch.long)
+    return ids, ids.clone(), tag
 
 
-def _flatten(batches: Iterable[Batch]) -> list[tuple[list[int], list[int], str]]:
-    out: list[tuple[list[int], list[int], str]] = []
-    for inp, lab, ids in batches:
-        for i in range(inp.shape[0]):
-            n = int((lab[i] != -100).sum())  # compare the supervised prefix only: trailing padding may be trimmed
-            out.append((inp[i, :n].tolist(), lab[i, :n].tolist(), ids[i]))
-    return out
+def _split(
+    tokenizer: Tokenizer, samples: list[Sample], micro_batch_size: int, sort: bool, multiple: int | None = None
+) -> list[Batch]:
+    return world_batch_micro_batches(
+        samples, micro_batch_size, tokenizer, BLOCK, sort_by_length=sort, padding_multiple=multiple
+    )
 
 
-def test_length_sorted_regroups_shortest_first_per_window() -> None:
-    pad = 0
-    batches = [
-        _padded_batch([7, 2], 8, pad, 10),
-        _padded_batch([5, 8], 8, pad, 20),
-        _padded_batch([1, 6], 8, pad, 30),  # second window starts here
-        _padded_batch([3, 4], 8, pad, 40),
-    ]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100))
-    assert len(out) == 4
-    # window 1 lengths: 7,2,5,8 -> sorted 2,5,7,8 ; window 2: 1,6,3,4 -> 1,3,4,6
-    lengths = [[int((row != pad).sum()) for row in o[0]] for o in out]
-    assert lengths == [[2, 5], [7, 8], [1, 3], [4, 6]]
-    # every micro-batch is trimmed to its longest sample
-    assert [o[0].shape for o in out] == [(2, 5), (2, 8), (2, 3), (2, 6)]
-    assert [o[1].shape for o in out] == [(2, 5), (2, 8), (2, 3), (2, 6)]
-    assert [o[2] for o in out] == [["d11", "d20"], ["d10", "d21"], ["d30", "d40"], ["d41", "d31"]]
-    # exactly the same samples, labels travel with their inputs
-    assert sorted(_flatten(out)) == sorted(_flatten(batches))
+def _widths(batches: list[Batch]) -> list[tuple[int, int]]:
+    return [(b[0].shape[0], b[0].shape[1]) for b in batches]
 
 
-def test_length_sorted_trailing_partial_window() -> None:
-    pad = 0
-    batches = [_padded_batch([4, 1], 6, pad, 10), _padded_batch([3, 2], 6, pad, 20), _padded_batch([6, 5], 6, pad, 30)]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100))
-    assert len(out) == 3
-    assert [[int((r != pad).sum()) for r in o[0]] for o in out] == [[1, 2], [3, 4], [5, 6]]
-    assert sorted(_flatten(out)) == sorted(_flatten(batches))
+def test_sample_length_is_the_token_count() -> None:
+    assert sample_length(_sample(7, "a")) == 7
 
 
-def test_length_sorted_uneven_split_yields_partial_micro_batch() -> None:
-    pad = 0
-    batches = [_padded_batch([3, 1, 2], 4, pad, 10)]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=1, ignore_index=-100))
-    assert [o[0].shape[0] for o in out] == [2, 1]
-    assert [o[2] for o in out] == [["d11", "d12"], ["d10"]]
+def test_world_batch_sorts_shortest_first_and_pads_each_micro_batch(tokenizer: Tokenizer) -> None:
+    samples = [_sample(7, "a"), _sample(2, "b"), _sample(5, "c"), _sample(8, "d")]
+    out = _split(tokenizer, samples, micro_batch_size=2, sort=True)
+    assert [b[2] for b in out] == [["b", "c"], ["a", "d"]]  # 2,5 then 7,8
+    assert _widths(out) == [(2, 4), (2, 7)]  # padded to the longest sample of the micro-batch, then shifted
+    assert [int((lab != IGNORE_INDEX).sum()) for b in out for lab in b[1]] == [1, 4, 6, 7]
 
 
-def test_length_sorted_is_lazy_across_windows() -> None:
-    pad = 0
-
-    def gen() -> Iterator[Batch]:
-        yield _padded_batch([2, 1], 4, pad, 10)
-        yield _padded_batch([2, 1], 4, pad, 20)
-        raise RuntimeError("should not be pulled before the first window is consumed")
-
-    it = length_sorted_batches(gen(), micro_batch_size=2, accumulation_steps=2, ignore_index=-100)
-    first = next(it)
-    assert first[2] == ["d11", "d21"]
-    next(it)
-    with pytest.raises(RuntimeError):
-        next(it)
+def test_world_batch_without_sorting_keeps_arrival_order(tokenizer: Tokenizer) -> None:
+    samples = [_sample(7, "a"), _sample(2, "b"), _sample(5, "c"), _sample(8, "d")]
+    out = _split(tokenizer, samples, micro_batch_size=2, sort=False)
+    assert [b[2] for b in out] == [["a", "b"], ["c", "d"]]
+    assert _widths(out) == [(2, 6), (2, 7)]
 
 
-def test_length_sorted_empty_input_yields_nothing() -> None:
-    assert list(length_sorted_batches([], micro_batch_size=2, accumulation_steps=2, ignore_index=-100)) == []
+def test_world_batch_ties_keep_arrival_order(tokenizer: Tokenizer) -> None:
+    samples = [_sample(3, "a"), _sample(3, "b"), _sample(3, "c"), _sample(1, "d")]
+    assert [b[2] for b in _split(tokenizer, samples, micro_batch_size=2, sort=True)] == [["d", "a"], ["b", "c"]]
 
 
-def test_length_sorted_single_sample_window() -> None:
-    batch = _padded_batch([3], 4, 0, 10)
-    out = list(length_sorted_batches([batch], micro_batch_size=4, accumulation_steps=1, ignore_index=-100))
-    assert len(out) == 1
-    assert torch.equal(out[0][0], batch[0][:, :3]) and torch.equal(out[0][1], batch[1][:, :3]) and out[0][2] == batch[2]
+def test_world_batch_padding_multiple_rounds_the_width_up(tokenizer: Tokenizer) -> None:
+    samples = [_sample(5, "a"), _sample(2, "b"), _sample(9, "c"), _sample(1, "d")]
+    out = _split(tokenizer, samples, micro_batch_size=2, sort=True, multiple=4)
+    # chunks 1,2 -> padded to 4 -> shifted 3 ; 5,9 -> padded to 12 -> shifted 11
+    assert _widths(out) == [(2, 3), (2, 11)]
 
 
-def test_length_sorted_ties_keep_arrival_order() -> None:
-    pad = 0
-    batches = [_padded_batch([3, 3], 4, pad, 10), _padded_batch([3, 1], 4, pad, 20)]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100))
-    assert [o[2] for o in out] == [["d21", "d10"], ["d11", "d20"]]
+def test_world_batch_width_is_capped_at_block_size(tokenizer: Tokenizer) -> None:
+    samples = [_sample(BLOCK + 1, "a"), _sample(BLOCK + 1, "b")]
+    assert _widths(_split(tokenizer, samples, micro_batch_size=2, sort=True, multiple=128)) == [(2, BLOCK)]
 
 
-def test_length_sorted_on_real_loader_preserves_samples(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
-    raw = _batches(loader, 4)
-    out = list(length_sorted_batches(raw, micro_batch_size=4, accumulation_steps=2, ignore_index=-100))
-    assert [o[0].shape[0] for o in out] == [4, 4, 4, 4]
-    assert sorted(_flatten(out)) == sorted(_flatten(raw))
+def test_world_batch_uneven_split_yields_a_partial_micro_batch(tokenizer: Tokenizer) -> None:
+    out = _split(tokenizer, [_sample(3, "a"), _sample(1, "b"), _sample(2, "c")], micro_batch_size=2, sort=True)
+    assert [b[2] for b in out] == [["b", "c"], ["a"]]
 
 
-def test_length_sorted_sorts_collated_batches_by_true_length(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    """On real collated batches (pads already replaced by EOS) the sort uses the supervised length and trims."""
-    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
-    raw = _batches(loader, 2)  # rows are 64..384 words, so these batches carry real padding
-    true_lens = [int((lab != -100).sum()) for b in raw for lab in b[1]]
-    assert true_lens != sorted(true_lens), "fixture must start unsorted for the test to mean anything"
-    out = list(length_sorted_batches(raw, micro_batch_size=4, accumulation_steps=2, ignore_index=-100, padding_multiple=128))
-    assert [int((lab != -100).sum()) for o in out for lab in o[1]] == sorted(true_lens)
-    for inp, lab, _ in out:
-        longest = int((lab != -100).sum(dim=1).max())
-        assert inp.shape[1] == lab.shape[1] == min(find_multiple(longest, 128), raw[0][0].shape[1])
-    assert sum(o[0].numel() for o in out) < sum(b[0].numel() for b in raw)  # trimming saved positions
+def test_world_batch_width_does_not_depend_on_the_loader_grouping(tokenizer: Tokenizer) -> None:
+    """The point of assembling before padding: a micro-batch of short rows is no longer widened because some other
+    micro-batch of the same world batch happened to contain a long row."""
+    short = [_sample(5, "a"), _sample(6, "b")]
+    long = [_sample(60, "c"), _sample(61, "d")]
+    alone = _split(tokenizer, short, micro_batch_size=2, sort=True, multiple=8)
+    together = _split(tokenizer, short + long, micro_batch_size=2, sort=True, multiple=8)
+    assert _widths(alone) == [(2, 7)] and _widths(together)[0] == (2, 7)
 
 
-def test_length_sorted_padding_multiple_rounds_width_up() -> None:
-    batches = [_padded_batch([5, 2], 16, 0, 10), _padded_batch([9, 1], 16, 0, 20)]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100, padding_multiple=4))
-    # chunks: lengths [1, 2] -> width 4 ; [5, 9] -> width 12
-    assert [o[0].shape for o in out] == [(2, 4), (2, 12)]
-    assert sorted(_flatten(out)) == sorted(_flatten(batches))
+def test_world_batch_on_real_loader_preserves_every_sample(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128, padded=False)
+    worker_batches: list[SampleBatch] = _batches(loader, 2)
+    samples = [s for batch in worker_batches for s in batch]
+    lengths = [sample_length(s) for s in samples]
+    assert lengths != sorted(lengths), "fixture must start unsorted for the test to mean anything"
+    out = world_batch_micro_batches(samples, 4, tokenizer, 512, sort_by_length=True, padding_multiple=128)
+    assert [b[0].shape[0] for b in out] == [4, 4]
+    assert [b[2] for b in out] == [["pre"] * 4, ["pre"] * 4]
+
+    def supervised(batches: list[Batch]) -> list[list[int]]:
+        return sorted(lab[lab != IGNORE_INDEX].tolist() for _, labs, _ in batches for lab in labs)
+
+    reference = world_batch_micro_batches(samples, 4, tokenizer, 512, sort_by_length=False, padding_multiple=128)
+    assert supervised(out) == supervised(reference)  # sorting only regroups, it never drops a label
+    for input_ids, labels, _ in out:
+        assert input_ids.shape == labels.shape and (input_ids.shape[1] + 1) % 128 == 0
 
 
-def test_length_sorted_loss_is_unchanged_by_trimming(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    """Trimming removes only ignore-index positions, so a per-token loss over the world batch is identical."""
-    loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128)
-    raw = _batches(loader, 2)
-    out = list(length_sorted_batches(raw, micro_batch_size=4, accumulation_steps=2, ignore_index=-100, padding_multiple=128))
-
-    def supervised(batches: list[Batch]) -> list[tuple[int, list[int]]]:
-        return sorted((hash(d), lab[lab != -100].tolist()) for _, labs, ids in batches for lab, d in zip(labs, ids))
-
-    assert supervised(out) == supervised(raw)
+def _prompt_masked_sample(prompt: int, answer: int, tag: str, pad_id: int) -> Sample:
+    """An instruct-shaped sample: `prompt` masked positions (pad id in the labels), then `answer` supervised ones."""
+    ids = torch.full((prompt + answer,), 3, dtype=torch.long)
+    labels = ids.clone()
+    labels[:prompt] = pad_id
+    return ids, labels, tag
 
 
-def _prompt_masked_batch(prompt: int, answer: int, width: int, tag: int) -> Batch:
-    """An instruct-shaped row: `prompt` masked positions, then `answer` supervised ones, then padding."""
-    inp = torch.full((1, width), 0)
-    labels = torch.full((1, width), -100)
-    inp[0, : prompt + answer] = tag
-    labels[0, prompt : prompt + answer] = tag + 1000
-    return inp, labels, [f"d{tag}"]
+def test_world_batch_keeps_every_supervised_label_of_prompt_masked_rows(tokenizer: Tokenizer) -> None:
+    """An instruct row's labels sit at the END of the row, so the width must come from the full length; a width
+    derived from the count of supervised labels would cut the answers off long-prompt rows."""
+    pad = tokenizer.pad_id
+    samples = [_prompt_masked_sample(200, 12, "a", pad), _prompt_masked_sample(150, 30, "b", pad)]
+    out = world_batch_micro_batches(samples, 2, tokenizer, 255, sort_by_length=True, padding_multiple=128)
+    assert _widths(out) == [(2, 255)]
+    # the shift drops the first label of each row; both rows keep every supervised position they had
+    assert sorted(int((lab != IGNORE_INDEX).sum()) for _, labs, _ in out for lab in labs) == [12, 30]
 
 
-def test_supervised_length_is_the_position_after_the_last_label() -> None:
-    assert supervised_length(torch.tensor([-100, -100, 7, 8, -100])) == 4
-    assert supervised_length(torch.tensor([5, 6, -100, -100])) == 2
-    assert supervised_length(torch.tensor([-100, -100])) == 0
-
-
-def test_length_sorted_keeps_the_labels_of_prompt_masked_rows() -> None:
-    """Regression: the width was the *count* of supervised labels, which cut the answers off long-prompt rows."""
-    batches = [_prompt_masked_batch(200, 12, 256, 1), _prompt_masked_batch(150, 30, 256, 2)]
-    out = list(length_sorted_batches(batches, micro_batch_size=2, accumulation_steps=2, ignore_index=-100, padding_multiple=128))
-    assert [o[0].shape for o in out] == [(2, 256)]
-    supervised_before = sorted(int((lab != -100).sum()) for _, labs, _ in batches for lab in labs)
-    supervised_after = sorted(int((lab != -100).sum()) for _, labs, _ in out for lab in labs)
-    assert supervised_after == supervised_before == [12, 30]
+def test_world_batch_keeps_the_labels_of_real_instruct_rows(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
+    rows = list(itertools.islice(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)), 8))
+    samples = collate_samples(rows, tokenizer, block_size=255)
+    expected = sorted(int((lab[1:] != tokenizer.pad_id).sum()) for _, lab, _ in samples)
+    out = world_batch_micro_batches(samples, 4, tokenizer, 255, sort_by_length=True, padding_multiple=128)
+    assert len(samples) == 8 and expected[0] > 0
+    assert sorted(int((lab != IGNORE_INDEX).sum()) for _, labs, _ in out for lab in labs) == expected
 
 
 def test_package_exports_resolve() -> None:

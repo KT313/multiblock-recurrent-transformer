@@ -1,23 +1,22 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Dataloader construction (one loader per stage mixture, `build_stage_dataloaders` for a whole run) and the
-per-stage batch sampling used by multi-stage training."""
+"""Dataloader construction (one loader per stage mixture, `build_stage_dataloaders` for a whole run), the per-stage
+batch sampling used by multi-stage training and the assembly of one world batch into padded micro-batches."""
 
 import random
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
-import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend import Backend
-from training.data.collate import IGNORE_INDEX, collate_fn, find_multiple
+from training.data.collate import IGNORE_INDEX, Batch, Sample, collate_fn, collate_samples, pad_and_shift
 from training.data.dataset_resolver import DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings
 
-Batch = tuple[torch.Tensor, torch.Tensor, list[str]]
+SampleBatch = list[Sample]  # what an unpadded (training) loader yields: the tokenized rows of one worker batch
 
 
 def build_dataloader(
@@ -31,15 +30,19 @@ def build_dataloader(
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
     pin_memory: bool = False,
+    padded: bool = True,
 ) -> DataLoader[Row]:
     """Loader over the weighted mixture of ``entries`` (a stage's ``train_data`` / ``val_data`` as resolved by
-    `training.data.dataset_resolver`), yielding ``(input_ids, labels, data_ids)`` batches.
+    `training.data.dataset_resolver`).
+
+    ``padded`` (the validation loaders, and the default) yields ready ``(input_ids, labels, data_ids)`` batches;
+    ``padded=False`` (the training loaders) yields the `Sample` list of the batch, unpadded — the workers still do
+    the tokenization, the padding happens once per assembled micro-batch in `world_batch_micro_batches`.
 
     Every entry becomes one `ParquetTextDataset` over its row range ``[skip_rows, skip_rows + max_rows)`` — the
-    validation split decided by the resolver — with its ``data_signature`` (None = the text column). Loader state
-    is not checkpointed: on resume, loaders are recreated fresh (as in the thesis runs). ``shard=(rank, world)`` is
-    passed to every dataset; with ``world == 1`` it is a no-op. ``pin_memory`` is the backend's decision
-    (`Backend.pin_memory`, true on CUDA).
+    validation split decided by the resolver — with its ``data_signature`` (None = the text column).
+    ``shard=(rank, world)`` is passed to every dataset; with ``world == 1`` it is a no-op. ``pin_memory`` is the
+    backend's decision (`Backend.pin_memory`, true on CUDA).
     """
     if len({e.prefix for e in entries}) != len(entries):
         raise ValueError("Dataset prefixes within one loader must be unique.")
@@ -52,13 +55,17 @@ def build_dataloader(
     dataset: IterableDataset[Row] = (
         datasets[0] if len(datasets) == 1 else WeightedMixtureDataset(datasets, [e.weight for e in entries], seed)
     )
-    collate = partial(
-        collate_fn,
-        tokenizer=tokenizer,
-        block_size=block_size,
-        padding_multiple=padding_multiple,
-        ignore_index=ignore_index,
-    )
+    collate: Callable[[list[Row]], Any]
+    if padded:
+        collate = partial(
+            collate_fn,
+            tokenizer=tokenizer,
+            block_size=block_size,
+            padding_multiple=padding_multiple,
+            ignore_index=ignore_index,
+        )
+    else:
+        collate = partial(collate_samples, tokenizer=tokenizer, block_size=block_size)
     return DataLoader(
         dataset,
         batch_size=micro_batch_size,
@@ -72,17 +79,23 @@ def build_dataloader(
 
 @dataclass
 class StageDataloaders:
-    """One train and one val loader per training stage, with lazily created and cycled train iterators."""
+    """One train and one val loader per training stage, with lazily created and cycled train iterators.
 
-    train_loaders: Sequence[Iterable[Batch]]
+    Train loaders yield unpadded `SampleBatch`es, validation loaders padded `Batch`es; `tokenizer` is the one every
+    loader was built with and the one `world_batch_micro_batches` pads with. Loader state is not checkpointed here —
+    `training.data.stream` is what a resume restores.
+    """
+
+    train_loaders: Sequence[Iterable[SampleBatch]]
     val_loaders: Sequence[Iterable[Batch]]
-    _train_iterators: list[Iterator[Batch] | None] = field(init=False)
+    tokenizer: Tokenizer
+    _train_iterators: list[Iterator[SampleBatch] | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._train_iterators = [None] * len(self.train_loaders)
 
-    def next_train_batch(self, stage_idx: int) -> Batch:
-        """Next batch of ``stage_idx``'s train loader; restarts the loader when it is exhausted."""
+    def next_train_batch(self, stage_idx: int) -> SampleBatch:
+        """Next worker batch of ``stage_idx``'s train loader; restarts the loader when it is exhausted."""
         iterator = self._train_iterators[stage_idx]
         if iterator is None:
             iterator = self._train_iterators[stage_idx] = iter(self.train_loaders[stage_idx])
@@ -97,12 +110,12 @@ def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backen
     """One train and one validation loader per stage of `dataset`, each mixing its entries with constant weights.
 
     The tokenizer is loaded once from `dataset.tokenizer_dir` and shared by every loader. Train loaders use
-    `settings.dataloader_num_workers`, validation loaders read in-process. Loader seed `settings.seed + rank`,
-    datasets sharded by `(rank, world_size)`.
+    `settings.dataloader_num_workers` and yield unpadded samples, validation loaders read in-process and yield
+    padded batches. Loader seed `settings.seed + rank`, datasets sharded by `(rank, world_size)`.
     """
     tokenizer = Tokenizer(dataset.tokenizer_dir)
 
-    def loader(entries: list[DataEntry], num_workers: int) -> Iterable[Batch]:
+    def loader(entries: list[DataEntry], num_workers: int, padded: bool) -> DataLoader[Row]:
         return build_dataloader(
             entries,
             tokenizer,
@@ -114,11 +127,13 @@ def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backen
             padding_multiple=settings.sequence_padding_multiple,
             ignore_index=IGNORE_INDEX,
             pin_memory=backend.pin_memory,
+            padded=padded,
         )
 
     return StageDataloaders(
-        train_loaders=[loader(stage.train_data, settings.dataloader_num_workers) for stage in dataset.stages],
-        val_loaders=[loader(stage.val_data, 0) for stage in dataset.stages],
+        train_loaders=[loader(stage.train_data, settings.dataloader_num_workers, False) for stage in dataset.stages],
+        val_loaders=[loader(stage.val_data, 0, True) for stage in dataset.stages],
+        tokenizer=tokenizer,
     )
 
 
@@ -128,68 +143,39 @@ def sample_stage_batch(
     prev_stage_idx: int | None,
     transition_progress: float,
     rng: random.Random,
-) -> Batch:
-    """Batch for the current step: from ``stage_idx`` with probability ``transition_progress``, else from the
+) -> SampleBatch:
+    """Worker batch for the current step: from ``stage_idx`` with probability ``transition_progress``, else from the
     previous stage. Outside a transition (``prev_stage_idx`` is None) always from ``stage_idx``."""
     if prev_stage_idx is not None and rng.random() >= transition_progress:
         return stage_loaders.next_train_batch(prev_stage_idx)
     return stage_loaders.next_train_batch(stage_idx)
 
 
-def _fit(row: torch.Tensor, width: int, fill: int) -> torch.Tensor:
-    """Slice or right-pad a 1-D row to `width`. Rows come from independently padded micro-batches, so a chunk can
-    mix widths; positions past a row's supervised length are never trained on, so the fill value is irrelevant."""
-    if row.shape[0] >= width:
-        return row[:width]
-    return torch.cat([row, row.new_full((width - row.shape[0],), fill)])
+def sample_length(sample: Sample) -> int:
+    """Tokens of a sample before padding — what its micro-batch will have to be padded to."""
+    return sample[0].shape[0]
 
 
-def supervised_length(labels: torch.Tensor, ignore_index: int = IGNORE_INDEX) -> int:
-    """Position after the last supervised label of a 1-D ``labels`` row (0 when every label is ``ignore_index``).
-    Trimming a row here keeps every supervised position, also when a masked prompt precedes them."""
-    supervised = (labels != ignore_index).nonzero()
-    return int(supervised.max()) + 1 if supervised.numel() else 0
-
-
-def length_sorted_batches(
-    batches: Iterable[Batch],
+def world_batch_micro_batches(
+    samples: list[Sample],
     micro_batch_size: int,
-    accumulation_steps: int,
-    ignore_index: int = IGNORE_INDEX,
+    tokenizer: Tokenizer,
+    block_size: int,
+    sort_by_length: bool,
     padding_multiple: int | None = None,
-) -> Iterator[Batch]:
-    """Regroup every ``accumulation_steps`` micro-batches (one world batch) into micro-batches sorted by length.
+    ignore_index: int = IGNORE_INDEX,
+) -> list[Batch]:
+    """Split one world batch of samples into micro-batches of `micro_batch_size` and pad each of them once.
 
-    A sample's length is the position after its last supervised label (``labels != ignore_index``) — not the count
-    of supervised positions: an instruct row masks its prompt, so its labels sit at the end of the row. ``input_ids``
-    cannot be used because ``collate_fn`` has already replaced padding by EOS. Every re-grouped micro-batch is trimmed
-    to its longest sample (rounded up to ``padding_multiple``), which is where the compute saving comes from.
-    Positions beyond a sample's length carry only ignore-index labels, so the loss is unchanged.
+    With `sort_by_length` the samples are sorted by their token count first (a stable sort: ties keep arrival
+    order), so a micro-batch groups rows of similar length and its padding — and with it the compute of the
+    forward — shrinks. Without it the arrival order is kept, which reproduces the loader's own batching exactly.
+    Every sample keeps all of its supervised positions either way: the width is derived from the full sample
+    length, never from the supervised part of it.
     """
-    buffer: list[Batch] = []
-
-    def flush() -> Iterator[Batch]:
-        samples: list[tuple[torch.Tensor, torch.Tensor, str, int]] = []
-        for input_ids, labels, data_ids in buffer:
-            for i in range(input_ids.shape[0]):
-                samples.append((input_ids[i], labels[i], data_ids[i], supervised_length(labels[i], ignore_index)))
-        samples.sort(key=lambda s: s[3])
-        for start in range(0, len(samples), micro_batch_size):
-            chunk = samples[start : start + micro_batch_size]
-            width = max(1, max(s[3] for s in chunk))
-            if padding_multiple:
-                width = find_multiple(width, padding_multiple)
-            width = min(width, max(s[0].shape[0] for s in chunk))
-            yield (
-                torch.stack([_fit(s[0], width, int(s[0][-1])) for s in chunk]),
-                torch.stack([_fit(s[1], width, ignore_index) for s in chunk]),
-                [s[2] for s in chunk],
-            )
-        buffer.clear()
-
-    for batch in batches:
-        buffer.append(batch)
-        if len(buffer) == accumulation_steps:
-            yield from flush()
-    if buffer:
-        yield from flush()
+    if sort_by_length:
+        samples = sorted(samples, key=sample_length)
+    return [
+        pad_and_shift(samples[start : start + micro_batch_size], tokenizer, block_size, padding_multiple, ignore_index)
+        for start in range(0, len(samples), micro_batch_size)
+    ]

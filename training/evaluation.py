@@ -19,7 +19,7 @@ from torch.nn import Module
 from model import RecurrentGPT
 from training.backend import Backend
 from training.checkpoint import unwrap_compiled
-from training.data.loader import Batch
+from training.data.collate import Batch
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress

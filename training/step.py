@@ -7,9 +7,10 @@ thesis loop, bit-identical: `golden_tiny_steps.json` (dataset-independent, `test
 (the 20-step tiny run, `test_run.py` / `golden.py`) pin it. Two things in the stream are NOT thesis behaviour and are
 pinned as the new reference instead: the transition draws come from a private `random.Random(seed + resume step)` (the
 thesis drew from the checkpointed global `random`, so a thesis resume kept the transition mix of the uninterrupted
-run, this one re-seeds it), and `sort_batches_by_length` trims the regrouped micro-batches (the thesis sorter only
-re-stacked). Steps are OPTIMIZER steps: one world batch of `gradient_accumulation_steps` micro-batches, one
-`optimizer.step()`.
+run, this one re-seeds it), and the world batch is assembled from unpadded samples and padded once per micro-batch
+(the thesis collated and padded per micro-batch, then re-stacked those padded batches; the width of a regrouped
+micro-batch therefore no longer depends on how the loader happened to group its rows). Steps are OPTIMIZER steps:
+one world batch of `gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
 """
 
 import random
@@ -26,8 +27,8 @@ from torch.optim import Optimizer
 from model import RecurrentGPT
 from training.backend import Backend
 from training.checkpoint import unwrap_compiled
-from training.data import IGNORE_INDEX, StageDataloaders, length_sorted_batches
-from training.data.loader import Batch, sample_stage_batch
+from training.data import IGNORE_INDEX, Batch, Sample, StageDataloaders, world_batch_micro_batches
+from training.data.loader import sample_stage_batch
 from training.logger import track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
 from training.optim import set_lr
@@ -77,32 +78,46 @@ def micro_batch_stream(
 ) -> Iterator[Batch]:
     """Endless stream of micro-batches; every `gradient_accumulation_steps` of them belong to one optimizer step.
 
+    One world batch at a time: the stream pulls worker batches of tokenized, unpadded samples until it holds
+    `world_batch_size` of them, then `world_batch_micro_batches` sorts them (`sort_batches_by_length`), splits them
+    into `gradient_accumulation_steps` micro-batches and pads each one to its own longest sample. A world batch
+    therefore always has exactly `world_batch_size` samples, also when a worker batch arrived short (a loader
+    reaching the end of its rows) or when a row without a supervised label was dropped: the stream pulls one more
+    worker batch and carries the surplus samples over to the next world batch.
+
     Numerics: the stream reads `progress.step` once per world batch, lazily, when the first micro-batch of that step
-    is requested (after the previous step advanced the counter). Inside a stage transition each micro-batch comes
+    is requested (after the previous step advanced the counter). Inside a stage transition each worker batch comes
     from the next stage's loader with probability `transition_progress`, drawn from `random.Random(settings.seed +
     progress.step)` — created here, at call time, i.e. seeded with the resume step (the stream is created once after
-    the resume); `rng.random()` is consumed only inside a transition. Loader iterators are created lazily by
-    `StageDataloaders.next_train_batch`, each `iter(DataLoader)` drawing one base seed from the global torch RNG — so
-    the first batch of a stage is fetched exactly here, after `model.step` and the LR are set and before the forward.
-    `sort_batches_by_length` regroups each world batch into length-sorted, trimmed micro-batches.
+    the resume); `rng.random()` is consumed only inside a transition, once per pulled worker batch (= once per
+    micro-batch as long as no batch is short). Loader iterators are created lazily by
+    `StageDataloaders.next_train_batch`, each `iter(DataLoader)` drawing one base seed from the global torch RNG —
+    all pulls of a world batch now happen before its first forward (with `sort_batches_by_length` they always did,
+    the sorter buffered the whole window; without it they used to be interleaved with the forwards).
     """
     rng = random.Random(settings.seed + progress.step)
 
-    def raw() -> Iterator[Batch]:
+    def stream() -> Iterator[Batch]:
+        surplus: list[Sample] = []
         while True:
             stage = stage_manager.get_stage_info(progress.step)
-            for _ in range(settings.gradient_accumulation_steps):
-                yield sample_stage_batch(loaders, stage.stage_idx, stage.prev_stage_idx, stage.transition_progress, rng)
+            samples, surplus = surplus, []
+            while len(samples) < settings.world_batch_size:
+                samples += sample_stage_batch(
+                    loaders, stage.stage_idx, stage.prev_stage_idx, stage.transition_progress, rng
+                )
+            samples, surplus = samples[: settings.world_batch_size], samples[settings.world_batch_size :]
+            yield from world_batch_micro_batches(
+                samples,
+                settings.micro_batch_size,
+                loaders.tokenizer,
+                settings.block_size,
+                sort_by_length=settings.sort_batches_by_length,
+                padding_multiple=settings.sequence_padding_multiple,
+                ignore_index=IGNORE_INDEX,
+            )
 
-    if settings.sort_batches_by_length:
-        return length_sorted_batches(
-            raw(),
-            settings.micro_batch_size,
-            settings.gradient_accumulation_steps,
-            ignore_index=IGNORE_INDEX,
-            padding_multiple=settings.sequence_padding_multiple,
-        )
-    return raw()
+    return stream()
 
 
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:

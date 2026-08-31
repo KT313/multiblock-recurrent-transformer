@@ -14,10 +14,10 @@ import torch
 
 from model import RecurrentGPT, build_model
 from training.backend import SingleDeviceBackend
-from training.data import IGNORE_INDEX, StageDataloaders
+from training.data import Batch, IGNORE_INDEX, SampleBatch, StageDataloaders
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import resolve_dataset
-from training.data.loader import Batch
+from training.data.tokenizer import Tokenizer
 from training.golden import (
     golden_exact_requested,
     golden_mismatches,
@@ -291,30 +291,62 @@ def test_non_finite_grad_norm_raises_with_the_exact_message(
 # micro-batch stream (moved from the former test_train.py; needs the tiny dataset for the stage budgets only)
 
 
-def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
-    ids = torch.full((1, 8), pad_id)
-    ids[0, :length] = 1
-    labels = torch.full((1, 8), IGNORE_INDEX)
-    labels[0, :length] = 1
-    return ids, labels, [tag]
+def _fake_samples(tag: str, lengths: list[int]) -> SampleBatch:
+    """One worker batch: one unpadded sample per entry of `lengths`, every position supervised."""
+    return [(torch.full((n,), 3, dtype=torch.long), torch.full((n,), 3, dtype=torch.long), tag) for n in lengths]
 
 
 class _Repeat:
-    """Endless iterable of one tagged batch with a running counter as the length."""
+    """Endless iterable of one tagged one-sample worker batch with a running counter as the sample length."""
 
-    def __init__(self, tag: str) -> None:
-        self.tag, self.count = tag, 0
+    def __init__(self, tag: str, batch_size: int = 1) -> None:
+        self.tag, self.batch_size, self.count = tag, batch_size, 0
 
-    def __iter__(self) -> Iterator[Batch]:
+    def __iter__(self) -> Iterator[SampleBatch]:
         while True:
             self.count += 1
-            yield _fake_batch(self.tag, 1 + self.count % 7)
+            yield _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
 
 
-def _stream_setup(tmp_path: Path, tiny_dataset_dir: Path, sort: bool) -> tuple[Settings, StageDataloaders, StageManager]:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
-    settings = parse_settings(["--config", str(yaml_path), "--micro_batch_size", "1"])  # 4 micro-batches per step
-    loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
+class _ShortBatches:
+    """A loader whose worker batches cycle through `sizes` rows — a short (or empty) batch is what a loader running
+    out of rows, or a batch whose rows were all dropped for lack of a supervised label, hands the stream."""
+
+    def __init__(self, tag: str, sizes: list[int]) -> None:
+        self.tag, self.sizes, self.count = tag, sizes, 0
+
+    def __iter__(self) -> Iterator[SampleBatch]:
+        while True:
+            size = self.sizes[self.count % len(self.sizes)]
+            self.count += 1
+            yield _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(size)])
+
+
+@pytest.fixture(scope="session")
+def stream_tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
+    """The synthetic tokenizer the stream pads its assembled micro-batches with."""
+    return Tokenizer(tiny_tokenizer_dir)
+
+
+def _stream_setup(
+    tmp_path: Path,
+    tiny_dataset_dir: Path,
+    sort: bool,
+    tokenizer: Tokenizer,
+    batch_size: int = 1,
+    padding_multiple: int = 128,
+) -> tuple[Settings, StageDataloaders, StageManager]:
+    yaml_path = write_tiny_yaml(
+        tmp_path,
+        tiny_dataset_dir,
+        tmp_path / "out",
+        sort_batches_by_length=str(sort).lower(),
+        sequence_padding_multiple=str(padding_multiple),
+    )
+    settings = parse_settings(
+        ["--config", str(yaml_path), "--micro_batch_size", str(batch_size)]  # 4 / batch_size micro-batches per step
+    )
+    loaders = StageDataloaders([_Repeat(t, batch_size) for t in "abc"], [], tokenizer)
     stage_manager = StageManager(resolve_dataset(settings).training_stages(), settings.world_batch_size, settings.block_size)
     return settings, loaders, stage_manager
 
@@ -323,8 +355,10 @@ def _tags(stream: Iterator[Batch], n: int) -> list[str]:
     return [next(stream)[2][0] for _ in range(n)]  # never pull an extra element (zip would)
 
 
-def test_micro_batch_stream_samples_by_transition_progress(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
+def test_micro_batch_stream_samples_by_transition_progress(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
     progress = TrainingProgress(step=3)  # plain stage 0
     stream = micro_batch_stream(settings, loaders, stage_manager, progress)
     assert _tags(stream, 4) == ["a"] * 4
@@ -339,10 +373,12 @@ def test_micro_batch_stream_samples_by_transition_progress(tmp_path: Path, tiny_
     assert _tags(stream, 4) == ["c"] * 4
 
 
-def test_micro_batch_stream_reads_the_step_lazily(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_micro_batch_stream_reads_the_step_lazily(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
     """The step is read when the first micro-batch of a world batch is requested, not when the stream is created and
     not again inside the world batch."""
-    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
     progress = TrainingProgress(step=0)
     stream = micro_batch_stream(settings, loaders, stage_manager, progress)
     progress.step = 8  # changed before the first request: the world batch is stage 1's
@@ -352,13 +388,15 @@ def test_micro_batch_stream_reads_the_step_lazily(tmp_path: Path, tiny_dataset_d
     assert _tags(stream, 4) == ["c"] * 4  # the next world batch reads step 19
 
 
-def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
     """Two streams created at the same `seed + step` draw the same mix; a different start step draws another (the
     resume seeds the transition RNG with `seed + resume step`, as the thesis loop did)."""
-    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
 
     def mix(start_step: int) -> list[str]:
-        loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
+        loaders = StageDataloaders([_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
         progress = TrainingProgress(step=start_step)
         stream = micro_batch_stream(settings, loaders, stage_manager, progress)
         progress.step = 15
@@ -368,20 +406,41 @@ def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(tmp_pat
     assert mix(0) != mix(14)
 
 
-def test_micro_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, sort=True)
+def test_micro_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, True, stream_tokenizer, padding_multiple=4)
     assert settings.gradient_accumulation_steps == 4
     progress = TrainingProgress()
     stream = micro_batch_stream(settings, loaders, stage_manager, progress)
-    for _ in range(3):  # every world batch (4 micro-batches) arrives sorted by supervised length, trimmed
+    for _ in range(3):  # every world batch (4 micro-batches) arrives sorted by length, padded to its own width
         batches = [next(stream) for _ in range(4)]
-        lengths = [int((b[1] != IGNORE_INDEX).sum()) for b in batches]
+        lengths = [int((b[1] != IGNORE_INDEX).sum()) for b in batches]  # supervised = sample length - 1
         assert lengths == sorted(lengths)
-        assert all(b[0].shape[1] == min(find_multiple(n, 128), 8) for b, n in zip(batches, lengths))  # trimmed
-    settings_unsorted, loaders2, _ = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
-    raw = micro_batch_stream(settings_unsorted, loaders2, stage_manager, progress)
+        assert all(b[0].shape[1] == find_multiple(n + 1, 4) - 1 for b, n in zip(batches, lengths))
+        progress.advance()
+    unsorted_settings, unsorted_loaders, _ = _stream_setup(
+        tmp_path, tiny_dataset_dir, False, stream_tokenizer, padding_multiple=4
+    )
+    raw = micro_batch_stream(unsorted_settings, unsorted_loaders, stage_manager, TrainingProgress())
     lengths = [int((next(raw)[1] != IGNORE_INDEX).sum()) for _ in range(4)]
-    assert lengths == [2, 3, 4, 5]  # loader order, untouched
+    assert lengths == [1, 2, 3, 4]  # loader order, untouched
+
+
+def test_micro_batch_stream_fills_the_world_batch_from_short_worker_batches(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """Regression (T-M3/T-M4): a short or empty worker batch — a loader reaching its last rows, or a batch whose rows
+    were all dropped — used to shrink the world batch and permanently misalign it with the optimizer steps. The
+    stream now pulls until it holds `world_batch_size` samples and carries the surplus over."""
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    assert (settings.gradient_accumulation_steps, settings.world_batch_size) == (2, 4)
+    loaders = StageDataloaders([_ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"], [], stream_tokenizer)
+    progress = TrainingProgress()
+    stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+    for _ in range(6):
+        batches = [next(stream) for _ in range(settings.gradient_accumulation_steps)]
+        assert [b[0].shape[0] for b in batches] == [settings.micro_batch_size] * settings.gradient_accumulation_steps
+        assert sum(len(b[2]) for b in batches) == settings.world_batch_size
+        progress.advance()
 
 
 # --------------------------------------------------------------------------------------------------------------
