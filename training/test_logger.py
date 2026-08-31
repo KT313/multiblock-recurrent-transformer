@@ -4,7 +4,7 @@
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -15,6 +15,7 @@ from training.logger import (
     _qkv_dims,
     _reverse_engineer_adam_effective_lr,
     _to_scalar,
+    describe_parameters,
     num_parameters,
     track_gradient_metrics,
 )
@@ -82,6 +83,18 @@ def test_to_scalar() -> None:
     assert _to_scalar(3) == 3
     t = torch.zeros(2)
     assert _to_scalar(t) is t
+
+
+def test_describe_parameters_counts_total_recurrent_and_unrolled(tiny_model: RecurrentGPT) -> None:
+    """The line names the total, the parameters of the core blocks and the unrolled count at the mean recurrence
+    (tiny: mean_recurrence [2, 2], so unrolled = total + recurrent)."""
+    total = num_parameters(tiny_model)
+    recurrent = sum(p.numel() for block in tiny_model.transformer.core_blocks for p in block.parameters())
+    assert 0 < recurrent < total
+    expected = f"Model: {total:,} parameters, {recurrent:,} in recurrent blocks, unfolds to {total + recurrent:,} at mean recurrence."
+    assert describe_parameters(tiny_model) == expected
+    compiled = cast(torch.nn.Module, torch.compile(tiny_model))  # typed as a bare callable, is an OptimizedModule
+    assert describe_parameters(compiled) == expected  # the compiled wrapper is unwrapped
 
 
 def test_num_parameters_counts_tied_weights_once(tiny_model: RecurrentGPT) -> None:

@@ -10,6 +10,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from training.data.collate import find_multiple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data_preparation.lib.build import prepare
-from model import RecurrentGPT
+from model import RecurrentConfig, RecurrentGPT
 from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
@@ -31,7 +32,16 @@ from training.logger import Logger
 from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.train import LoopState, build_stage_manager, micro_batch_stream, validate
+from training.train import (
+    LoopState,
+    build_run_model,
+    build_run_optimizer,
+    build_stage_manager,
+    check_block_sizes_agree,
+    micro_batch_stream,
+    prepare_run_directory,
+    validate,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -111,6 +121,71 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
     with pytest.raises(ValueError, match="divisible by world_size"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
+
+
+def test_prepare_run_directory_writes_run_config(tiny_settings: Settings) -> None:
+    run_directory = prepare_run_directory(tiny_settings)
+    assert run_directory == Path(tiny_settings.out_dir)
+    assert checkpoint_dir(run_directory).is_dir()
+    assert json.loads((run_directory / "run_config.json").read_text()) == json.loads(json.dumps(asdict(tiny_settings)))
+    prepare_run_directory(tiny_settings)  # idempotent (a resumed run reuses the directory)
+
+
+def test_check_block_sizes_agree_message(tiny_settings: Settings) -> None:
+    model_config = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config)
+    check_block_sizes_agree(tiny_settings, model_config)  # tiny: both 256
+    mismatched = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, block_size=128)
+    with pytest.raises(ValueError) as excinfo:
+        check_block_sizes_agree(tiny_settings, mismatched)
+    assert str(excinfo.value) == (
+        "block_size 256 of the run config does not match block_size 128 of the model architecture config "
+        "config/model_architecture/tiny.yaml (with model_overwrite applied)"
+    )
+
+
+def test_build_run_model_on_tiny(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+    """The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
+    settings, `model_config.json` next to the checkpoints, the model on the backend's device."""
+    tiny_settings.model_overwrite = {"n_embd": 32}
+    run_directory = prepare_run_directory(tiny_settings)
+    model = build_run_model(tiny_settings, cpu_backend, run_directory)
+    assert isinstance(model, RecurrentGPT)
+    assert model.config.n_embd == 32 and model.config.block_size == 256
+    assert model.ignore_index == IGNORE_INDEX
+    assert model.gradient_checkpointing is tiny_settings.gradient_checkpointing
+    assert all(p.device == cpu_backend.device for p in model.parameters())
+    written = json.loads((run_directory / "model_config.json").read_text())
+    assert written == model.config.to_dict() and written["n_embd"] == 32
+    tiny_settings.model_overwrite = {"block_size": 128}
+    with pytest.raises(ValueError, match="does not match block_size 128 of the model architecture"):
+        build_run_model(tiny_settings, cpu_backend, run_directory)
+
+
+def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+    """The parameter init consumes the global torch RNG (why `build_run_model` runs after the loaders): the same seed
+    gives the same weights, and the init advances the RNG."""
+    run_directory = prepare_run_directory(tiny_settings)
+    torch.manual_seed(3)
+    first = build_run_model(tiny_settings, cpu_backend, run_directory)
+    after_first = torch.get_rng_state()
+    torch.manual_seed(3)
+    second = build_run_model(tiny_settings, cpu_backend, run_directory)
+    assert all(torch.equal(a, b) for a, b in zip(first.parameters(), second.parameters()))
+    assert torch.equal(after_first, torch.get_rng_state())
+    torch.manual_seed(3)
+    assert not torch.equal(after_first, torch.get_rng_state())
+
+
+def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend) -> None:
+    """Three parameter groups (matrices, embeddings, norms + biases) with `base_lr` 1.0; the third has no weight
+    decay under `no_weight_decay_for_bias_and_norm_params`; the constructor LR is `optim_config.lr`."""
+    optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
+    assert isinstance(optimizer, torch.optim.AdamW)  # tiny.yaml
+    assert len(optimizer.param_groups) == 3
+    assert [g["base_lr"] for g in optimizer.param_groups] == [1.0, 1.0, 1.0]
+    assert [g["weight_decay"] for g in optimizer.param_groups] == [0.1, 0.1, 0.0]
+    assert all(float(g["lr"]) == tiny_settings.optim_config["lr"] for g in optimizer.param_groups)
+    assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:

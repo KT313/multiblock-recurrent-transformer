@@ -1,12 +1,16 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """Thin wandb wrapper (offline by default) and the gradient/parameter/MFU metric helpers that were logged."""
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 from torch.nn import Module
 from torch.optim import Optimizer
+
+from model import RecurrentGPT
+from training.checkpoint import unwrap_compiled
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -64,6 +68,23 @@ def num_parameters(model: Module, only_trainable: bool = False) -> int:
     if only_trainable:
         param_list = [p for p in param_list if p.requires_grad]
     return sum(p.numel() for p in param_list)
+
+
+def describe_parameters(model: Module) -> str:
+    """The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
+    blocks and the count of the unrolled model at the mean recurrence (`total - recurrent + recurrent * mean of
+    mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped)."""
+    plain_model = cast(RecurrentGPT, unwrap_compiled(model))
+    total_parameters = num_parameters(plain_model)
+    core_blocks = cast(Iterable[Module], plain_model.transformer.core_blocks)
+    recurrent_parameters = sum(p.numel() for block in core_blocks for p in block.parameters())
+    mean_recurrence = cast(list[int], plain_model.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
+    mean_of_means = sum(mean_recurrence) / len(mean_recurrence)
+    unrolled_parameters = int(total_parameters - recurrent_parameters + recurrent_parameters * mean_of_means)
+    return (
+        f"Model: {total_parameters:,} parameters, {recurrent_parameters:,} in recurrent blocks, unfolds to "
+        f"{unrolled_parameters:,} at mean recurrence."
+    )
 
 
 def _reverse_engineer_adam_effective_lr(

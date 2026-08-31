@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python training/train.py` from the repo root
 
-from model import RecurrentConfig, RecurrentGPT, build_model
+from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
 from training.backend import Backend, get_backend
 from training.checkpoint import (
@@ -38,7 +38,7 @@ from training.checkpoint import (
 from training.data import IGNORE_INDEX, StageDataloaders, build_stage_dataloaders, length_sorted_batches
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.data.loader import Batch, sample_stage_batch
-from training.logger import Logger, num_parameters, track_gradient_metrics
+from training.logger import Logger, describe_parameters, num_parameters, track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
 from training.optim import build_optimizer, get_param_groups, set_lr
 from training.settings import Settings, parse_settings
@@ -63,6 +63,50 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
         cooldown_steps=settings.cooldown_steps,
         micro_batch_size=settings.micro_batch_size,
     )
+
+
+def prepare_run_directory(settings: Settings) -> Path:
+    """Create the run directory (`settings.out_dir`) with its `checkpoints/` folder and write `run_config.json`
+    (the settings as parsed, jsonargparse overrides applied). Returns the run directory."""
+    run_directory = Path(settings.out_dir)
+    checkpoint_dir(run_directory).mkdir(parents=True, exist_ok=True)
+    with open(run_directory / "run_config.json", "w") as f:
+        json.dump(asdict(settings), f, indent=4)
+    return run_directory
+
+
+def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -> None:
+    """The run config's `block_size` must equal the architecture's (the RoPE table is sized by it). The dataset-side
+    check (`block_size` of the dataset config) is the resolver's."""
+    if model_config.block_size != settings.block_size:
+        raise ValueError(
+            f"block_size {settings.block_size} of the run config does not match block_size {model_config.block_size} "
+            f"of the model architecture config {settings.model_architecture_config} (with model_overwrite applied)"
+        )
+
+
+def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -> torch.nn.Module:
+    """The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
+    then `backend.setup_model` (device, optional compile).
+
+    Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`, so this must
+    run after the dataset is resolved and the loaders are built (nothing that draws may move before it).
+    """
+    model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
+    check_block_sizes_agree(settings, model_config)
+    model = RecurrentGPT(
+        model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
+    )
+    model_config.to_json(run_directory / "model_config.json")
+    return backend.setup_model(model, compile=settings.compile_model)
+
+
+def build_run_optimizer(settings: Settings, model: torch.nn.Module, backend: Backend) -> torch.optim.Optimizer:
+    """The run's optimizer: the three parameter groups of `get_param_groups`, `settings.optimizer` with
+    `settings.optim_config`, wrapped by `backend.setup_optimizer`."""
+    weight_decay = settings.optim_config.get("weight_decay", 0.0)
+    param_groups = get_param_groups(model, weight_decay, settings.no_weight_decay_for_bias_and_norm_params)
+    return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, **settings.optim_config))
 
 
 def micro_batch_stream(
@@ -122,65 +166,46 @@ def validate(
     return metrics
 
 
-def train(cfg: Settings) -> None:
+def train(settings: Settings) -> None:
     start_time = time.time()
-    backend = get_backend(cfg.backend, precision=cfg.precision)
-    backend.seed_everything(cfg.seed)
-    out_dir = Path(cfg.out_dir)
-    checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
+    backend = get_backend(settings.backend, precision=settings.precision)
+    backend.seed_everything(settings.seed)
+    run_directory = prepare_run_directory(settings)
 
-    resolved = resolve_dataset(cfg, backend)  # verifies the dataset config's data, auto-prepares if configured
-    stage_manager = build_stage_manager(cfg, resolved, backend.world_size)
+    resolved = resolve_dataset(settings, backend)  # verifies the dataset config's data, auto-prepares if configured
+    stage_manager = build_stage_manager(settings, resolved, backend.world_size)
     max_steps = stage_manager.total_steps
     print(stage_manager.get_stage_summary())
-    print(f"Total training steps: {max_steps:,} ({cfg.gradient_accumulation_steps} micro-batches each)")
-    loaders = build_stage_dataloaders(cfg, resolved, backend)
+    print(f"Total training steps: {max_steps:,} ({settings.gradient_accumulation_steps} micro-batches each)")
+    loaders = build_stage_dataloaders(settings, resolved, backend)
 
-    model_config = RecurrentConfig.from_yaml(cfg.model_architecture_config, **cfg.model_overwrite)
-    if model_config.block_size != cfg.block_size:
-        raise ValueError(
-            f"block_size {cfg.block_size} of the run config does not match block_size {model_config.block_size} of the "
-            f"model architecture config {cfg.model_architecture_config} (with model_overwrite applied)"
-        )
-    raw_model = build_model(model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=cfg.gradient_checkpointing)
-    with open(out_dir / "run_config.json", "w") as f:
-        json.dump(asdict(cfg), f, indent=4)
-    raw_model.config.to_json(out_dir / "model_config.json")
-    n_params = num_parameters(raw_model)
-    core_blocks = cast(Iterable[torch.nn.Module], raw_model.transformer.core_blocks)
-    rec_params = sum(p.numel() for block in core_blocks for p in block.parameters())
-    mean_recurrence = cast(list[int], raw_model.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
-    mean_rec = sum(mean_recurrence) / len(mean_recurrence)
-    print(f"Model: {n_params:,} parameters, {rec_params:,} in recurrent blocks, unfolds to "
-          f"{int(n_params - rec_params + rec_params * mean_rec):,} at mean recurrence.")
-    model = backend.setup_model(raw_model, compile=cfg.compile_model)
-
-    weight_decay = cfg.optim_config.get("weight_decay", 0.0)
-    param_groups = get_param_groups(model, weight_decay, cfg.no_weight_decay_for_bias_and_norm_params)
-    optimizer = backend.setup_optimizer(build_optimizer(cfg.optimizer, param_groups, **cfg.optim_config))
+    model = build_run_model(settings, backend, run_directory)  # after the loaders: first torch RNG draw after seeding
+    n_params = num_parameters(unwrap_compiled(model))
+    print(describe_parameters(model))
+    optimizer = build_run_optimizer(settings, model, backend)
 
     state: LoopState = {"step": 0, "resume_step": -1}
     resume_path = None
-    if cfg.resume:
-        resume_path = Path(cfg.resume_checkpoint_path) if cfg.resume_checkpoint_path else find_latest_checkpoint(
-            out_dir, cfg.run_name
+    if settings.resume:
+        resume_path = Path(settings.resume_checkpoint_path) if settings.resume_checkpoint_path else find_latest_checkpoint(
+            run_directory, settings.run_name
         )
     if resume_path is not None:
         metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
-        check_dataset_unchanged(metadata, resolved, cfg.allow_dataset_change)
+        check_dataset_unchanged(metadata, resolved, settings.allow_dataset_change)
         state["step"] = state["resume_step"] = metadata.step
         backend.set_rng_state(metadata.rng)
         print(f"Resumed from {resume_path} at step {state['step']}")
     else:
         print("No checkpoint loaded, starting from scratch.")
 
-    logger = Logger(cfg.logger_project, cfg.run_name, out_dir, offline=cfg.wandb_offline, enabled=cfg.wandb_enabled)
-    logger.log_hyperparams(asdict(cfg) | {"dataset_config_hash": resolved.config_hash})
+    logger = Logger(settings.logger_project, settings.run_name, run_directory, offline=settings.wandb_offline, enabled=settings.wandb_enabled)
+    logger.log_hyperparams(asdict(settings) | {"dataset_config_hash": resolved.config_hash})
     logger.log_summary({"num_parameters": n_params})
 
-    rng = random.Random(cfg.seed + state["step"])
-    batches = micro_batch_stream(cfg, loaders, stage_manager, state, rng)
-    tokens_per_step = cfg.world_batch_size * cfg.block_size
+    rng = random.Random(settings.seed + state["step"])
+    batches = micro_batch_stream(settings, loaders, stage_manager, state, rng)
+    tokens_per_step = settings.world_batch_size * settings.block_size
     sample_counter: Counter[str] = Counter()
     print(f"{time.ctime()[:-5]}: setup took {time.time() - start_time:.1f}s, starting training at step {state['step']}.")
 
@@ -194,40 +219,40 @@ def train(cfg: Settings) -> None:
             step,
             max_steps,
             stage_manager,
-            min_lr=cfg.min_lr,
-            warmup_steps=cfg.warmup_steps,
-            cooldown_steps=cfg.cooldown_steps,
-            schedule=cfg.lr_schedule,
+            min_lr=settings.min_lr,
+            warmup_steps=settings.warmup_steps,
+            cooldown_steps=settings.cooldown_steps,
+            schedule=settings.lr_schedule,
             resume_step=state["resume_step"],
-            resume_warmup_steps=cfg.resume_warmup_steps,
+            resume_warmup_steps=settings.resume_warmup_steps,
         )
         set_lr(optimizer, lr)
 
         loss_sum = torch.zeros((), device=backend.device)
         log_ppl_sum = torch.zeros((), device=backend.device)
-        for micro in range(cfg.gradient_accumulation_steps):
+        for micro in range(settings.gradient_accumulation_steps):
             input_ids, labels, data_ids = next(batches)
             sample_counter.update(data_ids)
             input_ids = backend.to_device(input_ids)
             labels = backend.to_device(labels)
-            with backend.no_sync(model) if micro < cfg.gradient_accumulation_steps - 1 else nullcontext():
+            with backend.no_sync(model) if micro < settings.gradient_accumulation_steps - 1 else nullcontext():
                 with backend.autocast():
                     outputs = model(input_ids, labels=labels)
-                backend.backward(outputs["loss"] / cfg.gradient_accumulation_steps)
+                backend.backward(outputs["loss"] / settings.gradient_accumulation_steps)
             loss_sum += outputs["loss"].detach()
             log_ppl_sum += outputs["log_ppl"].detach()
-        loss = loss_sum / cfg.gradient_accumulation_steps
-        log_ppl = log_ppl_sum / cfg.gradient_accumulation_steps
+        loss = loss_sum / settings.gradient_accumulation_steps
+        log_ppl = log_ppl_sum / settings.gradient_accumulation_steps
         if not torch.isfinite(loss):
             raise RuntimeError(f"Loss is {loss.item()} at step {step}. Terminating.")
 
-        grad_norm = backend.clip_grad_norm(model, cfg.grad_clip)
+        grad_norm = backend.clip_grad_norm(model, settings.grad_clip)
         if not torch.isfinite(grad_norm):
             raise RuntimeError(f"Gradient norm is non-finite at step {step}. Terminating.")
         if step > 0:  # as in the thesis runs: the very first update is skipped (LR is 0 there anyway with warmup)
             optimizer.step()
         metrics: dict[str, Any] = {}
-        if cfg.log_gradient_metrics and (step + 1) % cfg.log_step_interval == 0:
+        if settings.log_gradient_metrics and (step + 1) % settings.log_step_interval == 0:
             metrics |= track_gradient_metrics(model, optimizer)
         optimizer.zero_grad(set_to_none=True)
         state["step"] = done = step + 1
@@ -239,17 +264,17 @@ def train(cfg: Settings) -> None:
         elif info.in_transition and not next_info.in_transition:
             print(f"Step {done}: transition complete, now in stage {next_info.stage_idx} ({next_info.stage_name})")
 
-        if done % cfg.eval_step_interval == 0 or done >= max_steps:
+        if done % settings.eval_step_interval == 0 or done >= max_steps:
             t0 = time.time()
-            val_metrics = validate(cfg, backend, model, loaders.val_loaders[next_info.stage_idx])
+            val_metrics = validate(settings, backend, model, loaders.val_loaders[next_info.stage_idx])
             val_metrics["val_time"] = torch.as_tensor(time.time() - t0)
             print(f"Step {done}: val loss {val_metrics['val_loss'].item():.4f} "
                   f"(stage {next_info.stage_idx}, {val_metrics['val_time']:.1f}s)")
             metrics |= val_metrics
 
-        if done % cfg.log_step_interval == 0:
+        if done % settings.log_step_interval == 0:
             now = time.time()
-            steps_in_interval = cfg.log_step_interval
+            steps_in_interval = settings.log_step_interval
             seconds_per_step = (now - interval_t0) / steps_in_interval
             interval_t0 = now
             total = sum(sample_counter.values())
@@ -277,13 +302,13 @@ def train(cfg: Settings) -> None:
                   f"{seconds_per_step:.2f}s/step")
 
         stage_end = stage_manager.stage_ending_at(step)
-        if is_checkpoint_step(cfg, done, max_steps, stage_end=stage_end is not None):
-            path = checkpoint_path(out_dir, cfg.run_name, done, stage_end)
+        if is_checkpoint_step(settings, done, max_steps, stage_end=stage_end is not None):
+            path = checkpoint_path(run_directory, settings.run_name, done, stage_end)
             metadata = CheckpointMetadata(
                 step=done,
                 stage=next_info.stage_idx,
                 rng=backend.rng_state(),
-                settings=asdict(cfg),
+                settings=asdict(settings),
                 model_config=cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict(),
                 dataset_config_hash=resolved.config_hash,
                 validation_rows=resolved.validation_rows,
@@ -294,8 +319,8 @@ def train(cfg: Settings) -> None:
     logger.log_summary({"train_time": time.time() - train_t0})
     logger.finish()
     print(f"Training finished after {state['step']} steps in {time.time() - train_t0:.1f}s.")
-    if cfg.export_to_hf:
-        export_dir = Path(cfg.export_hf_path) if cfg.export_hf_path else out_dir / "hf_export"
+    if settings.export_to_hf:
+        export_dir = Path(settings.export_hf_path) if settings.export_hf_path else run_directory / "hf_export"
         raw = cast(RecurrentGPT, unwrap_compiled(model))
         export_to_hf(raw, raw.config, export_dir, tokenizer_dir=resolved.tokenizer_dir)
         print(f"Exported HuggingFace model to {export_dir}")
