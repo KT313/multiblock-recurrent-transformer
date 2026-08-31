@@ -26,22 +26,17 @@ from model import RecurrentConfig, RecurrentGPT, build_model
 from model.hf import export_to_hf
 from training.backend import Backend, get_backend
 from training.checkpoint import (
+    CheckpointMetadata,
     checkpoint_dir,
-    checkpoint_name,
+    checkpoint_path,
     find_latest_checkpoint,
-    load_checkpoint,
-    save_checkpoint,
-    should_save_checkpoint,
+    is_checkpoint_step,
+    load_training_checkpoint,
+    save_training_checkpoint,
+    unwrap_compiled,
 )
 from training.data import IGNORE_INDEX, StageDataloaders, build_stage_dataloaders, length_sorted_batches
-from training.data.dataset_resolver import (
-    CHECKPOINT_HASH_KEY,
-    CHECKPOINT_VALIDATION_ROWS_KEY,
-    ResolvedDataset,
-    check_checkpoint_dataset_hash,
-    check_checkpoint_validation_rows,
-    resolve_dataset,
-)
+from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.data.loader import Batch, sample_stage_batch
 from training.logger import Logger, num_parameters, track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
@@ -55,11 +50,6 @@ class LoopState(TypedDict):
 
     step: int  # next optimizer step to run
     resume_step: int  # step the run was resumed at, -1 for a fresh run
-
-
-def unwrap(model: torch.nn.Module) -> RecurrentGPT:
-    """The plain `RecurrentGPT` behind a `torch.compile` wrapper (for `.step`, `.config`, ...)."""
-    return cast(RecurrentGPT, getattr(model, "_orig_mod", model))
 
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
@@ -111,7 +101,7 @@ def validate(
 ) -> dict[str, torch.Tensor]:
     """Validation loss at every depth in `partial_depth_eval` and at the model's mean recurrence."""
     model.eval()
-    config = unwrap(model).config
+    config = cast(RecurrentGPT, unwrap_compiled(model)).config
     mean_recurrence = cast(list[int], config.mean_recurrence)  # broadcast to a list in RecurrentConfig.__post_init__
     depths: list[int | list[int]] = [*cfg.partial_depth_eval, mean_recurrence]
     losses = torch.zeros(cfg.eval_iters, len(depths), device=backend.device)
@@ -176,17 +166,16 @@ def train(cfg: Settings) -> None:
             out_dir, cfg.run_name
         )
     if resume_path is not None:
-        extra = load_checkpoint(backend, resume_path, model, optimizer)
-        check_checkpoint_dataset_hash(extra, resolved.config_hash, cfg.allow_dataset_change)
-        check_checkpoint_validation_rows(extra, resolved.validation_rows, cfg.allow_dataset_change)
-        state["step"] = state["resume_step"] = extra["step"]
-        backend.set_rng_state(extra["rng"])
+        metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
+        check_dataset_unchanged(metadata, resolved, cfg.allow_dataset_change)
+        state["step"] = state["resume_step"] = metadata.step
+        backend.set_rng_state(metadata.rng)
         print(f"Resumed from {resume_path} at step {state['step']}")
     else:
         print("No checkpoint loaded, starting from scratch.")
 
     logger = Logger(cfg.logger_project, cfg.run_name, out_dir, offline=cfg.wandb_offline, enabled=cfg.wandb_enabled)
-    logger.log_hyperparams(asdict(cfg) | {CHECKPOINT_HASH_KEY: resolved.config_hash})
+    logger.log_hyperparams(asdict(cfg) | {"dataset_config_hash": resolved.config_hash})
     logger.log_summary({"num_parameters": n_params})
 
     rng = random.Random(cfg.seed + state["step"])
@@ -199,7 +188,7 @@ def train(cfg: Settings) -> None:
     interval_t0 = time.time()
     while state["step"] < max_steps:
         step = state["step"]
-        unwrap(model).step = step
+        cast(RecurrentGPT, unwrap_compiled(model)).step = step
         info = stage_manager.get_stage_info(step)
         lr = get_lr_multistage(
             step,
@@ -287,25 +276,19 @@ def train(cfg: Settings) -> None:
             print(f"step {done}/{max_steps} | loss {loss.item():.4f} | lr {lr:.2e} | grad_norm {grad_norm.item():.3f} | "
                   f"{seconds_per_step:.2f}s/step")
 
-        stage_end, stage_suffix = stage_manager.should_save_stage_checkpoint(step)
-        if should_save_checkpoint(
-            done,
-            max_steps=max_steps,
-            save_step_interval=cfg.save_step_interval,
-            save_last_step=cfg.save_last_step,
-            stage_end=stage_end,
-        ):
-            stage_idx = int(stage_suffix.split("-")[1].split("_")[0]) if stage_end else None
-            path = checkpoint_dir(out_dir) / checkpoint_name(done, cfg.run_name, stage_end=stage_idx)
-            extra = {
-                "step": done,
-                "stage": next_info.stage_idx,
-                "rng": backend.rng_state(),
-                "config": asdict(cfg),
-                CHECKPOINT_HASH_KEY: resolved.config_hash,
-                CHECKPOINT_VALIDATION_ROWS_KEY: resolved.validation_rows,
-            }
-            save_checkpoint(backend, path, model, optimizer, extra)
+        stage_end = stage_manager.stage_ending_at(step)
+        if is_checkpoint_step(cfg, done, max_steps, stage_end=stage_end is not None):
+            path = checkpoint_path(out_dir, cfg.run_name, done, stage_end)
+            metadata = CheckpointMetadata(
+                step=done,
+                stage=next_info.stage_idx,
+                rng=backend.rng_state(),
+                settings=asdict(cfg),
+                model_config=cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict(),
+                dataset_config_hash=resolved.config_hash,
+                validation_rows=resolved.validation_rows,
+            )
+            save_training_checkpoint(backend, path, model, optimizer, metadata)
             print(f"Saved checkpoint {path}")
 
     logger.log_summary({"train_time": time.time() - train_t0})
@@ -313,7 +296,7 @@ def train(cfg: Settings) -> None:
     print(f"Training finished after {state['step']} steps in {time.time() - train_t0:.1f}s.")
     if cfg.export_to_hf:
         export_dir = Path(cfg.export_hf_path) if cfg.export_hf_path else out_dir / "hf_export"
-        raw = unwrap(model)
+        raw = cast(RecurrentGPT, unwrap_compiled(model))
         export_to_hf(raw, raw.config, export_dir, tokenizer_dir=resolved.tokenizer_dir)
         print(f"Exported HuggingFace model to {export_dir}")
 

@@ -27,16 +27,14 @@ from data_preparation.dataset_config import (
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build import DatasetReport
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
+from training.checkpoint import CheckpointMetadata
 from training.data.dataset_resolver import (
-    CHECKPOINT_HASH_KEY,
-    CHECKPOINT_VALIDATION_ROWS_KEY,
     INSTRUCT_DATA_SIGNATURE,
     DataEntry,
     ResolvedDataset,
     ResolvedStage,
     build_command,
-    check_checkpoint_dataset_hash,
-    check_checkpoint_validation_rows,
+    check_dataset_unchanged,
     check_entries_on_disk,
     processed_rows,
     resolve_dataset,
@@ -526,31 +524,58 @@ def test_block_size_mismatch_raises_naming_both_files(tmp_path: Path, crow_cfg: 
 # --- resume checks --------------------------------------------------------------------------------------------------
 
 
-def test_checkpoint_hash_check(caplog: pytest.LogCaptureFixture) -> None:
-    check_checkpoint_dataset_hash({CHECKPOINT_HASH_KEY: "abc"}, "abc", allow_change=False)
-    with pytest.raises(RuntimeError, match="hash abc, the current dataset config hashes to xyz"):
-        check_checkpoint_dataset_hash({CHECKPOINT_HASH_KEY: "abc"}, "xyz", allow_change=False)
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_checkpoint_dataset_hash({CHECKPOINT_HASH_KEY: "abc"}, "xyz", allow_change=True)
-    assert "allow_dataset_change" in caplog.text
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_checkpoint_dataset_hash({"step": 3}, "xyz", allow_change=False)  # older checkpoint format
-    assert "older format" in caplog.text
+def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedDataset:
+    return ResolvedDataset(
+        config=load_dataset_config(TINY_DATASET_YAML),
+        config_hash=config_hash,
+        tokenizer_dir="unused",
+        stages=[],
+        validation_rows=validation_rows,
+    )
 
 
-def test_checkpoint_validation_rows_check(caplog: pytest.LogCaptureFixture) -> None:
+def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMetadata:
+    return CheckpointMetadata(
+        step=3,
+        stage=0,
+        rng={},
+        settings={},
+        model_config={},
+        dataset_config_hash=config_hash,
+        validation_rows=validation_rows,
+    )
+
+
+def test_check_dataset_unchanged_passes_on_identical_hash_and_split() -> None:
+    check_dataset_unchanged(_metadata("abc", {"a": 3, "b": 0}), _resolved("abc", {"a": 3, "b": 0}), allow_change=False)
+
+
+def test_check_dataset_unchanged_hash_mismatch(caplog: pytest.LogCaptureFixture) -> None:
+    rows = {"a": 3}
+    with pytest.raises(RuntimeError, match="hash abc, the current dataset config hashes to xyz") as excinfo:
+        check_dataset_unchanged(_metadata("abc", rows), _resolved("xyz", rows), allow_change=False)
+    assert "allow_dataset_change: true" in str(excinfo.value) and "validation split" not in str(excinfo.value)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_dataset_unchanged(_metadata("abc", rows), _resolved("xyz", rows), allow_change=True)
+    assert "hash abc" in caplog.text and "allow_dataset_change" in caplog.text
+
+
+def test_check_dataset_unchanged_validation_rows_mismatch(caplog: pytest.LogCaptureFixture) -> None:
     expected = {"a": 3, "b": 0}
-    check_checkpoint_validation_rows({CHECKPOINT_VALIDATION_ROWS_KEY: {"a": 3, "b": 0}}, expected, allow_change=False)
     with pytest.raises(RuntimeError, match="validation rows per source: 'a': checkpoint 4, now 3\\)") as excinfo:
-        check_checkpoint_validation_rows({CHECKPOINT_VALIDATION_ROWS_KEY: {"a": 4, "b": 0}}, expected, allow_change=False)
+        check_dataset_unchanged(_metadata("h", {"a": 4, "b": 0}), _resolved("h", expected), allow_change=False)
     assert "'b'" not in str(excinfo.value) and "allow_dataset_change: true" in str(excinfo.value)
+    assert "config hash" not in str(excinfo.value)  # only the differing part is reported
     with pytest.raises(RuntimeError, match="'b': checkpoint 0, now absent; 'c': checkpoint absent, now 1"):
-        check_checkpoint_validation_rows({CHECKPOINT_VALIDATION_ROWS_KEY: {"a": 3, "b": 0}}, {"a": 3, "c": 1}, allow_change=False)
+        check_dataset_unchanged(_metadata("h", {"a": 3, "b": 0}), _resolved("h", {"a": 3, "c": 1}), allow_change=False)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_checkpoint_validation_rows({CHECKPOINT_VALIDATION_ROWS_KEY: {"a": 4, "b": 0}}, expected, allow_change=True)
+        check_dataset_unchanged(_metadata("h", {"a": 4, "b": 0}), _resolved("h", expected), allow_change=True)
     assert "'a': checkpoint 4, now 3" in caplog.text and "allow_dataset_change" in caplog.text
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_checkpoint_validation_rows({"step": 3, CHECKPOINT_HASH_KEY: "abc"}, expected, allow_change=False)  # older format
-    assert "older format" in caplog.text and CHECKPOINT_VALIDATION_ROWS_KEY in caplog.text
+
+
+def test_check_dataset_unchanged_reports_both_differences_at_once() -> None:
+    with pytest.raises(RuntimeError) as excinfo:
+        check_dataset_unchanged(_metadata("abc", {"a": 4}), _resolved("xyz", {"a": 3}), allow_change=False)
+    message = str(excinfo.value)
+    assert "hash abc, the current dataset config hashes to xyz; the validation split differs" in message
+    assert "'a': checkpoint 4, now 3" in message

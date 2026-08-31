@@ -82,7 +82,7 @@ def test_zero_length_transition_has_no_transition_steps_but_a_stage_end_checkpoi
     assert not any(sm.get_stage_info(s).in_transition for s in range(16))
     assert (sm.get_stage_info(7).stage_idx, sm.get_stage_info(8).stage_idx) == (0, 1)
     assert sm.get_stage_info(7).transition_progress == 0.0
-    assert sm.should_save_stage_checkpoint(7) == (True, "stage-0_end")
+    assert sm.stage_ending_at(7) == 0
     assert "Transition OUT: 0 steps (5.0% of current stage)" in sm.get_stage_summary()
 
 
@@ -155,11 +155,15 @@ def test_get_stage_info_past_the_end_reports_last_stage_complete() -> None:
         assert info.prev_stage_idx is None
 
 
-def test_should_save_stage_checkpoint_exact_steps() -> None:
+def test_stage_ending_at_exact_steps() -> None:
+    """The stage index only at the last step before each transition (5 -> 0, 13 -> 1), None everywhere else —
+    including the last stage, which has no transition after it."""
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
-    expected = {5: (True, "stage-0_end"), 13: (True, "stage-1_end")}
+    expected = {5: 0, 13: 1}
     for step in range(25):
-        assert sm.should_save_stage_checkpoint(step) == expected.get(step, (False, ""))
+        assert sm.stage_ending_at(step) == expected.get(step)
+    assert [b.transition_start_step for b in sm.boundaries[:-1]] == [6, 14]
+    assert all(sm.stage_ending_at(step) is None for step in range(sm.boundaries[-1].start_step, sm.total_steps + 5))
 
 
 def test_stage_boundary_helpers() -> None:

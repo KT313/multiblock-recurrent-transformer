@@ -205,12 +205,15 @@ class StageManager:
             prev_base_lr=None,
         )
 
-    def should_save_stage_checkpoint(self, step: int) -> tuple[bool, str]:
-        """Whether `step` is the last step before a transition starts, and the checkpoint suffix to use."""
+    def stage_ending_at(self, step: int) -> int | None:
+        """Index of the stage whose transition starts at `step + 1` (`step` is its last plain step), else None.
+
+        The training loop writes the `-stage-{i}_end` checkpoint after that step.
+        """
         for boundary in self.boundaries[:-1]:  # the last stage has no transition after it
             if step == boundary.transition_start_step - 1:
-                return True, f"stage-{boundary.stage_idx}_end"
-        return False, ""
+                return boundary.stage_idx
+        return None
 
     def get_stage_summary(self) -> str:
         """Human-readable summary of the stage configuration (verify the boundaries by hand when in doubt)."""

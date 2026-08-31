@@ -25,18 +25,13 @@ from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data import IGNORE_INDEX, StageDataloaders
-from training.data.dataset_resolver import (
-    CHECKPOINT_HASH_KEY,
-    CHECKPOINT_VALIDATION_ROWS_KEY,
-    ResolvedDataset,
-    resolve_dataset,
-)
+from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.loader import Batch
 from training.logger import Logger
 from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.train import LoopState, build_stage_manager, micro_batch_stream, unwrap, validate
+from training.train import LoopState, build_stage_manager, micro_batch_stream, validate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -98,16 +93,6 @@ def tiny_resolved(tiny_settings: Settings) -> ResolvedDataset:
 @pytest.fixture
 def cpu_backend() -> SingleDeviceBackend:
     return SingleDeviceBackend(device="cpu", precision="32")
-
-
-def test_unwrap(tiny_model: RecurrentGPT) -> None:
-    class Wrapper(torch.nn.Module):
-        def __init__(self, inner: torch.nn.Module) -> None:
-            super().__init__()
-            self._orig_mod = inner
-
-    assert unwrap(tiny_model) is tiny_model
-    assert unwrap(Wrapper(tiny_model)) is tiny_model
 
 
 def test_loop_state_fields() -> None:
@@ -330,9 +315,10 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
     for name, step, stage in (("step-00000006-tiny-stage-0_end.pth", 6, 1), ("step-00000014-tiny-stage-1_end.pth", 14, 2)):
         extra = torch.load(checkpoint_dir(full_run["out_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
-        assert extra["config"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
-        assert extra[CHECKPOINT_HASH_KEY] == full_run["dataset_hash"]
-        assert extra[CHECKPOINT_VALIDATION_ROWS_KEY] == validation_rows
+        assert extra["settings"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
+        assert extra["model_config"]["block_size"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
+        assert extra["dataset_config_hash"] == full_run["dataset_hash"]
+        assert extra["validation_rows"] == validation_rows
 
 
 @pytest.mark.slow
@@ -430,7 +416,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     assert [s for s, m in logged.items() if "val_loss" in m] == [16, 20]
     assert logged[16]["data_composition/finetune-synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
     final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
-    assert final[CHECKPOINT_VALIDATION_ROWS_KEY] == full_run["validation_rows"]  # the resumed run kept the split
+    assert final["validation_rows"] == full_run["validation_rows"]  # the resumed run kept the split
 
 
 def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
@@ -530,8 +516,8 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
     latest = checkpoint_dir(out_dir) / "step-00000014-tiny-stage-1_end.pth"
     state = torch.load(latest, map_location="cpu", weights_only=False)
-    k = state[CHECKPOINT_VALIDATION_ROWS_KEY]["synthetic_pretrain"]
-    state[CHECKPOINT_VALIDATION_ROWS_KEY]["synthetic_pretrain"] = k + 1
+    k = state["validation_rows"]["synthetic_pretrain"]
+    state["validation_rows"]["synthetic_pretrain"] = k + 1
     torch.save(state, latest)
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
     with pytest.raises(RuntimeError, match=f"validation rows per source: 'synthetic_pretrain': checkpoint {k + 1}, now {k}"):
@@ -541,7 +527,7 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
     logged = _run(yaml_path, monkeypatch)
     assert sorted(logged) == list(range(15, 21))
     final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
-    assert final[CHECKPOINT_VALIDATION_ROWS_KEY] == full_run["validation_rows"]  # the new checkpoint stores the current split
+    assert final["validation_rows"] == full_run["validation_rows"]  # the new checkpoint stores the current split
 
 
 # --------------------------------------------------------------------------------------------------------------

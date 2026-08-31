@@ -7,7 +7,7 @@ training is read whole, a source used only for validation is read whole as valid
 holds out its first `ceil(validation_fraction_of(source) × rows)` processed rows (`validation_rows`) for validation
 and trains on the rest. Rows are counted from the parquet footers of `processed/<source>` and cross-checked against
 the manifest; the same source gets the same split in every stage. The chosen `validation_rows` per source travel
-with every checkpoint next to `dataset_config_hash` and are verified on resume.
+with every checkpoint next to `dataset_config_hash` and are verified on resume (`check_dataset_unchanged`).
 
 Framework-neutral apart from `data_preparation.*` (manifests, parquet footers); no torch. The only cross-over
 between the run config and the dataset config happens here.
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
-from typing import Any, Literal, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
 from data_preparation.lib.build import prepare, status, summarize_dataset_state
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
@@ -33,14 +33,15 @@ from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
 from training.settings import Settings
 from training.stage_manager import TrainingStage
 
+if TYPE_CHECKING:  # annotation only: this module stays torch-free, `training.checkpoint` imports torch
+    from training.checkpoint import CheckpointMetadata
+
 log = get_logger(__name__)
 
 INSTRUCT_DATA_SIGNATURE: dict[str, Any] = {
     "keys": ["instruction", "input", "output"],
     "format_fn": "concatenate_instruction_input_output",
 }
-CHECKPOINT_HASH_KEY = "dataset_config_hash"
-CHECKPOINT_VALIDATION_ROWS_KEY = "dataset_validation_rows"  # {source: validation_rows} as chosen by `resolve_splits`
 
 Part = Literal["train", "val"]
 
@@ -348,46 +349,36 @@ def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = No
 # --- resume checks ---------------------------------------------------------------------------------------------------
 
 
-def check_checkpoint_dataset_hash(extra: dict[str, Any], expected_hash: str, allow_change: bool) -> None:
-    """Compare a checkpoint's stored dataset-config hash with the current one.
+def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDataset, allow_change: bool) -> None:
+    """Verify that a checkpoint was written against the dataset the run now resolves to.
 
-    A checkpoint without the key (older format) only logs a warning; a mismatch raises unless `allow_change`.
+    Two things are compared: the dataset-config hash (sources, stages, budgets, tokenizer, processing) and the
+    validation split (`{source: validation_rows}`, which only differs when the data on disk changed — a source
+    grew or shrank, was added or removed; a resumed run would then validate on rows it has trained on, or vice
+    versa). A mismatch raises `RuntimeError` naming every difference (for the split: every source and both numbers)
+    unless `allow_change` (`allow_dataset_change` in the run config), which only logs a warning.
     """
-    stored = extra.get(CHECKPOINT_HASH_KEY)
-    if stored is None:
-        log.warning("checkpoint carries no %s (older format); cannot verify the dataset config", CHECKPOINT_HASH_KEY)
-        return
-    if stored == expected_hash:
-        return
-    message = f"checkpoint was written with dataset config hash {stored}, the current dataset config hashes to {expected_hash}"
-    if allow_change:
-        log.warning("%s; continuing because allow_dataset_change is set", message)
-        return
-    raise RuntimeError(f"{message}. Set allow_dataset_change: true to resume anyway.")
-
-
-def check_checkpoint_validation_rows(extra: dict[str, Any], expected: Mapping[str, int], allow_change: bool) -> None:
-    """Compare a checkpoint's stored validation split (`{source: validation_rows}`) with the freshly resolved one.
-
-    The split can only differ when the data on disk changed (a source grew or shrank, a source was added or
-    removed); a resumed run would then validate on rows it has trained on, or vice versa. A checkpoint without the
-    key (older format) only logs a warning; a mismatch raises unless `allow_change`, naming every source and both
-    numbers.
-    """
-    stored: Any = extra.get(CHECKPOINT_VALIDATION_ROWS_KEY)
-    if stored is None:
-        log.warning(
-            "checkpoint carries no %s (older format); cannot verify the validation split", CHECKPOINT_VALIDATION_ROWS_KEY
+    problems: list[str] = []
+    if metadata.dataset_config_hash != dataset.config_hash:
+        problems.append(
+            f"checkpoint was written with dataset config hash {metadata.dataset_config_hash}, the current dataset "
+            f"config hashes to {dataset.config_hash}"
         )
-        return
+    stored, expected = metadata.validation_rows, dataset.validation_rows
     mismatches = [
         f"{name!r}: checkpoint {stored.get(name, 'absent')}, now {expected.get(name, 'absent')}"
         for name in sorted(set(stored) | set(expected))
         if stored.get(name) != expected.get(name)
     ]
-    if not mismatches:
+    if mismatches:
+        problems.append(
+            "the validation split differs from the checkpoint's (validation rows per source: "
+            + "; ".join(mismatches)
+            + ")"
+        )
+    if not problems:
         return
-    message = "the validation split differs from the checkpoint's (validation rows per source: " + "; ".join(mismatches) + ")"
+    message = "; ".join(problems)
     if allow_change:
         log.warning("%s; continuing because allow_dataset_change is set", message)
         return
@@ -395,15 +386,12 @@ def check_checkpoint_validation_rows(extra: dict[str, Any], expected: Mapping[st
 
 
 __all__ = [
-    "CHECKPOINT_HASH_KEY",
-    "CHECKPOINT_VALIDATION_ROWS_KEY",
     "INSTRUCT_DATA_SIGNATURE",
     "DataEntry",
     "ResolvedDataset",
     "ResolvedStage",
     "build_command",
-    "check_checkpoint_dataset_hash",
-    "check_checkpoint_validation_rows",
+    "check_dataset_unchanged",
     "check_entries_on_disk",
     "processed_rows",
     "resolve_dataset",

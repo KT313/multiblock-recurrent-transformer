@@ -1,13 +1,16 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Checkpoint save/load/resume through the backend. Steps in file names are OPTIMIZER steps.
+"""Checkpoint schema, naming, search, save/load through the backend. Steps in file names are OPTIMIZER steps.
 
-State layout: `{"model", "optimizer", "step", "stage", "rng", "config", "dataset_config_hash", "dataset_validation_rows"}`;
-the training loop supplies everything except "model"/"optimizer" via `extra` (the last two are verified on resume by
-`training.data.dataset_resolver.check_checkpoint_dataset_hash` / `check_checkpoint_validation_rows`; "rng" is
-`Backend.rng_state()`).
+A checkpoint is one `torch.save` dict: the two state dicts `"model"` / `"optimizer"` plus the fields of
+`CheckpointMetadata` (`step`, `stage`, `rng`, `settings`, `model_config`, `dataset_config_hash`, `validation_rows`).
+`dataset_config_hash` and `validation_rows` are verified on resume by
+`training.data.dataset_resolver.check_dataset_unchanged`; `rng` is `Backend.rng_state()`. There is no loader for
+older layouts (clean break, a standing decision): `CheckpointMetadata.from_state` raises on a missing key.
 """
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,9 +18,38 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from training.backend.base import Backend
+from training.settings import Settings
 
 CHECKPOINT_SUBDIR = "checkpoints"
 CHECKPOINT_SUFFIX = ".pth"
+
+
+@dataclass
+class CheckpointMetadata:
+    """Everything in a checkpoint besides the two state dicts."""
+
+    step: int  # optimizer steps completed when the checkpoint was written
+    stage: int  # stage the run is in at `step` (the one it enters next when written before a transition)
+    rng: dict[str, Any]  # `Backend.rng_state()` after evaluation and logging of `step`
+    settings: dict[str, Any]  # `asdict(Settings)` of the run
+    model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
+    dataset_config_hash: str  # `ResolvedDataset.config_hash`
+    validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
+
+    def to_state(self) -> dict[str, Any]:
+        """The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied)."""
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> "CheckpointMetadata":
+        """Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored."""
+        missing = [f.name for f in fields(cls) if f.name not in state]
+        if missing:
+            raise KeyError(
+                f"checkpoint is missing the metadata key(s) {missing}; it was written by an older version of the "
+                "training code and cannot be resumed (checkpoint formats are a clean break)"
+            )
+        return cls(**{f.name: state[f.name] for f in fields(cls)})
 
 
 def checkpoint_dir(out_dir: str | Path) -> Path:
@@ -30,6 +62,11 @@ def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None) -
     if stage_end is not None:
         name += f"-stage-{stage_end}_end"
     return name + CHECKPOINT_SUFFIX
+
+
+def checkpoint_path(run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None) -> Path:
+    """`run_directory/checkpoints/<checkpoint_name>`; `stage_end` is `StageManager.stage_ending_at(step - 1)`."""
+    return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end)
 
 
 def _step_from_name(path: Path) -> int:
@@ -46,36 +83,44 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
     return max(candidates, key=_step_from_name)
 
 
-def should_save_checkpoint(
-    step: int, *, max_steps: int, save_step_interval: int, save_last_step: bool, stage_end: bool = False
-) -> bool:
-    """Save at every `save_step_interval`, at the last step if requested, and before every stage transition."""
-    save_at_interval = save_step_interval > 0 and step % save_step_interval == 0
-    save_at_last_step = save_last_step and step >= max_steps
+def is_checkpoint_step(settings: Settings, progress_step: int, max_steps: int, stage_end: bool) -> bool:
+    """Whether to write a checkpoint after `progress_step` completed optimizer steps.
+
+    Three rules: every `save_step_interval` steps (0 disables), at the last step if `save_last_step`, and before
+    every stage transition (`stage_end`).
+    """
+    save_at_interval = settings.save_step_interval > 0 and progress_step % settings.save_step_interval == 0
+    save_at_last_step = settings.save_last_step and progress_step >= max_steps
     return save_at_interval or save_at_last_step or stage_end
 
 
-def _unwrap(model: Module) -> Module:
-    """Strip the `torch.compile` wrapper so state-dict keys stay stable across compiled/uncompiled runs."""
+def unwrap_compiled(model: Module) -> Module:
+    """The plain module behind a `torch.compile` wrapper (state-dict keys stay stable across compiled/uncompiled
+    runs; the loop reads `.step` / `.config` on it)."""
     return getattr(model, "_orig_mod", model)
 
 
-def save_checkpoint(
-    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer, extra: dict[str, Any]
+def save_training_checkpoint(
+    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer, metadata: CheckpointMetadata
 ) -> None:
-    """Write model + optimizer state dicts and `extra` (step, stage, dataloader, rng, config) to `path`."""
-    state: dict[str, Any] = {"model": _unwrap(model).state_dict(), "optimizer": optimizer.state_dict()}
-    state.update(extra)
+    """Write the model + optimizer state dicts and `metadata` to `path`."""
+    state: dict[str, Any] = {
+        "model": unwrap_compiled(model).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        **metadata.to_state(),
+    }
     backend.save_checkpoint(path, state)
 
 
-def load_checkpoint(
-    backend: Backend, path: str | Path, model: Module, optimizer: Optional[Optimizer] = None
-) -> dict[str, Any]:
-    """Load model (and optimizer) state in place; return the remaining entries (step, stage, dataloader, rng, ...)."""
+def load_training_checkpoint(
+    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer
+) -> CheckpointMetadata:
+    """Load the model and optimizer state in place and return the checkpoint's metadata.
+
+    The metadata is read first, so a checkpoint of an older layout fails before anything is modified.
+    """
     state = backend.load_checkpoint(path)
-    _unwrap(model).load_state_dict(state.pop("model"))
-    optimizer_state = state.pop("optimizer")
-    if optimizer is not None:
-        optimizer.load_state_dict(optimizer_state)
-    return state
+    metadata = CheckpointMetadata.from_state(state)
+    unwrap_compiled(model).load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    return metadata
