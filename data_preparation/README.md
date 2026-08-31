@@ -302,7 +302,7 @@ disappear into the summary; at most eight rows are shown per panel ("… and k m
 terminal while the display is up: every `logging` record (the HuggingFace libraries' included), `warnings` and
 stray prints land in the log panel, the libraries' own bars are silenced. Warnings and the tables (plan, repair,
 status) are *kept* and printed once, unwrapped, after the display closed — the scrollback of a run is those lines
-and the final table, no frame. Ctrl-C leaves the same way. When stderr is
+and the final table, no frame. Ctrl-C and SIGTERM (`tools/capped_download.sh`) leave the same way. When stderr is
 not a terminal (`nohup`, redirects) or `DATA_PREP_PROGRESS=0` is set, there is no dashboard and plain timestamped
 log lines are written instead.
 

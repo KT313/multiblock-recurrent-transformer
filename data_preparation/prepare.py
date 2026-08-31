@@ -16,8 +16,8 @@ complete. ``describe`` renders the config as Markdown (``docs/data_mixture.md`` 
 relocates the HuggingFace caches.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed raw
-deletion, 130 interrupted (Ctrl-C: every running step stops at its next shard, everything published is kept). On a
-terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
+deletion, 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
+kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
 the tables) and the final status table are printed once it closed.
 """
 
@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
 from pathlib import Path
+from types import FrameType
 
 if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without installing the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -144,10 +147,17 @@ def run_describe(args: argparse.Namespace) -> None:
     sys.stdout.write(describe(cfg, args.dataset_config, notes=leading_comment(args.dataset_config)))
 
 
+def _interrupt_on_sigterm(signum: int, frame: FrameType | None) -> None:
+    """``kill`` / a byte-capped run (``tools/capped_download.sh``) end like Ctrl-C: stop at the next shard, exit 130."""
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> None:
     """Parse ``argv`` (default ``sys.argv``), dispatch, and map failures to exit codes (module docstring)."""
     configure_logging()
     args = build_parser().parse_args(argv)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
     try:
         args.run(args)
     except SystemExit:

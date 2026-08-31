@@ -634,8 +634,9 @@ prepare.main(["prepare", "--dataset_config", "config/datasets/tiny.yaml", "--dat
 """
 
 
-def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0) -> tuple[int, bytes]:
-    """Run ``python -c script`` on a pseudo-terminal of the given size; the exit code and everything it wrote."""
+def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0, terminate_after: float | None = None) -> tuple[int, bytes]:
+    """Run ``python -c script`` on a pseudo-terminal of the given size; the exit code and everything it wrote.
+    ``terminate_after`` sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run)."""
     pid, fd = pty.fork()
     if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -645,6 +646,7 @@ def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0)
         os.execve(sys.executable, [sys.executable, "-c", script], env)
     output = bytearray()
     deadline = time.monotonic() + timeout
+    terminate_at: float | None = None
     while True:
         ready, _, _ = select.select([fd], [], [], 0.1)
         if ready:
@@ -655,6 +657,11 @@ def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0)
             if not chunk:
                 break
             output += chunk
+            if terminate_after is not None and terminate_at is None and b"downloads" in output:  # the first frame is up
+                terminate_at = time.monotonic() + terminate_after
+        if terminate_at is not None and time.monotonic() > terminate_at:
+            os.kill(pid, 15)
+            terminate_at = None
         if time.monotonic() > deadline:
             os.kill(pid, 9)
             break
@@ -682,3 +689,17 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     build_log = (dataset_dir / "build.log").read_text()
     assert "round 1:" in build_log and "synthetic_pretrain: kept 41 of 41 fetched rows" in build_log
 
+
+@pytest.mark.slow
+def test_sigterm_in_a_pseudo_terminal_clears_the_display_and_exits_130(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.1)  # ~4 s of downloading
+    code, raw = _run_in_pty(script, width=140, height=45, terminate_after=0.5)
+    text = raw.decode("utf-8", "replace")
+    assert code == 130, text[-3000:]
+    screen = _Screen(140)
+    screen.feed(text)
+    shown = screen.text()
+    assert "╭" not in shown and "│" not in shown and "jobs done" not in shown, shown
+    assert "prepare interrupted; everything published so far is kept, rerun to resume" in shown, shown
+    assert shown.count("interrupted; the running jobs stop at their next shard") == 1, shown
