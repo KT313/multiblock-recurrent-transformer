@@ -35,8 +35,9 @@ def describe(cfg: DatasetConfig, config_path: str | Path, notes: str = "") -> st
         "",
         "Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the",
         "config times the stage weights; sequences are those tokens divided by `block_size` (what the training loader",
-        "draws and what the planner sizes downloads with); rows are an estimate from `describe_tokens_per_row`, which",
-        "nothing but this document uses.",
+        "draws and what the planner sizes downloads with). The weights mix rows, not tokens: a row shorter than",
+        "`block_size` realises fewer tokens than its sequence, so the last column estimates the tokens actually trained on",
+        "from `describe_tokens_per_row` (a per-source estimate nothing but this document uses).",
         "",
     ]
     if notes.strip():
@@ -130,15 +131,16 @@ def _stages(cfg: DatasetConfig) -> list[str]:
         lines += [
             f"### Stage {index + 1}: `{stage.name}` ({_tokens(stage.tokens)} tokens, transition {stage.transition_pct:.0%})",
             "",
-            "| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |",
+            "| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |",
             "|---|---:|---:|---:|---:|---:|",
         ]
         for name, weight in stage.train.items():
             tokens = stage.tokens * weight
             tokens_per_row = cfg.sources[name].describe_tokens_per_row
+            realised = ceil(tokens / cfg.block_size) * min(tokens_per_row, cfg.block_size)
             lines.append(
                 f"| `{name}` | {weight:.2%} | {_tokens(int(tokens))} | {_sequences(tokens, cfg.block_size)} | "
-                f"{tokens_per_row} | {ceil(tokens / tokens_per_row):,} |"
+                f"{tokens_per_row} | {_tokens(realised)} |"
             )
         validation = ", ".join(f"`{name}` at {weight:.0%}" for name, weight in stage.val.items())
         lines += ["", f"Validation: {validation}", ""]

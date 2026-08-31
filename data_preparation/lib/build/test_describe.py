@@ -15,9 +15,9 @@ TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 EXPECTED_TINY_STAGE = """### Stage 1: `pretrain_a` (8.2K tokens, transition 25%)
 
-| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |
+| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |
 |---|---:|---:|---:|---:|---:|
-| `synthetic_pretrain` | 100.00% | 8.2K | 32 | 224 | 37 |
+| `synthetic_pretrain` | 100.00% | 8.2K | 32 | 224 | 7.2K |
 
 Validation: `synthetic_pretrain` at 100%
 """
@@ -37,7 +37,7 @@ def test_tiny_snippets_and_determinism() -> None:
     assert GENERATED_WITH.format(config="config/datasets/tiny.yaml") + " > docs/data_mixture.md" in text
     assert EXPECTED_TINY_STAGE in text and EXPECTED_TINY_SPLIT in text
     assert "### Stage 3: `finetune` (4.1K tokens, transition 0%)" in text
-    assert "| `synthetic_instruct` | 100.00% | 4.1K | 16 | 64 | 64 |" in text
+    assert "| `synthetic_instruct` | 100.00% | 4.1K | 16 | 64 | 1.0K |" in text
     assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 16 sequences (4.1K tokens), input inversions 10%, shuffled (seed 2) |" in text
     assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 32 sequences (8.2K tokens) |" in text
     assert "- tokenizer: `synthetic` (synthetic)" in text and "- `token_count`: `tokenizer`" in text
@@ -70,10 +70,10 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
     budget = cfg.sequence_budget("fineweb_edu")
     assert budget == ceil(3_300_000_000 * 0.65 / 2048)
     assert f"budget {budget:,} sequences ({_tokens(budget * 2048)} tokens)" in text
-    assert "| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | 1,072,500 |" in text
+    assert f"| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | {_tokens(1_047_364 * 2000)} |" in text  # 2000 tokens/row of 2048
     # the finetune stage renders like the others: eight instruct sources with their shares
     assert "### Stage 3: `finetune` (150.0M tokens, transition 0%)" in text
-    assert f"| `flan` | 40.00% | 60.0M | {ceil(60_000_000 / 2048):,} | 300 | {ceil(60_000_000 / 300):,} |" in text
+    assert f"| `flan` | 40.00% | 60.0M | {ceil(60_000_000 / 2048):,} | 300 | {_tokens(ceil(60_000_000 / 2048) * 300)} |" in text  # short rows realise far less than their sequences
     assert "Validation: `flan` at 40%, `metamath` at 15%" in text
     assert "| `fineweb_edu` | train + val | 5% held out (the first rows of `processed/fineweb_edu`) |" in text
     assert "| `wikipedia` | train only | none |" in text

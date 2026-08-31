@@ -8,8 +8,9 @@ uv run python data_preparation/prepare.py describe --dataset_config config/datas
 
 Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the
 config times the stage weights; sequences are those tokens divided by `block_size` (what the training loader
-draws and what the planner sizes downloads with); rows are an estimate from `describe_tokens_per_row`, which
-nothing but this document uses.
+draws and what the planner sizes downloads with). The weights mix rows, not tokens: a row shorter than
+`block_size` realises fewer tokens than its sequence, so the last column estimates the tokens actually trained on
+from `describe_tokens_per_row` (a per-source estimate nothing but this document uses).
 
 ## Notes
 
@@ -49,63 +50,63 @@ gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every so
 
 ### Stage 1: `pretrain_phase1` (3.30B tokens, transition 10%)
 
-| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |
+| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |
 |---|---:|---:|---:|---:|---:|
-| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | 1,072,500 |
-| `wikipedia` | 9.00% | 297.0M | 145,020 | 1500 | 198,000 |
-| `books_gutenberg` | 6.00% | 198.0M | 96,680 | 3000 | 66,000 |
-| `github_code_clean_python` | 3.60% | 118.8M | 58,008 | 500 | 237,600 |
-| `github_code_clean_javascript` | 2.40% | 79.2M | 38,672 | 500 | 158,400 |
-| `github_code_clean_typescript` | 1.20% | 39.6M | 19,336 | 500 | 79,200 |
-| `github_code_clean_java` | 1.20% | 39.6M | 19,336 | 500 | 79,200 |
-| `github_code_clean_cpp` | 0.96% | 31.7M | 15,469 | 500 | 63,360 |
-| `github_code_clean_go` | 0.84% | 27.7M | 13,536 | 500 | 55,440 |
-| `github_code_clean_rust` | 0.60% | 19.8M | 9,668 | 500 | 39,600 |
-| `github_code_clean_shell` | 0.48% | 15.8M | 7,735 | 500 | 31,680 |
-| `github_code_clean_sql` | 0.36% | 11.9M | 5,801 | 500 | 23,760 |
-| `github_code_clean_html` | 0.36% | 11.9M | 5,801 | 500 | 23,760 |
-| `peso` | 3.00% | 99.0M | 48,340 | 1500 | 66,000 |
-| `arxiv` | 2.00% | 66.0M | 32,227 | 1500 | 44,000 |
-| `openwebmath` | 3.00% | 99.0M | 48,340 | 750 | 132,000 |
+| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | 2.09B |
+| `wikipedia` | 9.00% | 297.0M | 145,020 | 1500 | 217.5M |
+| `books_gutenberg` | 6.00% | 198.0M | 96,680 | 3000 | 198.0M |
+| `github_code_clean_python` | 3.60% | 118.8M | 58,008 | 500 | 29.0M |
+| `github_code_clean_javascript` | 2.40% | 79.2M | 38,672 | 500 | 19.3M |
+| `github_code_clean_typescript` | 1.20% | 39.6M | 19,336 | 500 | 9.7M |
+| `github_code_clean_java` | 1.20% | 39.6M | 19,336 | 500 | 9.7M |
+| `github_code_clean_cpp` | 0.96% | 31.7M | 15,469 | 500 | 7.7M |
+| `github_code_clean_go` | 0.84% | 27.7M | 13,536 | 500 | 6.8M |
+| `github_code_clean_rust` | 0.60% | 19.8M | 9,668 | 500 | 4.8M |
+| `github_code_clean_shell` | 0.48% | 15.8M | 7,735 | 500 | 3.9M |
+| `github_code_clean_sql` | 0.36% | 11.9M | 5,801 | 500 | 2.9M |
+| `github_code_clean_html` | 0.36% | 11.9M | 5,801 | 500 | 2.9M |
+| `peso` | 3.00% | 99.0M | 48,340 | 1500 | 72.5M |
+| `arxiv` | 2.00% | 66.0M | 32,227 | 1500 | 48.3M |
+| `openwebmath` | 3.00% | 99.0M | 48,340 | 750 | 36.3M |
 
 Validation: `fineweb_edu` at 100%
 
 ### Stage 2: `pretrain_phase2` (1.50B tokens, transition 10%)
 
-| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |
+| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |
 |---|---:|---:|---:|---:|---:|
-| `fineweb_edu` | 35.00% | 525.0M | 256,348 | 2000 | 262,500 |
-| `github_code_clean_python` | 8.40% | 126.0M | 61,524 | 500 | 252,001 |
-| `github_code_clean_javascript` | 5.60% | 84.0M | 41,016 | 500 | 168,000 |
-| `github_code_clean_typescript` | 2.80% | 42.0M | 20,508 | 500 | 84,000 |
-| `github_code_clean_java` | 2.80% | 42.0M | 20,508 | 500 | 84,000 |
-| `github_code_clean_cpp` | 2.24% | 33.6M | 16,407 | 500 | 67,200 |
-| `github_code_clean_go` | 1.96% | 29.4M | 14,356 | 500 | 58,800 |
-| `github_code_clean_rust` | 1.40% | 21.0M | 10,254 | 500 | 42,000 |
-| `github_code_clean_shell` | 1.12% | 16.8M | 8,204 | 500 | 33,600 |
-| `github_code_clean_sql` | 0.84% | 12.6M | 6,153 | 500 | 25,200 |
-| `github_code_clean_html` | 0.84% | 12.6M | 6,153 | 500 | 25,200 |
-| `openwebmath` | 8.80% | 132.0M | 64,454 | 750 | 176,000 |
-| `tinygsm` | 6.60% | 99.0M | 48,340 | 300 | 330,000 |
-| `algebraic_stack` | 4.40% | 66.0M | 32,227 | 750 | 88,000 |
-| `gsm8k` | 2.20% | 33.0M | 16,114 | 300 | 110,000 |
-| `peso` | 9.00% | 135.0M | 65,918 | 1500 | 90,000 |
-| `arxiv` | 6.00% | 90.0M | 43,946 | 1500 | 60,000 |
+| `fineweb_edu` | 35.00% | 525.0M | 256,348 | 2000 | 512.7M |
+| `github_code_clean_python` | 8.40% | 126.0M | 61,524 | 500 | 30.8M |
+| `github_code_clean_javascript` | 5.60% | 84.0M | 41,016 | 500 | 20.5M |
+| `github_code_clean_typescript` | 2.80% | 42.0M | 20,508 | 500 | 10.3M |
+| `github_code_clean_java` | 2.80% | 42.0M | 20,508 | 500 | 10.3M |
+| `github_code_clean_cpp` | 2.24% | 33.6M | 16,407 | 500 | 8.2M |
+| `github_code_clean_go` | 1.96% | 29.4M | 14,356 | 500 | 7.2M |
+| `github_code_clean_rust` | 1.40% | 21.0M | 10,254 | 500 | 5.1M |
+| `github_code_clean_shell` | 1.12% | 16.8M | 8,204 | 500 | 4.1M |
+| `github_code_clean_sql` | 0.84% | 12.6M | 6,153 | 500 | 3.1M |
+| `github_code_clean_html` | 0.84% | 12.6M | 6,153 | 500 | 3.1M |
+| `openwebmath` | 8.80% | 132.0M | 64,454 | 750 | 48.3M |
+| `tinygsm` | 6.60% | 99.0M | 48,340 | 300 | 14.5M |
+| `algebraic_stack` | 4.40% | 66.0M | 32,227 | 750 | 24.2M |
+| `gsm8k` | 2.20% | 33.0M | 16,114 | 300 | 4.8M |
+| `peso` | 9.00% | 135.0M | 65,918 | 1500 | 98.9M |
+| `arxiv` | 6.00% | 90.0M | 43,946 | 1500 | 65.9M |
 
 Validation: `fineweb_edu` at 100%
 
 ### Stage 3: `finetune` (150.0M tokens, transition 0%)
 
-| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Rows (est.) |
+| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |
 |---|---:|---:|---:|---:|---:|
-| `flan` | 40.00% | 60.0M | 29,297 | 300 | 200,000 |
-| `metamath` | 15.00% | 22.5M | 10,987 | 300 | 75,000 |
-| `orca_math` | 10.00% | 15.0M | 7,325 | 300 | 50,000 |
-| `evol_code` | 12.50% | 18.8M | 9,156 | 400 | 46,875 |
-| `code_alpaca` | 2.50% | 3.8M | 1,832 | 200 | 18,750 |
-| `slimorca` | 10.00% | 15.0M | 7,325 | 300 | 50,000 |
-| `sharegpt` | 5.00% | 7.5M | 3,663 | 400 | 18,750 |
-| `wizardlm` | 5.00% | 7.5M | 3,663 | 400 | 18,750 |
+| `flan` | 40.00% | 60.0M | 29,297 | 300 | 8.8M |
+| `metamath` | 15.00% | 22.5M | 10,987 | 300 | 3.3M |
+| `orca_math` | 10.00% | 15.0M | 7,325 | 300 | 2.2M |
+| `evol_code` | 12.50% | 18.8M | 9,156 | 400 | 3.7M |
+| `code_alpaca` | 2.50% | 3.8M | 1,832 | 200 | 366.4K |
+| `slimorca` | 10.00% | 15.0M | 7,325 | 300 | 2.2M |
+| `sharegpt` | 5.00% | 7.5M | 3,663 | 400 | 1.5M |
+| `wizardlm` | 5.00% | 7.5M | 3,663 | 400 | 1.5M |
 
 Validation: `flan` at 40%, `metamath` at 15%, `orca_math` at 10%, `evol_code` at 12%, `code_alpaca` at 2%, `slimorca` at 10%, `sharegpt` at 5%, `wizardlm` at 5%
 
