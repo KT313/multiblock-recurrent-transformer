@@ -132,7 +132,15 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
         """`num_steps_pair` as in `RecurrentGPT.forward`; if None, `EVAL_RECURRENCE_STEPS` ("12" or "4,12,4") is used,
-        else in eval mode the config's `mean_recurrence` per block, else (training) the sampler."""
+        else in eval mode the config's `mean_recurrence` per block, else (training) the sampler.
+
+        `labels` follow the HuggingFace contract and are shifted **here**: `model(x, labels=x).loss` is the
+        next-token loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The INNER `RecurrentGPT` takes
+        *pre-shifted* labels instead (the trainer's collate shifts), so it is called with `labels=None`.
+
+        `attention_mask` is the usual `(B, S)` padding mask (1 = keep) and `position_ids` may be 1-D or `(B, S)`;
+        both are forwarded to the inner model, which turns them into a causal-plus-padding mask and per-row RoPE
+        positions."""
         if return_dict is None:
             return_dict = self.config.return_dict
 
@@ -150,24 +158,44 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            labels=labels,
+            labels=None,  # the inner model's loss is unshifted; the HF contract shifts, see below
             return_logits=True,
             num_steps_pair=num_steps_pair,
         )
         logits = outputs["logits"]
-        loss = None
+        assert logits is not None  # `return_logits=True`
+        loss: torch.Tensor | None = None
         if labels is not None:
-            loss = outputs["loss"]
+            # `contiguous()`: both slices are views, and the inner `loss` flattens them with `view`.
+            loss = self.model.loss(logits[:, :-1, :].contiguous(), labels[:, 1:].contiguous())
 
         if return_dict:
-            return CausalLMOutputWithPast(loss=loss, logits=logits)
+            # transformers annotates the field as FloatTensor; ours is a plain float32 Tensor (there is no such subclass)
+            return CausalLMOutputWithPast(loss=loss, logits=logits)  # type: ignore[arg-type]
         if loss is None:
             return (logits,)
         return (loss, logits)
 
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Attention is always causal over the full (unpadded) sequence; the HF padding mask is not forwarded."""
-        return {"input_ids": input_ids}
+        """The whole (growing) sequence every step — there is no KV cache — plus the padding mask and the positions.
+
+        A batch of prompts of different lengths is left-padded by `generate`, so without the mask the model would
+        attend to the pad tokens and count them as positions; with it, every row's positions are
+        `cumsum(mask) - 1` (clamped at 0 for the pads themselves), i.e. the first real token of every row sits at
+        position 0 whatever the padding. Everything else `generate` passes (a cache, embeddings) is dropped.
+
+        `*args` / `**kwargs`: transformers' own signature grows parameters between versions and `generate` only ever
+        calls this with keywords."""
+        attention_mask: torch.Tensor | None = kwargs.get("attention_mask")
+        position_ids: torch.Tensor | None = kwargs.get("position_ids")
+        model_inputs: dict[str, Any] = {"input_ids": input_ids}
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+            if position_ids is None:
+                position_ids = (attention_mask.to(torch.long).cumsum(-1) - 1).clamp(min=0)
+        if position_ids is not None:
+            model_inputs["position_ids"] = position_ids
+        return model_inputs
 
     def get_input_embeddings(self) -> torch.nn.Module:
         return self.model.transformer.wte

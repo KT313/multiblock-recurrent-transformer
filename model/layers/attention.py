@@ -48,12 +48,20 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tu
 
 
 def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
-    """Causal attention; inputs and output are (B, S, nh, hd)."""
+    """Causal attention; inputs and output are (B, S, nh, hd).
+
+    Without a mask, causality is left to sdpa's own ``is_causal=True`` (the training path). A ``mask`` must be a
+    broadcastable bool mask that *already contains the causal triangle* — that is what
+    `model.model.prepare_attention_inputs` builds — and is passed with ``is_causal=False``: sdpa rejects an explicit
+    mask together with ``is_causal=True`` on some of its backends (its math kernel raises "Explicit attn_mask should
+    not be set when is_causal=True", flash attention takes no mask at all)."""
     # scaled_dot_product_attention wants the head axis before the sequence axis: (B, nh, S, hd).
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=True)
+    y = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=mask is None
+    )
     return y.transpose(1, 2)
 
 

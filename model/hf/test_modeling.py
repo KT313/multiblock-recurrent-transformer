@@ -12,6 +12,7 @@ import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+import model.model as model_module
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
 from model.test_config import TINY_ARCHITECTURE, tiny_config
@@ -175,12 +176,36 @@ def test_wrapper_forward_matches_inner_model_in_eval() -> None:
     torch.manual_seed(1)
     out = hf_model(x, labels=x)
     torch.manual_seed(1)
-    ref = hf_model.model(x, labels=x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])
+    ref = hf_model.model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])
     assert torch.equal(out.logits, ref["logits"])
-    assert torch.equal(out.loss, ref["loss"])
     torch.manual_seed(1)
     tup = hf_model(x, return_dict=False)
     assert isinstance(tup, tuple) and len(tup) == 1 and torch.equal(tup[0], ref["logits"])
+
+
+def test_wrapper_loss_is_the_next_token_loss_shifted_internally() -> None:
+    """The HF contract: `model(x, labels=x).loss` predicts token t+1 from token t. The INNER model takes
+    pre-shifted labels (the trainer's collate shifts), so its own loss on the same call is a different number."""
+    hf_model = tiny_hf_model().train(False)
+    x = ids(2, 8)
+    torch.manual_seed(1)
+    out = hf_model(x, labels=x)
+    logits = out.logits
+    by_hand = torch.nn.functional.cross_entropy(
+        logits[:, :-1, :].reshape(-1, logits.shape[-1]), x[:, 1:].reshape(-1), ignore_index=-100
+    )
+    assert torch.allclose(out.loss, by_hand, atol=0, rtol=0)
+    unshifted = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), x.reshape(-1))
+    assert not torch.allclose(out.loss, unshifted), "the unshifted loss is what the inner model computes"
+    # -100 positions are ignored, and a label column of only -100 leaves the loss to the remaining columns
+    masked = x.clone()
+    masked[:, 1:4] = -100
+    torch.manual_seed(1)
+    loss_masked = hf_model(x, labels=masked).loss
+    kept = torch.nn.functional.cross_entropy(
+        logits[:, :-1, :].reshape(-1, logits.shape[-1]), masked[:, 1:].reshape(-1), ignore_index=-100
+    )
+    assert torch.allclose(loss_masked, kept, atol=0, rtol=0)
 
 
 def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None:
@@ -191,8 +216,9 @@ def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None
     out = hf_model(x, labels=x, return_dict=False)
     assert isinstance(out, tuple) and len(out) == 2
     torch.manual_seed(1)
-    ref = hf_model.model(x, labels=x, return_logits=True)  # num_steps_pair=None -> sampled at step 3
-    assert torch.equal(out[0], ref["loss"]) and torch.equal(out[1], ref["logits"])
+    ref = hf_model.model(x, return_logits=True)  # num_steps_pair=None -> sampled at step 3
+    assert torch.equal(out[1], ref["logits"])
+    assert torch.equal(out[0], hf_model.model.loss(out[1][:, :-1].contiguous(), x[:, 1:].contiguous()))
     # ... which is not the eval path
     torch.manual_seed(1)
     eval_ref = hf_model.model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
@@ -211,6 +237,57 @@ def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,2,3")
     with pytest.raises(ValueError, match="recurrence values"):
         hf_model(x)
+
+
+@pytest.fixture
+def zero_latent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero the random latent state: with it, an eval-mode forward at a fixed recurrence depth is deterministic and
+    two differently shaped batches of the same tokens can be compared."""
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+
+
+PADDED = torch.tensor([[0, 0, 5, 7, 11], [2, 3, 5, 7, 13]])
+PADDING_MASK = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+
+
+def test_left_padded_batch_gives_the_logits_of_the_single_prompts(zero_latent: None) -> None:
+    """The wrapper's own path (`prepare_inputs_for_generation` -> `forward`): a left-padded batch must attend to no
+    pad and count no pad as a position, so every row's real positions have the logits of that prompt run alone."""
+    hf_model = tiny_hf_model().train(False)
+    prepared = hf_model.prepare_inputs_for_generation(PADDED, attention_mask=PADDING_MASK)
+    batched = hf_model(**prepared).logits
+    short = hf_model(torch.tensor([[5, 7, 11]])).logits
+    long = hf_model(torch.tensor([[2, 3, 5, 7, 13]])).logits
+    torch.testing.assert_close(batched[0, 2:], short[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(batched[1], long[0], atol=1e-5, rtol=1e-5)
+    without_mask = hf_model(PADDED).logits  # what the wrapper used to do: the pads are attended to
+    assert not torch.allclose(without_mask[0, 2:], short[0], atol=1e-3)
+
+
+def test_masks_and_positions_of_both_shapes_reach_the_model(zero_latent: None) -> None:
+    hf_model = tiny_hf_model().train(False)
+    x = ids(2, 6)
+    plain = hf_model(x).logits
+    ones = torch.ones(2, 6, dtype=torch.long)
+    from_ints = hf_model(x, attention_mask=ones).logits
+    assert torch.equal(from_ints, hf_model(x, attention_mask=ones.bool()).logits), "1/0 ints and bools agree"
+    torch.testing.assert_close(from_ints, plain, atol=1e-5, rtol=1e-5)  # an all-ones mask is the plain causal run
+    assert torch.equal(hf_model(x, position_ids=torch.arange(6)).logits, plain)
+    torch.testing.assert_close(
+        hf_model(x, position_ids=torch.arange(6).expand(2, 6)).logits, plain, atol=1e-6, rtol=1e-6
+    )
+
+
+def test_generate_batches_left_padded_prompts_like_single_prompts(zero_latent: None) -> None:
+    hf_model = tiny_hf_model().train(False)
+    hf_model.generation_config.pad_token_id = 0
+    # transformers' `GenerativePreTrainedModel` protocol lists attributes PreTrainedModel only sets dynamically.
+    generate = hf_model.generate  # pyright: ignore[reportAttributeAccessIssue]
+    batched = generate(PADDED, attention_mask=PADDING_MASK, max_new_tokens=3, do_sample=False)
+    short = generate(torch.tensor([[5, 7, 11]]), max_new_tokens=3, do_sample=False)
+    long = generate(torch.tensor([[2, 3, 5, 7, 13]]), max_new_tokens=3, do_sample=False)
+    assert torch.equal(batched[0, 5:], short[0, 3:])
+    assert torch.equal(batched[1, 5:], long[0, 5:])
 
 
 def load_exported(out_dir: Path) -> RecurrentGPTForCausalLM:
@@ -241,12 +318,17 @@ def test_embedding_accessors() -> None:
     assert hf_model.get_output_embeddings() is new_head
 
 
-def test_prepare_inputs_for_generation_forwards_only_input_ids() -> None:
+def test_prepare_inputs_for_generation_forwards_the_mask_and_the_row_positions() -> None:
     hf_model = tiny_hf_model()
     x = ids(1, 4)
-    prepared = hf_model.prepare_inputs_for_generation(x, attention_mask=torch.ones_like(x), past_key_values=None)
-    assert list(prepared) == ["input_ids"]
-    assert prepared["input_ids"] is x
+    assert hf_model.prepare_inputs_for_generation(x, past_key_values=None) == {"input_ids": x}
+    mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])  # a left-padded batch, as `generate` builds it
+    prepared = hf_model.prepare_inputs_for_generation(ids(2, 4), attention_mask=mask, past_key_values=None)
+    assert list(prepared) == ["input_ids", "attention_mask", "position_ids"]
+    assert prepared["attention_mask"] is mask
+    assert torch.equal(prepared["position_ids"], torch.tensor([[0, 0, 0, 1], [0, 1, 2, 3]]))
+    given = torch.zeros(2, 4, dtype=torch.long)
+    assert hf_model.prepare_inputs_for_generation(x, attention_mask=mask, position_ids=given)["position_ids"] is given
 
 
 def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir: Path) -> None:

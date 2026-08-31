@@ -407,6 +407,85 @@ def test_position_ids_select_rope_rows(tiny_model: RecurrentGPT) -> None:
     assert not torch.allclose(a, d)
 
 
+# --- prepare_attention_inputs -----------------------------------------------------------------------------------------
+
+
+def freqs_table(sequence_length: int = 8, head_size: int = 4) -> Tensor:
+    return precompute_freqs_cis(head_size, sequence_length + 4, 50_000.0)
+
+
+def test_prepare_attention_inputs_without_arguments_is_the_plain_causal_path() -> None:
+    """The training path: the first S rows and no mask at all, so `attention_sdpa` keeps `is_causal=True`."""
+    table = freqs_table()
+    x = ids(2, 6)
+    rotary, mask = model_module.prepare_attention_inputs(table, x)
+    assert mask is None
+    assert torch.equal(rotary, table[:, :6]) and rotary.shape[0] == 1
+
+
+def test_prepare_attention_inputs_gathers_rope_rows_per_sequence() -> None:
+    table = freqs_table()
+    x = ids(2, 3)
+    one_d, _ = model_module.prepare_attention_inputs(table, x, position_ids=torch.tensor([2, 0, 1]))
+    assert torch.equal(one_d, table.index_select(1, torch.tensor([2, 0, 1])))
+    positions = torch.tensor([[0, 0, 1], [0, 1, 2]])  # the left-padded rows `transformers` builds
+    two_d, _ = model_module.prepare_attention_inputs(table, x, position_ids=positions)
+    assert two_d.shape == (2, 3, 1, table.shape[3], 2)
+    for row in range(2):
+        assert torch.equal(two_d[row], table[0].index_select(0, positions[row]))
+
+
+def test_prepare_attention_inputs_rejects_shapes_it_cannot_use() -> None:
+    table = freqs_table()
+    x = ids(2, 3)
+    with pytest.raises(ValueError, match="position_ids must be 1-D"):
+        model_module.prepare_attention_inputs(table, x, position_ids=torch.zeros(2, 3, 1, dtype=torch.long))
+    with pytest.raises(ValueError, match=r"attention_mask must be \(B, S\)"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=torch.ones(2, 3, 3, dtype=torch.long))
+    with pytest.raises(ValueError, match=r"attention_mask must be \(B, S\)"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=torch.ones(2, 4, dtype=torch.long))
+
+
+def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
+    """The mask carries the causal triangle itself (sdpa's math kernel rejects a mask next to `is_causal=True`),
+    and no query row is ever fully masked: an all-masked row would make softmax NaN and the NaN would spread."""
+    table = freqs_table()
+    x = ids(2, 4)
+    ints = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+    _rotary, mask = model_module.prepare_attention_inputs(table, x, attention_mask=ints)
+    assert mask is not None and mask.dtype == torch.bool and mask.shape == (2, 1, 4, 4)
+    assert torch.equal(mask[1, 0], torch.ones(4, 4, dtype=torch.bool).tril()), "an all-ones mask is plain causality"
+    expected_padded = torch.tensor(
+        [[True, False, False, False],  # a pad query keeps only itself
+         [False, True, False, False],
+         [False, False, True, False],
+         [False, False, True, True]],
+    )
+    assert torch.equal(mask[0, 0], expected_padded)
+    assert bool(mask.any(dim=-1).all()), "no row attends to nothing"
+    _rotary, from_bools = model_module.prepare_attention_inputs(table, x, attention_mask=ints.bool())
+    assert from_bools is not None and torch.equal(from_bools, mask), "1/0 ints and bools mean the same"
+
+
+def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the model: with the mask, the real positions of a left-padded row give the same logits as
+    the row on its own. The latent state is the only randomness left in eval mode; it is zeroed so both runs match."""
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+    tiny_model.eval()
+    real = torch.tensor([[5, 7, 11]])
+    padded = torch.tensor([[0, 0, 5, 7, 11]])
+    mask = torch.tensor([[0, 0, 1, 1, 1]])
+    positions = torch.tensor([[0, 0, 0, 1, 2]])
+    alone = tiny_model(real, return_logits=True)["logits"]
+    with_pads = tiny_model(padded, attention_mask=mask, position_ids=positions, return_logits=True)["logits"]
+    assert with_pads is not None and alone is not None
+    torch.testing.assert_close(with_pads[:, 2:], alone, atol=1e-5, rtol=1e-5)
+    unmasked = tiny_model(padded, return_logits=True)["logits"]
+    assert unmasked is not None and not torch.allclose(unmasked[:, 2:], alone, atol=1e-3)
+
+
 # --- gradient checkpointing -------------------------------------------------------------------------------------------
 
 

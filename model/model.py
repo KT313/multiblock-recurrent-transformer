@@ -26,6 +26,57 @@ from .layers.attention import precompute_freqs_cis
 from .layers.init import Linear
 
 
+def prepare_attention_inputs(
+    freqs_cis: Tensor,
+    input_ids: Tensor,
+    attention_mask: Tensor | None = None,
+    position_ids: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    """The two per-batch inputs every attention layer needs: the RoPE rows and the sdpa mask.
+
+    Returns ``(rotary, mask)``:
+
+    * ``rotary`` — the rows of ``freqs_cis`` for this batch's positions. Without ``position_ids`` the first S rows
+      (shape ``(1, S, 1, hd // 2, 2)``, broadcast over the batch: the training path, and an exact no-op); with 1-D
+      positions those rows, in that order; with the ``(B, S)`` positions ``transformers`` passes for a left-padded
+      batch, one row *per sequence* (shape ``(B, S, 1, hd // 2, 2)``, which broadcasts against ``(B, S, 2 * nh,
+      hd // 2)`` in :func:`~model.layers.attention.apply_rotary_emb_complex_like` just as well).
+    * ``mask`` — None when no ``attention_mask`` is given: the caller then leaves ``is_causal=True`` to
+      ``scaled_dot_product_attention`` and nothing changes. Otherwise the ``(B, S)`` HF padding mask (1/0 ints or
+      bools, 1 = keep) becomes a broadcastable ``(B, 1, S, S)`` **bool** mask that already contains the causal
+      triangle: sdpa rejects an explicit mask together with ``is_causal=True`` on some backends (its math kernel
+      raises "Explicit attn_mask should not be set when is_causal=True"), so causality has to be part of the mask.
+      True means *attend*.
+
+    A query row that may attend to nothing at all — a pad token at the start of a left-padded sequence — would make
+    softmax return NaN for that row, and the NaN would spread to every other row through the next layer's value
+    matmul (``0 * NaN``). Every query therefore keeps its own position (the diagonal), which changes nothing for a
+    real token (causality and the padding mask already allow it) and leaves the pad rows finite garbage that no
+    caller reads."""
+    sequence_length = input_ids.shape[1]
+    if position_ids is None:
+        rotary = freqs_cis[:, :sequence_length]
+    elif position_ids.dim() == 1:
+        rotary = freqs_cis.index_select(1, position_ids.to(torch.long))
+    elif position_ids.dim() == 2:
+        rows = freqs_cis[0].index_select(0, position_ids.to(torch.long).reshape(-1))  # (B * S, 1, hd // 2, 2)
+        rotary = rows.view(position_ids.shape[0], position_ids.shape[1], *rows.shape[1:])
+    else:
+        raise ValueError(f"position_ids must be 1-D (S,) or 2-D (B, S), got shape {tuple(position_ids.shape)}")
+
+    if attention_mask is None:
+        return rotary, None
+    if attention_mask.dim() != 2 or attention_mask.shape[1] != sequence_length:
+        raise ValueError(
+            f"attention_mask must be (B, S) with S={sequence_length}, got shape {tuple(attention_mask.shape)}"
+        )
+    device = attention_mask.device
+    keep = attention_mask.to(torch.bool)[:, None, None, :]  # (B, 1, 1, S): which *keys* each query may attend to
+    causal = torch.ones(sequence_length, sequence_length, dtype=torch.bool, device=device).tril()
+    self_attention = torch.eye(sequence_length, dtype=torch.bool, device=device)  # never leave a row fully masked
+    return rotary, (keep & causal) | self_attention
+
+
 class TransformerModules(torch.nn.ModuleDict):
     """`ModuleDict` of the model parts; the annotations only give `model.transformer.<name>` a precise static type."""
 
@@ -123,27 +174,29 @@ class RecurrentGPT(torch.nn.Module):
         num_steps_pair: NumSteps = None,
     ) -> dict[str, Tensor | None]:
         """`num_steps_pair`: None (sample per block), one (n_no_grad, k_with_grad) pair for all blocks, or a list of
-        pairs with one entry per core block."""
-        # RoPE rows for the positions of this batch: the first S rows, or the rows selected by `position_ids`.
-        if position_ids is None:
-            freqs_cis = self.freqs_cis[:, : input_ids.shape[1]]
-        else:
-            freqs_cis = self.freqs_cis.index_select(1, position_ids)
+        pairs with one entry per core block.
+
+        `labels` are expected **pre-shifted** (the trainer's collate does the shift): the loss is
+        `CE(logits[t], labels[t])`. The HuggingFace wrapper shifts internally instead, as that contract requires.
+        `attention_mask` is a `(B, S)` padding mask (1 = keep), `position_ids` 1-D or `(B, S)`; both are turned into
+        what the attention layers need by `prepare_attention_inputs` and are the no-op default of the training path.
+        """
+        freqs_cis, mask = prepare_attention_inputs(self.freqs_cis, input_ids, attention_mask, position_ids)
 
         x = self.transformer.wte(input_ids)  # (B, S, E)
         if self.emb_scale != 1:
             x = x * self.emb_scale
         for block in self.transformer.prelude:
-            x = block(x, freqs_cis, attention_mask)
+            x = block(x, freqs_cis, mask)
 
         # Each core block is iterated on its input and added back onto it (residual around the whole block).
         num_steps = normalize_num_steps(num_steps_pair, len(self.transformer.core_blocks))
         for block_idx, block_steps in enumerate(num_steps):
-            block_out = self.iterate_forward(x, freqs_cis, attention_mask, block_steps, block_idx)
+            block_out = self.iterate_forward(x, freqs_cis, mask, block_steps, block_idx)
             x = block_out + x
 
         for block in self.transformer.coda:
-            x = block(x, freqs_cis, attention_mask)
+            x = block(x, freqs_cis, mask)
         x = self.transformer.ln_final(x)
 
         logits = self.lm_head(x).float() * self.config.init.logit_scale  # (B, S, padded_vocab), float32
