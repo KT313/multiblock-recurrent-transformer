@@ -11,6 +11,27 @@ from typing import Any, Callable, Optional
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser, Namespace  # type: ignore[attr-defined]
 
+# The value rules of `Settings`, as three tables read by one loop each in `Settings.__post_init__` (the same idea as
+# `SOURCE_FIELD_SCOPES` in `data_preparation/dataset_config.py`, one size smaller): a field that must be set, one
+# that must be > 0, one that must be >= 0. Rules relating two fields stay explicit below the loops.
+REQUIRED_SETTINGS: dict[str, str] = {
+    "dataset_config": "path to config/datasets/<name>.yaml",
+    "model_architecture_config": "path to config/model_architecture/<name>.yaml",
+    "stage_base_lrs": "one base LR per stage of the dataset config",
+}
+POSITIVE_SETTINGS: dict[str, str] = {
+    "log_step_interval": "save_step_interval is the only interval 0 disables",
+    "eval_step_interval": "save_step_interval is the only interval 0 disables",
+    "eval_iters": "validation micro-batches per depth",
+    "grad_clip": "0 would zero every gradient",
+}
+NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
+    "save_step_interval",
+    "warmup_steps",
+    "cooldown_steps",
+    "resume_warmup_steps",
+)
+
 
 @dataclass
 class Settings:
@@ -86,23 +107,19 @@ class Settings:
     export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
 
     def __post_init__(self) -> None:
-        if not self.dataset_config:
-            raise ValueError("dataset_config is required (path to config/datasets/<name>.yaml)")
-        if not self.model_architecture_config:
-            raise ValueError("model_architecture_config is required (path to config/model_architecture/<name>.yaml)")
-        if not self.stage_base_lrs:
-            raise ValueError("stage_base_lrs must list one base LR per stage of the dataset config")
+        for name, why in REQUIRED_SETTINGS.items():
+            if not getattr(self, name):
+                raise ValueError(f"{name} is required ({why})")
+        for name, why in POSITIVE_SETTINGS.items():
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive ({why})")
+        for name in NON_NEGATIVE_SETTINGS:
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
         if self.world_batch_size % self.micro_batch_size != 0:
             raise ValueError("world_batch_size must be a multiple of micro_batch_size")
-        for name in ("log_step_interval", "eval_step_interval", "eval_iters"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive (save_step_interval is the only interval 0 disables)")
-        if self.save_step_interval < 0 or self.warmup_steps < 0 or self.cooldown_steps < 0 or self.resume_warmup_steps < 0:
-            raise ValueError("save_step_interval, warmup_steps, cooldown_steps and resume_warmup_steps must be >= 0")
-        if self.grad_clip <= 0:
-            raise ValueError("grad_clip must be positive (0 would zero every gradient)")
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
 

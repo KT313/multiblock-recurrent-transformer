@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 import yaml
 
-from training.settings import Settings, parse_settings
+from training.settings import (
+    NON_NEGATIVE_SETTINGS,
+    POSITIVE_SETTINGS,
+    REQUIRED_SETTINGS,
+    Settings,
+    parse_settings,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -257,3 +263,35 @@ def test_settings_do_not_touch_the_filesystem(tmp_path: Path) -> None:
 @pytest.mark.parametrize("micro,world,expected", [(2, 4, 2), (1, 4, 4), (4, 4, 1), (2, 64, 32)])
 def test_gradient_accumulation_steps(micro: int, world: int, expected: int) -> None:
     assert _settings(micro_batch_size=micro, world_batch_size=world).gradient_accumulation_steps == expected
+
+
+# --- the value-rule tables ---------------------------------------------------------------------------------------
+
+
+def test_value_rule_tables_name_real_fields_and_do_not_overlap() -> None:
+    """The three tables `Settings.__post_init__` loops over hold field names, each field in at most one of them."""
+    names = {f.name for f in fields(Settings)}
+    tables = [set(REQUIRED_SETTINGS), set(POSITIVE_SETTINGS), set(NON_NEGATIVE_SETTINGS)]
+    for table in tables:
+        assert table and table <= names
+    assert sum(len(t) for t in tables) == len(set().union(*tables))
+
+
+@pytest.mark.parametrize("name", sorted(POSITIVE_SETTINGS))
+def test_positive_settings_are_rejected_at_zero(name: str) -> None:
+    with pytest.raises(ValueError, match=f"{name} must be positive"):
+        _settings(**{name: 0})
+
+
+@pytest.mark.parametrize("name", sorted(NON_NEGATIVE_SETTINGS))
+def test_non_negative_settings_are_rejected_below_zero(name: str) -> None:
+    assert _settings(**{name: 0}) is not None
+    with pytest.raises(ValueError, match=f"{name} must be >= 0"):
+        _settings(**{name: -1})
+
+
+@pytest.mark.parametrize("name", sorted(REQUIRED_SETTINGS))
+def test_required_settings_are_rejected_when_empty(name: str) -> None:
+    empty: Any = [] if name == "stage_base_lrs" else ""
+    with pytest.raises(ValueError, match=f"{name} is required"):
+        _settings(**{name: empty})

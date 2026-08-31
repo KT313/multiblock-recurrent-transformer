@@ -115,10 +115,79 @@ class ProcessingConfig:
             raise ValueError("processing: min_chars must be >= 0")
 
 
+ALL_KINDS: frozenset[str] = frozenset(("pretrain", "instruct"))
+ALL_LOADERS: frozenset[str] = frozenset(("hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"))
+
+
+@dataclass(frozen=True)
+class FieldScope:
+    """Where one `SourceConfig` field applies: the kinds and the loaders that may set it, and whether it is
+    required wherever it applies. The defaults are "every kind, every loader, optional"."""
+
+    kinds: frozenset[str] = ALL_KINDS
+    loaders: frozenset[str] = ALL_LOADERS
+    required: bool = False
+
+
+_NOWHERE = FieldScope(kinds=frozenset(), loaders=frozenset())  # a field the table below forgot
+
+# The single table of which `SourceConfig` field belongs to which kind and loader. `_check_field_scopes` is the only
+# place that reads it, in both directions: a field set outside its scope is an error, and a required field missing
+# inside its scope is one. A new field of `SourceConfig` that is not listed here applies nowhere, so it fails
+# immediately instead of being silently accepted everywhere (`test_field_scopes_cover_every_source_field`).
+SOURCE_FIELD_SCOPES: dict[str, FieldScope] = {
+    # every kind, every loader
+    "kind": FieldScope(),
+    "loader": FieldScope(),
+    "converter": FieldScope(),  # instruct row mapping, and the text builder of a pretrain source (gsm8k)
+    "check_limit": FieldScope(),
+    "rows": FieldScope(),
+    "seed": FieldScope(),
+    "shuffle": FieldScope(),
+    "validation_fraction": FieldScope(),
+    "describe_tokens_per_row": FieldScope(),
+    "split": FieldScope(),  # only hf_split / hf_stream read it, but it is part of every source's raw hash
+    # one kind only
+    "text_field": FieldScope(kinds=frozenset({"pretrain"})),
+    "processing": FieldScope(kinds=frozenset({"pretrain"})),
+    "fields": FieldScope(kinds=frozenset({"instruct"})),
+    "filter": FieldScope(kinds=frozenset({"instruct"})),
+    "input_inversions": FieldScope(kinds=frozenset({"instruct"})),
+    # one loader (family) only
+    "hf_id": FieldScope(loaders=frozenset(HUB_LOADERS), required=True),
+    "revision": FieldScope(loaders=frozenset(HUB_LOADERS)),
+    "load_kwargs": FieldScope(loaders=frozenset(HUB_LOADERS)),
+    "language": FieldScope(loaders=frozenset({"github_code"}), required=True),
+    "path": FieldScope(loaders=frozenset({"local"}), required=True),
+}
+
+_NO_DEFAULT = object()  # a field without a default is always "set"
+
+
+def _field_default(f: Field[Any]) -> Any:
+    """The value a field has when a config does not mention it."""
+    if f.default is not MISSING:
+        return f.default
+    if f.default_factory is not MISSING:
+        return f.default_factory()
+    return _NO_DEFAULT
+
+
+def _scope_text(scope: FieldScope) -> str:
+    """The scope as the error message names it."""
+    if not scope.kinds or not scope.loaders:
+        return "no kind or loader: it is missing from SOURCE_FIELD_SCOPES"
+    kinds = "kind " + "/".join(sorted(scope.kinds)) if scope.kinds != ALL_KINDS else ""
+    loaders = "loader " + "/".join(sorted(scope.loaders)) if scope.loaders != ALL_LOADERS else ""
+    return " with ".join(part for part in (kinds, loaders) if part) or "every kind and loader"
+
+
 @dataclass
 class SourceConfig:
     """One data source. `kind` selects the converter and the training-side formatting, `loader` how rows are
-    fetched (see `lib/sources/loaders.py`). Both kinds go through the same download and build steps."""
+    fetched (see `lib/sources/loaders.py`). Both kinds go through the same download and build steps.
+
+    Which field belongs to which kind and loader is the `SOURCE_FIELD_SCOPES` table, not a chain of ifs."""
 
     kind: SourceKind  # pretrain (one text column) | instruct (instruction / input / output)
     loader: LoaderName = "hf_split"  # how rows are fetched: hf_files | hf_split | hf_stream | github_code | local | synthetic (lib/sources/loaders.py)
@@ -142,47 +211,43 @@ class SourceConfig:
     describe_tokens_per_row: int = 500  # only used by `describe` for its token table; never a planner input
 
     def __post_init__(self) -> None:
-        self._check_loader_fields()
-        self._check_kind_fields()
+        self._check_field_scopes()
+        self._check_values()
+
+    def _check_field_scopes(self) -> None:
+        """The one loop over `SOURCE_FIELD_SCOPES`: a field set outside the kind/loader it belongs to is an error
+        naming the field and where it does apply, and a required field missing inside its scope is one too."""
+        for f in fields(self):
+            scope = SOURCE_FIELD_SCOPES.get(f.name, _NOWHERE)
+            value = getattr(self, f.name)
+            if self.kind in scope.kinds and self.loader in scope.loaders:
+                if scope.required and not value:
+                    where = f"loader {self.loader}" if scope.loaders != ALL_LOADERS else f"kind {self.kind}"
+                    raise ValueError(f"{where} requires {f.name}")
+            elif value != _field_default(f):
+                raise ValueError(f"{f.name} only applies to {_scope_text(scope)}")
+
+    def _check_values(self) -> None:
+        """The rules about a field's value, which the scope table cannot express."""
+        if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
+            raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
+        max_cached_file_mb = self.load_kwargs.get("max_cached_file_mb")
+        if max_cached_file_mb is not None and not _is_non_negative_number(max_cached_file_mb):
+            raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
+        if self.kind == "instruct" and self.loader != "synthetic" and self.fields is None and self.converter is None:
+            raise ValueError("kind instruct requires fields or converter")
         if self.fields is not None and not {"instruction", "output"} <= set(self.fields):
             raise ValueError("fields must map at least instruction and output")
+        if self.check_limit is not None and self.check_limit <= 0:
+            raise ValueError("check_limit must be positive (omit it to read the whole source)")
         if self.rows is not None and self.rows <= 0:
             raise ValueError("rows must be positive")
+        if not 0.0 <= self.input_inversions < 1.0:
+            raise ValueError("input_inversions must be in [0, 1)")
         if self.validation_fraction is not None and not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
         if self.describe_tokens_per_row <= 0:
             raise ValueError("describe_tokens_per_row must be positive")
-
-    def _check_loader_fields(self) -> None:
-        """Every loader needs some fields the others do not."""
-        if self.loader == "github_code" and not self.language:
-            raise ValueError("loader github_code requires language")
-        if self.loader in HUB_LOADERS and not self.hf_id:
-            raise ValueError(f"loader {self.loader} requires hf_id")
-        if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
-            raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
-        if self.loader == "local" and not self.path:
-            raise ValueError("loader local requires path")
-        max_cached_file_mb = self.load_kwargs.get("max_cached_file_mb")
-        if max_cached_file_mb is not None and not _is_non_negative_number(max_cached_file_mb):
-            raise ValueError("load_kwargs.max_cached_file_mb must be a non-negative number (MB)")
-
-    def _check_kind_fields(self) -> None:
-        """Every kind needs some fields the others do not."""
-        if self.kind == "instruct":
-            has_row_mapping = self.fields is not None or self.converter is not None
-            if not has_row_mapping and self.loader != "synthetic":
-                raise ValueError("kind instruct requires fields or converter")
-        if self.kind == "pretrain" and self.filter is not None:
-            raise ValueError("filter only applies to kind instruct (pretrain rows are not filtered at download)")
-        if self.check_limit is not None and self.check_limit <= 0:
-            raise ValueError("check_limit must be positive (omit it to read the whole source)")
-        if self.kind != "pretrain" and self.processing is not None:
-            raise ValueError("processing overrides only apply to kind pretrain")
-        if not 0.0 <= self.input_inversions < 1.0:
-            raise ValueError("input_inversions must be in [0, 1)")
-        if self.input_inversions and self.kind != "instruct":
-            raise ValueError("input_inversions only applies to kind instruct")
 
 
 @dataclass

@@ -5,8 +5,9 @@ budgets and the raw / processed hash invariants."""
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -205,11 +206,11 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["sources"]["ins"].update({"input_inversions": 1.0}), r"input_inversions must be in \[0, 1\)"),
         (lambda d: d["sources"]["ins"].update({"input_inversions": -0.1}), r"input_inversions must be in \[0, 1\)"),
         (lambda d: d["sources"]["pre"].update({"describe_tokens_per_row": 0}), "describe_tokens_per_row"),
-        (lambda d: d["sources"]["ins"].update({"processing": {"min_chars": 1}}), "only apply to kind pretrain"),
+        (lambda d: d["sources"]["ins"].update({"processing": {"min_chars": 1}}), "processing only applies to kind pretrain"),
         (lambda d: d["sources"]["ins"].pop("fields"), "requires fields or converter"),
         (lambda d: d["sources"]["ins"].update({"fields": {"instruction": "a"}}), "instruction and output"),
         (lambda d: d["sources"]["ins"].pop("hf_id"), "requires hf_id"),
-        (lambda d: d["sources"]["pre"].update({"loader": "github_code"}), "requires language"),
+        (lambda d: d["sources"]["pre"].update({"loader": "github_code", "hf_id": "o/r"}), "requires language"),
         (lambda d: d["sources"]["pre"].update({"loader": "github_code", "language": "Python"}), "requires hf_id"),
         (lambda d: d["sources"]["pre"].update({"loader": "hf_files", "hf_id": "o/r"}), "requires load_kwargs.data_files"),
         (lambda d: d["sources"]["pre"].update({"loader": "hf_files", "hf_id": "o/r", "load_kwargs": {"data_files": 3}}), "requires load_kwargs.data_files"),
@@ -228,6 +229,50 @@ def test_validation_rejects(mutate: Mutation, match: str) -> None:
     mutate(d)
     with pytest.raises(ValueError, match=match):
         _build(d)
+
+
+# --- the field scope table --------------------------------------------------------------------------------------------
+
+
+def test_field_scopes_cover_every_source_field() -> None:
+    """A new `SourceConfig` field must state where it applies. Without an entry it applies nowhere, so this test
+    (and every config that sets it) fails instead of the field being silently accepted for every kind and loader."""
+    assert {f.name for f in fields(SourceConfig)} == set(dc.SOURCE_FIELD_SCOPES)
+    for name, scope in dc.SOURCE_FIELD_SCOPES.items():
+        assert scope.kinds <= dc.ALL_KINDS and scope.loaders <= dc.ALL_LOADERS, name
+        assert scope.kinds and scope.loaders, name
+
+
+def test_a_field_missing_from_the_table_applies_nowhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    scopes = {k: v for k, v in dc.SOURCE_FIELD_SCOPES.items() if k != "text_field"}
+    monkeypatch.setattr(dc, "SOURCE_FIELD_SCOPES", scopes)
+    with pytest.raises(ValueError, match="text_field only applies to no kind or loader"):
+        SourceConfig(kind="pretrain", loader="synthetic", text_field="body")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"kind": "instruct", "loader": "synthetic", "text_field": "body"}, "text_field only applies to kind pretrain"),
+        ({"kind": "pretrain", "loader": "synthetic", "fields": {"instruction": "a", "output": "b"}}, "fields only applies to kind instruct"),
+        ({"kind": "pretrain", "loader": "synthetic", "filter": "sharegpt_quality"}, "filter only applies to kind instruct"),
+        ({"kind": "pretrain", "loader": "local", "path": "p", "language": "Python"}, "language only applies to loader github_code"),
+        ({"kind": "pretrain", "loader": "synthetic", "path": "p"}, "path only applies to loader local"),
+        ({"kind": "pretrain", "loader": "synthetic", "hf_id": "o/r"}, "hf_id only applies to loader github_code/hf_files/hf_split/hf_stream"),
+        ({"kind": "pretrain", "loader": "local", "path": "p", "revision": "abc"}, "revision only applies to loader"),
+        ({"kind": "pretrain", "loader": "local", "path": "p", "load_kwargs": {"name": "cfg"}}, "load_kwargs only applies to loader"),
+    ],
+)
+def test_a_field_set_outside_its_scope_names_the_field_and_the_rule(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(match)):
+        SourceConfig(**kwargs)
+
+
+def test_a_field_at_its_default_is_never_out_of_scope() -> None:
+    """Only a value a config actually chose is checked, so an instruct source is not rejected for the `text_field`
+    default it never mentioned."""
+    source = SourceConfig(kind="instruct", loader="synthetic")
+    assert (source.text_field, source.split, source.input_inversions) == ("text", "train", 0.0)
 
 
 @pytest.mark.parametrize(
