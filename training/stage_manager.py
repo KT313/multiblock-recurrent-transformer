@@ -6,19 +6,18 @@ therefore independent of the world size; `world_size` is only used for the per-d
 sanity check that the world batch splits evenly across devices.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
 class TrainingStage:
-    """One stage of the curriculum: its data mixture, token budget, base LR and transition length."""
+    """One stage of the curriculum: token budget, base LR and transition length (the data lives in the resolver's
+    `ResolvedStage`; the manager only turns budgets into step boundaries)."""
 
     name: str
     tokens: int
     base_lr: float
-    train_data: list[dict[str, Any]] = field(default_factory=list)  # DatasetSpec-like dicts
-    val_data: list[dict[str, Any]] = field(default_factory=list)
     transition_pct: float = 0.05  # transition OUT of this stage, as a fraction of this stage's tokens
 
 

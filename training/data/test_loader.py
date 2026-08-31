@@ -10,17 +10,22 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from training.data.collate import find_multiple
+from training.backend import SingleDeviceBackend
+from training.data.collate import IGNORE_INDEX, find_multiple
+from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
 from training.data.loader import (
     Batch,
     StageDataloaders,
     build_dataloader,
+    build_stage_dataloaders,
     length_sorted_batches,
     sample_stage_batch,
 )
 from training.data.tokenizer import Tokenizer
-from training.settings import DataEntry
+from training.settings import Settings, parse_settings
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
 INSTRUCT_SIGNATURE = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
 
 
@@ -167,6 +172,36 @@ def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]
     r0 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(0, 2))]
     r1 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(1, 2))]
     assert r0 == full[0::2] and r1 == full[1::2]
+
+
+# --- build_stage_dataloaders ------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
+    return parse_settings(["--config", str(TINY_YAML), "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(tmp_path / "out")])
+
+
+def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
+    """One train and one validation loader per stage of the tiny dataset, tokenizer loaded from the resolved
+    directory, validation loaders restricted to the held-out rows of the split."""
+    dataset: ResolvedDataset = resolve_dataset(tiny_settings)
+    loaders = build_stage_dataloaders(tiny_settings, dataset, SingleDeviceBackend(device="cpu", precision="32"))
+    assert isinstance(loaders, StageDataloaders)
+    assert len(loaders.train_loaders) == len(loaders.val_loaders) == len(dataset.stages) == 3
+    input_ids, labels, data_ids = loaders.next_train_batch(0)
+    assert input_ids.shape[0] == tiny_settings.micro_batch_size and input_ids.shape == labels.shape
+    # collate pads to a multiple of sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
+    assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.block_size
+    assert input_ids.shape[1] <= tiny_settings.block_size
+    assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
+    assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
+    _, _, val_ids = next(iter(loaders.val_loaders[2]))
+    assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
+    # the validation loaders read only the held-out first rows of the split (a single dataset is one finite epoch)
+    for stage_idx, source in ((0, "synthetic_pretrain"), (2, "synthetic_instruct")):
+        k = dataset.validation_rows[source]
+        assert k >= 1 and len(list(loaders.val_loaders[stage_idx])) == math.ceil(k / tiny_settings.micro_batch_size)
 
 
 # --- StageDataloaders / sample_stage_batch ---------------------------------------------------------------------------

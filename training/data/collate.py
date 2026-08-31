@@ -8,6 +8,8 @@ import torch
 from training.data.formats import apply_formatting
 from training.data.tokenizer import Tokenizer
 
+IGNORE_INDEX = -100  # label value of positions without a loss (padding, out-of-vocab); the model defaults to it too
+
 
 def find_multiple(n: int, k: int) -> int:
     """Smallest multiple of ``k`` that is >= ``n``."""
@@ -35,7 +37,7 @@ def collate_fn(
     tokenizer: Tokenizer,
     block_size: int,
     padding_multiple: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:

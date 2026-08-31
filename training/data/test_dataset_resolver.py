@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import shutil
+from dataclasses import fields
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -30,6 +31,7 @@ from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
     CHECKPOINT_VALIDATION_ROWS_KEY,
     INSTRUCT_DATA_SIGNATURE,
+    DataEntry,
     ResolvedDataset,
     ResolvedStage,
     build_command,
@@ -44,7 +46,7 @@ from training.data.dataset_resolver import (
     validation_rows_of,
 )
 from training.data.datasets import ParquetTextDataset
-from training.settings import DataEntry, Settings
+from training.settings import Settings
 from training.stage_manager import TrainingStage
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -402,18 +404,22 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
             assert list(Path(entry.data_dir).glob("*.parquet")), entry
 
 
-def test_stage_manager_stages(tiny_dataset_dir: Path) -> None:
+def test_data_entry_defaults() -> None:
+    entry = DataEntry(prefix="p", data_dir="d")
+    assert (entry.weight, entry.data_signature, entry.skip_rows, entry.max_rows) == (1.0, None, 0, None)
+
+
+def test_training_stages(tiny_dataset_dir: Path) -> None:
+    """`training_stages()` hands the stage manager the budget, LR and transition of every stage and nothing about
+    the data (the entries stay in `ResolvedStage`)."""
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
-    stages = resolved.stage_manager_stages()
+    stages = resolved.training_stages()
     assert len(stages) == 3 and all(isinstance(s, TrainingStage) for s in stages)
-    ts = stages[2]
-    assert (ts.name, ts.tokens, ts.base_lr, ts.transition_pct) == ("finetune", 4096, 5e-5, 0.0)
-    assert ts.train_data == [vars(e) for e in resolved.stages[2].train_data]
-    assert ts.train_data[0]["prefix"] == "finetune-synthetic_instruct" and ts.train_data[0]["weight"] == 1.0
-    assert ts.val_data[0]["data_signature"] == INSTRUCT_DATA_SIGNATURE
-    k = resolved.validation_rows["synthetic_instruct"]
-    assert (ts.train_data[0]["skip_rows"], ts.train_data[0]["max_rows"]) == (k, None)
-    assert (ts.val_data[0]["skip_rows"], ts.val_data[0]["max_rows"]) == (0, k)
+    assert stages == [
+        TrainingStage(name=s.name, tokens=s.tokens, base_lr=s.base_lr, transition_pct=s.transition_pct) for s in resolved.stages
+    ]
+    assert (stages[2].name, stages[2].tokens, stages[2].base_lr, stages[2].transition_pct) == ("finetune", 4096, 5e-5, 0.0)
+    assert {f.name for f in fields(TrainingStage)} == {"name", "tokens", "base_lr", "transition_pct"}
 
 
 def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path) -> None:

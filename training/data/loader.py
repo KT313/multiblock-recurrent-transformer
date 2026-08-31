@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Dataloader construction and the per-stage batch sampling used by multi-stage training."""
+"""Dataloader construction (one loader per stage mixture, `build_stage_dataloaders` for a whole run) and the
+per-stage batch sampling used by multi-stage training."""
 
 import random
 from dataclasses import dataclass, field
@@ -9,10 +10,12 @@ from typing import Iterable, Iterator, Sequence
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from training.data.collate import collate_fn, find_multiple
+from training.backend import Backend
+from training.data.collate import IGNORE_INDEX, collate_fn, find_multiple
+from training.data.dataset_resolver import DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import Tokenizer
-from training.settings import DataEntry
+from training.settings import Settings
 
 Batch = tuple[torch.Tensor, torch.Tensor, list[str]]
 
@@ -26,7 +29,7 @@ def build_dataloader(
     seed: int = 1337,
     shard: tuple[int, int] = (0, 1),
     padding_multiple: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
 ) -> DataLoader[Row]:
     """Loader over the weighted mixture of ``entries`` (a stage's ``train_data`` / ``val_data`` as resolved by
     `training.data.dataset_resolver`), yielding ``(input_ids, labels, data_ids)`` batches.
@@ -88,6 +91,34 @@ class StageDataloaders:
             return next(iterator)
 
 
+def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> StageDataloaders:
+    """One train and one validation loader per stage of `dataset`, each mixing its entries with constant weights.
+
+    The tokenizer is loaded once from `dataset.tokenizer_dir` and shared by every loader. Train loaders use
+    `settings.dataloader_num_workers`, validation loaders read in-process. Loader seed `settings.seed + rank`,
+    datasets sharded by `(rank, world_size)`.
+    """
+    tokenizer = Tokenizer(dataset.tokenizer_dir)
+
+    def loader(entries: list[DataEntry], num_workers: int) -> Iterable[Batch]:
+        return build_dataloader(
+            entries,
+            tokenizer,
+            block_size=settings.block_size,
+            micro_batch_size=settings.micro_batch_size,
+            num_workers=num_workers,
+            seed=settings.seed + backend.rank,
+            shard=(backend.rank, backend.world_size),
+            padding_multiple=settings.sequence_padding_multiple,
+            ignore_index=IGNORE_INDEX,
+        )
+
+    return StageDataloaders(
+        train_loaders=[loader(stage.train_data, settings.dataloader_num_workers) for stage in dataset.stages],
+        val_loaders=[loader(stage.val_data, 0) for stage in dataset.stages],
+    )
+
+
 def sample_stage_batch(
     stage_loaders: StageDataloaders,
     stage_idx: int,
@@ -114,7 +145,7 @@ def length_sorted_batches(
     batches: Iterable[Batch],
     micro_batch_size: int,
     accumulation_steps: int,
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
     padding_multiple: int | None = None,
 ) -> Iterator[Batch]:
     """Regroup every ``accumulation_steps`` micro-batches (one world batch) into micro-batches sorted by length.

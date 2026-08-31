@@ -3,7 +3,6 @@
 config with synthetic data (marked slow)."""
 
 import json
-import math
 import os
 import random
 import shutil
@@ -25,7 +24,7 @@ from model import RecurrentGPT
 from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data import StageDataloaders, Tokenizer
+from training.data import IGNORE_INDEX, StageDataloaders
 from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
     CHECKPOINT_VALIDATION_ROWS_KEY,
@@ -37,7 +36,7 @@ from training.logger import Logger
 from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.train import IGNORE_INDEX, LoopState, build_stage_dataloaders, micro_batch_stream, unwrap, validate
+from training.train import LoopState, build_stage_manager, micro_batch_stream, unwrap, validate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -116,26 +115,17 @@ def test_loop_state_fields() -> None:
     assert set(LoopState.__annotations__) == set(state)
 
 
-def test_build_stage_dataloaders(
-    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend
-) -> None:
-    tokenizer = Tokenizer(tiny_resolved.tokenizer_dir)
-    loaders = build_stage_dataloaders(tiny_settings, tiny_resolved, tokenizer, cpu_backend)
-    assert isinstance(loaders, StageDataloaders)
-    assert len(loaders.train_loaders) == len(loaders.val_loaders) == 3
-    input_ids, labels, data_ids = loaders.next_train_batch(0)
-    assert input_ids.shape[0] == tiny_settings.micro_batch_size and input_ids.shape == labels.shape
-    # collate pads to a multiple of sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
-    assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.block_size
-    assert input_ids.shape[1] <= tiny_settings.block_size
-    assert data_ids == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
-    assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
-    _, _, val_ids = next(iter(loaders.val_loaders[2]))
-    assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
-    # the validation loaders read only the held-out first rows of the split (a single dataset is one finite epoch)
-    for stage_idx, source in ((0, "synthetic_pretrain"), (2, "synthetic_instruct")):
-        k = tiny_resolved.validation_rows[source]
-        assert k >= 1 and len(list(loaders.val_loaders[stage_idx])) == math.ceil(k / tiny_settings.micro_batch_size)
+def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
+    """`build_stage_manager` is today's seven-argument constructor call: budgets of the resolved stages, batch and
+    block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
+    sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
+    assert isinstance(sm, StageManager)
+    assert sm.stages == tiny_resolved.training_stages()
+    assert (sm.world_batch_size, sm.block_size, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.block_size, 1)
+    assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
+    assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
+    with pytest.raises(ValueError, match="divisible by world_size"):
+        build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
@@ -164,7 +154,7 @@ def _stream_setup(
     yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
     cfg = parse_settings(["--config", str(yaml_path), "--micro_batch_size", "1"])  # 4 micro-batches per step
     loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
-    sm = StageManager(resolve_dataset(cfg).stage_manager_stages(), cfg.world_batch_size, cfg.block_size)
+    sm = StageManager(resolve_dataset(cfg).training_stages(), cfg.world_batch_size, cfg.block_size)
     return cfg, loaders, sm
 
 

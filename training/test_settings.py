@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
-from training.settings import DataEntry, Settings, parse_settings
+from training.settings import Settings, parse_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -85,11 +85,6 @@ def _field_defaults() -> dict[str, Any]:
         elif f.default_factory is not MISSING:
             out[f.name] = f.default_factory()
     return out
-
-
-def test_data_entry_defaults() -> None:
-    entry = DataEntry(prefix="p", data_dir="d")
-    assert entry.weight == 1.0 and entry.data_signature is None
 
 
 def test_parse_tiny_yaml() -> None:

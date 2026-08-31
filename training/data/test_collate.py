@@ -1,4 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
+import inspect
 import itertools
 from pathlib import Path
 from typing import Any
@@ -6,7 +7,8 @@ from typing import Any
 import pytest
 import torch
 
-from training.data.collate import collate_fn, find_multiple, shift_inputs_and_labels
+from model import RecurrentGPT
+from training.data.collate import IGNORE_INDEX, collate_fn, find_multiple, shift_inputs_and_labels
 from training.data.datasets import ParquetTextDataset
 from training.data.tokenizer import Tokenizer
 
@@ -61,6 +63,13 @@ def test_padding_becomes_ignore_index_and_eos(tokenizer: Tokenizer) -> None:
     assert labels[0].tolist() == [3, 4, 5, 2, -100, -100, -100, -100, -100]
     assert (input_ids == tokenizer.pad_id).sum() == 0
     assert (labels == tokenizer.pad_id).sum() == 0
+
+
+def test_ignore_index_is_the_default_and_matches_the_model(tokenizer: Tokenizer) -> None:
+    """`IGNORE_INDEX` is defined once here; `collate_fn` defaults to it and it equals the model's own default."""
+    assert IGNORE_INDEX == -100 == inspect.signature(RecurrentGPT.__init__).parameters["ignore_index"].default
+    _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, block_size=128)
+    assert (labels == IGNORE_INDEX).sum() == 4
 
 
 def test_custom_ignore_index(tokenizer: Tokenizer) -> None:

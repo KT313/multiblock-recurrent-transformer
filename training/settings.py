@@ -13,18 +13,6 @@ from jsonargparse import ActionConfigFile, ArgumentParser, Namespace  # type: ig
 
 
 @dataclass
-class DataEntry:
-    """One parquet dataset directory inside a stage mixture (produced by `training.data.dataset_resolver`)."""
-
-    prefix: str  # unique name within its stage, used for logging
-    data_dir: str  # directory with *.parquet files
-    weight: float = 1.0  # sampling weight relative to the other entries of the same stage
-    data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
-    skip_rows: int = 0  # rows of the directory to skip from the start (shard order data-00000, data-00001, ...)
-    max_rows: Optional[int] = None  # at most this many rows after the skip; None = up to the last row
-
-
-@dataclass
 class Settings:
     # Config references (required): everything about the data (sources, stages, token budgets, weights, tokenizer)
     # lives in the dataset config and everything about the model architecture (sizes, depth, recurrence) in the

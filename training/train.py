@@ -35,7 +35,7 @@ from training.checkpoint import (
     save_checkpoint,
     should_save_checkpoint,
 )
-from training.data import StageDataloaders, Tokenizer, build_dataloader, length_sorted_batches
+from training.data import IGNORE_INDEX, StageDataloaders, build_stage_dataloaders, length_sorted_batches
 from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
     CHECKPOINT_VALIDATION_ROWS_KEY,
@@ -48,10 +48,8 @@ from training.data.loader import Batch, sample_stage_batch
 from training.logger import Logger, num_parameters, track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
 from training.optim import build_optimizer, get_param_groups, set_lr
-from training.settings import DataEntry, Settings, parse_settings
+from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-
-IGNORE_INDEX = -100
 
 
 class LoopState(TypedDict):
@@ -66,27 +64,16 @@ def unwrap(model: torch.nn.Module) -> RecurrentGPT:
     return cast(RecurrentGPT, getattr(model, "_orig_mod", model))
 
 
-def build_stage_dataloaders(
-    cfg: Settings, resolved: ResolvedDataset, tokenizer: Tokenizer, backend: Backend
-) -> StageDataloaders:
-    """One train and one validation loader per stage, each mixing its datasets with constant weights."""
-
-    def loader(entries: list[DataEntry], num_workers: int) -> Iterable[Batch]:
-        return build_dataloader(
-            entries,
-            tokenizer,
-            block_size=cfg.block_size,
-            micro_batch_size=cfg.micro_batch_size,
-            num_workers=num_workers,
-            seed=cfg.seed + backend.rank,
-            shard=(backend.rank, backend.world_size),
-            padding_multiple=cfg.sequence_padding_multiple,
-            ignore_index=IGNORE_INDEX,
-        )
-
-    return StageDataloaders(
-        train_loaders=[loader(s.train_data, cfg.dataloader_num_workers) for s in resolved.stages],
-        val_loaders=[loader(s.val_data, 0) for s in resolved.stages],
+def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
+    """The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries."""
+    return StageManager(
+        dataset.training_stages(),
+        world_batch_size=settings.world_batch_size,
+        block_size=settings.block_size,
+        world_size=world_size,
+        warmup_steps=settings.warmup_steps,
+        cooldown_steps=settings.cooldown_steps,
+        micro_batch_size=settings.micro_batch_size,
     )
 
 
@@ -155,20 +142,11 @@ def train(cfg: Settings) -> None:
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
 
     resolved = resolve_dataset(cfg, backend)  # verifies the dataset config's data, auto-prepares if configured
-    tokenizer = Tokenizer(resolved.tokenizer_dir)
-    stage_manager = StageManager(
-        resolved.stage_manager_stages(),
-        world_batch_size=cfg.world_batch_size,
-        block_size=cfg.block_size,
-        world_size=backend.world_size,
-        warmup_steps=cfg.warmup_steps,
-        cooldown_steps=cfg.cooldown_steps,
-        micro_batch_size=cfg.micro_batch_size,
-    )
+    stage_manager = build_stage_manager(cfg, resolved, backend.world_size)
     max_steps = stage_manager.total_steps
     print(stage_manager.get_stage_summary())
     print(f"Total training steps: {max_steps:,} ({cfg.gradient_accumulation_steps} micro-batches each)")
-    loaders = build_stage_dataloaders(cfg, resolved, tokenizer, backend)
+    loaders = build_stage_dataloaders(cfg, resolved, backend)
 
     model_config = RecurrentConfig.from_yaml(cfg.model_architecture_config, **cfg.model_overwrite)
     if model_config.block_size != cfg.block_size:

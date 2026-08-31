@@ -2,6 +2,8 @@
 """Tests for the stage manager: hand-computed boundaries, world-size independence, validation, stage info inside
 transitions and stage-end checkpoint steps."""
 
+from dataclasses import fields
+
 import pytest
 
 from training.stage_manager import StageBoundary, StageInfo, StageManager, TrainingStage
@@ -26,9 +28,13 @@ def _bounds(sm: StageManager) -> list[tuple[int, int, int, int]]:
     return [(b.start_step, b.end_step, b.transition_start_step, b.transition_end_step) for b in sm.boundaries]
 
 
-def test_training_stage_defaults() -> None:
+def test_training_stage_fields() -> None:
+    """A stage is budget, LR and transition only; the data entries live in the resolver (`train_data` / `val_data`
+    were dead fields here)."""
     stage = TrainingStage("s", tokens=10, base_lr=1e-3)
-    assert stage.transition_pct == 0.05 and stage.train_data == [] and stage.val_data == []
+    assert stage.transition_pct == 0.05
+    assert [f.name for f in fields(TrainingStage)] == ["name", "tokens", "base_lr", "transition_pct"]
+    assert not hasattr(stage, "train_data") and not hasattr(stage, "val_data")
 
 
 def test_tiny_config_boundaries_by_hand() -> None:

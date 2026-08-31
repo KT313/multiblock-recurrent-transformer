@@ -30,7 +30,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
-from training.settings import DataEntry, Settings
+from training.settings import Settings
 from training.stage_manager import TrainingStage
 
 log = get_logger(__name__)
@@ -43,6 +43,18 @@ CHECKPOINT_HASH_KEY = "dataset_config_hash"
 CHECKPOINT_VALIDATION_ROWS_KEY = "dataset_validation_rows"  # {source: validation_rows} as chosen by `resolve_splits`
 
 Part = Literal["train", "val"]
+
+
+@dataclass
+class DataEntry:
+    """One parquet dataset directory inside a stage mixture, with the row range the loader reads from it."""
+
+    prefix: str  # unique name within its stage, used for logging
+    data_dir: str  # directory with *.parquet files
+    weight: float = 1.0  # sampling weight relative to the other entries of the same stage
+    data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
+    skip_rows: int = 0  # rows of the directory to skip from the start (shard order data-00000, data-00001, ...)
+    max_rows: Optional[int] = None  # at most this many rows after the skip; None = up to the last row
 
 
 class _MainRankBarrier(Protocol):
@@ -73,17 +85,11 @@ class ResolvedDataset:
     stages: list[ResolvedStage]
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
 
-    def stage_manager_stages(self) -> list[TrainingStage]:
-        """The stages in the plain-dict form `training.stage_manager.StageManager` expects."""
+    def training_stages(self) -> list[TrainingStage]:
+        """The stages as `training.stage_manager.StageManager` takes them: name, token budget, base LR and transition
+        length per stage (the data entries stay here; the manager never reads them)."""
         return [
-            TrainingStage(
-                name=stage.name,
-                tokens=stage.tokens,
-                base_lr=stage.base_lr,
-                transition_pct=stage.transition_pct,
-                train_data=[vars(entry) for entry in stage.train_data],
-                val_data=[vars(entry) for entry in stage.val_data],
-            )
+            TrainingStage(name=stage.name, tokens=stage.tokens, base_lr=stage.base_lr, transition_pct=stage.transition_pct)
             for stage in self.stages
         ]
 
@@ -392,6 +398,7 @@ __all__ = [
     "CHECKPOINT_HASH_KEY",
     "CHECKPOINT_VALIDATION_ROWS_KEY",
     "INSTRUCT_DATA_SIGNATURE",
+    "DataEntry",
     "ResolvedDataset",
     "ResolvedStage",
     "build_command",
