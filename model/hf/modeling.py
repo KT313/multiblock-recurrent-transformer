@@ -20,7 +20,8 @@ from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..config import RecurrentConfig, RoPESettings
-from ..model import NumSteps, RecurrentGPT, StepsPair, StepsSpec
+from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
+from ..model import RecurrentGPT
 
 _MODEL_FIELDS = (
     "block_size",

@@ -12,8 +12,9 @@ from torch import Tensor
 from model import build_model
 from model.test_config import TINY_ARCHITECTURE, tiny_config
 import model.model as model_module
+from model.blocks import recurrence
+from model.blocks.recurrence import sample_recurrence_steps
 from model.blocks.sandwich import SandwichBlock
-from model.config import RecurrentConfig
 from model.layers.attention import precompute_freqs_cis
 from model.model import RecurrentGPT, TransformerModules
 
@@ -173,43 +174,20 @@ def test_reset_parameters_reinitializes_embedding_and_norms_only() -> None:
     assert m.lm_head.weight is m.transformer.wte.weight  # tie survives the reset
 
 
-def test_initialize_state_is_a_seeded_standard_normal(tiny_model: RecurrentGPT) -> None:
-    x = torch.zeros(4, 64, 64)
-    torch.manual_seed(0)
-    a = tiny_model.initialize_state(x)
-    torch.manual_seed(0)
-    b = tiny_model.initialize_state(x)
-    assert a.shape == x.shape and a.dtype == x.dtype
-    assert torch.equal(a, b)
-    assert abs(a.mean().item()) < 0.05 and a.std().item() == pytest.approx(1.0, abs=0.05)
-
-
-def test_core_block_forward_matches_hand_composition(tiny_model: RecurrentGPT) -> None:
-    freqs = tiny_model.freqs_cis[:, :6]
-    x_latent, x_base = torch.randn(1, 6, 64), torch.randn(1, 6, 64)
-    for idx in range(2):
-        block = core_block(tiny_model, idx)
-        got = tiny_model.core_block_forward(x_latent, x_base, freqs, None, block, idx)
-        expected = tiny_model.transformer.adapters[idx](torch.cat([x_latent, x_base], dim=-1))
-        for layer in block:
-            expected = layer(expected, freqs, None)
-        torch.testing.assert_close(got, expected)
-
-
 def test_iterate_forward_matches_manual_loop(tiny_model: RecurrentGPT) -> None:
     freqs = tiny_model.freqs_cis[:, :6]
     x = torch.randn(1, 6, 64)
     block = core_block(tiny_model, 1)
     torch.manual_seed(4)
-    got = tiny_model.iterate_forward(x, freqs, None, (2, 1), core_block=block, core_block_number=1)
+    got = tiny_model.iterate_forward(x, freqs, None, (2, 1), 1)
     torch.manual_seed(4)
     x_base = tiny_model.transformer.ln_fs[1](x)
     latent = torch.randn_like(x)
     for _ in range(3):
-        latent = tiny_model.core_block_forward(latent, x_base, freqs, None, block, 1)
+        latent = recurrence.core_block_forward(latent, x_base, freqs, None, tiny_model.transformer.adapters[1], block)
     torch.testing.assert_close(got, latent)
     assert got.requires_grad
-    no_grad = tiny_model.iterate_forward(x, freqs, None, (2, 0), core_block=block, core_block_number=1)
+    no_grad = tiny_model.iterate_forward(x, freqs, None, (2, 0), 1)
     assert not no_grad.requires_grad  # all steps under no_grad
 
 
@@ -335,14 +313,14 @@ def test_eval_forward_is_deterministic_under_a_seed_and_equals_explicit_mean_ste
     c = tiny_model(x, return_logits=True, num_steps_pair=explicit)["logits"]
     assert not torch.equal(a, c)
     # ... and is bit-identical once that draw is replayed (per block: latent init first, then the sampler's rand).
-    orig = tiny_model.initialize_state
+    orig = recurrence.initialize_state  # the function `model.model` calls
 
     def replay(t: Tensor) -> Tensor:
         latent = orig(t)
         torch.rand((1,))
         return latent
 
-    monkeypatch.setattr(tiny_model, "initialize_state", replay)
+    monkeypatch.setattr(model_module, "initialize_state", replay)
     torch.manual_seed(5)
     d = tiny_model(x, return_logits=True, num_steps_pair=explicit)["logits"]
     assert torch.equal(a, d)
@@ -370,17 +348,6 @@ def test_scalar_steps_mean_no_grad_only(tiny_model: RecurrentGPT) -> None:
     assert torch.equal(a, b)
 
 
-def test_canon_steps_all_input_forms() -> None:
-    canon = RecurrentGPT._canon_steps
-    assert canon((3, 2)) == (3, 2)
-    assert canon(4) == (4, 0)
-    assert canon(torch.tensor(4)) == (4, 0)
-    assert canon(torch.tensor([4])) == (4, 0)
-    assert canon(torch.tensor([[3], [2]])) == (3, 2)
-    n, k = canon(torch.tensor([3, 2], dtype=torch.long))
-    assert isinstance(n, int) and isinstance(k, int)
-
-
 def test_num_steps_pair_list_length_mismatch_raises(tiny_model: RecurrentGPT) -> None:
     with pytest.raises(ValueError, match="num_steps_pair has 3 entries but there are 2 blocks"):
         tiny_model(ids(), num_steps_pair=[(1, 1), (1, 1), (1, 1)])
@@ -401,17 +368,14 @@ def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
 ) -> None:
     """(n, k) is not symmetric: exactly the first n core-block applications happen under no_grad."""
     grad_modes: list[bool] = []
-    orig = tiny_model.core_block_forward
+    orig = recurrence.core_block_forward
 
     def spy(*args: Any, **kwargs: Any) -> Tensor:
         grad_modes.append(torch.is_grad_enabled())
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(tiny_model, "core_block_forward", spy)
-    block = core_block(tiny_model, 0)
-    tiny_model.iterate_forward(
-        torch.randn(1, 4, 64), tiny_model.freqs_cis[:, :4], None, (n, k), core_block=block, core_block_number=0
-    )
+    monkeypatch.setattr(recurrence, "core_block_forward", spy)
+    tiny_model.iterate_forward(torch.randn(1, 4, 64), tiny_model.freqs_cis[:, :4], None, (n, k), 0)
     assert grad_modes == [False] * n + [True] * k
 
 
@@ -450,13 +414,13 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
     plain = seeded_tiny()
     ckpt = seeded_tiny(gradient_checkpointing=True)
     calls: list[int] = []
-    orig_checkpoint = model_module._checkpoint
+    orig_checkpoint = recurrence._checkpoint
 
     def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
         calls.append(1)
         return cast(Tensor, orig_checkpoint(*args, **kwargs))
 
-    monkeypatch.setattr(model_module, "_checkpoint", counting_checkpoint)
+    monkeypatch.setattr(recurrence, "_checkpoint", counting_checkpoint)
     x = ids()
     torch.manual_seed(11)
     out_a = plain(x, labels=x, return_logits=True)
@@ -473,64 +437,20 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
         torch.testing.assert_close(pa.grad, pb.grad, atol=1e-6, rtol=1e-5, msg=na)
 
 
-# --- sampler --------------------------------------------------------------------------------------------------------
+# --- sampler (the scheme itself is tested in blocks/test_recurrence.py) ----------------------------------------------
 
 
-def test_sampler_respects_backprop_bound_and_is_positive() -> None:
-    m = seeded_tiny(mean_recurrence=[12, 6], mean_backprop_depth=[8, 3])
-    for block_idx, bound in enumerate(per_block(m.config.mean_backprop_depth)):
-        ks, ns = set(), set()
-        for step in range(300):
-            m.step = step
-            n, k = m.randomized_iteration_sampler(block_idx)
-            assert 1 <= k.item() <= bound
-            assert n.item() >= 0
-            assert n.item() + k.item() >= 1
-            ks.add(k.item())
-            ns.add(n.item())
-        assert len(ks) > 1 and len(ns) > 1  # actually random
-        assert bound in ks  # the bound is attained when p >= s
-
-
-def test_sampler_total_depth_mean_is_mean_recurrence_plus_one() -> None:
-    """n + k == p == Poisson(LogNormal(log(t+s) - sigma^2/2, sigma)) + 1, whose mean is mean_recurrence + 1
-    (the +1 is inherited from upstream and kept for identity). Also: k == min(s, p), n == p - k."""
-    m = seeded_tiny(mean_recurrence=[12, 4], mean_backprop_depth=[8, 3])
-    for block_idx, (mean, s) in enumerate(zip([12, 4], [8, 3])):
-        totals = []
-        for step in range(2000):
-            m.step = step
-            n, k = m.randomized_iteration_sampler(block_idx)
-            p = n.item() + k.item()
-            assert k.item() == min(s, p) and n.item() == p - k.item()
-            totals.append(p)
-        avg = sum(totals) / len(totals)
-        assert avg == pytest.approx(mean + 1, abs=0.5), avg
-
-
-def test_sampler_deterministic_in_step_independent_of_global_rng(tiny_model: RecurrentGPT) -> None:
-    tiny_model.step = 42
-    torch.manual_seed(0)
-    a = tiny_model.randomized_iteration_sampler(1)
-    torch.manual_seed(999)
-    b = tiny_model.randomized_iteration_sampler(1)
-    assert (a[0].item(), a[1].item()) == (b[0].item(), b[1].item())
-    draws = set()
-    for step in range(50):
-        tiny_model.step = step
-        n, k = tiny_model.randomized_iteration_sampler(0)
-        draws.add((n.item(), k.item()))
-    assert len(draws) > 1
-
-
-def test_sampler_advances_global_rng(tiny_model: RecurrentGPT) -> None:
-    """The (meta-check) `torch.rand` draw advances the global RNG; pinned for bit-identity with the thesis code."""
-    torch.manual_seed(0)
-    tiny_model.randomized_iteration_sampler(0)
-    after = torch.rand(())
-    torch.manual_seed(0)
-    torch.rand((1,))
-    assert torch.equal(after, torch.rand(()))
+@pytest.mark.parametrize("training", [True, False])
+def test_randomized_iteration_sampler_binds_step_mode_and_config(training: bool) -> None:
+    m = seeded_tiny(mean_recurrence=[12, 6], mean_backprop_depth=[8, 3]).train(training)
+    m.step = 7
+    for block_idx, (mean, depth) in enumerate(zip([12, 6], [8, 3])):
+        n, k = m.randomized_iteration_sampler(block_idx)
+        ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, training=training)
+        assert (n.item(), k.item()) == (ref_n.item(), ref_k.item())
+    m.step = 8
+    n8, _ = m.randomized_iteration_sampler(0)
+    assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, training=training)[0])
 
 
 def test_train_forward_deterministic_under_seed_and_step(tiny_model: RecurrentGPT) -> None:
