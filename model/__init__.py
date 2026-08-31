@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RecurrentConfig, RoPESettings
-from .recurrent_gpt import RecurrentGPT
+from .model import RecurrentGPT
 
 
 def build_model(config: RecurrentConfig | str | Path, **overrides: Any) -> RecurrentGPT:

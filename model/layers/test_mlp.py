@@ -8,7 +8,7 @@ import torch
 
 from model.config import RecurrentConfig
 from model.test_config import tiny_config
-from model.mlp import GatedMLP
+from model.layers.mlp import GatedMLP
 
 
 def make_mlp(**overrides: Any) -> tuple[GatedMLP, RecurrentConfig]:

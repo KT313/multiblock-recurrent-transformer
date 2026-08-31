@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from model.norms import RMSNorm
+from model.layers.norms import RMSNorm
 
 
 def test_shape_and_unit_rms() -> None:

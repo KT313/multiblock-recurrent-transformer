@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.blocks.SandwichBlock`."""
+"""Tests for `model.blocks.sandwich.SandwichBlock`."""
 
 from typing import Any
 
@@ -7,12 +7,12 @@ import pytest
 import torch
 from torch import Tensor
 
-from model.attention import precompute_freqs_cis
-from model.blocks import SandwichBlock
+from model.blocks.sandwich import SandwichBlock
 from model.config import RecurrentConfig
 from model.test_config import tiny_config
-from model.mlp import GatedMLP
-from model.norms import RMSNorm
+from model.layers.attention import precompute_freqs_cis
+from model.layers.mlp import GatedMLP
+from model.layers.norms import RMSNorm
 
 
 def make_block(**overrides: Any) -> tuple[SandwichBlock, RecurrentConfig, Tensor]:

@@ -7,11 +7,11 @@ This repository contains the code for my thesis "Efficient Large Language Models
 
 ## Work
 
-The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/recurrent_gpt.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
+The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
 Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
-- HuggingFace export path (`model/hf.py`)
+- HuggingFace export path (`model/hf/modeling.py`)
 - dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, budgets, mixtures and tokenizer in one YAML, built incrementally and verified before training
 
 The code was restructured and trimmed after the thesis: only the code path of the final run survives, with tests next to every module. The thesis-era tree (SLURM tooling, all upstream model variants) is in git history up to tag `v1.0`.

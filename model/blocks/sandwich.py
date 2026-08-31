@@ -5,10 +5,10 @@
 import torch
 from torch import Tensor
 
-from .attention import CausalSelfAttention
-from .config import RecurrentConfig
-from .mlp import GatedMLP
-from .norms import RMSNorm
+from ..config import RecurrentConfig
+from ..layers.attention import CausalSelfAttention
+from ..layers.mlp import GatedMLP
+from ..layers.norms import RMSNorm
 
 
 class SandwichBlock(torch.nn.Module):

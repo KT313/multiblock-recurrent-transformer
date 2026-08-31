@@ -6,7 +6,7 @@ from math import sqrt
 import pytest
 import torch
 
-from model.init import Init, Linear, init_glu, init_qkv, trunc_orthogonal_, wrapped_trunc_ortho
+from model.layers.init import Init, Linear, init_glu, init_qkv, trunc_orthogonal_, wrapped_trunc_ortho
 
 DIM, HEAD, LAYERS = 1024, 64, 50
 STD = sqrt(2 / (5 * DIM))

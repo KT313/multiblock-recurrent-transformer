@@ -19,8 +19,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Pretra
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from .config import RecurrentConfig, RoPESettings
-from .recurrent_gpt import NumSteps, RecurrentGPT, StepsPair, StepsSpec
+from ..config import RecurrentConfig, RoPESettings
+from ..model import NumSteps, RecurrentGPT, StepsPair, StepsSpec
 
 _MODEL_FIELDS = (
     "block_size",
@@ -170,7 +170,7 @@ AutoModelForCausalLM.register(RecurrentGPTConfig, RecurrentGPTForCausalLM)
 
 # --- export ----------------------------------------------------------------------------------------------------------
 
-_PACKAGE_DIR = Path(__file__).resolve().parent  # the `model/` package
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]  # the `model/` package (this file is `model/hf/modeling.py`)
 _RELATIVE_IMPORT = re.compile(r"^(?P<indent>[ \t]*)from[ \t]+(?P<dots>\.+)(?P<name>[\w.]*)[ \t]+import\b", re.MULTILINE)
 
 

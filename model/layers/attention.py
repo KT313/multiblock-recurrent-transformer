@@ -2,11 +2,17 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 """Causal self-attention (fused qkv projection, optional q/k bias, RoPE) on top of `scaled_dot_product_attention`."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from torch import Tensor
 
-from .config import RecurrentConfig
 from .init import Linear
+
+if TYPE_CHECKING:
+    from ..config import RecurrentConfig
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> Tensor:

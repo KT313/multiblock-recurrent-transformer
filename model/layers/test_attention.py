@@ -8,7 +8,12 @@ import pytest
 import torch
 from torch import Tensor
 
-from model.attention import CausalSelfAttention, apply_rotary_emb_complex_like, attention_sdpa, precompute_freqs_cis
+from model.layers.attention import (
+    CausalSelfAttention,
+    apply_rotary_emb_complex_like,
+    attention_sdpa,
+    precompute_freqs_cis,
+)
 from model.config import RecurrentConfig
 from model.test_config import tiny_config
 

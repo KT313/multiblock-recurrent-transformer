@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import yaml
 
-from .init import Init
+from .layers.init import Init
 
 
 def find_multiple(n: int, k: int) -> int:

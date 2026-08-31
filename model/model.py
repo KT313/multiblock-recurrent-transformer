@@ -11,10 +11,10 @@ import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from .attention import precompute_freqs_cis
-from .blocks import SandwichBlock
+from .blocks.sandwich import SandwichBlock
 from .config import RecurrentConfig
-from .init import Linear
+from .layers.attention import precompute_freqs_cis
+from .layers.init import Linear
 
 StepsPair = tuple[int, int]
 StepsSpec = StepsPair | Tensor | int

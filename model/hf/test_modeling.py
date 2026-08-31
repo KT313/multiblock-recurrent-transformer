@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.hf`: recurrence-step parsing, config conversion and the trust_remote_code export round trip."""
+"""Tests for `model.hf.modeling`: recurrence-step parsing, config conversion and the trust_remote_code export round trip."""
 
 import json
 import os
@@ -15,7 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
 from model.test_config import TINY_ARCHITECTURE, tiny_config
-from model.hf import (
+from model.hf.modeling import (
     RecurrentGPTConfig,
     RecurrentGPTForCausalLM,
     export_sources,
@@ -264,14 +264,14 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     names = {p.name for p in out_dir.iterdir()}
-    assert {"config.json", "model.safetensors", "hf.py", "recurrent_gpt.py", "config.py"} <= names
+    assert {"config.json", "model.safetensors", "hf_modeling.py", "model.py", "config.py", "layers_norms.py"} <= names
     assert not any(n.startswith("test_") for n in names)
     assert "__init__.py" not in names
 
     cfg = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
     assert cfg.model_type == "recurrent_gpt"
     loaded = load_exported(out_dir)
-    # In-process, transformers resolves the registered class from `model.hf` (see the standalone test for the copied
+    # In-process, transformers resolves the registered class from `model.hf.modeling` (see the standalone test for the copied
     # sources); the weights nevertheless come from the exported safetensors.
     assert isinstance(loaded, RecurrentGPTForCausalLM)
     model.eval()
@@ -285,7 +285,7 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     assert loaded.get_output_embeddings() is loaded.model.lm_head
     assert loaded.get_input_embeddings() is loaded.model.transformer.wte
     assert json.loads((out_dir / "config.json").read_text())["auto_map"]["AutoModelForCausalLM"] == (
-        "hf.RecurrentGPTForCausalLM"
+        "hf_modeling.RecurrentGPTForCausalLM"
     )
 
 

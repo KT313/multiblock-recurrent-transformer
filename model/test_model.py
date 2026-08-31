@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.recurrent_gpt.RecurrentGPT`: gradient flow through every layer, step handling, the recurrence
+"""Tests for `model.model.RecurrentGPT`: gradient flow through every layer, step handling, the recurrence
 sampler, loss masking, gradient checkpointing and the seeded golden forward (numerics regression guard)."""
 
 from pathlib import Path
@@ -11,10 +11,11 @@ from torch import Tensor
 
 from model import build_model
 from model.test_config import TINY_ARCHITECTURE, tiny_config
-from model.attention import precompute_freqs_cis
-from model.blocks import SandwichBlock
-import model.recurrent_gpt as recurrent_gpt_module
-from model.recurrent_gpt import RecurrentGPT, TransformerModules
+import model.model as model_module
+from model.blocks.sandwich import SandwichBlock
+from model.config import RecurrentConfig
+from model.layers.attention import precompute_freqs_cis
+from model.model import RecurrentGPT, TransformerModules
 
 GOLDEN_PATH = Path(__file__).with_name("golden_tiny_forward.pt")
 VOCAB = 512
@@ -449,13 +450,13 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
     plain = seeded_tiny()
     ckpt = seeded_tiny(gradient_checkpointing=True)
     calls: list[int] = []
-    orig_checkpoint = recurrent_gpt_module._checkpoint
+    orig_checkpoint = model_module._checkpoint
 
     def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
         calls.append(1)
         return cast(Tensor, orig_checkpoint(*args, **kwargs))
 
-    monkeypatch.setattr(recurrent_gpt_module, "_checkpoint", counting_checkpoint)
+    monkeypatch.setattr(model_module, "_checkpoint", counting_checkpoint)
     x = ids()
     torch.manual_seed(11)
     out_a = plain(x, labels=x, return_logits=True)
@@ -598,7 +599,7 @@ def golden_forward() -> dict[str, torch.Tensor]:
 
 def record_golden() -> Path:
     """Re-record `golden_tiny_forward.pt`. ONLY do this in a commit whose purpose is a numerics change:
-    `uv run python -c "from model.test_recurrent_gpt import record_golden; record_golden()"`."""
+    `uv run python -c "from model.test_model import record_golden; record_golden()"`."""
     torch.save(golden_forward(), GOLDEN_PATH)
     return GOLDEN_PATH
 
