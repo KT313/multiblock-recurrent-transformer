@@ -25,10 +25,10 @@ from rich.live import Live
 
 from data_preparation.lib.log import ProgressStreamHandler, configure_logging
 from data_preparation.lib.progress import NoProgress
+from data_preparation.lib.ui.capture import LineSink
 from data_preparation.lib.ui.dashboard import (
     Dashboard,
     Task,
-    _LineSink,
     active_dashboard,
     progress,
     set_status,
@@ -494,7 +494,7 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up() -> None:
     real_out, real_err = sys.stdout, sys.stderr
     with Dashboard(enabled=True, console=console) as board:
         streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
-        assert all(isinstance(stream, _LineSink) for stream in streams)
+        assert all(isinstance(stream, LineSink) for stream in streams)
         assert not sys.stderr.isatty()
         print("stray print")
         sys.stderr.write("\rbar 10%\rbar 100%\n")
@@ -510,17 +510,6 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up() -> None:
     assert board.lines()[-1].endswith("INFO data_preparation.stdout: partial")
     screen = _screen_text(console, 100)
     assert "bar 100%" in screen and "careful" in screen and "stray print" not in screen
-
-
-def test_line_sink_splits_lines_and_flushes_the_rest() -> None:
-    emitted: list[str] = []
-    sink = _LineSink(emitted.append)
-    assert sink.write("a\nb") == 3
-    sink.write("c\n\n\rd")
-    assert emitted == ["a", "bc", ""]
-    sink.close_flush()
-    sink.close_flush()
-    assert emitted == ["a", "bc", "", "d"] and sink.encoding == "utf-8" and sink.writable()
 
 
 def test_third_party_bars_are_silenced_while_the_display_is_up(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -544,7 +533,7 @@ def test_suspended_clears_the_display_for_a_prompt_and_brings_it_back(monkeypatc
             assert "src" not in _screen_text(console, 80), "the frame is erased while suspended"
         stdout: object = sys.stdout
         restarted = _live_of(board)
-        assert restarted is not None and restarted is not live and isinstance(stdout, _LineSink)
+        assert restarted is not None and restarted is not live and isinstance(stdout, LineSink)
         assert "src" in board.render_text()
 
 

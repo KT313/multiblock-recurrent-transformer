@@ -4,7 +4,9 @@ raw deletion, failures), `describe` output, `prepare` options, tiny end to end."
 
 from __future__ import annotations
 
+import logging
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,22 @@ from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
+
+
+@pytest.fixture(autouse=True)
+def detached_data_preparation_handlers() -> Iterator[logging.Logger]:
+    """The `data_preparation` logger (yielded) without the handler `configure_logging` adds to it — removed again
+    afterwards, so a handler bound to a captured stderr never outlives its test (the dashboard tests would then log
+    into a closed stream, and a failing handler used to take the whole run down with it). Autouse: every `main()`
+    call configures the hierarchy. The sibling of `training/test_train.py`'s fixture."""
+    logger = logging.getLogger("data_preparation")
+    handlers_before, level = list(logger.handlers), logger.level
+    yield logger
+    for handler in list(logger.handlers):
+        if handler not in handlers_before:
+            logger.removeHandler(handler)
+            handler.close()
+    logger.setLevel(level)
 
 
 def test_commands_are_registered() -> None:

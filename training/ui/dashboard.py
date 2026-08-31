@@ -4,7 +4,8 @@
 live in the sibling modules (``common``, ``format``, ``throughput``, ``capture``, ``fallback``, ``board``, ``demo``).
 
 Built on ``rich`` (the only training package that imports it), the sibling of ``data_preparation/lib/ui/dashboard.py``
-(whose stream sinks and handler detection it imports). A :class:`TrainingDashboard` owns exactly one *transient*
+(with which it shares the console capture of ``data_preparation/lib/ui/capture.py``: the line sinks, the log handler,
+``attach_logger`` and the logging / stream captures). A :class:`TrainingDashboard` owns exactly one *transient*
 ``rich.live.Live`` display on stdout that renders, top to bottom: a header (run name, model / dataset config names,
 device / precision, the current status), one progress bar per training stage plus an overall bar (optimizer steps,
 ETA from a smoothed steps-per-second estimate), a table with the metrics of the latest optimizer step, the latest

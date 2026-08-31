@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.ui.dashboard import _LineSink
+from data_preparation.lib.ui.capture import LineSink
 from training.ui.capture import (
     QUIET_ENV,
     STDERR_LOGGER,
@@ -177,7 +177,7 @@ def test_stdout_and_stderr_are_captured_while_captured() -> None:
     capture.start()
     try:
         streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
-        assert all(isinstance(stream, _LineSink) for stream in streams) and _redirected(capture)
+        assert all(isinstance(stream, LineSink) for stream in streams) and _redirected(capture)
         assert not sys.stdout.isatty()
         print("stray print")
         sys.stderr.write("\rbar 10%\rbar 100%\n")

@@ -9,7 +9,8 @@ panel's summary line (jobs done, rows done / wanted, MB read, elapsed), which is
 worker threads go through one lock; the display refreshes on its own timer.
 
 While the display is up nothing may print around it (a stray line between two frames shifts the frame and leaves
-its top behind in the scrollback), so ``__enter__`` also
+its top behind in the scrollback), so ``__enter__`` also (through the sibling :mod:`data_preparation.lib.ui.capture`,
+which the training dashboard uses too)
 
 * routes *every* ``logging`` record into the log panel: a handler on the root logger, while the plain
   ``StreamHandler``\\s that libraries such as ``huggingface_hub`` / ``datasets`` put on their own loggers are
@@ -42,19 +43,18 @@ no capture, tasks are no-ops and the log handler writes plain lines to stderr.
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Sized
+from collections.abc import Iterable, Iterator, Sized
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TextIO, TypeGuard, TypeVar
+from typing import Any, TextIO, TypeVar
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
@@ -63,9 +63,9 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-from data_preparation.lib.log import LOG_FORMAT
 from data_preparation.lib.progress import NoProgress, Progress, progress_enabled
 from data_preparation.lib.progress import progress as fallback_progress
+from data_preparation.lib.ui.capture import DashboardLogHandler, LoggingCapture, StreamCapture, attach_logger
 
 T = TypeVar("T")
 
@@ -282,69 +282,6 @@ class _PanelState:
         return Text(" · ".join(parts), style="bold" if running else "dim")
 
 
-class _LineSink(io.TextIOBase):
-    """A ``sys.stdout`` / ``sys.stderr`` replacement: complete lines go to ``emit``; a carriage return discards the
-    line so far (a tqdm-style bar only delivers its final state); the rest is emitted on :meth:`close_flush`."""
-
-    def __init__(self, emit: Callable[[str], None]) -> None:
-        super().__init__()
-        self._emit = emit
-        self._pending = ""
-        self._lock = threading.Lock()
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, s: str, /) -> int:
-        with self._lock:
-            self._pending += s
-            *complete, self._pending = self._pending.split("\n")
-        for line in complete:
-            self._emit(line.rsplit("\r", 1)[-1])
-        return len(s)
-
-    def isatty(self) -> bool:
-        return False
-
-    @property
-    def encoding(self) -> str:  # type: ignore[override]  # TextIOBase declares a plain attribute; libraries only read it
-        return "utf-8"
-
-    def close_flush(self) -> None:
-        with self._lock:
-            pending, self._pending = self._pending, ""
-        if pending.strip():
-            self._emit(pending.rsplit("\r", 1)[-1])
-
-
-class DashboardLogHandler(logging.Handler):
-    """``logging.Handler`` whose records land in the dashboard's log panel (or on ``stream`` when it is disabled).
-
-    Records of ``keep_level`` and above (default WARNING), and records logged with ``extra={"keep": True}`` (the
-    plan / status tables), are *kept*: printed once, unwrapped, after the live display closed, where they survive
-    the run in the terminal's history — the panel only shows the last few lines. The root handler the dashboard
-    installs (``root=True``) skips records of the loggers :meth:`Dashboard.attach` handles directly."""
-
-    def __init__(
-        self, dashboard: Dashboard, level: int = logging.NOTSET, keep_level: int = logging.WARNING, *, root: bool = False
-    ) -> None:
-        super().__init__(level)
-        self._dashboard = dashboard
-        self._keep_level = keep_level
-        self._root = root
-        self.setFormatter(logging.Formatter(LOG_FORMAT))
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            if self._root and self._dashboard.is_attached(record.name):
-                return
-            text = self.format(record)
-            keep = record.levelno >= self._keep_level or bool(getattr(record, "keep", False))
-            self._dashboard.write(text, keep=keep)
-        except Exception:
-            self.handleError(record)
-
-
 class Dashboard:
     """Live terminal display: header, one panel per task group (``downloads``, ``builds``, …), the log panel (last
     ``log_lines`` lines), footer.
@@ -388,10 +325,8 @@ class Dashboard:
         self._attached: list[str] = []
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
-        self._detached_handlers: list[tuple[logging.Logger, logging.Handler]] = []
-        self._root_handler: DashboardLogHandler | None = None
-        self._saved_streams: tuple[TextIO, TextIO] | None = None
-        self._sinks: tuple[_LineSink, _LineSink] | None = None
+        self._logging_capture = LoggingCapture(self, skip=self.is_attached)
+        self._stream_capture = StreamCapture(STDOUT_LOGGER, STDERR_LOGGER)
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
@@ -508,44 +443,18 @@ class Dashboard:
     def _capture_logging(self) -> None:
         """Every ``logging`` record into the panel: the dashboard's handler on the root logger, and every plain
         console ``StreamHandler`` of every logger (``huggingface_hub`` and ``datasets`` install one on theirs at
-        import) detached until :meth:`_release_logging`."""
-        console_streams = {stream for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__) if stream is not None}
-        loggers: list[logging.Logger] = [logging.getLogger()]
-        loggers.extend(logger for logger in logging.root.manager.loggerDict.values() if isinstance(logger, logging.Logger))
-        for logger in loggers:
-            for handler in list(logger.handlers):
-                if _is_console_handler(handler) and handler.stream in console_streams:
-                    logger.removeHandler(handler)
-                    self._detached_handlers.append((logger, handler))
-        self._root_handler = DashboardLogHandler(self, root=True)
-        logging.getLogger().addHandler(self._root_handler)
+        import) detached until :meth:`_release_logging` (:class:`~data_preparation.lib.ui.capture.LoggingCapture`)."""
+        self._logging_capture.start()
 
     def _release_logging(self) -> None:
-        if self._root_handler is not None:
-            logging.getLogger().removeHandler(self._root_handler)
-            self._root_handler.close()
-            self._root_handler = None
-        for logger, handler in self._detached_handlers:
-            logger.addHandler(handler)
-        self._detached_handlers = []
+        self._logging_capture.stop()
 
     def _redirect_streams(self) -> None:
         """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""
-        self._saved_streams = (sys.stdout, sys.stderr)
-        stdout_logger, stderr_logger = logging.getLogger(STDOUT_LOGGER), logging.getLogger(STDERR_LOGGER)
-        stdout_logger.setLevel(logging.INFO)  # whatever the package logger is set to, a stray line is never dropped
-        stderr_logger.setLevel(logging.INFO)
-        self._sinks = (_LineSink(stdout_logger.info), _LineSink(stderr_logger.warning))
-        sys.stdout, sys.stderr = self._sinks
+        self._stream_capture.redirect()
 
     def _restore_streams(self) -> None:
-        if self._saved_streams is not None:
-            sys.stdout, sys.stderr = self._saved_streams
-            self._saved_streams = None
-        if self._sinks is not None:
-            sinks, self._sinks = self._sinks, None
-            for sink in sinks:
-                sink.close_flush()
+        self._stream_capture.release()
 
     # --- tasks, status and log lines ------------------------------------------------------------------------------------
 
@@ -603,31 +512,16 @@ class Dashboard:
         """Route ``logger`` into this dashboard for the duration of the block: the plain stream handlers that
         ``lib.log.configure_logging`` installed are detached (their lines would print behind the live display) and
         restored afterwards; with ``log_file`` every record is also appended to that file (named in the footer)."""
-        detached: list[logging.Handler] = [h for h in logger.handlers if _is_console_handler(h)]
-        added: list[logging.Handler] = [self.log_handler()]
-        if log_file is not None:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(log_file, encoding="utf-8")
-            file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-            added.append(file_handler)
-        for handler in detached:
-            logger.removeHandler(handler)
-        for handler in added:
-            logger.addHandler(handler)
-        with self._lock:
-            self._attached.append(logger.name)
-            if log_file is not None:
-                self._log_file = log_file
-        try:
-            yield
-        finally:
+        with attach_logger(self, logger, log_file):
             with self._lock:
-                self._attached.remove(logger.name)
-            for handler in added:
-                logger.removeHandler(handler)
-                handler.close()
-            for handler in detached:
-                logger.addHandler(handler)
+                self._attached.append(logger.name)
+                if log_file is not None:
+                    self._log_file = log_file
+            try:
+                yield
+            finally:
+                with self._lock:
+                    self._attached.remove(logger.name)
 
     def lines(self) -> list[str]:
         """The log lines currently shown (newest last)."""
@@ -676,11 +570,6 @@ class Dashboard:
         with console.capture() as capture:
             console.print(self)
         return capture.get()
-
-
-def _is_console_handler(handler: logging.Handler) -> TypeGuard[logging.StreamHandler[Any]]:
-    """A plain ``StreamHandler`` (not a file handler): what writes log lines to a console stream."""
-    return isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
 
 
 def active_dashboard() -> Dashboard | None:

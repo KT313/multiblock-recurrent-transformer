@@ -1,24 +1,45 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Everything that could print around the live display, routed into it: the ``logging`` handler of the dashboards,
-:func:`attach_logger` (one logger plus the log file), and :class:`TerminalCapture` — the root-logger handler, the
-detached third-party console handlers, the ``warnings.showwarning`` hook, the ``sys.stdout`` / ``sys.stderr`` line
-sinks and the wandb environment variables, all for the duration of the display. The line sink and the console-handler
-check are the data-prep dashboard's (``data_preparation/lib/ui/dashboard.py``)."""
+"""Everything that could print around the training display, routed into it: :class:`TerminalCapture` — the
+root-logger handler, the detached third-party console handlers, the ``warnings.showwarning`` hook, the ``sys.stdout``
+/ ``sys.stderr`` line sinks and the wandb environment variables, all for the duration of the display.
+
+The generic half — the line sink, the dashboard log handler, :func:`attach_logger` and the logging / stream capture
+themselves — lives in :mod:`data_preparation.lib.ui.capture`, shared with the data-prep dashboard; this module adds
+what only a training run needs: the ``training.*`` logger names, the ``warnings`` hook and the wandb environment."""
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
 import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
 
-from data_preparation.lib.log import LOG_FORMAT
-from data_preparation.lib.ui.dashboard import _is_console_handler, _LineSink  # generic, shared with the data-prep dashboard
+from data_preparation.lib.ui.capture import (  # generic, shared with the data-prep dashboard
+    DashboardLogHandler,
+    LineSink,
+    LoggingCapture,
+    LogSink,
+    StreamCapture,
+)
+from data_preparation.lib.ui.capture import attach_logger as _attach_logger
 from training.ui.common import TRAINING_LOGGER_NAME
+
+__all__ = [
+    "QUIET_ENV",
+    "STDERR_LOGGER",
+    "STDOUT_LOGGER",
+    "WANDB_QUIET_SETTINGS",
+    "WARNINGS_LOGGER",
+    "DashboardLogHandler",
+    "LineSink",
+    "LogSink",
+    "TerminalCapture",
+    "attach_logger",
+    "format_warning",
+]
 
 STDOUT_LOGGER = f"{TRAINING_LOGGER_NAME}.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = f"{TRAINING_LOGGER_NAME}.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
@@ -53,79 +74,14 @@ class _ShowWarning(Protocol):
     ) -> None: ...
 
 
-class LogSink(Protocol):
-    """What :class:`DashboardLogHandler` writes to (the live dashboard and the fallback)."""
-
-    def write(self, text: str, *, keep: bool = False) -> None: ...
-
-
-class DashboardLogHandler(logging.Handler):
-    """``logging.Handler`` whose records land in the dashboard's log panel (or on its stream, for the fallback).
-
-    Records of ``keep_level`` and above (default WARNING), and records logged with ``extra={"keep": True}`` (stage
-    summaries, the final report), are *kept*: the live dashboard prints them once, unwrapped, after the display
-    closed, where they survive the run in the terminal's history — the panel only shows the last few lines. The
-    handler :class:`TerminalCapture` installs on the root logger passes ``skip``: records of loggers
-    :func:`attach_logger` handles directly are dropped there (they reach the panel through the attached handler)."""
-
-    def __init__(
-        self,
-        sink: LogSink,
-        level: int = logging.NOTSET,
-        keep_level: int = logging.WARNING,
-        *,
-        skip: Callable[[str], bool] | None = None,
-    ) -> None:
-        super().__init__(level)
-        self._sink = sink
-        self._keep_level = keep_level
-        self._skip = skip
-        self.setFormatter(logging.Formatter(LOG_FORMAT))
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            if self._skip is not None and self._skip(record.name):
-                return
-            text = self.format(record)
-            keep = record.levelno >= self._keep_level or bool(getattr(record, "keep", False))
-            self._sink.write(text, keep=keep)
-        except Exception:
-            self.handleError(record)
-
-
 @contextmanager
 def attach_logger(sink: LogSink, logger: logging.Logger, log_file: Path | None) -> Iterator[logging.FileHandler | None]:
-    """Route ``logger`` into ``sink`` for the duration of the block (the body of both dashboards' ``attach``).
+    """Route ``logger`` into ``sink`` for the duration of the block (the body of the training dashboard's ``open``).
 
-    The plain stream handlers a CLI installed are detached (their lines would print twice and garble the live
-    display) and restored afterwards; with ``log_file`` every record is also appended to that file. A logger whose
-    effective level is above INFO is lowered to INFO for the block — the dashboard lives on INFO records — and
-    restored afterwards. Yields the file handler (None without ``log_file``): the live dashboard hands it the lines
-    the fallback would log (step, validation, event), so they reach the file and only the file."""
-    detached: list[logging.Handler] = [h for h in logger.handlers if _is_console_handler(h)]
-    added: list[logging.Handler] = [DashboardLogHandler(sink)]
-    file_handler: logging.FileHandler | None = None
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-        added.append(file_handler)
-    for handler in detached:
-        logger.removeHandler(handler)
-    for handler in added:
-        logger.addHandler(handler)
-    previous_level = logger.level
-    if logger.getEffectiveLevel() > logging.INFO:
-        logger.setLevel(logging.INFO)
-    try:
+    :func:`data_preparation.lib.ui.capture.attach_logger` with ``ensure_info_level``: a logger whose effective level
+    is above INFO is lowered to INFO for the block — the training dashboard lives on INFO records."""
+    with _attach_logger(sink, logger, log_file, ensure_info_level=True) as file_handler:
         yield file_handler
-    finally:
-        logger.setLevel(previous_level)
-        for handler in added:
-            logger.removeHandler(handler)
-            handler.close()
-        for handler in detached:
-            logger.addHandler(handler)
 
 
 class TerminalCapture:
@@ -152,19 +108,15 @@ class TerminalCapture:
     """
 
     def __init__(self, sink: LogSink, *, skip: Callable[[str], bool] | None = None) -> None:
-        self._sink = sink
-        self._skip = skip
-        self._detached_handlers: list[tuple[logging.Logger, logging.Handler]] = []
-        self._root_handler: DashboardLogHandler | None = None
-        self._saved_streams: tuple[TextIO, TextIO] | None = None
-        self._sinks: tuple[_LineSink, _LineSink] | None = None
+        self._logging = LoggingCapture(sink, skip=skip)
+        self._streams = StreamCapture(STDOUT_LOGGER, STDERR_LOGGER)
         self._saved_env: dict[str, str | None] | None = None
         self._previous_showwarning: _ShowWarning | None = None  # what `warnings.showwarning` was when the capture started
         self._warnings_captured = False
 
     def start(self) -> None:
         self._quiet_environment()
-        self._capture_logging()
+        self._logging.start()
         self._capture_warnings()
         self.redirect_streams()
 
@@ -176,13 +128,13 @@ class TerminalCapture:
                 self._release_warnings()
             finally:
                 try:
-                    self._release_logging()
+                    self._logging.stop()
                 finally:
                     self._restore_environment()
 
     @property
     def streams_redirected(self) -> bool:
-        return self._sinks is not None
+        return self._streams.redirected
 
     def _quiet_environment(self) -> None:
         if self._saved_env is None:
@@ -196,29 +148,6 @@ class TerminalCapture:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-
-    def _capture_logging(self) -> None:
-        if self._root_handler is not None:
-            return
-        console_streams = {stream for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__) if stream is not None}
-        loggers: list[logging.Logger] = [logging.getLogger()]
-        loggers.extend(logger for logger in logging.root.manager.loggerDict.values() if isinstance(logger, logging.Logger))
-        for logger in loggers:
-            for handler in list(logger.handlers):
-                if _is_console_handler(handler) and handler.stream in console_streams:
-                    logger.removeHandler(handler)
-                    self._detached_handlers.append((logger, handler))
-        self._root_handler = DashboardLogHandler(self._sink, skip=self._skip)
-        logging.getLogger().addHandler(self._root_handler)
-
-    def _release_logging(self) -> None:
-        if self._root_handler is not None:
-            logging.getLogger().removeHandler(self._root_handler)
-            self._root_handler.close()
-            self._root_handler = None
-        detached, self._detached_handlers = self._detached_handlers, []
-        for logger, handler in detached:
-            logger.addHandler(handler)
 
     def _capture_warnings(self) -> None:
         if self._warnings_captured:
@@ -252,21 +181,8 @@ class TerminalCapture:
 
     def redirect_streams(self) -> None:
         """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""
-        if self._sinks is not None:
-            return
-        self._saved_streams = (sys.stdout, sys.stderr)
-        stdout_logger, stderr_logger = logging.getLogger(STDOUT_LOGGER), logging.getLogger(STDERR_LOGGER)
-        stdout_logger.setLevel(logging.INFO)  # whatever the `training` logger is set to, a stray line is never dropped
-        stderr_logger.setLevel(logging.INFO)
-        self._sinks = (_LineSink(stdout_logger.info), _LineSink(stderr_logger.warning))
-        sys.stdout, sys.stderr = self._sinks
+        self._streams.redirect()
 
     def release_streams(self) -> None:
         """The real streams back; what a sink still holds without a newline is logged now."""
-        if self._saved_streams is not None:
-            sys.stdout, sys.stderr = self._saved_streams
-            self._saved_streams = None
-        if self._sinks is not None:
-            sinks, self._sinks = self._sinks, None
-            for sink in sinks:
-                sink.close_flush()
+        self._streams.release()

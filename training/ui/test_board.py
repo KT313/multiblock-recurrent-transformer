@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from rich.live import Live
 
-from data_preparation.lib.ui.dashboard import _LineSink
+from data_preparation.lib.ui.capture import LineSink
 from training.ui.board import StageBar, TrainingDashboard
 from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 from training.ui.testing import (
@@ -311,7 +311,7 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up(tmp_path: Path, 
     # the `training` logger, as in a run: the sink loggers `training.stdout` / `training.stderr` sit under it
     with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
         streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
-        assert all(isinstance(stream, _LineSink) for stream in streams)
+        assert all(isinstance(stream, LineSink) for stream in streams)
         print("stray print")
         sys.stderr.write("a bare stderr write\n")
         lines = b.lines()
@@ -337,7 +337,7 @@ def test_suspended_clears_the_display_for_a_prompt_and_brings_it_back(clock: Fak
             assert "overall" not in screen_text(console, 80), "the frame is erased while suspended"
         stdout: object = sys.stdout
         restarted = _live_of(b)
-        assert restarted is not None and restarted is not live and isinstance(stdout, _LineSink)
+        assert restarted is not None and restarted is not live and isinstance(stdout, LineSink)
         assert "3/30" in b.render_text()
     with b.suspended():
         pass  # closed: nothing to suspend
@@ -366,7 +366,7 @@ def test_close_is_idempotent_and_a_console_on_stdout_is_pinned(clock: FakeClock)
     assert screen_text(console, 120).count("overall") == 1, "the summary is printed once"
     console.file = sys.stdout  # a console following sys.stdout: pinned to the current stream before the redirect
     with TrainingDashboard("r", STAGES, STEPS, TOTAL, console=console, clock=clock, final_frame=False):
-        assert not isinstance(console.file, _LineSink)
+        assert not isinstance(console.file, LineSink)
 
 
 # --- never raise -----------------------------------------------------------------------------------------------------------
