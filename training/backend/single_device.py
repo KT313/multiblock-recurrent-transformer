@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Single-device backend: one CUDA GPU (CPU fallback), bf16 autocast, plain `torch.save`/`torch.load`."""
 
-import os
 import random
 import warnings
 from contextlib import AbstractContextManager, nullcontext
@@ -13,6 +12,8 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
+
+from data_preparation.lib.storage.atomic import write_atomically
 
 PRECISIONS = ("bf16-mixed", "32")
 
@@ -82,16 +83,10 @@ class SingleDeviceBackend:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, error_if_nonfinite=False)
 
     def save_checkpoint(self, path: str | Path, state: dict[str, Any]) -> None:
-        # Written to a sibling temp file and renamed: a crash (or the second Ctrl-C) mid-save never leaves a
-        # truncated file under the final name, which `find_latest_checkpoint` would otherwise pick.
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        try:
+        # Written to a sibling temp file and renamed (`write_atomically`): a crash (or the second Ctrl-C) mid-save
+        # never leaves a truncated file under the final name, which `find_latest_checkpoint` would otherwise pick.
+        with write_atomically(path) as temporary:
             torch.save(state, temporary)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
         # Our own trusted checkpoints contain plain python objects (configs, RNG states), hence weights_only=False.
