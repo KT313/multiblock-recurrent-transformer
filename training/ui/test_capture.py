@@ -1,0 +1,223 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""Tests for the logging handler, attaching a logger, and the terminal capture around the live display."""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import sys
+import warnings
+from pathlib import Path
+
+import pytest
+
+from data_preparation.lib.ui.dashboard import _LineSink
+from training.ui.capture import (
+    QUIET_ENV,
+    STDERR_LOGGER,
+    STDOUT_LOGGER,
+    WANDB_QUIET_SETTINGS,
+    DashboardLogHandler,
+    TerminalCapture,
+    attach_logger,
+)
+from training.ui.testing import LOGGER_NAME
+
+
+class RecordingSink:
+    """A ``LogSink`` remembering what it was given."""
+
+    def __init__(self) -> None:
+        self.written: list[tuple[str, bool]] = []
+
+    def write(self, text: str, *, keep: bool = False) -> None:
+        self.written.append((text, keep))
+
+    def texts(self) -> list[str]:
+        return [text for text, _keep in self.written]
+
+
+def _streams() -> tuple[object, object]:
+    """``(sys.stdout, sys.stderr)`` through a call: mypy would otherwise keep the narrowing of an earlier assertion."""
+    return sys.stdout, sys.stderr
+
+
+def _redirected(capture: TerminalCapture) -> bool:
+    """``capture.streams_redirected`` through a call, for the same reason (mypy narrows attribute expressions)."""
+    return capture.streams_redirected
+
+
+def _record(name: str, level: int, message: str, **extra: object) -> logging.LogRecord:
+    record = logging.LogRecord(name, level, __file__, 1, message, None, None)
+    for key, value in extra.items():
+        setattr(record, key, value)
+    return record
+
+
+# --- the handler ------------------------------------------------------------------------------------------------------------
+
+
+def test_handler_formats_and_keeps_warnings_and_marked_records() -> None:
+    sink = RecordingSink()
+    handler = DashboardLogHandler(sink)
+    handler.emit(_record("training.x", logging.INFO, "plain"))
+    handler.emit(_record("training.x", logging.WARNING, "loud"))
+    handler.emit(_record("training.x", logging.INFO, "table", keep=True))
+    assert [text.split(": ")[-1] for text in sink.texts()] == ["plain", "loud", "table"]
+    assert [keep for _text, keep in sink.written] == [False, True, True]
+    assert sink.texts()[0].endswith("INFO training.x: plain")
+
+
+def test_handler_skips_the_loggers_it_is_told_to() -> None:
+    sink = RecordingSink()
+    handler = DashboardLogHandler(sink, skip=lambda name: name.startswith("training"))
+    handler.emit(_record("training.x", logging.INFO, "handled elsewhere"))
+    handler.emit(_record("some_library", logging.INFO, "mine"))
+    assert sink.texts() == [sink.texts()[0]] and sink.texts()[0].endswith("some_library: mine")
+
+
+def test_handler_never_raises_on_a_broken_sink() -> None:
+    class BrokenSink:
+        def write(self, text: str, *, keep: bool = False) -> None:
+            raise OSError("closed")
+
+    handler = DashboardLogHandler(BrokenSink())
+    handler.handleError = lambda record: None  # type: ignore[method-assign]  # silence the stderr report of the test
+    handler.emit(_record("training.x", logging.INFO, "msg"))
+
+
+# --- attaching a logger -------------------------------------------------------------------------------------------------------
+
+
+def test_attach_swaps_the_stream_handler_writes_the_log_file_and_restores(tmp_path: Path) -> None:
+    sink = RecordingSink()
+    logger = logging.getLogger(LOGGER_NAME + ".attach")
+    logger.propagate = False
+    logger.setLevel(logging.WARNING)
+    stream_handler = logging.StreamHandler(io.StringIO())
+    logger.addHandler(stream_handler)
+    log_file = tmp_path / "out" / "train.log"
+    try:
+        with attach_logger(sink, logger, log_file):
+            assert stream_handler not in logger.handlers and len(logger.handlers) == 2
+            assert logger.level == logging.INFO, "lowered to INFO for the block: the dashboard lives on INFO records"
+            logger.info("inside %d", 1)
+            assert sink.texts()[-1].endswith("inside 1")
+        assert logger.handlers == [stream_handler] and logger.level == logging.WARNING
+        assert "inside 1" in log_file.read_text()
+        assert stream_handler.stream.getvalue() == ""
+    finally:
+        logger.removeHandler(stream_handler)
+        logger.propagate = True
+
+
+def test_attach_restores_handlers_when_the_body_raises() -> None:
+    logger = logging.getLogger(LOGGER_NAME + ".raise")
+    logger.propagate = False
+    stream_handler = logging.StreamHandler(io.StringIO())
+    logger.addHandler(stream_handler)
+    try:
+        with pytest.raises(RuntimeError, match="boom"), attach_logger(RecordingSink(), logger, None):
+            assert stream_handler not in logger.handlers
+            raise RuntimeError("boom")
+        assert logger.handlers == [stream_handler]
+    finally:
+        logger.removeHandler(stream_handler)
+        logger.propagate = True
+
+
+# --- the terminal capture -----------------------------------------------------------------------------------------------------
+
+
+def test_third_party_console_handlers_are_detached_while_captured() -> None:
+    sink = RecordingSink()
+    library = logging.getLogger("fake_transformers_library")  # like transformers / datasets: a StreamHandler on stderr
+    library.setLevel(logging.WARNING)
+    plain = logging.StreamHandler(sys.stderr)
+    library.addHandler(plain)
+    root = logging.getLogger()
+    root_handlers = list(root.handlers)
+    capture = TerminalCapture(sink)
+    try:
+        capture.start()
+        assert library.handlers == [], "the plain handler would print behind the display"
+        assert len(root.handlers) == len(root_handlers) + 1
+        library.warning("model card missing")
+        assert sink.written[-1][0].endswith("WARNING fake_transformers_library: model card missing") and sink.written[-1][1]
+        capture.stop()
+        capture.stop()  # idempotent
+        assert library.handlers == [plain] and root.handlers == root_handlers
+    finally:
+        capture.stop()
+        library.removeHandler(plain)
+
+
+def test_root_handler_skips_what_an_attached_handler_covers() -> None:
+    sink = RecordingSink()
+    logger = logging.getLogger(LOGGER_NAME + ".covered")
+    capture = TerminalCapture(sink, skip=lambda name: name.startswith(LOGGER_NAME))
+    capture.start()
+    try:
+        with attach_logger(sink, logger, None):
+            logger.info("once")
+            logging.getLogger("elsewhere").warning("root")
+    finally:
+        capture.stop()
+    assert [text.split(": ")[-1] for text in sink.texts()] == ["once", "root"]
+
+
+def test_stdout_and_stderr_are_captured_while_captured() -> None:
+    sink = RecordingSink()
+    real_out, real_err = sys.stdout, sys.stderr
+    capture = TerminalCapture(sink)
+    capture.start()
+    try:
+        streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
+        assert all(isinstance(stream, _LineSink) for stream in streams) and _redirected(capture)
+        assert not sys.stdout.isatty()
+        print("stray print")
+        sys.stderr.write("\rbar 10%\rbar 100%\n")
+        # what `warnings.showwarning` writes to sys.stderr (pytest records warnings itself, so it is written by hand)
+        sys.stderr.write(warnings.formatwarning("careful", UserWarning, "x.py", 1))
+        print("partial", end="")  # no newline: flushed when the capture ends
+        texts = sink.texts()
+        assert texts[0].endswith(f"INFO {STDOUT_LOGGER}: stray print") and not sink.written[0][1], "stdout lines are not kept"
+        assert texts[1].endswith(f"WARNING {STDERR_LOGGER}: bar 100%") and sink.written[1][1], "a carriage return discards the line so far; stderr lines are kept"
+        assert f"WARNING {STDERR_LOGGER}: x.py:1: UserWarning: careful" in texts[2]
+        assert len(texts) == 3
+    finally:
+        capture.stop()
+    assert _streams() == (real_out, real_err) and not _redirected(capture)
+    assert sink.texts()[-1].endswith(f"INFO {STDOUT_LOGGER}: partial")
+
+
+def test_streams_can_be_released_for_a_prompt_and_redirected_again() -> None:
+    sink = RecordingSink()
+    real_out = sys.stdout
+    capture = TerminalCapture(sink)
+    capture.start()
+    try:
+        capture.release_streams()
+        assert _streams()[0] is real_out and not _redirected(capture)
+        capture.redirect_streams()
+        capture.redirect_streams()  # idempotent: the real streams stay saved
+        assert _streams()[0] is not real_out and _redirected(capture)
+        print("back")
+    finally:
+        capture.stop()
+    assert _streams()[0] is real_out and sink.texts()[-1].endswith("back")
+
+
+def test_wandb_is_quieted_through_the_environment_while_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WANDB_SILENT", raising=False)
+    monkeypatch.setenv("WANDB_CONSOLE", "wrap")
+    capture = TerminalCapture(RecordingSink())
+    capture.start()
+    try:
+        assert os.environ["WANDB_SILENT"] == "true" and os.environ["WANDB_CONSOLE"] == "off"
+    finally:
+        capture.stop()
+    assert "WANDB_SILENT" not in os.environ and os.environ["WANDB_CONSOLE"] == "wrap"
+    assert QUIET_ENV == {"WANDB_CONSOLE": "off", "WANDB_SILENT": "true"}
+    assert WANDB_QUIET_SETTINGS == {"console": "off", "silent": True}

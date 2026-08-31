@@ -1,0 +1,79 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""Tests for the formatting helpers, the step-dict readers and the panel-height fit."""
+
+from __future__ import annotations
+
+from rich.console import Console, Group
+
+from training.ui.format import (
+    TRANSITION_FLAG_KEY,
+    TRANSITION_PROGRESS_KEY,
+    as_float,
+    fit_panel_heights,
+    floats,
+    format_duration,
+    format_metric,
+    format_tokens,
+    known_metrics,
+    line,
+    transition_of,
+)
+
+
+def test_format_duration() -> None:
+    assert format_duration(None) == "—"
+    assert format_duration(float("inf")) == "—"
+    assert format_duration(-1) == "—"
+    assert format_duration(0) == "0:00:00"
+    assert format_duration(3_725.9) == "1:02:05"
+    assert format_duration(90_061) == "1d 01:01:01"
+
+
+def test_format_tokens() -> None:
+    assert format_tokens(999) == "999"
+    assert format_tokens(1_500) == "1.50k"
+    assert format_tokens(2_500_000) == "2.50M"
+    assert format_tokens(1.234e9) == "1.23B"
+    assert format_tokens(3e12) == "3.00T"
+
+
+def test_format_metric() -> None:
+    assert format_metric("loss", 3.14159) == "3.1416"
+    assert format_metric("ppl", 23.1) == "23.10"
+    assert format_metric("lr", 0.0003) == "3.00e-04"
+    assert format_metric("grad_norm", 1.23456) == "1.235"
+    assert format_metric("tokens/second", 12345.6) == "12,346"
+    assert format_metric("seconds/step", 0.5) == "0.50s"
+    assert format_metric("total_tokens", 2e9) == "2.00B"
+    assert format_metric("other", 0.123456) == "0.1235"
+
+
+def test_fit_panel_heights_shrinks_the_log_panel_first_then_the_events() -> None:
+    assert fit_panel_heights(100, 6, 12) == (6, 12), "room for everything"
+    assert fit_panel_heights(6 + 12 + 4, 6, 12) == (6, 12), "exactly enough (two borders per panel)"
+    assert fit_panel_heights(6 + 8 + 4, 6, 12) == (6, 8), "the log panel gives way first"
+    assert fit_panel_heights(3 + 2 + 4, 6, 12) == (3, 2), "then the events panel, the log panel at its minimum"
+    assert fit_panel_heights(0, 6, 12) == (1, 2), "never below one event line and MIN_LOG_LINES"
+    assert fit_panel_heights(100, 0, 0) == (1, 2), "an empty panel still shows its placeholder line"
+
+
+def test_step_dict_readers_accept_anything_float_like() -> None:
+    class Scalar:  # a one-element tensor: `float()` works through `__float__`
+        def __float__(self) -> float:
+            return 2.5
+
+    assert as_float(Scalar()) == 2.5 and as_float("3") == 3.0 and as_float("x") is None and as_float(None) is None
+    assert floats({"a": 1, "b": "nope", "c": Scalar()}) == {"a": 1.0, "c": 2.5}
+    assert known_metrics({"loss": 3, "unknown": 1.0, "lr": "bad", "ppl": Scalar()}) == {"loss": 3.0, "ppl": 2.5}
+    assert transition_of({}) is None and transition_of({TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.5}) is None
+    assert transition_of({TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}) == 0.5
+    assert transition_of({TRANSITION_FLAG_KEY: True}) == 0.0, "in a transition without progress: 0"
+
+
+def test_line_never_wraps_and_keeps_markup_literal() -> None:
+    console = Console(width=20, force_terminal=False, color_system=None)
+    with console.capture() as capture:
+        # inside a Group, as in the frame: `console.print(Text)` itself re-joins the text and drops `no_wrap`
+        console.print(Group(line("[bold]x[/bold] " + "y" * 40, style="dim")))
+    (rendered,) = capture.get().splitlines()
+    assert rendered.startswith("[bold]x[/bold] yyy") and rendered.endswith("…") and len(rendered) == 20
