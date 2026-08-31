@@ -142,11 +142,8 @@ def describe_parameters(model: Module) -> str:
 
 @dataclass
 class TrainingReport:
-    """What `train()` returns: the counts, times, last losses and files of one run.
-
-    Defined here for now; task 8 of `tasks/training_pipeline_restructure.md` may move it to `training/run.py` next
-    to `train()`.
-    """
+    """What `train()` returns: the counts, times, last losses and files of one run (built by `RunLogger.close`,
+    re-exported by `training/run.py`)."""
 
     run_directory: Path
     steps_completed: int  # optimizer steps run by this process (a resumed run counts from its resume step)
