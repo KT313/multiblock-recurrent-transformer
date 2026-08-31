@@ -703,7 +703,7 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
     assert _build(d).processed_hash("ins") == base.processed_hash("ins")
 
 
-def test_hash_fields_golden_defaults() -> None:
+def test_hash_payload_golden_defaults() -> None:
     """`hash_payload` drops default-valued fields, so a changed *default* re-labels data built under the old one.
     Changing any of these defaults must be a conscious, hash-breaking commit: update this golden dict with it."""
     assert asdict(ProcessingConfig()) == {
