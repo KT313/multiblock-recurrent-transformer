@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Single-device backend: one CUDA GPU (CPU fallback), bf16 autocast, plain `torch.save`/`torch.load`."""
 
+import os
 import random
 import warnings
 from contextlib import AbstractContextManager, nullcontext
@@ -81,9 +82,16 @@ class SingleDeviceBackend:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, error_if_nonfinite=False)
 
     def save_checkpoint(self, path: str | Path, state: dict[str, Any]) -> None:
+        # Written to a sibling temp file and renamed: a crash (or the second Ctrl-C) mid-save never leaves a
+        # truncated file under the final name, which `find_latest_checkpoint` would otherwise pick.
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state, path)
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            torch.save(state, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
         # Our own trusted checkpoints contain plain python objects (configs, RNG states), hence weights_only=False.
@@ -98,16 +106,18 @@ class SingleDeviceBackend:
         torch.cuda.manual_seed_all(seed)
 
     def rng_state(self) -> dict[str, Any]:
+        # Only this backend's device: a CPU run on a GPU box must not initialise CUDA at every checkpoint, and a
+        # checkpoint must not depend on how many GPUs the machine has.
         state = {"python": random.getstate(), "torch": torch.get_rng_state()}
-        if torch.cuda.is_available():
-            state["cuda"] = torch.cuda.get_rng_state_all()
+        if self.device.type == "cuda":
+            state["cuda"] = torch.cuda.get_rng_state(self.device)
         return state
 
     def set_rng_state(self, state: dict[str, Any]) -> None:
         random.setstate(state["python"])
         torch.set_rng_state(state["torch"].cpu())
-        if "cuda" in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+        if "cuda" in state and self.device.type == "cuda":
+            torch.cuda.set_rng_state(state["cuda"].cpu(), self.device)
 
     def to_device(self, tensor: Tensor) -> Tensor:
         return tensor.to(self.device, non_blocking=True)

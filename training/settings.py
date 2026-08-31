@@ -96,6 +96,15 @@ class Settings:
             raise ValueError("stage_base_lrs must be non-negative")
         if self.world_batch_size % self.micro_batch_size != 0:
             raise ValueError("world_batch_size must be a multiple of micro_batch_size")
+        for name in ("log_step_interval", "eval_step_interval", "eval_iters"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive (save_step_interval is the only interval 0 disables)")
+        if self.save_step_interval < 0 or self.warmup_steps < 0 or self.cooldown_steps < 0 or self.resume_warmup_steps < 0:
+            raise ValueError("save_step_interval, warmup_steps, cooldown_steps and resume_warmup_steps must be >= 0")
+        if self.grad_clip <= 0:
+            raise ValueError("grad_clip must be positive (0 would zero every gradient)")
+        if self.resume_checkpoint_path and not self.resume:
+            raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
 
     @property
     def gradient_accumulation_steps(self) -> int:

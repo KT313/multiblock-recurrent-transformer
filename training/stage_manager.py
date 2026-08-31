@@ -143,13 +143,24 @@ class StageManager:
         return boundaries
 
     def _validate_lr_schedule(self) -> None:
-        """Warmup must fit inside the first stage and cooldown inside the last stage."""
-        if self.warmup_steps > 0:
-            first_stage_steps = self.boundaries[0].end_step - self.boundaries[0].start_step
-            if self.warmup_steps >= first_stage_steps:
+        """Warmup must end before the first stage's transition starts (the ramp targets the first stage's base LR)
+        and cooldown must fit inside the last stage; every stage must be at least one step long, with its transition
+        shorter than the stage."""
+        for boundary in self.boundaries:
+            stage_steps = boundary.end_step - boundary.start_step
+            if stage_steps < 1:
                 raise ValueError(
-                    f"warmup_steps ({self.warmup_steps}) must be less than first stage steps ({first_stage_steps}). "
-                    "Consider reducing warmup_steps or increasing stage 0 tokens."
+                    f"stage {boundary.stage_name!r} is shorter than one optimizer step ({boundary.tokens} tokens < "
+                    f"{self.tokens_per_step} per step); increase its tokens or lower world_batch_size"
+                )
+            if boundary.transition_end_step - boundary.transition_start_step >= stage_steps:
+                raise ValueError(f"stage {boundary.stage_name!r}: the transition must be shorter than the stage")
+        if self.warmup_steps > 0:
+            plain_first_stage_steps = self.boundaries[0].transition_start_step - self.boundaries[0].start_step
+            if self.warmup_steps >= plain_first_stage_steps:
+                raise ValueError(
+                    f"warmup_steps ({self.warmup_steps}) must be less than the first stage's steps before its "
+                    f"transition ({plain_first_stage_steps}). Consider reducing warmup_steps or increasing stage 0 tokens."
                 )
         if self.cooldown_steps > 0:
             last_boundary = self.boundaries[-1]

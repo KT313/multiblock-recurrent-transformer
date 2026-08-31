@@ -113,12 +113,25 @@ def test_warmup_or_cooldown_too_long_raises(warmup: int, cooldown: int) -> None:
 
 
 def test_warmup_and_cooldown_that_fit_are_accepted() -> None:
-    sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256, warmup_steps=7, cooldown_steps=3)
+    """Stage 0 has 8 steps of which the last 2 are its transition: the warmup must end before step 6."""
+    sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256, warmup_steps=5, cooldown_steps=3)
     assert sm.total_steps == 20
     sm._validate_lr_schedule()  # idempotent re-check
-    sm.warmup_steps = 8
+    sm.warmup_steps = 6
     with pytest.raises(ValueError, match="warmup_steps"):
         sm._validate_lr_schedule()
+
+
+def test_a_stage_shorter_than_one_step_is_rejected() -> None:
+    stages = [TrainingStage("a", tokens=8192, base_lr=3e-4), TrainingStage("b", tokens=100, base_lr=1e-4), TrainingStage("c", tokens=8192, base_lr=5e-5)]
+    with pytest.raises(ValueError, match="shorter than one optimizer step"):
+        StageManager(stages, world_batch_size=4, block_size=256)
+
+
+def test_a_transition_as_long_as_its_stage_is_rejected() -> None:
+    stages = [TrainingStage("a", tokens=2100, base_lr=3e-4, transition_pct=0.99), TrainingStage("b", tokens=8192, base_lr=1e-4)]  # 2 steps, 2 in transition
+    with pytest.raises(ValueError, match="transition must be shorter"):
+        StageManager(stages, world_batch_size=4, block_size=256)
 
 
 def test_get_stage_info_inside_and_outside_transitions() -> None:

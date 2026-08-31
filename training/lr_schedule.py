@@ -53,9 +53,10 @@ def get_lr_multistage(
 
     stage_info = stage_manager.get_stage_info(step)
 
-    # Global warmup (beginning of first stage)
+    # Global warmup (beginning of first stage): towards the first stage's base LR — inside the first transition
+    # `stage_info.base_lr` would already be the next stage's, and the ramp must not change its target midway.
     if step < warmup_steps:
-        return stage_info.base_lr * step / warmup_steps
+        return stage_manager.stages[0].base_lr * step / warmup_steps
 
     if step > max_steps:
         return min_lr

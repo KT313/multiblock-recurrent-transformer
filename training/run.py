@@ -123,7 +123,8 @@ def train(
                 with logger.evaluating():
                     result.validation = evaluate(settings, backend, model, validation_loader)
             logger.log_step(result, progress)
-            stopped = stop_requested(should_stop)
+            # a request arriving during the last step changes nothing: the run is finished, not stopped
+            stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
             if stopped:
                 logger.status("stopping after this step, saving a checkpoint")
             if is_checkpoint_step(settings, progress.done, stage_manager) or stopped:

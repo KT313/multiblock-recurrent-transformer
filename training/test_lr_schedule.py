@@ -78,6 +78,15 @@ def test_no_warmup_and_no_cooldown_is_a_flat_plateau() -> None:
     assert _lr(sm, 20) == pytest.approx(5e-5)  # step == max_steps is still the last stage's LR
 
 
+def test_warmup_ramps_monotonically_to_the_first_stage_lr_up_to_the_transition() -> None:
+    """The longest allowed warmup (5 of stage a's 6 plain steps) never targets the next stage's LR: no dip."""
+    sm = _tiny_manager(warmup=5)
+    lrs = [_lr(sm, step) for step in range(8)]
+    assert lrs[:6] == pytest.approx([3e-4 * step / 5 for step in range(6)])
+    assert lrs[6:] == pytest.approx([3e-4, 2e-4]), "steps 6 and 7 are the transition (progress 0 and 0.5)"
+    assert all(b >= a for a, b in zip(lrs[:5], lrs[1:6]))
+
+
 def test_warmup_starts_at_zero_even_with_min_lr() -> None:
     """The global warmup ramps from 0 (not from `min_lr`); only plateau/transition/cooldown are floored, as upstream."""
     sm = _tiny_manager()

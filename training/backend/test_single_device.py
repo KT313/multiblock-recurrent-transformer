@@ -170,8 +170,7 @@ def test_rng_state_round_trip(tmp_path: Path) -> None:
     random.seed(5)
     torch.manual_seed(5)
     state = backend.rng_state()
-    assert set(state) >= {"python", "torch"}
-    assert ("cuda" in state) == torch.cuda.is_available()
+    assert set(state) == {"python", "torch"}, "a CPU backend stores no CUDA state, whatever the machine has"
     expected = (random.random(), torch.rand(3))
     backend.save_checkpoint(tmp_path / "rng.pth", {"rng": state})  # survives the checkpoint round trip
     random.seed(77)
@@ -192,17 +191,48 @@ def test_set_rng_state_without_cuda_entry() -> None:
     assert torch.equal(torch.rand(2), first[0]) and random.random() == first[1]
 
 
-def test_rng_state_no_cuda_branch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without CUDA the state has no "cuda" key, and a state carrying one is restored without touching CUDA."""
+def test_rng_state_of_a_cpu_backend_never_touches_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CPU backend neither stores CUDA generator state nor consults a "cuda" entry it is handed."""
     backend = SingleDeviceBackend(device="cpu", precision="32")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda *_: pytest.fail("CUDA generator read by a CPU backend"))
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda *_: pytest.fail("CUDA generator set by a CPU backend"))
     state = backend.rng_state()
     assert set(state) == {"python", "torch"}
     torch.manual_seed(3)
     expected = torch.rand(2)
     torch.manual_seed(3)
-    backend.set_rng_state({**backend.rng_state(), "cuda": [torch.zeros(1, dtype=torch.uint8)]})  # not consulted
+    backend.set_rng_state({**backend.rng_state(), "cuda": torch.zeros(1, dtype=torch.uint8)})  # not consulted
     assert torch.equal(torch.rand(2), expected)
+
+
+@pytest.mark.gpu
+def test_rng_state_of_a_cuda_backend_holds_its_own_device_only() -> None:
+    backend = SingleDeviceBackend(device="cuda:0", precision="32")
+    state = backend.rng_state()
+    assert isinstance(state["cuda"], torch.Tensor), "one generator state, not the per-GPU list"
+    torch.cuda.manual_seed(9)
+    expected = torch.rand(2, device=backend.device)
+    torch.cuda.manual_seed(9)
+    backend.set_rng_state(backend.rng_state())
+    torch.cuda.manual_seed(9)  # the round trip restored the state the draw above was made from
+    assert torch.equal(torch.rand(2, device=backend.device), expected)
+
+
+def test_save_checkpoint_is_atomic_and_leaves_no_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The final name appears only after a complete write; a failing save leaves neither a partial file nor a .tmp."""
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    path = tmp_path / "ckpt" / "step.pth"
+    backend.save_checkpoint(path, {"a": torch.ones(2)})
+    assert sorted(p.name for p in path.parent.iterdir()) == ["step.pth"]
+
+    def failing_save(*_: object, **__: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", failing_save)
+    with pytest.raises(OSError):
+        backend.save_checkpoint(path, {"a": torch.zeros(2)})
+    assert sorted(p.name for p in path.parent.iterdir()) == ["step.pth"], "the previous checkpoint is untouched"
+    assert torch.equal(backend.load_checkpoint(path)["a"], torch.ones(2))
 
 
 def test_to_device_moves_to_the_backend_device() -> None:
