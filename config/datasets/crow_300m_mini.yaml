@@ -2,7 +2,7 @@
 # identical, so a build exercises every source, loader and file format of the thesis config with a
 # few MB of data in minutes. `nampdn-ai/mini-peS2o` is gated: export `HF_TOKEN` (or `huggingface-cli login`) before
 # building. Build with
-#     uv run python data_preparation/prepare.py build --dataset_config config/datasets/crow_300m_mini.yaml
+#     uv run python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_mini.yaml
 # (or under a download cap: `tools/capped_download.sh 500 uv run python ...`, see `tools/README.md`).
 name: crow-300m-mini
 

@@ -1,6 +1,6 @@
 # Synthetic dataset for the smoke run (config/tiny.yaml) and the tests: a hand-written WordLevel tokenizer
 # (<pad>, <bos>, <eos>, tok_0..tok_255) and random-word documents generated on demand. Builds in seconds, no
-# network. `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
+# network. `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
 
 name: tiny
 

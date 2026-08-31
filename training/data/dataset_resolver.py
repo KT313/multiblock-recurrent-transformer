@@ -24,7 +24,7 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Literal, Optional, Protocol
 
-from data_preparation.lib.build import build, plan as compute_plan, status
+from data_preparation.lib.build import prepare, status, summarize_dataset_state
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger
@@ -90,7 +90,7 @@ class ResolvedDataset:
 
 def build_command(dataset_config: str, dataset_dir: str) -> str:
     """The CLI command that materialises the dataset config (quoted in error messages)."""
-    return f"python data_preparation/prepare.py build --dataset_config {dataset_config} --dataset_dir {dataset_dir}"
+    return f"python data_preparation/prepare.py prepare --dataset_config {dataset_config} --dataset_dir {dataset_dir}"
 
 
 # --- the validation split ---------------------------------------------------------------------------------------------
@@ -261,36 +261,43 @@ def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
 def _ensure_prepared(
     settings: Settings, cfg: DatasetConfig, layout: DatasetLayout, backend: Optional[_MainRankBarrier]
 ) -> None:
-    """Verify the dataset on disk; build what is missing when `auto_prepare` allows it, else raise."""
-    plan = status(cfg, layout)  # logs the status table
-    if plan.complete:
+    """Verify the dataset on disk; prepare what is missing when `auto_prepare` allows it, else raise.
+
+    Auto-prepare never deletes raw data and never prompts: it runs `prepare` with `assume_yes=False` and a `confirm`
+    that always declines, so a stale or outdated raw folder fails the run with the same message `prepare.py` prints
+    (rerun it with `--yes` to confirm the deletion).
+    """
+    report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
+    if report.complete:
         return
-    missing = "\n  ".join(plan.missing())
+    missing = ", ".join(report.missing())
     if not settings.auto_prepare:
         raise RuntimeError(
             f"dataset config {settings.dataset_config!r} is not prepared under {settings.dataset_dir!r} "
-            f"(auto_prepare is off). Missing:\n  {missing}\nRun:\n  "
+            f"(auto_prepare is off). Missing: {missing}\n{report.describe()}\nRun:\n  "
             + build_command(settings.dataset_config, settings.dataset_dir)
         )
 
-    log.info("dataset %s is incomplete, preparing missing data (%d item(s))", cfg.name, len(plan.missing()))
+    log.info("dataset %s is incomplete, preparing missing data (%s)", cfg.name, missing)
     if backend is None or backend.is_main:
         with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
-            build(
-                cfg,
-                layout,
+            prepare(
+                settings.dataset_config,
+                settings.dataset_dir,
                 num_workers=settings.prepare_num_workers,
                 max_parallel_downloads=settings.prepare_max_parallel_downloads,
+                assume_yes=False,
+                confirm=lambda _message: False,  # never delete raw from a training run
                 hf_token=os.environ.get("HF_TOKEN"),
             )
     if backend is not None:
         backend.barrier()
 
-    plan = compute_plan(cfg, layout)  # `build` already logged the final status table; re-verify silently
-    if not plan.complete:
-        still_missing = "\n  ".join(plan.missing())
+    report = summarize_dataset_state(cfg, layout)  # `prepare` already logged the final status table; re-verify silently
+    if not report.complete:
         raise RuntimeError(
-            f"dataset config {settings.dataset_config!r} is still incomplete after preparing:\n  {still_missing}"
+            f"dataset config {settings.dataset_config!r} is still incomplete after preparing: "
+            f"{', '.join(report.missing())}\n{report.describe()}"
         )
 
 

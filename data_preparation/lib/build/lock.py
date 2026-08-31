@@ -1,8 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """One build per dataset directory: an advisory ``flock`` on ``<dataset_dir>/.build.lock`` held for the duration of
-``build``. ``prepare.py build`` and ``train.py``'s auto-prepare (or two training runs sharing ``dataset_dir``) would
-otherwise interleave directory removals, shard writes and manifest saves. The lock file records who holds it so the
-error message can say so; ``status`` / ``--dry_run`` do not take it."""
+``prepare``. ``prepare.py prepare`` and ``train.py``'s auto-prepare (or two training runs sharing ``dataset_dir``)
+would otherwise interleave directory removals, shard writes and manifest saves. The lock file records who holds it
+(pid, host, since) so the error message can say so; the OS releases the lock when the holder dies, so a lock file is
+never stale and never has to be removed by hand. ``status`` / ``--dry_run`` do not take it."""
 
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ def build_lock(root: Path) -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise BuildLocked(f"another build holds {path} ({_holder(path)}); wait for it to finish or remove a stale lock file") from None
+            raise BuildLocked(f"another build holds {path} ({_holder(path)}); wait for it to finish") from None
         os.ftruncate(fd, 0)
         os.write(fd, _holder_record().encode())
         log.debug("holding %s", path)

@@ -10,7 +10,7 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, BinaryIO
@@ -18,6 +18,7 @@ from typing import Any, BinaryIO
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 import zstandard
 
 from data_preparation.dataset_config import (
@@ -158,9 +159,9 @@ def cfg_factory() -> CfgFactory:
     A `pretrain` stage trains on every pretrain source without `rows` (equal weights) and a `finetune` stage on
     every instruct source without `rows`; a source with `rows` is used only for validation (in the stage of its
     kind, or the other one). Without any trainable source a synthetic `_pretrain` source is added so the config
-    validates. `tokens` is the per-stage budget; `block_size` defaults to 1 so the interim token budget
-    (`sequence_budget × block_size`, task 8 replaces it) equals `tokens × weight`. The dedup filter of every config
-    is `TEST_BLOOM_MEMORY_MB` (also when `processing` is given).
+    validates. `tokens` is the per-stage budget; `block_size` defaults to 1 so the sequence budget of a trained
+    source equals `tokens × weight` (rows). The dedup filter of every config is `TEST_BLOOM_MEMORY_MB` (also when
+    `processing` is given).
     """
 
     def make(
@@ -264,3 +265,16 @@ def with_tokenizer(layout: DatasetLayout) -> Callable[[DatasetConfig], DatasetCo
         return cfg
 
     return prepare
+
+
+@pytest.fixture
+def config_file(tmp_path: Path) -> Callable[[DatasetConfig], Path]:
+    """`config_file(cfg)` writes the config as YAML — what `prepare` / `status` take — and returns the path
+    (`<tmp_path>/<cfg.name>.yaml`; a second call with the same name overwrites it)."""
+
+    def write(cfg: DatasetConfig) -> Path:
+        path = tmp_path / f"{cfg.name}.yaml"
+        path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
+        return path
+
+    return write

@@ -1,18 +1,21 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare: command registration, `status` exit codes, `describe` output, `build` options,
-tiny end to end."""
+"""Tests for data_preparation.prepare: command registration and flags, exit codes (`status`, interrupt, unconfirmed
+raw deletion, failures), `describe` output, `prepare` options, tiny end to end."""
 
 from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from data_preparation import prepare
-from data_preparation.lib.build import STEPS
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
+from data_preparation.lib.abort import BuildAborted
+from data_preparation.lib.build import STEPS, DatasetReport
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
@@ -20,25 +23,28 @@ TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 def test_commands_are_registered() -> None:
     parser = prepare.build_parser()
-    args = parser.parse_args(["build", "--dataset_config", "x.yaml"])
-    assert args.run is prepare.run_build and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
-    assert args.num_workers == 2 and args.hf_token is None and not args.dry_run and args.cache_dir is None
-    assert args.max_parallel_downloads == 2
-    assert parser.parse_args(["build", "--dataset_config", "x.yaml", "--max_parallel_downloads", "4"]).max_parallel_downloads == 4
-    args = parser.parse_args(["build", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "process", "--dry_run", "--num_workers", "3"])
-    assert args.sources == ["a", "b"] and args.steps == ["download", "process"] and args.dry_run and args.num_workers == 3
+    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml"])
+    assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
+    assert args.num_workers == 2 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
+    assert not args.dry_run and not args.yes
+    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--dry_run", "--yes", "--num_workers", "3", "--max_parallel_downloads", "4"])
+    assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.dry_run and args.yes
+    assert args.num_workers == 3 and args.max_parallel_downloads == 4
+    assert parser.parse_args(["prepare", "--dataset_config", "x.yaml", "-y"]).yes
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
     assert args.run is prepare.run_status and args.dataset_dir == Path("d")
     args = parser.parse_args(["describe", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_describe and args.dataset_config == Path("x.yaml")
     args = parser.parse_args(["tiny"])
-    assert args.run is prepare.run_build and args.dataset_config == Path("config/datasets/tiny.yaml")
-    for command in ("build", "status", "describe"):
+    assert args.run is prepare.run_prepare and args.dataset_config == Path("config/datasets/tiny.yaml")
+    for command in ("prepare", "status", "describe"):
         with pytest.raises(SystemExit):
             parser.parse_args([command])  # --dataset_config is required
     with pytest.raises(SystemExit):
-        parser.parse_args(["build", "--dataset_config", "x.yaml", "--steps", "nope"])
-    assert set(STEPS) == {"tokenizer", "download", "process"}
+        parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--steps", "nope"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["build", "--dataset_config", "x.yaml"])  # the old command name is gone
+    assert STEPS == ("tokenizer", "download", "build")
 
 
 def test_missing_or_unknown_command_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
@@ -68,50 +74,91 @@ def test_describe_prints_markdown_with_the_config_notes(capsys: pytest.CaptureFi
     assert "| `synthetic_pretrain` | pretrain | `synthetic` |" in out
 
 
-def test_build_dry_run_writes_nothing(tmp_path: Path) -> None:
+def test_prepare_dry_run_writes_nothing(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--dry_run"])
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--dry_run"])
     assert not root.exists()
 
 
-def test_build_sources_and_steps_filters(tmp_path: Path) -> None:
+def test_prepare_sources_and_steps_filters(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     layout = DatasetLayout(root)
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
     assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
     assert (layout.raw_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
     assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.processed_dir("synthetic_instruct").exists()
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_instruct"])
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_instruct"])
     assert layout.processed_dir("synthetic_instruct").is_dir() and not layout.processed_dir("synthetic_pretrain").exists()
     with pytest.raises(SystemExit) as exc:
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == 1
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "build"])
+    prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # exit 0
 
 
-def test_build_writes_the_build_log(tmp_path: Path) -> None:
+def test_prepare_writes_the_build_log(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer"])
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer"])
     log_text = (root / "build.log").read_text()
-    assert "building dataset config" in log_text and "dataset status:" in log_text
+    assert "preparing dataset config" in log_text and "dataset status:" in log_text
 
 
-def test_build_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+def test_prepare_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("stage exploded")
 
-    monkeypatch.setattr(prepare, "build", boom)
+    monkeypatch.setattr(prepare, "prepare", boom)
     with pytest.raises(SystemExit) as exc:
-        prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
-    assert exc.value.code == 1 and "stage exploded" in caplog.text and "build failed" in caplog.text
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+    assert exc.value.code == 1 and "stage exploded" in caplog.text and "prepare failed" in caplog.text
 
 
-def test_build_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from data_preparation.lib.build.planner import Plan
-
-    monkeypatch.setattr(prepare, "build", lambda *a, **k: Plan())
+def test_prepare_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: DatasetReport())
     with pytest.raises(SystemExit) as exc:
-        prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), BuildAborted("interrupted")])
+def test_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: BaseException) -> None:
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(prepare, "prepare", interrupted)
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+    assert exc.value.code == 130 and "prepare interrupted; everything published so far is kept" in caplog.text
+
+
+def test_unconfirmed_raw_deletion_exits_two_with_the_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    action = RepairAction("fineweb", tmp_path / "raw", "raw", "would_delete", "outdated: max_seq_length 2048 -> 4096")
+    message = "The following raw folders will be deleted and downloaded again:\n  fineweb: outdated: max_seq_length 2048 -> 4096\nContinue? [y/N] "
+
+    def refused(*args: object, **kwargs: object) -> None:
+        raise ConfirmationRequired(RepairReport([action]), message, interactive=False)
+
+    monkeypatch.setattr(prepare, "prepare", refused)
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "fineweb: outdated: max_seq_length 2048 -> 4096" in err and "rerun with --yes" in err
+    assert not (tmp_path / "sources").exists()
+
+
+def test_yes_flag_reaches_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def record(*args: object, **kwargs: object) -> DatasetReport:
+        seen.update(kwargs)
+        return DatasetReport(tokenizer_complete=True)
+
+    monkeypatch.setattr(prepare, "prepare", record)
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--hf_token", "t", "--num_workers", "3"])
+    assert (seen["assume_yes"], seen["hf_token"], seen["num_workers"], seen["steps"]) == (True, "t", 3, STEPS)
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+    assert (seen["assume_yes"], seen["dry_run"]) == (False, False)
 
 
 @pytest.mark.slow
@@ -124,5 +171,5 @@ def test_tiny_end_to_end(tmp_path: Path, tiny_dataset_config: DatasetConfig) -> 
     shutil.rmtree(layout.processed_dir("synthetic_instruct"))
     with pytest.raises(SystemExit):
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
-    prepare.main(["build", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # repairs
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # rebuilds from raw
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])

@@ -2,7 +2,7 @@
 
 A **dataset config** (`config/datasets/<name>.yaml`) is the single definition of a dataset: its sources, the
 tokenizer, the processing options, the per-stage token budgets with their train/validation mixtures, and the
-instruct mixtures. `python data_preparation/prepare.py build --dataset_config <file>` materialises it under
+instruct mixtures. `python data_preparation/prepare.py prepare --dataset_config <file>` materialises it under
 `dataset/`; a run config (`config/<run>.yaml`) references it via `dataset_config:` and `training/train.py` verifies
 the prepared data before training, building whatever is missing by default. Everything runs from the repo root
 with `uv run ...`; the implementation lives in `lib/` (tests beside every module).
@@ -56,7 +56,7 @@ source that only appears in `val` (it would never be prepared), and so on. The c
 `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is generated from it),
 `config/datasets/crow_300m_mini.yaml` (the same sources with 300k / 150k / 60k-token budgets and a 40k-token validation split:
 a real-source smoke build of a few MB that finishes in minutes and exercises every loader; needs `HF_TOKEN` for
-`mini-peS2o`; `tools/capped_download.sh 500 uv run python data_preparation/prepare.py build --dataset_config
+`mini-peS2o`; `tools/capped_download.sh 500 uv run python data_preparation/prepare.py prepare --dataset_config
 config/datasets/crow_300m_mini.yaml` runs it under a hard download cap) and `config/datasets/tiny.yaml` (synthetic,
 builds in seconds, used by the tests and `config/tiny.yaml`).
 
@@ -93,12 +93,12 @@ a `.tmp` directory and rename it into place. Ctrl-C stops every running stage at
 ## Commands
 
 ```bash
-uv run python data_preparation/prepare.py build    --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-        [--sources NAME ...] [--steps tokenizer download process validation instruct_mixtures] [--num_workers N] [--max_parallel_downloads N]
+uv run python data_preparation/prepare.py prepare    --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
+        [--sources NAME ...] [--steps tokenizer download build] [--yes] [--num_workers N] [--max_parallel_downloads N]
         [--hf_token T] [--cache_dir DIR] [--dry_run]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
-uv run python data_preparation/prepare.py tiny     # = build --dataset_config config/datasets/tiny.yaml
+uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 ```
 
 - `build` computes the plan (what the config needs versus what the manifests say is there) and runs only the
@@ -109,7 +109,7 @@ uv run python data_preparation/prepare.py tiny     # = build --dataset_config co
   its files, instruct mixtures run after their sources. `--sources` / `--steps` restrict it, `--dry_run` prints the
   plan and writes nothing. A failing item is a failing build (exit 1, the other items stop at their next shard) —
   never a silently smaller dataset; Ctrl-C likewise stops every item at its next shard and exits 130. One build at
-  a time per dataset directory (`dataset/.build.lock`; a second `prepare.py build` or `train.py` auto-prepare on the
+  a time per dataset directory (`dataset/.build.lock`; a second `prepare.py prepare` or `train.py` auto-prepare on the
   same directory fails fast naming the holder). Everything published so far survives both; rerun to resume.
 - `status` prints the same table (rows/tokens present versus needed, fetch increment, manifest state) and exits 0
   iff the dataset is complete.
@@ -185,7 +185,7 @@ set, there is no dashboard and plain timestamped log lines are written instead.
 default) — runs `build` in-process on the main rank (`prepare_num_workers` items processed and
 `prepare_max_parallel_downloads` items downloading at a time, the same dashboard and `build.log`, the same build
 lock), then re-verifies. With
-`auto_prepare: false` a missing dataset is a hard error quoting the `prepare.py build` command. Gated sources
+`auto_prepare: false` a missing dataset is a hard error quoting the `prepare.py prepare` command. Gated sources
 (`nampdn-ai/mini-peS2o` in the crow config) need `HF_TOKEN` in the environment (or `--hf_token` for `build`).
 The dataset config's hash is written into every checkpoint; resuming with a changed dataset config is an error
 unless the run config sets `allow_dataset_change: true`.

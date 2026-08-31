@@ -14,7 +14,7 @@
 # `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets/mixtures (3.3B + 1.5B + 0.15B
 # tokens) and the tokenizer are defined in config/datasets/crow_300m_final.yaml. Training verifies the prepared data
 # under dataset_dir and builds what is missing (`auto_prepare`);
-# `python data_preparation/prepare.py build --dataset_config config/datasets/crow_300m_final.yaml` does the same up
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_final.yaml` does the same up
 # front (export HF_TOKEN for the gated peS2o source). The only per-stage value that stays here is the base learning
 # rate (`stage_base_lrs`, positional, one per dataset-config stage).
 

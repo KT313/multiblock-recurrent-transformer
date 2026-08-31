@@ -33,9 +33,9 @@ verifies the prepared data under `dataset/` and builds what is missing (`auto_pr
 or inspect the plan:
 
 ```bash
-uv run python data_preparation/prepare.py build  --dataset_config config/datasets/crow_300m_final.yaml   # export HF_TOKEN for gated sources
+uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml   # export HF_TOKEN for gated sources
 uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
-uv run python data_preparation/prepare.py build  --dataset_config config/datasets/crow_300m_mini.yaml    # same sources, a few MB: real-source smoke build
+uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml    # same sources, a few MB: real-source smoke build
 ```
 
 `crow_300m_mini.yaml` is the thesis config with tiny budgets — it touches every real source (minutes, a few MB) and
@@ -49,7 +49,7 @@ from the config) and `docs/multistage_training.md` for the stage mechanism.
 ```
 model/             architecture (RecurrentGPT, config, HF export)
 training/          train.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
-data_preparation/  prepare.py (build / status / describe / tiny) + lib/
+data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
 dataset/           gitignored; prepared data, instruct mixtures and tokenizers
 docs/              thesis documentation and figures

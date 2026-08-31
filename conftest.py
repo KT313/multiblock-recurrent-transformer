@@ -8,7 +8,7 @@ import torch
 
 from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.build import build
+from data_preparation.lib.build import prepare
 from model import RecurrentGPT
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -34,7 +34,7 @@ def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_conf
     """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, processed/,
     tokenizers/) that `config/tiny.yaml` expects under `dataset/`."""
     root: Path = tmp_path_factory.mktemp("tiny_dataset")
-    build(tiny_dataset_config, DatasetLayout(root))
+    prepare(TINY_DATASET_CONFIG, root, assume_yes=False)
     return root
 
 

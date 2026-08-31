@@ -125,8 +125,7 @@ def build_source(
     if not output.is_new:
         seen.add_all(output.stored_hashes())
     if processing.dedup.mode != "none":
-        # rows_needed for the false-positive estimate: until the planner hands the build a row target (task 8), the
-        # raw row count is the honest upper bound of what this build can insert
+        # the raw row count is the honest upper bound of what this build can insert (the false-positive estimate)
         log.info("%s: %s", name, seen.describe(raw.rows()))
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 

@@ -24,7 +24,7 @@ from data_preparation.dataset_config import (
     load_dataset_config,
 )
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.build import Plan
+from data_preparation.lib.build import DatasetReport
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
 from training.data.dataset_resolver import (
     CHECKPOINT_HASH_KEY,
@@ -366,7 +366,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
     """A planner that claims completeness does not save a run whose processed folder is missing."""
     import training.data.dataset_resolver as resolver_module
 
-    monkeypatch.setattr(resolver_module, "status", lambda cfg, layout: Plan(tokenizer_complete=True, complete=True))
+    monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir: DatasetReport(tokenizer_complete=True))
     root = tmp_path / "ds"
     expected_folder = re.escape(str(DatasetLayout(root).processed_dir("synthetic_pretrain")))
     with pytest.raises(FileNotFoundError, match=f"source 'synthetic_pretrain' \\(stage keys pretrain_a.train, pretrain_b.train, pretrain_a.val, pretrain_b.val\\): processed folder {expected_folder} does not exist"):
@@ -423,8 +423,8 @@ def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path)
         resolve_dataset(settings)
     message = str(excinfo.value)
     assert build_command(str(TINY_DATASET_YAML), str(empty)) in message
-    assert f"python data_preparation/prepare.py build --dataset_config {TINY_DATASET_YAML} --dataset_dir {empty}" in message
-    assert "tokenizer: missing or stale" in message and "source synthetic_pretrain" in message
+    assert f"python data_preparation/prepare.py prepare --dataset_config {TINY_DATASET_YAML} --dataset_dir {empty}" in message
+    assert "Missing: synthetic_pretrain, synthetic_instruct, tokenizer" in message and "raw missing" in message
     assert not empty.exists() or not any(empty.iterdir())  # nothing was written
 
 
@@ -469,13 +469,30 @@ def test_auto_prepare_builds_on_main_rank_only_and_barriers(tmp_path: Path) -> N
     assert main.barriers == 1 and Path(resolved.tokenizer_dir).is_dir()
 
 
-def test_still_incomplete_after_build_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_still_incomplete_after_prepare_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import training.data.dataset_resolver as resolver_module
 
-    monkeypatch.setattr(resolver_module, "build", lambda *a, **k: None)
+    monkeypatch.setattr(resolver_module, "prepare", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="still incomplete after preparing") as excinfo:
         resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "x"))
-    assert "tokenizer: missing or stale" in str(excinfo.value)
+    assert "tokenizer" in str(excinfo.value) and "synthetic_pretrain" in str(excinfo.value)
+
+
+def test_auto_prepare_never_deletes_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The training run hands `prepare` `assume_yes=False` and a `confirm` that declines: a stale raw folder is a
+    hard error naming the folder, never a silent re-download."""
+    import training.data.dataset_resolver as resolver_module
+
+    seen: dict[str, Any] = {}
+
+    def record(*args: Any, **kwargs: Any) -> None:
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(resolver_module, "prepare", record)
+    with pytest.raises(RuntimeError, match="stop here"):
+        resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "x"))
+    assert seen["assume_yes"] is False and seen["confirm"]("delete?") is False
 
 
 # --- cross-checks ---------------------------------------------------------------------------------------------------

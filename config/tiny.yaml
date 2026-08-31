@@ -3,7 +3,7 @@
 # a few seconds on CPU or GPU. The model is defined by config/model_architecture/tiny.yaml, the data (stages, token
 # budgets, weights, tokenizer) by config/datasets/tiny.yaml; training builds the data under dataset/ (sources/,
 # processed/, tokenizers/) when missing (`auto_prepare`), or run
-# `python data_preparation/prepare.py build --dataset_config config/datasets/tiny.yaml`.
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
 # This file stays short; config/crow_300m_final.yaml lists every `Settings` key with a comment.
 
 run_name: tiny
