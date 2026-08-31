@@ -9,6 +9,13 @@ saves a checkpoint and exits 130 — during the in-process dataset build (`auto_
 instead, everything published kept (`BuildAborted`, also 130); a second Ctrl-C aborts right away as usual.
 `resume: true` continues a stopped run from its last checkpoint.
 
+The console: this module attaches one stderr handler to the `training` and `data_preparation` logger hierarchies
+(`configure_console_logging`). For the run itself `RunLogger` opens the terminal dashboard of `training/ui/` — the
+live display on a TTY, the one-line-per-`log_step_interval` fallback when piped or with `TRAINING_DASHBOARD=0`,
+`<out_dir>/train.log` in both cases — which swaps that `training` handler out for the duration and puts it back, so
+nothing prints twice; a first Ctrl-C / SIGTERM and an exception both leave through the dashboard's `__exit__`
+(frame erased, kept lines and the static summary printed), and the report's summary is printed after that.
+
 Exit codes: 0 finished, 1 failed (logged with its traceback), 130 interrupted.
 """
 
@@ -30,8 +37,8 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
 from training.settings import parse_settings
+from training.ui.dashboard import TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
 
-TRAINING_LOGGER_NAME = "training"  # the logger hierarchy of `training/`; `RunLogger` logs on `training.logger`
 EXIT_INTERRUPTED = 130
 KEEP = {"keep": True}  # `extra=` of the records that must survive in the terminal scrollback under a live dashboard
 
@@ -89,8 +96,8 @@ def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
     `RunLogger`'s lines and the dataset resolver's (which logs under `data_preparation`) reach the terminal; idempotent.
 
     The CLI's job — library code does not configure logging. Both hierarchies get the same handler type and line
-    format (`data_preparation.lib.log.configure_logging` for the data-prep one). Task 10's dashboard swaps the
-    `training` stream handler out for the run and restores it afterwards. Returns the `training` logger.
+    format (`data_preparation.lib.log.configure_logging` for the data-prep one). The dashboard `RunLogger` opens
+    swaps the `training` stream handler out for the run and restores it afterwards. Returns the `training` logger.
     """
     configure_logging(level)  # the `data_preparation` hierarchy: the resolver's status table, split and build lines
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)

@@ -1,10 +1,18 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for the training CLI (`training/train.py`): argv parsing, the exit codes 0 / 1 / 130 with a monkeypatched
-`train`, the stop request set by the first Ctrl-C / SIGTERM (the second aborting), console logging. The run itself is
-tested in `test_run.py`."""
+`train`, the stop request set by the first Ctrl-C / SIGTERM (the second aborting), console logging, and the tiny run
+end to end in a pseudo-terminal with the live dashboard (marked slow): a full run and one interrupted by SIGINT, both
+leaving a clean screen. The run itself is tested in `test_run.py`."""
 
+import fcntl
 import logging
+import os
+import pty
+import select
 import signal
+import struct
+import sys
+import termios
 import threading
 import time
 from collections.abc import Iterator
@@ -17,10 +25,15 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.log import ProgressStreamHandler
 from training import train as train_module
 from training.backend import Backend
+from training.checkpoint import checkpoint_dir
 from training.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
 from training.train import StopRequest, main, stop_on_interrupt
+from training.ui.dashboard import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
+from training.ui.testing import BOX_CHARACTERS, screen_of, strip_ansi
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
@@ -43,7 +56,7 @@ def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
 def detached_training_handlers() -> Iterator[logging.Logger]:
     """The `training` logger without the handlers `configure_console_logging` adds (removed again afterwards, so a
     handler bound to a captured stderr never outlives its test). Autouse: every `main()` call configures one."""
-    training_logger = logging.getLogger(train_module.TRAINING_LOGGER_NAME)
+    training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     before = list(training_logger.handlers)
     level = training_logger.level
     yield training_logger
@@ -250,3 +263,112 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
     lines = capsys.readouterr().err.rstrip().splitlines()
     assert lines[-2].endswith("INFO training.logger: Total training steps: 20 (2 micro-batches each)")
     assert lines[-1].endswith("INFO data_preparation.training.data.dataset_resolver: source a: 40 processed rows, all training")
+
+
+# --- end to end in a pseudo-terminal: the live dashboard ---------------------------------------------------------------
+
+
+def _run_cli_in_pty(
+    arguments: list[str], *, width: int, height: int, interrupt_after: float | None = None, timeout: float = 240.0
+) -> tuple[int, str]:
+    """Run `python training/train.py <arguments>` on the CPU on a pseudo-terminal of the given size; the exit code
+    and everything it wrote. `interrupt_after` sends SIGINT that many seconds after the first dashboard frame. (The
+    pty runner of `training/ui/test_demo.py`, with the command line and the CPU pin of a training run.)"""
+    pid, fd = pty.fork()
+    if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
+        fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        os.chdir(REPO_ROOT)
+        env = {key: value for key, value in os.environ.items() if key != "TRAINING_DASHBOARD"}
+        env["TERM"] = "xterm-256color"
+        env["CUDA_VISIBLE_DEVICES"] = ""  # the CPU whatever the machine has; the assertions are about the terminal
+        os.execve(sys.executable, [sys.executable, "training/train.py", *arguments], env)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    interrupt_at: float | None = None
+    interrupted = False  # exactly one SIGINT: a second one would hit the default handler the first one put back
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:  # EIO: the child closed its side
+                break
+            if not chunk:
+                break
+            output += chunk
+            if interrupt_after is not None and not interrupted and interrupt_at is None and b"overall" in output:
+                interrupt_at = time.monotonic() + interrupt_after  # the first frame is up
+        if interrupt_at is not None and time.monotonic() > interrupt_at:
+            os.kill(pid, signal.SIGINT)
+            interrupt_at, interrupted = None, True
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            break
+    _, status = os.waitpid(pid, 0)
+    os.close(fd)
+    return os.waitstatus_to_exitcode(status), bytes(output).decode("utf-8", "replace")
+
+
+def _tiny_cli_arguments(tiny_dataset_dir: Path, out_dir: Path, *overrides: str) -> list[str]:
+    """`config/tiny.yaml` on the prepared tiny dataset, fp32 (bf16 autocast is slow on the CPU), no wandb."""
+    return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir), "--precision", "32", *overrides]
+
+
+def _assert_clean_terminal(text: str, width: int) -> str:
+    """The screen after the run: the live dashboard did run, no panel remnants, the bars once (the dashboard's static
+    summary), the cursor shown again; returns the screen text."""
+    plain = strip_ansi(text)
+    assert "╭─ log" in plain and "╭─ events" in plain and plain.count("overall") > 1, "the live dashboard did run"
+    shown = screen_of(text, width)
+    assert not any(character in shown for character in BOX_CHARACTERS), shown
+    assert shown.count("overall") == 1 and shown.count("grad norm") == 1, shown
+    assert text.rfind("\x1b[?25h") > text.rfind("\x1b[?25l"), "the cursor is visible again"
+    return shown
+
+
+@pytest.mark.slow
+def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(tiny_dataset_dir: Path, tmp_path: Path) -> None:
+    """The whole CLI with the live dashboard: exit 0, the checkpoints and `train.log` written; the screen afterwards
+    shows the kept header lines and the final line once, the dashboard's static summary once (every stage ticked)
+    and then the report's summary, and nothing of the live frame."""
+    out_dir = tmp_path / "out"
+    code, text = _run_cli_in_pty(_tiny_cli_arguments(tiny_dataset_dir, out_dir), width=140, height=45)
+    assert code == 0, text[-3000:]
+    shown = _assert_clean_terminal(text, 140)
+    for kept in ("Total training steps: 20 (2 micro-batches each)", "Training finished after 20 steps", "Training run in "):
+        assert shown.count(kept) == 1, (kept, shown)
+    assert "✓ pretrain_a" in shown and "✓ pretrain_b" in shown and "✓ finetune" in shown and "20/20" in shown, shown
+    assert "step 20" in shown and "finished" in shown and "validation (step 20)" in shown, shown
+    assert "saved checkpoint" in shown and "step-00000020-tiny.pth" in shown, shown
+    assert shown.index("Training finished after 20 steps") < shown.index("overall") < shown.index("Training run in ")
+    assert "20 optimizer steps completed" in shown and "3 checkpoints written" in shown  # the long path may wrap
+    assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == [
+        "step-00000006-tiny-stage-0_end.pth",
+        "step-00000014-tiny-stage-1_end.pth",
+        "step-00000020-tiny.pth",
+    ]
+    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    assert "Total training steps: 20" in log_text and "Training finished after 20 steps" in log_text
+
+
+@pytest.mark.slow
+def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_screen(tiny_dataset_dir: Path, tmp_path: Path) -> None:
+    """Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
+    finishes its step, saves a checkpoint, exits 130; the screen shows the signal's kept warning, the "stopped on
+    request" line, the static summary and the report once — no frame remnants."""
+    out_dir = tmp_path / "out"
+    arguments = _tiny_cli_arguments(tiny_dataset_dir, out_dir, "--world_batch_size", "1", "--micro_batch_size", "1")
+    code, text = _run_cli_in_pty(arguments, width=140, height=45, interrupt_after=0.5)
+    assert code == 130, text[-3000:]
+    shown = _assert_clean_terminal(text, 140)
+    assert shown.count("SIGINT received: stopping after this step, saving a checkpoint") == 1, shown
+    assert shown.count("Training stopped on request after ") == 1 and "Training finished" not in shown, shown
+    assert "rerun with resume: true to continue" in shown and "checkpoints written, last:" in shown, shown
+    assert "stopped on request" in shown and "saved checkpoint" in shown, shown
+    checkpoints = sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth"))
+    assert checkpoints and all(name.startswith("step-000000") for name in checkpoints), checkpoints
+    assert checkpoints[-1].endswith("-tiny.pth") and "_end" not in checkpoints[-1], "the last one is the stop checkpoint"
+    assert checkpoints[-1][len("step-") : len("step-00000000")].lstrip("0").isdigit(), "named after the stopped step"
+    # events are dashboard-only under the live display (the fallback logs them); the records are in train.log
+    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    assert "SIGINT received" in log_text and "Training stopped on request" in log_text

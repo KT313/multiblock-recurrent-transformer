@@ -1,16 +1,20 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the disabled logger (no-ops), the stubbed wandb path, the gradient/parameter metric helpers and
-`RunLogger` (console lines via `caplog` on `training.logger`, wandb dict, timers on a fake clock, data composition,
-history, `TrainingReport`)."""
+"""Tests for the disabled logger (no-ops), the stubbed wandb path (quiet settings included), the gradient/parameter
+metric helpers and `RunLogger` (the header records via `caplog` on `training.logger`, the dashboard calls on a
+recording fake and on a real `TrainingDashboard` over a StringIO console, the fallback picked under pytest and its
+`train.log`, wandb dict, timers on a fake clock, data composition, history, `TrainingReport`)."""
 
+import io
 import logging
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
+from rich.console import Console
 
 from data_preparation.dataset_config import DatasetConfig
 from model import RecurrentGPT
@@ -18,14 +22,17 @@ from training.backend import SingleDeviceBackend
 from training.data.dataset_resolver import ResolvedDataset
 from training.logger import (
     CONSOLE_LOGGER_NAME,
+    Dashboard,
     Logger,
     RunLogger,
     TrainingReport,
     _qkv_dims,
     _reverse_engineer_adam_effective_lr,
+    _stage_for_the_bars,
     _to_scalar,
     describe_parameters,
     num_parameters,
+    open_dashboard,
     track_gradient_metrics,
 )
 from training.optim import ELLISAdam, get_param_groups
@@ -33,6 +40,14 @@ from training.settings import Settings
 from training.stage_manager import StageManager, TrainingStage
 from training.step import StepResult, TrainingProgress
 from training.test_step import reference_settings, reference_stage_manager
+from training.ui.dashboard import (
+    TRAIN_LOG_NAME,
+    TRANSITION_FLAG_KEY,
+    TRANSITION_PROGRESS_KEY,
+    WANDB_QUIET_SETTINGS,
+    NoOpDashboard,
+    TrainingDashboard,
+)
 
 
 def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:
@@ -64,7 +79,15 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
         def finish(self) -> None:
             calls.append(("finish",))
 
+    class _Settings:
+        """Stands in for `wandb.Settings`: records what `Logger` asks for."""
+
+        def __init__(self, **values: Any) -> None:
+            self.values = values
+
     class _WandbStub:
+        Settings = _Settings
+
         @staticmethod
         def init(**kwargs: Any) -> _Run:
             calls.append(("init", kwargs))
@@ -74,6 +97,8 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
     logger = Logger("proj", "run", tmp_path / "out", offline=True, enabled=True)
     assert calls[0][1]["mode"] == "offline" and calls[0][1]["project"] == "proj"
     assert calls[0][1]["name"] == "run" and calls[0][1]["dir"] == str(tmp_path / "out")
+    quiet = calls[0][1]["settings"]  # no stdout / stderr wrapping and no banner under the dashboard
+    assert isinstance(quiet, _Settings) and quiet.values == WANDB_QUIET_SETTINGS == {"console": "off", "silent": True}
     assert (tmp_path / "out").is_dir()
     logger.log({"loss": torch.tensor(1.5), "n": 3}, step=4)
     assert calls.pop() == ("log", {"loss": 1.5, "n": 3}, 4)
@@ -302,6 +327,41 @@ def console_records(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixtur
     return caplog
 
 
+class RecordingDashboard:
+    """A `Dashboard` that records every call (`RunLogger`'s side of the dashboard API, without a display)."""
+
+    def __init__(self) -> None:
+        self.steps: list[tuple[int, int, dict[str, object]]] = []  # (step, stage index, the step dict as passed)
+        self.validations: list[tuple[int, dict[str, object]]] = []
+        self.events: list[str] = []
+        self.statuses: list[str] = []
+
+    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
+        self.steps.append((step, stage_index, dict(metrics)))
+
+    def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
+        self.validations.append((step, dict(losses)))
+
+    def note_event(self, text: str) -> None:
+        self.events.append(text)
+
+    def set_status(self, text: str) -> None:
+        self.statuses.append(text)
+
+
+def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
+    """A real `TrainingDashboard` rendering into a StringIO (never entered: no live display, no terminal capture)."""
+    return TrainingDashboard(
+        "steps",
+        [b.stage_name for b in stage_manager.boundaries],
+        [b.end_step - b.start_step for b in stage_manager.boundaries],
+        stage_manager.total_steps,
+        details={"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"},
+        log_step_interval=log_step_interval,
+        console=Console(file=io.StringIO(), force_terminal=True, width=120),
+    )
+
+
 def open_run_logger(
     settings: Settings,
     stage_manager: StageManager,
@@ -312,12 +372,31 @@ def open_run_logger(
     *,
     start_step: int = 0,
     setup_started: float | None = None,
+    dashboard: Dashboard | None = None,
 ) -> RunLogger:
+    """`RunLogger.open` on the CPU backend; `dashboard` defaults to a fresh `RecordingDashboard` (available as
+    `run_logger.dashboard`), so no test opens the real factory unless it asks for it (`dashboard=None` explicitly is
+    not possible here — call `RunLogger.open` directly for that)."""
     progress = TrainingProgress(step=start_step, resume_step=start_step if start_step else -1)
     backend = SingleDeviceBackend(device="cpu", precision="32")
     return RunLogger.open(
-        settings, run_directory, resolved, model, stage_manager, progress, backend, clock=clock, setup_started=setup_started
+        settings,
+        run_directory,
+        resolved,
+        model,
+        stage_manager,
+        progress,
+        backend,
+        dashboard=dashboard if dashboard is not None else RecordingDashboard(),
+        clock=clock,
+        setup_started=setup_started,
     )
+
+
+def recording(run_logger: RunLogger) -> RecordingDashboard:
+    """The `RecordingDashboard` behind a logger opened by `open_run_logger` without a dashboard of its own."""
+    assert isinstance(run_logger.dashboard, RecordingDashboard)
+    return run_logger.dashboard
 
 
 def run_fake_steps(
@@ -368,8 +447,9 @@ def test_log_step_history_wandb_dict_and_throughput(
     console_records: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every log step: the same metric dict (already scalars) to wandb and, as floats, to `history[done]`; the
-    throughput arithmetic on a fake clock ticking 2 s per step; the one-line console summary."""
+    """Every log step: the same metric dict (already scalars) to wandb, as floats to `history[done]` and to the
+    dashboard's `update_step` (no tensor in it); the throughput arithmetic on a fake clock ticking 2 s per step; no
+    per-step console record (the fallback dashboard's line is the one console line of a step)."""
     recorded = _record_wandb_logs(monkeypatch)
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
@@ -395,20 +475,20 @@ def test_log_step_history_wandb_dict_and_throughput(
         assert (metrics["stage/current_stage"], metrics["stage/in_transition"], metrics["stage/base_lr"]) == (0, 0, 3e-4)
         assert metrics["data_composition/source_a"] == 1.0
         assert recorded[done] == metrics and not any(torch.is_tensor(v) for v in recorded[done].values())
-    summaries = [r.getMessage() for r in console_records.records if r.getMessage().startswith("step ")]
-    assert summaries == [
-        "step 1/10 | loss 2.0000 | lr 0.00e+00 | grad_norm 0.500 | 2.00s/step",
-        "step 2/10 | loss 2.0000 | lr 1.00e-04 | grad_norm 0.500 | 2.00s/step",
-        "step 3/10 | loss 2.0000 | lr 2.00e-04 | grad_norm 0.500 | 2.00s/step",
-    ]
-    assert not any(getattr(r, "keep", False) for r in console_records.records if r.getMessage().startswith("step "))
+    shown = recording(run_logger).steps
+    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0)]
+    for (_, _, step_dict), metrics in zip(shown, run_logger.history.values()):
+        assert step_dict == metrics | {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}  # no transition here
+        assert not any(torch.is_tensor(value) for value in step_dict.values())
+    assert not any(r.getMessage().startswith("step ") for r in console_records.records)
 
 
 def test_log_interval_composition_fractions_sum_to_one_and_reset(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`log_step_interval: 2`: only even steps are logged (no `.item()` in between), `seconds/step` is the interval
-    time per step, the composition counts every world batch since the last log step and starts over afterwards."""
+    """`log_step_interval: 2`: only even steps are logged (no `.item()` in between — the dashboard gets an empty step
+    dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
+    counts every world batch since the last log step and starts over afterwards."""
     recorded = _record_wandb_logs(monkeypatch)
     settings = reference_settings(log_step_interval=2)
     stage_manager = reference_stage_manager(settings)
@@ -422,6 +502,10 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         clock.advance(1.0)
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
+    shown = recording(run_logger).steps
+    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
+    assert shown[0][2] == {} and shown[2][2] == {}, "nothing is read from the step's tensors at a non-log step"
+    assert shown[1][2]["loss"] == 2.0 and shown[3][2]["step"] == 4
     second, fourth = run_logger.history[2], run_logger.history[4]
     assert second["seconds/step"] == 1.0 and second["tokens/second"] == TOKENS_PER_STEP
     assert second["data_composition/a"] == 0.25 and second["data_composition/b"] == 0.75
@@ -430,11 +514,14 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         assert sum(v for k, v in metrics.items() if k.startswith("data_composition/")) == pytest.approx(1.0)
 
 
-def test_log_step_logs_the_transition_lines(
+def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_at_done(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """One "starting transition" line after the last plain step of stage a and one "transition complete" line after
-    the last transition step, worded as the thesis loop printed them; nothing at any other step."""
+    """Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
+    done and one "transition complete" event after step 8 is done (worded as the thesis loop printed them, with the
+    stage names); no console record for them. The bars get the stage at `done`: the index of the stage whose steps
+    are counting (a until 8 steps are done, b from then on) and the transition keys of `done` — while `history` keeps
+    the `stage/*` metrics of the step trained on, one step behind, as the thesis logged them."""
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
@@ -442,29 +529,38 @@ def test_log_step_logs_the_transition_lines(
     progress = TrainingProgress()
     run_fake_steps(run_logger, stage_manager, progress, clock, stage_manager.total_steps, 1.0)
 
-    expected = []
-    for step in range(stage_manager.total_steps):
-        before, after = stage_manager.get_stage_info(step), stage_manager.get_stage_info(step + 1)
-        if after.in_transition and not before.in_transition:
-            expected.append(
-                f"Step {step + 1}: starting transition {after.prev_stage_idx} -> {after.stage_idx} ({after.stage_name}), "
-                f"LR {cast(float, after.prev_base_lr):.2e} -> {after.base_lr:.2e}"
-            )
-        elif before.in_transition and not after.in_transition:
-            expected.append(f"Step {step + 1}: transition complete, now in stage {after.stage_idx} ({after.stage_name})")
-    assert len(expected) == 2 and "starting transition 0 -> 1 (b), LR 3.00e-04 -> 1.00e-04" in expected[0]
-    assert expected[1].endswith("transition complete, now in stage 1 (b)")
-    transition_lines = [r.getMessage() for r in console_records.records if "transition" in r.getMessage()]
-    assert transition_lines == expected
+    assert recording(run_logger).events == [
+        "starting transition 0 -> 1 (a -> b), LR 3.00e-04 -> 1.00e-04",
+        "transition complete, now in stage 1 (b)",
+    ]
+    assert not any("transition" in r.getMessage() for r in console_records.records)
+    shown = recording(run_logger).steps
+    assert [stage for _, stage, _ in shown] == [0] * 7 + [1] * 5  # done 6, 7: a's transition steps count for a
+    assert [d[TRANSITION_FLAG_KEY] for _, _, d in shown] == [0.0] * 5 + [1.0, 1.0] + [0.0] * 5
+    assert [d[TRANSITION_PROGRESS_KEY] for _, _, d in shown][5:7] == [0.0, 0.5]
     assert [run_logger.history[d]["stage/in_transition"] for d in range(1, 13)] == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+    assert [run_logger.history[d]["stage/transition_progress"] for d in (7, 8)] == [0.0, 0.5]
+    assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 6 + [1] * 6
+
+
+def test_stage_for_the_bars() -> None:
+    """Inside a transition the info names the stage being entered; the bars count the steps of the stage being left."""
+    settings = reference_settings()
+    stage_manager = two_stage_manager(settings)
+    assert _stage_for_the_bars(stage_manager.get_stage_info(5)) == (0, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
+    assert _stage_for_the_bars(stage_manager.get_stage_info(6)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.0})
+    assert _stage_for_the_bars(stage_manager.get_stage_info(7)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5})
+    assert _stage_for_the_bars(stage_manager.get_stage_info(8)) == (1, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
+    assert _stage_for_the_bars(stage_manager.get_stage_info(12))[0] == 1  # past the last step: the last stage
 
 
 def test_evaluating_times_the_validation_and_log_step_reports_it(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """The `evaluating()` block's duration becomes `val_time` of that step's validation metrics (floats in the
-    metric dict, `history` and the report), with the `Step N: val loss ...` line; a validation without a timed block
-    reports 0 s (the timer is consumed, never stale)."""
+    """The `evaluating()` block shows `evaluating` as the status (the previous status afterwards) and its duration
+    becomes `val_time` of that step's validation metrics (floats in the metric dict, `history` and the report); the
+    dashboard gets the `val_loss*` entries as floats; a validation without a timed block reports 0 s (the timer is
+    consumed, never stale)."""
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()
@@ -474,8 +570,11 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
 
     result = fake_result(stage_manager, 0, validation=validation)
     progress.advance()
+    run_logger.status("training")
     with run_logger.evaluating():
+        assert recording(run_logger).statuses == ["training", "evaluating"]
         clock.advance(3.0)
+    assert recording(run_logger).statuses == ["training", "evaluating", "training"]
     run_logger.log_step(result, progress)
     assert run_logger.history[1]["val_time"] == 3.0 and run_logger.history[1]["val_loss"] == 2.5
     assert run_logger.history[1]["val_loss_1"] == pytest.approx(2.6)
@@ -485,8 +584,11 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
     clock.advance(1.0)
     run_logger.log_step(result, progress)
     assert run_logger.history[2]["val_time"] == 0.0
-    validation_lines = [r.getMessage() for r in console_records.records if "val loss" in r.getMessage()]
-    assert validation_lines == ["Step 1: val loss 2.5000 (stage 0, 3.0s)", "Step 2: val loss 2.5000 (stage 0, 0.0s)"]
+    shown = recording(run_logger).validations
+    assert [step for step, _ in shown] == [1, 2] and list(shown[0][1]) == ["val_loss", "val_loss_1"]
+    assert shown[0][1]["val_loss"] == 2.5 and shown[0][1]["val_loss_1"] == pytest.approx(2.6)
+    assert all(isinstance(value, float) for _, losses in shown for value in losses.values())
+    assert not any("val loss" in r.getMessage() for r in console_records.records)
     report = run_logger.close(progress, None)
     assert report.last_validation == {"val_loss": 2.5, "val_ppl": pytest.approx(math.exp(2.5)), "val_loss_1": pytest.approx(2.6), "val_time": 0.0}
     assert all(isinstance(v, float) for v in report.last_validation.values())
@@ -496,8 +598,8 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
     """A run resumed at step 4 that ran 3 steps, wrote 2 checkpoints and exported: every report field, the summary
-    text, the `keep` lines of resume / checkpoint / export / finish, and `close()` + `__exit__` releasing the
-    resources exactly once."""
+    text, the events of resume / checkpoint / export, the `keep` line and the status of the finish, and `close()` +
+    `__exit__` releasing the resources exactly once."""
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock(500.0)
@@ -537,14 +639,15 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
             f"  HuggingFace export: {export_dir}",
         ]
     )
-    kept = {r.getMessage() for r in console_records.records if getattr(r, "keep", False)}
-    assert {
-        f"Resumed from {resume_path} at step 4",
-        f"Saved checkpoint {first}",
-        f"Saved checkpoint {second}",
-        f"Exported HuggingFace model to {export_dir}",
-        "Training finished after 7 steps in 6.0s.",
-    } <= kept
+    assert recording(run_logger).events == [
+        f"resumed from {resume_path} at step 4",
+        f"saved checkpoint {first}",
+        f"saved checkpoint {second}",
+        f"exported HuggingFace model to {export_dir}",
+    ]
+    assert recording(run_logger).statuses == ["finished", "finished"]  # once per `close()`
+    kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
+    assert kept.count("Training finished after 7 steps in 6.0s.") == 2 and not any("checkpoint" in k for k in kept)
 
 
 def test_fresh_start_report_summary_without_steps(
@@ -555,8 +658,8 @@ def test_fresh_start_report_summary_without_steps(
     run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, FakeClock())
     run_logger.log_fresh_start()
     report = run_logger.close(TrainingProgress(), None)
-    fresh = [r for r in console_records.records if r.getMessage() == "No checkpoint loaded, starting from scratch."]
-    assert len(fresh) == 1 and getattr(fresh[0], "keep", False) is True
+    assert recording(run_logger).events == ["no checkpoint found, starting from scratch"]
+    assert not any("scratch" in r.getMessage() for r in console_records.records)
     assert (report.steps_completed, report.final_step, report.resumed_from, report.last_loss) == (0, 0, None, None)
     assert report.summary() == "\n".join(
         [
@@ -572,25 +675,138 @@ def test_fresh_start_report_summary_without_steps(
 def test_run_logger_never_prints(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Every console line is a logging record; nothing reaches stdout / stderr without a handler on `training`."""
+    """Every console line is a logging record or a dashboard call; with a recording dashboard nothing reaches stdout /
+    stderr (there is no handler on `training`), and the module has no `print` at all."""
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
     with open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock) as run_logger:
         run_logger.log_fresh_start()
+        run_logger.status("training")
         progress = TrainingProgress()
         run_fake_steps(run_logger, stage_manager, progress, clock, stage_manager.total_steps, 1.0)
-        run_logger.log_checkpoint(tmp_path / "c.pth")
+        with run_logger.saving_checkpoint():
+            run_logger.log_checkpoint(tmp_path / "c.pth")
         run_logger.close(progress, None)
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err == ""
+    assert "print(" not in Path(sys.modules[RunLogger.__module__].__file__ or "").read_text()
+
+
+def test_status_and_saving_checkpoint_forward_to_the_dashboard(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    """`status(text)` sets the header status; `saving_checkpoint()` shows `saving checkpoint` for the block and puts
+    the status from before it back (also after an exception in the block)."""
+    settings = reference_settings()
+    run_logger = open_run_logger(settings, reference_stage_manager(settings), tiny_model, resolved, tmp_path, FakeClock())
+    run_logger.status("training")
+    with run_logger.saving_checkpoint():
+        pass
+    run_logger.status("stopping after this step, saving a checkpoint")
+    with pytest.raises(OSError), run_logger.saving_checkpoint():
+        raise OSError("disk full")
+    assert recording(run_logger).statuses == [
+        "training",
+        "saving checkpoint",
+        "training",
+        "stopping after this step, saving a checkpoint",
+        "saving checkpoint",
+        "stopping after this step, saving a checkpoint",
+    ]
+
+
+def test_run_logger_drives_a_real_training_dashboard(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    """The same calls on a `TrainingDashboard` over a StringIO console (not entered: rendering only): after a log
+    step the frame shows the loss and the bar counts, `log_checkpoint` shows up in the events, `evaluating()` in the
+    status, the validation losses in their table."""
+    settings = reference_settings()
+    stage_manager = two_stage_manager(settings)
+    board = string_console_dashboard(stage_manager)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock, dashboard=board)
+    assert run_logger.dashboard is board
+    progress = TrainingProgress()
+    run_logger.status("training")
+    run_fake_steps(run_logger, stage_manager, progress, clock, 3, 2.0)
+    text = board.render_text()
+    assert "3/8" in text and "0/4" in text and "3/12" in text, "the stage bars and the overall bar count optimizer steps"
+    assert "▶ a" in text and "2.0000" in text and "2.00e-04" in text and "0.500" in text and "training" in text
+    assert "2.00s" in text, "seconds/step from the step dict"
+
+    run_logger.log_checkpoint(tmp_path / "checkpoints" / "step-00000003-steps.pth")
+    assert board.events()[-1].endswith("step 3: saved checkpoint " + str(tmp_path / "checkpoints" / "step-00000003-steps.pth"))
+    with run_logger.evaluating():
+        assert "evaluating" in board.render_text()
+    result = fake_result(stage_manager, progress.step, validation={"val_loss": torch.tensor(2.5), "val_loss_1": torch.tensor(2.6)})
+    progress.advance()
+    run_logger.log_step(result, progress)
+    text = board.render_text()
+    assert "validation (step 4)" in text and "val_loss_1" in text and "2.6000" in text and "2.5000" in text
+    run_fake_steps(run_logger, stage_manager, progress, clock, 3, 1.0)  # steps 5-7: the transition starts after 6
+    text = board.render_text()
+    assert "▶ a" in text and "transition → b 50%" in text and "7/8" in text
+    run_logger.close(progress, None)
+    assert "finished" in board.render_text()
+
+
+def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without an injected dashboard `open` goes through `open_dashboard`: stdout is not a TTY under pytest, so the
+    `NoOpDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
+    details, the log interval, the resume step) with the `training` logger attached for the block and
+    `run_directory / train.log` appended — the header records, the fallback's step lines and events all end up there
+    and on stdout; `close()` detaches it again."""
+    monkeypatch.setenv("TRAINING_DASHBOARD", "1")
+    settings = reference_settings(log_step_interval=2)
+    stage_manager = two_stage_manager(settings)
+    progress = TrainingProgress(step=4, resume_step=4)
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    training_logger = logging.getLogger("training")
+    handlers_before = list(training_logger.handlers)
+    with RunLogger.open(settings, tmp_path, resolved, tiny_model, stage_manager, progress, backend, clock=FakeClock()) as run_logger:
+        board = run_logger.dashboard
+        assert isinstance(board, NoOpDashboard)
+        assert board.stage_names == ["a", "b"] and board.steps_per_stage == [8, 4] and board.total_steps == 12
+        assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"}
+        assert board.log_step_interval == 2
+        assert len(training_logger.handlers) == len(handlers_before) + 2, "the dashboard handler and the file handler"
+        run_logger.log_resume(tmp_path / "step-00000004-steps.pth", 4)
+        run_fake_steps(run_logger, stage_manager, progress, FakeClock(), 8, 1.0)
+        run_logger.log_checkpoint(tmp_path / "checkpoints" / "step-00000012-steps.pth")
+        run_logger.close(progress, None)
+    assert training_logger.handlers == handlers_before
+    log_text = (tmp_path / TRAIN_LOG_NAME).read_text()
+    assert "Total training steps: 12 (2 micro-batches each)" in log_text
+    assert "event: resumed from" in log_text and "event: saved checkpoint" in log_text
+    assert "step 6/12 | stage 0 a | " in log_text and "step 12/12 | stage 1 b | " in log_text and "step 5/12" not in log_text
+    assert "Training finished after 12 steps" in log_text
+    out = capsys.readouterr().out
+    assert "step 12/12 | stage 1 b | " in out and "event: saved checkpoint" in out, "the fallback's lines go to stdout"
+
+
+def test_open_dashboard_arguments(tmp_path: Path) -> None:
+    """`open_dashboard` passes the run to the factory: one bar per stage, the config file names as the header
+    details, the log interval and the resume step; the fallback is chosen when the display is disabled."""
+    settings = reference_settings(log_step_interval=3)
+    stage_manager = two_stage_manager(settings)
+    with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
+        assert isinstance(board, NoOpDashboard)  # stdout is not a TTY under pytest
+        assert (board.run_name, board.stage_names, board.steps_per_stage, board.total_steps) == ("steps", ["a", "b"], [8, 4], 12)
+        assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cuda:0", "precision": "32"}
+        assert board.log_step_interval == 3
+        board.update_step(6, 0, {"loss": 1.0})
+    assert (tmp_path / TRAIN_LOG_NAME).exists() and "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 
 def test_close_of_a_stopped_run(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
     """`close(..., stopped=True)` (the stop request of `train()`): the report says so, its summary tells how to
-    continue, the final `keep` line reads "stopped on request"."""
+    continue, the final `keep` line and the final dashboard status read "stopped on request"."""
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()
@@ -599,6 +815,7 @@ def test_close_of_a_stopped_run(
     run_fake_steps(run_logger, stage_manager, progress, clock, 5, 1.0)
     run_logger.log_checkpoint(tmp_path / "checkpoints" / "step-00000005-steps.pth")
     report = run_logger.close(progress, None, stopped=True)
+    assert recording(run_logger).statuses == ["stopped on request"]
     assert report.stopped is True and (report.steps_completed, report.final_step) == (5, 5)
     assert report.export_dir is None
     lines = report.summary().splitlines()

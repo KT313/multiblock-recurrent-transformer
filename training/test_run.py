@@ -8,7 +8,7 @@ import json
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -29,6 +29,8 @@ from training.golden import (
     golden_run_metrics,
     write_tiny_yaml,
 )
+from training import logger as logger_module
+from training import run as run_module
 from training.logger import TrainingReport
 from training.run import (
     build_run_model,
@@ -44,6 +46,7 @@ from training.run import (
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
+from training.ui.dashboard import TRAIN_LOG_NAME
 
 History = dict[int, dict[str, float]]
 
@@ -310,6 +313,32 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
     assert summary.startswith(f"Training run in {full_run['out_dir']}: 20 optimizer steps completed (final step 20, fresh start)")
     assert "3 checkpoints written, last:" in summary and "HuggingFace export:" in summary
     assert "stopped on request" not in summary
+
+
+@pytest.mark.slow
+def test_train_log_of_a_full_run(full_run: dict[str, Any]) -> None:
+    """Under pytest stdout is not a TTY, so `RunLogger` opened the console fallback of the dashboard: the run left
+    `out_dir / train.log` with the header lines, one line per optimizer step (`log_step_interval: 1`), the
+    validation lines, the events (checkpoints, transitions, export) and the final line."""
+    log_text = (full_run["out_dir"] / TRAIN_LOG_NAME).read_text()
+    assert "Total training steps: 20 (2 micro-batches each)" in log_text
+    assert "event: no checkpoint found, starting from scratch" in log_text
+    assert "step 1/20 | stage 0 pretrain_a | " in log_text and "step 20/20 | stage 2 finetune | " in log_text
+    assert "step 7/20 | stage 0 pretrain_a | transition 50% | " in log_text
+    assert "event: starting transition 0 -> 1 (pretrain_a -> pretrain_b), LR 3.00e-04 -> 1.00e-04" in log_text
+    assert "event: transition complete, now in stage 1 (pretrain_b)" in log_text
+    assert "step 8: validation val_loss " in log_text and "val_loss_1 " in log_text
+    for name in ("step-00000006-tiny-stage-0_end.pth", "step-00000014-tiny-stage-1_end.pth", "step-00000020-tiny.pth"):
+        assert f"event: saved checkpoint {checkpoint_dir(full_run['out_dir']) / name}" in log_text
+    assert f"event: exported HuggingFace model to {full_run['out_dir'] / 'hf_export'}" in log_text
+    assert "Training finished after 20 steps" in log_text
+
+
+def test_train_and_logger_never_print() -> None:
+    """Only the CLI (`train.py`) prints; `run.py` and `logger.py` log and drive the dashboard."""
+    for module in (run_module, logger_module):
+        source = Path(cast(str, module.__file__)).read_text()
+        assert "print(" not in source, module.__name__
 
 
 @pytest.mark.slow

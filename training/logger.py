@@ -1,11 +1,19 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """Logging of a training run: the thin wandb wrapper (`Logger`, offline by default), the gradient / parameter metric
-helpers that were logged, and `RunLogger` — every console line, timer and counter of a run in one place, ending in a
-`TrainingReport`.
+helpers that were logged, and `RunLogger` — every console line, timer and counter of a run in one place, driving the
+terminal dashboard and ending in a `TrainingReport`.
 
-`RunLogger` never prints: every console line is an INFO record on the `training.logger` logger (the `training`
-hierarchy the CLI attaches a stream handler to and the dashboard of task 10 takes over for the run). Lines that must
-survive in the terminal scrollback under a live dashboard carry `extra={"keep": True}`.
+`RunLogger` never prints. What a run shows on the terminal goes through two channels, both owned by the dashboard of
+`training.ui` for the duration of the run (`RunLogger.open` enters it; the live `TrainingDashboard` on a TTY, the
+`NoOpDashboard` console fallback otherwise — one log line per `log_step_interval` steps — and `train.log` under the
+run directory in both cases):
+
+* *records* on the `training.logger` logger (the `training` hierarchy the CLI attaches a stream handler to and the
+  dashboard takes over for the run): the header lines of `open` and the final line of `close`, marked
+  `extra={"keep": True}` so they survive in the scrollback under the live display;
+* *dashboard calls*: the bars move at every step (`update_step`; the metric dict only at log steps — never a tensor
+  at the other steps, so no device sync is added), validation losses (`update_validation`), the events (checkpoints,
+  resume point, transitions, export: `note_event`) and the header status (`set_status`).
 """
 
 from __future__ import annotations
@@ -13,12 +21,12 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, Protocol, cast
 
 import torch
 from torch.nn import Module
@@ -27,7 +35,15 @@ from torch.optim import Optimizer
 from model import RecurrentGPT
 from training.checkpoint import unwrap_compiled
 from training.settings import Settings
-from training.stage_manager import StageManager
+from training.stage_manager import StageInfo, StageManager
+from training.ui.dashboard import (
+    TRAIN_LOG_NAME,
+    TRANSITION_FLAG_KEY,
+    TRANSITION_PROGRESS_KEY,
+    WANDB_QUIET_SETTINGS,
+    RunDashboard,
+    training_dashboard,
+)
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -43,7 +59,12 @@ console = logging.getLogger(CONSOLE_LOGGER_NAME)
 
 
 class Logger:
-    """wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported)."""
+    """wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported).
+
+    The run is created quiet (`wandb.Settings(**WANDB_QUIET_SETTINGS)`: `console="off"`, `silent=True`): wandb's
+    default `console="wrap"` would replace `sys.stdout` / `sys.stderr` with its own proxies and print its banner
+    lines to stderr, both of which fight the terminal dashboard's stream capture. The metrics are unaffected.
+    """
 
     def __init__(
         self, project: str, run_name: str, out_dir: str | Path, offline: bool = True, enabled: bool = True
@@ -55,8 +76,11 @@ class Logger:
         import wandb
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # the constant is a `dict[str, object]` shared with the dashboard's environment variables; `wandb.Settings`
+        # types every field, so the two values must be passed as `Any` for the checkers
+        quiet = wandb.Settings(**cast(dict[str, Any], WANDB_QUIET_SETTINGS))
         self.run = wandb.init(
-            project=project, name=run_name, dir=str(out_dir), mode="offline" if offline else "online"
+            project=project, name=run_name, dir=str(out_dir), mode="offline" if offline else "online", settings=quiet
         )
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
@@ -161,13 +185,74 @@ class TrainingReport:
         return "\n".join(lines)
 
 
+class Dashboard(Protocol):
+    """The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    live display) and `NoOpDashboard` (the console fallback) satisfy it; tests pass a recording fake."""
+
+    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None: ...
+
+    def update_validation(self, step: int, losses: Mapping[str, object]) -> None: ...
+
+    def note_event(self, text: str) -> None: ...
+
+    def set_status(self, text: str) -> None: ...
+
+
+def open_dashboard(
+    settings: Settings, run_directory: Path, stage_manager: StageManager, *, start_step: int, device: str
+) -> AbstractContextManager[RunDashboard]:
+    """The run's dashboard (`training.ui.training_dashboard`): the live display when stdout is a terminal and
+    `TRAINING_DASHBOARD` is not `0`, the one-line-per-`log_step_interval` console fallback otherwise; one bar per
+    stage (`stage_manager.boundaries`) plus the overall bar, the header naming the run, the model and dataset config
+    (file names without `.yaml`), the device and precision; every record appended to `run_directory / train.log`.
+    `start_step` (the resume step) keeps the ETA honest after a resume."""
+    return training_dashboard(
+        settings.run_name,
+        [boundary.stage_name for boundary in stage_manager.boundaries],
+        [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries],
+        stage_manager.total_steps,
+        details={
+            "model": Path(settings.model_architecture_config).stem,
+            "dataset": Path(settings.dataset_config).stem,
+            "device": device,
+            "precision": settings.precision,
+        },
+        start_step=start_step,
+        log_step_interval=settings.log_step_interval,
+        log_file=run_directory / TRAIN_LOG_NAME,
+    )
+
+
+def _stage_for_the_bars(at_done: StageInfo) -> tuple[int, dict[str, float]]:
+    """Where the run is after `progress.done` steps, for the dashboard's bars: the index of the stage whose steps
+    are counting (inside a transition the stage being left, `prev_stage_idx` — the info itself already names the
+    stage being entered) and the two transition keys the dashboard reads for the bar note.
+
+    `at_done` is `result.next_stage`, the stage at `done` (the same info the checkpoint's `stage` and the validation
+    loader use). wandb and `history` keep `result.stage`, the stage the step trained on, in their `stage/*` metrics as
+    the thesis logged them; at a log step the dashboard's copy of the step dict gets these two keys instead, so the
+    bar note and the marker agree.
+    """
+    if at_done.in_transition and at_done.prev_stage_idx is not None:
+        stage_index = at_done.prev_stage_idx
+    else:
+        stage_index = at_done.stage_idx
+    transition = {
+        TRANSITION_FLAG_KEY: float(at_done.in_transition),
+        TRANSITION_PROGRESS_KEY: at_done.transition_progress,
+    }
+    return stage_index, transition
+
+
 class RunLogger:
-    """Console lines, wandb metrics, timers, the data-composition counter and the metric history of one run.
+    """Console records, the terminal dashboard, wandb metrics, timers, the data-composition counter and the metric
+    history of one run.
 
     Create it with `open()` once the setup (resume included) is done; use it as a context manager so a failing loop
-    still releases what it holds (task 10 enters the terminal dashboard on `resources`, the `ExitStack` kept here);
-    `close()` returns the `TrainingReport`. Nothing here touches the numerics: tensors become floats only at log
-    steps and for validation metrics, exactly where the thesis loop called `.item()`.
+    still releases what it holds (the dashboard is entered on `resources`, the `ExitStack` kept here, and torn down
+    by `__exit__` on a normal end, an exception and a Ctrl-C alike); `close()` returns the `TrainingReport`.
+    Nothing here touches the numerics: tensors become floats only at log steps and for validation metrics, exactly
+    where the thesis loop called `.item()`; the dashboard gets an empty step dict at every other step.
     """
 
     def __init__(
@@ -179,6 +264,7 @@ class RunLogger:
         *,
         start_step: int,
         device: str,
+        dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
     ) -> None:
@@ -188,7 +274,16 @@ class RunLogger:
         self.wandb = wandb
         self.start_step = start_step  # `progress.step` when the logger opened (the resume step, 0 for a fresh run)
         self.device = device
-        self.resources = ExitStack()  # closed by `close()` / `__exit__`; task 10 enters the dashboard on it
+        self.resources = ExitStack()  # closed by `close()` / `__exit__`; the dashboard is entered on it
+        # a given dashboard (tests: a `TrainingDashboard` on a StringIO console, a recording fake) is driven as it is
+        # and not closed here; otherwise `open_dashboard` picks the live display or the fallback for the run
+        self.dashboard: Dashboard = (
+            dashboard
+            if dashboard is not None
+            else self.resources.enter_context(
+                open_dashboard(settings, run_directory, stage_manager, start_step=start_step, device=device)
+            )
+        )
         self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats
         self.checkpoints_written: list[Path] = []
         self.resumed_from: Path | None = None
@@ -200,6 +295,7 @@ class RunLogger:
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._sample_counter: Counter[str] = Counter()  # data ids of the world batches since the last log step
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
+        self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
         self._last_loss: float | None = None
         self._last_validation: dict[str, float] = {}
 
@@ -214,12 +310,14 @@ class RunLogger:
         progress: TrainingProgress,
         backend: Backend,
         *,
+        dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
     ) -> RunLogger:
         """Open the run's logging once the setup is done: the wandb run with the hyperparameters (the settings plus
-        `dataset_config_hash`) and the `num_parameters` summary; on the console the stage summary, the total-steps
-        line, the parameter line and the setup line. The setup timer ends and the train timer starts here.
+        `dataset_config_hash`) and the `num_parameters` summary, then the dashboard (`open_dashboard`, unless a
+        `dashboard` is given), then on the console the stage summary, the total-steps line, the parameter line and
+        the setup line. The setup timer ends and the train timer starts here.
 
         `progress.step` is the step training starts at (the resume step), `backend.device` names the device;
         `setup_started` is the clock reading at the start of the run (`setup_seconds` of the report; 0 if not given).
@@ -241,6 +339,7 @@ class RunLogger:
             wandb,
             start_step=progress.step,
             device=str(backend.device),
+            dashboard=dashboard,
             clock=clock,
             setup_started=setup_started,
         )
@@ -263,36 +362,73 @@ class RunLogger:
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        """Release what the logger holds; idempotent (`close()` normally ran before)."""
+        """Release what the logger holds — the dashboard included, so the terminal is restored on an exception and
+        on a Ctrl-C too; idempotent (`close()` normally ran before)."""
         self.wandb.finish()
         self.resources.close()
+
+    # --- status and events -----------------------------------------------------------------------------------------
+
+    def status(self, text: str) -> None:
+        """The dashboard's header status: what the run is doing right now (`training`, `stopping after this step,
+        saving a checkpoint`, `exporting`; `finished` / `stopped on request` set by `close`)."""
+        self._status = text
+        self.dashboard.set_status(text)
+
+    @contextmanager
+    def _status_during(self, text: str) -> Iterator[None]:
+        """Show `text` as the status for the block, then the status from before it."""
+        previous = self._status
+        self.status(text)
+        try:
+            yield
+        finally:
+            self.status(previous)
+
+    @contextmanager
+    def evaluating(self) -> Iterator[None]:
+        """Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
+        next to the validation metrics of that step in `log_step`, as the thesis loop reported it."""
+        started = self._clock()
+        with self._status_during("evaluating"):
+            try:
+                yield
+            finally:
+                self._evaluation_seconds = self._clock() - started
+
+    def saving_checkpoint(self) -> AbstractContextManager[None]:
+        """Around one checkpoint write: the status reads `saving checkpoint`."""
+        return self._status_during("saving checkpoint")
 
     def log_resume(self, path: Path, step: int) -> None:
         """The run continues from checkpoint `path` at optimizer step `step` (the report's `resumed_from`)."""
         self.resumed_from = path
-        console.info(f"Resumed from {path} at step {step}", extra=KEEP)
+        self.dashboard.note_event(f"resumed from {path} at step {step}")
 
     def log_fresh_start(self) -> None:
         """No checkpoint was loaded; the run starts at step 0."""
-        console.info("No checkpoint loaded, starting from scratch.", extra=KEEP)
+        self.dashboard.note_event("no checkpoint found, starting from scratch")
 
-    @contextmanager
-    def evaluating(self) -> Iterator[None]:
-        """Time one `evaluate` call; `log_step` reports the duration as `val_time` (seconds) next to the validation
-        metrics of that step, as the thesis loop did. Task 10 sets the dashboard status here too."""
-        started = self._clock()
-        try:
-            yield
-        finally:
-            self._evaluation_seconds = self._clock() - started
+    def log_checkpoint(self, path: Path) -> None:
+        """A checkpoint was written to `path` (the report's `checkpoints_written`)."""
+        self.checkpoints_written.append(path)
+        self.dashboard.note_event(f"saved checkpoint {path}")
+
+    def log_export(self, path: Path) -> None:
+        """The HuggingFace export was written to `path`."""
+        self.dashboard.note_event(f"exported HuggingFace model to {path}")
+
+    # --- steps -------------------------------------------------------------------------------------------------------
 
     def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
         """Account one completed optimizer step (`progress.done`, i.e. after `progress.advance()`).
 
         Every step: the data ids join the composition counter, a stage transition starting or ending with this step
-        gets its console line, and a set `result.validation` gets the validation line (`Step N: val loss ...`) and
-        becomes the report's `last_validation`. At log steps (`done % log_step_interval == 0`) the metric dict goes
-        to wandb, to `history[done]` (as floats) and to the one-line console summary:
+        becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
+        `last_validation`, and the dashboard's bars move (`update_step` with the stage at `done` and — only at log
+        steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
+        added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and
+        to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
         * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR before the
           per-group `base_lr`), `grad_norm` (pre-clip), `step` (= done);
@@ -308,47 +444,43 @@ class RunLogger:
           (`val_loss*`, `val_ppl*`, `val_time`) when this step evaluated.
         """
         self._sample_counter.update(result.data_ids)
-        self._log_transition(result, progress)
+        self._note_transition(result)
         validation = self._log_validation(result, progress)
+        stage_index, transition = _stage_for_the_bars(result.next_stage)
         if progress.done % self.settings.log_step_interval != 0:
+            self.dashboard.update_step(progress.done, stage_index, {})
             return
         metrics = self._step_metrics(result, progress, validation)
         self.wandb.log(metrics, step=progress.done)
         self.history[progress.done] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
-        console.info(
-            f"step {progress.done}/{self.stage_manager.total_steps} | loss {metrics['loss']:.4f} | "
-            f"lr {metrics['lr']:.2e} | grad_norm {metrics['grad_norm']:.3f} | {metrics['seconds/step']:.2f}s/step"
-        )
+        self.dashboard.update_step(progress.done, stage_index, metrics | transition)
 
-    def _log_transition(self, result: StepResult, progress: TrainingProgress) -> None:
-        """The two transition lines: after the last plain step of a stage ("starting transition") and after the last
-        transition step ("transition complete"). `result.stage` is the info at the step, `result.next_stage` at the
-        step after; inside a transition the info already names the next stage."""
+    def _note_transition(self, result: StepResult) -> None:
+        """The two transition events: after the last plain step of a stage ("starting transition") and after the
+        last transition step ("transition complete"). `result.stage` is the info at the step, `result.next_stage` at
+        the step after; inside a transition the info already names the next stage."""
         before, after = result.stage, result.next_stage
         if after.in_transition and not before.in_transition:
-            console.info(
-                f"Step {progress.done}: starting transition {after.prev_stage_idx} -> {after.stage_idx} "
-                f"({after.stage_name}), LR {cast(float, after.prev_base_lr):.2e} -> {after.base_lr:.2e}"
+            leaving = self.stage_manager.boundaries[cast(int, after.prev_stage_idx)].stage_name
+            self.dashboard.note_event(
+                f"starting transition {after.prev_stage_idx} -> {after.stage_idx} ({leaving} -> {after.stage_name}), "
+                f"LR {cast(float, after.prev_base_lr):.2e} -> {after.base_lr:.2e}"
             )
         elif before.in_transition and not after.in_transition:
-            console.info(
-                f"Step {progress.done}: transition complete, now in stage {after.stage_idx} ({after.stage_name})"
-            )
+            self.dashboard.note_event(f"transition complete, now in stage {after.stage_idx} ({after.stage_name})")
 
     def _log_validation(self, result: StepResult, progress: TrainingProgress) -> dict[str, float] | None:
-        """The validation metrics of this step as floats plus `val_time`, and their console line; None if the step
-        did not evaluate."""
+        """The validation metrics of this step as floats plus `val_time`, shown on the dashboard (the `val_loss*`
+        entries: one per evaluated depth and the mean-recurrence one); None if the step did not evaluate."""
         if result.validation is None:
             return None
         validation = {name: float(_to_scalar(value)) for name, value in result.validation.items()}
         validation["val_time"] = self._evaluation_seconds or 0.0
         self._evaluation_seconds = None
         self._last_validation = validation
-        console.info(
-            f"Step {progress.done}: val loss {validation['val_loss']:.4f} "
-            f"(stage {result.next_stage.stage_idx}, {validation['val_time']:.1f}s)"
-        )
+        losses = {name: value for name, value in validation.items() if name.startswith("val_loss")}
+        self.dashboard.update_validation(progress.done, losses)
         return validation
 
     def _step_metrics(
@@ -383,24 +515,17 @@ class RunLogger:
         self._sample_counter.clear()
         return metrics
 
-    def log_checkpoint(self, path: Path) -> None:
-        """A checkpoint was written to `path` (the report's `checkpoints_written`)."""
-        self.checkpoints_written.append(path)
-        console.info(f"Saved checkpoint {path}", extra=KEEP)
-
-    def log_export(self, path: Path) -> None:
-        """The HuggingFace export was written to `path`."""
-        console.info(f"Exported HuggingFace model to {path}", extra=KEEP)
-
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
         """End the run's logging: `train_time` into the wandb summary, `finish()`, the final console line, the
-        resources released; returns the report. `stopped` says the run ended on request before its last step.
+        final status, the resources released (the dashboard closes: erases its frame, prints the kept lines and its
+        static summary); returns the report. `stopped` says the run ended on request before its last step.
         `__exit__` afterwards is a no-op (both are idempotent)."""
         train_seconds = self._clock() - self._train_started
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
         ending = "stopped on request" if stopped else "finished"
         console.info(f"Training {ending} after {progress.done} steps in {train_seconds:.1f}s.", extra=KEEP)
+        self.status(ending)
         self.resources.close()
         return TrainingReport(
             run_directory=self.run_directory,

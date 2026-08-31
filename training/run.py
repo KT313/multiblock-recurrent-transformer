@@ -13,10 +13,12 @@
     export_if_requested               the HuggingFace folder, once training finished
 
 Steps are OPTIMIZER steps (one world batch each). Nothing in `train()` touches a tensor, a device, `torch.*`, a clock
-or `print`: the numerics live in `step.py` and `evaluation.py`, device code in `backend/`, every console line and
-timer in `logger.py`. The order of the setup is itself numerics (`tasks/training_pipeline_restructure.md`,
-section 3): seed, then the dataset and the loaders (no torch RNG draw), then the model — its parameter init is the
-first consumer of the global torch RNG — then the optimizer and the resume, which restores the stored RNG state.
+or `print`: the numerics live in `step.py` and `evaluation.py`, device code in `backend/`, every console line, timer
+and the terminal dashboard (`training/ui/`, entered by `RunLogger.open`, torn down by its `__exit__` on every way out
+of the `with` block; `train()` only sets its status) in `logger.py`. The order of the setup is itself numerics
+(`tasks/training_pipeline_restructure.md`, section 3): seed, then the dataset and the loaders (no torch RNG draw),
+then the model — its parameter init is the first consumer of the global torch RNG — then the optimizer and the
+resume, which restores the stored RNG state.
 `golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
 
 The CLI around this is `training/train.py`; `TrainingReport`, what `train()` returns, is defined next to `RunLogger`
@@ -83,8 +85,9 @@ def train(
 
     `backend` is created from the settings unless given (tests inject the CPU backend; it is seeded here either way).
     `should_stop` is the run's stop request (the CLI's Ctrl-C): polled between the shards of the in-process dataset
-    build (`BuildAborted` when it says stop) and after every optimizer step — the loop then saves a checkpoint of
-    the completed step, skips the export and returns with `report.stopped`; `resume: true` continues from there.
+    build (`BuildAborted` when it says stop) and after every optimizer step — the loop then says so in the dashboard
+    status, saves a checkpoint of the completed step, skips the export and returns with `report.stopped`;
+    `resume: true` continues from there.
     `started_at` is the caller's clock reading at the start of the run (`report.setup_seconds`); the run's own
     clock lives in `RunLogger`.
 
@@ -110,6 +113,7 @@ def train(
         else:
             logger.log_resume(resumed_from, progress.step)
         batches = micro_batch_stream(settings, loaders, stage_manager, progress)
+        logger.status("training")
         stopped = False
         while progress.step < stage_manager.total_steps and not stopped:
             result = run_one_optimizer_step(settings, backend, model, optimizer, stage_manager, batches, progress)
@@ -120,13 +124,13 @@ def train(
                     result.validation = evaluate(settings, backend, model, validation_loader)
             logger.log_step(result, progress)
             stopped = stop_requested(should_stop)
+            if stopped:
+                logger.status("stopping after this step, saving a checkpoint")
             if is_checkpoint_step(settings, progress.done, stage_manager) or stopped:
                 save_run_checkpoint(
                     settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger
                 )
-        export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset)
-        if export_dir is not None:
-            logger.log_export(export_dir)
+        export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
         return logger.close(progress, export_dir, stopped=stopped)
 
 
@@ -249,7 +253,8 @@ def save_run_checkpoint(
     progress: TrainingProgress,
     logger: RunLogger,
 ) -> None:
-    """Write the checkpoint of `progress.done` completed optimizer steps and tell the logger.
+    """Write the checkpoint of `progress.done` completed optimizer steps and tell the logger (the status reads
+    `saving checkpoint` meanwhile, the path becomes a dashboard event).
 
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
     step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is in at `done`, i.e. the one it
@@ -267,7 +272,8 @@ def save_run_checkpoint(
         dataset_config_hash=dataset.config_hash,
         validation_rows=dataset.validation_rows,
     )
-    save_training_checkpoint(backend, path, model, optimizer, metadata)
+    with logger.saving_checkpoint():
+        save_training_checkpoint(backend, path, model, optimizer, metadata)
     logger.log_checkpoint(path)
 
 
@@ -275,13 +281,16 @@ def save_run_checkpoint(
 
 
 def export_if_requested(
-    settings: Settings, run_directory: Path, model: Module, dataset: ResolvedDataset
+    settings: Settings, run_directory: Path, model: Module, dataset: ResolvedDataset, logger: RunLogger
 ) -> Path | None:
     """With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`) from
-    the unwrapped model and the dataset's tokenizer and return it; None otherwise."""
+    the unwrapped model and the dataset's tokenizer, tell the logger (status `exporting`, then the export event) and
+    return the folder; None otherwise."""
     if not settings.export_to_hf:
         return None
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else run_directory / "hf_export"
+    logger.status("exporting")
     plain_model = cast(RecurrentGPT, unwrap_compiled(model))
     export_to_hf(plain_model, plain_model.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
+    logger.log_export(export_dir)
     return export_dir
