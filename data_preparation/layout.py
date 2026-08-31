@@ -24,7 +24,7 @@ from pathlib import Path
 # instead of rewriting, and refills the dedup filter from disk
 PRETRAIN_PROCESSED_COLUMNS: tuple[str, ...] = ("text", "source", "tokens", "hash")
 INSTRUCT_PROCESSED_COLUMNS: tuple[str, ...] = ("instruction", "input", "output", "tokens", "hash")
-# alias for the pretrain columns; callers that predate per-kind columns use it until the build is per kind (task 4)
+# alias for the pretrain columns (kept for callers that only handle pretrain shards)
 PROCESSED_COLUMNS: tuple[str, ...] = PRETRAIN_PROCESSED_COLUMNS
 
 

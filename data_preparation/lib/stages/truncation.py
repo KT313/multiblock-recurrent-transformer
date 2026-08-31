@@ -20,7 +20,7 @@ if TYPE_CHECKING:  # transformers is imported lazily by the tokenizer stage (HF 
     from transformers import PreTrainedTokenizerFast
 
 # ``token_count: estimate`` counts ``len(text) // CHARS_PER_TOKEN_ESTIMATE``. Must match ``estimate_tokens`` in
-# ``storage/parquet.py`` (asserted in the tests); the constant will be unified there with the pipeline restructure.
+# ``storage/parquet.py`` (asserted in the tests).
 CHARS_PER_TOKEN_ESTIMATE = 4
 
 # Before tokenizing, a text is cut at ``PRE_CUT_CHARS_PER_TOKEN * max_tokens`` characters so the tokenizer cost per

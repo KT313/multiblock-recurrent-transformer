@@ -11,7 +11,7 @@ implementation lives in `training/stage_manager.py` with its integration in
 The stage list lives in the dataset config (`config/datasets/<name>.yaml`,
 `stages:`); each entry defines:
 
-- `train` / `val` — the mixture over sources (or `<mixture>[/validation]`) for
+- `train` / `val` — the weights over sources (plain source names; a source in both is split by `validation_fraction`) for
   the stage, weights summing to 1
 - `tokens` — the stage's global token budget
 - `transition_pct` — fraction of the stage reserved (at its end) for the

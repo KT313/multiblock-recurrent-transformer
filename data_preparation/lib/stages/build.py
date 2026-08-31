@@ -284,7 +284,7 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
     else:
         stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
         stats["removed_empty"] = 0  # rows without instruction or output after stripping
-        stats["removed_too_long"] = 0  # rows over `max_seq_length` tokens (a safety net; dropped at download from task 6 on)
+        stats["removed_too_long"] = 0  # rows over `max_seq_length` tokens (a safety net; the download already drops them)
     manifest.extra = {
         "input_shards": [],
         "columns": list(processed_columns(source.kind)),

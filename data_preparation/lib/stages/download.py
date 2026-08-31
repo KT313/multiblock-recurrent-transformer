@@ -8,7 +8,7 @@ data allow it. Raw folders are append-only and precious (bandwidth): :func:`down
 manifest, starts a fresh folder when there is none, and **never deletes** one — a folder whose manifest is *stale*
 (``DatasetConfig.raw_hash``: loader identity, ``token_count`` and tokenizer changed) or *outdated* (stored with a
 smaller ``max_seq_length`` than the config asks for, :meth:`Manifest.is_outdated`) makes it raise
-:class:`RawFolderError`; the repair step deletes such folders after the user confirmed (task 7), nothing else does.
+:class:`RawFolderError`; the repair step (``lib/build/repair.py``) deletes such folders after the user confirmed, nothing else does.
 
 What a raw row is: pretrain rows carry ``text_field`` **truncated at the token boundary** ``max_seq_length`` (the
 stored ``tokens`` is the true count of the stored text, see ``truncation.py``); instruct rows carry ``instruction /
@@ -211,7 +211,7 @@ def _inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> tup
 class RawFolderError(RuntimeError):
     """A raw folder that :func:`download` may not append to: ``state`` is ``stale`` or ``outdated``, ``problem`` the
     :func:`raw_manifest_problem` string. The download never deletes raw data; the repair step does, after the user
-    confirmed (task 7)."""
+    confirmed (``lib/build/repair.py``)."""
 
     def __init__(self, name: str, directory: Path, state: RawManifestState, problem: str) -> None:
         super().__init__(

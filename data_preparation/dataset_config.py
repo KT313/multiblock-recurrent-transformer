@@ -6,7 +6,7 @@ Framework-neutral (no torch). Loaded by `data_preparation/prepare.py` (materiali
 references the file; every data-related setting lives here. This file is the config reference: every field
 carries a trailing comment, `DatasetConfig` lists the top-level keys.
 
-Layout produced on disk (see `tasks/data_pipeline_restructure.md`, section 1):
+Layout produced on disk (see `data_preparation/README.md`):
 
     dataset/sources/<source>/raw/     rows as downloaded (text truncated to max_seq_length tokens); shared, append-only
     dataset/processed/<source>/       rows after cleaning (what training reads); derived from raw, shared
