@@ -121,10 +121,10 @@ def build_source(
             return output.manifest
 
     stats: dict[str, Any] = output.manifest.extra["stats"]
-    seen = SeenDocuments(memory_mb=processing.dedup.bloom_memory_mb)
-    if not output.is_new:
-        seen.add_all(output.stored_hashes())
-    if processing.dedup.mode != "none":
+    seen = SeenDocuments(memory_mb=processing.dedup.bloom_memory_mb) if processing.dedup.mode != "none" else None
+    if seen is not None:
+        if not output.is_new:
+            seen.add_all(output.stored_hashes())
         # the raw row count is the honest upper bound of what this build can insert (the false-positive estimate)
         log.info("%s: %s", name, seen.describe(raw.rows()))
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
@@ -317,7 +317,7 @@ class RowPipeline:
         batch_size: int,
         stats: dict[str, Any],
         *,
-        seen: SeenDocuments,
+        seen: SeenDocuments | None,
         should_stop: StopCheck | None = None,
     ) -> None:
         self.config = config
@@ -351,7 +351,7 @@ class RowPipeline:
             rows = self._pretrain_rows(raw_dir, shards)
         else:
             rows = self._instruct_rows(raw_dir, shards, first_row_index)
-        if self.processing.dedup.mode != "none":  # minhash = the cheap exact pass first, then fuzzy (all at once)
+        if self.seen is not None:  # dedup on (minhash = this cheap exact pass first, then fuzzy, all at once)
             rows = _exact_dedup(rows, self.seen, self.stats["dedup"])
         return rows
 

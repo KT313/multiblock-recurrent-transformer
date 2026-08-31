@@ -161,16 +161,17 @@ def test_raw_is_exhausted_honours_a_grown_check_limit() -> None:
     assert not raw_is_exhausted(cfg, "i", manifest)
 
 
-def test_plan_downloads_rejects_a_stale_or_outdated_raw_folder(layout: DatasetLayout, config_file: ConfigFile) -> None:
+def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """The repair step (or a dry run's report) owns such a folder: the plan names the state and fetches nothing."""
     cfg = two_stage_cfg()
     prepare(config_file(cfg), layout.root, assume_yes=False)
     cfg.token_count = "estimate"  # part of the raw hash: every raw folder is stale
-    with pytest.raises(RuntimeError, match="a: raw folder .* is stale; .* run the repair step"):
-        plan_downloads(cfg, layout)
+    stale_entry = next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
+    assert stale_entry.rows_to_fetch == 0 and stale_entry.reason == "raw stale: the repair step deletes it after confirmation"
     outdated = two_stage_cfg()
     outdated.max_seq_length = 4096  # raised above the stored cap
-    with pytest.raises(RuntimeError, match="is outdated"):
-        plan_downloads(outdated, layout)
+    outdated_entry = next(s for s in plan_downloads(outdated, layout).sources if s.name == "a")
+    assert outdated_entry.rows_to_fetch == 0 and outdated_entry.reason.startswith("raw outdated")
     a = source_state(cfg, "a", layout)  # the status table only reports it
     assert not a.satisfied and a.reason == "raw stale: the repair step deletes it after confirmation"
 

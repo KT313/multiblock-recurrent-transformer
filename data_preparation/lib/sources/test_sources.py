@@ -314,6 +314,14 @@ def _sharegpt(human: str, gpt: str, first: str = "human", second: str = "gpt") -
     return {"conversations": [{"from": first, "value": human}, {"from": second, "value": gpt}]}
 
 
+def test_converters_turn_null_values_into_empty_fields_not_the_string_none() -> None:
+    """A null turn / column must become an empty field (dropped at build), never the text "None" trained on."""
+    conversation = {"conversations": [{"from": "human", "value": None}, {"from": "gpt", "value": "x"}]}
+    assert sharegpt_conversations(conversation) == {"instruction": "", "input": "", "output": "x"}
+    assert first_two_turns({"conversations": [{"value": None}, {"value": "y"}]}) == {"instruction": "", "input": "", "output": "y"}
+    assert gsm8k_question_answer({"question": None, "answer": "a"}) == {"text": "Question: \n\nAnswer: a"}
+
+
 def test_sharegpt_quality() -> None:
     ok_h, ok_g = "h" * 100, "g" * 100
     assert sharegpt_quality(_sharegpt(ok_h, ok_g))

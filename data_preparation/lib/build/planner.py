@@ -161,9 +161,9 @@ class DownloadPlan:
 def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> DownloadPlan:
     """Rows still missing per source (all, or ``sources``) against the raw manifests.
 
-    A raw folder that is stale or outdated must have been handled by the repair step before: such a state is an
-    error here (``RuntimeError`` naming the source), never "download more" — the download never appends to a
-    folder whose rows the current config would not have produced.
+    A raw folder that is stale or outdated is planned as "nothing to fetch" with the state as its reason: the
+    repair step deletes it (after confirmation) before any download runs, and a dry run shows the state instead of
+    failing — the download never appends to a folder whose rows the current config would not have produced.
     """
     plan = DownloadPlan()
     for name in _selected(config, sources):
@@ -173,12 +173,9 @@ def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Ite
 
 def _plan_source_download(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceDownload:
     state = raw_manifest_state(config, name, layout)
-    if state not in ("missing", "current"):
-        raise RuntimeError(
-            f"{name}: raw folder {layout.raw_dir(name)} is {state}; it has to be deleted and downloaded again — "
-            "run the repair step (prepare asks for confirmation) before planning downloads"
-        )
     needed = rows_needed(config, name)
+    if state not in ("missing", "current"):
+        return SourceDownload(name, 0, needed, 0, f"raw {state}: the repair step deletes it after confirmation")
     raw = current_raw_manifest(config, name, layout)
     if raw is None:
         return SourceDownload(name, 0, needed, needed, "raw missing")

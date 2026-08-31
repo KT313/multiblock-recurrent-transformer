@@ -327,7 +327,7 @@ def download(
     log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, manifest.rows_fetched, out)
     counters = _FetchCounters()
     increment = _Increment(manifest, out, counters, should_stop)
-    token_step = _TokenStep(source, TokenCounter(cfg, layout), cfg.max_seq_length, counters)
+    token_step = _TokenStep(source, TokenCounter(cfg, layout), _folder_cap(manifest, cfg), counters)
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=wanted, desc=name, unit="row", panel="downloads") as bar:
         rows = _fetch_rows(source, name, manifest.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
@@ -362,6 +362,15 @@ def _raw_manifest_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLay
     if has_shards(out):
         raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
     return new_manifest(cfg, name, cfg.raw_hash(name), "raw", tokens=True, truncated_at_tokens=cfg.max_seq_length)
+
+
+def _folder_cap(manifest: Manifest, cfg: DatasetConfig) -> int:
+    """The token cap the rows appended to a raw folder are cut at: the folder's recorded ``truncated_at_tokens``.
+    Appending under a *lower* config cap would otherwise leave a folder whose manifest promises longer rows than the
+    appended part holds, and raising the cap back would not be detected (:meth:`Manifest.is_outdated`). Lowering
+    stays free (the build clamps the stored counts). A manifest without the field (never written by this code)
+    falls back to the config's cap."""
+    return manifest.truncated_at_tokens if manifest.truncated_at_tokens is not None else cfg.max_seq_length
 
 
 def _reset_check_limit_exhaustion(manifest: Manifest, source: SourceConfig, name: str) -> None:
@@ -623,7 +632,7 @@ def download_github_code_group(
             counter = counter or TokenCounter(cfg, layout)
             counters = _FetchCounters()
             increment = _Increment(manifest, out, counters, should_stop)
-            token_step = _TokenStep(source, counter, cfg.max_seq_length, counters)
+            token_step = _TokenStep(source, counter, _folder_cap(manifest, cfg), counters)
             members.append(_GroupMember(name, source, out, manifest, wanted, counters, increment, token_step))
     if not members:
         return results

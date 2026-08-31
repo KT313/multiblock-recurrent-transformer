@@ -100,7 +100,7 @@ def prepare(
     with build_lock(layout.root) if not dry_run else nullcontext():
         if "tokenizer" in active_steps and not dry_run:
             prepare_tokenizer(config, layout)
-        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm)
+        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected)
         log_repair(repair_report)
         for round_number in range(1, MAX_ROUNDS + 1):
             download_plan = plan_downloads(config, layout, sources=selected)
@@ -215,11 +215,12 @@ def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: Da
 
 def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str]]:
     """The ``github_code`` sources among ``names`` that share a repo (:func:`github_code_repo_key`), two or more
-    per group, in config order; a single source of a repo goes through the ordinary per-source download."""
+    per group, in config order; a single source of a repo, or one with a ``check_limit`` (the group pass has none),
+    goes through the ordinary per-source download."""
     groups: dict[tuple[str | None, str | None, str], list[str]] = {}
     for name in names:
         source = config.sources[name]
-        if source.loader == "github_code":
+        if source.loader == "github_code" and source.check_limit is None:
             groups.setdefault(github_code_repo_key(source), []).append(name)
     return [group for group in groups.values() if len(group) >= 2]
 

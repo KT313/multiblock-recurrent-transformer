@@ -345,8 +345,9 @@ Pretrain sources need a text column (`text_field`, default `text`); instruct sou
 `sharegpt_quality` (keeps human→gpt openings with 50–2000 characters per side and no code block in the answer;
 `check_limit` bounds the rows inspected). Write a new converter when the source's schema is not a simple column
 mapping: add a function `(row) -> row` to `converters.py`, register it in `CONVERTERS` (or `FILTERS`), test it on a
-hand-written row in `test_sources.py`, and reference it by name in the YAML. A converter raising `ValueError` skips
-the row (counted in the manifest as `skipped_malformed`).
+hand-written row in `test_sources.py`, and reference it by name in the YAML. For an instruct source a converter
+raising `ValueError` skips the row (counted in the manifest as `skipped_malformed`); for a pretrain source it fails the
+download (a pretrain converter maps whole columns, a failing row means a wrong mapping).
 
 ### A local dataset
 

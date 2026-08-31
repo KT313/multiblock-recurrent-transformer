@@ -34,7 +34,7 @@ def _text_or_empty(value: Any) -> str:
 def gsm8k_question_answer(row: Row) -> Row:
     """GSM8K `question` + `answer` -> one pretraining document."""
     _require(row, "question", "answer")
-    return {"text": f"Question: {row['question']}\n\nAnswer: {row['answer']}"}
+    return {"text": f"Question: {_text_or_empty(row['question'])}\n\nAnswer: {_text_or_empty(row['answer'])}"}
 
 
 def _conversations(row: Row) -> list[Any]:
@@ -57,7 +57,7 @@ def sharegpt_conversations(row: Row) -> Row:
             raise ValueError(f"sharegpt_conversations: turns need 'from'/'value' keys, got {turn!r}")
         role = turn["from"]
         if role in by_role:
-            by_role[role] = str(turn.get("value", ""))
+            by_role[role] = _text_or_empty(turn.get("value"))
     return {"instruction": by_role["human"], "input": by_role["system"], "output": by_role["gpt"]}
 
 
@@ -69,7 +69,7 @@ def first_two_turns(row: Row) -> Row:
     first, second = conversations[0], conversations[1]
     if not isinstance(first, dict) or not isinstance(second, dict):
         raise ValueError(f"first_two_turns: turns must be dicts with a 'value' key, got {conversations[:2]!r}")
-    return {"instruction": str(first.get("value", "")), "input": "", "output": str(second.get("value", ""))}
+    return {"instruction": _text_or_empty(first.get("value")), "input": "", "output": _text_or_empty(second.get("value"))}
 
 
 def fields_converter(fields: dict[str, str]) -> Converter:

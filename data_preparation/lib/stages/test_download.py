@@ -510,6 +510,25 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     assert m.tokens() == sum(r["tokens"] for r in rows) and all(s.tokens is not None for s in m.shards)
 
 
+def test_download_appends_at_the_folder_cap_when_the_config_cap_is_lower(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
+) -> None:
+    """Lowering `max_seq_length` is free, so an append under the lower cap must not shorten the folder's rows: the
+    manifest keeps promising `truncated_at_tokens`, and raising the cap back must still be `current`, not a lie."""
+    high = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=100))
+    download(high, "p", layout, rows_needed=20, shard_size=10)
+    low = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=40))
+    assert raw_manifest_state(low, "p", layout) == "current", "a lower cap never outdates the folder"
+    m = download(low, "p", layout, rows_needed=40, shard_size=10)
+    rows = read_rows(layout.raw_dir("p"))
+    assert len(rows) == 40 and m.truncated_at_tokens == 100
+    counter = TokenCounter(high, layout)
+    appended = rows[20:]
+    assert all(counter.count(row["text"]) <= 100 for row in appended)
+    assert any(counter.count(row["text"]) > 40 for row in appended), "appended rows are cut at the folder's cap, not the config's"
+    assert raw_manifest_state(high, "p", layout) == "current" and read_rows(layout.raw_dir("p"))[:20] == rows[:20]
+
+
 def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
     cfg_factory: CfgFactory, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:

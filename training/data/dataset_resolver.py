@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
 from data_preparation.lib.abort import StopCheck
-from data_preparation.lib.build import prepare, status, summarize_dataset_state
+from data_preparation.lib.build import ConfirmationRequired, prepare, status, summarize_dataset_state
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
@@ -276,8 +276,8 @@ def _ensure_prepared(
     """Verify the dataset on disk; prepare what is missing when `auto_prepare` allows it, else raise.
 
     Auto-prepare never deletes raw data and never prompts: it runs `prepare` with `assume_yes=False` and a `confirm`
-    that always declines, so a stale or outdated raw folder fails the run with the same message `prepare.py` prints
-    (rerun it with `--yes` to confirm the deletion). `should_stop` is the run's stop request (the CLI's Ctrl-C):
+    that always declines, so a stale or outdated raw folder fails the run with the list of folders `prepare.py`
+    would ask about and the `prepare.py prepare ... --yes` command that confirms the deletion. `should_stop` is the run's stop request (the CLI's Ctrl-C):
     the build polls it between shards and raises `BuildAborted` with everything published so far kept.
     """
     report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
@@ -294,16 +294,23 @@ def _ensure_prepared(
     log.info("dataset %s is incomplete, preparing missing data (%s)", dataset_config.name, missing)
     if backend is None or backend.is_main:
         with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
-            prepare(
-                settings.dataset_config,
-                settings.dataset_dir,
-                num_workers=settings.prepare_num_workers,
-                max_parallel_downloads=settings.prepare_max_parallel_downloads,
-                assume_yes=False,
-                confirm=lambda _message: False,  # never delete raw from a training run
-                hf_token=os.environ.get("HF_TOKEN"),
-                should_stop=should_stop,
-            )
+            try:
+                prepare(
+                    settings.dataset_config,
+                    settings.dataset_dir,
+                    num_workers=settings.prepare_num_workers,
+                    max_parallel_downloads=settings.prepare_max_parallel_downloads,
+                    assume_yes=False,
+                    confirm=lambda _message: False,  # never delete raw from a training run
+                    hf_token=os.environ.get("HF_TOKEN"),
+                    should_stop=should_stop,
+                )
+            except ConfirmationRequired as err:
+                raise RuntimeError(
+                    f"{err.message.rstrip()}\nauto-prepare never deletes raw data; to confirm the deletion run:\n  "
+                    + build_command(settings.dataset_config, settings.dataset_dir)
+                    + " --yes"
+                ) from err
     if backend is not None:
         backend.barrier()
 

@@ -5,7 +5,8 @@ Every stage directory (``dataset/sources/<source>/raw/``, ``dataset/processed/<s
 manifest. ``source_hash`` is the stage's key from the config that produced it (:meth:`DatasetConfig.raw_hash` for
 ``raw/`` — loader identity plus token settings, so processing changes never invalidate downloads —,
 :meth:`DatasetConfig.processed_hash` for ``processed/``, ``tokenizer_hash`` for tokenizers); a manifest whose hash
-differs from the current config is stale and its stage is rebuilt. A raw manifest also records
+differs from the current config is stale: a processed folder is rebuilt, a raw folder is an error until the repair
+step deletes it after confirmation (raw is never re-downloaded silently). A raw manifest also records
 ``truncated_at_tokens`` (the ``max_seq_length`` its texts were cut at): raising the cap above it makes the folder
 *outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification is cheap (parquet metadata only).
 """

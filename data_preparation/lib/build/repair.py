@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import shutil
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -129,8 +129,9 @@ def repair_broken_and_stale_folders(
     assume_yes: bool,
     dry_run: bool = False,
     confirm: Confirm | None = None,
+    sources: Iterable[str] | None = None,
 ) -> RepairReport:
-    """Inspect the raw and processed folder of every source in ``config``, confirm the raw deletions once, perform
+    """Inspect the raw and processed folder of every source in ``config`` (or of ``sources``), confirm the raw deletions once, perform
     everything (see the module docstring) and return what was done.
 
     ``assume_yes`` skips the prompt; otherwise ``confirm(message)`` decides when given, else the question is put on
@@ -139,7 +140,7 @@ def repair_broken_and_stale_folders(
     Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
     """
     planned = RepairReport()
-    for name in config.sources:
+    for name in config.sources if sources is None else sources:
         raw_shards = inspect_raw_folder(config, name, layout.raw_dir(name), planned)
         inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, planned)
         inspect_leftover_temporary_folder(name, layout.processed_dir(name), planned)
