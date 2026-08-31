@@ -54,17 +54,20 @@ def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
 
 @pytest.fixture(autouse=True)
 def detached_training_handlers() -> Iterator[logging.Logger]:
-    """The `training` logger without the handlers `configure_console_logging` adds (removed again afterwards, so a
-    handler bound to a captured stderr never outlives its test). Autouse: every `main()` call configures one."""
+    """The `training` logger (yielded) and the `data_preparation` logger without the handlers
+    `configure_console_logging` adds to either of them — removed again afterwards, so a handler bound to a captured
+    stderr never outlives its test (later tests of other modules would log into a closed stream). Autouse: every
+    `main()` call configures both hierarchies."""
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
-    before = list(training_logger.handlers)
-    level = training_logger.level
+    data_logger = logging.getLogger("data_preparation")
+    before = {logger: (list(logger.handlers), logger.level) for logger in (training_logger, data_logger)}
     yield training_logger
-    for handler in training_logger.handlers:
-        if handler not in before:
-            training_logger.removeHandler(handler)
-            handler.close()
-    training_logger.setLevel(level)
+    for logger, (handlers_before, level) in before.items():
+        for handler in list(logger.handlers):
+            if handler not in handlers_before:
+                logger.removeHandler(handler)
+                handler.close()
+        logger.setLevel(level)
 
 
 @pytest.fixture
