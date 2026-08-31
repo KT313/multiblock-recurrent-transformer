@@ -21,6 +21,11 @@ then the model — its parameter init is the first consumer of the global torch 
 resume, which restores the stored RNG state.
 `golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
 
+A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows consumed per data entry plus the
+transition RNG) and every train dataset starts that many rows into its range. It does NOT reproduce the order of an
+uninterrupted run inside a stage — the mixture draws happen in the dataloader workers and are not replayed — so only
+a resume from a stage boundary is bit-exact (`test_resume_is_bit_exact_without_transitions`).
+
 The CLI around this is `training/train.py`; `TrainingReport`, what `train()` returns, is defined next to `RunLogger`
 in `logger.py` (its `close()` builds it) and re-exported here.
 """
@@ -30,7 +35,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from torch.nn import Module
 from torch.optim import Optimizer
@@ -56,7 +61,7 @@ from training.logger import RunLogger, TrainingReport
 from training.optim import build_optimizer, get_param_groups
 from training.settings import Settings
 from training.stage_manager import StageManager
-from training.step import TrainingProgress, micro_batch_stream, run_one_optimizer_step
+from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
 
 __all__ = [
     "TrainingReport",
@@ -103,7 +108,9 @@ def train(
     loaders = build_stage_dataloaders(settings, dataset, backend)
     model = build_run_model(settings, backend, run_directory)
     optimizer = build_run_optimizer(settings, model, backend)
-    progress, resumed_from = restore_checkpoint_if_resuming(settings, run_directory, backend, model, optimizer, dataset)
+    progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
+        settings, run_directory, backend, model, optimizer, dataset
+    )
 
     with RunLogger.open(
         settings, run_directory, dataset, model, stage_manager, progress, backend, setup_started=started_at
@@ -112,7 +119,9 @@ def train(
             logger.log_fresh_start()
         else:
             logger.log_resume(resumed_from, progress.step)
-        batches = micro_batch_stream(settings, loaders, stage_manager, progress)
+        batches = BatchStream(settings, loaders, stage_manager, progress)
+        if data_stream_state is not None:
+            batches.load_state_dict(data_stream_state)
         logger.status("training")
         stopped = False
         while progress.step < stage_manager.total_steps and not stopped:
@@ -129,7 +138,7 @@ def train(
                 logger.status("stopping after this step, saving a checkpoint")
             if is_checkpoint_step(settings, progress.done, stage_manager) or stopped:
                 save_run_checkpoint(
-                    settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger
+                    settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger, batches
                 )
         export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
         return logger.close(progress, export_dir, stopped=stopped)
@@ -209,30 +218,32 @@ def restore_checkpoint_if_resuming(
     model: Module,
     optimizer: Optimizer,
     dataset: ResolvedDataset,
-) -> tuple[TrainingProgress, Path | None]:
-    """The progress to start at and the checkpoint it was restored from (None: a fresh run at step 0).
+) -> tuple[TrainingProgress, Path | None, dict[str, Any] | None]:
+    """The progress to start at, the checkpoint it was restored from and the data-stream state stored in it (None,
+    None: a fresh run at step 0).
 
     With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` under the run
     directory; a run without one starts fresh. Loading restores the model and optimizer state, verifies the dataset
     against the checkpoint (`check_dataset_unchanged`: config hash and validation split), restores the RNG state
     (numerics: the stored state includes the evaluation draws of the checkpoint's step) and sets
-    `progress.step = progress.resume_step = checkpoint step` — the resume warmup and the transition RNG seed of
-    `micro_batch_stream` derive from it.
+    `progress.step = progress.resume_step = checkpoint step` — the resume warmup derives from it. The data-stream
+    state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the transition RNG, which
+    the stream would otherwise re-seed with `seed + resume step`).
     """
     progress = TrainingProgress()
     if not settings.resume:
-        return progress, None
+        return progress, None, None
     if settings.resume_checkpoint_path:
         resume_path: Path | None = Path(settings.resume_checkpoint_path)
     else:
         resume_path = find_latest_checkpoint(run_directory, settings.run_name)
     if resume_path is None:
-        return progress, None
+        return progress, None, None
     metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
     check_dataset_unchanged(metadata, dataset, settings.allow_dataset_change)
     progress.step = progress.resume_step = metadata.step
     backend.set_rng_state(metadata.rng)
-    return progress, resume_path
+    return progress, resume_path, metadata.data_stream
 
 
 # --- inside the loop -------------------------------------------------------------------------------------------------
@@ -253,6 +264,7 @@ def save_run_checkpoint(
     stage_manager: StageManager,
     progress: TrainingProgress,
     logger: RunLogger,
+    batches: BatchStream,
 ) -> None:
     """Write the checkpoint of `progress.done` completed optimizer steps and tell the logger (the status reads
     `saving checkpoint` meanwhile, the path becomes a dashboard event).
@@ -260,7 +272,9 @@ def save_run_checkpoint(
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
     step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is in at `done`, i.e. the one it
     enters next when written before a transition. Numerics: called after evaluation and logging of the step, so the
-    stored RNG state includes the evaluation draws (a resume continues exactly where the run would have).
+    stored RNG state includes the evaluation draws; `batches.state_dict()` adds the rows the run has consumed per
+    data entry, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
+    does not promise).
     """
     stage_end = stage_manager.stage_ending_at(progress.done - 1)
     path = checkpoint_path(run_directory, settings.run_name, progress.done, stage_end)
@@ -272,6 +286,7 @@ def save_run_checkpoint(
         model_config=cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict(),
         dataset_config_hash=dataset.config_hash,
         validation_rows=dataset.validation_rows,
+        data_stream=batches.state_dict(),
     )
     with logger.saving_checkpoint():
         save_training_checkpoint(backend, path, model, optimizer, metadata)

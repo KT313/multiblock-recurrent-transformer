@@ -362,3 +362,49 @@ def test_empty_directory_raises(tmp_path: Path) -> None:
     (tmp_path / "empty").mkdir()
     with pytest.raises(FileNotFoundError, match="No parquet files"):
         ParquetTextDataset(tmp_path / "empty", "p")
+
+
+# --- resume offsets ------------------------------------------------------------------------------------------------
+
+
+def test_resume_offset_starts_the_next_epoch_inside_the_range(small_dir: Path) -> None:
+    ds = ParquetTextDataset(small_dir, "small")
+    ds.set_resume_offset(7)
+    assert ds.resume_offset == 7
+    assert [r["text"] for r in ds] == [f"row {i}" for i in range(7, 23)]
+
+
+def test_resume_offset_is_one_shot(small_dir: Path) -> None:
+    """A permanent offset would hide the rows before it in every later epoch."""
+    ds = ParquetTextDataset(small_dir, "small")
+    ds.set_resume_offset(20)
+    assert len(list(ds)) == 3 and ds.resume_offset == 0
+    assert [r["text"] for r in ds] == [f"row {i}" for i in range(23)]
+
+
+def test_resume_offset_wraps_around_the_range(small_dir: Path) -> None:
+    ds = ParquetTextDataset(small_dir, "small")
+    ds.set_resume_offset(23 * 3 + 4)
+    assert ds.resume_offset == 4
+
+
+def test_resume_offset_applies_on_top_of_the_validation_split(small_dir: Path) -> None:
+    """`skip_rows` is the split, the resume offset is counted inside the resulting range."""
+    ds = ParquetTextDataset(small_dir, "small", skip_rows=5, max_rows=10)
+    ds.set_resume_offset(3)
+    assert [r["text"] for r in ds] == [f"row {i}" for i in range(8, 15)]
+
+
+def test_resume_offset_is_shared_by_the_shards(small_dir: Path) -> None:
+    """The offset counts rows of the range, not of a shard, so the shards together still yield each row once."""
+    rows: list[str] = []
+    for rank in (0, 1):
+        ds = ParquetTextDataset(small_dir, "small", shard=(rank, 2))
+        ds.set_resume_offset(10)
+        rows += [r["text"] for r in ds]
+    assert sorted(rows) == sorted(f"row {i}" for i in range(10, 23))
+
+
+def test_resume_offset_rejects_a_negative_value(small_dir: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ParquetTextDataset(small_dir, "small").set_resume_offset(-1)

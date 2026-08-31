@@ -5,7 +5,7 @@ batch sampling used by multi-stage training and the assembly of one world batch 
 import random
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -82,8 +82,8 @@ class StageDataloaders:
     """One train and one val loader per training stage, with lazily created and cycled train iterators.
 
     Train loaders yield unpadded `SampleBatch`es, validation loaders padded `Batch`es; `tokenizer` is the one every
-    loader was built with and the one `world_batch_micro_batches` pads with. Loader state is not checkpointed here —
-    `training.data.stream` is what a resume restores.
+    loader was built with and the one `world_batch_micro_batches` pads with. What a resume restores is the row
+    offsets of `set_resume_offsets` (`training.step.BatchStream` owns the bookkeeping).
     """
 
     train_loaders: Sequence[Iterable[SampleBatch]]
@@ -102,8 +102,33 @@ class StageDataloaders:
         try:
             return next(iterator)
         except StopIteration:
+            # the epoch that started at the resume offsets is over; every later one reads the whole range again
+            self.clear_resume_offsets(stage_idx)
             iterator = self._train_iterators[stage_idx] = iter(self.train_loaders[stage_idx])
             return next(iterator)
+
+    def train_datasets(self, stage_idx: int) -> list[ParquetTextDataset]:
+        """The parquet datasets behind a stage's train loader (empty for a loader that is not a `DataLoader` over
+        them, which is what the tests hand in)."""
+        dataset = getattr(self.train_loaders[stage_idx], "dataset", None)
+        if isinstance(dataset, ParquetTextDataset):
+            return [dataset]
+        if isinstance(dataset, WeightedMixtureDataset):
+            return [member for member in dataset.datasets if isinstance(member, ParquetTextDataset)]
+        return []
+
+    def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
+        """Start every train dataset whose prefix appears in `consumed_rows` that many rows into its range, so a
+        resumed run does not train on the rows the interrupted run already saw. One-shot (see
+        `ParquetTextDataset.set_resume_offset`); prefixes of other runs or of removed sources are ignored."""
+        for stage_idx in range(len(self.train_loaders)):
+            for dataset in self.train_datasets(stage_idx):
+                dataset.set_resume_offset(consumed_rows.get(dataset.prefix, 0))
+
+    def clear_resume_offsets(self, stage_idx: int) -> None:
+        """Drop the pending resume offsets of a stage (its loader is about to be re-created for a fresh epoch)."""
+        for dataset in self.train_datasets(stage_idx):
+            dataset.set_resume_offset(0)
 
 
 def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> StageDataloaders:

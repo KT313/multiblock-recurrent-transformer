@@ -173,15 +173,17 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
 def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
     tiny_settings: Settings, tiny_resolved: ResolvedDataset, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """`resume: false`, and `resume: true` with no checkpoint of the run in the directory: step 0, no path."""
+    """`resume: false`, and `resume: true` with no checkpoint of the run in the directory: step 0, no path, no
+    data-stream state."""
     run_directory = prepare_run_directory(tiny_settings)
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
     for resume in (False, True):
         tiny_settings.resume = resume
-        progress, resumed_from = restore_checkpoint_if_resuming(
+        progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
             tiny_settings, run_directory, cpu_backend, tiny_model, optimizer, tiny_resolved
         )
-        assert progress == TrainingProgress(step=0, resume_step=-1) and resumed_from is None
+        assert progress == TrainingProgress(step=0, resume_step=-1)
+        assert resumed_from is None and data_stream_state is None
 
 
 def test_block_size_mismatch_with_the_dataset_config_raises(
@@ -485,6 +487,36 @@ def test_resume_is_bit_exact_without_transitions(tmp_path: Path, tiny_dataset_di
     for sa, sb in zip(final_full["optimizer"]["state"].values(), final_res["optimizer"]["state"].values()):
         assert all(torch.equal(sa[k], sb[k]) for k in sa if torch.is_tensor(sa[k]))
     assert final_res["step"] == 20
+
+
+@pytest.mark.slow
+def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-entry row
+    counters continue instead of restarting at row 0, so the resumed run trains on rows the interrupted run had not
+    reached (`BatchStream.load_state_dict`; the within-stage order still differs from an uninterrupted run)."""
+
+    def consumed(directory: Path, name: str) -> dict[str, int]:
+        state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
+        return dict(state["data_stream"]["consumed_rows"])
+
+    full_dir = tmp_path / "full" / "out"
+    options = {"save_step_interval": "4", "export_to_hf": "false"}
+    _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
+    # 12 steps of 4 rows: stage 0 ran steps 0-7, stage 1 steps 8-11
+    assert consumed(full_dir, "step-00000012-tiny.pth") == {
+        "pretrain_a-synthetic_pretrain": 32,
+        "pretrain_b-synthetic_pretrain": 16,
+    }
+
+    resumed_dir = tmp_path / "resumed" / "out"
+    mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
+    _run(
+        _no_transition_yaml(
+            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume="true", resume_checkpoint_path=str(mid), **options
+        )
+    )
+    # the resumed run added its 8 steps on top of the stored counters instead of counting from zero
+    assert consumed(resumed_dir, "step-00000020-tiny.pth") == consumed(full_dir, "step-00000020-tiny.pth")
 
 
 @pytest.mark.slow

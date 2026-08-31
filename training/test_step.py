@@ -14,7 +14,7 @@ import torch
 
 from model import RecurrentGPT, build_model
 from training.backend import SingleDeviceBackend
-from training.data import Batch, IGNORE_INDEX, SampleBatch, StageDataloaders
+from training.data import IGNORE_INDEX, Batch, SampleBatch, StageDataloaders, build_stage_dataloaders
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import resolve_dataset
 from training.data.tokenizer import Tokenizer
@@ -29,9 +29,9 @@ from training.run import build_run_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager, TrainingStage
 from training.step import (
+    BatchStream,
     StepResult,
     TrainingProgress,
-    micro_batch_stream,
     run_one_optimizer_step,
     scheduled_learning_rate,
 )
@@ -355,12 +355,12 @@ def _tags(stream: Iterator[Batch], n: int) -> list[str]:
     return [next(stream)[2][0] for _ in range(n)]  # never pull an extra element (zip would)
 
 
-def test_micro_batch_stream_samples_by_transition_progress(
+def test_batch_stream_samples_by_transition_progress(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
     progress = TrainingProgress(step=3)  # plain stage 0
-    stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+    stream = BatchStream(settings, loaders, stage_manager, progress)
     assert _tags(stream, 4) == ["a"] * 4
     progress.step = 6  # transition 0 -> 1, progress 0: everything still from stage 0
     assert _tags(stream, 4) == ["a"] * 4
@@ -373,14 +373,14 @@ def test_micro_batch_stream_samples_by_transition_progress(
     assert _tags(stream, 4) == ["c"] * 4
 
 
-def test_micro_batch_stream_reads_the_step_lazily(
+def test_batch_stream_reads_the_step_lazily(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """The step is read when the first micro-batch of a world batch is requested, not when the stream is created and
     not again inside the world batch."""
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
     progress = TrainingProgress(step=0)
-    stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+    stream = BatchStream(settings, loaders, stage_manager, progress)
     progress.step = 8  # changed before the first request: the world batch is stage 1's
     assert _tags(stream, 2) == ["b"] * 2
     progress.step = 19  # changed inside the world batch: the remaining two micro-batches still belong to step 8
@@ -388,7 +388,7 @@ def test_micro_batch_stream_reads_the_step_lazily(
     assert _tags(stream, 4) == ["c"] * 4  # the next world batch reads step 19
 
 
-def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(
+def test_batch_stream_transition_rng_is_seeded_with_the_start_step(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """Two streams created at the same `seed + step` draw the same mix; a different start step draws another (the
@@ -398,7 +398,7 @@ def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(
     def mix(start_step: int) -> list[str]:
         loaders = StageDataloaders([_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
         progress = TrainingProgress(step=start_step)
-        stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+        stream = BatchStream(settings, loaders, stage_manager, progress)
         progress.step = 15
         return _tags(stream, 40)
 
@@ -406,11 +406,11 @@ def test_micro_batch_stream_transition_rng_is_seeded_with_the_start_step(
     assert mix(0) != mix(14)
 
 
-def test_micro_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
+def test_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, True, stream_tokenizer, padding_multiple=4)
     assert settings.gradient_accumulation_steps == 4
     progress = TrainingProgress()
-    stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+    stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(3):  # every world batch (4 micro-batches) arrives sorted by length, padded to its own width
         batches = [next(stream) for _ in range(4)]
         lengths = [int((b[1] != IGNORE_INDEX).sum()) for b in batches]  # supervised = sample length - 1
@@ -420,12 +420,12 @@ def test_micro_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Pat
     unsorted_settings, unsorted_loaders, _ = _stream_setup(
         tmp_path, tiny_dataset_dir, False, stream_tokenizer, padding_multiple=4
     )
-    raw = micro_batch_stream(unsorted_settings, unsorted_loaders, stage_manager, TrainingProgress())
+    raw = BatchStream(unsorted_settings, unsorted_loaders, stage_manager, TrainingProgress())
     lengths = [int((next(raw)[1] != IGNORE_INDEX).sum()) for _ in range(4)]
     assert lengths == [1, 2, 3, 4]  # loader order, untouched
 
 
-def test_micro_batch_stream_fills_the_world_batch_from_short_worker_batches(
+def test_batch_stream_fills_the_world_batch_from_short_worker_batches(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """Regression (T-M3/T-M4): a short or empty worker batch — a loader reaching its last rows, or a batch whose rows
@@ -435,12 +435,100 @@ def test_micro_batch_stream_fills_the_world_batch_from_short_worker_batches(
     assert (settings.gradient_accumulation_steps, settings.world_batch_size) == (2, 4)
     loaders = StageDataloaders([_ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"], [], stream_tokenizer)
     progress = TrainingProgress()
-    stream = micro_batch_stream(settings, loaders, stage_manager, progress)
+    stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(6):
         batches = [next(stream) for _ in range(settings.gradient_accumulation_steps)]
         assert [b[0].shape[0] for b in batches] == [settings.micro_batch_size] * settings.gradient_accumulation_steps
         assert sum(len(b[2]) for b in batches) == settings.world_batch_size
         progress.advance()
+
+
+# --------------------------------------------------------------------------------------------------------------
+# BatchStream state: what a checkpoint stores and what a resume does with it
+
+
+def test_batch_stream_counts_the_rows_it_consumed(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
+    progress = TrainingProgress()
+    stream = BatchStream(settings, loaders, stage_manager, progress)
+    assert stream.state_dict()["consumed_rows"] == {}
+    for _ in range(3):
+        for _ in range(settings.gradient_accumulation_steps):
+            next(stream)
+        progress.advance()
+    # three world batches of `world_batch_size` samples, all from stage 0's loader (no transition at steps 0-2)
+    assert stream.state_dict()["consumed_rows"] == {"a": 3 * settings.world_batch_size}
+
+
+def test_batch_stream_state_round_trip(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
+    """`load_state_dict` restores the row counters and the transition RNG, so a stream resumed from the state draws
+    the same transition mix as the one it was taken from."""
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
+    progress = TrainingProgress(step=15)  # inside the 1 -> 2 transition: the rng is consumed
+    stream = BatchStream(settings, loaders, stage_manager, progress)
+    _tags(stream, 8)
+    state = stream.state_dict()
+    continued = _tags(stream, 12)
+
+    fresh_loaders = StageDataloaders([_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
+    resumed = BatchStream(settings, fresh_loaders, stage_manager, TrainingProgress(step=15))
+    resumed.load_state_dict(state)
+    assert resumed.state_dict()["consumed_rows"] == state["consumed_rows"]
+    assert _tags(resumed, 12) == continued
+
+
+def test_batch_stream_load_state_dict_sets_the_loader_offsets(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
+    """The counters become a per-dataset row offset (modulo the range), which is what makes a resume skip the rows
+    the interrupted run consumed."""
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    dataset = resolve_dataset(settings)
+    loaders = build_stage_dataloaders(settings, dataset, cpu_backend)
+    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    parquet = loaders.train_datasets(0)[0]
+    state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "transition_rng": stream.rng.getstate()}
+    stream.load_state_dict(state)
+    assert parquet.resume_offset == 5  # wrapped around one epoch
+    assert all(d.resume_offset == 0 for d in loaders.train_datasets(2))  # untouched entries stay at the start
+
+
+def test_batch_stream_resume_does_not_repeat_rows(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
+    """The point of checkpointing the stream: a stream restored from a state continues into rows the first one had
+    not reached, while a stream that only restarts the loaders serves the very same rows again."""
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    dataset = resolve_dataset(settings)
+    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+
+    def fresh_stream() -> BatchStream:
+        loaders = build_stage_dataloaders(settings, dataset, cpu_backend)
+        return BatchStream(settings, loaders, stage_manager, TrainingProgress())
+
+    def rows(stream: BatchStream, world_batches: int) -> list[tuple[int, ...]]:
+        """The first 20 tokens of every sample of `world_batches` world batches — a row identity that survives the
+        different padding widths of two runs. Only plain stage-0 steps, so no transition draw is involved."""
+        seen: list[tuple[int, ...]] = []
+        for _ in range(world_batches):
+            for _ in range(settings.gradient_accumulation_steps):
+                input_ids, _, _ = next(stream)
+                seen += [tuple(row[:20].tolist()) for row in input_ids]
+            stream.progress.advance()
+        return seen
+
+    stream = fresh_stream()
+    before = rows(stream, 3)
+    state = stream.state_dict()
+    assert len(set(before)) == len(before) == 3 * settings.world_batch_size
+
+    resumed = fresh_stream()
+    resumed.load_state_dict(state)
+    assert not set(before) & set(rows(resumed, 3))
+    assert rows(fresh_stream(), 3) == before  # without the state the rows are read from the top again
 
 
 # --------------------------------------------------------------------------------------------------------------

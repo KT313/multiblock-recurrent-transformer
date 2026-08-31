@@ -9,6 +9,7 @@ from typing import Iterable, TypeVar
 import pyarrow.parquet as pq
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from training.backend import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, collate_samples
@@ -22,7 +23,7 @@ from training.data.loader import (
     sample_stage_batch,
     world_batch_micro_batches,
 )
-from training.data.datasets import ParquetTextDataset
+from training.data.datasets import ParquetTextDataset, Row
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings, parse_settings
 
@@ -55,7 +56,8 @@ def _loader(
     shard: tuple[int, int] = (0, 1),
     padding_multiple: int | None = None,
     block_size: int = 64,
-) -> Iterable[Batch]:
+    padded: bool = True,
+) -> DataLoader[Row]:
     return build_dataloader(
         entries,
         tokenizer,
@@ -65,6 +67,7 @@ def _loader(
         seed=seed,
         shard=shard,
         padding_multiple=padding_multiple,
+        padded=padded,
     )
 
 
@@ -268,6 +271,34 @@ def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
     assert sd._train_iterators[0] is None
     assert _first(sd.next_train_batch(1)) == 1
     assert _first(sd.next_train_batch(0)) == 0
+
+
+def test_train_datasets_reaches_through_a_single_dataset_and_a_mixture(
+    tokenizer: Tokenizer, entries: list[DataEntry]
+) -> None:
+    loaders = StageDataloaders([_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries, tokenizer, 2, padded=False)], [], tokenizer)
+    assert [d.prefix for d in loaders.train_datasets(0)] == ["pre"]
+    assert [d.prefix for d in loaders.train_datasets(1)] == ["pre", "ft"]
+    assert StageDataloaders([_tagged("s0", 1)], [], tokenizer).train_datasets(0) == []  # a plain list of batches
+
+
+def test_set_and_clear_resume_offsets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    loaders = StageDataloaders([_loader(entries, tokenizer, 2, padded=False)], [], tokenizer)
+    loaders.set_resume_offsets({"pre": 3, "gone": 9})  # a prefix no dataset has is ignored
+    assert [d.resume_offset for d in loaders.train_datasets(0)] == [3, 0]
+    loaders.clear_resume_offsets(0)
+    assert [d.resume_offset for d in loaders.train_datasets(0)] == [0, 0]
+
+
+def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    """The first epoch after a resume starts at the offset; once it ends, the loader reads its whole range again."""
+    entry = DataEntry("pre", str(tiny_pretrain_dir))
+    total = _rows_in(tiny_pretrain_dir)
+    loaders = StageDataloaders([build_dataloader([entry], tokenizer, 64, 1, padded=False)], [], tokenizer)
+    loaders.set_resume_offsets({"pre": total - 2})
+    first_epoch = [loaders.next_train_batch(0)[0][2] for _ in range(2)]
+    assert first_epoch == ["pre", "pre"] and loaders.train_datasets(0)[0].resume_offset == 0
+    assert len([loaders.next_train_batch(0) for _ in range(total)]) == total  # the restart reads every row
 
 
 def test_sample_stage_batch_outside_transition_is_current(tokenizer: Tokenizer) -> None:

@@ -553,6 +553,7 @@ def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMe
         model_config={},
         dataset_config_hash=config_hash,
         validation_rows=validation_rows,
+        data_stream={},
     )
 
 

@@ -2,8 +2,8 @@
 """Checkpoint schema, naming, search, save/load through the backend. Steps in file names are OPTIMIZER steps.
 
 A checkpoint is one `torch.save` dict: the two state dicts `"model"` / `"optimizer"` plus the fields of
-`CheckpointMetadata` (`step`, `stage`, `rng`, `settings`, `model_config`, `dataset_config_hash`, `validation_rows`).
-`dataset_config_hash` and `validation_rows` are verified on resume by
+`CheckpointMetadata` (`step`, `stage`, `rng`, `settings`, `model_config`, `dataset_config_hash`, `validation_rows`,
+`data_stream`). `dataset_config_hash` and `validation_rows` are verified on resume by
 `training.data.dataset_resolver.check_dataset_unchanged`; `rng` is `Backend.rng_state()`. There is no loader for
 older layouts (clean break, a standing decision): `CheckpointMetadata.from_state` raises on a missing key.
 """
@@ -36,6 +36,7 @@ class CheckpointMetadata:
     model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
+    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: consumed rows + the transition RNG
 
     def to_state(self) -> dict[str, Any]:
         """The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied)."""

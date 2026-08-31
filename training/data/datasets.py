@@ -29,6 +29,10 @@ class ParquetTextDataset(IterableDataset[Row]):
     is clipped to the rows that exist. One pass of ``__iter__`` is one epoch over the range. Rows of the range are
     dealt round-robin across ``world * num_workers`` shards: shard ``rank * num_workers + worker_id`` takes every
     ``num_shards``-th row of the range, so all shards together yield every row of the range exactly once.
+
+    ``set_resume_offset`` starts the NEXT epoch that many rows into the range — how a resume skips the rows the
+    interrupted run already trained on. It is one-shot: ``__iter__`` clears it, so every later epoch is the whole
+    range again (a permanent offset would hide the rows before it forever).
     """
 
     def __init__(
@@ -62,10 +66,18 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.start = min(skip_rows, self.total_rows)  # first row of the range (directory index)
         self.stop = self.total_rows if max_rows is None else min(self.total_rows, self.start + max_rows)
         self.num_rows = self.stop - self.start
+        self.resume_offset = 0  # rows of the range the next epoch skips; see `set_resume_offset`
 
     def __len__(self) -> int:
         """Rows in the range over all shards (one epoch)."""
         return self.num_rows
+
+    def set_resume_offset(self, rows: int) -> None:
+        """Skip the first `rows` rows of the range in the next epoch (taken modulo the range, so more consumed rows
+        than the range holds wrap around to where the last epoch stood)."""
+        if rows < 0:
+            raise ValueError(f"{self.prefix}: resume offset must be non-negative, got {rows}")
+        self.resume_offset = rows % self.num_rows if self.num_rows else 0
 
     def _shard(self) -> tuple[int, int]:
         """(shard_id, num_shards) for the calling process/worker; the single place sharding is decided."""
@@ -109,15 +121,18 @@ class ParquetTextDataset(IterableDataset[Row]):
 
     def __iter__(self) -> Iterator[Row]:
         shard_id, num_shards = self._shard()
+        offset, self.resume_offset = self.resume_offset, 0  # one-shot: only this epoch starts inside the range
         keys: list[str] = list(self.data_signature["keys"])
         logger.info(
-            f"{self.prefix}: shard {shard_id}/{num_shards} over rows [{self.start}, {self.stop}) "
-            f"({self.num_rows} rows) in {self.data_dir}"
+            f"{self.prefix}: shard {shard_id}/{num_shards} over rows [{self.start + offset}, {self.stop}) "
+            f"({self.num_rows - offset} of {self.num_rows} rows) in {self.data_dir}"
         )
         for range_idx, batch in self._range_batches(keys):
+            if range_idx + batch.num_rows <= offset:  # entirely before the resume offset: never decoded
+                continue
             record: Row
             for record in batch.to_pylist():
-                if range_idx % num_shards == shard_id:
+                if range_idx >= offset and range_idx % num_shards == shard_id:
                     record["data_signature"] = self.data_signature
                     record["data_id"] = self.prefix
                     yield record

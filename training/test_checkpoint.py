@@ -55,6 +55,7 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
         "model_config": model.config.to_dict(),
         "dataset_config_hash": "abc123",
         "validation_rows": {"synthetic_pretrain": 3, "synthetic_instruct": 1},
+        "data_stream": {"consumed_rows": {"pretrain_a-synthetic_pretrain": 12}, "transition_rng": (3, (1, 2), None)},
     }
     return CheckpointMetadata(**(values | overrides))
 
@@ -65,7 +66,9 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
 def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
     metadata = _metadata(backend, tiny_model, step=7)
     state = metadata.to_state()
-    assert set(state) == {"step", "stage", "rng", "settings", "model_config", "dataset_config_hash", "validation_rows"}
+    assert set(state) == {
+        "step", "stage", "rng", "settings", "model_config", "dataset_config_hash", "validation_rows", "data_stream"
+    }
     assert state["rng"] is metadata.rng  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
     assert restored == metadata
@@ -91,6 +94,7 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
         "model_config",
         "dataset_config_hash",
         "validation_rows",
+        "data_stream",
     ]
 
 

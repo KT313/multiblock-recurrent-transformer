@@ -14,10 +14,10 @@ one world batch of `gradient_accumulation_steps` micro-batches, one `optimizer.s
 """
 
 import random
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -73,9 +73,7 @@ class StepResult:
     validation: dict[str, Tensor] | None = None  # filled by `train()` when it is an evaluation step
 
 
-def micro_batch_stream(
-    settings: Settings, loaders: StageDataloaders, stage_manager: StageManager, progress: TrainingProgress
-) -> Iterator[Batch]:
+class BatchStream:
     """Endless stream of micro-batches; every `gradient_accumulation_steps` of them belong to one optimizer step.
 
     One world batch at a time: the stream pulls worker batches of tokenized, unpadded samples until it holds
@@ -85,39 +83,84 @@ def micro_batch_stream(
     reaching the end of its rows) or when a row without a supervised label was dropped: the stream pulls one more
     worker batch and carries the surplus samples over to the next world batch.
 
+    It is also the checkpointable part of the data path (`state_dict` / `load_state_dict`, stored as
+    `CheckpointMetadata.data_stream`): it counts the rows it consumed per data entry and keeps the transition RNG.
+
     Numerics: the stream reads `progress.step` once per world batch, lazily, when the first micro-batch of that step
     is requested (after the previous step advanced the counter). Inside a stage transition each worker batch comes
     from the next stage's loader with probability `transition_progress`, drawn from `random.Random(settings.seed +
-    progress.step)` — created here, at call time, i.e. seeded with the resume step (the stream is created once after
-    the resume); `rng.random()` is consumed only inside a transition, once per pulled worker batch (= once per
-    micro-batch as long as no batch is short). Loader iterators are created lazily by
-    `StageDataloaders.next_train_batch`, each `iter(DataLoader)` drawing one base seed from the global torch RNG —
-    all pulls of a world batch now happen before its first forward (with `sort_batches_by_length` they always did,
-    the sorter buffered the whole window; without it they used to be interleaved with the forwards).
+    progress.step)` — created here, at construction time, i.e. seeded with the resume step (the stream is created
+    once after the resume) unless `load_state_dict` restores the stored state; `rng.random()` is consumed only
+    inside a transition, once per pulled worker batch (= once per micro-batch as long as no batch is short). Loader
+    iterators are created lazily by `StageDataloaders.next_train_batch`, each `iter(DataLoader)` drawing one base
+    seed from the global torch RNG — all pulls of a world batch happen before its first forward (with
+    `sort_batches_by_length` they always did, the sorter buffered the whole window; without it they used to be
+    interleaved with the forwards).
     """
-    rng = random.Random(settings.seed + progress.step)
 
-    def stream() -> Iterator[Batch]:
-        surplus: list[Sample] = []
+    def __init__(
+        self, settings: Settings, loaders: StageDataloaders, stage_manager: StageManager, progress: TrainingProgress
+    ) -> None:
+        self.settings = settings
+        self.loaders = loaders
+        self.stage_manager = stage_manager
+        self.progress = progress
+        self.rng = random.Random(settings.seed + progress.step)
+        self.consumed_rows: dict[str, int] = {}  # data entry prefix (`<stage>-<source>`) -> rows delivered so far
+        self._surplus: list[Sample] = []
+        self._micro_batches = self._stream()
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self
+
+    def __next__(self) -> Batch:
+        return next(self._micro_batches)
+
+    def state_dict(self) -> dict[str, Any]:
+        """What a checkpoint stores: the consumed rows per data entry and the transition RNG state."""
+        return {"consumed_rows": dict(self.consumed_rows), "transition_rng": self.rng.getstate()}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it
+        and the transition RNG picks its state back up (instead of re-seeding with `seed + resume step`).
+
+        This is "no repeated rows", not "the same order": the mixture draws live inside the dataloader workers and
+        are not replayed, and the worker sharding regroups the remaining rows, so a mid-stage resume trains on the
+        rows the interrupted run had not reached yet, in an order of its own. Rows dropped in a worker (no
+        supervised label) never reach this counter, so a resume may re-read — and drop again — those few rows.
+        """
+        self.consumed_rows = {str(prefix): int(rows) for prefix, rows in state["consumed_rows"].items()}
+        self.rng.setstate(state["transition_rng"])
+        self.loaders.set_resume_offsets(self.consumed_rows)
+
+    def _pull(self, stage: StageInfo) -> list[Sample]:
+        """One worker batch (from the transition mix), counted against its data entry."""
+        samples = sample_stage_batch(
+            self.loaders, stage.stage_idx, stage.prev_stage_idx, stage.transition_progress, self.rng
+        )
+        for _, _, data_id in samples:
+            self.consumed_rows[data_id] = self.consumed_rows.get(data_id, 0) + 1
+        return samples
+
+    def _stream(self) -> Iterator[Batch]:
         while True:
-            stage = stage_manager.get_stage_info(progress.step)
-            samples, surplus = surplus, []
-            while len(samples) < settings.world_batch_size:
-                samples += sample_stage_batch(
-                    loaders, stage.stage_idx, stage.prev_stage_idx, stage.transition_progress, rng
-                )
-            samples, surplus = samples[: settings.world_batch_size], samples[settings.world_batch_size :]
+            stage = self.stage_manager.get_stage_info(self.progress.step)
+            samples, self._surplus = self._surplus, []
+            while len(samples) < self.settings.world_batch_size:
+                samples += self._pull(stage)
+            samples, self._surplus = (
+                samples[: self.settings.world_batch_size],
+                samples[self.settings.world_batch_size :],
+            )
             yield from world_batch_micro_batches(
                 samples,
-                settings.micro_batch_size,
-                loaders.tokenizer,
-                settings.block_size,
-                sort_by_length=settings.sort_batches_by_length,
-                padding_multiple=settings.sequence_padding_multiple,
+                self.settings.micro_batch_size,
+                self.loaders.tokenizer,
+                self.settings.block_size,
+                sort_by_length=self.settings.sort_batches_by_length,
+                padding_multiple=self.settings.sequence_padding_multiple,
                 ignore_index=IGNORE_INDEX,
             )
-
-    return stream()
 
 
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:
