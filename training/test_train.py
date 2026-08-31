@@ -213,16 +213,40 @@ def test_main_maps_a_stop_during_training_to_130(monkeypatch: pytest.MonkeyPatch
 # --- console logging ---------------------------------------------------------------------------------------------------
 
 
-def test_configure_console_logging_routes_training_records_to_stderr(
-    capsys: pytest.CaptureFixture[str], detached_training_handlers: logging.Logger
+@pytest.fixture
+def detached_data_preparation_handlers() -> Iterator[logging.Logger]:
+    """The `data_preparation` logger with no handler for the test (an earlier `configure_logging` of the session may
+    have left one bound to a since-closed capture stream); its handlers and level are put back afterwards."""
+    data_logger = logging.getLogger("data_preparation")
+    before = list(data_logger.handlers)
+    level = data_logger.level
+    for handler in before:
+        data_logger.removeHandler(handler)
+    yield data_logger
+    for handler in list(data_logger.handlers):
+        data_logger.removeHandler(handler)
+        handler.close()
+    for handler in before:
+        data_logger.addHandler(handler)
+    data_logger.setLevel(level)
+
+
+def test_configure_console_logging_routes_training_and_data_preparation_records_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+    detached_training_handlers: logging.Logger,
+    detached_data_preparation_handlers: logging.Logger,
 ) -> None:
-    """One stderr handler on the `training` logger (idempotent) at INFO, so `RunLogger`'s `training.logger` records
-    reach the terminal in the formatted line format of the data-prep CLI."""
+    """One stderr handler each on the `training` and the `data_preparation` logger (idempotent) at INFO, so
+    `RunLogger`'s `training.logger` records and the dataset resolver's `data_preparation.*` records both reach the
+    terminal in the line format of the data-prep CLI (the resolver itself configures nothing)."""
     training_logger = train_module.configure_console_logging()
     train_module.configure_console_logging()
     assert training_logger is detached_training_handlers and training_logger.level == logging.INFO
-    handlers = [h for h in training_logger.handlers if isinstance(h, ProgressStreamHandler)]
-    assert len(handlers) == 1
+    for configured in (training_logger, detached_data_preparation_handlers):
+        handlers = [h for h in configured.handlers if isinstance(h, ProgressStreamHandler)]
+        assert len(handlers) == 1 and configured.level == logging.INFO
     logging.getLogger("training.logger").info("Total training steps: 20 (2 micro-batches each)")
-    err = capsys.readouterr().err
-    assert err.rstrip().endswith("INFO training.logger: Total training steps: 20 (2 micro-batches each)")
+    logging.getLogger("data_preparation.training.data.dataset_resolver").info("source a: 40 processed rows, all training")
+    lines = capsys.readouterr().err.rstrip().splitlines()
+    assert lines[-2].endswith("INFO training.logger: Total training steps: 20 (2 micro-batches each)")
+    assert lines[-1].endswith("INFO data_preparation.training.data.dataset_resolver: source a: 40 processed rows, all training")

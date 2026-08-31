@@ -10,7 +10,7 @@ This repository contains the code for my thesis "Efficient Large Language Models
 The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
 Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
-- a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
+- a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
 - HuggingFace export path (`model/hf/modeling.py`)
 - dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, stages with token budgets and weights, and the tokenizer in one YAML; downloaded and built incrementally and verified before training
 
@@ -48,7 +48,7 @@ from the config) and `docs/multistage_training.md` for the stage mechanism.
 
 ```
 model/             architecture (RecurrentGPT, config, HF export)
-training/          train.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
+training/          train.py (CLI), run.py (train()), step.py, evaluation.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
 data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
 dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers

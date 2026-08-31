@@ -4,7 +4,7 @@ The thesis runs train through three phases (broad pretraining → domain
 upsampling → instruction finetuning) in a single launch, with smooth dataset
 transitions between phases. This document describes the mechanism; the
 implementation lives in `training/stage_manager.py` with its integration in
-`training/train.py` (LR schedule, transition detection, stage checkpoints, metrics).
+`training/run.py` / `training/step.py` (LR schedule, transition detection, stage checkpoints, metrics).
 
 ## What a stage specifies
 

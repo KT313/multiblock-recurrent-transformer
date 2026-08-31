@@ -20,7 +20,7 @@ class Settings:
     dataset_config: str  # path to config/datasets/<name>.yaml
     model_architecture_config: str  # path to config/model_architecture/<name>.yaml
 
-    # Data: `training/train.py` verifies the prepared data and, with `auto_prepare`, builds what is missing
+    # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command

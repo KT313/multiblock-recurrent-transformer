@@ -47,12 +47,12 @@ def get_param_groups(
     return param_groups
 
 
-def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], **cfg: Any) -> Optimizer:
+def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], **options: Any) -> Optimizer:
     """Construct "AdamW" (torch) or "ELLISAdam" from the `optim_config` keyword arguments."""
     if name == "ELLISAdam":
-        return ELLISAdam(params, **cfg)
+        return ELLISAdam(params, **options)
     if name == "AdamW":
-        return torch.optim.AdamW(params, **cfg)
+        return torch.optim.AdamW(params, **options)
     raise ValueError(f"Invalid optimizer {name!r} requested (use 'AdamW' or 'ELLISAdam').")
 
 

@@ -27,7 +27,7 @@ from types import FrameType
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python training/train.py` from the repo root
 
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler
+from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
 from training.settings import parse_settings
 
@@ -85,13 +85,14 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
 
 
 def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
-    """Attach one stderr stream handler to the `training` logger so `RunLogger`'s lines reach the terminal; idempotent.
+    """Attach one stderr stream handler each to the `training` and the `data_preparation` logger hierarchies, so
+    `RunLogger`'s lines and the dataset resolver's (which logs under `data_preparation`) reach the terminal; idempotent.
 
-    The CLI's job (library code does not configure logging): the same handler type and line format as
-    `data_preparation.lib.log.configure_logging`, which `resolve_dataset` still calls for the `data_preparation`
-    hierarchy (task 9 moves that call here). Task 10's dashboard swaps this plain stream handler out for the run and
-    restores it afterwards.
+    The CLI's job — library code does not configure logging. Both hierarchies get the same handler type and line
+    format (`data_preparation.lib.log.configure_logging` for the data-prep one). Task 10's dashboard swaps the
+    `training` stream handler out for the run and restores it afterwards. Returns the `training` logger.
     """
+    configure_logging(level)  # the `data_preparation` hierarchy: the resolver's status table, split and build lines
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     training_logger.setLevel(level)
     handler = next((h for h in training_logger.handlers if isinstance(h, ProgressStreamHandler)), None)

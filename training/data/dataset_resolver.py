@@ -28,7 +28,7 @@ from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.build import prepare, status, summarize_dataset_state
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger
+from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
 from training.settings import Settings
@@ -104,7 +104,7 @@ def build_command(dataset_config: str, dataset_dir: str) -> str:
 # --- the validation split ---------------------------------------------------------------------------------------------
 
 
-def validation_rows_of(cfg: DatasetConfig, source_name: str, total_rows: int) -> int:
+def validation_rows_of(dataset_config: DatasetConfig, source_name: str, total_rows: int) -> int:
     """How many of the first rows of `processed/<source>` (`total_rows` in all) are validation rows.
 
     Every row of a source used only for validation, none of a source used only for training (its
@@ -112,9 +112,9 @@ def validation_rows_of(cfg: DatasetConfig, source_name: str, total_rows: int) ->
     The fraction is multiplied as the decimal written in the YAML (`Fraction(str(...))`): a float product such as
     `0.07 × 100 = 7.000000000000001` would otherwise round up one row too many.
     """
-    if not cfg.used_in_train(source_name):
+    if not dataset_config.used_in_train(source_name):
         return total_rows
-    return ceil(Fraction(str(cfg.validation_fraction_of(source_name))) * total_rows)
+    return ceil(Fraction(str(dataset_config.validation_fraction_of(source_name))) * total_rows)
 
 
 def _rows_on_disk(directory: Path, what: str) -> int:
@@ -143,27 +143,27 @@ def processed_rows(directory: Path, what: str) -> int:
     return rows_on_disk
 
 
-def _stage_keys(cfg: DatasetConfig, source_name: str) -> str:
+def _stage_keys(dataset_config: DatasetConfig, source_name: str) -> str:
     """`pretrain_a.train, pretrain_a.val, ...`: where a source is used (for error messages)."""
-    keys = [f"{stage.name}.train" for stage in cfg.stages if source_name in stage.train]
-    keys += [f"{stage.name}.val" for stage in cfg.stages if source_name in stage.val]
+    keys = [f"{stage.name}.train" for stage in dataset_config.stages if source_name in stage.train]
+    keys += [f"{stage.name}.val" for stage in dataset_config.stages if source_name in stage.val]
     return ", ".join(keys)
 
 
-def resolve_splits(cfg: DatasetConfig, layout: DatasetLayout) -> dict[str, int]:
+def resolve_splits(dataset_config: DatasetConfig, layout: DatasetLayout) -> dict[str, int]:
     """`{source: validation_rows}` for every source of the config, from the rows in `processed/<source>` on disk
     (footers cross-checked against the manifest). Decided once per run; every stage uses the same split."""
     splits: dict[str, int] = {}
-    for name in cfg.sources:
+    for name in dataset_config.sources:
         directory = layout.processed_dir(name)
-        total = processed_rows(directory, f"source {name!r} (stage keys {_stage_keys(cfg, name)})")
-        validation = validation_rows_of(cfg, name, total)
+        total = processed_rows(directory, f"source {name!r} (stage keys {_stage_keys(dataset_config, name)})")
+        validation = validation_rows_of(dataset_config, name, total)
         if validation == 0:
             detail = "all training"
         elif validation == total:
             detail = "all validation"
         else:
-            detail = f"rows [0, {validation}) validation ({cfg.validation_fraction_of(name):.1%}), [{validation}, {total}) training"
+            detail = f"rows [0, {validation}) validation ({dataset_config.validation_fraction_of(name):.1%}), [{validation}, {total}) training"
         log.info("source %s: %d processed rows, %s", name, total, detail)
         splits[name] = validation
     return splits
@@ -173,13 +173,13 @@ def resolve_splits(cfg: DatasetConfig, layout: DatasetLayout) -> dict[str, int]:
 
 
 def _data_entry(
-    cfg: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float, part: Part, validation_rows: int
+    dataset_config: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float, part: Part, validation_rows: int
 ) -> DataEntry:
     """The `DataEntry` for one stage key (a source name): its `processed/<source>` folder, read through the text
     column (pretrain) or the instruction/input/output signature (instruct), restricted to the validation rows
     `[0, validation_rows)` (part `val`) or the training rows from `validation_rows` on (part `train`)."""
     prefix = f"{stage_name}-{key}"
-    signature = dict(INSTRUCT_DATA_SIGNATURE) if cfg.sources[key].kind == "instruct" else None
+    signature = dict(INSTRUCT_DATA_SIGNATURE) if dataset_config.sources[key].kind == "instruct" else None
     skip_rows, max_rows = (0, validation_rows) if part == "val" else (validation_rows, None)
     return DataEntry(
         prefix=prefix,
@@ -192,14 +192,14 @@ def _data_entry(
 
 
 def _entries(
-    cfg: DatasetConfig,
+    dataset_config: DatasetConfig,
     layout: DatasetLayout,
     stage_name: str,
     keys: dict[str, float],
     part: Part,
     validation_rows: Mapping[str, int],
 ) -> list[DataEntry]:
-    entries = [_data_entry(cfg, layout, stage_name, key, weight, part, validation_rows[key]) for key, weight in keys.items()]
+    entries = [_data_entry(dataset_config, layout, stage_name, key, weight, part, validation_rows[key]) for key, weight in keys.items()]
     prefixes = [entry.prefix for entry in entries]
     if len(set(prefixes)) != len(prefixes):
         raise ValueError(f"stage {stage_name}: duplicate data entry prefixes in {prefixes}")
@@ -207,7 +207,7 @@ def _entries(
 
 
 def resolve_entries(
-    cfg: DatasetConfig, layout: DatasetLayout, stage: StageConfig, validation_rows: Mapping[str, int]
+    dataset_config: DatasetConfig, layout: DatasetLayout, stage: StageConfig, validation_rows: Mapping[str, int]
 ) -> tuple[list[DataEntry], list[DataEntry]]:
     """`(train_data, val_data)` of one dataset-config stage.
 
@@ -217,8 +217,8 @@ def resolve_entries(
     `validation_rows` to the end. Prefixes are `<stage>-<key>` and unique per stage. Pure path arithmetic, no I/O.
     """
     return (
-        _entries(cfg, layout, stage.name, stage.train, "train", validation_rows),
-        _entries(cfg, layout, stage.name, stage.val, "val", validation_rows),
+        _entries(dataset_config, layout, stage.name, stage.train, "train", validation_rows),
+        _entries(dataset_config, layout, stage.name, stage.val, "val", validation_rows),
     )
 
 
@@ -248,19 +248,19 @@ def check_entries_on_disk(stages: list[ResolvedStage]) -> None:
 # --- run config <-> dataset config ----------------------------------------------------------------------------------
 
 
-def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
+def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None:
     """The two cross-checks between run config and dataset config: one base LR per stage, and the same
     `block_size` (the planner counted sequences with the dataset config's; `block_size <= max_seq_length` follows
     from the dataset-config schema)."""
-    if len(settings.stage_base_lrs) != len(cfg.stages):
+    if len(settings.stage_base_lrs) != len(dataset_config.stages):
         raise ValueError(
             f"stage_base_lrs has {len(settings.stage_base_lrs)} entries but dataset config "
-            f"{settings.dataset_config!r} ({cfg.name}) has {len(cfg.stages)} stages "
-            f"{[s.name for s in cfg.stages]}; give one base LR per stage, in order"
+            f"{settings.dataset_config!r} ({dataset_config.name}) has {len(dataset_config.stages)} stages "
+            f"{[s.name for s in dataset_config.stages]}; give one base LR per stage, in order"
         )
-    if settings.block_size != cfg.block_size:
+    if settings.block_size != dataset_config.block_size:
         raise ValueError(
-            f"block_size {settings.block_size} of the run config does not match block_size {cfg.block_size} of dataset "
+            f"block_size {settings.block_size} of the run config does not match block_size {dataset_config.block_size} of dataset "
             f"config {settings.dataset_config!r}; the planner sized the data in sequences of the dataset config's "
             "block_size, so the two must be equal"
         )
@@ -268,7 +268,7 @@ def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
 
 def _ensure_prepared(
     settings: Settings,
-    cfg: DatasetConfig,
+    dataset_config: DatasetConfig,
     layout: DatasetLayout,
     backend: Optional[_MainRankBarrier],
     should_stop: StopCheck | None = None,
@@ -291,7 +291,7 @@ def _ensure_prepared(
             + build_command(settings.dataset_config, settings.dataset_dir)
         )
 
-    log.info("dataset %s is incomplete, preparing missing data (%s)", cfg.name, missing)
+    log.info("dataset %s is incomplete, preparing missing data (%s)", dataset_config.name, missing)
     if backend is None or backend.is_main:
         with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
             prepare(
@@ -307,7 +307,7 @@ def _ensure_prepared(
     if backend is not None:
         backend.barrier()
 
-    report = summarize_dataset_state(cfg, layout)  # `prepare` already logged the final status table; re-verify silently
+    report = summarize_dataset_state(dataset_config, layout)  # `prepare` already logged the final status table; re-verify silently
     if not report.complete:
         raise RuntimeError(
             f"dataset config {settings.dataset_config!r} is still incomplete after preparing: "
@@ -326,16 +326,15 @@ def resolve_dataset(
     Raises `RuntimeError` when data is missing and cannot / must not be prepared here, or when a folder on disk
     does not match its manifest or leaves a used part of the split empty.
     """
-    configure_logging(logging.INFO)
-    cfg = load_dataset_config(settings.dataset_config)
-    validate_settings(settings, cfg)
+    dataset_config = load_dataset_config(settings.dataset_config)
+    validate_settings(settings, dataset_config)
     layout = DatasetLayout(Path(settings.dataset_dir))
-    _ensure_prepared(settings, cfg, layout, backend, should_stop)
-    validation_rows = resolve_splits(cfg, layout)
+    _ensure_prepared(settings, dataset_config, layout, backend, should_stop)
+    validation_rows = resolve_splits(dataset_config, layout)
 
     stages: list[ResolvedStage] = []
-    for stage, base_lr in zip(cfg.stages, settings.stage_base_lrs):
-        train_data, val_data = resolve_entries(cfg, layout, stage, validation_rows)
+    for stage, base_lr in zip(dataset_config.stages, settings.stage_base_lrs):
+        train_data, val_data = resolve_entries(dataset_config, layout, stage, validation_rows)
         stages.append(
             ResolvedStage(
                 name=stage.name,
@@ -348,9 +347,9 @@ def resolve_dataset(
         )
     check_entries_on_disk(stages)
     return ResolvedDataset(
-        config=cfg,
-        config_hash=cfg.config_hash(),
-        tokenizer_dir=str(layout.tokenizer_dir(cfg.tokenizer.name)),
+        config=dataset_config,
+        config_hash=dataset_config.config_hash(),
+        tokenizer_dir=str(layout.tokenizer_dir(dataset_config.tokenizer.name)),
         stages=stages,
         validation_rows=validation_rows,
     )
