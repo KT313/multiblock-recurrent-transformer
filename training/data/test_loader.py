@@ -100,6 +100,12 @@ def test_row_range_reaches_the_dataset(tokenizer: Tokenizer, tiny_pretrain_dir: 
     assert set(tags) == {"val", "train"}  # a mixture keeps every member's range
 
 
+def test_pin_memory_is_off_unless_requested(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    entries = [DataEntry("p", str(tiny_pretrain_dir))]
+    assert build_dataloader(entries, tokenizer, 64, 2).pin_memory is False
+    assert build_dataloader(entries, tokenizer, 64, 2, pin_memory=True).pin_memory is True
+
+
 def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
     d = str(tiny_pretrain_dir)
     with pytest.raises(ValueError, match="unique"):

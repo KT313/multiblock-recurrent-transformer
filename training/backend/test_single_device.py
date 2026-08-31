@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the single-device backend: device pick, autocast, clipping, checkpoint round trip, no-op collectives."""
+"""Tests for the single-device backend: device pick, autocast, clipping, checkpoint round trip, no-op collectives,
+RNG state round trip, device transfer and pin_memory."""
 
 import random
 import warnings
@@ -20,6 +21,7 @@ def test_registry_and_default_device() -> None:
     expected = "cuda" if torch.cuda.is_available() else "cpu"
     assert backend.device.type == expected
     assert (backend.world_size, backend.rank, backend.is_main) == (1, 0, True)
+    assert backend.pin_memory == (expected == "cuda")
     assert set(BACKENDS) == {"single_device"}
 
 
@@ -163,10 +165,66 @@ def test_seed_everything_is_reproducible() -> None:
     assert torch.equal(a[0], b[0]) and a[1:] == b[1:]
 
 
+def test_rng_state_round_trip(tmp_path: Path) -> None:
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    random.seed(5)
+    torch.manual_seed(5)
+    state = backend.rng_state()
+    assert set(state) >= {"python", "torch"}
+    assert ("cuda" in state) == torch.cuda.is_available()
+    expected = (random.random(), torch.rand(3))
+    backend.save_checkpoint(tmp_path / "rng.pth", {"rng": state})  # survives the checkpoint round trip
+    random.seed(77)
+    torch.manual_seed(77)
+    backend.set_rng_state(backend.load_checkpoint(tmp_path / "rng.pth")["rng"])
+    assert random.random() == expected[0]
+    assert torch.equal(torch.rand(3), expected[1])
+
+
+def test_set_rng_state_without_cuda_entry() -> None:
+    """A state written on a CPU-only machine (no "cuda" key) restores the python and torch generators."""
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    torch.manual_seed(1)
+    random.seed(1)
+    state = {"python": random.getstate(), "torch": torch.get_rng_state()}
+    first = (torch.rand(2), random.random())
+    backend.set_rng_state(state)
+    assert torch.equal(torch.rand(2), first[0]) and random.random() == first[1]
+
+
+def test_rng_state_no_cuda_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without CUDA the state has no "cuda" key, and a state carrying one is restored without touching CUDA."""
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    state = backend.rng_state()
+    assert set(state) == {"python", "torch"}
+    torch.manual_seed(3)
+    expected = torch.rand(2)
+    torch.manual_seed(3)
+    backend.set_rng_state({**backend.rng_state(), "cuda": [torch.zeros(1, dtype=torch.uint8)]})  # not consulted
+    assert torch.equal(torch.rand(2), expected)
+
+
+def test_to_device_moves_to_the_backend_device() -> None:
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    t = torch.arange(3)
+    moved = backend.to_device(t)
+    assert moved.device == backend.device and torch.equal(moved, t)
+    assert moved is t  # `.to` on the same device returns the tensor itself (no copy)
+
+
+def test_pin_memory_follows_the_device_type() -> None:
+    assert SingleDeviceBackend(device="cpu", precision="32").pin_memory is False
+    assert SingleDeviceBackend(device="meta", precision="32").pin_memory is False
+
+
 @pytest.mark.gpu
 def test_gpu_device_and_autocast() -> None:
     backend = SingleDeviceBackend()
     assert backend.device == torch.device("cuda:0")
+    assert backend.pin_memory is True
+    assert backend.to_device(torch.ones(2)).device == backend.device
+    assert "cuda" in backend.rng_state()
     model = backend.setup_model(torch.nn.Linear(4, 4))
     with backend.autocast():
         out = model(torch.ones(2, 4, device=backend.device))

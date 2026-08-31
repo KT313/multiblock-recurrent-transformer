@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for checkpoint naming/search, save→load→forward bit-identity, optimizer state and RNG restore."""
+"""Tests for checkpoint naming/search, save→load→forward bit-identity and optimizer state."""
 
-import random
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +15,8 @@ from training.checkpoint import (
     _unwrap,
     checkpoint_dir,
     checkpoint_name,
-    collect_rng_state,
     find_latest_checkpoint,
     load_checkpoint,
-    restore_rng_state,
     save_checkpoint,
     should_save_checkpoint,
 )
@@ -122,7 +119,7 @@ def test_save_load_forward_bit_identical(
 ) -> None:
     opt, x = _train_one_step(tiny_model)
     path = checkpoint_dir(tmp_path) / checkpoint_name(1, "tiny")
-    rng_state = collect_rng_state()
+    rng_state = backend.rng_state()
     extra: dict[str, Any] = {"step": 1, "stage": 0, "rng": rng_state, "config": {"seed": 42}}
     save_checkpoint(backend, path, tiny_model, opt, extra)
     assert path.exists()
@@ -192,26 +189,3 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     fresh = build_model(TINY_MODEL_ARCHITECTURE)
     load_checkpoint(backend, path, Wrapper(fresh))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
-
-
-def test_rng_state_round_trip(tmp_path: Path, backend: SingleDeviceBackend) -> None:
-    random.seed(5)
-    torch.manual_seed(5)
-    state = collect_rng_state()
-    assert set(state) >= {"python", "torch"}
-    expected = (random.random(), torch.rand(3))
-    backend.save_checkpoint(tmp_path / "rng.pth", {"rng": state})
-    random.seed(77)
-    torch.manual_seed(77)
-    restore_rng_state(backend.load_checkpoint(tmp_path / "rng.pth")["rng"])
-    assert random.random() == expected[0]
-    assert torch.equal(torch.rand(3), expected[1])
-    assert ("cuda" in state) == torch.cuda.is_available()
-
-
-def test_restore_rng_state_without_cuda_entry() -> None:
-    torch.manual_seed(1)
-    state = {"python": random.getstate(), "torch": torch.get_rng_state()}
-    first = torch.rand(2)
-    restore_rng_state(state)
-    assert torch.equal(torch.rand(2), first)

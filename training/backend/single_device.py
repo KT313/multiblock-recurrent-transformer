@@ -43,6 +43,7 @@ class SingleDeviceBackend:
                 device = "cpu"
         self.device = torch.device(device)
         self.precision = precision
+        self.pin_memory = self.device.type == "cuda"
         _set_torch_flags()
 
     def setup_model(self, model: Module, compile: bool = False) -> Module:
@@ -95,3 +96,18 @@ class SingleDeviceBackend:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+    def rng_state(self) -> dict[str, Any]:
+        state = {"python": random.getstate(), "torch": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def set_rng_state(self, state: dict[str, Any]) -> None:
+        random.setstate(state["python"])
+        torch.set_rng_state(state["torch"].cpu())
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+
+    def to_device(self, tensor: Tensor) -> Tensor:
+        return tensor.to(self.device, non_blocking=True)

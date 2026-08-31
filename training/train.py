@@ -28,10 +28,8 @@ from training.backend import Backend, get_backend
 from training.checkpoint import (
     checkpoint_dir,
     checkpoint_name,
-    collect_rng_state,
     find_latest_checkpoint,
     load_checkpoint,
-    restore_rng_state,
     save_checkpoint,
     should_save_checkpoint,
 )
@@ -182,7 +180,7 @@ def train(cfg: Settings) -> None:
         check_checkpoint_dataset_hash(extra, resolved.config_hash, cfg.allow_dataset_change)
         check_checkpoint_validation_rows(extra, resolved.validation_rows, cfg.allow_dataset_change)
         state["step"] = state["resume_step"] = extra["step"]
-        restore_rng_state(extra["rng"])
+        backend.set_rng_state(extra["rng"])
         print(f"Resumed from {resume_path} at step {state['step']}")
     else:
         print("No checkpoint loaded, starting from scratch.")
@@ -221,8 +219,8 @@ def train(cfg: Settings) -> None:
         for micro in range(cfg.gradient_accumulation_steps):
             input_ids, labels, data_ids = next(batches)
             sample_counter.update(data_ids)
-            input_ids = input_ids.to(backend.device, non_blocking=True)
-            labels = labels.to(backend.device, non_blocking=True)
+            input_ids = backend.to_device(input_ids)
+            labels = backend.to_device(labels)
             with backend.no_sync(model) if micro < cfg.gradient_accumulation_steps - 1 else nullcontext():
                 with backend.autocast():
                     outputs = model(input_ids, labels=labels)
@@ -302,7 +300,7 @@ def train(cfg: Settings) -> None:
             extra = {
                 "step": done,
                 "stage": next_info.stage_idx,
-                "rng": collect_rng_state(),
+                "rng": backend.rng_state(),
                 "config": asdict(cfg),
                 CHECKPOINT_HASH_KEY: resolved.config_hash,
                 CHECKPOINT_VALIDATION_ROWS_KEY: resolved.validation_rows,

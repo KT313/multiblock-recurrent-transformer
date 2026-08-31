@@ -30,6 +30,7 @@ def build_dataloader(
     shard: tuple[int, int] = (0, 1),
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
+    pin_memory: bool = False,
 ) -> DataLoader[Row]:
     """Loader over the weighted mixture of ``entries`` (a stage's ``train_data`` / ``val_data`` as resolved by
     `training.data.dataset_resolver`), yielding ``(input_ids, labels, data_ids)`` batches.
@@ -37,7 +38,8 @@ def build_dataloader(
     Every entry becomes one `ParquetTextDataset` over its row range ``[skip_rows, skip_rows + max_rows)`` — the
     validation split decided by the resolver — with its ``data_signature`` (None = the text column). Loader state
     is not checkpointed: on resume, loaders are recreated fresh (as in the thesis runs). ``shard=(rank, world)`` is
-    passed to every dataset; with ``world == 1`` it is a no-op.
+    passed to every dataset; with ``world == 1`` it is a no-op. ``pin_memory`` is the backend's decision
+    (`Backend.pin_memory`, true on CUDA).
     """
     if len({e.prefix for e in entries}) != len(entries):
         raise ValueError("Dataset prefixes within one loader must be unique.")
@@ -61,7 +63,7 @@ def build_dataloader(
         dataset,
         batch_size=micro_batch_size,
         shuffle=False,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
         collate_fn=collate,
         num_workers=num_workers,
         prefetch_factor=4 if num_workers > 0 else None,
@@ -111,6 +113,7 @@ def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backen
             shard=(backend.rank, backend.world_size),
             padding_multiple=settings.sequence_padding_multiple,
             ignore_index=IGNORE_INDEX,
+            pin_memory=backend.pin_memory,
         )
 
     return StageDataloaders(

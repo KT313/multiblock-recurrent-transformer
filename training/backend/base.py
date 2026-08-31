@@ -23,6 +23,7 @@ class Backend(Protocol):
     world_size: int
     rank: int
     is_main: bool
+    pin_memory: bool  # whether dataloaders should pin host memory (true on CUDA)
 
     def setup_model(self, model: Module, compile: bool = False) -> Module:
         """Move the model to the device, optionally compile it, and wrap it (DDP/FSDP later)."""
@@ -55,3 +56,15 @@ class Backend(Protocol):
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]: ...
 
     def seed_everything(self, seed: int) -> None: ...
+
+    def rng_state(self) -> dict[str, Any]:
+        """Python + torch (+ device) RNG state, as stored in a checkpoint."""
+        ...
+
+    def set_rng_state(self, state: dict[str, Any]) -> None:
+        """Restore what `rng_state` collected."""
+        ...
+
+    def to_device(self, tensor: Tensor) -> Tensor:
+        """Move a host tensor (a batch) to the device."""
+        ...

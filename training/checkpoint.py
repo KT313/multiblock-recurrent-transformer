@@ -3,15 +3,14 @@
 
 State layout: `{"model", "optimizer", "step", "stage", "rng", "config", "dataset_config_hash", "dataset_validation_rows"}`;
 the training loop supplies everything except "model"/"optimizer" via `extra` (the last two are verified on resume by
-`training.data.dataset_resolver.check_checkpoint_dataset_hash` / `check_checkpoint_validation_rows`).
+`training.data.dataset_resolver.check_checkpoint_dataset_hash` / `check_checkpoint_validation_rows`; "rng" is
+`Backend.rng_state()`).
 """
 
-import random
 import re
 from pathlib import Path
 from typing import Any, Optional
 
-import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
@@ -59,20 +58,6 @@ def should_save_checkpoint(
 def _unwrap(model: Module) -> Module:
     """Strip the `torch.compile` wrapper so state-dict keys stay stable across compiled/uncompiled runs."""
     return getattr(model, "_orig_mod", model)
-
-
-def collect_rng_state() -> dict[str, Any]:
-    state = {"python": random.getstate(), "torch": torch.get_rng_state()}
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    return state
-
-
-def restore_rng_state(state: dict[str, Any]) -> None:
-    random.setstate(state["python"])
-    torch.set_rng_state(state["torch"].cpu())
-    if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
 def save_checkpoint(
