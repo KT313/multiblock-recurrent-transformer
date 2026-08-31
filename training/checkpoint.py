@@ -19,6 +19,7 @@ from torch.optim import Optimizer
 
 from training.backend.base import Backend
 from training.settings import Settings
+from training.stage_manager import StageManager
 
 CHECKPOINT_SUBDIR = "checkpoints"
 CHECKPOINT_SUFFIX = ".pth"
@@ -83,15 +84,17 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
     return max(candidates, key=_step_from_name)
 
 
-def is_checkpoint_step(settings: Settings, progress_step: int, max_steps: int, stage_end: bool) -> bool:
-    """Whether to write a checkpoint after `progress_step` completed optimizer steps.
+def is_checkpoint_step(settings: Settings, done: int, stage_manager: StageManager) -> bool:
+    """Whether to write a checkpoint after `done` completed optimizer steps.
 
-    Three rules: every `save_step_interval` steps (0 disables), at the last step if `save_last_step`, and before
-    every stage transition (`stage_end`).
+    Three rules: every `save_step_interval` steps (0 disables), at the last step (`stage_manager.total_steps`) if
+    `save_last_step`, and before every stage transition (`done` follows the last plain step of a stage,
+    `StageManager.stage_ending_at(done - 1)`).
     """
-    save_at_interval = settings.save_step_interval > 0 and progress_step % settings.save_step_interval == 0
-    save_at_last_step = settings.save_last_step and progress_step >= max_steps
-    return save_at_interval or save_at_last_step or stage_end
+    save_at_interval = settings.save_step_interval > 0 and done % settings.save_step_interval == 0
+    save_at_last_step = settings.save_last_step and done >= stage_manager.total_steps
+    save_at_stage_end = stage_manager.stage_ending_at(done - 1) is not None
+    return save_at_interval or save_at_last_step or save_at_stage_end
 
 
 def unwrap_compiled(model: Module) -> Module:

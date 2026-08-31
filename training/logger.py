@@ -133,7 +133,8 @@ class TrainingReport:
     last_loss: float | None  # training loss of the last logged step, None if no step was logged
     last_validation: dict[str, float]  # `val_loss*`, `val_ppl*`, `val_time` of the last evaluation, {} if none ran
     checkpoints_written: list[Path]  # every checkpoint saved by this process, in order
-    export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf`
+    export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf` (and after a stop)
+    stopped: bool = False  # the run stopped on request (`should_stop` of `train()`, the CLI's Ctrl-C) before its last step
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # `RunLogger.log_step`'s metrics per logged step
 
     def summary(self) -> str:
@@ -144,6 +145,8 @@ class TrainingReport:
             f"(final step {self.final_step}, {origin})",
             f"  setup {self.setup_seconds:.1f}s, training {self.train_seconds:.1f}s",
         ]
+        if self.stopped:
+            lines.append(f"  stopped on request after step {self.final_step}; rerun with resume: true to continue")
         loss = f"last loss {self.last_loss:.4f}" if self.last_loss is not None else "no step logged"
         if self.last_validation:
             losses = ", ".join(f"{k} {v:.4f}" for k, v in self.last_validation.items() if k.startswith("val_loss"))
@@ -389,13 +392,15 @@ class RunLogger:
         """The HuggingFace export was written to `path`."""
         console.info(f"Exported HuggingFace model to {path}", extra=KEEP)
 
-    def close(self, progress: TrainingProgress, export_dir: Path | None) -> TrainingReport:
+    def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
         """End the run's logging: `train_time` into the wandb summary, `finish()`, the final console line, the
-        resources released; returns the report. `__exit__` afterwards is a no-op (both are idempotent)."""
+        resources released; returns the report. `stopped` says the run ended on request before its last step.
+        `__exit__` afterwards is a no-op (both are idempotent)."""
         train_seconds = self._clock() - self._train_started
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
-        console.info(f"Training finished after {progress.done} steps in {train_seconds:.1f}s.", extra=KEEP)
+        ending = "stopped on request" if stopped else "finished"
+        console.info(f"Training {ending} after {progress.done} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.resources.close()
         return TrainingReport(
             run_directory=self.run_directory,
@@ -408,6 +413,7 @@ class RunLogger:
             last_validation=dict(self._last_validation),
             checkpoints_written=list(self.checkpoints_written),
             export_dir=export_dir,
+            stopped=stopped,
             history=self.history,
         )
 

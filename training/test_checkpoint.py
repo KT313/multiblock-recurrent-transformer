@@ -26,6 +26,7 @@ from training.checkpoint import (
 )
 from training.optim import ELLISAdam, get_param_groups
 from training.settings import Settings
+from training.stage_manager import StageManager, TrainingStage
 
 TINY_MODEL_ARCHITECTURE = Path(__file__).resolve().parent.parent / "config" / "model_architecture" / "tiny.yaml"
 TINY_DATASET_CONFIG = Path(__file__).resolve().parent.parent / "config" / "datasets" / "tiny.yaml"
@@ -158,16 +159,22 @@ def test_find_latest_checkpoint_ignores_runs_with_a_longer_name(tmp_path: Path, 
 
 
 def test_is_checkpoint_step_table() -> None:
-    """Three rules: every `save_step_interval` steps, the last step if `save_last_step`, and a stage end."""
+    """Three rules: every `save_step_interval` steps, the last step (`total_steps`) if `save_last_step`, and the
+    step after the last plain step of a stage (`stage_ending_at`). Two stages of 12 + 8 optimizer steps (4 × 256
+    tokens each, no transition): stage 0 ends with step 12, the run with step 20."""
+    stages = [
+        TrainingStage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
+        TrainingStage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
+    ]
+    stage_manager = StageManager(stages, world_batch_size=4, block_size=256)
+    assert stage_manager.total_steps == 20 and stage_manager.stage_ending_at(11) == 0
     settings = _settings(save_step_interval=8, save_last_step=True)
-    assert [s for s in range(1, 21) if is_checkpoint_step(settings, s, 20, stage_end=False)] == [8, 16, 20]
-    assert is_checkpoint_step(settings, 3, 20, stage_end=True)
-    assert is_checkpoint_step(settings, 25, 20, stage_end=False)  # past the end still counts as the last step
+    assert [s for s in range(1, 21) if is_checkpoint_step(settings, s, stage_manager)] == [8, 12, 16, 20]
+    assert is_checkpoint_step(settings, 25, stage_manager)  # past the end still counts as the last step
     no_interval = _settings(save_step_interval=0, save_last_step=False)
-    assert not any(is_checkpoint_step(no_interval, s, 20, stage_end=False) for s in range(1, 21))
-    assert is_checkpoint_step(no_interval, 5, 20, stage_end=True)
+    assert [s for s in range(1, 21) if is_checkpoint_step(no_interval, s, stage_manager)] == [12]  # stage end only
     last_only = _settings(save_step_interval=0, save_last_step=True)
-    assert [s for s in range(1, 26) if is_checkpoint_step(last_only, s, 20, stage_end=False)] == list(range(20, 26))
+    assert [s for s in range(1, 26) if is_checkpoint_step(last_only, s, stage_manager)] == [12, *range(20, 26)]
 
 
 # --- save / load -----------------------------------------------------------------------------------------------------

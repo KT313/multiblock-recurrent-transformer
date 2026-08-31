@@ -4,7 +4,7 @@
 
 Everything here is numerics (see `tasks/training_pipeline_restructure.md`, section 3). The step body is a move of the
 thesis loop, bit-identical: `golden_tiny_steps.json` (dataset-independent, `test_step.py`) and `golden_tiny_run.json`
-(the 20-step tiny run, `test_train.py`) pin it. Steps are OPTIMIZER steps: one world batch of
+(the 20-step tiny run, `test_run.py` / `golden.py`) pin it. Steps are OPTIMIZER steps: one world batch of
 `gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
 """
 

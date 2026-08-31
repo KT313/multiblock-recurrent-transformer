@@ -25,6 +25,7 @@ from data_preparation.dataset_config import (
     load_dataset_config,
 )
 from data_preparation.layout import DatasetLayout
+from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build import DatasetReport
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
 from training.checkpoint import CheckpointMetadata
@@ -451,6 +452,15 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
         again = resolve_dataset(_settings(TINY_DATASET_YAML, empty, auto_prepare=False))
     assert "preparing missing data" not in caplog.text
     assert again.config_hash == resolved.config_hash and again.validation_rows == resolved.validation_rows
+
+
+def test_auto_prepare_forwards_the_stop_request_to_the_build(tmp_path: Path) -> None:
+    """`should_stop` (the CLI's Ctrl-C) reaches `prepare`: a request that already says stop ends the in-process build
+    at its first shard with `BuildAborted` — the dataset stays incomplete, nothing is deleted."""
+    empty = tmp_path / "empty"
+    with pytest.raises(BuildAborted):
+        resolve_dataset(_settings(TINY_DATASET_YAML, empty), should_stop=lambda: True)
+    assert not DatasetLayout(empty).processed_dir("synthetic_pretrain").exists()
 
 
 class _FakeBackend:

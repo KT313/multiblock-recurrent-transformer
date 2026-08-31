@@ -5,7 +5,6 @@ reference `training/golden_tiny_steps.json` (five steps of fixed batches through
 
 import copy
 import json
-import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,14 @@ from training.data import IGNORE_INDEX, StageDataloaders
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import resolve_dataset
 from training.data.loader import Batch
+from training.golden import (
+    golden_exact_requested,
+    golden_mismatches,
+    golden_run_json,
+    single_thread_deterministic,
+    write_tiny_yaml,
+)
+from training.run import build_run_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager, TrainingStage
 from training.step import (
@@ -27,13 +34,6 @@ from training.step import (
     micro_batch_stream,
     run_one_optimizer_step,
     scheduled_learning_rate,
-)
-from training.test_train import (
-    GOLDEN_EXACT_ENV,
-    _single_thread_deterministic,
-    _write_yaml,
-    golden_mismatches,
-    golden_run_json,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -100,8 +100,6 @@ def fresh_tiny_model(backend: SingleDeviceBackend, seed: int = 0) -> torch.nn.Mo
 
 
 def fresh_optimizer(settings: Settings, model: torch.nn.Module, backend: SingleDeviceBackend) -> torch.optim.Optimizer:
-    from training.train import build_run_optimizer
-
     return build_run_optimizer(settings, model, backend)
 
 
@@ -290,7 +288,7 @@ def test_non_finite_grad_norm_raises_with_the_exact_message(
 
 
 # --------------------------------------------------------------------------------------------------------------
-# micro-batch stream (moved from test_train.py; needs the tiny dataset for the stage budgets only)
+# micro-batch stream (moved from the former test_train.py; needs the tiny dataset for the stage budgets only)
 
 
 def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
@@ -314,7 +312,7 @@ class _Repeat:
 
 
 def _stream_setup(tmp_path: Path, tiny_dataset_dir: Path, sort: bool) -> tuple[Settings, StageDataloaders, StageManager]:
-    yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
     settings = parse_settings(["--config", str(yaml_path), "--micro_batch_size", "1"])  # 4 micro-batches per step
     loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
     stage_manager = StageManager(resolve_dataset(settings).training_stages(), settings.world_batch_size, settings.block_size)
@@ -401,7 +399,7 @@ def step_reference_metrics() -> dict[str, Any]:
     """
     settings = reference_settings()
     backend = SingleDeviceBackend(device="cpu", precision="32")
-    with _single_thread_deterministic():
+    with single_thread_deterministic():
         model = fresh_tiny_model(backend, seed=0)
         optimizer = fresh_optimizer(settings, model, backend)
         results = run_steps(settings, backend, model, optimizer, steps=REFERENCE_STEPS)
@@ -448,6 +446,6 @@ def test_golden_tiny_steps() -> None:
     actual = step_reference_metrics()
     assert sorted(actual["steps"], key=int) == [str(s) for s in range(REFERENCE_STEPS)]
     assert actual["steps"]["0"]["lr"] == 0.0 and actual["steps"]["2"]["lr"] == 3e-4
-    exact = os.environ.get(GOLDEN_EXACT_ENV) == "1"
+    exact = golden_exact_requested()
     mismatches = golden_mismatches(expected, json.loads(golden_run_json(actual)), exact=exact)
     assert not mismatches, "step reference changed:\n" + "\n".join(mismatches)

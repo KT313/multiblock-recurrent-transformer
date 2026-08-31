@@ -24,6 +24,7 @@ from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
+from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.build import prepare, status, summarize_dataset_state
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
@@ -266,13 +267,18 @@ def validate_settings(settings: Settings, cfg: DatasetConfig) -> None:
 
 
 def _ensure_prepared(
-    settings: Settings, cfg: DatasetConfig, layout: DatasetLayout, backend: Optional[_MainRankBarrier]
+    settings: Settings,
+    cfg: DatasetConfig,
+    layout: DatasetLayout,
+    backend: Optional[_MainRankBarrier],
+    should_stop: StopCheck | None = None,
 ) -> None:
     """Verify the dataset on disk; prepare what is missing when `auto_prepare` allows it, else raise.
 
     Auto-prepare never deletes raw data and never prompts: it runs `prepare` with `assume_yes=False` and a `confirm`
     that always declines, so a stale or outdated raw folder fails the run with the same message `prepare.py` prints
-    (rerun it with `--yes` to confirm the deletion).
+    (rerun it with `--yes` to confirm the deletion). `should_stop` is the run's stop request (the CLI's Ctrl-C):
+    the build polls it between shards and raises `BuildAborted` with everything published so far kept.
     """
     report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
     if report.complete:
@@ -296,6 +302,7 @@ def _ensure_prepared(
                 assume_yes=False,
                 confirm=lambda _message: False,  # never delete raw from a training run
                 hf_token=os.environ.get("HF_TOKEN"),
+                should_stop=should_stop,
             )
     if backend is not None:
         backend.barrier()
@@ -308,11 +315,14 @@ def _ensure_prepared(
         )
 
 
-def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = None) -> ResolvedDataset:
+def resolve_dataset(
+    settings: Settings, backend: Optional[_MainRankBarrier] = None, *, should_stop: StopCheck | None = None
+) -> ResolvedDataset:
     """Load, verify and (with `auto_prepare`) build the dataset of a run, then decide the validation split; see the
     module docstring.
 
-    The build runs on the main rank only (`backend is None or backend.is_main`), followed by `backend.barrier()`.
+    The build runs on the main rank only (`backend is None or backend.is_main`), followed by `backend.barrier()`,
+    and polls `should_stop` between shards (`BuildAborted` when it says stop; None: never).
     Raises `RuntimeError` when data is missing and cannot / must not be prepared here, or when a folder on disk
     does not match its manifest or leaves a used part of the split empty.
     """
@@ -320,7 +330,7 @@ def resolve_dataset(settings: Settings, backend: Optional[_MainRankBarrier] = No
     cfg = load_dataset_config(settings.dataset_config)
     validate_settings(settings, cfg)
     layout = DatasetLayout(Path(settings.dataset_dir))
-    _ensure_prepared(settings, cfg, layout, backend)
+    _ensure_prepared(settings, cfg, layout, backend, should_stop)
     validation_rows = resolve_splits(cfg, layout)
 
     stages: list[ResolvedStage] = []

@@ -584,3 +584,25 @@ def test_run_logger_never_prints(
         run_logger.close(progress, None)
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err == ""
+
+
+def test_close_of_a_stopped_run(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
+) -> None:
+    """`close(..., stopped=True)` (the stop request of `train()`): the report says so, its summary tells how to
+    continue, the final `keep` line reads "stopped on request"."""
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+    run_fake_steps(run_logger, stage_manager, progress, clock, 5, 1.0)
+    run_logger.log_checkpoint(tmp_path / "checkpoints" / "step-00000005-steps.pth")
+    report = run_logger.close(progress, None, stopped=True)
+    assert report.stopped is True and (report.steps_completed, report.final_step) == (5, 5)
+    assert report.export_dir is None
+    lines = report.summary().splitlines()
+    assert lines[2] == "  stopped on request after step 5; rerun with resume: true to continue"
+    final = [r for r in console_records.records if r.getMessage() == "Training stopped on request after 5 steps in 5.0s."]
+    assert len(final) == 1 and getattr(final[0], "keep", False) is True
+    assert TrainingReport(**{**report.__dict__, "stopped": False}).stopped is False  # default when not given
