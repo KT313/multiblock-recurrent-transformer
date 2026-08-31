@@ -26,7 +26,7 @@ from data_preparation.lib.build.repair import (
     repair_broken_and_stale_folders,
 )
 from data_preparation.lib.stages.build import build_source
-from data_preparation.lib.stages.shared import download
+from data_preparation.lib.stages.download import download
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
 
 CfgFactory = Callable[..., DatasetConfig]

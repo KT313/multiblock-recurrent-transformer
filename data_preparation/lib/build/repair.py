@@ -34,7 +34,7 @@ from typing import Any, Literal
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.shared import truncate_raw_to_good_prefix
+from data_preparation.lib.stages.download import truncate_raw_to_good_prefix
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 
 log = get_logger(__name__)
