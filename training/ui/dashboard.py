@@ -20,9 +20,12 @@ its top behind in the scrollback — duplicated bars), so ``__enter__`` also (:c
 * routes *every* ``logging`` record into the log panel: a handler on the root logger, while the plain
   ``StreamHandler``\\s that libraries such as ``transformers`` / ``datasets`` / ``huggingface_hub`` put on their own
   loggers are detached for the duration (they would write to the real stdout / stderr behind the display),
-* replaces ``sys.stdout`` / ``sys.stderr`` with line sinks that log what is written to them (``warnings``, stray
-  prints, the final line of a tqdm bar, handlers created later) on ``training.stdout`` (INFO) and ``training.stderr``
-  (WARNING, i.e. kept), and
+* replaces ``warnings.showwarning`` so that every ``warnings.warn`` is one kept record on ``training.warnings``
+  (``UserWarning: text (file:line)`` — one line, the message first — whether the process writes warnings to stderr or
+  routes them through ``logging.captureWarnings``),
+* replaces ``sys.stdout`` / ``sys.stderr`` with line sinks that log what is written to them (stray prints, bare
+  stderr writes, the final line of a tqdm bar, handlers created later) on ``training.stdout`` (INFO) and
+  ``training.stderr`` (WARNING, i.e. kept), and
 * sets ``WANDB_CONSOLE=off`` / ``WANDB_SILENT=true`` in the environment for a ``wandb.init`` inside the block. A wandb
   run created *before* the dashboard opens must pass ``wandb.Settings(**WANDB_QUIET_SETTINGS)`` itself: wandb's
   default ``console="wrap"`` replaces ``sys.stdout`` / ``sys.stderr`` on its own and prints its banner to stderr.
@@ -80,10 +83,12 @@ from training.ui.capture import (
     STDERR_LOGGER,
     STDOUT_LOGGER,
     WANDB_QUIET_SETTINGS,
+    WARNINGS_LOGGER,
     DashboardLogHandler,
     LogSink,
     TerminalCapture,
     attach_logger,
+    format_warning,
 )
 from training.ui.common import ENV_VAR, TRAIN_LOG_NAME, TRAINING_LOGGER_NAME, Clock, dashboard_enabled
 from training.ui.fallback import NoOpDashboard
@@ -115,6 +120,7 @@ __all__ = [
     "TRANSITION_FLAG_KEY",
     "TRANSITION_PROGRESS_KEY",
     "WANDB_QUIET_SETTINGS",
+    "WARNINGS_LOGGER",
     "Clock",
     "DashboardLogHandler",
     "LogSink",
@@ -130,6 +136,7 @@ __all__ = [
     "format_duration",
     "format_metric",
     "format_tokens",
+    "format_warning",
     "training_dashboard",
 ]
 

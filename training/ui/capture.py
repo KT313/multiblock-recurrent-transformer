@@ -1,15 +1,16 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Everything that could print around the live display, routed into it: the ``logging`` handler of the dashboards,
 :func:`attach_logger` (one logger plus the log file), and :class:`TerminalCapture` — the root-logger handler, the
-detached third-party console handlers, the ``sys.stdout`` / ``sys.stderr`` line sinks and the wandb environment
-variables, all for the duration of the display. The line sink and the console-handler check are the data-prep
-dashboard's (``data_preparation/lib/ui/dashboard.py``)."""
+detached third-party console handlers, the ``warnings.showwarning`` hook, the ``sys.stdout`` / ``sys.stderr`` line
+sinks and the wandb environment variables, all for the duration of the display. The line sink and the console-handler
+check are the data-prep dashboard's (``data_preparation/lib/ui/dashboard.py``)."""
 
 from __future__ import annotations
 
 import logging
 import os
 import sys
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,11 +22,35 @@ from training.ui.common import TRAINING_LOGGER_NAME
 
 STDOUT_LOGGER = f"{TRAINING_LOGGER_NAME}.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = f"{TRAINING_LOGGER_NAME}.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
+WARNINGS_LOGGER = f"{TRAINING_LOGGER_NAME}.warnings"  # `warnings.warn` calls while the display is up (WARNING: kept)
 
 # `wandb.init(settings=wandb.Settings(**WANDB_QUIET_SETTINGS))`: no console wrapping, no banner lines on stderr
 WANDB_QUIET_SETTINGS: dict[str, object] = {"console": "off", "silent": True}
 # the same as environment variables, set while the display is up (wandb reads them at `init`)
 QUIET_ENV: dict[str, str] = {f"WANDB_{key.upper()}": str(value).lower() for key, value in WANDB_QUIET_SETTINGS.items()}
+
+
+def format_warning(message: Warning | str, category: type[Warning], filename: str, lineno: int) -> str:
+    """One line per warning with the message first: ``UserWarning: the text (/abs/path/module.py:12)``.
+
+    ``warnings.formatwarning`` puts the (absolute, environment-dependent) path first and adds the source line as a
+    second line; here the location trails, so a long path never pushes the message past the terminal width, where the
+    terminal's soft-wrap would split it, and a warning is exactly one kept line."""
+    return f"{category.__name__}: {message} ({filename}:{lineno})"
+
+
+class _ShowWarning(Protocol):
+    """The signature of ``warnings.showwarning``."""
+
+    def __call__(
+        self,
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: TextIO | None = None,
+        line: str | None = None,
+    ) -> None: ...
 
 
 class LogSink(Protocol):
@@ -107,9 +132,17 @@ class TerminalCapture:
     * every ``logging`` record goes to ``sink`` through a handler on the root logger (``skip`` names the loggers
       an attached handler already covers), while every plain console ``StreamHandler`` of every logger — the ones
       ``transformers`` / ``datasets`` / ``huggingface_hub`` install on theirs at import — is detached,
+    * ``warnings.showwarning`` is replaced: every ``warnings.warn`` becomes one WARNING (kept) record on
+      :data:`WARNINGS_LOGGER`, :func:`format_warning`\\ ed — whether the process would otherwise write warnings to
+      stderr (the default) or route them through ``logging.captureWarnings`` (``py.warnings``), the hook is what the
+      ``warnings`` module calls, so the text and the routing are the dashboard's. The previous hook is restored
+      afterwards; one installed *inside* the block (a library calling ``logging.captureWarnings(True)``) is left in
+      place — its records reach the panel through the root handler, its stderr lines through the sink below — and
+      a stale reference to the dashboard's hook forwards to the hook the display found,
     * ``sys.stdout`` / ``sys.stderr`` are replaced by line sinks logging on :data:`STDOUT_LOGGER` (INFO) and
-      :data:`STDERR_LOGGER` (WARNING), so ``warnings``, stray prints and the final line of a tqdm bar land in the
-      panel (the sink loggers sit under ``training``: the lines also reach the attached log file),
+      :data:`STDERR_LOGGER` (WARNING), so stray prints, bare stderr writes and the final line of a tqdm bar land in
+      the panel (the sink loggers and :data:`WARNINGS_LOGGER` sit under ``training``: the lines also reach the
+      attached log file),
     * :data:`QUIET_ENV` is set for a ``wandb.init`` inside the block.
 
     :meth:`stop` undoes all of it (idempotent; each part on its own, so a failure in one still restores the rest).
@@ -124,10 +157,13 @@ class TerminalCapture:
         self._saved_streams: tuple[TextIO, TextIO] | None = None
         self._sinks: tuple[_LineSink, _LineSink] | None = None
         self._saved_env: dict[str, str | None] | None = None
+        self._previous_showwarning: _ShowWarning | None = None  # what `warnings.showwarning` was when the capture started
+        self._warnings_captured = False
 
     def start(self) -> None:
         self._quiet_environment()
         self._capture_logging()
+        self._capture_warnings()
         self.redirect_streams()
 
     def stop(self) -> None:
@@ -135,9 +171,12 @@ class TerminalCapture:
             self.release_streams()
         finally:
             try:
-                self._release_logging()
+                self._release_warnings()
             finally:
-                self._restore_environment()
+                try:
+                    self._release_logging()
+                finally:
+                    self._restore_environment()
 
     @property
     def streams_redirected(self) -> bool:
@@ -178,6 +217,36 @@ class TerminalCapture:
         detached, self._detached_handlers = self._detached_handlers, []
         for logger, handler in detached:
             logger.addHandler(handler)
+
+    def _capture_warnings(self) -> None:
+        if self._warnings_captured:
+            return
+        self._previous_showwarning = warnings.showwarning
+        self._warnings_captured = True
+        logging.getLogger(WARNINGS_LOGGER).setLevel(logging.INFO)  # whatever the `training` logger is set to
+        warnings.showwarning = self._show_warning
+
+    def _release_warnings(self) -> None:
+        if not self._warnings_captured:
+            return
+        self._warnings_captured = False
+        if warnings.showwarning == self._show_warning and self._previous_showwarning is not None:  # else: replaced inside the block, theirs stays
+            warnings.showwarning = self._previous_showwarning
+
+    def _show_warning(
+        self,
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: TextIO | None = None,
+        line: str | None = None,
+    ) -> None:
+        """The ``warnings.showwarning`` of the block: one kept record per warning on :data:`WARNINGS_LOGGER`."""
+        if self._warnings_captured:
+            logging.getLogger(WARNINGS_LOGGER).warning(format_warning(message, category, filename, lineno))
+        elif self._previous_showwarning is not None:  # a stale reference after the display closed: behave like the hook it replaced
+            self._previous_showwarning(message, category, filename, lineno, file, line)
 
     def redirect_streams(self) -> None:
         """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""

@@ -21,8 +21,8 @@ from training.ui.demo import demo, main
 from training.ui.testing import BOX_CHARACTERS, console_output, screen_of, screen_text, string_console, strip_ansi
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# the demo's deliberate `warnings.warn`: under pytest the warnings plugin records it before it reaches the stderr sink
-pytestmark = pytest.mark.filterwarnings("ignore:step 24")
+# the fallback captures nothing: without the filter pytest would list the demo's deliberate `warnings.warn` in its summary
+_IGNORE_THE_DEMO_WARNING = pytest.mark.filterwarnings("ignore:step 24")
 
 
 def test_demo_on_a_string_console_runs_the_whole_script(tmp_path: Path) -> None:
@@ -33,18 +33,22 @@ def test_demo_on_a_string_console_runs_the_whole_script(tmp_path: Path) -> None:
     assert not any(character in shown for character in BOX_CHARACTERS), shown
     assert shown.count("overall") == 1 and "50/50" in shown and "✓ instruct" in shown
     assert shown.count("Training finished after 50 steps") == 1 and shown.count("a bare stderr write (kept)") == 1
+    assert shown.count("UserWarning: step 24: a warnings.warn (kept) (") == 1, "one kept line, the message before the location"
+    assert "warnings.warn(f" not in shown, "the source line of the default warning format is not a second kept line"
     assert "stray print" not in shown and "sample log record" not in shown
     log_text = log_file.read_text()
     assert "a stray print" in log_text and "sample log record" in log_text and "Training finished" in log_text
     assert "╭─ log" in strip_ansi(console_output(console)), "the live display did run"
 
 
+@_IGNORE_THE_DEMO_WARNING
 def test_demo_falls_back_to_plain_lines_when_disabled(capsys: pytest.CaptureFixture[str]) -> None:
     demo(0.02, enabled=False)
     out = capsys.readouterr().out
     assert "step 5/50 | stage 0 pretrain" in out and "event: exported HuggingFace model" in out and "╭" not in out
 
 
+@_IGNORE_THE_DEMO_WARNING
 def test_main_parses_the_seconds_and_returns_the_exit_code(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRAINING_DASHBOARD", "0")
     assert main(["0.02"]) == 0

@@ -18,9 +18,11 @@ from training.ui.capture import (
     STDERR_LOGGER,
     STDOUT_LOGGER,
     WANDB_QUIET_SETTINGS,
+    WARNINGS_LOGGER,
     DashboardLogHandler,
     TerminalCapture,
     attach_logger,
+    format_warning,
 )
 from training.ui.testing import LOGGER_NAME
 
@@ -178,7 +180,7 @@ def test_stdout_and_stderr_are_captured_while_captured() -> None:
         assert not sys.stdout.isatty()
         print("stray print")
         sys.stderr.write("\rbar 10%\rbar 100%\n")
-        # what `warnings.showwarning` writes to sys.stderr (pytest records warnings itself, so it is written by hand)
+        # what a foreign `warnings.showwarning` (one installed inside the block) writes to sys.stderr
         sys.stderr.write(warnings.formatwarning("careful", UserWarning, "x.py", 1))
         print("partial", end="")  # no newline: flushed when the capture ends
         texts = sink.texts()
@@ -190,6 +192,56 @@ def test_stdout_and_stderr_are_captured_while_captured() -> None:
         capture.stop()
     assert _streams() == (real_out, real_err) and not _redirected(capture)
     assert sink.texts()[-1].endswith(f"INFO {STDOUT_LOGGER}: partial")
+
+
+def test_format_warning_puts_the_message_before_the_location_on_one_line() -> None:
+    text = format_warning("careful", UserWarning, "/a/very/long/path/module.py", 12)
+    assert text == "UserWarning: careful (/a/very/long/path/module.py:12)"
+    assert format_warning(DeprecationWarning("old"), DeprecationWarning, "x.py", 1) == "DeprecationWarning: old (x.py:1)"
+    assert "\n" not in format_warning("a", UserWarning, "x.py", 1), "the source line of `warnings.formatwarning` is left out"
+
+
+def test_warnings_become_one_kept_record_while_captured() -> None:
+    sink = RecordingSink()
+    previous = warnings.showwarning
+    capture = TerminalCapture(sink)
+    capture.start()
+    try:
+        assert warnings.showwarning is not previous
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn("careful", stacklevel=1)
+        [(text, kept)] = sink.written
+        assert f"WARNING {WARNINGS_LOGGER}: UserWarning: careful ({__file__}:" in text and text.endswith(")") and kept
+        capture.stop()
+        capture.stop()  # idempotent
+        assert warnings.showwarning is previous
+    finally:
+        capture.stop()
+
+
+def test_a_showwarning_installed_inside_the_block_stays_and_a_stale_hook_forwards() -> None:
+    sink = RecordingSink()
+    seen: list[tuple[str, str]] = []
+
+    def before(message: Warning | str, category: type[Warning], filename: str, lineno: int, file: object = None, line: str | None = None) -> None:
+        seen.append(("before", str(message)))
+
+    def inside(message: Warning | str, category: type[Warning], filename: str, lineno: int, file: object = None, line: str | None = None) -> None:
+        seen.append(("inside", str(message)))
+
+    with warnings.catch_warnings():  # restores `warnings.showwarning` afterwards
+        warnings.showwarning = before
+        capture = TerminalCapture(sink)
+        capture.start()
+        try:
+            ours = warnings.showwarning
+            warnings.showwarning = inside  # like `logging.captureWarnings(True)` called inside the block
+        finally:
+            capture.stop()
+        assert warnings.showwarning is inside, "a hook installed inside the block is left in place"
+        ours("late", UserWarning, "x.py", 1)  # a stale reference (`logging.captureWarnings(False)` restoring it) forwards
+        assert seen == [("before", "late")] and sink.written == []
 
 
 def test_streams_can_be_released_for_a_prompt_and_redirected_again() -> None:
