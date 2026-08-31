@@ -23,6 +23,7 @@ uv sync --all-extras                                        # environment (uv on
 uv run pytest                                               # tests, CPU, < 1 min
 uv run python training/train.py --config config/tiny.yaml   # 20-step smoke run on synthetic data (built on the fly)
 uv run python training/train.py --config config/crow_300m_final.yaml   # the thesis run on one GPU
+TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml   # plain one-line-per-interval console (also under a pipe); <out_dir>/train.log either way
 ```
 
 A run config (`config/<run>.yaml`) holds optimizer, LR and batch settings and points to a model architecture config
@@ -48,7 +49,7 @@ from the config) and `docs/multistage_training.md` for the stage mechanism.
 
 ```
 model/             architecture (RecurrentGPT, config, HF export)
-training/          train.py (CLI), run.py (train()), step.py, evaluation.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
+training/          train.py (CLI), run.py (train()), step.py (one optimizer step), evaluation.py, checkpoint.py, logger.py (RunLogger, TrainingReport), ui/ (terminal dashboard, train.log), golden.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
 data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
 dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers
