@@ -58,6 +58,70 @@ def test_structure_follows_config(tiny_model: RecurrentGPT) -> None:
     assert sum(p.numel() for p in tiny_model.parameters()) == 256_256
 
 
+def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
+    """Module and parameter names of the tiny model (checkpoint / HF export compatibility): recorded from the thesis
+    code, any change here breaks every saved checkpoint."""
+    expected = [
+        "freqs_cis",
+        "transformer.wte.weight",
+        "transformer.prelude.0.norm_1.weight",
+        "transformer.prelude.0.attn.qk_bias",
+        "transformer.prelude.0.attn.Wqkv.weight",
+        "transformer.prelude.0.attn.proj.weight",
+        "transformer.prelude.0.norm_2.weight",
+        "transformer.prelude.0.mlp.fc.weight",
+        "transformer.prelude.0.mlp.proj.weight",
+        "transformer.prelude.0.norm_3.weight",
+        "transformer.prelude.0.norm_4.weight",
+        "transformer.prelude.1.norm_1.weight",
+        "transformer.prelude.1.attn.qk_bias",
+        "transformer.prelude.1.attn.Wqkv.weight",
+        "transformer.prelude.1.attn.proj.weight",
+        "transformer.prelude.1.norm_2.weight",
+        "transformer.prelude.1.mlp.fc.weight",
+        "transformer.prelude.1.mlp.proj.weight",
+        "transformer.prelude.1.norm_3.weight",
+        "transformer.prelude.1.norm_4.weight",
+        "transformer.adapters.0.weight",
+        "transformer.adapters.1.weight",
+        "transformer.core_blocks.0.0.norm_1.weight",
+        "transformer.core_blocks.0.0.attn.qk_bias",
+        "transformer.core_blocks.0.0.attn.Wqkv.weight",
+        "transformer.core_blocks.0.0.attn.proj.weight",
+        "transformer.core_blocks.0.0.norm_2.weight",
+        "transformer.core_blocks.0.0.mlp.fc.weight",
+        "transformer.core_blocks.0.0.mlp.proj.weight",
+        "transformer.core_blocks.0.0.norm_3.weight",
+        "transformer.core_blocks.0.0.norm_4.weight",
+        "transformer.core_blocks.1.0.norm_1.weight",
+        "transformer.core_blocks.1.0.attn.qk_bias",
+        "transformer.core_blocks.1.0.attn.Wqkv.weight",
+        "transformer.core_blocks.1.0.attn.proj.weight",
+        "transformer.core_blocks.1.0.norm_2.weight",
+        "transformer.core_blocks.1.0.mlp.fc.weight",
+        "transformer.core_blocks.1.0.mlp.proj.weight",
+        "transformer.core_blocks.1.0.norm_3.weight",
+        "transformer.core_blocks.1.0.norm_4.weight",
+        "transformer.coda.0.norm_1.weight",
+        "transformer.coda.0.attn.qk_bias",
+        "transformer.coda.0.attn.Wqkv.weight",
+        "transformer.coda.0.attn.proj.weight",
+        "transformer.coda.0.norm_2.weight",
+        "transformer.coda.0.mlp.fc.weight",
+        "transformer.coda.0.mlp.proj.weight",
+        "transformer.coda.0.norm_3.weight",
+        "transformer.coda.0.norm_4.weight",
+        "transformer.ln_fs.0.weight",
+        "transformer.ln_fs.0.bias",
+        "transformer.ln_fs.1.weight",
+        "transformer.ln_fs.1.bias",
+        "transformer.ln_final.weight",
+        "transformer.ln_final.bias",
+        "lm_head.weight",
+    ]
+    assert list(tiny_model.state_dict()) == expected
+
+
 def test_build_model_kwargs_routing() -> None:
     m = seeded_tiny(ignore_index=-1, gradient_checkpointing=True, n_layers_in_coda=3)
     assert m.ignore_index == -1 and m.gradient_checkpointing is True
