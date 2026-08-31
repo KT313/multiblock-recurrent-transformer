@@ -1,10 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the training loop helpers (fast) and end-to-end runs of `training.train.train` on the tiny 3-stage
-config with synthetic data (marked slow)."""
+"""Tests for the run setup helpers (fast) and end-to-end runs of `training.train.train` on the tiny 3-stage config
+with synthetic data (marked slow), including the golden 20-step run. One optimizer step is tested in `test_step.py`,
+evaluation in `test_evaluation.py`."""
 
 import json
 import os
-import random
 import shutil
 import sys
 import tempfile
@@ -17,7 +17,6 @@ from typing import Any
 import pytest
 import torch
 
-from training.data.collate import find_multiple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data_preparation.lib.build import prepare
@@ -25,22 +24,18 @@ from model import RecurrentConfig, RecurrentGPT
 from training import train as train_module
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data import IGNORE_INDEX, StageDataloaders
+from training.data import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
-from training.data.loader import Batch
 from training.logger import Logger
 from training.optim import build_optimizer
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.train import (
-    LoopState,
     build_run_model,
     build_run_optimizer,
     build_stage_manager,
     check_block_sizes_agree,
-    micro_batch_stream,
     prepare_run_directory,
-    validate,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -103,11 +98,6 @@ def tiny_resolved(tiny_settings: Settings) -> ResolvedDataset:
 @pytest.fixture
 def cpu_backend() -> SingleDeviceBackend:
     return SingleDeviceBackend(device="cpu", precision="32")
-
-
-def test_loop_state_fields() -> None:
-    state: LoopState = {"step": 0, "resume_step": -1}
-    assert set(LoopState.__annotations__) == set(state)
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
@@ -186,107 +176,6 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
     assert [g["weight_decay"] for g in optimizer.param_groups] == [0.1, 0.1, 0.0]
     assert all(float(g["lr"]) == tiny_settings.optim_config["lr"] for g in optimizer.param_groups)
     assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))
-
-
-def _fake_batch(tag: str, length: int, pad_id: int = 0) -> Batch:
-    ids = torch.full((1, 8), pad_id)
-    ids[0, :length] = 1
-    labels = torch.full((1, 8), IGNORE_INDEX)
-    labels[0, :length] = 1
-    return ids, labels, [tag]
-
-
-class _Repeat:
-    """Endless iterable of one tagged batch with a running counter as the length."""
-
-    def __init__(self, tag: str) -> None:
-        self.tag, self.count = tag, 0
-
-    def __iter__(self) -> Iterator[Batch]:
-        while True:
-            self.count += 1
-            yield _fake_batch(self.tag, 1 + self.count % 7)
-
-
-def _stream_setup(
-    tmp_path: Path, tiny_dataset_dir: Path, sort: bool
-) -> tuple[Settings, StageDataloaders, StageManager]:
-    yaml_path = _write_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", sort_batches_by_length=str(sort).lower())
-    cfg = parse_settings(["--config", str(yaml_path), "--micro_batch_size", "1"])  # 4 micro-batches per step
-    loaders = StageDataloaders(train_loaders=[_Repeat("a"), _Repeat("b"), _Repeat("c")], val_loaders=[])
-    sm = StageManager(resolve_dataset(cfg).training_stages(), cfg.world_batch_size, cfg.block_size)
-    return cfg, loaders, sm
-
-
-def _tags(stream: Iterator[Batch], n: int) -> list[str]:
-    return [next(stream)[2][0] for _ in range(n)]  # never pull an extra element (zip would)
-
-
-def test_micro_batch_stream_samples_by_transition_progress(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    cfg, loaders, sm = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
-    state: LoopState = {"step": 3, "resume_step": -1}  # plain stage 0
-    stream = micro_batch_stream(cfg, loaders, sm, state, random.Random(0))
-    assert _tags(stream, 4) == ["a"] * 4
-    state["step"] = 6  # transition 0 -> 1, progress 0: everything still from stage 0
-    assert _tags(stream, 4) == ["a"] * 4
-    state["step"] = 8  # fully in stage 1
-    assert _tags(stream, 4) == ["b"] * 4
-    state["step"] = 15  # transition 1 -> 2 at progress 0.5: a mix, driven by the rng
-    tags = _tags(stream, 40)
-    assert set(tags) == {"b", "c"} and 8 < tags.count("c") < 32
-    state["step"] = 19
-    assert _tags(stream, 4) == ["c"] * 4
-
-
-def test_micro_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    cfg, loaders, sm = _stream_setup(tmp_path, tiny_dataset_dir, sort=True)
-    assert cfg.gradient_accumulation_steps == 4
-    state: LoopState = {"step": 0, "resume_step": -1}
-    stream = micro_batch_stream(cfg, loaders, sm, state, random.Random(0))
-    for _ in range(3):  # every world batch (4 micro-batches) arrives sorted by supervised length, trimmed
-        batches = [next(stream) for _ in range(4)]
-        lengths = [int((b[1] != IGNORE_INDEX).sum()) for b in batches]
-        assert lengths == sorted(lengths)
-        assert all(b[0].shape[1] == min(find_multiple(n, 128), 8) for b, n in zip(batches, lengths))  # trimmed
-    cfg_unsorted, loaders2, _ = _stream_setup(tmp_path, tiny_dataset_dir, sort=False)
-    raw = micro_batch_stream(cfg_unsorted, loaders2, sm, state, random.Random(0))
-    lengths = [int((next(raw)[1] != IGNORE_INDEX).sum()) for _ in range(4)]
-    assert lengths == [2, 3, 4, 5]  # loader order, untouched
-
-
-def test_validate_reports_every_depth(
-    tiny_model: RecurrentGPT, tiny_settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tiny_settings.partial_depth_eval = [1, 3]
-    tiny_settings.eval_iters = 2
-    torch.manual_seed(0)
-    batches = [(torch.randint(1, 512, (2, 16)), torch.randint(1, 512, (2, 16)), ["v", "v"]) for _ in range(5)]
-    seen: list[tuple[bool, Any]] = []
-    forward = RecurrentGPT.forward
-
-    def spy(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
-        seen.append((self.training, kwargs.get("num_steps_pair")))
-        return forward(self, *args, **kwargs)
-
-    monkeypatch.setattr(RecurrentGPT, "forward", spy)
-    torch.manual_seed(1)  # the latent state is drawn from the global RNG; depth 1 is evaluated first
-    metrics = validate(tiny_settings, cpu_backend, tiny_model, batches)
-    expected = {"val_loss", "val_ppl"} | {f"val_{k}_{d}" for k in ("loss", "ppl") for d in (1, 3, "[2, 2]")}
-    assert set(metrics) == expected
-    assert all(torch.isfinite(v) for v in metrics.values())
-    assert metrics["val_loss"] == metrics["val_loss_[2, 2]"]
-    assert torch.allclose(metrics["val_ppl_1"], metrics["val_loss_1"].exp())
-    assert tiny_model.training  # restored to train mode
-    # every depth is evaluated on exactly `eval_iters` batches in eval mode, as one (depth, 0) pair per core block
-    assert seen == [(False, [(1, 0), (1, 0)])] * 2 + [(False, [(3, 0), (3, 0)])] * 2 + [(False, [(2, 0), (2, 0)])] * 2
-    # the depth actually changes the computation
-    assert metrics["val_loss_1"] != metrics["val_loss_3"] != metrics["val_loss_[2, 2]"]
-    # each column is the mean over the eval_iters batches (same RNG stream as the depth-1 column above)
-    with torch.no_grad():
-        torch.manual_seed(1)
-        tiny_model.eval()
-        per_batch = [tiny_model(x, labels=y, num_steps_pair=[(1, 0), (1, 0)])["loss"] for x, y, _ in batches[:2]]
-    assert metrics["val_loss_1"].item() == pytest.approx(torch.stack(per_batch).mean().item(), rel=1e-6)
 
 
 def test_main_parses_argv_and_trains(monkeypatch: pytest.MonkeyPatch, tiny_dataset_dir: Path, tmp_path: Path) -> None:
