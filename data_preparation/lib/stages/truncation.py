@@ -3,7 +3,7 @@
 
 Raw shards used to store the full text of every document and only cap the *count* at ``max_seq_length``; the
 download step now cuts the text itself, so the stored count is the true count of the stored text and storage is
-bounded. The token definition is the one of ``TokenCounter`` in ``stages/shared.py``: the config tokenizer with
+bounded. The token definition is the one of ``TokenCounter`` in ``stages/download.py``: the config tokenizer with
 ``add_special_tokens=False`` (no bos/eos), or ``len(text) // 4`` in ``token_count: estimate`` mode.
 
 Invariants of :func:`truncate_to_token_cap` / :func:`truncate_many` (tested): the returned text is a prefix of the

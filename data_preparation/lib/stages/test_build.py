@@ -27,7 +27,7 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
-from data_preparation.lib.stages.shared import TokenCounter, download, prepare_tokenizer
+from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.parquet import text_hash64
 
@@ -122,14 +122,14 @@ def test_build_exact_dedup_tokens_and_idempotence(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, mtimes: Mtimes,
 ) -> None:  # fmt: skip
-    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(70)]
+    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(64)]  # the last one exactly at the cap
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=64)
     m = build_source(cfg, "s", layout, shard_size=2)
     processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
     rows = read_rows(processed)
-    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(70)], "normalized duplicates dropped, text untouched"
-    assert [r["tokens"] for r in rows] == [5, 3, 64], "token count capped at max_seq_length"
+    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(64)], "normalized duplicates dropped, text untouched"
+    assert [r["tokens"] for r in rows] == [5, 3, 64], "the raw counts (true counts of the stored text) reused"
     assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
     assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
     assert [(s.rows, s.tokens) for s in m.shards] == [(2, 8), (1, 64)] and m.tokens() == 72
@@ -160,7 +160,7 @@ def test_build_estimate_mode_caps_too(
     m = build_source(cfg, "s", layout)
     assert m.token_count == "estimate" and m.tokenizer is None
     assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [10, 50]
-    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 400]
+    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 200], "the download cut the long text at 4 chars/token"
 
 
 def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
@@ -497,9 +497,11 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     build_source(cfg, "i", other, shard_size=8)
     assert read_rows(other.processed_dir("i")) == out
     reseeded = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, seed=4)
-    download(reseeded, "i", layout, rows_needed=len(rows), shard_size=8)  # a new seed is a new raw hash: re-downloaded
-    build_source(reseeded, "i", layout, shard_size=8)
-    reseeded_rows = read_rows(processed)
+    reseeded_layout = DatasetLayout(tmp_path / "reseeded")  # a new seed is a new raw hash; the download never deletes raw
+    prepare_tokenizer(reseeded, reseeded_layout)
+    download(reseeded, "i", reseeded_layout, rows_needed=len(rows), shard_size=8)
+    build_source(reseeded, "i", reseeded_layout, shard_size=8)
+    reseeded_rows = read_rows(reseeded_layout.processed_dir("i"))
     assert reseeded_rows != out and sorted(r["instruction"] for r in reseeded_rows) == sorted(r["instruction"] for r in out)
 
 
@@ -557,11 +559,12 @@ def test_instruct_rows_over_the_cap_are_dropped_and_counted(
     rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 6 and 10 tokens
     write_local(src_dir, rows, "jsonl")
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, max_seq_length=8)
-    download(cfg, "i", layout, rows_needed=10)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [6] * 5 + [10] * 5, "instruct counts are not capped"
+    raw = download(cfg, "i", layout, rows_needed=10)
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [6] * 5, "rows over the cap are dropped at download, never truncated"
+    assert raw.extra["dropped_too_long"] == 5 and raw.extra["exhausted"] is True
     m = build_source(cfg, "i", layout)
     out = read_rows(layout.processed_dir("i"))
-    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.extra["stats"]["removed_too_long"] == 5
+    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.extra["stats"]["removed_too_long"] == 0  # the build's safety net has nothing left to do
 
 
 def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(

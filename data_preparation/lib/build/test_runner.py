@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import threading
 import time
@@ -21,7 +22,7 @@ from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest, verify_shards
 from data_preparation.lib.stages.build import build_source as real_build
-from data_preparation.lib.stages.shared import download as real_download
+from data_preparation.lib.stages.download import download as real_download
 
 CfgFactory = Callable[..., DatasetConfig]
 Writer = Callable[[Path, list[dict[str, Any]], str], Path]
@@ -146,7 +147,7 @@ def test_token_mode_change_makes_raw_stale_and_re_downloads(
 ) -> None:
     """`token_count` (and the tokenizer) are part of the raw hash: the stored counts depend on them, so a change
     re-downloads the source from offset 0 instead of recounting in place (task 7 asks for confirmation first)."""
-    from data_preparation.lib.stages import shared
+    download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, max_seq_length=4096)
     build(cfg, layout)
@@ -155,13 +156,13 @@ def test_token_mode_change_makes_raw_stale_and_re_downloads(
     assert before is not None and before.token_count == "tokenizer"
 
     offsets: list[int] = []
-    original = shared._fetch_rows
+    original = download_module._fetch_rows
 
     def spy(source: Any, name: str, offset: int, *args: Any, **kwargs: Any) -> Any:
         offsets.append(offset)
         return original(source, name, offset, *args, **kwargs)
 
-    monkeypatch.setattr(shared, "_fetch_rows", spy)
+    monkeypatch.setattr(download_module, "_fetch_rows", spy)
     cfg.token_count = "estimate"
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         result = build(cfg, layout)
@@ -507,7 +508,7 @@ def test_failure_stops_a_running_download_within_a_shard(
 def test_broken_raw_shard_is_truncated_not_redownloaded(
     cfg_factory: CfgFactory, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from data_preparation.lib.stages import shared
+    download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
     from functools import partial
 
@@ -520,13 +521,13 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     last = manifest.shards[-1]
     (raw / last.name).write_bytes(b"corrupt")
     offsets: list[int] = []
-    original = shared._fetch_rows
+    original = download_module._fetch_rows
 
     def spy(source: Any, name: str, offset: int, *args: Any, **kwargs: Any) -> Any:
         offsets.append(offset)
         return original(source, name, offset, *args, **kwargs)
 
-    monkeypatch.setattr(shared, "_fetch_rows", spy)
+    monkeypatch.setattr(download_module, "_fetch_rows", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         result = build(cfg, layout)
     assert result.complete and "kept the" in caplog.text and "removing" not in caplog.text

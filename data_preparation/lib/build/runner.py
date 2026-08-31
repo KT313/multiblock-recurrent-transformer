@@ -40,6 +40,8 @@ from data_preparation.lib.stages import (
     download,
     download_github_code_group,
     prepare_tokenizer,
+    raw_manifest_problem,
+    raw_manifest_state,
     truncate_raw_to_good_prefix,
 )
 from data_preparation.lib.storage.manifest import Manifest
@@ -317,12 +319,17 @@ def _log_plan(result: Plan, *, summary: bool = True) -> None:
 
 
 def _remove_broken_stages(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> None:
-    """Delete folders whose manifest is stale or whose shards do not verify, so the step rebuilds — except a raw
-    folder with a broken shard, which is truncated to its good prefix (the next download resumes there) rather than
-    downloaded again. (Task 7 turns this into the repair step; deleting a raw folder then needs confirmation.)"""
-    for stage, problem in stage_problems(cfg, name, layout).items():
+    """Delete folders whose manifest is stale or outdated (raw: `max_seq_length` raised above the stored cap) or
+    whose shards do not verify, so the step rebuilds — except a raw folder with a broken shard, which is truncated to
+    its good prefix (the next download resumes there) rather than downloaded again.
+    # task 9: replaced by repair_broken_and_stale_folders (confirmed deletion) — `download()` itself never deletes a
+    stale or outdated raw folder (it raises `RawFolderError`), this transitional step still does so unconfirmed."""
+    problems = stage_problems(cfg, name, layout)
+    if raw_manifest_state(cfg, name, layout) == "outdated":
+        problems["raw"] = f"raw: manifest {raw_manifest_problem(cfg, name, layout)}"
+    for stage, problem in problems.items():
         directory = stage_dir(layout, name, stage)
-        if stage == "raw" and not problem.endswith("manifest stale"):
+        if stage == "raw" and not problem.endswith("manifest stale") and "manifest outdated" not in problem:
             manifest = Manifest.load(directory)
             if manifest is not None and truncate_raw_to_good_prefix(directory, manifest):
                 log.warning("%s: %s; kept the %d good shard(s) of %s", name, problem, len(manifest.shards), directory)

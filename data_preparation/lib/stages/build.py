@@ -64,11 +64,11 @@ from data_preparation.lib.stages.row_pipeline import (
     instruct_text,
     preprocess_batch,
 )
-from data_preparation.lib.stages.shared import (
+from data_preparation.lib.stages.download import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     current_manifest,
-    ensure_raw_tokens,
+    current_raw_manifest,
     new_manifest,
     shard_list,
 )
@@ -100,7 +100,7 @@ def build_source(
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
     raw_dir, processed_dir = layout.raw_dir(name), layout.processed_dir(name)
-    raw = ensure_raw_tokens(config, name, layout)
+    raw = current_raw_manifest(config, name, layout)
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     columns = processed_columns(source.kind)
@@ -449,7 +449,7 @@ class RowPipeline:
 
     def _counter(self) -> TokenCounter:
         if self._token_counter is None:
-            self._token_counter = TokenCounter.for_source(self.config, self.layout, self.name)  # instruct: uncapped
+            self._token_counter = TokenCounter(self.config, self.layout)
         return self._token_counter
 
     def _advance(self, rows: int) -> None:

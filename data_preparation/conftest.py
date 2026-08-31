@@ -30,7 +30,7 @@ from data_preparation.dataset_config import (
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import file_format
-from data_preparation.lib.stages.shared import prepare_tokenizer
+from data_preparation.lib.stages.download import prepare_tokenizer
 
 # Must happen before `datasets` is imported anywhere (its config reads the env at import time).
 _CACHE = tempfile.mkdtemp(prefix="hf_datasets_cache_")
