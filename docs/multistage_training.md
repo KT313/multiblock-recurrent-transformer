@@ -40,8 +40,10 @@ stage boundary.
 
 Logged per step (wandb): `stage/current_stage`, `stage/base_lr`,
 `stage/in_transition`, `stage/transition_progress`, `stage/stage_progress`,
-plus per-dataset scheduler weights (`data_scheduler_norm_weight/*`) and
-per-stage validation metrics.
+plus the realised data composition of the world batches since the last log step
+(`data_composition/<source>`) and the validation metrics `val_loss`, `val_ppl`,
+`val_loss_<depth>` / `val_ppl_<depth>` for every `partial_depth_eval` depth and
+`val_time` (of the stage the run is in at that step, not per stage).
 
 ## Step accounting
 

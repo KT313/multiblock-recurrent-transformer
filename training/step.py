@@ -4,8 +4,12 @@
 
 Everything here is numerics (see `tasks/training_pipeline_restructure.md`, section 3). The step body is a move of the
 thesis loop, bit-identical: `golden_tiny_steps.json` (dataset-independent, `test_step.py`) and `golden_tiny_run.json`
-(the 20-step tiny run, `test_run.py` / `golden.py`) pin it. Steps are OPTIMIZER steps: one world batch of
-`gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
+(the 20-step tiny run, `test_run.py` / `golden.py`) pin it. Two things in the stream are NOT thesis behaviour and are
+pinned as the new reference instead: the transition draws come from a private `random.Random(seed + resume step)` (the
+thesis drew from the checkpointed global `random`, so a thesis resume kept the transition mix of the uninterrupted
+run, this one re-seeds it), and `sort_batches_by_length` trims the regrouped micro-batches (the thesis sorter only
+re-stacked). Steps are OPTIMIZER steps: one world batch of `gradient_accumulation_steps` micro-batches, one
+`optimizer.step()`.
 """
 
 import random

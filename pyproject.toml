@@ -17,6 +17,8 @@ dependencies = [
   "tqdm",
   "rich>=13",
   "rbloom>=1.5.4",
+  "pyyaml",           # model/config.py reads the architecture YAML
+  "huggingface_hub",  # data_preparation/lib/sources/hub_files.py lists repo files
 ]
 
 [project.optional-dependencies]
