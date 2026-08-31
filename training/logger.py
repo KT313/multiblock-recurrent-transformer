@@ -290,6 +290,7 @@ class RunLogger:
         self.setup_seconds = now - setup_started if setup_started is not None else 0.0
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
+        self._interval_step = start_step  # the step the interval timer started at (the resume step, then each log step)
         self._sample_counter: Counter[str] = Counter()  # data ids of the world batches since the last log step
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
         self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
@@ -486,8 +487,9 @@ class RunLogger:
         """The metric dict of a log step (documented in `log_step`); resets the interval timer and the composition
         counter."""
         now = self._clock()
-        seconds_per_step = (now - self._interval_started) / self.settings.log_step_interval
-        self._interval_started = now
+        steps_in_interval = max(progress.done - self._interval_step, 1)  # after an off-grid resume fewer than the interval
+        seconds_per_step = (now - self._interval_started) / steps_in_interval
+        self._interval_started, self._interval_step = now, progress.done
         total_samples = sum(self._sample_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
