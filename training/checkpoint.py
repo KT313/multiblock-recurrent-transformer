@@ -85,52 +85,99 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
     return max(candidates, key=_step_from_name)
 
 
-# Settings whose value changes the numbers a run produces: a resume that silently mixes two configurations of these
-# is a chimera, so `restore_checkpoint_if_resuming` compares them against the checkpoint (`allow_settings_change`
-# overrides). The evaluation knobs are here because every forward consumes the global torch RNG (the meta check and
-# the latent `randn_like` of the recurrence): how often validation runs, how many batches it draws and at how many
-# depths it scores each of them all change the training stream itself, not just the reported numbers — and so does
-# `dataloader_num_workers`, which changes how the workers hand batches over. Deliberately absent: paths, run_name,
-# resume/logging/export knobs, `resume_warmup_steps` (a resume feature by design) and the dataset config (its own
-# hash check).
-NUMERICS_SETTINGS = (
-    "world_batch_size",
-    "micro_batch_size",
-    "seed",
-    "stage_base_lrs",
-    "lr_schedule",
-    "warmup_steps",
-    "cooldown_steps",
-    "min_lr",
-    "grad_clip",
-    "optimizer",
-    "optim_config",
-    "no_weight_decay_for_bias_and_norm_params",
-    "block_size",
-    "dataloader_num_workers",
-    "sort_batches_by_length",
-    "sequence_padding_multiple",
-    "precision",
-    "eval_step_interval",
-    "eval_iters",
-    "partial_depth_eval",
+# A resume that silently mixes two configurations is a chimera, so `restore_checkpoint_if_resuming` compares EVERY
+# `Settings` field against the ones stored in the checkpoint (`allow_settings_change` overrides) — a field added in
+# the future is checked by default until it is deliberately exempted here. Each entry (group) says why differing
+# from the checkpoint is harmless. Deliberately NOT exempt, although they look like reporting knobs: the evaluation
+# settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`) — every forward consumes the global torch RNG
+# (the meta check and the latent `randn_like` of the recurrence), so how often validation runs, how many batches it
+# draws and at how many depths it scores them change the training stream itself — and `dataloader_num_workers`,
+# which changes how the workers hand batches over.
+SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
+    # run identity and output location: where results go, not what is computed
+    "run_name",
+    "out_dir",
+    # the resume feature's own knobs: they exist to differ between the original run and its resume
+    "resume",
+    "resume_checkpoint_path",
+    "resume_warmup_steps",
+    # the override flags themselves: comparing them would make the escape hatches refuse their own use
+    "allow_settings_change",
+    "allow_dataset_change",
+    # dataset reference: the dataset itself has its dedicated resume check (`check_dataset_unchanged` verifies the
+    # dataset config HASH and the validation split), which a changed path or root alone does not trip
+    "dataset_config",
+    "dataset_dir",
+    # model reference: the resolved `RecurrentConfig` is compared WHOLE (the `model_config` argument below), so the
+    # built model is verified regardless of which architecture file / overrides produced it
+    "model_architecture_config",
+    "model_overwrite",
+    # dataset-preparation conveniences: how missing data gets built, never what it contains
+    "auto_prepare",
+    "prepare_num_workers",
+    "prepare_max_parallel_downloads",
+    # logging cadence: log steps read out metrics, they draw no RNG and change no state
+    "log_step_interval",
+    "log_gradient_metrics",
+    # checkpoint cadence: when state is saved, not what it is
+    "save_step_interval",
+    "save_last_step",
+    # wandb / export: reporting and post-run export only
+    "logger_project",
+    "wandb_offline",
+    "wandb_enabled",
+    "export_to_hf",
+    "export_hf_path",
 )
+
+# Changing this flag on resume could NEVER take effect: the optimizer's parameter groups are restored from the
+# checkpoint, so the old grouping silently stays. `check_settings_unchanged` therefore refuses a changed value even
+# under `allow_settings_change`.
+PARAM_GROUPING_SETTING = "no_weight_decay_for_bias_and_norm_params"
 
 
 def check_settings_unchanged(
     metadata: CheckpointMetadata, settings: "Settings", model_config: dict[str, Any], allow_settings_change: bool
 ) -> None:
-    """Fail a resume whose numerics-relevant settings (:data:`NUMERICS_SETTINGS`) or model config differ from what
-    the checkpoint was written with, unless `allow_settings_change` is set. `model_config` is the current model's
-    `RecurrentConfig.to_dict()`, compared whole against the stored one."""
+    """Fail a resume whose settings or model config differ from what the checkpoint was written with, unless
+    `allow_settings_change` is set.
+
+    Every `Settings` field outside :data:`SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME` is compared; a field the (older)
+    checkpoint did not store counts as changed. `model_config` is the current model's `RecurrentConfig.to_dict()`,
+    compared whole against the stored one. A changed :data:`PARAM_GROUPING_SETTING` is refused even with
+    `allow_settings_change`: the restored optimizer keeps the checkpoint's parameter groups, so the new value would
+    be silently ignored.
+    """
     current = asdict(settings)
-    changed = sorted(key for key in NUMERICS_SETTINGS if current.get(key) != metadata.settings.get(key))
-    if model_config != metadata.model_config:
-        changed.append("model_config")
-    if changed and not allow_settings_change:
+    compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
+    details = {
+        key: f"checkpoint {metadata.settings[key]!r} != current {current[key]!r}"
+        for key in compared
+        if key in metadata.settings and metadata.settings[key] != current[key]
+    }
+    if PARAM_GROUPING_SETTING in details:
         raise ValueError(
-            f"resuming with changed {changed}: the checkpoint was written with different values; "
-            "set allow_settings_change: true to continue anyway (the run becomes a mix of two configurations)"
+            f"resuming with changed {PARAM_GROUPING_SETTING} ({details[PARAM_GROUPING_SETTING]}): the optimizer's "
+            "parameter groups are restored from the checkpoint, so the new value would be silently ignored; "
+            "allow_settings_change cannot override this — keep the checkpoint's value or start a fresh run"
+        )
+    details |= {
+        key: "not stored in the checkpoint (written by an older version of the training code)"
+        for key in compared
+        if key not in metadata.settings
+    }
+    if model_config != metadata.model_config:
+        differing = sorted(
+            key
+            for key in model_config.keys() | metadata.model_config.keys()
+            if model_config.get(key) != metadata.model_config.get(key)
+        )
+        details["model_config"] = f"differs from the stored model config in {differing}"
+    if details and not allow_settings_change:
+        listed = "; ".join(f"{key}: {details[key]}" for key in sorted(details))
+        raise ValueError(
+            f"resuming with changed {sorted(details)}: {listed}; set allow_settings_change: true to continue "
+            "anyway (the run becomes a mix of two configurations)"
         )
 
 
