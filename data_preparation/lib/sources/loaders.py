@@ -8,8 +8,9 @@ align_to_row_group) -> Iterator[Row]` yields raw rows starting at row `offset` o
 (`align_to_row_group=True`, the default) so the rows that were downloaded anyway are kept and a later fetch at
 the resulting offset never fetches those bytes again; `align_to_row_group=False` makes every loader exact. The
 caller must consume everything yielded and advance its offset by the number of rows consumed. `columns` projects the
-rows `hf_files` / `github_code` read, whatever the file format (`github_code` adds `language`, its filter column),
-and the local parquet files `local` reads; the other loaders and local `.jsonl` files yield every column.
+rows `hf_files` / `github_code` / `local` read, whatever the file format (`github_code` adds `language`, its filter
+column) — they all read through `hub_files.iter_row_batches`, the one reading contract; the other loaders yield
+every column.
 
 `index_dir` is where `hf_files` / `github_code` persist their file index (None: in memory), `on_file` is called
 with every repo file they open (progress display) and `stats` collects their download counters (`FetchStats`,
@@ -17,14 +18,11 @@ remote bytes read). `datasets` is imported lazily so the HF cache environment ca
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
-
-import pyarrow.parquet as pq
 
 from data_preparation.dataset_config import SourceConfig
 from data_preparation.lib.sources.hub_files import (
@@ -34,6 +32,7 @@ from data_preparation.lib.sources.hub_files import (
     HubFetcher,
     OnFile,
     ReadRequest,
+    iter_file,
     read_rows,
     read_rows_multi,
 )
@@ -301,23 +300,12 @@ def list_local_files(directory: Path) -> list[Path]:
     return sorted(files)
 
 
-def _iter_local_file(path: Path, columns: list[str] | None = None) -> Iterator[Row]:
-    """Every row of one local `.parquet` (projected to `columns`) or `.jsonl` file (empty lines skipped)."""
-    if path.suffix == ".parquet":
-        parquet = pq.ParquetFile(path)
-        for batch in parquet.iter_batches(columns=columns):
-            yield from batch.to_pylist()
-    else:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    yield json.loads(line)
-
-
 def _iter_local_rows(directory: Path, columns: list[str] | None = None) -> Iterator[Row]:
-    """Every row of every file under `directory`, files in sorted order."""
+    """Every row of every file under `directory`, files in sorted order, projected to `columns` — through the
+    same reading contract as the Hub loaders (`hub_files.iter_row_batches` via `iter_file`: bounded batches,
+    empty `.jsonl` lines skipped)."""
     for file in list_local_files(directory):
-        yield from _iter_local_file(file, columns)
+        yield from iter_file(file, file.name, 0, columns)
 
 
 def load_local(
@@ -332,8 +320,8 @@ def load_local(
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
 ) -> Iterator[Row]:
-    """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order); parquet
-    files are read with the `columns` projection."""
+    """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order), each
+    projected to `columns` (None: every column) whatever the file format."""
     _check_offset_count(offset, count)
     if count == 0:
         return

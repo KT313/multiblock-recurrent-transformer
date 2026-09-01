@@ -169,6 +169,17 @@ def test_local_reads_parquet_and_jsonl_in_sorted_order(tmp_path: Path) -> None:
     assert list(LOADERS["local"](source, 0, 0)) == []
 
 
+def test_local_projects_jsonl_and_parquet_to_the_requested_columns(tmp_path: Path) -> None:
+    """`local` goes through the shared reading contract: `columns` projects both formats (a `.jsonl` row's surplus
+    column is dropped, a requested column a row lacks stays absent), None keeps every column."""
+    pq.write_table(pa.table({"text": ["b0"], "extra": [1]}), tmp_path / "b.parquet")
+    (tmp_path / "a.jsonl").write_text(json.dumps({"text": "a0", "extra": 0}) + "\n")
+    source = _src(loader="local", path=str(tmp_path), hf_id=None, revision=None)
+    assert list(LOADERS["local"](source, 0, 10, columns=["text"])) == [{"text": "a0"}, {"text": "b0"}]
+    assert list(LOADERS["local"](source, 0, 1, columns=["text", "missing"])) == [{"text": "a0"}]  # jsonl: absent stays absent
+    assert list(LOADERS["local"](source, 0, 10)) == [{"text": "a0", "extra": 0}, {"text": "b0", "extra": 1}]
+
+
 def test_local_missing_directory(tmp_path: Path) -> None:
     source = _src(loader="local", path=str(tmp_path / "nope"), hf_id=None, revision=None)
     with pytest.raises(FileNotFoundError):

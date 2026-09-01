@@ -207,14 +207,16 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     assert download(cfg, "g", layout, rows_needed=100, shard_size=4) == m
 
 
-def test_download_keeps_extra_columns_and_requires_text_field(
+def test_download_projects_to_the_text_field_and_requires_it(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:
+    """A pretrain source read as-is stores only its `text_field` (plus `tokens`): the projection applies to every
+    file format, local `.jsonl` included, so the surplus `lang` column never reaches the raw shards."""
     src_dir = layout.root.parent / "code"
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
     download(cfg, "c", layout, rows_needed=1)
-    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "lang": "py", "tokens": 40}]  # tokens of `code`
+    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40}]  # tokens of `code`; no `lang`
     bad = cfg_factory({"c": _local(src_dir, text_field="text")})
     other = DatasetLayout(layout.root / "other")
     prepare_tokenizer(bad, other)

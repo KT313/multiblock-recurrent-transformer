@@ -675,8 +675,9 @@ class _DownloadPostfix:
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
-    """Parquet column projection for a source's loader: ``[text_field]`` for pretrain sources read as-is,
-    None (every column) when a converter or ``fields`` mapping may need others or the rows are instruct rows."""
+    """Column projection for a source's loader (applied whatever the file format): ``[text_field]`` for pretrain
+    sources read as-is, None (every column) when a converter or ``fields`` mapping may need others or the rows are
+    instruct rows."""
     if source.kind == "instruct" or get_converter(source) is not None:
         return None
     return [source.text_field]
