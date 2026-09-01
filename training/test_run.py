@@ -44,6 +44,7 @@ from training.run import (
     stop_requested,
     train,
 )
+from training.run_lock import RunDirectoryLocked, run_directory_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
@@ -114,6 +115,17 @@ def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_rec
     record_run_config(tiny_settings, run_directory)
     assert json.loads((run_directory / "run_config.json").read_text()) == json.loads(json.dumps(asdict(tiny_settings)))
     prepare_run_directory(tiny_settings)  # idempotent (a resumed run reuses the directory)
+
+
+def test_train_refuses_a_run_directory_another_run_holds(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend
+) -> None:
+    """`train()` takes the run-directory lock right after creating the directory and holds it for the whole run: a
+    second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
+    `train.log` and `run_config.json` with the first one."""
+    with run_directory_lock(Path(tiny_settings.out_dir)), pytest.raises(RunDirectoryLocked, match="already using"):
+        train(tiny_settings, backend=cpu_backend)
+    assert list(checkpoint_dir(Path(tiny_settings.out_dir)).glob("*.pth")) == [], "nothing ran"
 
 
 def test_check_block_sizes_agree_message(tiny_settings: Settings) -> None:
