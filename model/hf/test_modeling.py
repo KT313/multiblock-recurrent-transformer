@@ -23,6 +23,7 @@ from model.hf.modeling import (
     export_to_hf,
     flat_module_name,
     flatten_relative_imports,
+    mask_padded_vocabulary,
     parse_recurrence_steps,
 )
 
@@ -237,6 +238,66 @@ def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,2,3")
     with pytest.raises(ValueError, match="recurrence values"):
         hf_model(x)
+
+
+def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The env var fixes the eval depths with zero backprop iterations: honouring it in training mode would train
+    the recurrence without any gradient reaching it."""
+    monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,1")
+    hf_model = tiny_hf_model().train(True)
+    hf_model.model.step = 3
+    x = ids()
+    torch.manual_seed(1)
+    out = hf_model(x).logits
+    torch.manual_seed(1)
+    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps_pair=None -> sampled at step 3
+    assert torch.equal(out, sampled)
+    torch.manual_seed(1)
+    fixed = hf_model.model(x, return_logits=True, num_steps_pair=[(1, 0), (1, 0)])["logits"]
+    assert not torch.equal(out, fixed), "the env var is an eval knob"
+    hf_model.train(False)  # and it is honoured again in eval mode
+    torch.manual_seed(1)
+    assert torch.equal(hf_model(x).logits, fixed)
+
+
+def test_hf_config_broadcasts_the_per_block_int_shorthand() -> None:
+    """`mean_recurrence: 12` for every block is the documented shorthand `RecurrentConfig` broadcasts; the wrapper's
+    config used to raise a TypeError on it (it zipped over an int)."""
+    hf_cfg = RecurrentGPTConfig(n_layers_in_recurrent_block=[2, 2, 2], mean_recurrence=3, mean_backprop_depth=2)
+    assert hf_cfg.mean_recurrence == [3, 3, 3] and hf_cfg.mean_backprop_depth == [2, 2, 2]
+    assert hf_cfg.num_hidden_layers == hf_cfg.to_recurrent_config().effective_expected_depth
+    single = RecurrentGPTConfig(n_layers_in_recurrent_block=4, mean_recurrence=12, mean_backprop_depth=8)
+    assert single.n_layers_in_recurrent_block == [4] and single.mean_recurrence == [12] == single.to_recurrent_config().mean_recurrence
+    with pytest.raises(ValueError, match="mean_recurrence has 2 entries but there are 3"):
+        RecurrentGPTConfig(n_layers_in_recurrent_block=[2, 2, 2], mean_recurrence=[3, 3])
+
+
+def test_mask_padded_vocabulary_helper() -> None:
+    logits = torch.zeros(2, 3, 8)
+    assert mask_padded_vocabulary(logits, 8, 8) is logits, "no padding: the logits are handed on untouched"
+    masked = mask_padded_vocabulary(logits, 5, 8)
+    assert torch.isinf(masked[..., 5:]).all() and (masked[..., 5:] < 0).all()
+    assert torch.equal(masked[..., :5], logits[..., :5]) and torch.equal(logits, torch.zeros(2, 3, 8)), "not in place"
+
+
+def test_padded_vocabulary_columns_are_masked_and_never_generated() -> None:
+    """The embedding table is padded to `padding_multiple` and those columns are trained on no target, so the
+    wrapper hides them: `generate(do_sample=True)` can only draw ids the tokenizer knows."""
+    cfg = tiny_config(vocab_size=500, padding_multiple=512)
+    assert (cfg.vocab_size, cfg.padded_vocab_size) == (500, 512)
+    torch.manual_seed(0)
+    hf_model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(cfg)).train(False)
+    x = ids() % 500
+    logits = hf_model(x).logits
+    assert logits.shape[-1] == 512
+    assert torch.isinf(logits[..., 500:]).all() and (logits[..., 500:] < 0).all()
+    assert torch.isfinite(logits[..., :500]).all()
+    torch.manual_seed(1)
+    # transformers' `GenerativePreTrainedModel` protocol lists attributes PreTrainedModel only sets dynamically.
+    generate = hf_model.generate  # pyright: ignore[reportAttributeAccessIssue]
+    generated = generate(x[:, :4], max_new_tokens=6, do_sample=True)
+    assert isinstance(generated, torch.Tensor) and (generated < 500).all()
+    assert torch.isfinite(tiny_hf_model().train(False)(x).logits).all(), "an unpadded table is not masked"
 
 
 @pytest.fixture

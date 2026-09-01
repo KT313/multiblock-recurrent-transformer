@@ -37,6 +37,21 @@ _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
 )
 
 
+def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> list[int]:
+    """A per-block field as one entry per core block: an int (or a one-element list) is repeated for every block, a
+    longer list must already have one entry per block. `RecurrentConfig.__post_init__` and the HuggingFace wrapper's
+    config (`model/hf/modeling.py`) broadcast the same way, so the int shorthand means the same in both."""
+    if isinstance(value, int):
+        values = [value]
+    else:
+        values = list(value)
+    if len(values) == 1 and num_blocks > 1:
+        values = values * num_blocks
+    if len(values) != num_blocks:
+        raise ValueError(f"{name} has {len(values)} entries but there are {num_blocks} recurrent blocks")
+    return values
+
+
 @dataclass
 class RecurrentConfig:
     """Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block."""
@@ -101,8 +116,8 @@ class RecurrentConfig:
         if isinstance(self.n_layers_in_recurrent_block, int):
             self.n_layers_in_recurrent_block = [self.n_layers_in_recurrent_block]
         num_blocks = len(self.n_layers_in_recurrent_block)
-        self.mean_recurrence = self._broadcast("mean_recurrence", self.mean_recurrence, num_blocks)
-        self.mean_backprop_depth = self._broadcast("mean_backprop_depth", self.mean_backprop_depth, num_blocks)
+        self.mean_recurrence = broadcast_per_block("mean_recurrence", self.mean_recurrence, num_blocks)
+        self.mean_backprop_depth = broadcast_per_block("mean_backprop_depth", self.mean_backprop_depth, num_blocks)
         self._validate_recurrence()
 
         # Expected unrolled depth of the model: every core block contributes its layers times its mean recurrence.
@@ -139,19 +154,6 @@ class RecurrentConfig:
                 raise ValueError(
                     f"core block {block}: mean_recurrence ({mean_recurrence}) must be >= mean_backprop_depth ({mean_backprop_depth})"
                 )
-
-    @staticmethod
-    def _broadcast(name: str, value: int | list[int], num_blocks: int) -> list[int]:
-        """An int (or a one-element list) is repeated for every block; a longer list must have one entry per block."""
-        if isinstance(value, int):
-            values = [value]
-        else:
-            values = list(value)
-        if len(values) == 1 and num_blocks > 1:
-            values = values * num_blocks
-        if len(values) != num_blocks:
-            raise ValueError(f"{name} has {len(values)} entries but there are {num_blocks} recurrent blocks")
-        return values
 
     @classmethod
     def from_yaml(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":

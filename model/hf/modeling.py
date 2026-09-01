@@ -19,7 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Pretra
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ..config import RecurrentConfig, RoPESettings
+from ..config import RecurrentConfig, RoPESettings, broadcast_per_block
 from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
 from ..model import RecurrentGPT
 
@@ -66,6 +66,20 @@ def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[
     return per_block
 
 
+def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_size: int) -> torch.Tensor:
+    """`logits` with the columns of the embedding table's padding (`vocab_size:`) set to -inf; unchanged when the
+    table is not padded.
+
+    The table is padded to `padding_multiple` so the matmuls stay aligned, and those columns are trained on no
+    target — with them exposed, `generate(do_sample=True)` can draw an id the tokenizer cannot decode. Only the HF
+    wrapper masks: the training loss must keep seeing the model's own logits (the goldens pin those numbers)."""
+    if padded_vocab_size <= vocab_size:
+        return logits
+    masked = logits.clone()  # a clone, not an in-place write: `logits` is part of the autograd graph
+    masked[..., vocab_size:] = float("-inf")
+    return masked
+
+
 class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # transformers' __init_subclass__ is untyped
     """`RecurrentConfig` fields as a `PretrainedConfig` (RoPE settings flattened to `rope_base`)."""
 
@@ -75,8 +89,19 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         # Defaults only fill keys missing from a config.json (export_to_hf writes every field); the exported folder
         # is standalone and has no access to config/model_architecture/, so the dataclass defaults are used.
         defaults = RecurrentConfig()
+        values: dict[str, Any] = {}
         for name in _MODEL_FIELDS:
-            setattr(self, name, kwargs.pop(name, getattr(defaults, name)))
+            values[name] = kwargs.pop(name, getattr(defaults, name))
+        # The per-block fields take the same int shorthand as `RecurrentConfig` (`mean_recurrence: 12` = every
+        # block), so they are broadcast here the way `RecurrentConfig.__post_init__` does it: everything below and
+        # in the wrapper (`num_hidden_layers`, the eval depths) then reads one entry per core block.
+        layers_per_block = values["n_layers_in_recurrent_block"]
+        values["n_layers_in_recurrent_block"] = [layers_per_block] if isinstance(layers_per_block, int) else list(layers_per_block)
+        num_blocks = len(values["n_layers_in_recurrent_block"])
+        for name in ("mean_recurrence", "mean_backprop_depth"):
+            values[name] = broadcast_per_block(name, values[name], num_blocks)
+        for name, value in values.items():
+            setattr(self, name, value)
         self.rope_base = rope_base
 
         # Standard HF attribute names, derived from ours (`num_hidden_layers` = the expected unrolled depth).
@@ -131,8 +156,14 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         num_steps_pair: NumSteps = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
-        """`num_steps_pair` as in `RecurrentGPT.forward`; if None, `EVAL_RECURRENCE_STEPS` ("12" or "4,12,4") is used,
-        else in eval mode the config's `mean_recurrence` per block, else (training) the sampler.
+        """`num_steps_pair` as in `RecurrentGPT.forward`; if None, **in eval mode** `EVAL_RECURRENCE_STEPS` ("12" or
+        "4,12,4") when it is set, else the config's `mean_recurrence` per block; in training mode always the sampler
+        (the env var fixes eval depths with zero backprop iterations — honouring it while training would silently
+        train the recurrence without gradient).
+
+        Logits over the embedding table's padding columns (`vocab_size:` of `padded_vocab_size`) are `-inf`, so
+        sampling can only produce ids the tokenizer can decode. The inner model is left untouched: masking there
+        would change the training numerics.
 
         `labels` follow the HuggingFace contract and are shifted **here**: `model(x, labels=x).loss` is the
         next-token loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The INNER `RecurrentGPT` takes
@@ -144,11 +175,11 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         if return_dict is None:
             return_dict = self.config.return_dict
 
-        if num_steps_pair is None:
+        if num_steps_pair is None and not self.training:
             env_steps = os.environ.get("EVAL_RECURRENCE_STEPS", "").strip()
             if env_steps:
                 num_steps_pair = parse_recurrence_steps(env_steps, self.num_recurrent_blocks)
-            elif not self.training:
+            else:
                 per_block: list[StepsSpec] = []
                 for mean_recurrence in self.config.mean_recurrence:
                     per_block.append((mean_recurrence, 0))
@@ -164,6 +195,7 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         )
         logits = outputs["logits"]
         assert logits is not None  # `return_logits=True`
+        logits = mask_padded_vocabulary(logits, int(self.config.vocab_size), int(self.config.padded_vocab_size))
         loss: torch.Tensor | None = None
         if labels is not None:
             # `contiguous()`: both slices are views, and the inner `loss` flattens them with `view`.

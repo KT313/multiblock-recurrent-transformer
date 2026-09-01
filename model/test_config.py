@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from model.config import RecurrentConfig, RoPESettings, find_multiple
+from model.config import RecurrentConfig, RoPESettings, broadcast_per_block, find_multiple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ARCHITECTURE_DIR = REPO_ROOT / "config" / "model_architecture"
@@ -61,12 +61,12 @@ def test_length_mismatch_raises(field: str) -> None:
 
 
 def test_broadcast_helper_directly() -> None:
-    assert RecurrentConfig._broadcast("f", 3, 1) == [3]
-    assert RecurrentConfig._broadcast("f", 3, 3) == [3, 3, 3]
-    assert RecurrentConfig._broadcast("f", [3], 2) == [3, 3]
-    assert RecurrentConfig._broadcast("f", [1, 2], 2) == [1, 2]
+    assert broadcast_per_block("f", 3, 1) == [3]
+    assert broadcast_per_block("f", 3, 3) == [3, 3, 3]
+    assert broadcast_per_block("f", [3], 2) == [3, 3]
+    assert broadcast_per_block("f", [1, 2], 2) == [1, 2]
     with pytest.raises(ValueError, match="f has 3 entries but there are 2"):
-        RecurrentConfig._broadcast("f", [1, 2, 3], 2)
+        broadcast_per_block("f", [1, 2, 3], 2)
 
 
 def test_rope_settings_default() -> None:
