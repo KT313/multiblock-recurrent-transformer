@@ -207,15 +207,17 @@ def test_rng_state_of_a_cpu_backend_never_touches_cuda(monkeypatch: pytest.Monke
 
 @pytest.mark.gpu
 def test_rng_state_of_a_cuda_backend_holds_its_own_device_only() -> None:
+    """The **restore** is what is measured: capture, draw, let the generator move on, restore, draw again — with no
+    reseeding in between, only `set_rng_state` can make the second draw repeat the first (the old version reseeded
+    before each draw and passed with the restore stubbed out)."""
     backend = SingleDeviceBackend(device="cuda:0", precision="32")
+    torch.cuda.manual_seed(9)
     state = backend.rng_state()
     assert isinstance(state["cuda"], torch.Tensor), "one generator state, not the per-GPU list"
-    torch.cuda.manual_seed(9)
-    expected = torch.rand(2, device=backend.device)
-    torch.cuda.manual_seed(9)
-    backend.set_rng_state(backend.rng_state())
-    torch.cuda.manual_seed(9)  # the round trip restored the state the draw above was made from
-    assert torch.equal(torch.rand(2, device=backend.device), expected)
+    first = torch.rand(2, device=backend.device)
+    assert not torch.equal(torch.rand(2, device=backend.device), first), "the generator moved on"
+    backend.set_rng_state(state)
+    assert torch.equal(torch.rand(2, device=backend.device), first)
 
 
 def test_save_checkpoint_is_atomic_and_leaves_no_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

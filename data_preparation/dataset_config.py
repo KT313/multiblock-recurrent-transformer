@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from math import ceil
 from pathlib import Path
@@ -690,7 +691,10 @@ def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None)
             namespace = parser.parse_args(overrides, namespace=namespace)
     except ArgumentError as error:
         raise ValueError(_load_error_message(path, str(error))) from error
-    instantiated = parser.instantiate_classes(namespace)
+    instantiate: Callable[[Namespace], Namespace | dict[str, Any]] = (
+        getattr(parser, "instantiate", None) or parser.instantiate_classes  # jsonargparse >=4.49 / older
+    )
+    instantiated = instantiate(namespace)
     values = instantiated.as_dict() if isinstance(instantiated, Namespace) else instantiated
     return DatasetConfig(**values)
 

@@ -222,6 +222,8 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
         assert sum(e.weight for e in train) == pytest.approx(1.0)
 
 
+# Not in this list: `model.config`, the known gap — it is framework-neutral by intent but imports
+# `model/layers/init.py` for its `Init` object, and that imports torch (checked: `import model.config` loads torch).
 FRAMEWORK_NEUTRAL_MODULES = (
     "training.settings",
     "training.stage_manager",
