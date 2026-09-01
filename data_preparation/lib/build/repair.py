@@ -12,10 +12,13 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   counters the last kept shard recorded); when no prefix can be kept it is queued for
   the same confirmed deletion. Shards without a manifest are an error: nothing says where those rows came from, and
   guessing would either delete data or resume from the wrong offset.
-* **processed** (derived, cheap): deleted without confirmation when stale, broken, without a manifest, built from raw
-  shards that no longer exist (its ``extra["input_shards"]`` is not a prefix of the raw shard list — e.g. after a
-  truncation), or when its raw folder is being deleted. A leftover ``processed/<name>.tmp`` of an interrupted
-  all-at-once build is removed too.
+* **processed** (derived, cheap): judged by the shared verdict (``lib/build/assessment.py``), which attaches the
+  cheapest repair — and this step performs exactly that repair, never more. A rebuild is a deletion without
+  confirmation: stale, broken, without a manifest, unlisted stray shards, built from raw shards that no longer
+  exist (its ``extra["input_shards"]`` is not a prefix of the raw shard list — e.g. after a truncation), or its
+  raw folder is being deleted. The one exception is the crash leftover of an interrupted per-shard build — a single
+  unlisted file that is exactly the next shard the resumed build writes: it is left alone (the build overwrites
+  it). A leftover ``processed/<name>.tmp`` of an interrupted all-at-once build is removed too.
 
 Nothing is touched until every folder was inspected; the queued raw deletions are then confirmed **once** with one
 list, and only then is anything deleted or truncated. ``dry_run=True`` (``prepare.py status``) records what would be
@@ -30,21 +33,20 @@ import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
+from data_preparation.lib.build.assessment import ShardList, assess_processed_folder
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
-from data_preparation.lib.storage.parquet import list_parquet_files
 from data_preparation.lib.storage.raw_folder import RawFolder
 
 log = get_logger(__name__)
 
 FolderKind = Literal["raw", "processed"]
 RepairVerb = Literal["delete", "truncate", "would_delete", "would_truncate"]
-ShardList = list[list[Any]]  # ``[[shard name, rows], ...]`` — the shape of ``processed`` manifests' ``extra["input_shards"]``
 Confirm = Callable[[str], bool]
 
 CONFIRMATION_HEADER = "The following raw folders will be deleted and downloaded again:"
@@ -188,38 +190,18 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
 
 def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
     """Plan what happens to the processed folder of ``name`` given the raw shards it will be able to build from
-    (None: the raw folder is being deleted). Every problem is a deletion; derived data needs no confirmation —
-    including an unreadable manifest (`Manifest.load` treats that as an error next to shards, which is right for
-    raw folders; a processed folder is simply rebuilt) and shard files the manifest does not list (left behind by
-    a crash between publishing a shard and saving the manifest; the training resolver refuses such a folder, so
-    the repair step must be the one that heals it)."""
-    try:
-        manifest = Manifest.load(folder)
-    except RuntimeError:
-        _plan(report, name, folder, "processed", "delete", "unreadable manifest")
-        return
-    if manifest is None:
-        if has_shards(folder):
-            _plan(report, name, folder, "processed", "delete", "no manifest")
-        return
-    if raw_shards is None:
-        _plan(report, name, folder, "processed", "delete", "built from a raw folder that is being deleted")
-        return
-    if not manifest.is_current(config.processed_hash(name)):
-        _plan(report, name, folder, "processed", "delete", "stale: processing settings, max_seq_length or the source changed")
-        return
-    _, problem = _good_prefix_length(folder, manifest)
-    if problem is not None:
-        _plan(report, name, folder, "processed", "delete", f"broken: {problem}")
-        return
-    listed = {shard.name for shard in manifest.shards}
-    unlisted = sorted(path.name for path in list_parquet_files(folder) if path.name not in listed)
-    if unlisted:
-        _plan(report, name, folder, "processed", "delete", f"unlisted shard(s): {', '.join(unlisted)}")
-        return
-    covered: ShardList = manifest.extra.get("input_shards", [])
-    if raw_shards[: len(covered)] != covered:
-        _plan(report, name, folder, "processed", "delete", "built from raw shards that no longer exist")
+    (None: the raw folder is being deleted): the shared verdict of
+    :func:`~data_preparation.lib.build.assessment.assess_processed_folder` decides, and this step performs exactly
+    the cheapest repair the verdict attaches — a ``rebuild`` is a deletion (derived data needs no confirmation, the
+    build writes the folder again), everything else is left alone. In particular the single crash leftover of an
+    interrupted per-shard build (an unlisted file that is exactly the next shard the resumed build writes) is no
+    longer treated as corruption: the build overwrites it, so deleting the whole folder would redo the entire
+    cleaning for one file."""
+    assessment = assess_processed_folder(config, name, folder, raw_shards)
+    if assessment.repair == "rebuild":
+        _plan(report, name, folder, "processed", "delete", assessment.reason)
+    elif assessment.problem == "crash_leftover":
+        log.info("%s: leaving %s alone (%s)", name, folder, assessment.reason)
 
 
 def inspect_leftover_temporary_folder(name: str, processed_dir: Path, report: RepairReport) -> None:

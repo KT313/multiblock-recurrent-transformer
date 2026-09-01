@@ -234,6 +234,47 @@ def test_an_unlisted_processed_shard_deletes_the_folder(cfg_factory: CfgFactory,
     assert not folder.exists()
 
 
+def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
+) -> None:
+    """The M1 regression: a build that crashes between publishing a shard and saving the manifest leaves one
+    unlisted file — exactly the next shard the resumed build writes. The repair step leaves it alone (deleting the
+    folder would redo the whole build for one file), the resumed build overwrites it and completes the folder."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards, fully built
+    processed = layout.processed_dir("a")
+    complete_rows = read_rows(processed)
+    manifest = Manifest.load(processed)
+    assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet", "data-00001.parquet", "data-00002.parquet"]
+    # reconstruct the crash state by hand: the shard file of the third raw shard is on disk, the manifest save never ran
+    manifest.shards = manifest.shards[:2]
+    manifest.extra["input_shards"] = manifest.extra["input_shards"][:2]
+    manifest.save(processed)
+    stray = processed / "data-00002.parquet"
+    assert stray.exists()
+
+    before = _snapshot(layout.root)
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert report.actions == [], "the crash leftover is the resumed build's to overwrite, not corruption"
+    assert _snapshot(layout.root) == before and stray.exists()
+
+    resumed = build_source(cfg, "a", layout, shard_size=4)  # the resumed build overwrites the stray and completes
+    assert [shard.name for shard in resumed.shards] == ["data-00000.parquet", "data-00001.parquet", "data-00002.parquet"]
+    assert len(resumed.extra["input_shards"]) == 3 and read_rows(processed) == complete_rows, "no data lost"
+    assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False).actions == []
+
+
+def test_the_same_stray_on_a_complete_folder_is_still_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """The next-shard name is only harmless while raw shards are uncovered; on a folder that covers every raw shard
+    no build would overwrite it, so the folder is rebuilt as before."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)  # 2 raw shards, fully built
+    folder = layout.processed_dir("a")
+    (folder / "data-00002.parquet").write_bytes(b"stray")
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _kinds(report) == [("a", "processed", "delete")]
+    assert report.actions[0].reason == "unlisted shard(s): data-00002.parquet"
+    assert not folder.exists()
+
+
 def test_an_unreadable_processed_manifest_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     """Derived data is deleted without asking; a corrupt processed MANIFEST.json used to abort the run instead."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
