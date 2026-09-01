@@ -161,6 +161,11 @@ class Settings:
                 f"({self.micro_batch_size}): gradient_accumulation_steps is their integer quotient, so anything else "
                 "silently trains on fewer sequences per step than configured"
             )
+        if self.eval_step_interval % self.log_step_interval != 0:  # both are POSITIVE_SETTINGS, no 0-disables case
+            raise ValueError(
+                f"eval_step_interval ({self.eval_step_interval}) must be a multiple of log_step_interval "
+                f"({self.log_step_interval}): validation results would be computed and never logged"
+            )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
 

@@ -293,6 +293,19 @@ def test_validation_of_nonsensical_batch_sizes() -> None:
     assert _settings(micro_batch_size=8, world_batch_size=8).gradient_accumulation_steps == 1
 
 
+def test_validation_misaligned_eval_and_log_intervals() -> None:
+    """Validation runs every eval_step_interval steps but the logger only emits at log steps, so an evaluation at a
+    non-log step would be computed and silently thrown away — refused at settings time instead."""
+    with pytest.raises(ValueError, match=r"eval_step_interval \(10\) must be a multiple of log_step_interval \(4\)"):
+        _settings(log_step_interval=4, eval_step_interval=10)
+
+
+@pytest.mark.parametrize("log,eval_", [(1, 1), (1, 100), (4, 4), (4, 16), (5, 100)])
+def test_validation_aligned_eval_and_log_intervals(log: int, eval_: int) -> None:
+    cfg = _settings(log_step_interval=log, eval_step_interval=eval_)
+    assert (cfg.log_step_interval, cfg.eval_step_interval) == (log, eval_)
+
+
 def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
     """`parse_settings` goes through `Settings.__post_init__`, so a bad YAML value is rejected the same way."""
     yaml = tmp_path / "bad.yaml"

@@ -792,7 +792,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
 def test_open_dashboard_arguments(tmp_path: Path) -> None:
     """`open_dashboard` passes the run to the factory: one bar per stage, the config file names as the header
     details, the log interval and the resume step; the fallback is chosen when the display is disabled."""
-    settings = reference_settings(log_step_interval=3)
+    settings = reference_settings(log_step_interval=3, eval_step_interval=99)  # eval must be a multiple of log
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
         assert isinstance(board, NoOpDashboard)  # stdout is not a TTY under pytest
