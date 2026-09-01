@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import random
+import shutil
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -581,3 +582,62 @@ def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         m = build_source(cfg, "i", layout)
     assert "leftover" in caplog.text and not leftover.exists() and m.rows() == 4 and len(read_rows(layout.processed_dir("i"))) == 4
+    assert not layout.processed_dir("i").with_name("i.old").exists()
+
+
+def test_swap_into_place_is_rename_aside(tmp_path: Path) -> None:
+    """Old aside, new in place, only then a deletion — and without an old folder the aside step is skipped."""
+    processed = tmp_path / "i"
+    processed.mkdir()
+    (processed / "data-00000.parquet").write_bytes(b"old")
+    temporary = tmp_path / "i.tmp"
+    temporary.mkdir()
+    (temporary / "data-00000.parquet").write_bytes(b"new")
+    stages_build._swap_into_place(temporary, processed)
+    assert (processed / "data-00000.parquet").read_bytes() == b"new"
+    assert not temporary.exists() and not (tmp_path / "i.old").exists()
+    # first build: no old folder to step aside
+    fresh = tmp_path / "j.tmp"
+    fresh.mkdir()
+    (fresh / "data-00000.parquet").write_bytes(b"only")
+    stages_build._swap_into_place(fresh, tmp_path / "j")
+    assert (tmp_path / "j" / "data-00000.parquet").read_bytes() == b"only" and not fresh.exists()
+    # a stale .old of an earlier crashed swap is cleared before the renames
+    stale_old = tmp_path / "i.old"
+    stale_old.mkdir()
+    (stale_old / "data-00000.parquet").write_bytes(b"stale")
+    again = tmp_path / "i.tmp"
+    again.mkdir()
+    (again / "data-00000.parquet").write_bytes(b"newer")
+    stages_build._swap_into_place(again, processed)
+    assert (processed / "data-00000.parquet").read_bytes() == b"newer" and not stale_old.exists()
+
+
+def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
+    cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename-aside window: a crash on the final delete leaves the new folder in place and the replaced one as
+    ``.old`` — never a moment without the data (the repair step removes the ``.old``)."""
+    src_dir = layout.root.parent / "swap"
+    write_local(src_dir, [_instruct_row(i) for i in range(4)], "jsonl")
+    cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir)
+    download(cfg, "i", layout, rows_needed=4)
+    build_source(cfg, "i", layout)
+    write_local(src_dir, [_instruct_row(i) for i in range(4, 8)], "jsonl")
+    download(cfg, "i", layout, rows_needed=8)  # a top-up: the next build rebuilds the folder whole and swaps again
+
+    real_rmtree = shutil.rmtree
+
+    def crash_on_old(path: str | Path, *args: Any, **kwargs: Any) -> None:
+        if str(path).endswith(".old"):
+            raise RuntimeError("crash while deleting the old folder")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", crash_on_old)  # build.py calls it as `shutil.rmtree`, so patching the module reaches it
+    with pytest.raises(RuntimeError, match="crash while deleting the old folder"):
+        build_source(cfg, "i", layout)
+    processed = layout.processed_dir("i")
+    old = processed.with_name("i.old")
+    assert len(read_rows(processed)) == 8, "the new folder is in place"
+    assert len(read_rows(old)) == 4, "the replaced folder survived the crash aside"
+    assert not processed.with_name("i.tmp").exists()

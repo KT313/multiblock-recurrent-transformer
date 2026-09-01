@@ -18,7 +18,11 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   exist (its ``extra["input_shards"]`` is not a prefix of the raw shard list — e.g. after a truncation), or its
   raw folder is being deleted. The one exception is the crash leftover of an interrupted per-shard build — a single
   unlisted file that is exactly the next shard the resumed build writes: it is left alone (the build overwrites
-  it). A leftover ``processed/<name>.tmp`` of an interrupted all-at-once build is removed too.
+  it). The rename-aside swap of an all-at-once build (``lib/stages/build.py:_swap_into_place``) can be interrupted
+  too: a **complete** ``processed/<name>.tmp`` (its own manifest is current and every shard verifies) next to a
+  *missing* processed folder is the swap's data — it is renamed into place instead of deleted; an incomplete
+  ``.tmp`` is removed as the leftover of an interrupted build, and a leftover ``processed/<name>.old`` (the folder
+  the swap already replaced) is removed without asking.
 
 Nothing is touched until every folder was inspected; the queued raw deletions are then confirmed **once** with one
 list, and only then is anything deleted or truncated. ``dry_run=True`` (``prepare.py status``) records what would be
@@ -46,7 +50,7 @@ from data_preparation.lib.storage.raw_folder import RawFolder
 log = get_logger(__name__)
 
 FolderKind = Literal["raw", "processed"]
-RepairVerb = Literal["delete", "truncate", "would_delete", "would_truncate"]
+RepairVerb = Literal["delete", "truncate", "swap", "would_delete", "would_truncate", "would_swap"]
 Confirm = Callable[[str], bool]
 
 CONFIRMATION_HEADER = "The following raw folders will be deleted and downloaded again:"
@@ -73,7 +77,7 @@ class ConfirmationRequired(RepairError):
 
 @dataclass(frozen=True)
 class RepairAction:
-    """One thing the repair step did (``delete`` / ``truncate``) or would do (``would_*``) to one folder."""
+    """One thing the repair step did (``delete`` / ``truncate`` / ``swap``) or would do (``would_*``) to one folder."""
 
     source: str
     folder: Path
@@ -120,6 +124,8 @@ def _planned_verb(verb: RepairVerb) -> RepairVerb:
         return "would_delete"
     if verb == "truncate":
         return "would_truncate"
+    if verb == "swap":
+        return "would_swap"
     return verb
 
 
@@ -147,7 +153,7 @@ def repair_broken_and_stale_folders(
     for name in config.sources if sources is None else sources:
         raw_shards = inspect_raw_folder(config, name, layout.raw_dir(name), planned)
         inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, planned)
-        inspect_leftover_temporary_folder(name, layout.processed_dir(name), planned)
+        inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, planned)
     if dry_run:
         report = planned.as_planned()
         log.info("repair (dry run):\n%s", report.describe())
@@ -204,11 +210,21 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
         log.info("%s: leaving %s alone (%s)", name, folder, assessment.reason)
 
 
-def inspect_leftover_temporary_folder(name: str, processed_dir: Path, report: RepairReport) -> None:
-    """Plan the removal of ``processed/<name>.tmp`` left behind by an interrupted all-at-once build."""
+def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
+    """Plan the cleanup after an interrupted rename-aside swap of an all-at-once build
+    (``lib/stages/build.py:_swap_into_place``): a **complete** ``processed/<name>.tmp`` (the shared verdict on the
+    folder itself is ``ok`` — current manifest, every shard verifies) next to a missing processed folder is the
+    swap's data and is renamed into place; any other leftover ``.tmp`` is removed as an interrupted build's; a
+    leftover ``processed/<name>.old`` (the folder a swap already replaced) is removed without asking."""
     temporary = processed_dir.with_name(processed_dir.name + ".tmp")
     if temporary.exists():
-        _plan(report, name, temporary, "processed", "delete", "leftover of an interrupted all-at-once build")
+        if not processed_dir.exists() and assess_processed_folder(config, name, temporary, raw_shards).verdict == "ok":
+            _plan(report, name, temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place")
+        else:
+            _plan(report, name, temporary, "processed", "delete", "leftover of an interrupted all-at-once build")
+    old = processed_dir.with_name(processed_dir.name + ".old")
+    if old.exists():
+        _plan(report, name, old, "processed", "delete", "leftover of a completed folder swap")
 
 
 def _good_prefix_length(folder: Path, manifest: Manifest) -> tuple[int, str | None]:
@@ -260,8 +276,9 @@ def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, 
 
 
 def perform_repairs(report: RepairReport) -> None:
-    """Carry out every planned action of ``report`` in order: processed folders first (so a crash never leaves
-    derived data next to a raw folder it no longer matches), then raw truncations and deletions."""
+    """Carry out every planned action of ``report`` in order: processed folders first (deletions and the swap of a
+    complete ``.tmp`` into place — so a crash never leaves derived data next to a raw folder it no longer matches),
+    then raw truncations and deletions."""
     processed = [action for action in report.actions if action.kind == "processed"]
     raw = [action for action in report.actions if action.kind == "raw"]
     for action in processed + raw:
@@ -271,6 +288,9 @@ def perform_repairs(report: RepairReport) -> None:
         elif action.action == "truncate":
             log.warning("%s: truncating %s (%s)", action.source, action.folder, action.reason)
             _truncate_raw(action)
+        elif action.action == "swap":
+            log.warning("%s: renaming %s into place (%s)", action.source, action.folder, action.reason)
+            action.folder.rename(action.folder.with_name(action.folder.name.removesuffix(".tmp")))
         else:
             raise RepairError(f"{action.source}: cannot perform a planned-only action {action.action!r} on {action.folder}")
 
@@ -290,9 +310,9 @@ __all__ = [
     "RepairReport",
     "confirm_raw_deletions",
     "confirmation_message",
-    "inspect_leftover_temporary_folder",
     "inspect_processed_folder",
     "inspect_raw_folder",
+    "inspect_swap_leftovers",
     "perform_repairs",
     "repair_broken_and_stale_folders",
 ]

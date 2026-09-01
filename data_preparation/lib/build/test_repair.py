@@ -315,6 +315,86 @@ def test_leftover_temporary_folder_is_removed(cfg_factory: CfgFactory, with_toke
     assert not leftover.exists() and layout.processed_dir("a").exists()
 
 
+# --- interrupted rename-aside swaps (all-at-once builds) -----------------------------------------------------------------
+
+
+def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
+) -> None:
+    """A crash between the two renames of the all-at-once swap leaves the replaced folder aside as ``.old`` and the
+    complete ``.tmp`` as the only copy of the data: the repair step renames the ``.tmp`` into place and removes the
+    ``.old`` instead of discarding the completed build."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    processed = layout.processed_dir("a")
+    rows_before = read_rows(processed)
+    temporary = processed.with_name("a.tmp")
+    processed.rename(temporary)  # the crash state by hand: old aside, new not yet in place
+    old = processed.with_name("a.old")
+    old.mkdir()
+    (old / "data-00000.parquet").write_bytes(b"replaced")
+    tmp_snapshot = _snapshot(temporary)
+
+    dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
+    assert _kinds(dry) == [("a", "processed", "would_swap"), ("a", "processed", "would_delete")]
+    assert temporary.exists() and old.exists() and not processed.exists(), "a dry run touches nothing"
+
+    calls: list[str] = []
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
+    assert calls == [], "derived data: no confirmation"
+    assert _kinds(report) == [("a", "processed", "swap"), ("a", "processed", "delete")]
+    assert report.actions[0] == RepairAction("a", temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place")
+    assert report.actions[1] == RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")
+    assert processed.exists() and not temporary.exists() and not old.exists()
+    assert _snapshot(processed) == tmp_snapshot and read_rows(processed) == rows_before, "renamed, not rewritten: no data lost"
+    assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False).actions == []
+
+
+def test_incomplete_tmp_next_to_missing_processed_is_still_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """Only a ``.tmp`` whose own manifest says the build finished (current hash, every shard verifies) is swapped
+    into place; one without a manifest is the leftover of an interrupted build as before."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    processed = layout.processed_dir("a")
+    temporary = processed.with_name("a.tmp")
+    processed.rename(temporary)
+    (temporary / MANIFEST_NAME).unlink()  # nothing says the build finished
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _kinds(report) == [("a", "processed", "delete")]
+    assert report.actions[0].reason == "leftover of an interrupted all-at-once build"
+    assert not temporary.exists() and not processed.exists()
+
+
+def test_complete_tmp_next_to_an_existing_processed_folder_is_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """A crash after the ``.tmp`` was completed but before the swap began: the old folder is still in place, so the
+    ``.tmp`` is removed as a leftover (the next build rebuilds it) instead of replacing a folder that exists."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    processed = layout.processed_dir("a")
+    temporary = processed.with_name("a.tmp")
+    shutil.copytree(processed, temporary)
+    before = _snapshot(processed)
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _kinds(report) == [("a", "processed", "delete")]
+    assert report.actions[0].reason == "leftover of an interrupted all-at-once build"
+    assert not temporary.exists() and _snapshot(processed) == before
+
+
+def test_leftover_old_folder_is_removed_without_confirmation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """A crash after the new folder was renamed into place leaves the replaced ``.old`` behind: derived data that
+    was already replaced, deleted without asking."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    processed = layout.processed_dir("a")
+    old = processed.with_name("a.old")
+    old.mkdir()
+    (old / "data-00000.parquet").write_bytes(b"replaced")
+    before = _snapshot(processed)
+    dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
+    assert dry.actions == [RepairAction("a", old, "processed", "would_delete", "leftover of a completed folder swap")]
+    assert old.exists()
+    calls: list[str] = []
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
+    assert calls == [] and report.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")]
+    assert not old.exists() and _snapshot(processed) == before
+
+
 # --- confirmation --------------------------------------------------------------------------------------------------------
 
 

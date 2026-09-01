@@ -19,8 +19,11 @@ Two write modes:
   build, so the rows kept are exactly those of one full pass.
 * **all at once** (``config.shuffle_of(name)`` — the default for instruct sources — and ``dedup.mode: minhash``): every
   raw shard is read, the survivors are shuffled with ``random.Random(source.seed)`` (or, for minhash, run through the
-  LSH index, which needs every signature at once), written into ``processed/<name>.tmp`` and renamed into place —
-  all or nothing; a stale ``.tmp`` from an interrupted build is removed first. Why shuffle at all: the training
+  LSH index, which needs every signature at once), written into ``processed/<name>.tmp`` and swapped into place
+  rename-aside (:func:`_swap_into_place`: the old folder steps aside as ``processed/<name>.old``, the complete
+  ``.tmp`` is renamed into place, only then is the ``.old`` deleted — at no crash point is there neither folder;
+  the repair step finishes an interrupted swap and removes a leftover ``.old``) — all or nothing; a stale ``.tmp``
+  from an interrupted build is removed first. Why shuffle at all: the training
   loader reads a source's shards **in order** and only mixes *between* sources; instruct repositories are sorted by
   task, so without a shuffle the model would see one task for thousands of steps, and the training resolver's
   "first k rows" validation split would be a single task. Instruct sources are small (all eight of the thesis run
@@ -178,7 +181,8 @@ def _build_all_at_once(
     should_stop: StopCheck | None,
 ) -> None:
     """Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
-    it, written into ``output.directory`` (the ``.tmp`` sibling) and renamed over ``processed_dir``."""
+    it, written into ``output.directory`` (the ``.tmp`` sibling) and swapped over ``processed_dir`` rename-aside
+    (:func:`_swap_into_place`)."""
     pipeline.stats["input_rows"] += raw.rows()
     rows = pipeline.run(raw_dir, list(raw.shards), first_row_index=0)
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
@@ -194,15 +198,35 @@ def _build_all_at_once(
         shutil.rmtree(temporary)
     output.publish(survivors, shard_size)
     output.save(raw, shard_list(raw))
-    if processed_dir.exists():
-        shutil.rmtree(processed_dir)
-    temporary.rename(processed_dir)
+    _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
 
 
+def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
+    """Replace ``processed_dir`` by the complete ``temporary`` folder without a moment where neither exists: the
+    old folder steps aside (``processed/<name>.old``), the new one is renamed into place, and only then is anything
+    deleted. A crash between the renames leaves the ``.old`` next to the complete ``.tmp`` (the repair step
+    finishes the swap), one after them leaves the new folder in place next to a stale ``.old`` (the repair step
+    removes it)."""
+    old = _old_dir(processed_dir)
+    if old.exists():
+        shutil.rmtree(old)  # leftover of an earlier crashed swap; the folder that replaced it is in place or in `temporary`
+    if processed_dir.exists():
+        processed_dir.rename(old)
+    temporary.rename(processed_dir)
+    if old.exists():
+        shutil.rmtree(old)
+
+
 def _temporary_dir(processed_dir: Path) -> Path:
-    """``processed/<name>.tmp``: where an all-at-once build writes before the rename into place."""
+    """``processed/<name>.tmp``: where an all-at-once build writes before the swap into place."""
     return processed_dir.with_name(processed_dir.name + ".tmp")
+
+
+def _old_dir(processed_dir: Path) -> Path:
+    """``processed/<name>.old``: where :func:`_swap_into_place` parks the folder it replaces until the new one is
+    in place."""
+    return processed_dir.with_name(processed_dir.name + ".old")
 
 
 # --- the processed folder ------------------------------------------------------------------------------------------------
