@@ -59,6 +59,7 @@ from typing import Any, BinaryIO, cast
 import pyarrow.parquet as pq
 
 Row = dict[str, Any]
+RowBatch = list[Row]
 OnFile = Callable[[str], None]
 RowFilter = Callable[[Row], bool]
 
@@ -405,6 +406,13 @@ class HubFetcher:
 
 
 # --- per-format readers -----------------------------------------------------------------------------------------------
+#
+# One reading contract for every file format, enforced in one place: a per-format reader (FORMAT_READERS) only
+# decodes bytes into batches of at most `batch_size` rows, and the shared dispatch `iter_row_batches` — the single
+# entry every consumer goes through (`iter_stream` / `iter_file` here, the `local` loader in loaders.py) — checks
+# the bound and projects every row to the requested columns itself. A reader therefore cannot forget the
+# projection (it never does it; parquet passes `columns` down only so pyarrow prunes the read) and cannot
+# materialise a whole file into one batch without the dispatch failing loudly.
 
 
 def file_format(name: str) -> str:
@@ -422,29 +430,45 @@ def parquet_row_groups(parquet: pq.ParquetFile) -> list[int]:
 
 
 def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | None = None) -> Generator[Row, None, None]:
-    """Rows of an open parquet file in order, skipping the first ``skip``; row groups are read one at a time and
-    only from the first one that holds a wanted row on (a consumer that stops early never touches later groups).
-    ``columns`` projects the read (None: every column)."""
+    """Rows of :func:`parquet_batches` one at a time (kept for consumers that want rows, not batches)."""
+    for batch in parquet_batches(parquet, skip, columns, ROW_BATCH):
+        yield from batch
+
+
+def parquet_batches(
+    parquet: pq.ParquetFile, skip: int, columns: list[str] | None, batch_size: int
+) -> Iterator[RowBatch]:
+    """Row batches of an open parquet file in order, skipping the first ``skip`` rows; row groups are read one at a
+    time and only from the first one that holds a wanted row on (a consumer that stops early never touches later
+    groups), each decoded in ``batch_size`` slices. ``columns`` prunes the read (None: every column)."""
     for group, group_rows in enumerate(parquet_row_groups(parquet)):
         if skip >= group_rows:  # every row of this group is skipped: do not read it
             skip -= group_rows
             continue
-        for row in read_row_group(parquet, group, columns):
+        for rows in row_group_batches(parquet, group, columns, batch_size):
             if skip > 0:
-                skip -= 1
-                continue
-            yield row
+                dropped = min(skip, len(rows))
+                skip -= dropped
+                rows = rows[dropped:]
+            if rows:
+                yield rows
 
 
 def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | None) -> Iterator[Row]:
-    """Rows of one row group as dicts (the single place that pulls row-group bytes), in :data:`ROW_BATCH` slices.
+    """Rows of :func:`row_group_batches` one at a time, in :data:`ROW_BATCH` slices."""
+    for batch in row_group_batches(parquet, group, columns, ROW_BATCH):
+        yield from batch
+
+
+def row_group_batches(parquet: pq.ParquetFile, group: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """Row batches of one row group as dicts (the single place that pulls row-group bytes), ``batch_size`` rows each.
 
     A whole row group as a python list is what a book-like source cannot afford — gutenberg row groups hold ~300 MB
     per 1,000 rows and several downloads run at once — so the group is decoded batch by batch
     (``ParquetFile.iter_batches(row_groups=[group])``) and only one batch of dicts is alive at a time. Rows and
     their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded."""
-    for batch in parquet.iter_batches(batch_size=ROW_BATCH, columns=columns, row_groups=[group]):
-        yield from batch.to_pylist()
+    for batch in parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group]):
+        yield batch.to_pylist()
 
 
 def project_row(row: Row, columns: list[str] | None) -> Row:
@@ -458,22 +482,71 @@ def project_row(row: Row, columns: list[str] | None) -> Row:
     return {column: row[column] for column in columns if column in row}
 
 
-def iter_stream(handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
-    """Rows of an open binary file in order, skipping the first ``skip`` (parquet skips whole row groups), each
-    projected to ``columns`` (None: every column).
+FormatReader = Callable[[BinaryIO, str, int, list[str] | None, int], Iterator[RowBatch]]
 
-    Parquet reads only the wanted columns; the json formats have no column-wise access, so a row is parsed whole
-    and reduced afterwards (:func:`project_row`) — which still keeps every surplus column out of what the caller
-    stores, including one whose type varies from row to row and would make the shard writer fail."""
+
+def _parquet_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """:data:`FORMAT_READERS` entry for parquet: :func:`parquet_batches` over the opened file. ``columns`` is
+    passed down so pyarrow prunes the read to those columns (and errors on an unknown one); the projection
+    guarantee itself lives in :func:`iter_row_batches`."""
+    yield from parquet_batches(pq.ParquetFile(handle), skip, columns, batch_size)
+
+
+def _json_array_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """:data:`FORMAT_READERS` entry for ``.json`` arrays: one row per batch (the parse is sequential, so a
+    single-row batch keeps an early stop as cheap as before); the dispatch projects."""
+    for row in iter_json_array(handle, name, skip):
+        yield [row]
+
+
+def _json_lines_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """:data:`FORMAT_READERS` entry for the json-lines family: one row per batch (a remote stream is dropped the
+    moment the consumer has enough rows, so nothing may be decoded ahead); the dispatch projects."""
+    for row in _iter_json_lines(handle, file_format(name), skip):
+        yield [row]
+
+
+FORMAT_READERS: dict[str, FormatReader] = {
+    ".parquet": _parquet_batches,
+    ".jsonl.zst": _json_lines_batches,
+    ".jsonl.gz": _json_lines_batches,
+    ".json.gz": _json_lines_batches,
+    ".jsonl": _json_lines_batches,
+    ".json": _json_array_batches,
+}
+
+
+def iter_row_batches(
+    handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None, batch_size: int | None = None
+) -> Iterator[RowBatch]:
+    """**The reading contract**, the single dispatch every consumer reads files through: batches of at most
+    ``batch_size`` (default :data:`ROW_BATCH`) rows of the open binary file in order, skipping the first ``skip``
+    rows (parquet skips whole row groups), every row projected to ``columns`` (None: every column).
+
+    The per-format reader (:data:`FORMAT_READERS` by :func:`file_format`) only decodes bounded batches; this
+    function enforces the bound (a reader that materialises more is a loud error, not a silent memory hog) and
+    applies the projection itself (:func:`project_row`: a requested column a row lacks stays absent, so a caller
+    checking for its own column still sees the row as the file had it). Parquet additionally prunes the read to
+    ``columns`` and raises for an unknown one at read time, so neither path invents data — and either way every
+    surplus column stays out of what the caller stores, including one whose type varies from row to row and would
+    make the shard writer fail."""
     fmt = file_format(name)
-    if fmt == ".parquet":
-        yield from iter_parquet(pq.ParquetFile(handle), skip, columns)
-    elif fmt == ".json":
-        for row in iter_json_array(handle, name, skip):
-            yield project_row(row, columns)
-    else:
-        for row in _iter_json_lines(handle, fmt, skip):
-            yield project_row(row, columns)
+    reader = FORMAT_READERS.get(fmt)
+    if reader is None:
+        raise ValueError(f"{name}: no reader registered for format {fmt!r}; readers: {sorted(FORMAT_READERS)}")
+    limit = ROW_BATCH if batch_size is None else batch_size
+    for batch in reader(handle, name, skip, columns, limit):
+        if len(batch) > limit:
+            raise RuntimeError(
+                f"{name}: the {fmt} reader broke the reading contract: {len(batch)} rows in one batch (limit {limit})"
+            )
+        yield batch if columns is None else [project_row(row, columns) for row in batch]
+
+
+def iter_stream(handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
+    """Rows of :func:`iter_row_batches` one at a time (same contract: ordered, ``skip`` applied, projected)."""
+    for batch in iter_row_batches(handle, name, skip, columns):
+        yield from batch
 
 
 def iter_file(path: Path, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:

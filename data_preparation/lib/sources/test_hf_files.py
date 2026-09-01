@@ -27,6 +27,7 @@ from data_preparation.lib.sources.hub_files import (
     index_path,
     iter_file,
     iter_parquet,
+    iter_row_batches,
     parquet_row_groups,
     read_rows,
 )
@@ -430,6 +431,47 @@ def test_index_without_sizes_is_upgraded(hub: FakeHub, tmp_path: Path) -> None:
     assert json.loads(old.read_text())["sizes"] == index.sizes and json.loads(old.read_text())["row_groups"] == {}
     FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
     assert hub.size_lookups == 1
+
+
+# --- the reading contract (one dispatch, every format) ------------------------------------------------------------------
+
+
+def test_every_supported_format_has_a_reader() -> None:
+    """The dispatch table and the recognised suffixes must agree: a format added to one without the other either
+    fails here or raises loudly (``file_format`` / the dispatch), so no format can bypass the contract."""
+    assert set(hub_files.FORMAT_READERS) == set(hub_files.FORMATS)
+
+
+@pytest.mark.parametrize("suffix", hub_files.FORMATS)
+def test_reading_contract_bounds_and_projects_every_format(hub: FakeHub, suffix: str) -> None:
+    """Every supported format through the shared dispatch: batches of at most ``batch_size`` rows, every row
+    projected to ``columns``, order preserved across ``skip``, ``columns=None`` keeps every column."""
+    rows = [{"id": f"r{i}", "text": f"doc {i}", "extra": i} for i in range(7)]
+    hub.add(f"rows{suffix}", rows)
+    path = hub.files[f"rows{suffix}"]
+    with path.open("rb") as handle:
+        batches = list(iter_row_batches(handle, f"rows{suffix}", skip=1, columns=["id"], batch_size=3))
+    assert all(len(batch) <= 3 for batch in batches)
+    assert [row for batch in batches for row in batch] == [{"id": f"r{i}"} for i in range(1, 7)]
+    with path.open("rb") as handle:
+        assert [r for b in iter_row_batches(handle, f"rows{suffix}", batch_size=3) for r in b] == rows
+
+
+def test_dispatch_enforces_the_contract_centrally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A format reader only decodes: the dispatch itself projects (a reader cannot forget it) and refuses a batch
+    over the bound (a reader that materialises a whole file is a loud error, not a silent memory hog)."""
+    path = tmp_path / "x.jsonl"
+    rows = [{"id": f"r{i}", "extra": i} for i in range(5)]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    def whole_file(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[list[Row]]:
+        yield [json.loads(line) for line in handle.read().decode().splitlines()]  # ignores columns AND the bound
+
+    monkeypatch.setitem(hub_files.FORMAT_READERS, ".jsonl", whole_file)
+    with path.open("rb") as handle, pytest.raises(RuntimeError, match="broke the reading contract"):
+        list(iter_row_batches(handle, "x.jsonl", batch_size=3))
+    with path.open("rb") as handle:  # a batch within the bound: the dispatch projects it for the reader
+        assert list(iter_row_batches(handle, "x.jsonl", columns=["id"], batch_size=5)) == [[{"id": f"r{i}"} for i in range(5)]]
 
 
 def test_parquet_iter_stops_before_later_groups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
