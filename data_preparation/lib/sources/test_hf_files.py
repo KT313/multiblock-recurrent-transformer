@@ -30,6 +30,7 @@ from data_preparation.lib.sources.hub_files import (
     parquet_row_groups,
     read_rows,
 )
+from data_preparation.lib.storage.parquet import write_dict_rows
 
 def _rows(prefix: str, n: int, language: Callable[[int], str] | None = None) -> list[Row]:
     return [
@@ -506,9 +507,34 @@ def test_columns_are_projected_for_parquet(hub: FakeHub, monkeypatch: pytest.Mon
     assert list(LOADERS["hf_files"](remote, 2, 1, columns=["text"])) == [{"text": "a doc 2"}]
     assert calls == [(1, ["text"])]
     assert set(next(iter(LOADERS["hf_files"](_src(), 0, 1)))) == {"id", "text", "language"}  # None: every column
-    hub.add("f/a.jsonl", _rows("a", 2))
-    jsonl = _src(load_kwargs={"data_files": "f/*.jsonl"})
-    assert set(next(iter(LOADERS["hf_files"](jsonl, 0, 1, columns=["id"])))) == {"id", "text", "language"}  # ignored
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".json"])
+def test_columns_are_projected_for_the_json_formats(hub: FakeHub, suffix: str) -> None:
+    """The json family parses whole rows and drops the surplus columns afterwards — cached and streamed alike."""
+    hub.add(f"f/a{suffix}", _rows("a", 4))
+    for load_kwargs in ({"data_files": f"f/*{suffix}"}, {"data_files": f"f/*{suffix}", **REMOTE}):
+        src = _src(load_kwargs=load_kwargs)
+        assert list(LOADERS["hf_files"](src, 1, 2, columns=["id"])) == [{"id": "a1"}, {"id": "a2"}]
+        assert list(LOADERS["hf_files"](src, 0, 1, columns=["text", "id"])) == [{"text": "a doc 0", "id": "a0"}]
+        # a column the row does not have stays absent (the caller's own "row has no <column>" check still fires)
+        assert list(LOADERS["hf_files"](src, 0, 1, columns=["id", "missing"])) == [{"id": "a0"}]
+        assert set(next(iter(LOADERS["hf_files"](src, 0, 1)))) == {"id", "text", "language"}  # None: every column
+
+
+def test_projection_keeps_a_mixed_type_surplus_column_out_of_the_shard_writer(hub: FakeHub, tmp_path: Path) -> None:
+    """Why the json path must project: a surplus column whose type varies from row to row (a string here, a list
+    there) makes the shard writer fail on every retry, so the source could never complete."""
+    hub.add("f/a.jsonl", [
+        {"id": "a0", "text": "a doc 0", "meta": "a string"},
+        {"id": "a1", "text": "a doc 1", "meta": ["a", "list"]},
+    ])
+    src = _src(load_kwargs={"data_files": "f/*.jsonl"})
+    projected = list(LOADERS["hf_files"](src, 0, 2, columns=["text"]))
+    assert projected == [{"text": "a doc 0"}, {"text": "a doc 1"}]
+    assert write_dict_rows(projected, tmp_path / "shards", shard_size=2) == 1
+    with pytest.raises(pa.ArrowException):
+        write_dict_rows(list(LOADERS["hf_files"](src, 0, 2)), tmp_path / "unprojected", shard_size=2)
 
 
 def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_counts(

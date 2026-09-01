@@ -439,21 +439,39 @@ def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | Non
     return parquet.read_row_group(group, columns=columns).to_pylist()
 
 
-def iter_stream(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
-    """Rows of an open binary file in order, skipping the first ``skip`` (parquet skips whole row groups)."""
+def project_row(row: Row, columns: list[str] | None) -> Row:
+    """``row`` reduced to ``columns`` (``None``: the row unchanged).
+
+    A column the row does not have stays absent instead of becoming ``None``, so a caller checking for its own
+    column (``download.py``'s ``text_row``) still sees the row as the file had it; parquet raises for an unknown
+    column at read time, so neither path invents data."""
+    if columns is None:
+        return row
+    return {column: row[column] for column in columns if column in row}
+
+
+def iter_stream(handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
+    """Rows of an open binary file in order, skipping the first ``skip`` (parquet skips whole row groups), each
+    projected to ``columns`` (None: every column).
+
+    Parquet reads only the wanted columns; the json formats have no column-wise access, so a row is parsed whole
+    and reduced afterwards (:func:`project_row`) — which still keeps every surplus column out of what the caller
+    stores, including one whose type varies from row to row and would make the shard writer fail."""
     fmt = file_format(name)
     if fmt == ".parquet":
-        yield from iter_parquet(pq.ParquetFile(handle), skip)
+        yield from iter_parquet(pq.ParquetFile(handle), skip, columns)
     elif fmt == ".json":
-        yield from iter_json_array(handle, name, skip)
+        for row in iter_json_array(handle, name, skip):
+            yield project_row(row, columns)
     else:
-        yield from _iter_json_lines(handle, fmt, skip)
+        for row in _iter_json_lines(handle, fmt, skip):
+            yield project_row(row, columns)
 
 
-def iter_file(path: Path, name: str, skip: int = 0) -> Iterator[Row]:
+def iter_file(path: Path, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
     """:func:`iter_stream` over a local file."""
     with path.open("rb") as handle:
-        yield from iter_stream(handle, name, skip)
+        yield from iter_stream(handle, name, skip, columns)
 
 
 def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
@@ -607,8 +625,8 @@ def read_rows(
     ``count`` is exact for files read from the Hub cache and for remote streams. For a parquet file read remotely
     with ``align_to_row_group`` (the default) the reader finishes the row group in which it reached ``count`` — the
     bytes were already fetched, so keeping the rows means a later fetch at the resulting offset never downloads
-    them again; ``align_to_row_group=False`` stops at exactly ``count`` rows. ``columns`` projects parquet reads
-    (other formats yield every column).
+    them again; ``align_to_row_group=False`` stops at exactly ``count`` rows. ``columns`` projects every yielded
+    row (None: every column): parquet reads only those columns, the json formats drop the rest after parsing.
 
     Files whose known row count (``index.count(key, file)``) lies entirely before ``offset`` are skipped without
     being opened; every file read through to its end records its count (``key`` for the matching rows, and the
@@ -671,7 +689,7 @@ def read_rows_multi(
                     finish_group = align_to_row_group and is_remote
                     yield from _parquet_rows(parquet, index, file, readers, columns, finish_group)
                 else:
-                    yield from _stream_rows(handle, index, file, readers)
+                    yield from _stream_rows(handle, index, file, readers, columns)
     finally:
         index.save()  # the row-group counts recorded in memory while reading
 
@@ -767,15 +785,17 @@ def _parquet_rows(
             index.record(record_key, file, sum(reader.known_group_counts))
 
 
-def _stream_rows(handle: BinaryIO, index: FileIndex, file: str, cursors: list[_Cursor]) -> Iterator[tuple[str, Row]]:
-    """Rows of one non-parquet file for several requests, each exactly up to its ``count``; the stream is dropped
-    as soon as every request is satisfied. The file is decoded from its first row (a stream has no cheap way to
-    skip, and only a full read tells how many rows it holds), so a file read to its end records its row count and,
-    for every keyed request that read it through, its matching rows."""
+def _stream_rows(
+    handle: BinaryIO, index: FileIndex, file: str, cursors: list[_Cursor], columns: list[str] | None = None
+) -> Iterator[tuple[str, Row]]:
+    """Rows of one non-parquet file for several requests, each exactly up to its ``count`` and projected to
+    ``columns``; the stream is dropped as soon as every request is satisfied. The file is decoded from its first row
+    (a stream has no cheap way to skip, and only a full read tells how many rows it holds), so a file read to its end
+    records its row count and, for every keyed request that read it through, its matching rows."""
     reading = list(cursors)
     matched = {c.name: 0 for c in cursors}
     rows_seen = 0
-    for row in iter_stream(handle, file, 0):
+    for row in iter_stream(handle, file, 0, columns):
         rows_seen += 1
         for cursor in list(reading):
             if not cursor.wants(row):

@@ -7,8 +7,9 @@ align_to_row_group) -> Iterator[Row]` yields raw rows starting at row `offset` o
 `hf_files` / `github_code` reading a large parquet file remotely finish the row group in which `count` was reached
 (`align_to_row_group=True`, the default) so the rows that were downloaded anyway are kept and a later fetch at
 the resulting offset never fetches those bytes again; `align_to_row_group=False` makes every loader exact. The
-caller must consume everything yielded and advance its offset by the number of rows consumed. `columns` projects
-parquet reads to those columns (`github_code` adds `language`); other formats and loaders yield every column.
+caller must consume everything yielded and advance its offset by the number of rows consumed. `columns` projects the
+rows `hf_files` / `github_code` read, whatever the file format (`github_code` adds `language`, its filter column),
+and the local parquet files `local` reads; the other loaders and local `.jsonl` files yield every column.
 
 `index_dir` is where `hf_files` / `github_code` persist their file index (None: in memory), `on_file` is called
 with every repo file they open (progress display) and `stats` collects their download counters (`FetchStats`,
