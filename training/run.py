@@ -5,8 +5,8 @@
     prepare_run_directory             out_dir/checkpoints, run_config.json
     run_directory_lock                one training run per out_dir, held until the run is over (`run_lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
-    build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR
-    build_stage_dataloaders           one train and one validation loader per stage
+    build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
+    build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
     build_run_model                   architecture yaml + overrides, block-size check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     restore_checkpoint_if_resuming    latest / explicit checkpoint -> model, optimizer, RNG state, progress
@@ -22,10 +22,12 @@ then the model — its parameter init is the first consumer of the global torch 
 resume, which restores the stored RNG state.
 `golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
 
-A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows READ per data entry — dropped
-rows included — plus the transition RNG) and every train dataset starts that many rows into its range. It does NOT reproduce the order of an
-uninterrupted run inside a stage — the mixture draws happen in the dataloader workers and are not replayed — so only
-a resume from a stage boundary is bit-exact (`test_resume_is_bit_exact_without_transitions`).
+A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows READ per source — dropped rows
+included — plus the draw RNG) and every train dataset starts that many rows into its range; the restored RNG
+continues the per-sample source draws exactly. It is not bit-exact: samples buffered in the stream when the
+checkpoint was written are skipped, and the fresh loader iterators draw new base seeds from the global torch RNG,
+so the losses of a resumed run diverge from the uninterrupted one while the data stream itself continues
+(`test_stage_boundary_resume_continues_schedule_and_stream`).
 
 The CLI around this is `training/train.py`; `TrainingReport`, what `train()` returns, is defined next to `RunLogger`
 in `logger.py` (its `close()` builds it) and re-exported here.
@@ -57,7 +59,7 @@ from training.checkpoint import (
     unwrap_compiled,
 )
 from training.data.collate import IGNORE_INDEX
-from training.data.loader import build_stage_dataloaders
+from training.data.loader import build_run_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport
@@ -113,7 +115,7 @@ def train(
     with run_directory_lock(run_directory):  # one run per out_dir; released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
-        loaders = build_stage_dataloaders(settings, dataset, backend)
+        loaders = build_run_dataloaders(settings, dataset, backend)
         model = build_run_model(settings, backend, run_directory)
         optimizer = build_run_optimizer(settings, model, backend)
         progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
@@ -242,7 +244,7 @@ def restore_checkpoint_if_resuming(
     against the checkpoint (`check_dataset_unchanged`: config hash and validation split), restores the RNG state
     (numerics: the stored state includes the evaluation draws of the checkpoint's step) and sets
     `progress.step = progress.resume_step = checkpoint step` — the resume warmup derives from it. The data-stream
-    state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the transition RNG, which
+    state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the draw RNG, which
     the stream would otherwise re-seed with `seed + resume step`).
     """
     progress = TrainingProgress()
@@ -290,7 +292,7 @@ def save_run_checkpoint(
     step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is in at `done`, i.e. the one it
     enters next when written before a transition. Numerics: called after evaluation and logging of the step, so the
     stored RNG state includes the evaluation draws; `batches.state_dict()` adds the rows the run has consumed per
-    data entry, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
+    source, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
     does not promise).
     """
     stage_end = stage_manager.stage_ending_at(progress.done - 1)

@@ -6,19 +6,22 @@ therefore independent of the world size; `world_size` is only used for the per-d
 sanity check that the world batch splits evenly across devices.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
 @dataclass
 class TrainingStage:
-    """One stage of the curriculum: token budget, base LR and transition length (the data lives in the resolver's
-    `ResolvedStage`; the manager only turns budgets into step boundaries)."""
+    """One stage of the curriculum: token budget, base LR, transition length and the sampling weights over the
+    run's train sources (the data entries themselves live in the resolver's `ResolvedStage` / `ResolvedDataset`;
+    the manager turns budgets into step boundaries and weights into a per-step schedule)."""
 
     name: str
     tokens: int
     base_lr: float
     transition_pct: float = 0.05  # transition OUT of this stage, as a fraction of this stage's tokens
+    train_weights: dict[str, float] = field(default_factory=dict)  # source name -> sampling weight (sum 1); the
+    # stream draws every sample's source from `StageManager.data_weights`, which interpolates these per step
 
 
 @dataclass
@@ -215,6 +218,27 @@ class StageManager:
             prev_stage_idx=None,
             prev_base_lr=None,
         )
+
+    def data_weights(self, step: int) -> dict[str, float]:
+        """Sampling weight per train source at optimizer step `step` (from `TrainingStage.train_weights`).
+
+        Outside a transition: the current stage's constants. Inside one: the linear interpolation
+        ``(1 − p) × previous stage's weight + p × next stage's weight`` with ``p = transition_progress``, over the
+        union of both stages' sources — a source leaving the mixture ramps to 0, one entering ramps from 0, and a
+        source in neither stage is absent (weight 0, never drawn). Each stage's weights sum to 1, so the
+        interpolated weights do too. This is the stage structure's ONLY effect on the training data: the per-source
+        readers run through the whole run, only their draw probabilities change.
+        """
+        info = self.get_stage_info(step)
+        current = self.stages[info.stage_idx].train_weights
+        if info.prev_stage_idx is None:
+            return dict(current)
+        previous = self.stages[info.prev_stage_idx].train_weights
+        progress = info.transition_progress
+        return {
+            name: (1.0 - progress) * previous.get(name, 0.0) + progress * current.get(name, 0.0)
+            for name in {**previous, **current}
+        }
 
     def stage_ending_at(self, step: int) -> int | None:
         """Index of the stage whose transition starts at `step + 1` (`step` is its last plain step), else None.

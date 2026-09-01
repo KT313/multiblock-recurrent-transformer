@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import itertools
 import math
-import random
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, TypeVar
@@ -13,13 +12,12 @@ from torch.utils.data import DataLoader
 
 from training.backend import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
-from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
+from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset, resolve_dataset
 from training.data.loader import (
-    StageDataloaders,
+    RunDataloaders,
     build_dataloader,
-    build_stage_dataloaders,
+    build_run_dataloaders,
     sample_length,
-    sample_stage_batch,
     world_batch_micro_batches,
 )
 from training.data.datasets import ParquetTextDataset, Row
@@ -203,7 +201,7 @@ def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]
     assert r0 == full[0::2] and r1 == full[1::2]
 
 
-# --- build_stage_dataloaders ------------------------------------------------------------------------------------------
+# --- build_run_dataloaders --------------------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -211,19 +209,22 @@ def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
     return parse_settings(["--config", str(TINY_YAML), "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(tmp_path / "out")])
 
 
-def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
-    """One train and one validation loader per stage of the tiny dataset, tokenizer loaded from the resolved
-    directory, train loaders unpadded, validation loaders padded and restricted to the held-out rows of the split."""
+def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
+    """One train loader per SOURCE (the whole-run readers, one worker each) and one validation loader per stage of
+    the tiny dataset, tokenizer loaded from the resolved directory, train loaders unpadded, validation loaders
+    padded and restricted to the held-out rows of the split."""
     dataset: ResolvedDataset = resolve_dataset(tiny_settings)
-    loaders = build_stage_dataloaders(tiny_settings, dataset, SingleDeviceBackend(device="cpu", precision="32"))
-    assert isinstance(loaders, StageDataloaders)
-    assert len(loaders.train_loaders) == len(loaders.val_loaders) == len(dataset.stages) == 3
+    loaders = build_run_dataloaders(tiny_settings, dataset, SingleDeviceBackend(device="cpu", precision="32"))
+    assert isinstance(loaders, RunDataloaders)
+    assert loaders.train_sources == ["synthetic_pretrain", "synthetic_instruct"]  # dataset-config order
+    assert len(loaders.train_loaders) == 2 and len(loaders.val_loaders) == len(dataset.stages) == 3
+    assert all(isinstance(loader, DataLoader) and loader.num_workers == TRAIN_LOADER_NUM_WORKERS for loader in loaders.train_loaders)
     assert loaders.tokenizer.path == Path(dataset.tokenizer_dir)
-    batch = loaders.next_train_batch(0)
+    batch = loaders.next_train_batch("synthetic_pretrain")
     samples = batch.samples
     assert len(samples) == tiny_settings.micro_batch_size
-    assert batch.rows_read == {"pretrain_a-synthetic_pretrain": tiny_settings.micro_batch_size}  # no row dropped
-    assert [s[2] for s in samples] == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
+    assert batch.rows_read == {"synthetic_pretrain": tiny_settings.micro_batch_size}  # no row dropped
+    assert [s[2] for s in samples] == ["synthetic_pretrain"] * tiny_settings.micro_batch_size
     for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
         assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
     input_ids, labels, _ = world_batch_micro_batches(
@@ -242,7 +243,7 @@ def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) 
         assert k >= 1 and len(list(loaders.val_loaders[stage_idx])) == math.ceil(k / tiny_settings.micro_batch_size)
 
 
-# --- StageDataloaders / sample_stage_batch ---------------------------------------------------------------------------
+# --- RunDataloaders ---------------------------------------------------------------------------------------------------
 
 
 def _tagged(tag: str, n: int) -> list[WorkerBatch]:
@@ -256,98 +257,71 @@ def _first(batch: WorkerBatch) -> int:
 
 
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 3), _tagged("s1", 2)], [], tokenizer)
-    assert [_first(sd.next_train_batch(0)) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
-    assert [s[2] for s in sd.next_train_batch(1).samples] == ["s1"]
-    assert sd._train_iterators[0] is not None and sd._train_iterators[1] is not None
+    """A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
+    `check_entries_on_disk` guarantees at least one training row per source)."""
+    rd = RunDataloaders(["a", "b"], [_tagged("a", 3), _tagged("b", 2)], [], tokenizer)
+    assert [_first(rd.next_train_batch("a")) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
+    assert [s[2] for s in rd.next_train_batch("b").samples] == ["b"]
+    assert rd._train_iterators["a"] is not None and rd._train_iterators["b"] is not None
 
 
-def test_post_init_creates_one_slot_per_train_loader(tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 1), _tagged("s1", 1), _tagged("s2", 1)], [], tokenizer)
-    assert sd._train_iterators == [None, None, None]
-    assert StageDataloaders([], [], tokenizer)._train_iterators == []
+def test_post_init_creates_one_slot_per_source_and_validates_alignment(tokenizer: Tokenizer) -> None:
+    rd = RunDataloaders(["a", "b", "c"], [_tagged(tag, 1) for tag in "abc"], [], tokenizer)
+    assert rd._train_iterators == {"a": None, "b": None, "c": None}
+    assert RunDataloaders([], [], [], tokenizer)._train_iterators == {}
+    with pytest.raises(ValueError, match="unique and aligned"):
+        RunDataloaders(["a", "b"], [_tagged("a", 1)], [], tokenizer)
+    with pytest.raises(ValueError, match="unique and aligned"):
+        RunDataloaders(["a", "a"], [_tagged("a", 1), _tagged("a", 1)], [], tokenizer)
 
 
 def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 3), _tagged("s1", 3)], [], tokenizer)
-    assert sd._train_iterators == [None, None]
-    sd.next_train_batch(1)
-    assert sd._train_iterators[0] is None
-    assert _first(sd.next_train_batch(1)) == 1
-    assert _first(sd.next_train_batch(0)) == 0
+    rd = RunDataloaders(["a", "b"], [_tagged("a", 3), _tagged("b", 3)], [], tokenizer)
+    assert rd._train_iterators == {"a": None, "b": None}
+    rd.next_train_batch("b")
+    assert rd._train_iterators["a"] is None
+    assert _first(rd.next_train_batch("b")) == 1
+    assert _first(rd.next_train_batch("a")) == 0
 
 
-def test_train_datasets_reaches_through_a_single_dataset_and_a_mixture(
-    tokenizer: Tokenizer, entries: list[DataEntry]
-) -> None:
-    loaders = StageDataloaders([_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries, tokenizer, 2, padded=False)], [], tokenizer)
-    assert [d.prefix for d in loaders.train_datasets(0)] == ["pre"]
-    assert [d.prefix for d in loaders.train_datasets(1)] == ["pre", "ft"]
-    assert StageDataloaders([_tagged("s0", 1)], [], tokenizer).train_datasets(0) == []  # a plain list of batches
+def test_train_dataset_reaches_through_a_real_loader_only(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    rd = RunDataloaders(
+        ["pre", "ft"],
+        [_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries[1:], tokenizer, 2, padded=False)],
+        [],
+        tokenizer,
+    )
+    dataset = rd.train_dataset("pre")
+    assert isinstance(dataset, ParquetTextDataset) and dataset.prefix == "pre"
+    assert RunDataloaders(["a"], [_tagged("a", 1)], [], tokenizer).train_dataset("a") is None  # a plain list of batches
 
 
-def test_set_and_clear_resume_offsets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    loaders = StageDataloaders([_loader(entries, tokenizer, 2, padded=False)], [], tokenizer)
-    loaders.set_resume_offsets({"pre": 3, "gone": 9})  # a prefix no dataset has is ignored
-    assert [d.resume_offset for d in loaders.train_datasets(0)] == [3, 0]
-    loaders.clear_resume_offsets(0)
-    assert [d.resume_offset for d in loaders.train_datasets(0)] == [0, 0]
+def test_set_resume_offsets_and_clear_resume_offset(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    rd = RunDataloaders(
+        ["pre", "ft"],
+        [_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries[1:], tokenizer, 2, padded=False)],
+        [],
+        tokenizer,
+    )
+    rd.set_resume_offsets({"pre": 3, "gone": 9})  # a name no source has is ignored
+    pre, ft = rd.train_dataset("pre"), rd.train_dataset("ft")
+    assert pre is not None and ft is not None
+    assert (pre.resume_offset, ft.resume_offset) == (3, 0)
+    rd.clear_resume_offset("pre")
+    assert (pre.resume_offset, ft.resume_offset) == (0, 0)
 
 
 def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
     """The first epoch after a resume starts at the offset; once it ends, the loader reads its whole range again."""
     entry = DataEntry("pre", str(tiny_pretrain_dir))
     total = _rows_in(tiny_pretrain_dir)
-    loaders = StageDataloaders([build_dataloader([entry], tokenizer, 64, 1, padded=False)], [], tokenizer)
-    loaders.set_resume_offsets({"pre": total - 2})
-    first_epoch = [loaders.next_train_batch(0).samples[0][2] for _ in range(2)]
-    assert first_epoch == ["pre", "pre"] and loaders.train_datasets(0)[0].resume_offset == 0
-    assert len([loaders.next_train_batch(0) for _ in range(total)]) == total  # the restart reads every row
-
-
-def test_sample_stage_batch_outside_transition_is_current(tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
-    rng = random.Random(0)
-    for p in (0.0, 0.5, 1.0):
-        assert [s[2] for s in sample_stage_batch(sd, 1, None, p, rng).samples] == ["s1"]
-
-
-@pytest.mark.parametrize("progress", [0.0, 0.25, 0.8, 1.0])
-def test_sample_stage_batch_bernoulli_frequency(progress: float, tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
-    rng = random.Random(123)
-    n = 4000
-    tags = Counter(sample_stage_batch(sd, 1, 0, progress, rng).samples[0][2] for _ in range(n))
-    assert tags["s1"] / n == pytest.approx(progress, abs=0.03)
-    if progress in (0.0, 1.0):
-        assert len(tags) == 1
-
-
-class _ScriptedRandom(random.Random):
-    """random() returns a fixed script; lets the >= boundary of the Bernoulli draw be checked exactly."""
-
-    def __init__(self, values: list[float]) -> None:
-        super().__init__(0)
-        self._values = iter(values)
-
-    def random(self) -> float:
-        return next(self._values)
-
-
-def test_sample_stage_batch_bernoulli_exact_boundary(tokenizer: Tokenizer) -> None:
-    """Draw u; next stage iff u < progress (so u == progress stays on the previous stage)."""
-    sd = StageDataloaders([_tagged("s0", 9), _tagged("s1", 9)], [], tokenizer)
-    rng = _ScriptedRandom([0.1, 0.5, 0.49999, 0.9, 0.0])
-    tags = [sample_stage_batch(sd, 1, 0, 0.5, rng).samples[0][2] for _ in range(5)]
-    assert tags == ["s1", "s0", "s1", "s0", "s1"]
-
-
-def test_sample_stage_batch_consumes_rng_only_in_transition(tokenizer: Tokenizer) -> None:
-    sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
-    rng = random.Random(0)
-    state = rng.getstate()
-    sample_stage_batch(sd, 1, None, 0.5, rng)
-    assert rng.getstate() == state
+    rd = RunDataloaders(["pre"], [build_dataloader([entry], tokenizer, 64, 1, padded=False)], [], tokenizer)
+    rd.set_resume_offsets({"pre": total - 2})
+    first_epoch = [rd.next_train_batch("pre").samples[0][2] for _ in range(2)]
+    dataset = rd.train_dataset("pre")
+    assert dataset is not None
+    assert first_epoch == ["pre", "pre"] and dataset.resume_offset == 0
+    assert len([rd.next_train_batch("pre") for _ in range(total)]) == total  # the restart reads every row
 
 
 # --- world_batch_micro_batches ----------------------------------------------------------------------------------------

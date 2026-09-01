@@ -387,10 +387,12 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
 
 @pytest.mark.slow
 def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
+    """Data ids are plain SOURCE names (the run-wide readers): all pretrain until the transition into finetune, all
+    instruct after it, a per-sample mix inside the window."""
     history: History = full_run["history"]
-    assert history[3]["data_composition/pretrain_a-synthetic_pretrain"] == pytest.approx(1.0)
-    assert history[18]["data_composition/finetune-synthetic_instruct"] == pytest.approx(1.0)
-    for done in range(15, 17):  # inside the 1 -> 2 transition both stages' sources may appear, weights sum to 1
+    assert history[3]["data_composition/synthetic_pretrain"] == pytest.approx(1.0)
+    assert history[18]["data_composition/synthetic_instruct"] == pytest.approx(1.0)
+    for done in range(15, 17):  # inside the 1 -> 2 transition both sources may appear, weights sum to 1
         total = sum(v for k, v in history[done].items() if k.startswith("data_composition/"))
         assert total == pytest.approx(1.0)
 
@@ -459,9 +461,9 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
 ) -> None:
     """`resume: true` continues from the latest checkpoint of the run (here the stage-1_end one at step 14).
 
-    Losses cannot be compared exactly here: the resumed run re-seeds the transition sampler with
-    `seed + step` and rebuilds the loaders, so the mixed batches of the 1 -> 2 transition (steps 14, 15) differ
-    by design. Exact equivalence is asserted in `test_resume_is_bit_exact_without_transitions`."""
+    Losses cannot be compared exactly here: the resumed run rebuilds the loaders, whose fresh iterators draw base
+    seeds from the global torch RNG at points the uninterrupted run does not (see
+    `test_stage_boundary_resume_continues_schedule_and_stream` for what a resume does promise)."""
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
@@ -484,7 +486,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert history[done]["stage/in_transition"] == full[done]["stage/in_transition"]
         assert history[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in history.items() if "val_loss" in m] == [16, 20]
-    assert history[16]["data_composition/finetune-synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
+    assert history[16]["data_composition/synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
     final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final["validation_rows"] == full_run["validation_rows"]  # the resumed run kept the split
 
@@ -501,9 +503,15 @@ def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, *
 
 
 @pytest.mark.slow
-def test_resume_is_bit_exact_without_transitions(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """Without transitions (no rng-driven mixing) resuming from the stage-0_end checkpoint reproduces the
-    uninterrupted run exactly: every logged loss, the validation losses and the final model + optimizer state."""
+def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """Resuming from the stage-0_end checkpoint continues the run: the same remaining steps, the exact LR schedule,
+    the evaluation cadence, and the data stream picks up where the checkpoint stood — the resumed run ends with
+    exactly the uninterrupted run's per-source consumed-row counters, having repeated no row.
+
+    It is deliberately NOT bit-exact any more: the run-wide readers live across stage boundaries, so a resumed
+    run's freshly created loader iterators draw base seeds from the global torch RNG at points the uninterrupted
+    run does not, and the losses diverge (the old per-stage loaders happened to make a stage-boundary resume
+    bit-exact because the next stage's loader had not been created yet)."""
     full_dir = tmp_path / "full" / "out"
     history_full = _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir)).history
     names = sorted(p.name for p in checkpoint_dir(full_dir).glob("*.pth"))
@@ -520,25 +528,25 @@ def test_resume_is_bit_exact_without_transitions(tmp_path: Path, tiny_dataset_di
     history = _run(yaml_path).history
     assert sorted(history) == list(range(9, 21))
     for done in range(9, 21):
-        assert history[done]["loss"] == history_full[done]["loss"], done  # exact, not approx
         assert history[done]["lr"] == history_full[done]["lr"]
-        assert history[done].get("val_loss") == history_full[done].get("val_loss")
+        assert ("val_loss" in history[done]) == ("val_loss" in history_full[done])
+        assert torch.isfinite(torch.tensor(history[done]["loss"]))
     assert "val_loss" in history[16] and "val_loss" in history[20]
 
     final_full = torch.load(checkpoint_dir(full_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     final_res = torch.load(checkpoint_dir(resumed_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
-    assert final_full["model"].keys() == final_res["model"].keys()
-    assert all(torch.equal(final_full["model"][k], final_res["model"][k]) for k in final_full["model"])
-    for sa, sb in zip(final_full["optimizer"]["state"].values(), final_res["optimizer"]["state"].values()):
-        assert all(torch.equal(sa[k], sb[k]) for k in sa if torch.is_tensor(sa[k]))
     assert final_res["step"] == 20
+    # the data stream continued: rows consumed per source add up to the uninterrupted run's counters exactly
+    # (no-transition config, worker batches of micro_batch_size 2 divide each step's draws: no buffered leftovers)
+    assert final_res["data_stream"]["consumed_rows"] == final_full["data_stream"]["consumed_rows"]
+    assert final_res["model"].keys() == final_full["model"].keys()
 
 
 @pytest.mark.slow
 def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-entry row
+    """A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-source row
     counters continue instead of restarting at row 0, so the resumed run trains on rows the interrupted run had not
-    reached (`BatchStream.load_state_dict`; the within-stage order still differs from an uninterrupted run)."""
+    reached (`BatchStream.load_state_dict` says exactly what that does and does not promise)."""
 
     def consumed(directory: Path, name: str) -> dict[str, int]:
         state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
@@ -547,11 +555,9 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     full_dir = tmp_path / "full" / "out"
     options = {"save_step_interval": "4", "export_to_hf": "false"}
     _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
-    # 12 steps of 4 rows: stage 0 ran steps 0-7, stage 1 steps 8-11
-    assert consumed(full_dir, "step-00000012-tiny.pth") == {
-        "pretrain_a-synthetic_pretrain": 32,
-        "pretrain_b-synthetic_pretrain": 16,
-    }
+    # 12 steps of 4 rows, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the source and
+    # only change its weight, so the counter keeps counting across the stage boundary at step 8)
+    assert consumed(full_dir, "step-00000012-tiny.pth") == {"synthetic_pretrain": 48}
 
     resumed_dir = tmp_path / "resumed" / "out"
     mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"

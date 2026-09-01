@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Training data pipeline: parquet streaming, on-the-fly tokenization, collation and per-stage loaders.
+"""Training data pipeline: parquet streaming, on-the-fly tokenization, collation, the per-source train loaders and
+the per-stage validation loaders.
 
 Deliberately NO re-exports: `dataset_resolver` is framework-neutral, and a convenience import of the torch
 modules here would load torch for everyone importing it (enforced by

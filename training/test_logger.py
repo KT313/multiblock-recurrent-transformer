@@ -318,7 +318,9 @@ def fake_result(
 @pytest.fixture
 def resolved(tiny_dataset_config: DatasetConfig) -> ResolvedDataset:
     """Only `config_hash` is read by `RunLogger.open` (the wandb hyperparameters)."""
-    return ResolvedDataset(config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], validation_rows={})
+    return ResolvedDataset(
+        config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}
+    )
 
 
 @pytest.fixture

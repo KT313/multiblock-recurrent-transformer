@@ -45,8 +45,9 @@ from training.data.dataset_resolver import (
     loader_shards,
     processed_rows,
     resolve_dataset,
-    resolve_entries,
     resolve_splits,
+    resolve_train_sources,
+    resolve_val_entries,
     validate_settings,
     validation_batches_available,
     validation_rows_of,
@@ -60,25 +61,18 @@ CROW_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"
 TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 # The last hand-written run config (git history before the dataset-config restructure, `config/crow_300m_final.yaml`)
-# as (data_dir, weight, data_signature, skip_rows, max_rows) per stage, with its per-stage data directories mapped onto
-# the new layout: every source -> processed/<source>; fineweb's held-out set is the validation_fraction split of the
-# same folder; the former flan_instruct mixture is the eight instruct sources with the mixture shares as weights, in
-# train and val alike, each split by validation_fraction. The golden test needs no data on disk: every source is
-# pretended to hold GOLDEN_ROWS processed rows, of which 5 % = GOLDEN_VAL_ROWS are validation rows when the source is
-# used in train and val.
+# with its per-stage data directories mapped onto the new layout: every source -> processed/<source>; fineweb's
+# held-out set is the validation_fraction split of the same folder; the former flan_instruct mixture is the eight
+# instruct sources with the mixture shares as weights, in train and val alike, each split by validation_fraction.
+# Since the continuous-stream design, training reads every source through ONE run-wide reader
+# (`ResolvedDataset.train_sources`), so the per-stage train side is the WEIGHTS dict and the row ranges live on the
+# run-wide source entries. The golden test needs no data on disk: every source is pretended to hold GOLDEN_ROWS
+# processed rows, of which 5 % = GOLDEN_VAL_ROWS are validation rows when the source is used in train and val.
 _P = "dataset/processed/{}"
 _INSTRUCT = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
 GOLDEN_ROWS = 1000
 GOLDEN_VAL_ROWS = 50
 Entry = tuple[str, float, dict[str, Any] | None, int, int | None]
-
-
-def _train_only(name: str, weight: float) -> Entry:
-    return (_P.format(name), weight, None, 0, None)
-
-
-def _train_split(name: str, weight: float, signature: dict[str, Any] | None = None) -> Entry:
-    return (_P.format(name), weight, signature, GOLDEN_VAL_ROWS, None)
 
 
 def _val_split(name: str, weight: float, signature: dict[str, Any] | None = None) -> Entry:
@@ -101,24 +95,24 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
         "tokens": 3_300_000_000,
         "base_lr": 3e-4,
         "transition_pct": 0.10,
-        "train": [
-            _train_split("fineweb_edu", 0.65),
-            _train_only("wikipedia", 0.09),
-            _train_only("books_gutenberg", 0.06),
-            _train_only("github_code_clean_python", 0.036),
-            _train_only("github_code_clean_javascript", 0.024),
-            _train_only("github_code_clean_typescript", 0.012),
-            _train_only("github_code_clean_java", 0.012),
-            _train_only("github_code_clean_cpp", 0.0096),
-            _train_only("github_code_clean_go", 0.0084),
-            _train_only("github_code_clean_rust", 0.006),
-            _train_only("github_code_clean_shell", 0.0048),
-            _train_only("github_code_clean_sql", 0.0036),
-            _train_only("github_code_clean_html", 0.0036),
-            _train_only("peso", 0.03),
-            _train_only("arxiv", 0.02),
-            _train_only("openwebmath", 0.03),
-        ],
+        "train": {
+            "fineweb_edu": 0.65,
+            "wikipedia": 0.09,
+            "books_gutenberg": 0.06,
+            "github_code_clean_python": 0.036,
+            "github_code_clean_javascript": 0.024,
+            "github_code_clean_typescript": 0.012,
+            "github_code_clean_java": 0.012,
+            "github_code_clean_cpp": 0.0096,
+            "github_code_clean_go": 0.0084,
+            "github_code_clean_rust": 0.006,
+            "github_code_clean_shell": 0.0048,
+            "github_code_clean_sql": 0.0036,
+            "github_code_clean_html": 0.0036,
+            "peso": 0.03,
+            "arxiv": 0.02,
+            "openwebmath": 0.03,
+        },
         "val": [_val_split("fineweb_edu", 1.0)],
     },
     {
@@ -126,25 +120,25 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
         "tokens": 1_500_000_000,
         "base_lr": 1e-4,
         "transition_pct": 0.10,
-        "train": [
-            _train_split("fineweb_edu", 0.35),
-            _train_only("github_code_clean_python", 0.084),
-            _train_only("github_code_clean_javascript", 0.056),
-            _train_only("github_code_clean_typescript", 0.028),
-            _train_only("github_code_clean_java", 0.028),
-            _train_only("github_code_clean_cpp", 0.0224),
-            _train_only("github_code_clean_go", 0.0196),
-            _train_only("github_code_clean_rust", 0.014),
-            _train_only("github_code_clean_shell", 0.0112),
-            _train_only("github_code_clean_sql", 0.0084),
-            _train_only("github_code_clean_html", 0.0084),
-            _train_only("openwebmath", 0.088),
-            _train_only("tinygsm", 0.066),
-            _train_only("algebraic_stack", 0.044),
-            _train_only("gsm8k", 0.022),
-            _train_only("peso", 0.09),
-            _train_only("arxiv", 0.06),
-        ],
+        "train": {
+            "fineweb_edu": 0.35,
+            "github_code_clean_python": 0.084,
+            "github_code_clean_javascript": 0.056,
+            "github_code_clean_typescript": 0.028,
+            "github_code_clean_java": 0.028,
+            "github_code_clean_cpp": 0.0224,
+            "github_code_clean_go": 0.0196,
+            "github_code_clean_rust": 0.014,
+            "github_code_clean_shell": 0.0112,
+            "github_code_clean_sql": 0.0084,
+            "github_code_clean_html": 0.0084,
+            "openwebmath": 0.088,
+            "tinygsm": 0.066,
+            "algebraic_stack": 0.044,
+            "gsm8k": 0.022,
+            "peso": 0.09,
+            "arxiv": 0.06,
+        },
         "val": [_val_split("fineweb_edu", 1.0)],
     },
     {
@@ -152,10 +146,12 @@ GOLDEN_CROW_STAGES: list[dict[str, Any]] = [
         "tokens": 150_000_000,
         "base_lr": 5e-5,
         "transition_pct": 0.0,
-        "train": [_train_split(name, weight, _INSTRUCT) for name, weight in _INSTRUCT_SHARES],
+        "train": dict(_INSTRUCT_SHARES),
         "val": [_val_split(name, weight, _INSTRUCT) for name, weight in _INSTRUCT_SHARES],
     },
 ]
+# sources used in train AND val: their run-wide reader starts after the GOLDEN_VAL_ROWS held-out rows
+GOLDEN_SPLIT_SOURCES = {"fineweb_edu", *(name for name, _ in _INSTRUCT_SHARES)}
 CROW_BASE_LRS = [3e-4, 1e-4, 5e-5]
 
 
@@ -202,7 +198,7 @@ def crow_cfg() -> DatasetConfig:
     return load_dataset_config(CROW_DATASET_YAML)
 
 
-# --- resolve_entries: golden comparison with the thesis run config ---------------------------------------------------
+# --- golden comparison with the thesis run config --------------------------------------------------------------------
 
 
 def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> None:
@@ -212,14 +208,30 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
     assert validation_rows["wikipedia"] == 0 and validation_rows["gsm8k"] == 0
     assert [s.name for s in crow_cfg.stages] == [g["name"] for g in GOLDEN_CROW_STAGES]
     for stage, golden in zip(crow_cfg.stages, GOLDEN_CROW_STAGES):
-        train, val = resolve_entries(crow_cfg, layout, stage, validation_rows)
-        assert _ranges(train) == golden["train"], stage.name
+        assert stage.train == golden["train"], stage.name
+        val = resolve_val_entries(crow_cfg, layout, stage, validation_rows)
         assert _ranges(val) == golden["val"], stage.name
         assert (stage.tokens, stage.transition_pct) == (golden["tokens"], golden["transition_pct"])
-        for entries in (train, val):  # a source in both train and val has one prefix in each list, with disjoint ranges
-            prefixes = [e.prefix for e in entries]
-            assert len(set(prefixes)) == len(prefixes), stage.name
-        assert sum(e.weight for e in train) == pytest.approx(1.0)
+        prefixes = [e.prefix for e in val]
+        assert len(set(prefixes)) == len(prefixes), stage.name
+        assert sum(stage.train.values()) == pytest.approx(1.0)
+
+
+def test_crow_train_sources_are_one_run_wide_reader_per_source(crow_cfg: DatasetConfig) -> None:
+    """The train side of the thesis mixture as the continuous-stream design reads it: one entry per source used in
+    training, in config order, prefix = the plain source name, range = validation holdout -> end (so stages sharing
+    a source never re-read rows)."""
+    layout = DatasetLayout(Path("dataset"))
+    validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
+    sources = resolve_train_sources(crow_cfg, layout, validation_rows)
+    assert [e.prefix for e in sources] == [n for n in crow_cfg.sources if crow_cfg.used_in_train(n)]  # config order
+    assert {e.prefix for e in sources} == {name for golden in GOLDEN_CROW_STAGES for name in golden["train"]}
+    instruct_names = {name for name, _ in _INSTRUCT_SHARES}
+    for entry in sources:
+        assert entry.data_dir == _P.format(entry.prefix)
+        held_out = GOLDEN_VAL_ROWS if entry.prefix in GOLDEN_SPLIT_SOURCES else 0
+        assert (entry.skip_rows, entry.max_rows) == (held_out, None), entry.prefix
+        assert entry.data_signature == (_INSTRUCT if entry.prefix in instruct_names else None), entry.prefix
 
 
 # Not in this list: `model.config`, the known gap — it is framework-neutral by intent but imports
@@ -244,31 +256,37 @@ def test_framework_neutral_modules_do_not_load_torch() -> None:
 
 
 def test_same_source_same_split_in_every_stage(crow_cfg: DatasetConfig) -> None:
+    """fineweb_edu is validated on in both pretrain stages and trained on through one run-wide reader: every
+    stage's validation entry reads the same held-out rows `[0, GOLDEN_VAL_ROWS)` and the single train source
+    starts right after them."""
     layout = DatasetLayout(Path("dataset"))
     validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
-    fineweb: dict[str, tuple[int, int | None]] = {}
     for stage in crow_cfg.stages[:2]:
-        train, val = resolve_entries(crow_cfg, layout, stage, validation_rows)
-        (train_entry,) = [e for e in train if e.data_dir.endswith("fineweb_edu")]
+        val = resolve_val_entries(crow_cfg, layout, stage, validation_rows)
         (val_entry,) = [e for e in val if e.data_dir.endswith("fineweb_edu")]
-        fineweb[stage.name] = (train_entry.skip_rows, train_entry.max_rows)
         assert (val_entry.skip_rows, val_entry.max_rows) == (0, GOLDEN_VAL_ROWS)
-    assert fineweb["pretrain_phase1"] == fineweb["pretrain_phase2"] == (GOLDEN_VAL_ROWS, None)
+    (train_entry,) = [
+        e for e in resolve_train_sources(crow_cfg, layout, validation_rows) if e.data_dir.endswith("fineweb_edu")
+    ]
+    assert (train_entry.skip_rows, train_entry.max_rows) == (GOLDEN_VAL_ROWS, None)
 
 
 def test_entry_prefixes_and_signatures(crow_cfg: DatasetConfig) -> None:
     layout = DatasetLayout(Path("/data"))
     validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
-    train, val = resolve_entries(crow_cfg, layout, crow_cfg.stages[2], validation_rows)
-    assert train[0].prefix == "finetune-flan" and val[0].prefix == "finetune-flan"
-    assert train[0].data_dir == val[0].data_dir == "/data/processed/flan"
-    assert train[0].data_signature == INSTRUCT_DATA_SIGNATURE and train[0].data_signature is not INSTRUCT_DATA_SIGNATURE
-    assert (train[0].skip_rows, train[0].max_rows) == (GOLDEN_VAL_ROWS, None)
+    val = resolve_val_entries(crow_cfg, layout, crow_cfg.stages[2], validation_rows)
+    assert val[0].prefix == "finetune-flan" and val[0].data_dir == "/data/processed/flan"
+    assert val[0].data_signature == INSTRUCT_DATA_SIGNATURE and val[0].data_signature is not INSTRUCT_DATA_SIGNATURE
     assert (val[0].skip_rows, val[0].max_rows) == (0, GOLDEN_VAL_ROWS)
-    train1, val1 = resolve_entries(crow_cfg, layout, crow_cfg.stages[0], validation_rows)
-    assert train1[0].prefix == "pretrain_phase1-fineweb_edu" and train1[0].data_signature is None
+    val1 = resolve_val_entries(crow_cfg, layout, crow_cfg.stages[0], validation_rows)
     assert val1[0].prefix == "pretrain_phase1-fineweb_edu" and val1[0].data_dir == "/data/processed/fineweb_edu"
-    assert (train1[1].prefix, train1[1].skip_rows, train1[1].max_rows) == ("pretrain_phase1-wikipedia", 0, None)
+    assert val1[0].data_signature is None
+    sources = resolve_train_sources(crow_cfg, layout, validation_rows)
+    flan = next(e for e in sources if e.prefix == "flan")
+    assert flan.data_dir == "/data/processed/flan" and (flan.skip_rows, flan.max_rows) == (GOLDEN_VAL_ROWS, None)
+    assert flan.data_signature == INSTRUCT_DATA_SIGNATURE and flan.data_signature is not INSTRUCT_DATA_SIGNATURE
+    wikipedia = next(e for e in sources if e.prefix == "wikipedia")
+    assert (wikipedia.skip_rows, wikipedia.max_rows) == (0, None) and wikipedia.data_signature is None
 
 
 # --- the split arithmetic --------------------------------------------------------------------------------------------
@@ -325,8 +343,8 @@ def test_split_ranges_are_disjoint_and_complete(
         return [tuple(str(row[key]) for key in keys) for row in dataset]
 
     val_entries = [e for s in resolved.stages for e in s.val_data if e.data_dir == str(directory)]
-    train_entries = [e for s in resolved.stages for e in s.train_data if e.data_dir == str(directory)]
-    assert val_entries and train_entries
+    train_entries = [e for e in resolved.train_sources if e.data_dir == str(directory)]
+    assert val_entries and len(train_entries) == 1  # ONE run-wide train reader per source
     assert {(e.skip_rows, e.max_rows) for e in val_entries} == {(0, k)}  # the same split in every stage
     assert {(e.skip_rows, e.max_rows) for e in train_entries} == {(k, None)}
     assert all(e.data_signature == signature for e in val_entries + train_entries)
@@ -370,25 +388,27 @@ def test_processed_rows_missing_or_empty_folder(tmp_path: Path) -> None:
         processed_rows(tmp_path / "empty", "what")
 
 
-def _stage(train: list[DataEntry], val: list[DataEntry]) -> ResolvedStage:
-    return ResolvedStage(name="s", tokens=1, base_lr=1e-4, transition_pct=0.0, train_data=train, val_data=val)
+def _stage(val: list[DataEntry]) -> ResolvedStage:
+    return ResolvedStage(name="s", tokens=1, base_lr=1e-4, transition_pct=0.0, train_weights={}, val_data=val)
 
 
-def test_check_entries_on_disk_names_the_stage_key(tmp_path: Path, tiny_pretrain_dir: Path) -> None:
+def test_check_entries_on_disk_names_the_entry(tmp_path: Path, tiny_pretrain_dir: Path) -> None:
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
-    check_entries_on_disk([_stage([DataEntry("s-a", good, skip_rows=total - 1)], [DataEntry("s-a", good, max_rows=1)])])
-    check_entries_on_disk([_stage([DataEntry("s-a", good)], [DataEntry("s-a", good)])])  # full range twice is fine
+    check_entries_on_disk([DataEntry("a", good, skip_rows=total - 1)], [_stage([DataEntry("s-a", good, max_rows=1)])])
+    check_entries_on_disk([DataEntry("a", good)], [_stage([DataEntry("s-a", good)])])  # full range twice is fine
     missing = str(tmp_path / "nope")
-    with pytest.raises(FileNotFoundError, match=f"stage 's' train entry 's-a': processed folder {re.escape(missing)} does not exist"):
-        check_entries_on_disk([_stage([DataEntry("s-a", missing)], [])])
+    with pytest.raises(FileNotFoundError, match=f"train source 'a': processed folder {re.escape(missing)} does not exist"):
+        check_entries_on_disk([DataEntry("a", missing)], [])
     (tmp_path / "empty").mkdir()
     with pytest.raises(FileNotFoundError, match="stage 's' val entry 's-b': .* holds no data-\\*.parquet shard"):
-        check_entries_on_disk([_stage([], [DataEntry("s-b", str(tmp_path / "empty"))])])
-    with pytest.raises(RuntimeError, match=rf"stage 's' train entry 's-a': row range \[{total}, end\) of .* is empty \({total} rows on disk\); the training part"):
-        check_entries_on_disk([_stage([DataEntry("s-a", good, skip_rows=total)], [])])
+        check_entries_on_disk([], [_stage([DataEntry("s-b", str(tmp_path / "empty"))])])
+    # an empty training range is the error that makes the stream's restart-on-exhaustion safe: a source that runs
+    # dry mid-run is restarted, which would spin forever on a range without a single row
+    with pytest.raises(RuntimeError, match=rf"train source 'a': row range \[{total}, end\) of .* is empty \({total} rows on disk\); the training part"):
+        check_entries_on_disk([DataEntry("a", good, skip_rows=total)], [])
     with pytest.raises(RuntimeError, match=r"stage 's' val entry 's-a': row range \[0, 0\) of .* is empty .*; the validation part"):
-        check_entries_on_disk([_stage([], [DataEntry("s-a", good, max_rows=0)])])
+        check_entries_on_disk([], [_stage([DataEntry("s-a", good, max_rows=0)])])
 
 
 # --- one row per dataloader worker shard ------------------------------------------------------------------------------
@@ -413,40 +433,36 @@ def test_entry_rows_in_range_clips_to_the_rows_on_disk(tiny_pretrain_dir: Path) 
     assert entry_rows_in_range(DataEntry("s-a", good, skip_rows=total + 5), total) == 0
 
 
-def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_worker_count(tiny_pretrain_dir: Path) -> None:
-    """A source with fewer rows than the loader has worker shards leaves a worker with an empty shard; the mixture
-    restarts that member, gets a second `StopIteration` and the run dies inside the worker — so it is a setup error
-    naming the entry, its rows and the worker count. `dataloader_num_workers=0` is a single in-process shard and
-    can never trip it."""
+def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_pretrain_dir: Path) -> None:
+    """An entry with fewer rows than its loader has shards leaves a shard empty; the restart of an exhausted
+    loader (or mixture member) then gets a second `StopIteration` and the run dies mid-training — so it is a setup
+    error naming the entry, its rows and the shard count. Train loaders run one worker per source and validation
+    loaders in-process, so with one device everything is a single shard and only a larger world can starve one."""
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
-    stage = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=1)])
-    check_entry_shards([stage], dataloader_num_workers=0)  # in-process: one shard, whatever the row count
-    check_entry_shards([stage], dataloader_num_workers=total)  # exactly one row per shard
-    check_entry_shards([stage], dataloader_num_workers=1)
+    train = [DataEntry("a", good), DataEntry("narrow", good, skip_rows=total - 2)]
+    stage = _stage([DataEntry("s-a", good, max_rows=1)])
+    check_entry_shards(train, [stage])  # world size 1: one shard per loader, whatever the row count
+    check_entry_shards(train, [stage], world_size=1)
+    # the training range is what counts, not the folder: the validation split narrows `narrow` to 2 rows
+    check_entry_shards([DataEntry("narrow", good, skip_rows=total - 2)], [], world_size=2)
     with pytest.raises(
         ValueError,
         match=(
-            rf"stage 's' train entry 's-a': .* gives it {total} row\(s\) after the validation split, but its loader "
-            rf"deals the rows round-robin over {total + 1} shards \({total + 1} dataloader worker\(s\)\), so 1 "
-            rf"shard\(s\) would be empty and the run would fail during training\. Lower dataloader_num_workers to at "
-            rf"most {total}, or give the source more rows"
+            r"train source 'narrow': .* gives it 2 row\(s\) after the validation split, but its loader deals the "
+            r"rows round-robin over 3 shards \(1 dataloader worker\(s\) × world size 3\), so 1 shard\(s\) would be "
+            r"empty and the run would fail during training\. Give the source more rows, or lower the world size"
         ),
     ):
-        check_entry_shards([stage], dataloader_num_workers=total + 1)
-    # the training range is what counts, not the folder: the validation split narrows it
-    narrow = _stage([DataEntry("s-a", good, skip_rows=total - 2)], [])
-    check_entry_shards([narrow], dataloader_num_workers=2)
-    with pytest.raises(ValueError, match=r"gives it 2 row\(s\).*over 3 shards \(3 dataloader worker\(s\)\)"):
-        check_entry_shards([narrow], dataloader_num_workers=3)
-    # validation loaders read in-process (`num_workers=0`), so only extra ranks can starve one
-    val_only = _stage([], [DataEntry("s-b", good, max_rows=2)])
-    check_entry_shards([val_only], dataloader_num_workers=64)
+        check_entry_shards([DataEntry("narrow", good, skip_rows=total - 2)], [], world_size=3)
+    # validation loaders read in-process (`num_workers=0`): one shard per rank
+    val_only = _stage([DataEntry("s-b", good, max_rows=2)])
+    check_entry_shards([], [val_only], world_size=2)
     with pytest.raises(
         ValueError,
         match=r"stage 's' val entry 's-b': .*over 4 shards \(0 dataloader worker\(s\) × world size 4\).*lower the world size",
     ):
-        check_entry_shards([val_only], dataloader_num_workers=0, world_size=4)
+        check_entry_shards([], [val_only], world_size=4)
 
 
 # --- the validation data an evaluation needs --------------------------------------------------------------------------
@@ -475,7 +491,7 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     error naming the stage, the entries and both numbers; fewer batches than `eval_iters` is a warning (`evaluate`
     averages the batches it gets), and enough data passes silently."""
     good = str(tiny_pretrain_dir)
-    stage = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=4)])
+    stage = _stage([DataEntry("s-a", good, max_rows=4)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         check_validation_batches([stage], micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
     assert caplog.text == ""
@@ -489,7 +505,7 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
         check_validation_batches([stage], micro_batch_size=2, eval_iters=1, world_size=8)
     # a validation loader that mixes several sources restarts them and is never short, whatever the row counts are
-    mixed = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
+    mixed = _stage([DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         caplog.clear()
         check_validation_batches([mixed], micro_batch_size=8, eval_iters=50)
@@ -546,12 +562,17 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert [s.base_lr for s in resolved.stages] == pytest.approx([3e-4, 1e-4, 5e-5])
     assert [s.tokens for s in resolved.stages] == [8192, 8192, 4096]
     assert all(isinstance(s, ResolvedStage) for s in resolved.stages)
-    assert resolved.stages[0].train_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_pretrain"))
+    assert [s.train_weights for s in resolved.stages] == [
+        {"synthetic_pretrain": 1.0},
+        {"synthetic_pretrain": 1.0},
+        {"synthetic_instruct": 1.0},
+    ]
+    assert [e.prefix for e in resolved.train_sources] == ["synthetic_pretrain", "synthetic_instruct"]  # config order
+    assert resolved.train_sources[0].data_dir == str(tiny_layout.processed_dir("synthetic_pretrain"))
     assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_instruct"))
     assert resolved.validation_rows == resolve_splits(resolved.config, tiny_layout)
-    for stage in resolved.stages:
-        for entry in stage.train_data + stage.val_data:
-            assert list(Path(entry.data_dir).glob("*.parquet")), entry
+    for entry in resolved.train_sources + [e for stage in resolved.stages for e in stage.val_data]:
+        assert list(Path(entry.data_dir).glob("*.parquet")), entry
 
 
 def test_data_entry_defaults() -> None:
@@ -560,16 +581,21 @@ def test_data_entry_defaults() -> None:
 
 
 def test_training_stages(tiny_dataset_dir: Path) -> None:
-    """`training_stages()` hands the stage manager the budget, LR and transition of every stage and nothing about
-    the data (the entries stay in `ResolvedStage`)."""
+    """`training_stages()` hands the stage manager the budget, LR, transition and sampling weights of every stage
+    and nothing about the data on disk (the entries stay in `ResolvedStage` / `ResolvedDataset`)."""
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
     stages = resolved.training_stages()
     assert len(stages) == 3 and all(isinstance(s, TrainingStage) for s in stages)
     assert stages == [
-        TrainingStage(name=s.name, tokens=s.tokens, base_lr=s.base_lr, transition_pct=s.transition_pct) for s in resolved.stages
+        TrainingStage(
+            name=s.name, tokens=s.tokens, base_lr=s.base_lr, transition_pct=s.transition_pct, train_weights=s.train_weights
+        )
+        for s in resolved.stages
     ]
+    assert stages[0].train_weights is not resolved.stages[0].train_weights  # a copy: the manager cannot mutate it
     assert (stages[2].name, stages[2].tokens, stages[2].base_lr, stages[2].transition_pct) == ("finetune", 4096, 5e-5, 0.0)
-    assert {f.name for f in fields(TrainingStage)} == {"name", "tokens", "base_lr", "transition_pct"}
+    assert stages[2].train_weights == {"synthetic_instruct": 1.0}
+    assert {f.name for f in fields(TrainingStage)} == {"name", "tokens", "base_lr", "transition_pct", "train_weights"}
 
 
 def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path) -> None:
@@ -692,6 +718,7 @@ def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedData
         config_hash=config_hash,
         tokenizer_dir="unused",
         stages=[],
+        train_sources=[],
         validation_rows=validation_rows,
     )
 

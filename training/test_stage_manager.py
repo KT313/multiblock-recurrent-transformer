@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for the stage manager: hand-computed boundaries, world-size independence, validation, stage info inside
-transitions and stage-end checkpoint steps."""
+transitions, the interpolated per-step data weights and stage-end checkpoint steps."""
 
 from dataclasses import fields
 
@@ -29,11 +29,11 @@ def _bounds(sm: StageManager) -> list[tuple[int, int, int, int]]:
 
 
 def test_training_stage_fields() -> None:
-    """A stage is budget, LR and transition only; the data entries live in the resolver (`train_data` / `val_data`
-    were dead fields here)."""
+    """A stage is budget, LR, transition and sampling weights; the data entries live in the resolver (`train_data` /
+    `val_data` were dead fields here)."""
     stage = TrainingStage("s", tokens=10, base_lr=1e-3)
-    assert stage.transition_pct == 0.05
-    assert [f.name for f in fields(TrainingStage)] == ["name", "tokens", "base_lr", "transition_pct"]
+    assert stage.transition_pct == 0.05 and stage.train_weights == {}
+    assert [f.name for f in fields(TrainingStage)] == ["name", "tokens", "base_lr", "transition_pct", "train_weights"]
     assert not hasattr(stage, "train_data") and not hasattr(stage, "val_data")
 
 
@@ -158,6 +158,46 @@ def test_get_stage_info_inside_and_outside_transitions() -> None:
     info = sm.get_stage_info(15)
     assert (info.stage_idx, info.stage_name, info.prev_stage_idx) == (2, "finetune", 1)
     assert info.transition_progress == pytest.approx(0.5)
+
+
+def weighted_stages() -> list[TrainingStage]:
+    """The tiny boundaries ((0,8,6,8), (8,16,14,16), (16,20)) with a source `a` leaving, `b` shared and `c`
+    entering across the first transition."""
+    return [
+        TrainingStage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 0.7, "b": 0.3}),
+        TrainingStage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 0.5, "c": 0.5}),
+        TrainingStage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
+    ]
+
+
+def test_data_weights_outside_a_transition_are_the_stage_constants() -> None:
+    sm = StageManager(weighted_stages(), world_batch_size=4, block_size=256)
+    assert sm.data_weights(0) == {"a": 0.7, "b": 0.3}
+    assert sm.data_weights(5) == {"a": 0.7, "b": 0.3}  # last plain step of stage 0
+    assert sm.data_weights(8) == {"b": 0.5, "c": 0.5}  # first step fully in stage 1
+    assert sm.data_weights(19) == {"c": 1.0}
+    assert sm.data_weights(25) == {"c": 1.0}  # past the end: the last stage's constants
+
+
+def test_data_weights_interpolate_linearly_inside_a_transition() -> None:
+    sm = StageManager(weighted_stages(), world_batch_size=4, block_size=256)
+    # progress 0 (step 6): still entirely the outgoing stage's mix; the entering source is present at weight 0
+    assert sm.data_weights(6) == {"a": 0.7, "b": 0.3, "c": 0.0}
+    mid = sm.data_weights(7)  # progress 0.5
+    assert mid["a"] == pytest.approx(0.35)  # leaving: ramps to 0
+    assert mid["b"] == pytest.approx(0.4)  # 0.5 × 0.3 + 0.5 × 0.5
+    assert mid["c"] == pytest.approx(0.25)  # entering: ramps from 0
+    assert sum(mid.values()) == pytest.approx(1.0)  # each stage sums to 1, so every interpolation does
+    late = sm.data_weights(15)  # 1 -> 2 transition at progress 0.5
+    assert late == pytest.approx({"b": 0.25, "c": 0.75})
+    assert "a" not in late  # a source in neither stage of the pair is absent (weight 0, never drawn)
+
+
+def test_data_weights_returns_a_copy() -> None:
+    sm = StageManager(weighted_stages(), world_batch_size=4, block_size=256)
+    weights = sm.data_weights(0)
+    weights["a"] = 0.0
+    assert sm.data_weights(0)["a"] == 0.7
 
 
 def test_get_stage_info_past_the_end_reports_last_stage_complete() -> None:

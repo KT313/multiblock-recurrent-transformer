@@ -1,8 +1,12 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Dataloader construction (one loader per stage mixture, `build_stage_dataloaders` for a whole run), the per-stage
-batch sampling used by multi-stage training and the assembly of one world batch into padded micro-batches."""
+"""Dataloader construction (one train loader per SOURCE for the whole run and one validation loader per stage,
+`build_run_dataloaders`) and the assembly of one world batch into padded micro-batches.
 
-import random
+The stage structure never touches the train loaders: which source a sample comes from is drawn per sample in
+`training.step.BatchStream` with the stage-interpolated weights (`StageManager.data_weights`), so a reader simply
+continues across stage boundaries and consecutive stages sharing a source never re-read its rows.
+"""
+
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -19,7 +23,7 @@ from training.data.collate import (
     collate_worker_batch,
     pad_and_shift,
 )
-from training.data.dataset_resolver import DataEntry, ResolvedDataset
+from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings
@@ -40,8 +44,8 @@ def build_dataloader(
     pin_memory: bool = False,
     padded: bool = True,
 ) -> DataLoader[Row]:
-    """Loader over the weighted mixture of ``entries`` (a stage's ``train_data`` / ``val_data`` as resolved by
-    `training.data.dataset_resolver`).
+    """Loader over ``entries``: a single per-source train entry, or a stage's ``val_data`` mixed by weight
+    (`training.data.dataset_resolver` resolves both).
 
     ``padded`` (the validation loaders, and the default) yields ready ``(input_ids, labels, data_ids)`` batches;
     ``padded=False`` (the training loaders) yields a `WorkerBatch` — the unpadded `Sample` list of the batch plus
@@ -87,66 +91,78 @@ def build_dataloader(
 
 
 @dataclass
-class StageDataloaders:
-    """One train and one val loader per training stage, with lazily created and cycled train iterators.
+class RunDataloaders:
+    """One train loader per SOURCE for the whole run and one validation loader per stage, with lazily created and
+    cycled train iterators.
 
-    Train loaders yield unpadded `WorkerBatch`es (surviving samples + rows read per entry), validation loaders
-    padded `Batch`es; `tokenizer` is the one every loader was built with and the one `world_batch_micro_batches`
-    pads with. What a resume restores is the row offsets of `set_resume_offsets` (`training.step.BatchStream` owns
-    the bookkeeping).
+    ``train_sources`` are the source names in dataset-config order, aligned with ``train_loaders`` — the
+    deterministic order the stream draws over. Train loaders yield unpadded `WorkerBatch`es (surviving samples +
+    rows read per source), validation loaders padded `Batch`es; `tokenizer` is the one every loader was built with
+    and the one `world_batch_micro_batches` pads with. What a resume restores is the row offsets of
+    `set_resume_offsets` (`training.step.BatchStream` owns the bookkeeping).
     """
 
+    train_sources: list[str]
     train_loaders: Sequence[Iterable[WorkerBatch]]
     val_loaders: Sequence[Iterable[Batch]]
     tokenizer: Tokenizer
-    _train_iterators: list[Iterator[WorkerBatch] | None] = field(init=False)
+    _train_iterators: dict[str, Iterator[WorkerBatch] | None] = field(init=False)
 
     def __post_init__(self) -> None:
-        self._train_iterators = [None] * len(self.train_loaders)
+        if len(self.train_sources) != len(self.train_loaders) or len(set(self.train_sources)) != len(self.train_sources):
+            raise ValueError("train_sources must be unique and aligned with train_loaders")
+        self._train_iterators = dict.fromkeys(self.train_sources)
 
-    def next_train_batch(self, stage_idx: int) -> WorkerBatch:
-        """Next worker batch of ``stage_idx``'s train loader; restarts the loader when it is exhausted."""
-        iterator = self._train_iterators[stage_idx]
+    def _train_loader(self, source: str) -> Iterable[WorkerBatch]:
+        return self.train_loaders[self.train_sources.index(source)]
+
+    def next_train_batch(self, source: str) -> WorkerBatch:
+        """Next worker batch of ``source``'s loader; restarts the loader when its epoch is over.
+
+        The restart can never spin on an empty range: setup guarantees at least one training row per source
+        (`check_entries_on_disk` in the resolver). Numerics: the iterator is created lazily at the first pull (and
+        anew on every restart), and each `iter(DataLoader)` draws one base seed from the global torch RNG.
+        """
+        iterator = self._train_iterators[source]
         if iterator is None:
-            iterator = self._train_iterators[stage_idx] = iter(self.train_loaders[stage_idx])
+            iterator = self._train_iterators[source] = iter(self._train_loader(source))
         try:
             return next(iterator)
         except StopIteration:
-            # the epoch that started at the resume offsets is over; every later one reads the whole range again
-            self.clear_resume_offsets(stage_idx)
-            iterator = self._train_iterators[stage_idx] = iter(self.train_loaders[stage_idx])
+            # the epoch that started at the resume offset is over; every later one reads the whole range again
+            self.clear_resume_offset(source)
+            iterator = self._train_iterators[source] = iter(self._train_loader(source))
             return next(iterator)
 
-    def train_datasets(self, stage_idx: int) -> list[ParquetTextDataset]:
-        """The parquet datasets behind a stage's train loader (empty for a loader that is not a `DataLoader` over
-        them, which is what the tests hand in)."""
-        dataset = getattr(self.train_loaders[stage_idx], "dataset", None)
-        if isinstance(dataset, ParquetTextDataset):
-            return [dataset]
-        if isinstance(dataset, WeightedMixtureDataset):
-            return [member for member in dataset.datasets if isinstance(member, ParquetTextDataset)]
-        return []
+    def train_dataset(self, source: str) -> ParquetTextDataset | None:
+        """The parquet dataset behind a source's train loader (None for a loader that is not a `DataLoader` over
+        one, which is what the tests hand in)."""
+        dataset = getattr(self._train_loader(source), "dataset", None)
+        return dataset if isinstance(dataset, ParquetTextDataset) else None
 
     def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
-        """Start every train dataset whose prefix appears in `consumed_rows` that many rows into its range, so a
+        """Start every train dataset whose source appears in `consumed_rows` that many rows into its range, so a
         resumed run does not train on the rows the interrupted run already saw. One-shot (see
-        `ParquetTextDataset.set_resume_offset`); prefixes of other runs or of removed sources are ignored."""
-        for stage_idx in range(len(self.train_loaders)):
-            for dataset in self.train_datasets(stage_idx):
-                dataset.set_resume_offset(consumed_rows.get(dataset.prefix, 0))
+        `ParquetTextDataset.set_resume_offset`); names of removed sources are ignored."""
+        for source in self.train_sources:
+            dataset = self.train_dataset(source)
+            if dataset is not None:
+                dataset.set_resume_offset(consumed_rows.get(source, 0))
 
-    def clear_resume_offsets(self, stage_idx: int) -> None:
-        """Drop the pending resume offsets of a stage (its loader is about to be re-created for a fresh epoch)."""
-        for dataset in self.train_datasets(stage_idx):
+    def clear_resume_offset(self, source: str) -> None:
+        """Drop the pending resume offset of a source (its loader is about to be re-created for a fresh epoch)."""
+        dataset = self.train_dataset(source)
+        if dataset is not None:
             dataset.set_resume_offset(0)
 
 
-def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> StageDataloaders:
-    """One train and one validation loader per stage of `dataset`, each mixing its entries with constant weights.
+def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> RunDataloaders:
+    """One train loader per train source of `dataset` (the whole-run readers) and one validation loader per stage
+    (mixing its entries with constant weights).
 
-    The tokenizer is loaded once from `dataset.tokenizer_dir` and shared by every loader. Train loaders use
-    `settings.dataloader_num_workers` and yield unpadded samples, validation loaders read in-process and yield
-    padded batches. Loader seed `settings.seed + rank`, datasets sharded by `(rank, world_size)`.
+    The tokenizer is loaded once from `dataset.tokenizer_dir` and shared by every loader. Train loaders run
+    `TRAIN_LOADER_NUM_WORKERS` (= 1) worker each and yield unpadded samples; validation loaders read in-process
+    and yield padded batches. Loader seed `settings.seed + rank`, datasets sharded by `(rank, world_size)`.
     """
     tokenizer = Tokenizer(dataset.tokenizer_dir)
 
@@ -165,25 +181,12 @@ def build_stage_dataloaders(settings: Settings, dataset: ResolvedDataset, backen
             padded=padded,
         )
 
-    return StageDataloaders(
-        train_loaders=[loader(stage.train_data, settings.dataloader_num_workers, False) for stage in dataset.stages],
+    return RunDataloaders(
+        train_sources=[entry.prefix for entry in dataset.train_sources],
+        train_loaders=[loader([entry], TRAIN_LOADER_NUM_WORKERS, False) for entry in dataset.train_sources],
         val_loaders=[loader(stage.val_data, 0, True) for stage in dataset.stages],
         tokenizer=tokenizer,
     )
-
-
-def sample_stage_batch(
-    stage_loaders: StageDataloaders,
-    stage_idx: int,
-    prev_stage_idx: int | None,
-    transition_progress: float,
-    rng: random.Random,
-) -> WorkerBatch:
-    """Worker batch for the current step: from ``stage_idx`` with probability ``transition_progress``, else from the
-    previous stage. Outside a transition (``prev_stage_idx`` is None) always from ``stage_idx``."""
-    if prev_stage_idx is not None and rng.random() >= transition_progress:
-        return stage_loaders.next_train_batch(prev_stage_idx)
-    return stage_loaders.next_train_batch(stage_idx)
 
 
 def sample_length(sample: Sample) -> int:

@@ -253,9 +253,13 @@ at most `truncated_at_tokens` long; the build clamps the stored counts, training
 
 ### Sequences, not tokens (`lib/build/planner.py`)
 
-The trainer draws **rows** from a source with the stage weight and pads or truncates every row to `block_size`
-(no packing), so a stage consumes `stage.tokens × weight ÷ block_size` rows of a source. That is the planner's
-unit, the **sequence budget** (maximised over the stages, since the folders are shared):
+The trainer draws **rows** from one continuous reader per source, one draw per sample, weighted by the stage
+schedule (the stage's constant weight, linearly interpolated across a transition window), and pads or truncates
+every row to `block_size` (no packing). The run therefore consumes the integral of a source's weight schedule over
+the stage token budgets, ÷ `block_size`. That is the planner's unit, the **sequence budget**: stages sharing a
+source ADD UP (the reader continues across stage boundaries instead of re-reading), each stage contributing
+`(tokens − transition tokens) × weight` plus the trapezoid `transition tokens × (weight + next stage's weight) / 2`
+for the window at its end:
 
 ```
 rows_needed(source)     = ceil(sequence_budget × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train

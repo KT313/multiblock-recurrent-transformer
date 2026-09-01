@@ -25,10 +25,12 @@ run is one entry with `transition_pct: 0.0`.
 ## Transitions
 
 Instead of switching datasets abruptly at a stage boundary, the last
-`transition_pct` of a stage gradually shifts sampling from the current stage's
-dataloader to the next stage's: every micro-batch is drawn from the next stage
-with probability equal to the transition progress (0→1, linear). The learning
-rate interpolates linearly between the two stages' base LRs over the same window.
+`transition_pct` of a stage gradually shifts the sampling weights: every source
+is read by one continuous reader for the whole run, each sample's source is
+drawn with the current stage's weights, and inside the window those weights are
+interpolated linearly between the two stages' (a source leaving ramps to 0, one
+entering ramps from 0; the transition progress runs 0→1). The learning rate
+interpolates linearly between the two stages' base LRs over the same window.
 
 Global `warmup_steps` apply at the start of the first stage and
 `cooldown_steps` at the end of the last; within a stage the configured

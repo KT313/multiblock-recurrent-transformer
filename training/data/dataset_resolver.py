@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Turn a run's `dataset_config` into what the training loop consumes: verified (or auto-prepared) data
-directories per stage with their row ranges, the tokenizer path and the stage token budgets for `StageManager`.
+"""Turn a run's `dataset_config` into what the training loop consumes: one verified (or auto-prepared) data
+directory per TRAIN SOURCE with its row range (read once, continuously, for the whole run), the per-stage
+validation entries and sampling weights, the tokenizer path and the stage token budgets for `StageManager`.
 
 The validation split is decided here, once per source and run, never by the data pipeline: a source used only for
 training is read whole, a source used only for validation is read whole as validation, and a source used for both
@@ -9,8 +10,10 @@ and trains on the rest. Rows are counted from the parquet footers of `processed/
 the manifest; the same source gets the same split in every stage. The chosen `validation_rows` per source travel
 with every checkpoint next to `dataset_config_hash` and are verified on resume (`check_dataset_unchanged`).
 The split is also checked against what the loaders and evaluation need: a stage whose validation loader cannot fill
-one micro-batch (`check_validation_batches`) and an entry with fewer rows than its loader has worker shards
-(`check_entry_shards`) fail here, at setup, instead of at the first evaluation step or mid-training in a worker.
+one micro-batch (`check_validation_batches`), a train source or validation entry whose range is empty
+(`check_entries_on_disk` — what makes the stream's restart-on-exhaustion safe) and an entry with fewer rows than
+its loader has worker shards (`check_entry_shards`) fail here, at setup, instead of at the first evaluation step or
+mid-training in a worker.
 
 Framework-neutral apart from `data_preparation.*` (manifests, parquet footers); no torch. The only cross-over
 between the run config and the dataset config happens here.
@@ -20,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from math import ceil
@@ -50,11 +53,17 @@ INSTRUCT_DATA_SIGNATURE: dict[str, Any] = {
 Part = Literal["train", "val"]
 
 
+TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting (the
+# old per-stage-mixture loaders had a worker-count knob; per-source readers make it dead)
+
+
 @dataclass
 class DataEntry:
-    """One parquet dataset directory inside a stage mixture, with the row range the loader reads from it."""
+    """One parquet dataset directory with the row range its loader reads: a run-wide train source
+    (`ResolvedDataset.train_sources`, prefix = the source name) or a member of a stage's validation mixture
+    (`ResolvedStage.val_data`, prefix = `<stage>-<source>`)."""
 
-    prefix: str  # unique name within its stage, used for logging
+    prefix: str  # unique name within its list, used for logging (train: the data_id of `data_composition/...`)
     data_dir: str  # directory with *.parquet files
     weight: float = 1.0  # sampling weight relative to the other entries of the same stage
     data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
@@ -74,13 +83,15 @@ class _MainRankBarrier(Protocol):
 
 @dataclass
 class ResolvedStage:
-    """One training stage with its data directories (and row ranges) resolved on disk."""
+    """One training stage: its sampling weights over the run-wide train sources (`ResolvedDataset.train_sources`)
+    and its validation entries resolved on disk. The stage structure changes the WEIGHTS only — the train readers
+    themselves run once per source for the whole run."""
 
     name: str
     tokens: int
     base_lr: float
     transition_pct: float
-    train_data: list[DataEntry]
+    train_weights: dict[str, float]  # source name -> sampling weight (the dataset config's `stage.train`, sum 1)
     val_data: list[DataEntry]
 
 
@@ -90,13 +101,22 @@ class ResolvedDataset:
     config_hash: str
     tokenizer_dir: str
     stages: list[ResolvedStage]
+    train_sources: list[DataEntry]  # one entry per source any stage trains on, in dataset-config order; each is
+    # read by ONE loader for the whole run (rows validation_rows -> end), so stages sharing a source never re-read
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
 
     def training_stages(self) -> list[TrainingStage]:
-        """The stages as `training.stage_manager.StageManager` takes them: name, token budget, base LR and transition
-        length per stage (the data entries stay here; the manager never reads them)."""
+        """The stages as `training.stage_manager.StageManager` takes them: name, token budget, base LR, transition
+        length and train weights per stage (the manager interpolates the weights per step in `data_weights`; the
+        data entries stay here, it never reads them)."""
         return [
-            TrainingStage(name=stage.name, tokens=stage.tokens, base_lr=stage.base_lr, transition_pct=stage.transition_pct)
+            TrainingStage(
+                name=stage.name,
+                tokens=stage.tokens,
+                base_lr=stage.base_lr,
+                transition_pct=stage.transition_pct,
+                train_weights=dict(stage.train_weights),
+            )
             for stage in self.stages
         ]
 
@@ -174,16 +194,15 @@ def resolve_splits(dataset_config: DatasetConfig, layout: DatasetLayout) -> dict
     return splits
 
 
-# --- stage keys -> data entries -------------------------------------------------------------------------------------
+# --- sources and stage keys -> data entries ---------------------------------------------------------------------------
 
 
 def _data_entry(
-    dataset_config: DatasetConfig, layout: DatasetLayout, stage_name: str, key: str, weight: float, part: Part, validation_rows: int
+    dataset_config: DatasetConfig, layout: DatasetLayout, key: str, prefix: str, weight: float, part: Part, validation_rows: int
 ) -> DataEntry:
-    """The `DataEntry` for one stage key (a source name): its `processed/<source>` folder, read through the text
-    column (pretrain) or the instruction/input/output signature (instruct), restricted to the validation rows
+    """The `DataEntry` for one source name `key`: its `processed/<source>` folder, read through the text column
+    (pretrain) or the instruction/input/output signature (instruct), restricted to the validation rows
     `[0, validation_rows)` (part `val`) or the training rows from `validation_rows` on (part `train`)."""
-    prefix = f"{stage_name}-{key}"
     signature = dict(INSTRUCT_DATA_SIGNATURE) if dataset_config.sources[key].kind == "instruct" else None
     skip_rows, max_rows = (0, validation_rows) if part == "val" else (validation_rows, None)
     return DataEntry(
@@ -196,35 +215,39 @@ def _data_entry(
     )
 
 
-def _entries(
-    dataset_config: DatasetConfig,
-    layout: DatasetLayout,
-    stage_name: str,
-    keys: dict[str, float],
-    part: Part,
-    validation_rows: Mapping[str, int],
+def resolve_train_sources(
+    dataset_config: DatasetConfig, layout: DatasetLayout, validation_rows: Mapping[str, int]
 ) -> list[DataEntry]:
-    entries = [_data_entry(dataset_config, layout, stage_name, key, weight, part, validation_rows[key]) for key, weight in keys.items()]
+    """One `DataEntry` per source any stage trains on, in dataset-config order — the deterministic order the
+    stream draws over and the loaders are built in.
+
+    Each entry is read by ONE loader, continuously, for the whole run (the stage structure only changes sampling
+    weights), so consecutive stages sharing a source never re-read its rows. The prefix is the plain source name:
+    the key of the stream's consumed-row counters (`data_stream` in a checkpoint) and of `data_composition/...`
+    logging. The range starts after the validation holdout (`validation_rows[name]`, see `resolve_splits`) and
+    runs to the end of the folder. Pure path arithmetic, no I/O.
+    """
+    return [
+        _data_entry(dataset_config, layout, name, name, 1.0, "train", validation_rows[name])
+        for name in dataset_config.sources
+        if dataset_config.used_in_train(name)
+    ]
+
+
+def resolve_val_entries(
+    dataset_config: DatasetConfig, layout: DatasetLayout, stage: StageConfig, validation_rows: Mapping[str, int]
+) -> list[DataEntry]:
+    """The `val_data` of one dataset-config stage: every `stage.val` key with its weight, reading the held-out
+    validation rows `[0, validation_rows[name])` of `processed/<name>`. Prefixes are `<stage>-<key>` and unique
+    per stage. Pure path arithmetic, no I/O."""
+    entries = [
+        _data_entry(dataset_config, layout, key, f"{stage.name}-{key}", weight, "val", validation_rows[key])
+        for key, weight in stage.val.items()
+    ]
     prefixes = [entry.prefix for entry in entries]
     if len(set(prefixes)) != len(prefixes):
-        raise ValueError(f"stage {stage_name}: duplicate data entry prefixes in {prefixes}")
+        raise ValueError(f"stage {stage.name}: duplicate data entry prefixes in {prefixes}")
     return entries
-
-
-def resolve_entries(
-    dataset_config: DatasetConfig, layout: DatasetLayout, stage: StageConfig, validation_rows: Mapping[str, int]
-) -> tuple[list[DataEntry], list[DataEntry]]:
-    """`(train_data, val_data)` of one dataset-config stage.
-
-    Every stage key is a source name and maps to `processed/<name>`; pretrain sources read the `text` column,
-    instruct sources use the instruction/input/output signature. `validation_rows[name]` (see `resolve_splits`)
-    gives the row range: validation entries read rows `[0, validation_rows)`, training entries the rows from
-    `validation_rows` to the end. Prefixes are `<stage>-<key>` and unique per stage. Pure path arithmetic, no I/O.
-    """
-    return (
-        _entries(dataset_config, layout, stage.name, stage.train, "train", validation_rows),
-        _entries(dataset_config, layout, stage.name, stage.val, "val", validation_rows),
-    )
 
 
 def entry_rows_in_range(entry: DataEntry, total_rows: int) -> int:
@@ -235,25 +258,36 @@ def entry_rows_in_range(entry: DataEntry, total_rows: int) -> int:
     return stop - start
 
 
-def check_entries_on_disk(stages: list[ResolvedStage]) -> None:
+def _labeled_entries(train_sources: list[DataEntry], stages: list[ResolvedStage]) -> Iterator[tuple[str, Part, DataEntry]]:
+    """Every data entry of a run with its error label: the run-wide train sources, then each stage's validation
+    entries."""
+    for entry in train_sources:
+        yield f"train source {entry.prefix!r}", "train", entry
+    for stage in stages:
+        for entry in stage.val_data:
+            yield f"stage {stage.name!r} val entry {entry.prefix!r}", "val", entry
+
+
+def check_entries_on_disk(train_sources: list[DataEntry], stages: list[ResolvedStage]) -> None:
     """Direct filesystem check of every data entry, independent of manifests and of the planner: the directory
     exists, holds at least one `data-*.parquet` shard, and the entry's row range (clipped to the rows on disk as
-    `ParquetTextDataset` clips it) contains at least one row. Errors name the stage, the part, the entry
-    (`<stage>-<source>`) and the folder."""
+    `ParquetTextDataset` clips it) contains at least one row. Errors name the entry (a train source, or a stage's
+    `<stage>-<source>` validation entry) and the folder.
+
+    The at-least-one-row guarantee for the train sources is what makes the stream's restart-on-exhaustion safe:
+    a source that runs dry mid-run is restarted (`RunDataloaders.next_train_batch`), which would spin forever on
+    an empty range — impossible after this check."""
     rows_cache: dict[str, int] = {}
-    for stage in stages:
-        for part, entries in (("train", stage.train_data), ("val", stage.val_data)):
-            for entry in entries:
-                what = f"stage {stage.name!r} {part} entry {entry.prefix!r}"
-                if entry.data_dir not in rows_cache:
-                    rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
-                total = rows_cache[entry.data_dir]
-                if entry_rows_in_range(entry, total) <= 0:
-                    end = "end" if entry.max_rows is None else str(entry.skip_rows + entry.max_rows)
-                    raise RuntimeError(
-                        f"{what}: row range [{entry.skip_rows}, {end}) of {entry.data_dir} is empty ({total} rows on "
-                        f"disk); the {'validation' if part == 'val' else 'training'} part of the split has no row"
-                    )
+    for what, part, entry in _labeled_entries(train_sources, stages):
+        if entry.data_dir not in rows_cache:
+            rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
+        total = rows_cache[entry.data_dir]
+        if entry_rows_in_range(entry, total) <= 0:
+            end = "end" if entry.max_rows is None else str(entry.skip_rows + entry.max_rows)
+            raise RuntimeError(
+                f"{what}: row range [{entry.skip_rows}, {end}) of {entry.data_dir} is empty ({total} rows on "
+                f"disk); the {'validation' if part == 'val' else 'training'} part of the split has no row"
+            )
 
 
 def loader_shards(num_workers: int, world_size: int) -> int:
@@ -262,44 +296,34 @@ def loader_shards(num_workers: int, world_size: int) -> int:
     return world_size * max(num_workers, 1)
 
 
-def check_entry_shards(stages: list[ResolvedStage], dataloader_num_workers: int, world_size: int = 1) -> None:
-    """Fail at setup when a data entry has fewer rows than the loader has shards.
+def check_entry_shards(train_sources: list[DataEntry], stages: list[ResolvedStage], world_size: int = 1) -> None:
+    """Fail at setup when a data entry has fewer rows than its loader has shards.
 
-    `ParquetTextDataset` deals the rows of an entry's range round-robin over `world_size × num_workers` shards, so a
-    shard is empty as soon as the range holds fewer rows than there are shards. An empty member of a
-    `WeightedMixtureDataset` is fatal mid-run: the mixture restarts a member that runs out and immediately gets a
-    second `StopIteration` from the empty shard, which Python turns into a `RuntimeError` inside the worker and kills
-    the training run. Checked for the train entries (`dataloader_num_workers`) and the validation entries (built with
-    `num_workers=0`, so one shard per rank) alike; the error names the entry, its folder, its row count and the
-    worker count.
+    `ParquetTextDataset` deals the rows of an entry's range round-robin over `world_size × num_workers` shards, so
+    a shard is empty as soon as the range holds fewer rows than there are shards — fatal mid-run: the restart of an
+    exhausted loader (train) or mixture member (validation) immediately gets a second `StopIteration` from the
+    empty shard, which Python turns into a `RuntimeError` and kills the training run. Train loaders run one worker
+    per source (`TRAIN_LOADER_NUM_WORKERS`) and validation loaders in-process, so both have `world_size` shards:
+    with one device this reduces to the at-least-one-row guarantee `check_entries_on_disk` already gives, and only
+    a larger world can starve a shard. The error names the entry, its folder, its row count and the shard count.
     """
     rows_cache: dict[str, int] = {}
-    for stage in stages:
-        for part, entries, num_workers in (
-            ("train", stage.train_data, dataloader_num_workers),
-            ("val", stage.val_data, 0),
-        ):
-            shards = loader_shards(num_workers, world_size)
-            if shards <= 1:  # a single in-process shard reads the whole range; nothing to split
-                continue
-            for entry in entries:
-                what = f"stage {stage.name!r} {part} entry {entry.prefix!r}"
-                if entry.data_dir not in rows_cache:
-                    rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
-                rows = entry_rows_in_range(entry, rows_cache[entry.data_dir])
-                if rows >= shards:
-                    continue
-                ranks = f" × world size {world_size}" if world_size > 1 else ""
-                fix = (
-                    f"Lower dataloader_num_workers to at most {rows}, or give the source more rows"
-                    if num_workers > 0
-                    else "Give the source more rows, or lower the world size"
-                )
-                raise ValueError(
-                    f"{what}: {entry.data_dir} gives it {rows} row(s) after the validation split, but its loader "
-                    f"deals the rows round-robin over {shards} shards ({num_workers} dataloader worker(s){ranks}), "
-                    f"so {shards - rows} shard(s) would be empty and the run would fail during training. {fix}"
-                )
+    for what, part, entry in _labeled_entries(train_sources, stages):
+        num_workers = TRAIN_LOADER_NUM_WORKERS if part == "train" else 0
+        shards = loader_shards(num_workers, world_size)
+        if shards <= 1:  # a single shard reads the whole range; nothing to split
+            continue
+        if entry.data_dir not in rows_cache:
+            rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
+        rows = entry_rows_in_range(entry, rows_cache[entry.data_dir])
+        if rows >= shards:
+            continue
+        raise ValueError(
+            f"{what}: {entry.data_dir} gives it {rows} row(s) after the validation split, but its loader "
+            f"deals the rows round-robin over {shards} shards ({num_workers} dataloader worker(s) × world size "
+            f"{world_size}), so {shards - rows} shard(s) would be empty and the run would fail during training. "
+            "Give the source more rows, or lower the world size"
+        )
 
 
 def validation_batches_available(entries: list[DataEntry], micro_batch_size: int, world_size: int) -> int | None:
@@ -464,28 +488,29 @@ def resolve_dataset(
     _ensure_prepared(settings, dataset_config, layout, backend, should_stop)
     validation_rows = resolve_splits(dataset_config, layout)
 
+    train_sources = resolve_train_sources(dataset_config, layout, validation_rows)
     stages: list[ResolvedStage] = []
     for stage, base_lr in zip(dataset_config.stages, settings.stage_base_lrs):
-        train_data, val_data = resolve_entries(dataset_config, layout, stage, validation_rows)
         stages.append(
             ResolvedStage(
                 name=stage.name,
                 tokens=stage.tokens,
                 base_lr=base_lr,
                 transition_pct=stage.transition_pct,
-                train_data=train_data,
-                val_data=val_data,
+                train_weights=dict(stage.train),
+                val_data=resolve_val_entries(dataset_config, layout, stage, validation_rows),
             )
         )
     world_size = 1 if backend is None else backend.world_size
-    check_entries_on_disk(stages)
-    check_entry_shards(stages, settings.dataloader_num_workers, world_size)
+    check_entries_on_disk(train_sources, stages)
+    check_entry_shards(train_sources, stages, world_size)
     check_validation_batches(stages, settings.micro_batch_size, settings.eval_iters, world_size)
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),
         tokenizer_dir=str(layout.tokenizer_dir(dataset_config.tokenizer.name)),
         stages=stages,
+        train_sources=train_sources,
         validation_rows=validation_rows,
     )
 
@@ -531,6 +556,7 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
 
 __all__ = [
     "INSTRUCT_DATA_SIGNATURE",
+    "TRAIN_LOADER_NUM_WORKERS",
     "DataEntry",
     "ResolvedDataset",
     "ResolvedStage",
@@ -543,8 +569,9 @@ __all__ = [
     "loader_shards",
     "processed_rows",
     "resolve_dataset",
-    "resolve_entries",
     "resolve_splits",
+    "resolve_train_sources",
+    "resolve_val_entries",
     "validate_settings",
     "validation_batches_available",
     "validation_rows_of",
