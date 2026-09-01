@@ -5,9 +5,10 @@ with it, so the documentation of the thesis mixture cannot drift from ``config/d
 Pure function of the config file: tokenizer, sequence length and processing defaults, one table per stage (weights,
 derived token budgets and sequence counts), the validation split per source and the source registry. The leading
 comment block of the YAML file (the lines starting with ``#`` before the first key) is rendered as the "Notes"
-section, so config-specific remarks live next to the config. Sequence counts are the planner's arithmetic
-(``DatasetConfig.sequence_budget``); tokens are ``stage.tokens × weight``; the rows-per-stage column is an estimate
-from ``describe_tokens_per_row`` (which nothing else uses).
+section, so config-specific remarks live next to the config. Per-source budgets are the planner's arithmetic
+(``DatasetConfig.sequence_budget``: the integral of the weight schedule over the run); the per-stage tables show
+``stage.tokens × weight``; the rows-per-stage column is an estimate from ``describe_tokens_per_row`` (which
+nothing else uses).
 """
 
 from __future__ import annotations

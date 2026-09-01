@@ -38,8 +38,10 @@ def test_tiny_snippets_and_determinism() -> None:
     assert EXPECTED_TINY_STAGE in text and EXPECTED_TINY_SPLIT in text
     assert "### Stage 3: `finetune` (4.1K tokens, transition 0%)" in text
     assert "| `synthetic_instruct` | 100.00% | 4.1K | 16 | 64 | 1.0K |" in text
-    assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 16 sequences (4.1K tokens), input inversions 10%, shuffled (seed 2) |" in text
-    assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 32 sequences (8.2K tokens) |" in text
+    # budgets are the run-total weight-schedule integral: instruct ramps in over pretrain_b's transition window
+    # (8192 × 0.25 / 2 + 4096 = 5120 tokens), pretrain ramps out over it (8192 + 8192 × 0.875 = 15360 tokens)
+    assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 20 sequences (5.1K tokens), input inversions 10%, shuffled (seed 2) |" in text
+    assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 60 sequences (15.4K tokens) |" in text
     assert "- tokenizer: `synthetic` (synthetic)" in text and "- `token_count`: `tokenizer`" in text
     assert "- `block_size`: 256" in text and "- `validation_fraction`: 5%" in text
     assert "- dedup: `exact` (normalize: on, Bloom filter 1 MB per source)" in text and "- quality filter: off" in text
@@ -66,9 +68,10 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
         assert src.revision is not None and src.revision[:12] in text
     for stage in cfg.stages:
         assert f"`{stage.name}`" in text
-    # per-source budgets shown in the source table are the planner's sequence budgets (max over stages, not the sum)
+    # per-source budgets shown in the source table are the planner's sequence budgets: the integral of the weight
+    # schedule over the whole run (stages sharing a source add up, transition windows count as trapezoids)
     budget = cfg.sequence_budget("fineweb_edu")
-    assert budget == ceil(3_300_000_000 * 0.65 / 2048)
+    assert budget == ceil(2_594_250_000 / 2048) == 1_266_724
     assert f"budget {budget:,} sequences ({_tokens(budget * 2048)} tokens)" in text
     assert f"| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | {_tokens(1_047_364 * 2000)} |" in text  # 2000 tokens/row of 2048
     # the finetune stage renders like the others: eight instruct sources with their shares

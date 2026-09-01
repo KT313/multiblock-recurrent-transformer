@@ -1,8 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Planner: what a dataset config needs on disk versus what the manifests say is there, counted in **sequences**.
 
-The trainer draws *rows* from a source with the stage weight and pads or truncates every row to ``block_size``, so a
-stage consumes ``stage.tokens × weight ÷ block_size`` rows of a source — its :meth:`DatasetConfig.sequence_budget`.
+The trainer draws *rows* from one continuous stream per source with the stage weight (linearly interpolated across
+a transition window) and pads or truncates every row to ``block_size``, so the run consumes the integral of the
+source's weight schedule over the stage token budgets, ÷ ``block_size`` — its :meth:`DatasetConfig.sequence_budget`
+(each stage adds ``(tokens − transition tokens) × weight`` plus the trapezoid ``transition tokens × (weight +
+next stage's weight) / 2``; the 1.2 safety margin comes on top).
 That is the planner's unit: :func:`rows_needed` turns it into a download target and :func:`rows_sufficient` into the
 processed rows that serve it. There is no tokens-per-row estimate anywhere in this arithmetic: a source whose rows
 are shorter than ``block_size`` is no longer over-downloaded, and the realised **token** mix of a stage is
@@ -318,7 +321,7 @@ class SourceLedger:
     kind: str
     rows_needed: int  # raw rows to download (:func:`rows_needed`)
     rows_sufficient: int  # processed rows that serve the budget (:func:`rows_sufficient`)
-    sequence_budget: int  # sequences the largest stage draws (0 when the source is not trained on)
+    sequence_budget: int  # sequences the whole run draws (weight-schedule integral; 0 when the source is not trained on)
     raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated"
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
     exhausted: bool  # the loader has nothing more to give (:func:`raw_is_exhausted`)
@@ -433,8 +436,8 @@ class SourceLedger:
         return f"processed rows {self.processed_rows:,} < {self.rows_sufficient:,}"
 
     def epochs(self) -> float | None:
-        """How often the trainer cycles this source's training rows to serve its sequence budget (the largest
-        single-stage demand); None while it is not satisfied, for a source it does not train on, or without rows."""
+        """How often the trainer cycles this source's training rows to serve its sequence budget (the run's total
+        demand over all stages); None while it is not satisfied, for a source it does not train on, or without rows."""
         if not self.satisfaction().satisfied or self.sequence_budget <= 0 or self.training_rows <= 0:
             return None
         return self.sequence_budget / self.training_rows

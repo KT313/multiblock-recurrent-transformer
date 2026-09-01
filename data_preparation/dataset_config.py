@@ -485,15 +485,27 @@ class DatasetConfig:
     # --- budgets ---------------------------------------------------------------------------------------------------
 
     def sequence_budget(self, source_name: str) -> int:
-        """Sequences (rows padded / truncated to ``block_size``) a stage draws from the source, maximised over the
-        stages (folders are shared between stages, so max, not sum): ``ceil(stage.tokens × train weight ÷
-        block_size)``; 0 for a source not used in training."""
-        budget = 0
-        for stage in self.stages:
-            weight = stage.train.get(source_name, 0.0)
-            if weight:
-                budget = max(budget, ceil(stage.tokens * weight / self.block_size))
-        return budget
+        """Sequences (rows padded / truncated to ``block_size``) the whole run draws from the source: the integral
+        of its sampling-weight schedule over the stage token budgets, rounded up.
+
+        The trainer reads every source as ONE continuous stream for the whole run — a stage does not restart the
+        source, it only changes the sampling weight — so stages sharing a source add up instead of overlapping.
+        Each stage contributes its plain part ``(tokens − transition tokens) × weight`` plus, for the transition
+        window at its end (``transition tokens = tokens × transition_pct``; none after the last stage), the
+        trapezoid ``transition tokens × (weight + next stage's weight) / 2`` of the linear weight interpolation.
+        Exact arithmetic from the config's own numbers (the YAML decimals as `Fraction`); 0 for a source not used
+        in training.
+        """
+        total = Fraction(0)
+        for stage, next_stage in zip(self.stages, [*self.stages[1:], None]):
+            weight = Fraction(str(stage.train.get(source_name, 0.0)))
+            if next_stage is None:
+                total += stage.tokens * weight
+                continue
+            transition = Fraction(str(stage.transition_pct)) * stage.tokens
+            next_weight = Fraction(str(next_stage.train.get(source_name, 0.0)))
+            total += (stage.tokens - transition) * weight + transition * (weight + next_weight) / 2
+        return ceil(total / self.block_size)
 
     def rows_needed(self, source_name: str) -> int:
         """Raw rows to download for the source — THE definition of the planner's row requirement

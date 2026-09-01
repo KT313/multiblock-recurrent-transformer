@@ -150,30 +150,30 @@ for validation is all validation rows (`rows` says how many are downloaded), one
 
 | Source | Kind | Loader | Origin | Revision | Details |
 |---|---|---|---|---|---|
-| `fineweb_edu` | pretrain | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=data/CC-MAIN-2013-20/*.parquet | `87f09149ef47` | budget 1,047,364 sequences (2.15B tokens) |
-| `wikipedia` | pretrain | `hf_files` | `wikimedia/wikipedia` data_files=20231101.en/*.parquet | `b04c8d1ceb2f` | budget 145,020 sequences (297.0M tokens) |
-| `books_gutenberg` | pretrain | `hf_files` | `sedthh/gutenberg_english` data_files=data/*.parquet | `28973b04f28f` | text_field `TEXT`, budget 96,680 sequences (198.0M tokens) |
-| `peso` | pretrain | `hf_files` | `nampdn-ai/mini-peS2o` data_files=train-*.parquet | `18a60ef8d79f` | budget 65,918 sequences (135.0M tokens) |
-| `arxiv` | pretrain | `hf_files` | `common-pile/arxiv_papers_filtered` data_files=arxiv-papers-*.json.gz | `033cf7f53f9b` | budget 43,946 sequences (90.0M tokens) |
-| `openwebmath` | pretrain | `hf_files` | `open-web-math/open-web-math` data_files=data/*.parquet | `fde8ef8de230` | budget 64,454 sequences (132.0M tokens) |
-| `tinygsm` | pretrain | `hf_files` | `ostapeno/tinygsm-mind` data_files=data/*.parquet | `f5ecf416b715` | budget 48,340 sequences (99.0M tokens) |
-| `algebraic_stack` | pretrain | `hf_files` | `EleutherAI/proof-pile-2` data_files=algebraic-stack/train/*.jsonl.zst | `901a9273a770` | budget 32,227 sequences (66.0M tokens) |
-| `gsm8k` | pretrain | `hf_split` | `openai/gsm8k` name=main | `740312add88f` | converter `gsm8k_question_answer`, budget 16,114 sequences (33.0M tokens) |
-| `github_code_clean_python` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Python, text_field `code`, budget 61,524 sequences (126.0M tokens) |
-| `github_code_clean_javascript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language JavaScript, text_field `code`, budget 41,016 sequences (84.0M tokens) |
-| `github_code_clean_typescript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language TypeScript, text_field `code`, budget 20,508 sequences (42.0M tokens) |
-| `github_code_clean_java` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Java, text_field `code`, budget 20,508 sequences (42.0M tokens) |
-| `github_code_clean_cpp` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language C++, text_field `code`, budget 16,407 sequences (33.6M tokens) |
-| `github_code_clean_go` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language GO, text_field `code`, budget 14,356 sequences (29.4M tokens) |
-| `github_code_clean_rust` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Rust, text_field `code`, budget 10,254 sequences (21.0M tokens) |
-| `github_code_clean_shell` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Shell, text_field `code`, budget 8,204 sequences (16.8M tokens) |
-| `github_code_clean_sql` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language SQL, text_field `code`, budget 6,153 sequences (12.6M tokens) |
-| `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 6,153 sequences (12.6M tokens) |
-| `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets`, budget 29,297 sequences (60.0M tokens), input inversions 5%, shuffled (seed 42) |
-| `metamath` | instruct | `hf_files` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response`, budget 10,987 sequences (22.5M tokens), input inversions 5%, shuffled (seed 42) |
-| `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer`, budget 7,325 sequences (15.0M tokens), input inversions 5%, shuffled (seed 42) |
-| `evol_code` | instruct | `hf_files` | `nickrosh/Evol-Instruct-Code-80k-v1` data_files=EvolInstruct-Code-80k.json | `3ae930c20d54` | fields instruction←`instruction`, output←`output`, budget 9,156 sequences (18.8M tokens), input inversions 5%, shuffled (seed 42) |
-| `code_alpaca` | instruct | `hf_files` | `sahil2801/CodeAlpaca-20k` data_files=code_alpaca_20k.json | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output`, budget 1,832 sequences (3.8M tokens), input inversions 5%, shuffled (seed 42) |
-| `slimorca` | instruct | `hf_files` | `Open-Orca/SlimOrca-Dedup` data_files=data/*.parquet | `bd7d445aa1ff` | converter `sharegpt_conversations`, budget 7,325 sequences (15.0M tokens), input inversions 5%, shuffled (seed 42) |
-| `sharegpt` | instruct | `hf_files` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000, budget 3,663 sequences (7.5M tokens), input inversions 5%, shuffled (seed 42) |
-| `wizardlm` | instruct | `hf_files` | `WizardLM/WizardLM_evol_instruct_V2_196k` data_files=WizardLM_evol_instruct_V2_143k.json | `8a7d15a83028` | converter `first_two_turns`, budget 3,663 sequences (7.5M tokens), input inversions 5%, shuffled (seed 42) |
+| `fineweb_edu` | pretrain | `hf_files` | `HuggingFaceFW/fineweb-edu` data_files=data/CC-MAIN-2013-20/*.parquet | `87f09149ef47` | budget 1,266,724 sequences (2.59B tokens) |
+| `wikipedia` | pretrain | `hf_files` | `wikimedia/wikipedia` data_files=20231101.en/*.parquet | `b04c8d1ceb2f` | budget 137,769 sequences (282.2M tokens) |
+| `books_gutenberg` | pretrain | `hf_files` | `sedthh/gutenberg_english` data_files=data/*.parquet | `28973b04f28f` | text_field `TEXT`, budget 91,846 sequences (188.1M tokens) |
+| `peso` | pretrain | `hf_files` | `nampdn-ai/mini-peS2o` data_files=train-*.parquet | `18a60ef8d79f` | budget 115,796 sequences (237.2M tokens) |
+| `arxiv` | pretrain | `hf_files` | `common-pile/arxiv_papers_filtered` data_files=arxiv-papers-*.json.gz | `033cf7f53f9b` | budget 77,198 sequences (158.1M tokens) |
+| `openwebmath` | pretrain | `hf_files` | `open-web-math/open-web-math` data_files=data/*.parquet | `fde8ef8de230` | budget 114,244 sequences (234.0M tokens) |
+| `tinygsm` | pretrain | `hf_files` | `ostapeno/tinygsm-mind` data_files=data/*.parquet | `f5ecf416b715` | budget 51,241 sequences (104.9M tokens) |
+| `algebraic_stack` | pretrain | `hf_files` | `EleutherAI/proof-pile-2` data_files=algebraic-stack/train/*.jsonl.zst | `901a9273a770` | budget 34,161 sequences (70.0M tokens) |
+| `gsm8k` | pretrain | `hf_split` | `openai/gsm8k` name=main | `740312add88f` | converter `gsm8k_question_answer`, budget 17,081 sequences (35.0M tokens) |
+| `github_code_clean_python` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Python, text_field `code`, budget 120,323 sequences (246.4M tokens) |
+| `github_code_clean_javascript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language JavaScript, text_field `code`, budget 80,215 sequences (164.3M tokens) |
+| `github_code_clean_typescript` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language TypeScript, text_field `code`, budget 40,108 sequences (82.1M tokens) |
+| `github_code_clean_java` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Java, text_field `code`, budget 40,108 sequences (82.1M tokens) |
+| `github_code_clean_cpp` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language C++, text_field `code`, budget 32,086 sequences (65.7M tokens) |
+| `github_code_clean_go` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language GO, text_field `code`, budget 28,076 sequences (57.5M tokens) |
+| `github_code_clean_rust` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Rust, text_field `code`, budget 20,054 sequences (41.1M tokens) |
+| `github_code_clean_shell` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language Shell, text_field `code`, budget 16,043 sequences (32.9M tokens) |
+| `github_code_clean_sql` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language SQL, text_field `code`, budget 12,033 sequences (24.6M tokens) |
+| `github_code_clean_html` | pretrain | `github_code` | `codeparrot/github-code-clean` | `c48d40f9e70f` | language HTML, text_field `code`, budget 12,033 sequences (24.6M tokens) |
+| `flan` | instruct | `hf_files` | `Open-Orca/FLAN` data_files=flan_zsopt_data/*.parquet | `6845b1b3b53c` | fields instruction←`inputs`, output←`targets`, budget 43,946 sequences (90.0M tokens), input inversions 5%, shuffled (seed 42) |
+| `metamath` | instruct | `hf_files` | `meta-math/MetaMathQA` data_files=MetaMathQA-395K.json | `aa4f34d3d2d3` | fields instruction←`query`, output←`response`, budget 16,480 sequences (33.8M tokens), input inversions 5%, shuffled (seed 42) |
+| `orca_math` | instruct | `hf_files` | `microsoft/orca-math-word-problems-200k` data_files=data/*.parquet | `29255d1770cc` | fields instruction←`question`, output←`answer`, budget 10,987 sequences (22.5M tokens), input inversions 5%, shuffled (seed 42) |
+| `evol_code` | instruct | `hf_files` | `nickrosh/Evol-Instruct-Code-80k-v1` data_files=EvolInstruct-Code-80k.json | `3ae930c20d54` | fields instruction←`instruction`, output←`output`, budget 13,733 sequences (28.1M tokens), input inversions 5%, shuffled (seed 42) |
+| `code_alpaca` | instruct | `hf_files` | `sahil2801/CodeAlpaca-20k` data_files=code_alpaca_20k.json | `152bb5e9a296` | fields instruction←`instruction`, input←`input`, output←`output`, budget 2,747 sequences (5.6M tokens), input inversions 5%, shuffled (seed 42) |
+| `slimorca` | instruct | `hf_files` | `Open-Orca/SlimOrca-Dedup` data_files=data/*.parquet | `bd7d445aa1ff` | converter `sharegpt_conversations`, budget 10,987 sequences (22.5M tokens), input inversions 5%, shuffled (seed 42) |
+| `sharegpt` | instruct | `hf_files` | `anon8231489123/ShareGPT_Vicuna_unfiltered` data_files=ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json | `192ab2185289` | converter `sharegpt_conversations`, filter `sharegpt_quality`, check_limit 100,000, budget 5,494 sequences (11.3M tokens), input inversions 5%, shuffled (seed 42) |
+| `wizardlm` | instruct | `hf_files` | `WizardLM/WizardLM_evol_instruct_V2_196k` data_files=WizardLM_evol_instruct_V2_143k.json | `8a7d15a83028` | converter `first_two_turns`, budget 5,494 sequences (11.3M tokens), input inversions 5%, shuffled (seed 42) |

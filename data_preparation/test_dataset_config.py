@@ -9,6 +9,7 @@ import dataclasses
 import re
 from collections.abc import Callable
 from dataclasses import asdict, fields
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -341,26 +342,41 @@ def test_validation_fraction_of() -> None:
     assert cfg.validation_fraction_of("hold") == 0.0 and cfg.validation_fraction_of("only_train") == 0.0
 
 
-def test_sequence_budget_is_the_max_over_stages_in_block_size_units() -> None:
+def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -> None:
+    """One continuous stream per source: the budgets of stages sharing a source ADD UP (they used to be maximised
+    when every stage re-read the source from the top)."""
     d = _minimal()
     d["sources"]["pre2"] = {"kind": "pretrain", "loader": "synthetic"}
     d["stages"][0]["train"] = {"pre": 0.6, "pre2": 0.4}
     d["stages"][1] = {"name": "s2", "tokens": 4000, "train": {"pre": 0.1, "pre2": 0.9}, "val": {"pre": 1.0}}
     d["stages"].append({"name": "s3", "tokens": 500, "train": {"ins": 1.0}, "val": {"ins": 1.0}})
-    cfg = _build(d)  # block_size 64
-    assert cfg.sequence_budget("pre") == max(-(-600 // 64), -(-400 // 64)) == 10
-    assert cfg.sequence_budget("pre2") == max(-(-400 // 64), -(-3600 // 64)) == 57
+    cfg = _build(d)  # block_size 64; no transitions: the integral is the plain sum of stage.tokens × weight
+    assert cfg.sequence_budget("pre") == ceil((1000 * 0.6 + 4000 * 0.1) / 64) == 16
+    assert cfg.sequence_budget("pre2") == ceil((1000 * 0.4 + 4000 * 0.9) / 64) == 63
     assert cfg.sequence_budget("ins") == 8  # ceil(500 / 64)
     assert cfg.sequence_budget("hold") == 0  # validation only: `rows` says how many to download
     d["block_size"] = 32
-    assert _build(d).sequence_budget("pre2") == 113  # ceil(3600 / 32)
+    assert _build(d).sequence_budget("pre2") == 125  # ceil(4000 / 32)
+
+
+def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
+    """Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
+    ``transition tokens × (weight + next stage's weight) / 2`` — a source leaving ramps out, one entering ramps in."""
+    d = _minimal()
+    d["stages"][0]["transition_pct"] = 0.2  # transition window: 1000 × 0.2 = 200 tokens at the end of s1
+    cfg = _build(d)
+    assert cfg.sequence_budget("pre") == ceil((800 * 1.0 + 200 * (1.0 + 0.0) / 2) / 64) == 15  # ramps out over s1's end
+    assert cfg.sequence_budget("ins") == ceil((200 * (0.0 + 1.0) / 2 + 500 * 1.0) / 64) == 10  # ramps in over the same window
 
 
 def test_sequence_budget_of_the_crow_config() -> None:
     cfg = load_dataset_config(CROW)
-    assert cfg.sequence_budget("fineweb_edu") == -(-int(3_300_000_000 * 0.65) // 2048) == 1_047_364
-    assert cfg.sequence_budget("gsm8k") == -(-int(1_500_000_000 * 0.022) // 2048) == 16_114
-    assert cfg.sequence_budget("flan") == -(-int(150_000_000 * 0.40) // 2048) == 29_297
+    # fineweb_edu: 3.3B × (0.9 × 0.65 + 0.1 × (0.65 + 0.35)/2) + 1.5B × (0.9 × 0.35 + 0.1 × (0.35 + 0)/2) = 2 594.25M tokens
+    assert cfg.sequence_budget("fineweb_edu") == -(-2_594_250_000 // 2048) == 1_266_724
+    # gsm8k (phase 2 only): ramp-in 3.3B × 0.1 × 0.022/2 + phase 2 1.5B × (0.9 × 0.022 + 0.1 × 0.022/2) = 34.98M tokens
+    assert cfg.sequence_budget("gsm8k") == -(-34_980_000 // 2048) == 17_081
+    # flan (finetune only; no transition out of the last stage): ramp-in 1.5B × 0.1 × 0.40/2 + 150M × 0.40 = 90M tokens
+    assert cfg.sequence_budget("flan") == -(-90_000_000 // 2048) == 43_946
 
 
 def test_rows_needed_counts_the_margin_and_the_split() -> None:

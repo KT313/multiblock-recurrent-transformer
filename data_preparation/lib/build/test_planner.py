@@ -78,20 +78,20 @@ def _state(report: DatasetReport, name: str) -> SourceState:
 
 def test_rows_needed_counts_sequences_with_the_margin_and_the_split() -> None:
     cfg = two_stage_cfg()
-    # a: max(ceil(6400 × 0.5 / 64), ceil(3200 / 64)) = 50 sequences; × 1.2 ÷ (1 − 0.05) = 63.16 -> 64
-    assert cfg.sequence_budget("a") == 50 and cfg.validation_fraction_of("a") == 0.05 and rows_needed(cfg, "a") == 64
-    # b: 50 sequences, not validated on: 50 × 1.2 = 60 exactly (no float slop from 1.2)
+    # a: ceil((6400 × 0.5 + 3200 × 1.0) / 64) = 100 sequences over the run; × 1.2 ÷ (1 − 0.05) = 126.3 -> 127
+    assert cfg.sequence_budget("a") == 100 and cfg.validation_fraction_of("a") == 0.05 and rows_needed(cfg, "a") == 127
+    # b: ceil(6400 × 0.5 / 64) = 50 sequences, not validated on: 50 × 1.2 = 60 exactly (no float slop from 1.2)
     assert cfg.validation_fraction_of("b") == 0.0 and rows_needed(cfg, "b") == 60
     # i: ceil(1280 / 64) = 20 sequences, split: 20 × 1.2 ÷ 0.95 = 25.26 -> 26
     assert rows_needed(cfg, "i") == 26
 
 
-def test_rows_needed_takes_the_largest_stage_and_scales_with_block_size() -> None:
-    overlap = two_stage_cfg(tokens_b=12800)  # stage 2 now dominates: ceil(12800 / 64) = 200 sequences
-    assert overlap.sequence_budget("a") == 200 and rows_needed(overlap, "a") == 253  # 240 ÷ 0.95 = 252.6
+def test_rows_needed_sums_the_stages_and_scales_with_block_size() -> None:
+    overlap = two_stage_cfg(tokens_b=12800)  # stage 2 grows: ceil((6400 × 0.5 + 12800) / 64) = 250 sequences
+    assert overlap.sequence_budget("a") == 250 and rows_needed(overlap, "a") == 316  # 300 ÷ 0.95 = 315.8
     assert rows_needed(overlap, "b") == 60  # stage 1 unchanged
     wide = two_stage_cfg(block_size=128)  # half the sequences per stage
-    assert wide.sequence_budget("a") == 25 and rows_needed(wide, "a") == 32  # 30 ÷ 0.95 = 31.58
+    assert wide.sequence_budget("a") == 50 and rows_needed(wide, "a") == 64  # 60 ÷ 0.95 = 63.16
     assert rows_needed(wide, "b") == 30
 
 
@@ -109,10 +109,10 @@ def test_rows_needed_of_a_validation_only_source_is_its_rows() -> None:
 
 def test_rows_sufficient_and_training_rows_after_split() -> None:
     cfg = two_stage_cfg()
-    assert rows_sufficient(cfg, "a") == 54  # 64 ÷ 1.2 = 53.3
+    assert rows_sufficient(cfg, "a") == 106  # 127 ÷ 1.2 = 105.8
     assert rows_sufficient(cfg, "b") == 50 and rows_sufficient(cfg, "h") == 7 and rows_sufficient(cfg, "i") == 22
-    # the resolver holds ceil(0.05 × rows) out; 64 rows -> 4 validation, 60 training >= the 50-sequence budget
-    assert training_rows_after_split(cfg, "a", 64) == 60 >= cfg.sequence_budget("a")
+    # the resolver holds ceil(0.05 × rows) out; 127 rows -> 7 validation, 120 training >= the 100-sequence budget
+    assert training_rows_after_split(cfg, "a", 127) == 120 >= cfg.sequence_budget("a")
     assert training_rows_after_split(cfg, "b", 60) == 60  # not validated on: nothing held out
     assert training_rows_after_split(cfg, "a", 0) == 0
 
@@ -123,13 +123,13 @@ def test_rows_sufficient_and_training_rows_after_split() -> None:
 def test_plan_downloads_on_an_empty_dir(layout: DatasetLayout) -> None:
     plan = plan_downloads(two_stage_cfg(), layout)
     assert [(s.name, s.rows_present, s.rows_needed, s.rows_to_fetch, s.reason) for s in plan.sources] == [
-        ("a", 0, 64, 64, "raw missing"),
+        ("a", 0, 127, 127, "raw missing"),
         ("b", 0, 60, 60, "raw missing"),
         ("h", 0, 8, 8, "raw missing"),
         ("i", 0, 26, 26, "raw missing"),
     ]
-    assert plan.total_rows_to_fetch() == 158 and [s.name for s in plan.to_fetch()] == ["a", "b", "h", "i"]
-    assert plan.summary() == "4 source(s) short, downloading 158 rows (a 64, b 60, h 8, i 26)"
+    assert plan.total_rows_to_fetch() == 221 and [s.name for s in plan.to_fetch()] == ["a", "b", "h", "i"]
+    assert plan.summary() == "4 source(s) short, downloading 221 rows (a 127, b 60, h 8, i 26)"
     assert plan.describe().splitlines()[0].split() == ["source", "present", "needed", "fetch", "reason"]
     only = plan_downloads(two_stage_cfg(), layout, sources=["i", "a"])
     assert [s.name for s in only.sources] == ["a", "i"]  # config order
@@ -146,7 +146,7 @@ def test_rows_to_fetch_is_the_difference_clamped_at_zero(layout: DatasetLayout, 
 
     bigger = two_stage_cfg(tokens_b=12800)  # same hashes, a larger budget for `a`: top up by the difference
     a = next(s for s in plan_downloads(bigger, layout).sources if s.name == "a")
-    assert (a.rows_present, a.rows_needed, a.rows_to_fetch, a.reason) == (64, 253, 189, "rows 64 < 253")
+    assert (a.rows_present, a.rows_needed, a.rows_to_fetch, a.reason) == (127, 316, 189, "rows 127 < 316")
     smaller = two_stage_cfg(tokens_a=640, tokens_b=320)
     assert all(s.rows_to_fetch == 0 for s in plan_downloads(smaller, layout).sources)
 
@@ -210,7 +210,7 @@ def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, 
     prepare(config_file(cfg), layout.root, assume_yes=False)
     ledger = source_ledger(cfg, "a", layout)
     assert (ledger.name, ledger.kind, ledger.raw_state, ledger.processed_state) == ("a", "pretrain", "current", "built")
-    assert (ledger.rows_needed, ledger.rows_sufficient, ledger.raw_rows) == (64, 54, 64)
+    assert (ledger.rows_needed, ledger.rows_sufficient, ledger.raw_rows) == (127, 106, 127)
     assert ledger.satisfaction() is Satisfaction.OK and ledger.rows_to_fetch() == 0
     assert ledger.download() == next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
     assert ledger.state() == source_state(cfg, "a", layout)
@@ -293,8 +293,8 @@ def test_sources_are_satisfied_after_prepare(layout: DatasetLayout, config_file:
     assert report.complete and report.tokenizer_complete and report.missing() == []
     a = _state(report, "a")
     assert a.satisfied and a.reason == "ok" and a.state() == "complete" and not a.exhausted
-    assert a.raw_rows == 64 and a.processed_rows >= 54 and a.rows_needed == 64
-    assert a.epochs == pytest.approx(50 / training_rows_after_split(cfg, "a", a.processed_rows))
+    assert a.raw_rows == 127 and a.processed_rows >= 106 and a.rows_needed == 127
+    assert a.epochs == pytest.approx(100 / training_rows_after_split(cfg, "a", a.processed_rows))
     h = _state(report, "h")
     assert h.satisfied and h.raw_rows == 8 and h.epochs is None  # not trained on: no budget to cycle
     assert every_source_satisfies_its_budget(cfg, layout) and every_source_satisfies_its_budget(cfg, layout, sources=["i"])
@@ -314,12 +314,12 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
     stale = two_stage_cfg(min_chars=2)  # changes every processed hash, no raw hash
     a = source_state(stale, "a", layout)
-    assert not a.satisfied and a.reason == "processed stale" and a.raw_rows == 64
+    assert not a.satisfied and a.reason == "processed stale" and a.raw_rows == 127
 
     bigger = two_stage_cfg(tokens_b=12800)
     prepare(config_file(bigger), layout.root, assume_yes=False, steps=["download"])  # raw topped up, processed not
     a = source_state(bigger, "a", layout)
-    assert not a.satisfied and a.reason == "processed behind raw" and a.raw_rows == 253 and 0 < a.processed_rows < 253
+    assert not a.satisfied and a.reason == "processed behind raw" and a.raw_rows == 316 and 0 < a.processed_rows < 316
     assert sources_with_pending_raw_shards(bigger, layout) == ["a", "b"]
 
 
@@ -389,7 +389,7 @@ def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile
     assert report.missing() == ["a", "b", "h", "i", "tokenizer"] and not report.complete
     lines = report.table().splitlines()
     assert lines[0].split() == ["source", "kind", "needed", "raw", "processed", "epochs", "state", "reason"]
-    assert lines[1].split() == ["a", "pretrain", "64", "0", "0", "-", "incomplete", "raw", "missing"]
+    assert lines[1].split() == ["a", "pretrain", "127", "0", "0", "-", "incomplete", "raw", "missing"]
     assert lines[-1].split() == ["tokenizer", "tokenizer", "incomplete"]
     prepare(config_file(cfg), layout.root, assume_yes=False)
     complete = summarize_dataset_state(cfg, layout)
