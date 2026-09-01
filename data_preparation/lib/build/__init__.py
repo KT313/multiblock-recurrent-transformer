@@ -18,6 +18,7 @@ from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction
 from data_preparation.lib.build.runner import (
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
     DEFAULT_NUM_WORKERS,
+    DEFAULT_PASS_WORKERS,
     MAX_ROUNDS,
     STEPS,
     BuildAborted,
@@ -31,6 +32,7 @@ __all__ = [
     "BUILD_LOCK_NAME",
     "DEFAULT_MAX_PARALLEL_DOWNLOADS",
     "DEFAULT_NUM_WORKERS",
+    "DEFAULT_PASS_WORKERS",
     "MAX_ROUNDS",
     "STEPS",
     "BuildAborted",

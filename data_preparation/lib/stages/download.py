@@ -105,8 +105,9 @@ def _auto_tokenizer() -> Any:
     and under a lock: ``transformers`` initialises its lazy modules on first import, which is not thread-safe and
     the build runs items in threads."""
     with _IMPORT_LOCK:
-        # the tokenizer's Rust thread pool + a later fork (decontamination / minhash pools) is the
-        # well-known tokenizers deadlock; the library's own mitigation, set before the first load
+        # the tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination /
+        # minhash pools are spawn and immune) is the well-known tokenizers deadlock; the library's own
+        # mitigation, set before the first load (spawn children inherit it through the environment)
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from transformers import AutoTokenizer
 

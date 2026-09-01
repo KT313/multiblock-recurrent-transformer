@@ -234,6 +234,8 @@ def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_f
         prepare(path, layout.root, assume_yes=False, sources=["c"])
     with pytest.raises(ValueError, match="must be >= 1"):
         prepare(path, layout.root, assume_yes=False, max_parallel_downloads=0)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        prepare(path, layout.root, assume_yes=False, pass_workers=0)
 
 
 def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
@@ -386,7 +388,7 @@ def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() 
 
 def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     cfg = _three_sources(cfg_factory)  # no raw folders: nothing pending, and an empty plan: nothing to download
-    runner.download_and_build_missing(DownloadPlan(), cfg, layout, steps=set(runner.STEPS), sources=None, max_parallel_downloads=1, num_workers=1)
+    runner.download_and_build_missing(DownloadPlan(), cfg, layout, steps=set(runner.STEPS), sources=None, max_parallel_downloads=1, num_workers=1, pass_workers=1)
     assert not layout.root.exists()
     flag = runner.StopFlag()
     assert not flag.should_stop()
@@ -635,7 +637,7 @@ def test_pending_sources_that_need_no_download_are_built_right_away(
     monkeypatch.setattr(runner, "build_source", build_stub)
     plan = plan_downloads(cfg, layout)
     assert plan.total_rows_to_fetch() == 0
-    runner.download_and_build_missing(plan, cfg, layout, steps={"download", "build"}, sources=None, max_parallel_downloads=2, num_workers=2)
+    runner.download_and_build_missing(plan, cfg, layout, steps={"download", "build"}, sources=None, max_parallel_downloads=2, num_workers=2, pass_workers=1)
     assert downloaded == [] and sorted(built) == ["s0", "s1", "s2"] and status(path, layout.root).complete
 
 

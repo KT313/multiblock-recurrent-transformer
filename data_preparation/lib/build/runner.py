@@ -20,7 +20,10 @@
 download jobs (the ``github_code`` sources of one repo form one job, read in a single pass over the repo files) and
 a pool of ``num_workers`` build jobs run side by side (:class:`JobPool`); the build of a source is submitted from
 the main thread the moment its download job finished, sources with nothing to download are built right away, and a
-source is never built while its own download runs. A failing job stops every running job of both pools at its next
+source is never built while its own download runs. Each build job may additionally hold a spawn **process** pool of
+``pass_workers`` for its optional cleaning passes (decontamination / minhash — off in the shipped configs), so the
+worst case with those passes on is ``num_workers × pass_workers`` worker processes (2 × 4 = 8 with the defaults)
+next to the threads. A failing job stops every running job of both pools at its next
 shard (the steps take ``should_stop``; :class:`StopFlag`) and is re-raised after they stopped — a failed source is
 a failed build, never a silently smaller dataset. Ctrl-C while waiting does the same and raises
 :class:`BuildAborted` (``prepare.py`` exits 130); everything published so far is kept and the next run resumes at
@@ -65,7 +68,8 @@ log = get_logger(__name__)
 STEPS: tuple[str, ...] = ("tokenizer", "download", "build")
 MAX_ROUNDS = 5  # download → build rounds; a source still short afterwards is reported, not looped on forever
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
-DEFAULT_NUM_WORKERS = 2  # sources built at a time; also the pool size of each decontamination / minhash pass
+DEFAULT_NUM_WORKERS = 2  # sources built at a time (threads; pyarrow/tokenizers release the GIL)
+DEFAULT_PASS_WORKERS = 4  # spawn processes per build for the optional cleaning passes (decontamination / minhash)
 
 
 # --- prepare / status ------------------------------------------------------------------------------------------------
@@ -76,6 +80,7 @@ def prepare(
     dataset_dir: str | Path,
     *,
     num_workers: int = DEFAULT_NUM_WORKERS,
+    pass_workers: int = DEFAULT_PASS_WORKERS,
     max_parallel_downloads: int = DEFAULT_MAX_PARALLEL_DOWNLOADS,
     assume_yes: bool,
     dry_run: bool = False,
@@ -99,7 +104,7 @@ def prepare(
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
     selected = checked_sources(config, sources)
-    check_worker_counts(num_workers, max_parallel_downloads)
+    check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
     warn_about_overlaps(config)
 
     with build_lock(layout.root) if not dry_run else nullcontext():
@@ -116,7 +121,7 @@ def prepare(
             set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download + build")
             download_and_build_missing(
                 download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
-                num_workers=num_workers, hf_token=hf_token, should_stop=should_stop,
+                num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop,
             )
             if every_source_satisfies_its_budget(config, layout, sources=selected):
                 break
@@ -150,20 +155,23 @@ def download_and_build_missing(
     sources: list[str] | None,
     max_parallel_downloads: int,
     num_workers: int,
+    pass_workers: int,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
 ) -> None:
     """One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
     not all processed yet — at the same time. A pool of ``max_parallel_downloads`` download jobs (the ``github_code``
     sources of one repo are one job, :func:`download_github_code_group`) and a pool of ``num_workers`` build jobs
-    (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`. Sources with nothing to download
-    are built right away; every other source is built as soon as its download job finished (the members of a
-    ``github_code`` group after the group pass), so a source is never built while its own download runs. ``steps``
-    restricts the round to its download / build part, ``sources`` to the named sources."""
+    (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`; each build hands
+    ``pass_workers`` to its optional cleaning passes (their spawn process pool — the module docstring has the
+    worker-count arithmetic). Sources with nothing to download are built right away; every other source is built as
+    soon as its download job finished (the members of a ``github_code`` group after the group pass), so a source is
+    never built while its own download runs. ``steps`` restricts the round to its download / build part, ``sources``
+    to the named sources."""
     downloads = download_jobs(download_plan, config, layout, hf_token) if "download" in steps else []
     downloading = {name for job in downloads for name in job.sources}
     pending = sources_with_pending_raw_shards(config, layout, sources) if "build" in steps else []
-    builds = [build_source_job(config, name, layout, num_workers) for name in pending if name not in downloading]
+    builds = [build_source_job(config, name, layout, pass_workers) for name in pending if name not in downloading]
 
     flag = StopFlag(should_stop)
     build_pool = JobPool("builds", max_workers=num_workers, flag=flag, total=len(builds) + len(downloading))
@@ -172,7 +180,7 @@ def download_and_build_missing(
         """The follow-up of a finished download job (called in the main thread): build what it fetched."""
         for name in job.sources:
             if "build" in steps and build_is_pending(config, name, layout):
-                build_pool.submit(build_source_job(config, name, layout, num_workers))
+                build_pool.submit(build_source_job(config, name, layout, pass_workers))
             else:
                 build_pool.bar.update(1)  # nothing to build for this source: it counts as done
 
@@ -242,9 +250,9 @@ def github_code_group_job(config: DatasetConfig, names: list[str], layout: Datas
     return Job("github_code group", ", ".join(names), tuple(names), action)
 
 
-def build_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, num_workers: int) -> Job:
+def build_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, pass_workers: int) -> Job:
     def action(should_stop: StopCheck) -> object:
-        return build_source(config, name, layout, num_workers=num_workers, should_stop=should_stop)
+        return build_source(config, name, layout, pass_workers=pass_workers, should_stop=should_stop)
 
     return Job("source", name, (name,), action)
 
@@ -435,9 +443,12 @@ def checked_sources(config: DatasetConfig, sources: Iterable[str] | None) -> lis
     return selected
 
 
-def check_worker_counts(num_workers: int, max_parallel_downloads: int) -> None:
-    if num_workers < 1 or max_parallel_downloads < 1:
-        raise ValueError(f"num_workers and max_parallel_downloads must be >= 1, got {num_workers} and {max_parallel_downloads}")
+def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_workers: int) -> None:
+    if num_workers < 1 or max_parallel_downloads < 1 or pass_workers < 1:
+        raise ValueError(
+            "num_workers, max_parallel_downloads and pass_workers must be >= 1, got "
+            f"{num_workers}, {max_parallel_downloads} and {pass_workers}"
+        )
 
 
 def another_round_can_fetch_more(config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None) -> bool:
@@ -495,6 +506,7 @@ def log_report(report: DatasetReport) -> None:
 __all__ = [
     "DEFAULT_MAX_PARALLEL_DOWNLOADS",
     "DEFAULT_NUM_WORKERS",
+    "DEFAULT_PASS_WORKERS",
     "MAX_ROUNDS",
     "STEPS",
     "BuildAborted",

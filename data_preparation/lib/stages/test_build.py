@@ -314,11 +314,13 @@ def test_build_quality_filter_only_when_enabled(
     assert m.extra["stats"]["quality_filter"] == {"enabled": True, "filtered_count": 1, "rejection_reasons": {"too_few_sentences": 1}}
 
 
-@pytest.mark.parametrize("num_workers", [1, 2])
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_decontamination_only_when_enabled(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
-    read_rows: Reader, monkeypatch: pytest.MonkeyPatch, num_workers: int,
+    read_rows: Reader, monkeypatch: pytest.MonkeyPatch, pass_workers: int,
 ) -> None:  # fmt: skip
+    """`pass_workers=2` runs the real spawn pool end to end: the n-grams are loaded once in the parent (where the
+    patched loader lives — a spawn child would not see the monkeypatch) and reach the workers as pickled init args."""
     planted = " ".join(f"w{i}" for i in range(20))
     calls: list[tuple[list[str], int, str]] = []
 
@@ -329,16 +331,15 @@ def test_build_decontamination_only_when_enabled(
     monkeypatch.setattr(stages_build, "load_benchmark_ngrams", fake_load)
     texts = [planted, GOOD, planted + " tail"]
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
-    build_source(cfg, "s", layout, num_workers=num_workers)
+    build_source(cfg, "s", layout, pass_workers=pass_workers)
     assert len(read_rows(layout.processed_dir("s"))) == 3 and calls == []
     decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test", "mmlu_test"])
     on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon), max_seq_length=500))
     download(on, "s", layout, rows_needed=3)
-    m = build_source(on, "s", layout, num_workers=num_workers)
+    m = build_source(on, "s", layout, pass_workers=pass_workers)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
     assert m.extra["stats"]["decontamination"] == {"enabled": True, "contaminated_count": 2, "contaminated_by_benchmark": {"gsm8k_test": 2}}
-    if num_workers == 1:
-        assert calls == [(["gsm8k_test", "mmlu_test"], 13, str(layout.benchmark_cache_dir()))]
+    assert calls == [(["gsm8k_test", "mmlu_test"], 13, str(layout.benchmark_cache_dir()))]
 
 
 def test_build_benchmark_load_failure_is_an_error(

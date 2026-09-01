@@ -115,6 +115,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # dataset-preparation conveniences: how missing data gets built, never what it contains
     "auto_prepare",
     "prepare_num_workers",
+    "prepare_pass_workers",
     "prepare_max_parallel_downloads",
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",

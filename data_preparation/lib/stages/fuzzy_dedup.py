@@ -1,10 +1,12 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Streaming MinHash + LSH near-duplicate removal (``dedup.mode: minhash``), first occurrence wins.
 
-Signatures are computed in a ``multiprocessing.Pool`` (``num_workers > 1``) in chunks of ``chunk_size`` rows;
-workers return only the ``uint64[num_perm]`` hash values of each document (nothing but numpy arrays is pickled),
-the main process rebuilds the ``MinHash`` from that array and queries/inserts the single ``MinHashLSH`` in input
-order. Rows stream in and out; at most ``2 * num_workers`` chunks are in flight at any time.
+Signatures are computed in a **spawn**-context ``multiprocessing.Pool`` of ``pass_workers`` (``pass_workers > 1``;
+spawn because the pool is created from a build worker thread, where a fork could inherit another thread's lock
+mid-hold) in chunks of ``chunk_size`` rows; workers return only the ``uint64[num_perm]`` hash values of each
+document (nothing but numpy arrays is pickled), the main process rebuilds the ``MinHash`` from that array and
+queries/inserts the single ``MinHashLSH`` in input order. Rows stream in and out; at most ``2 * pass_workers``
+chunks are in flight at any time.
 
 Memory: the LSH index holds the signature of every *kept* row, i.e. O(kept rows). Per kept row this is the
 ``num_perm`` uint64 hash values (8 * num_perm bytes, 2 KB at num_perm=256) plus ``b`` band keys and the ``doc_<i>``
@@ -34,7 +36,8 @@ CHUNK_SIZE = 1024
 MINHASH_SEED = 1  # datasketch default; pinned so signatures are stable
 
 # Signature parameters of *this* process: the n-gram size and the MinHash constructor arguments. Set once per process
-# by ``_init_worker`` (the pool initializer, or called directly when num_workers <= 1) before ``_signature`` is used.
+# by ``_init_worker`` (the spawn-pool initializer — spawn children start with fresh module globals and its arguments
+# are two plain ints — or called directly when pass_workers <= 1) before ``_signature`` is used.
 _NGRAM: int = 0
 _MINHASH_KWARGS: dict[str, Any] = {}
 
@@ -108,21 +111,21 @@ def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[
 
 
 def _signatures_in_pool(
-    rows: Iterator[Row], dedup: DedupConfig, num_workers: int, chunk_size: int
+    rows: Iterator[Row], dedup: DedupConfig, pass_workers: int, chunk_size: int
 ) -> Iterator[tuple[Row, Signature]]:
-    """``(row, signature)`` pairs in input order, signatures computed by a worker pool chunk by chunk.
+    """``(row, signature)`` pairs in input order, signatures computed by a spawn worker pool chunk by chunk.
 
-    Bounded in-order pipeline: at most ``2 * num_workers`` chunks are read ahead of the consumer, so the input keeps
+    Bounded in-order pipeline: at most ``2 * pass_workers`` chunks are read ahead of the consumer, so the input keeps
     streaming however slow the LSH side is (``pool.imap`` would read the whole input into its task queue).
     """
-    max_inflight = 2 * num_workers
+    max_inflight = 2 * pass_workers
     inflight: deque[tuple[list[Row], AsyncResult[list[Signature]]]] = deque()
 
     def oldest_finished() -> Iterator[tuple[Row, Signature]]:
         chunk, pending = inflight.popleft()
         return zip(chunk, pending.get())
 
-    with multiprocessing.Pool(num_workers, initializer=_init_worker, initargs=(dedup.num_perm, dedup.ngram)) as pool:
+    with multiprocessing.get_context("spawn").Pool(pass_workers, initializer=_init_worker, initargs=(dedup.num_perm, dedup.ngram)) as pool:
         for chunk in _chunks(rows, chunk_size):
             texts = [row["text"] for row in chunk]
             inflight.append((chunk, pool.apply_async(_signatures, (texts,))))
@@ -133,7 +136,7 @@ def _signatures_in_pool(
 
 
 def fuzzy_dedup(
-    rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], num_workers: int = 1, chunk_size: int = CHUNK_SIZE
+    rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], pass_workers: int = 1, chunk_size: int = CHUNK_SIZE
 ) -> Iterator[Row]:
     """Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= ``dedup.threshold``) among the rows
     yielded before; rows too short for a single n-gram pass through untouched (``stats["too_short_passed"]``, they
@@ -144,10 +147,10 @@ def fuzzy_dedup(
     lsh = MinHashLSH(threshold=dedup.threshold, num_perm=dedup.num_perm)
     minhash_kwargs = _minhash_kwargs(dedup.num_perm)
 
-    if num_workers <= 1:
+    if pass_workers <= 1:
         signatures = _signatures_in_process(rows, dedup)
     else:
-        signatures = _signatures_in_pool(rows, dedup, num_workers, chunk_size)
+        signatures = _signatures_in_pool(rows, dedup, pass_workers, chunk_size)
 
     start = time.monotonic()
     for index, (row, signature) in enumerate(signatures):

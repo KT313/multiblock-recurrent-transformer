@@ -26,6 +26,7 @@ POSITIVE_SETTINGS: dict[str, str] = {
     "grad_clip": "0 would zero every gradient",
     "micro_batch_size": "sequences per forward/backward; 0 or less makes the micro-batch loop of a step run zero times",
     "world_batch_size": "sequences per optimizer step",
+    "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
     "save_step_interval",
@@ -68,8 +69,9 @@ class Settings:
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
-    prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers); also the
-    # pool size of each decontamination / minhash pass, so the product is what runs with those toggles on
+    prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers)
+    prepare_pass_workers: int = 4  # worker processes of EACH build's optional cleaning passes (decontamination /
+    # minhash; = prepare.py --pass_workers), so up to prepare_num_workers × prepare_pass_workers with those passes on
     prepare_max_parallel_downloads: int = 2  # sources downloading at a time during the in-process build
     stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional
     allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config

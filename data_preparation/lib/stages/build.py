@@ -90,12 +90,14 @@ def build_source(
     name: str,
     layout: DatasetLayout,
     *,
-    num_workers: int = 1,
+    pass_workers: int = 1,
     shard_size: int = DEFAULT_SHARD_SIZE,
     should_stop: StopCheck | None = None,
 ) -> Manifest:
     """Turn the raw shards of source ``name`` into ``processed/<name>`` (see the module docstring) and return the
-    processed manifest. Raises ``FileNotFoundError`` without a current raw manifest (run the download first)."""
+    processed manifest. ``pass_workers`` sizes the spawn process pool of the optional cleaning passes
+    (decontamination / minhash; 1 = in-process). Raises ``FileNotFoundError`` without a current raw manifest (run
+    the download first)."""
     source = config.sources[name]
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
@@ -131,7 +133,7 @@ def build_source(
 
     # per-shard builds check the stop request after every published shard; an all-at-once build reads every raw
     # shard before it writes anything, so its readers check between raw shards instead
-    pipeline = RowPipeline(config, name, layout, num_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
+    pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
     with pipeline, progress(total=pending_rows, desc=name, unit="row", leave=False, panel="builds") as bar:
         pipeline.bar = bar
@@ -180,7 +182,7 @@ def _build_all_at_once(
     pipeline.stats["input_rows"] += raw.rows()
     rows = pipeline.run(raw_dir, list(raw.shards), first_row_index=0)
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
-        rows = fuzzy_dedup(rows, pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.num_workers)
+        rows = fuzzy_dedup(rows, pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.pass_workers)
     survivors = list(rows)
     if output.manifest.extra["shuffled"]:
         random.Random(pipeline.source.seed).shuffle(survivors)
@@ -302,8 +304,8 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
 
 class RowPipeline:
     """The row pipeline of one build call, reusable per raw shard: the dedup filter, the statistics, the token
-    counter (instruct inversions) and the decontamination worker pool (a ``with`` resource) persist across ``run``
-    calls. Pretrain: length filter -> quality filter -> decontamination -> hash -> exact dedup; instruct: input
+    counter (instruct inversions) and the decontamination worker pool (a ``with`` resource, ``pass_workers``
+    processes) persist across ``run`` calls. Pretrain: length filter -> quality filter -> decontamination -> hash -> exact dedup; instruct: input
     inversions -> empty / over-cap removal -> hash -> exact dedup. The filters run **before** the dedup, so the hashes
     on disk are exactly the dedup's "seen" set and an incremental build keeps the same rows as a full pass (a
     filtered-out row never claims a hash)."""
@@ -313,7 +315,7 @@ class RowPipeline:
         config: DatasetConfig,
         name: str,
         layout: DatasetLayout,
-        num_workers: int,
+        pass_workers: int,
         batch_size: int,
         stats: dict[str, Any],
         *,
@@ -327,12 +329,12 @@ class RowPipeline:
         self.kind = self.source.kind
         self.processing = config.source_processing(name)
         self.max_seq_length = config.max_seq_length
-        self.num_workers = num_workers
+        self.pass_workers = pass_workers
         self.batch_size = batch_size
         self.stats = stats
         self.seen = seen
         self.should_stop = should_stop
-        self.decontaminator = Decontaminator(self.processing.decontamination, num_workers, layout, stats.get("decontamination", {}))
+        self.decontaminator = Decontaminator(self.processing.decontamination, pass_workers, layout, stats.get("decontamination", {}))
         self.bar: Progress | None = None
         self._token_counter: TokenCounter | None = None  # instruct inversions only, created on first use
 
@@ -485,14 +487,16 @@ def _increment(counts: dict[str, int], key: str) -> None:
 
 # --- decontamination -----------------------------------------------------------------------------------------------------
 
-# the benchmark n-grams are loaded once per process (pool initializer for num_workers > 1)
+# the per-process parameters of `_contaminated_by`: set by `_init_decontamination` — called directly for
+# `pass_workers <= 1`, and as the pool initializer of every spawn worker otherwise (spawn children start with fresh
+# module globals, so the n-grams are handed over as plain picklable init args, loaded once in the parent)
 _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 
 
-def _init_decontamination(names: list[str], n: int, threshold: float, cache_dir: str) -> None:
+def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float) -> None:
     global _BENCHMARK_NGRAMS
-    _BENCHMARK_NGRAMS = load_benchmark_ngrams(names, n, cache_dir)
+    _BENCHMARK_NGRAMS = ngrams
     _DECONTAM.update({"n": n, "threshold": threshold})
 
 
@@ -503,22 +507,27 @@ def _contaminated_by(text: str) -> list[str]:
 
 class Decontaminator:
     """Drops rows contaminated by a benchmark (counts hits per benchmark in ``stats``); the benchmark n-grams are
-    loaded once — in this process, or in a pool of ``num_workers`` that lives for the whole ``with`` block."""
+    loaded once, in this process, and checked in-process (``pass_workers <= 1``) or in a pool of ``pass_workers``
+    **spawn** processes that lives for the whole ``with`` block. Spawn, not fork: the pool is created from a build
+    worker thread (`lib/build/runner.py` runs one build per thread), and a fork of a multi-threaded process can
+    inherit a lock another thread holds mid-operation; spawn children start clean."""
 
-    def __init__(self, config: DecontaminationConfig, num_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
+    def __init__(self, config: DecontaminationConfig, pass_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
         self.config = config
-        self.num_workers = num_workers
+        self.pass_workers = pass_workers
         self.stats = stats
-        self.init_args = (list(config.benchmarks), config.ngram, config.threshold, str(layout.benchmark_cache_dir()))
+        self.cache_dir = str(layout.benchmark_cache_dir())
         self._pool: multiprocessing.pool.Pool | None = None
 
     def __enter__(self) -> Decontaminator:
         if not self.config.enabled:
             return self
-        if self.num_workers <= 1:
-            _init_decontamination(*self.init_args)
+        ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
+        init_args = (ngrams, self.config.ngram, self.config.threshold)
+        if self.pass_workers <= 1:
+            _init_decontamination(*init_args)
         else:
-            self._pool = multiprocessing.Pool(self.num_workers, initializer=_init_decontamination, initargs=self.init_args)
+            self._pool = multiprocessing.get_context("spawn").Pool(self.pass_workers, initializer=_init_decontamination, initargs=init_args)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:

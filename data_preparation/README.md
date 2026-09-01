@@ -110,7 +110,7 @@ or dropped source row twice. All-at-once builds (shuffled sources, minhash) writ
 ```bash
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
         [--sources NAME ...] [--steps tokenizer download build] [--yes] [--dry_run]
-        [--num_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
+        [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
 uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
@@ -136,7 +136,7 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
 `lib/build/runner.py:prepare` is the whole pipeline, readable top to bottom; trimmed to its shape:
 
 ```python
-def prepare(config_path, dataset_dir, *, num_workers, max_parallel_downloads, assume_yes, dry_run, steps, sources, ...):
+def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel_downloads, assume_yes, dry_run, steps, sources, ...):
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     with build_lock(layout.root):
@@ -156,8 +156,10 @@ def prepare(config_path, dataset_dir, *, num_workers, max_parallel_downloads, as
 
 `download_and_build_missing` is the only place with thread-pool code: a pool of `--max_parallel_downloads` download
 jobs (the `github_code` sources of one repo form one job and are read in a single pass over the repo's files) and a
-pool of `--num_workers` build jobs (`--num_workers` is also the pool size of each decontamination / minhash pass) run
-side by side under one stop flag. Sources with nothing to download are built right away, every other source the
+pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
+spawn process pool of `--pass_workers` for its optional cleaning passes (decontamination / minhash — off in the
+shipped configs), so those toggles cost up to `num_workers × pass_workers` worker processes (2 × 4 = 8 with the
+defaults). Sources with nothing to download are built right away, every other source the
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
 overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
@@ -346,7 +348,7 @@ log lines are written instead.
 ## Training auto-prepares
 
 `training/train.py` loads the run config's `dataset_config`, runs `status`, and — with `auto_prepare: true` (the
-default) — runs `prepare` in-process on the main rank (`prepare_num_workers` / `prepare_max_parallel_downloads`,
+default) — runs `prepare` in-process on the main rank (`prepare_num_workers` / `prepare_pass_workers` / `prepare_max_parallel_downloads`,
 the same dashboard, `build.log` and lock; `assume_yes=False`, so it never deletes raw), then re-verifies. With
 `auto_prepare: false` a missing dataset is a hard error quoting the `prepare.py prepare` command. Gated sources
 (`nampdn-ai/mini-peS2o` in the crow config) need `HF_TOKEN` in the environment (or `--hf_token` for `prepare`).

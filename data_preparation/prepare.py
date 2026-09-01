@@ -3,7 +3,8 @@
 
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--yes] [--dry_run]
-                                                [--num_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
+                                                [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
+                                                [--hf_token T] [--cache_dir DIR]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
@@ -37,6 +38,7 @@ if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without
 from data_preparation.lib.build import (  # noqa: E402
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
     DEFAULT_NUM_WORKERS,
+    DEFAULT_PASS_WORKERS,
     STEPS,
     BuildAborted,
     ConfirmationRequired,
@@ -100,7 +102,8 @@ def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
     sub.add_argument("--yes", "-y", action="store_true", help="delete stale / outdated raw folders without asking")
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
-    sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (and worker processes per decontamination / minhash pass)")
+    sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
+    sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")
     sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")
 
@@ -118,6 +121,7 @@ def run_prepare(args: argparse.Namespace) -> None:
             args.dataset_config,
             args.dataset_dir,
             num_workers=args.num_workers,
+            pass_workers=args.pass_workers,
             max_parallel_downloads=args.max_parallel_downloads,
             assume_yes=args.yes,
             dry_run=args.dry_run,

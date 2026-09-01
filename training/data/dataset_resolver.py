@@ -419,6 +419,7 @@ def _ensure_prepared(
                     settings.dataset_config,
                     settings.dataset_dir,
                     num_workers=settings.prepare_num_workers,
+                    pass_workers=settings.prepare_pass_workers,
                     max_parallel_downloads=settings.prepare_max_parallel_downloads,
                     assume_yes=False,
                     confirm=lambda _message: False,  # never delete raw from a training run

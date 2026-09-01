@@ -43,11 +43,11 @@ def test_commands_are_registered() -> None:
     parser = prepare.build_parser()
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
-    assert args.num_workers == 2 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
+    assert args.num_workers == 2 and args.pass_workers == 4 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
     assert not args.dry_run and not args.yes
-    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--dry_run", "--yes", "--num_workers", "3", "--max_parallel_downloads", "4"])
+    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--dry_run", "--yes", "--num_workers", "3", "--pass_workers", "5", "--max_parallel_downloads", "4"])
     assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.dry_run and args.yes
-    assert args.num_workers == 3 and args.max_parallel_downloads == 4
+    assert args.num_workers == 3 and args.pass_workers == 5 and args.max_parallel_downloads == 4
     assert parser.parse_args(["prepare", "--dataset_config", "x.yaml", "-y"]).yes
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
     assert args.run is prepare.run_status and args.dataset_dir == Path("d")
@@ -173,8 +173,8 @@ def test_yes_flag_reaches_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         return DatasetReport(tokenizer_complete=True)
 
     monkeypatch.setattr(prepare, "prepare", record)
-    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--hf_token", "t", "--num_workers", "3"])
-    assert (seen["assume_yes"], seen["hf_token"], seen["num_workers"], seen["steps"]) == (True, "t", 3, STEPS)
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2"])
+    assert (seen["assume_yes"], seen["hf_token"], seen["num_workers"], seen["pass_workers"], seen["steps"]) == (True, "t", 3, 2, STEPS)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert (seen["assume_yes"], seen["dry_run"]) == (False, False)
 

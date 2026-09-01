@@ -68,11 +68,11 @@ def test_corpus_is_deterministic() -> None:
 
 @needs_datasketch
 @pytest.mark.parametrize("threshold", [0.8, 0.95])
-@pytest.mark.parametrize("num_workers", [1, 2])
-def test_kept_rows_match_reference(threshold: float, num_workers: int) -> None:
+@pytest.mark.parametrize("pass_workers", [1, 2])
+def test_kept_rows_match_reference(threshold: float, pass_workers: int) -> None:
     stats: dict[str, Any] = {}
     dedup = DedupConfig(mode="minhash", threshold=threshold, num_perm=128)
-    kept = [r["i"] for r in fuzzy_dedup(_rows(make_corpus()), dedup, stats, num_workers=num_workers)]
+    kept = [r["i"] for r in fuzzy_dedup(_rows(make_corpus()), dedup, stats, pass_workers=pass_workers)]
     assert kept == EXPECTED_KEPT[threshold]
     assert stats["near_duplicates_removed"] == N_DOCS - len(kept)
     assert stats["near_duplicate_rate"] == pytest.approx((N_DOCS - len(kept)) / N_DOCS)
@@ -80,8 +80,8 @@ def test_kept_rows_match_reference(threshold: float, num_workers: int) -> None:
 
 
 @needs_datasketch
-@pytest.mark.parametrize("num_workers", [1, 2])
-def test_rows_stream_before_input_is_exhausted(num_workers: int) -> None:
+@pytest.mark.parametrize("pass_workers", [1, 2])
+def test_rows_stream_before_input_is_exhausted(pass_workers: int) -> None:
     docs = make_corpus()
     consumed = 0
 
@@ -92,11 +92,11 @@ def test_rows_stream_before_input_is_exhausted(num_workers: int) -> None:
             yield {"text": text, "i": i}
 
     dedup = DedupConfig(mode="minhash", threshold=0.8, num_perm=32)
-    out = fuzzy_dedup(source(), dedup, {}, num_workers=num_workers, chunk_size=32)
+    out = fuzzy_dedup(source(), dedup, {}, pass_workers=pass_workers, chunk_size=32)
     first = next(out)
     assert first["i"] == 0
-    # serial path: exactly one row read; pool path: at most 2 * num_workers chunks read ahead
-    assert consumed <= (1 if num_workers <= 1 else 2 * num_workers * 32) < len(docs)
+    # serial path: exactly one row read; spawn-pool path: at most 2 * pass_workers chunks read ahead
+    assert consumed <= (1 if pass_workers <= 1 else 2 * pass_workers * 32) < len(docs)
     list(out)  # drain
     assert consumed == len(docs)
 
