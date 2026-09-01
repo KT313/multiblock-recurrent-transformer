@@ -40,7 +40,7 @@ seed: 233                            # seed for model init, the recurrence sampl
 
 # --- Model ------------------------------------------------------------------------------------------------------
 model_overwrite: {}                  # RecurrentConfig keys overriding the architecture config, e.g. {n_embd: 512}
-block_size: 2048                     # sequence length; must equal the architecture config's block_size and be <= the dataset's max_seq_length
+block_size: 2048                     # sequence length; must equal the block_size of the architecture config AND of the dataset config (which itself is <= its max_seq_length)
 
 # --- Data loading -----------------------------------------------------------------------------------------------
 dataloader_num_workers: 8            # worker processes per stage dataloader (0: load in the main process)
