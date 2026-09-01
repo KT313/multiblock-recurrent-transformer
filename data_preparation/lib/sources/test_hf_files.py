@@ -491,7 +491,64 @@ def test_legacy_index_without_revision_upgrades_once_then_guards(hub: FakeHub, t
         FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
 
 
-# --- the reading contract (one dispatch, every format) ------------------------------------------------------------------
+# --- the save clock -----------------------------------------------------------------------------------------------------
+
+
+class _ManualClock:
+    """Hand-advanced stand-in for ``time.monotonic`` (injected as ``FileIndex.clock``)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _index_on_manual_clock(hub: FakeHub, index_dir: Path, files: str) -> tuple[FileIndex, _ManualClock]:
+    """An open index whose save throttle runs on a hand-advanced clock starting at 0.0."""
+    clock = _ManualClock()
+    for name in files:
+        hub.add(f"f/{name}.jsonl", _rows(name, 2))
+    index = FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None)
+    index.clock = clock
+    index.save()  # aligns the throttle with the manual clock (the last write is now at 0.0)
+    return index, clock
+
+
+def _spy_writes(monkeypatch: pytest.MonkeyPatch, clock: _ManualClock) -> list[float]:
+    """The clock reading of every index write from here on."""
+    writes: list[float] = []
+    original = FileIndex._write
+
+    def spy(self: FileIndex) -> None:
+        writes.append(clock.now)
+        original(self)
+
+    monkeypatch.setattr(FileIndex, "_write", spy)
+    return writes
+
+
+def test_index_saves_once_per_read_within_the_save_interval(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    index, clock = _index_on_manual_clock(hub, tmp_path / "index", "abcd")
+    writes = _spy_writes(monkeypatch, clock)
+    assert len(_ids(read_rows(index, 0, 100))) == 8  # four files, each read to its end records its row count
+    assert writes == [0.0]  # no per-file writes inside the interval; only the read's final save (the backstop)
+    assert index.rows == {f"f/{n}.jsonl": 2 for n in "abcd"}
+    _forget_open_indexes()
+    assert FileIndex.open(REPO, REV, "f/*.jsonl", tmp_path / "index", None).rows == index.rows  # all persisted
+
+
+def test_index_saves_between_files_once_the_save_interval_passed(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    index, clock = _index_on_manual_clock(hub, tmp_path / "index", "abc")
+    writes = _spy_writes(monkeypatch, clock)
+    step = hub_files.INDEX_SAVE_INTERVAL_SECONDS + 1.0
+
+    def advance(file: str) -> None:
+        clock.now += step
+
+    assert len(_ids(read_rows(index, 0, 100, on_file=advance))) == 6
+    # each file's record found the interval passed and wrote; the finally saved once more at the end
+    assert writes == [step, 2 * step, 3 * step, 3 * step]
 
 
 def test_every_supported_format_has_a_reader() -> None:

@@ -53,6 +53,7 @@ import itertools
 import json
 import re
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -75,6 +76,7 @@ ROW_BATCH = 1000  # rows decoded from a parquet row group at a time (a whole gro
 STREAM_BLOCK_SIZE = 8 << 20  # fsspec read-ahead for sequential remote streams (fewer, larger range requests)
 STREAM_BUFFER_SIZE = 1 << 16  # local buffer in front of a remote stream (json lines / ijson decode from it)
 PATHS_INFO_BATCH = 500  # paths per `get_paths_info` request
+INDEX_SAVE_INTERVAL_SECONDS = 30.0  # how often at most a persisted FileIndex is rewritten while reading (`_write_if_due`)
 
 
 # --- Hub access (module-level so tests can stub them) --------------------------------------------------------------
@@ -162,7 +164,9 @@ class FileIndex:
     group_counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     resolved_revision: str | None = None  # commit hash the file list was taken at (None: pre-recording index file)
     path: Path | None = None  # where the index is persisted (None: in memory)
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False, compare=False)  # injected by tests
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _last_write: float = field(default=0.0, repr=False, compare=False)  # `clock()` at the last write
 
     @classmethod
     def open(
@@ -254,7 +258,11 @@ class FileIndex:
                 self.sizes.update(sizes)
 
     def save(self) -> None:
-        """Write the index to ``path`` atomically (no-op for an in-memory index); serialised per instance."""
+        """Write the index to ``path`` atomically (no-op for an in-memory index); serialised per instance.
+
+        This is the unconditional backstop of the throttled :meth:`_write_if_due`: `open()` calls it, and so does
+        the ``finally`` of :func:`read_rows_multi` — which also runs when a download completes or the stop flag
+        makes the consumer close the row generator early."""
         if self.path is None:
             return
         with self._lock:
@@ -280,6 +288,18 @@ class FileIndex:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
+        self._last_write = self.clock()
+
+    def _write_if_due(self) -> None:
+        """Write only when :data:`INDEX_SAVE_INTERVAL_SECONDS` have passed since the last write (caller holds
+        ``_lock``).
+
+        The index is a cache of learned row counts — several MB of JSON for a repo of ~12,000 files — and writing
+        it after every finished file rewrote the whole file once per file. Batching on a clock loses at most the
+        last interval's counts in a crash, and a lost count is only re-learned by re-reading that file: never
+        wrong data, just a bounded re-read. :meth:`save` is the unconditional backstop at the end of every read."""
+        if self.clock() - self._last_write >= INDEX_SAVE_INTERVAL_SECONDS:
+            self._write()
 
     def count(self, key: str | None, file: str) -> int | None:
         """Known row count of ``file`` (``key=None``: all rows; else the ``counts[key]`` counter), or None."""
@@ -288,20 +308,21 @@ class FileIndex:
         return self.counts.get(key, {}).get(file)
 
     def record(self, key: str | None, file: str, value: int) -> None:
-        """Store the row count of ``file`` (``key=None``: all rows; else the ``counts[key]`` counter) and save."""
+        """Store the row count of ``file`` (``key=None``: all rows; else the ``counts[key]`` counter) and save on
+        the clock (:meth:`_write_if_due`; the end of the read saves unconditionally)."""
         with self._lock:
             if key is None:
                 self.rows[file] = value
             else:
                 self.counts.setdefault(key, {})[file] = value
-            self._write()
+            self._write_if_due()
 
     def record_row_groups(self, file: str, groups: list[int]) -> None:
-        """Store a parquet file's row-group row counts (and thereby its total row count)."""
+        """Store a parquet file's row-group row counts (and thereby its total row count); save on the clock."""
         with self._lock:
             self.row_groups[file] = groups
             self.rows[file] = sum(groups)
-            self._write()
+            self._write_if_due()
 
     def known_group_counts(self, key: str | None, file: str) -> list[int]:
         """Rows per row group of ``file`` that count towards ``key`` (``key=None``: the footer's row counts; else the
@@ -312,9 +333,9 @@ class FileIndex:
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
         """Store (a copy of) the matching rows per row group read so far under ``key`` (a prefix of the file's
-        groups) in memory; the index is written when a file is finished (``record``) and when a read ends
-        (``save``) — not once per row group, which for a repo of hundreds of files and thousands of row groups
-        would rewrite the whole JSON thousands of times."""
+        groups) in memory; the index is written on the save clock (``record`` / :meth:`_write_if_due`) and when a
+        read ends (``save``) — not once per row group, which for a repo of hundreds of files and thousands of row
+        groups would rewrite the whole JSON thousands of times."""
         with self._lock:
             self.group_counts.setdefault(key, {})[file] = list(groups)
 
