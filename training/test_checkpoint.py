@@ -13,8 +13,10 @@ from model import RecurrentGPT, build_model
 from training.backend import SingleDeviceBackend
 from training.checkpoint import (
     CHECKPOINT_SUBDIR,
+    NUMERICS_SETTINGS,
     CheckpointMetadata,
     _step_from_name,
+    check_settings_unchanged,
     checkpoint_dir,
     checkpoint_name,
     checkpoint_path,
@@ -179,6 +181,65 @@ def test_is_checkpoint_step_table() -> None:
     assert [s for s in range(1, 21) if is_checkpoint_step(no_interval, s, stage_manager)] == [12]  # stage end only
     last_only = _settings(save_step_interval=0, save_last_step=True)
     assert [s for s in range(1, 26) if is_checkpoint_step(last_only, s, stage_manager)] == [12, *range(20, 26)]
+
+
+# --- the resume compatibility check ------------------------------------------------------------------------------------
+
+# One differing value per numerics-relevant setting (the defaults are in `training/settings.py`).
+CHANGED_NUMERICS_VALUES: dict[str, Any] = {
+    "world_batch_size": 2048,
+    "micro_batch_size": 2,
+    "seed": 7,
+    "stage_base_lrs": [2e-3],
+    "lr_schedule": "cosine",
+    "warmup_steps": 5,
+    "cooldown_steps": 5,
+    "min_lr": 1e-6,
+    "grad_clip": 0.5,
+    "optimizer": "AdamW",
+    "optim_config": {"lr": 2e-4, "weight_decay": 4e-5, "betas": (0.9, 0.95)},
+    "no_weight_decay_for_bias_and_norm_params": False,
+    "block_size": 128,
+    "dataloader_num_workers": 0,
+    "sort_batches_by_length": False,
+    "sequence_padding_multiple": 64,
+    "precision": "32",
+    "eval_step_interval": 7,
+    "eval_iters": 3,
+    "partial_depth_eval": [2],
+}
+
+
+def test_every_numerics_setting_is_a_settings_field_with_a_case_here() -> None:
+    assert set(NUMERICS_SETTINGS) <= {f.name for f in fields(Settings)}
+    assert set(CHANGED_NUMERICS_VALUES) == set(NUMERICS_SETTINGS)
+
+
+def test_check_settings_unchanged_catches_every_numerics_setting(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    """Each entry of `NUMERICS_SETTINGS` fails a resume on its own — the eval knobs included: every forward draws
+    from the global torch RNG, so how often and how widely validation runs changes the training stream itself."""
+    metadata = _metadata(backend, tiny_model)
+    config = tiny_model.config.to_dict()
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), config, False)  # nothing changed
+    for key, value in CHANGED_NUMERICS_VALUES.items():
+        changed = _settings(**({"run_name": "tiny", "seed": 42} | {key: value}))
+        with pytest.raises(ValueError, match=rf"resuming with changed \['{key}'\]"):
+            check_settings_unchanged(metadata, changed, config, False)
+        check_settings_unchanged(metadata, changed, config, True)  # allow_settings_change
+
+
+def test_check_settings_unchanged_ignores_the_settings_that_are_not_numerics(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT
+) -> None:
+    """Paths, run bookkeeping, logging and the resume features themselves may differ from the checkpoint."""
+    metadata = _metadata(backend, tiny_model)
+    harmless = _settings(
+        run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
+        resume_warmup_steps=10, wandb_enabled=False, export_to_hf=True,
+    )
+    check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
+    with pytest.raises(ValueError, match=r"resuming with changed \['model_config'\]"):
+        check_settings_unchanged(metadata, harmless, {"n_embd": 1}, False)
 
 
 # --- save / load -----------------------------------------------------------------------------------------------------

@@ -87,22 +87,33 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
 
 # Settings whose value changes the numbers a run produces: a resume that silently mixes two configurations of these
 # is a chimera, so `restore_checkpoint_if_resuming` compares them against the checkpoint (`allow_settings_change`
-# overrides). Deliberately absent: paths, run_name, resume/logging/export knobs, `resume_warmup_steps` (a resume
-# feature by design) and the dataset config (its own hash check).
+# overrides). The evaluation knobs are here because every forward consumes the global torch RNG (the meta check and
+# the latent `randn_like` of the recurrence): how often validation runs, how many batches it draws and at how many
+# depths it scores each of them all change the training stream itself, not just the reported numbers — and so does
+# `dataloader_num_workers`, which changes how the workers hand batches over. Deliberately absent: paths, run_name,
+# resume/logging/export knobs, `resume_warmup_steps` (a resume feature by design) and the dataset config (its own
+# hash check).
 NUMERICS_SETTINGS = (
     "world_batch_size",
     "micro_batch_size",
     "seed",
     "stage_base_lrs",
+    "lr_schedule",
     "warmup_steps",
     "cooldown_steps",
+    "min_lr",
     "grad_clip",
     "optimizer",
     "optim_config",
+    "no_weight_decay_for_bias_and_norm_params",
     "block_size",
+    "dataloader_num_workers",
     "sort_batches_by_length",
     "sequence_padding_multiple",
     "precision",
+    "eval_step_interval",
+    "eval_iters",
+    "partial_depth_eval",
 )
 
 
