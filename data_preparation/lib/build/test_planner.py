@@ -21,7 +21,7 @@ from data_preparation.dataset_config import (
     TokenizerConfig,
 )
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.build import prepare
+from data_preparation.lib.build import prepare, status
 from data_preparation.lib.build.planner import (
     DatasetReport,
     Satisfaction,
@@ -228,12 +228,12 @@ def test_the_satisfaction_cases() -> None:
 
 
 def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
-    """Raw is long enough but only 20 of 100 rows survived the build: the shortfall (84 − 20) is divided by the
-    observed yield (0.2) and multiplied by the same 1.2 safety margin the first download uses."""
-    short = _ledger(processed_rows=20, training_rows=20)
-    assert short.rows_to_fetch() == 384 == ceil((84 - 20) * Fraction("1.2") / Fraction(20, 100))
-    assert short.download().rows_target == 100 + 384, "the download takes a target, not an increment"
-    assert "top-up: 20 of 84 rows survived 100 raw" in short.download().reason
+    """Raw is long enough but only 60 of 100 rows survived the build: the shortfall (84 − 60) is divided by the
+    observed yield (0.6) and multiplied by the same 1.2 safety margin the first download uses."""
+    short = _ledger(processed_rows=60, training_rows=60)
+    assert short.rows_to_fetch() == 48 == ceil((84 - 60) * Fraction("1.2") / Fraction(60, 100))
+    assert short.download().rows_target == 100 + 48, "the download takes a target, not an increment"
+    assert "top-up: 60 of 84 rows survived 100 raw" in short.download().reason
 
     assert _ledger(raw_rows=50, processed_rows=45, training_rows=45).rows_to_fetch() == 50  # raw itself is short
     assert _ledger(processed_rows=20, exhausted=True).rows_to_fetch() == 0  # nothing left to fetch
@@ -241,6 +241,21 @@ def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
     nothing_survives = _ledger(processed_rows=0)
     assert nothing_survives.rows_to_fetch() == 0  # no yield to extrapolate from: more raw would be dropped too
     assert nothing_survives.download().reason == "no row of 100 raw rows survives the build"
+
+
+def test_the_top_up_is_capped_at_the_full_requirement(caplog: pytest.LogCaptureFixture) -> None:
+    """A pathological yield (1 of 1,200 rows) extrapolates to a download nobody wants: the round asks for at most
+    `rows_needed`, with a warning, and the next round measures the yield again on more data."""
+    pathological = _ledger(raw_rows=1200, processed_rows=1, training_rows=1)
+    assert ceil((84 - 1) * Fraction("1.2") * 1200) == 119_520  # what the yield extrapolates to
+    with caplog.at_level("WARNING", logger="data_preparation"):
+        assert pathological.rows_to_fetch() == 100 == pathological.rows_needed
+    assert "capping this round at the full requirement of 100 rows" in caplog.text
+    assert "top-up: 1 of 84 rows survived 1,200 raw" in pathological.download().reason
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="data_preparation"):
+        assert _ledger(processed_rows=60, training_rows=60).rows_to_fetch() == 48  # under the cap: unchanged, no warning
+    assert caplog.text == ""
 
 
 # --- satisfaction ---------------------------------------------------------------------------------------------------
@@ -280,6 +295,25 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
     a = source_state(bigger, "a", layout)
     assert not a.satisfied and a.reason == "processed behind raw" and a.raw_rows == 253 and 0 < a.processed_rows < 253
     assert sources_with_pending_raw_shards(bigger, layout) == ["a", "b"]
+
+
+def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """`Manifest.load` raises next to shards — right for raw, wrong for the derived processed folder the repair step
+    deletes without asking: `status` (and `prepare --dry_run`, and training's auto-prepare) must report it."""
+    cfg = two_stage_cfg()
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=False)
+    (layout.processed_dir("b") / "MANIFEST.json").write_text("{ not json")
+
+    b = source_state(cfg, "b", layout)
+    assert not b.satisfied and b.processed_rows == 0 and b.raw_rows == 60
+    assert b.reason == "processed manifest unreadable: the repair step deletes the folder and builds it again"
+    assert not every_source_satisfies_its_budget(cfg, layout) and sources_with_pending_raw_shards(cfg, layout) == ["b"]
+    assert [s.name for s in plan_downloads(cfg, layout).to_fetch()] == []  # raw is complete; the build is what is missing
+
+    report = status(path, layout.root)  # used to crash with "unreadable manifest ... next to shards"
+    assert not report.complete and "b" in report.missing() and "b" in report.needs_repair
+    assert prepare(path, layout.root, assume_yes=False).complete  # and the repair step heals it
 
 
 def test_short_processed_folder_is_not_satisfied(layout: DatasetLayout, config_file: ConfigFile) -> None:

@@ -32,13 +32,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
 from math import ceil
+from pathlib import Path
 from typing import Literal
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
+from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
-from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
 from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted, rejected_rows
+
+log = get_logger(__name__)
 
 _MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not 60.000000000000007
 
@@ -98,9 +102,24 @@ def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
     return limit is not None and limit <= reached
 
 
+def load_processed_manifest(directory: Path) -> Manifest | None:
+    """The processed manifest in ``directory``, or None when it is absent **or unreadable**.
+
+    ``Manifest.load`` raises next to shards, which is the right caution for a raw folder (expensive, never guessed)
+    but not for a derived one: the repair step deletes an unreadable *processed* folder without asking and the build
+    writes it again, so the planner must report that folder as not built instead of crashing ``status`` /
+    ``prepare --dry_run`` (and training's auto-prepare, which runs status first) on the very state repair heals.
+    Raw manifests keep raising.
+    """
+    try:
+        return Manifest.load(directory)
+    except RuntimeError:
+        return None
+
+
 def current_processed_manifest(config: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
     """The processed manifest of ``name`` when it carries the current ``processed_hash`` and the current columns."""
-    manifest = Manifest.load(layout.processed_dir(name))
+    manifest = load_processed_manifest(layout.processed_dir(name))
     if manifest is None or manifest.stage != "processed" or not manifest.is_current(config.processed_hash(name)):
         return None
     if manifest.extra.get("columns") != list(processed_columns(config.sources[name].kind)):
@@ -275,9 +294,14 @@ class Satisfaction(Enum):
         return self in (Satisfaction.OK, Satisfaction.EXHAUSTED_SMALL)
 
 
-ProcessedState = Literal["missing", "stale", "behind_raw", "built"]
+ProcessedState = Literal["missing", "unreadable", "stale", "behind_raw", "built"]
 
-_PROCESSED_PROBLEM: dict[str, str] = {"missing": "processed missing", "stale": "processed stale", "behind_raw": "processed behind raw"}
+_PROCESSED_PROBLEM: dict[str, str] = {
+    "missing": "processed missing",
+    "unreadable": "processed manifest unreadable: the repair step deletes the folder and builds it again",
+    "stale": "processed stale",
+    "behind_raw": "processed behind raw",
+}
 
 
 @dataclass(frozen=True)
@@ -336,11 +360,25 @@ class SourceLedger:
         """Raw rows to add when the build dropped more than the ``SAFETY_MARGIN`` covers: the shortfall in processed
         rows divided by the yield this source actually showed (``processed ÷ raw``) and multiplied by the same margin
         the first download uses — the yield is one measurement, and overshooting costs a few rows while
-        undershooting costs another round. 0 when there is no yield to extrapolate from."""
+        undershooting costs another round. 0 when there is no yield to extrapolate from.
+
+        **Capped at** :attr:`rows_needed`, the full requirement of the budget: a pathological yield (0.08 % of the
+        rows surviving, say) extrapolates to billions of rows and would ask the loader for a download nobody wants.
+        This is a runtime measurement going wrong mid-download, not a config mistake, so the round is capped with a
+        warning and the next round measures the yield again on more data.
+        """
         if self.raw_rows <= 0 or self.processed_rows <= 0:
             return 0
         observed_yield = Fraction(self.processed_rows, self.raw_rows)
-        return ceil((self.rows_sufficient - self.processed_rows) * _MARGIN / observed_yield)
+        wanted = ceil((self.rows_sufficient - self.processed_rows) * _MARGIN / observed_yield)
+        if wanted <= self.rows_needed:
+            return wanted
+        log.warning(
+            "%s: only %.3f%% of %s raw rows survived the build; a top-up of %s rows would serve the budget — "
+            "capping this round at the full requirement of %s rows",
+            self.name, 100 * float(observed_yield), f"{self.raw_rows:,}", f"{wanted:,}", f"{self.rows_needed:,}",
+        )
+        return self.rows_needed
 
     # --- is it done ------------------------------------------------------------------------------------------------
 
@@ -428,10 +466,22 @@ def _processed_state(config: DatasetConfig, name: str, layout: DatasetLayout, ra
     """The state of ``processed/<name>`` against the current raw shards, and the rows it holds (0 unless current)."""
     processed = current_processed_manifest(config, name, layout)
     if processed is None:
-        return ("missing" if Manifest.load(layout.processed_dir(name)) is None else "stale"), 0
+        return _unusable_processed_state(name, layout.processed_dir(name)), 0
     if not processed_covers_raw(processed, raw):
         return "behind_raw", processed.rows()
     return "built", processed.rows()
+
+
+def _unusable_processed_state(name: str, directory: Path) -> ProcessedState:
+    """Why ``directory`` holds no current manifest: none at all, one that cannot be read, or one from another
+    config. All three mean "build it again"; the unreadable one is the repair step's deletion (it needs no
+    confirmation, processed data is derived), reported here instead of raised."""
+    if load_processed_manifest(directory) is not None:
+        return "stale"
+    if (directory / MANIFEST_NAME).is_file():
+        log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, directory)
+        return "unreadable"
+    return "missing"
 
 
 def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> list[SourceLedger]:
@@ -497,6 +547,7 @@ __all__ = [
     "current_processed_manifest",
     "every_source_satisfies_its_budget",
     "format_table",
+    "load_processed_manifest",
     "plan_downloads",
     "processed_covers_raw",
     "raw_is_exhausted",

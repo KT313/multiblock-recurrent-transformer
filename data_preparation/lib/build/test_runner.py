@@ -140,14 +140,15 @@ def test_a_source_still_short_after_max_rounds_is_reported(
     assert not p.satisfied and p.reason == f"processed rows 5 < {sufficient}" and f"p: processed rows 5 < {sufficient}" in caplog.text
 
 
-def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_a_second_round(
+def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The 20 % safety margin does not always cover what the build drops — here four of every five rows are exact
     duplicates. Round 1 downloads `rows_needed` raw rows and lands far short of `rows_sufficient` processed ones;
-    round 2 sees that raw is long enough but *processed* is not and tops the source up by the shortfall scaled with
-    the yield it showed. Before the ledger the plan only looked at raw rows: it planned nothing, the round loop gave
-    up, and `prepare` failed with no way to make progress (open finding H5)."""
+    the next rounds see that raw is long enough but *processed* is not and top the source up from the yield it
+    showed — no round asking for more than the full requirement (`_top_up_rows` caps it, so one bad yield
+    measurement cannot ask the loader for billions of rows). Before the ledger the plan only looked at raw rows: it
+    planned nothing, the round loop gave up, and `prepare` failed with no way to make progress (open finding H5)."""
     src_dir = layout.root.parent / "dupes"
     rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
     write_local(src_dir, rows, "parquet")
@@ -159,7 +160,10 @@ def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_a_second_round(
     assert report.complete and d.satisfied and not d.exhausted and d.reason == "ok"
     assert (needed, sufficient) == (632, 527) and d.processed_rows >= sufficient
     assert d.raw_rows > needed, "the top-up fetched beyond the budget, sized from the observed yield"
-    assert "round 2: 1 source(s) short" in caplog.text and "round 3" not in caplog.text
+    assert "round 2: 1 source(s) short" in caplog.text  # round 1 did not serve the budget
+    planned = [int(line.split("downloading ")[1].split(" rows")[0].replace(",", "")) for line in caplog.text.splitlines() if "source(s) short, downloading" in line]
+    assert len(planned) >= 2 and max(planned) <= needed, f"every round is capped at the full requirement, got {planned}"
+    assert f"capping this round at the full requirement of {needed:,} rows" in caplog.text
     assert plan_downloads(cfg, layout).total_rows_to_fetch() == 0
 
 
