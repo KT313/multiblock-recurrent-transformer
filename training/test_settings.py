@@ -43,7 +43,6 @@ CROW_EXPLICIT: dict[str, Any] = {
     "gradient_checkpointing": False,
     "micro_batch_size": 4,
     "world_batch_size": 1024,
-    "dataloader_num_workers": 8,
     "sort_batches_by_length": True,
     "sequence_padding_multiple": 128,
     "optimizer": "ELLISAdam",

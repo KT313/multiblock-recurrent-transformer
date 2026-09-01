@@ -192,7 +192,6 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "stage_base_lrs": [2e-3],
     "seed": 7,
     "block_size": 128,
-    "dataloader_num_workers": 0,
     "sort_batches_by_length": False,
     "sequence_padding_multiple": 64,
     "backend": "future_ddp",

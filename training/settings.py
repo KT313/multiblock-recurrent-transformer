@@ -91,8 +91,7 @@ class Settings:
     block_size: int = 2048  # sequence length; must equal the block_size of the architecture config and of the
     # dataset config (the planner sized the data in sequences of it; <= max_seq_length follows from the schema)
 
-    # Data loading
-    dataloader_num_workers: int = 4
+    # Data loading (train loaders always run one worker per source; there is no worker-count knob)
     sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
     sequence_padding_multiple: Optional[int] = 128  # pad micro-batches to a multiple of this (None: max length)
 

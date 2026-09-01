@@ -91,8 +91,7 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
 # from the checkpoint is harmless. Deliberately NOT exempt, although they look like reporting knobs: the evaluation
 # settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`) — every forward consumes the global torch RNG
 # (the meta check and the latent `randn_like` of the recurrence), so how often validation runs, how many batches it
-# draws and at how many depths it scores them change the training stream itself — and `dataloader_num_workers`,
-# which changes how the workers hand batches over.
+# draws and at how many depths it scores them change the training stream itself.
 SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # run identity and output location: where results go, not what is computed
     "run_name",

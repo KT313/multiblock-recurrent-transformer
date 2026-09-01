@@ -27,7 +27,6 @@ gradient_checkpointing: false
 
 micro_batch_size: 2
 world_batch_size: 4
-dataloader_num_workers: 0
 sort_batches_by_length: true
 sequence_padding_multiple: 128
 

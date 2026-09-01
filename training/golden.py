@@ -84,7 +84,7 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
     """The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms), reduced to its numerics.
 
     `config/tiny.yaml` with `precision: "32"`, `wandb_enabled: false`, `export_to_hf: false`,
-    `dataloader_num_workers: 0`, `resume: false` and `out_dir` in a temporary directory, through
+    `resume: false` and `out_dir` in a temporary directory, through
     `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"))`. Returns
     `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss, val_loss_<depth>...]}}, "checkpoints": [file names],
     "optimizer_steps": number of optimizer.step() calls, "parameter_norms": {name: L2 norm in the final checkpoint}}`.
@@ -101,7 +101,6 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
             precision='"32"',
             wandb_enabled="false",
             export_to_hf="false",
-            dataloader_num_workers="0",
             resume="false",
         )
         settings = parse_settings(["--config", str(yaml_path)])
