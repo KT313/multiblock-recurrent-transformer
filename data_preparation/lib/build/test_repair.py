@@ -220,6 +220,32 @@ def test_processed_shards_without_a_manifest_are_deleted(cfg_factory: CfgFactory
     assert not layout.processed_dir("a").exists()
 
 
+def test_an_unlisted_processed_shard_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """A shard on disk that the manifest does not list (a crash between publishing and saving) used to be invisible
+    here while the training resolver refused the folder — the repair step must be the one that heals it."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    folder = layout.processed_dir("a")
+    existing = sorted(folder.glob("data-*.parquet"))[0]
+    stray = folder / "data-00099.parquet"
+    stray.write_bytes(existing.read_bytes())
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _kinds(report) == [("a", "processed", "delete")]
+    assert report.actions[0].reason == "unlisted shard(s): data-00099.parquet"
+    assert not folder.exists()
+
+
+def test_an_unreadable_processed_manifest_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """Derived data is deleted without asking; a corrupt processed MANIFEST.json used to abort the run instead."""
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    folder = layout.processed_dir("a")
+    (folder / "MANIFEST.json").write_text("{ not json")
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _kinds(report) == [("a", "processed", "delete")]
+    assert report.actions[0].reason == "unreadable manifest"
+    assert not folder.exists()
+
+
+
 def test_processed_built_from_a_raw_folder_that_disappeared_is_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     shutil.rmtree(layout.raw_dir("a"))

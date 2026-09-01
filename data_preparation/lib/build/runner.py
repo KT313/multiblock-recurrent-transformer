@@ -384,6 +384,13 @@ def wait_for_jobs(pools: list[JobPool], flag: StopFlag) -> list[BaseException]:
         cancel_all(pools)
         log.warning("interrupted; the running jobs stop at their next shard, everything published so far is kept")
         failures.append(BuildAborted("interrupted; everything published so far is kept, rerun to resume"))
+    except BaseException:
+        # a crash in an `on_success` follow-up (main-thread code) must stop the running jobs like a job
+        # failure would — otherwise the pool exits block on downloads polling a flag nobody raised
+        flag.stop("a follow-up after a finished job failed")
+        cancel_all(pools)
+        log.exception("follow-up after a finished job failed; the running jobs stop at their next shard")
+        raise
     return failures
 
 

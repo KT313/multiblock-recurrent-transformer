@@ -8,6 +8,8 @@ import json
 import logging
 import re
 import shutil
+import subprocess
+import sys
 from dataclasses import fields
 from fractions import Fraction
 from math import ceil
@@ -215,6 +217,7 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
         assert sum(e.weight for e in train) == pytest.approx(1.0)
 
 
+
 def test_same_source_same_split_in_every_stage(crow_cfg: DatasetConfig) -> None:
     layout = DatasetLayout(Path("dataset"))
     validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
@@ -374,13 +377,18 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
 
 
-def test_resolve_dataset_rejects_an_unlisted_shard(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """A shard the manifest does not list used to be a dead end: status said complete, training refused, repair saw
+    nothing. Now the repair step owns it — without auto_prepare the run fails saying the dataset needs repair, with
+    auto_prepare the derived folder is rebuilt and the run proceeds."""
     root = tmp_path / "ds"
     shutil.copytree(tiny_dataset_dir, root)
     folder = DatasetLayout(root).processed_dir("synthetic_instruct")
     shutil.copy(folder / "data-00000.parquet", folder / "data-00001.parquet")
-    with pytest.raises(RuntimeError, match=f"source 'synthetic_instruct' \\(stage keys finetune.train, finetune.val\\): {MANIFEST_NAME} of {re.escape(str(folder))} lists"):
-        resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))  # the planner is satisfied, the resolver is not
+    with pytest.raises(RuntimeError, match="not prepared .*auto_prepare is off.*synthetic_instruct"):
+        resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
+    resolved = resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=True))
+    assert isinstance(resolved, ResolvedDataset) and not (folder / "data-00001.parquet").exists()
 
 
 # --- resolve_dataset -------------------------------------------------------------------------------------------------

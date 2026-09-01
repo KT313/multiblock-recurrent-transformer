@@ -37,6 +37,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
+from data_preparation.lib.storage.parquet import list_parquet_files
 from data_preparation.lib.storage.raw_folder import RawFolder
 
 log = get_logger(__name__)
@@ -187,8 +188,16 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
 
 def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
     """Plan what happens to the processed folder of ``name`` given the raw shards it will be able to build from
-    (None: the raw folder is being deleted). Every problem is a deletion; derived data needs no confirmation."""
-    manifest = Manifest.load(folder)
+    (None: the raw folder is being deleted). Every problem is a deletion; derived data needs no confirmation —
+    including an unreadable manifest (`Manifest.load` treats that as an error next to shards, which is right for
+    raw folders; a processed folder is simply rebuilt) and shard files the manifest does not list (left behind by
+    a crash between publishing a shard and saving the manifest; the training resolver refuses such a folder, so
+    the repair step must be the one that heals it)."""
+    try:
+        manifest = Manifest.load(folder)
+    except RuntimeError:
+        _plan(report, name, folder, "processed", "delete", "unreadable manifest")
+        return
     if manifest is None:
         if has_shards(folder):
             _plan(report, name, folder, "processed", "delete", "no manifest")
@@ -202,6 +211,11 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
     _, problem = _good_prefix_length(folder, manifest)
     if problem is not None:
         _plan(report, name, folder, "processed", "delete", f"broken: {problem}")
+        return
+    listed = {shard.name for shard in manifest.shards}
+    unlisted = sorted(path.name for path in list_parquet_files(folder) if path.name not in listed)
+    if unlisted:
+        _plan(report, name, folder, "processed", "delete", f"unlisted shard(s): {', '.join(unlisted)}")
         return
     covered: ShardList = manifest.extra.get("input_shards", [])
     if raw_shards[: len(covered)] != covered:

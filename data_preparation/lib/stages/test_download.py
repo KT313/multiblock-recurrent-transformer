@@ -12,6 +12,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import os
+
 import pytest
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
@@ -23,6 +25,7 @@ from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages.download import (
+    _auto_tokenizer,
     RawFolderError,
     TokenCounter,
     current_manifest,
@@ -484,6 +487,17 @@ def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactor
 
 
 # --- truncation at the token cap, dropped instruct rows, raw manifest state ---------------------------------------------
+
+
+def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rust tokenizer threads plus a later fork is the known `tokenizers` deadlock; loading must set the guard."""
+    monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
+    _auto_tokenizer()
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")  # an explicit user choice is respected
+    _auto_tokenizer()
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
+
 
 
 def test_download_truncates_pretrain_text_at_the_token_cap(

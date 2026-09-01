@@ -348,6 +348,25 @@ def test_an_outer_should_stop_is_honoured(cfg_factory: CfgFactory, layout: Datas
         prepare(path, layout.root, assume_yes=False, should_stop=lambda: True)
 
 
+def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() -> None:
+    """H6: an exception in the main-thread `on_success` follow-up must stop the pools like a job failure would —
+    otherwise the pool exits block on downloads polling a flag nobody raised."""
+    flag = runner.StopFlag()
+    ran: list[str] = []
+
+    def follow_up(job: runner.Job) -> None:
+        raise RuntimeError("follow-up boom")
+
+    pool = runner.JobPool("downloads", max_workers=1, flag=flag, total=2, on_success=follow_up)
+    with pool:
+        pool.submit(runner.Job("source", "a", ("a",), lambda stop: ran.append("a")))
+        pool.submit(runner.Job("source", "b", ("b",), lambda stop: ran.append("b")))
+        with pytest.raises(RuntimeError, match="follow-up boom"):
+            runner.wait_for_jobs([pool], flag)
+        assert flag.should_stop(), "the flag must be raised so running jobs stop at their next shard"
+
+
+
 def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     cfg = _three_sources(cfg_factory)  # no raw folders: nothing pending, and an empty plan: nothing to download
     runner.download_and_build_missing(DownloadPlan(), cfg, layout, steps=set(runner.STEPS), sources=None, max_parallel_downloads=1, num_workers=1)
