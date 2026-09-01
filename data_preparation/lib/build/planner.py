@@ -55,19 +55,12 @@ _MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not
 
 
 def rows_needed(config: DatasetConfig, name: str) -> int:
-    """Raw rows to download for source ``name``.
-
-    A source used for training (and maybe validation): ``ceil(sequence_budget × SAFETY_MARGIN ÷ (1 −
-    validation_fraction_of(name)))`` — the margin covers what the length filter and the dedup drop, the division
-    keeps the *training* part at the sequence budget after the training resolver holds ``validation_fraction`` of
-    the processed rows out. A source used only for validation: its ``rows``. No tokens-per-row estimate is involved
-    (see the module docstring): the trainer draws rows, so rows are what is counted.
-    """
-    source = config.sources[name]
-    if not config.used_in_train(name):
-        return int(source.rows or 0)
-    held_out = Fraction(str(config.validation_fraction_of(name)))
-    return ceil(config.sequence_budget(name) * _MARGIN / (1 - held_out))
+    """Raw rows to download for source ``name``: :meth:`DatasetConfig.rows_needed` — the formula lives in the
+    schema, where the shuffled-build cap reads the same number at config load, so the two cannot drift. In short:
+    the sequence budget times ``SAFETY_MARGIN`` over the training share left by the validation split, or the
+    ``rows`` of a validation-only source. No tokens-per-row estimate is involved (see the module docstring): the
+    trainer draws rows, so rows are what is counted."""
+    return config.rows_needed(name)
 
 
 def rows_sufficient(config: DatasetConfig, name: str) -> int:

@@ -363,6 +363,59 @@ def test_sequence_budget_of_the_crow_config() -> None:
     assert cfg.sequence_budget("flan") == -(-int(150_000_000 * 0.40) // 2048) == 29_297
 
 
+def test_rows_needed_counts_the_margin_and_the_split() -> None:
+    cfg = _build(_minimal())
+    assert cfg.rows_needed("pre") == 21  # ceil(1000/64) = 16 sequences; × 1.2 ÷ (1 − 0.05) = 20.2 -> 21
+    assert cfg.rows_needed("ins") == 11  # ceil(500/64) = 8 sequences; × 1.2 ÷ 0.95 = 10.1 -> 11
+    assert cfg.rows_needed("hold") == 10  # validation-only: its `rows`
+
+
+# --- the shuffled-build row cap ---------------------------------------------------------------------------------------
+
+
+def _over_the_cap_tokens() -> int:
+    """A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (block_size 64, split 0.05):
+    ceil(80e6 / 64) = 1,250,000 sequences; × 1.2 ÷ 0.95 = 1,578,948 rows."""
+    return 80_000_000
+
+
+def test_a_shuffled_source_over_the_build_cap_is_refused_at_load(tmp_path: Path) -> None:
+    """`shuffle: true` builds all-at-once in memory (`lib/stages/build.py`); a config asking that of a huge source
+    would OOM hours in, so it fails at `load_dataset_config` — before `prepare` or auto-prepare do any work (D4)."""
+    d = _minimal()
+    d["sources"]["pre"]["shuffle"] = True
+    d["stages"][0]["tokens"] = _over_the_cap_tokens()
+    with pytest.raises(ValueError, match=re.escape(
+        "pre: shuffle=true builds all-at-once in memory; 1,578,948 rows exceed the limit of 1,000,000. "
+        "Split the source or turn shuffle off. "
+        "(Read-time shuffle for large sources is planned — see reviews/design_decisions.md D4.)"
+    )):
+        load_dataset_config(_write(tmp_path, d))
+    assert dc.SHUFFLED_BUILD_MAX_ROWS == 1_000_000
+
+
+def test_the_build_cap_spares_small_shuffled_and_huge_unshuffled_sources(tmp_path: Path) -> None:
+    small_shuffled = _minimal()
+    small_shuffled["sources"]["pre"]["shuffle"] = True  # 21 rows: far under the cap
+    assert load_dataset_config(_write(tmp_path, small_shuffled)).shuffle_of("pre")
+    huge_unshuffled = _minimal()
+    huge_unshuffled["stages"][0]["tokens"] = _over_the_cap_tokens()  # pretrain defaults to shuffle=False: streams per shard
+    assert _build(huge_unshuffled).rows_needed("pre") == 1_578_948
+
+
+def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> None:
+    instruct = _minimal()
+    instruct["stages"][1]["tokens"] = _over_the_cap_tokens()  # `ins` never sets shuffle; instruct defaults to True
+    with pytest.raises(ValueError, match="ins: shuffle=true builds all-at-once"):
+        _build(instruct)
+    val_only = _minimal()
+    val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows`
+    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,000,000 rows"):
+        _build(val_only)
+    val_only["sources"]["hold"]["rows"] = 10
+    assert _build(val_only).rows_needed("hold") == 10
+
+
 def test_source_processing_override() -> None:
     d = _minimal()
     d["sources"]["pre"]["processing"] = {"min_chars": 7, "quality_filter": True}

@@ -95,6 +95,13 @@ def test_rows_needed_takes_the_largest_stage_and_scales_with_block_size() -> Non
     assert rows_needed(wide, "b") == 30
 
 
+def test_rows_needed_is_the_schema_formula() -> None:
+    """The planner delegates to `DatasetConfig.rows_needed` — the number the shuffled-build cap checks at config
+    load — so the two views of the requirement cannot drift."""
+    cfg = two_stage_cfg()
+    assert [rows_needed(cfg, name) for name in cfg.sources] == [cfg.rows_needed(name) for name in cfg.sources]
+
+
 def test_rows_needed_of_a_validation_only_source_is_its_rows() -> None:
     assert rows_needed(two_stage_cfg(rows_h=8), "h") == 8
     assert rows_needed(two_stage_cfg(rows_h=20), "h") == 20

@@ -23,6 +23,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
+from fractions import Fraction
 from math import ceil
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -47,6 +48,10 @@ DEFAULT_BENCHMARKS = [
     "winogrande_test",
 ]
 SAFETY_MARGIN = 1.2  # rows downloaded = sequence budget × this (covers what the length filter / dedup drop; planner)
+
+SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
+# derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
+# (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
 
 # Top-level / source keys of the pre-restructure schema, with the hint shown when a YAML still uses them.
 REMOVED_KEYS: dict[str, str] = {
@@ -383,6 +388,7 @@ class DatasetConfig:
                 self._check_stage_key(stage.name, key)
         self._check_source_usage()
         self._check_dedup_modes()
+        self._check_shuffled_build_sizes()
 
     def _check_stage_key(self, stage_name: str, key: str) -> None:
         """A stage key is the plain name of a declared source."""
@@ -422,6 +428,23 @@ class DatasetConfig:
                     f"source {name!r}: dedup.mode=minhash is not implemented for instruct sources (only pretrain "
                     "sources run the near-duplicate pass) — use dedup.mode=exact, and set minhash in the "
                     "`processing` block of each pretrain source instead of the dataset-level one"
+                )
+
+    def _check_shuffled_build_sizes(self) -> None:
+        """A shuffled source is built all-at-once: every processed row is held in memory, shuffled, then written
+        (`lib/stages/build.py`). A config can legally ask that of a huge source and OOM hours into the build, so a
+        shuffled source whose planned row requirement (:meth:`rows_needed`, the planner's number) exceeds
+        `SHUFFLED_BUILD_MAX_ROWS` is refused here — both `prepare.py` and training's auto-prepare load the config
+        before any work."""
+        for name in self.sources:
+            if not self.shuffle_of(name):
+                continue
+            needed = self.rows_needed(name)
+            if needed > SHUFFLED_BUILD_MAX_ROWS:
+                raise ValueError(
+                    f"{name}: shuffle=true builds all-at-once in memory; {needed:,} rows exceed the limit of "
+                    f"{SHUFFLED_BUILD_MAX_ROWS:,}. Split the source or turn shuffle off. "
+                    "(Read-time shuffle for large sources is planned — see reviews/design_decisions.md D4.)"
                 )
 
     # --- source usage ----------------------------------------------------------------------------------------------
@@ -471,6 +494,20 @@ class DatasetConfig:
             if weight:
                 budget = max(budget, ceil(stage.tokens * weight / self.block_size))
         return budget
+
+    def rows_needed(self, source_name: str) -> int:
+        """Raw rows to download for the source — THE definition of the planner's row requirement
+        (`lib/build/planner.py:rows_needed` delegates here, and `_check_shuffled_build_sizes` reads the same number,
+        so the two cannot drift). A source used for training (and maybe validation): ``ceil(sequence_budget ×
+        SAFETY_MARGIN ÷ (1 − validation_fraction_of(name)))`` — the margin covers what the length filter and the
+        dedup drop, the division keeps the *training* part at the sequence budget after the training resolver holds
+        ``validation_fraction`` of the processed rows out. A source used only for validation: its ``rows``. Exact
+        `Fraction` arithmetic: 50 × 1.2 is 60, not 60.000000000000007."""
+        source = self.sources[source_name]
+        if not self.used_in_train(source_name):
+            return int(source.rows or 0)
+        held_out = Fraction(str(self.validation_fraction_of(source_name)))
+        return ceil(self.sequence_budget(source_name) * Fraction(str(SAFETY_MARGIN)) / (1 - held_out))
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
