@@ -39,11 +39,13 @@ from training.data.dataset_resolver import (
     build_command,
     check_dataset_unchanged,
     check_entries_on_disk,
+    check_validation_batches,
     processed_rows,
     resolve_dataset,
     resolve_entries,
     resolve_splits,
     validate_settings,
+    validation_batches_available,
     validation_rows_of,
 )
 from training.data.datasets import ParquetTextDataset
@@ -384,6 +386,66 @@ def test_check_entries_on_disk_names_the_stage_key(tmp_path: Path, tiny_pretrain
         check_entries_on_disk([_stage([], [DataEntry("s-a", good, max_rows=0)])])
 
 
+# --- the validation data an evaluation needs --------------------------------------------------------------------------
+
+
+def test_validation_batches_available_counts_only_finite_loaders(tiny_pretrain_dir: Path) -> None:
+    """A one-entry validation loader is one finite epoch over its row range (`ceil(rows / micro_batch_size)`
+    batches, the rows dealt over `world_size` shards); a loader over several entries mixes them through
+    `WeightedMixtureDataset`, which restarts exhausted members and therefore never runs out (`None`)."""
+    good = str(tiny_pretrain_dir)
+    total = _rows_in(tiny_pretrain_dir)
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], micro_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], micro_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], micro_batch_size=2, world_size=4) == 1
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], micro_batch_size=2, world_size=4) == 0
+    assert validation_batches_available([DataEntry("s-a", good)], micro_batch_size=1, world_size=1) == total
+    assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], 4, 1) == 1  # a short last batch
+    mixture = [DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)]
+    assert validation_batches_available(mixture, micro_batch_size=4, world_size=1) is None  # restarts, never short
+
+
+def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
+    tiny_pretrain_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Too little validation data is caught at setup, not at the first evaluation step: no batch at all is a hard
+    error naming the stage, the entries and both numbers; fewer batches than `eval_iters` is a warning (`evaluate`
+    averages the batches it gets), and enough data passes silently."""
+    good = str(tiny_pretrain_dir)
+    stage = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=4)])
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_validation_batches([stage], micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
+    assert caplog.text == ""
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_validation_batches([stage], micro_batch_size=8, eval_iters=1)  # one short batch is still a batch
+    assert caplog.text == ""
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_validation_batches([stage], micro_batch_size=2, eval_iters=5)
+    assert "stage s: its validation data (s-a) yields 2 micro-batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
+    # nothing at all reaches a rank (here: 4 rows dealt over 8 ranks, the last two get none) is the hard error
+    with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
+        check_validation_batches([stage], micro_batch_size=2, eval_iters=1, world_size=8)
+    # a validation loader that mixes several sources restarts them and is never short, whatever the row counts are
+    mixed = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        caplog.clear()
+        check_validation_batches([mixed], micro_batch_size=8, eval_iters=50)
+    assert caplog.text == ""
+
+
+def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
+    tiny_dataset_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The tiny dataset's finetune validation split is a couple of rows — enough for one micro-batch (the run is
+    fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so."""
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        resolved = resolve_dataset(settings)
+    assert resolved.validation_rows["synthetic_instruct"] < 2 * 2  # fewer rows than eval_iters micro-batches
+    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 1 micro-batch(es)" in caplog.text
+    assert "stage pretrain_a" not in caplog.text  # the pretrain split is long enough
+
+
 def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A planner that claims completeness does not save a run whose processed folder is missing."""
     import training.data.dataset_resolver as resolver_module
@@ -492,6 +554,7 @@ def test_auto_prepare_forwards_the_stop_request_to_the_build(tmp_path: Path) -> 
 class _FakeBackend:
     def __init__(self, is_main: bool) -> None:
         self.is_main = is_main
+        self.world_size = 1  # the resolver reads it for `check_validation_batches`
         self.barriers = 0
 
     def barrier(self) -> None:

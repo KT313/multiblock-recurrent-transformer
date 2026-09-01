@@ -8,6 +8,8 @@ holds out its first `ceil(validation_fraction_of(source) × rows)` processed row
 and trains on the rest. Rows are counted from the parquet footers of `processed/<source>` and cross-checked against
 the manifest; the same source gets the same split in every stage. The chosen `validation_rows` per source travel
 with every checkpoint next to `dataset_config_hash` and are verified on resume (`check_dataset_unchanged`).
+The split is also checked against what evaluation needs (`check_validation_batches`): a stage whose validation
+loader cannot fill one micro-batch fails here, at setup, instead of at the first evaluation step.
 
 Framework-neutral apart from `data_preparation.*` (manifests, parquet footers); no torch. The only cross-over
 between the run config and the dataset config happens here.
@@ -60,9 +62,11 @@ class DataEntry:
 
 
 class _MainRankBarrier(Protocol):
-    """The two `training.backend.Backend` members the resolver needs (kept as a Protocol to stay torch-free)."""
+    """The `training.backend.Backend` members the resolver needs (kept as a Protocol to stay torch-free):
+    `is_main` / `barrier` for the build, `world_size` for the validation-batch check."""
 
     is_main: bool
+    world_size: int
 
     def barrier(self) -> None: ...
 
@@ -245,6 +249,71 @@ def check_entries_on_disk(stages: list[ResolvedStage]) -> None:
                     )
 
 
+def validation_batches_available(entries: list[DataEntry], micro_batch_size: int, world_size: int) -> int | None:
+    """How many micro-batches one evaluation can draw from a stage's validation loader; `None` = unbounded.
+
+    What `training.data.loader.build_dataloader` builds decides this, and the two cases differ fundamentally:
+
+    * ONE entry: the loader reads that single `ParquetTextDataset` directly. One `__iter__` is one epoch over the
+      entry's row range and then stops, so the loader is FINITE — `ceil(rows / micro_batch_size)` batches (the last
+      one short; `drop_last` is off). This is the case that can come up short of `eval_iters`.
+    * SEVERAL entries: the loader reads a `WeightedMixtureDataset`, which restarts every member that runs out and
+      therefore never raises `StopIteration`. Such a loader always delivers `eval_iters` batches (with repeated
+      rows once the smallest member has wrapped around), so there is nothing to check — hence `None`.
+
+    Rows are dealt round-robin over `world_size × num_workers` shards (`ParquetTextDataset`); validation loaders run
+    with `num_workers=0`, so each rank reads every `world_size`-th row and the smallest shard holds
+    `rows // world_size` of them. The row range is clipped to the rows on disk exactly as the dataset clips it.
+    """
+    if len(entries) != 1:
+        return None
+    entry = entries[0]
+    total = _rows_on_disk(Path(entry.data_dir), f"validation entry {entry.prefix!r}")
+    start = min(entry.skip_rows, total)
+    stop = total if entry.max_rows is None else min(total, start + entry.max_rows)
+    rows_per_rank = (stop - start) // world_size
+    return -(-rows_per_rank // micro_batch_size)  # ceil, in integers
+
+
+def check_validation_batches(
+    stages: list[ResolvedStage], micro_batch_size: int, eval_iters: int, world_size: int = 1
+) -> None:
+    """Fail (or warn) at setup time about a validation split that cannot feed `training.evaluation.evaluate`.
+
+    A stage whose validation loader delivers no batch at all is a hard error naming the stage, its validation
+    entries and both numbers — `evaluate` would otherwise raise in the middle of the run, at the first evaluation
+    step. Fewer than `eval_iters` batches is only a warning: the loader still hands out a last, short batch, and
+    `evaluate` averages the batches it actually receives, so the reported loss stays correct — it is just measured
+    on less data than the config asks for. Loaders that mix several sources are unbounded (see
+    `validation_batches_available`) and are never reported.
+    """
+    for stage in stages:
+        available = validation_batches_available(stage.val_data, micro_batch_size, world_size)
+        if available is None:
+            continue
+        entries = ", ".join(entry.prefix for entry in stage.val_data)
+        rank = f" per rank (world size {world_size})" if world_size > 1 else ""
+        if available == 0:
+            raise RuntimeError(
+                f"stage {stage.name!r}: its validation data ({entries}) yields 0 micro-batches of {micro_batch_size} "
+                f"rows{rank} but eval_iters is {eval_iters}, so evaluation would have nothing to score. Raise "
+                "validation_fraction for the source in the dataset config, give the stage a larger validation "
+                "source, or lower micro_batch_size"
+            )
+        if available < eval_iters:
+            log.warning(
+                "stage %s: its validation data (%s) yields %d micro-batch(es) of %d rows%s, fewer than eval_iters "
+                "(%d); every evaluation of this stage averages the %d batch(es) it gets",
+                stage.name,
+                entries,
+                available,
+                micro_batch_size,
+                rank,
+                eval_iters,
+                available,
+            )
+
+
 # --- run config <-> dataset config ----------------------------------------------------------------------------------
 
 
@@ -330,8 +399,10 @@ def resolve_dataset(
 
     The build runs on the main rank only (`backend is None or backend.is_main`), followed by `backend.barrier()`,
     and polls `should_stop` between shards (`BuildAborted` when it says stop; None: never).
-    Raises `RuntimeError` when data is missing and cannot / must not be prepared here, or when a folder on disk
-    does not match its manifest or leaves a used part of the split empty.
+    Raises `RuntimeError` when data is missing and cannot / must not be prepared here, when a folder on disk does
+    not match its manifest or leaves a used part of the split empty, or when a stage's validation loader cannot
+    fill one evaluation micro-batch (`check_validation_batches`, which warns about a split shorter than
+    `eval_iters` batches).
     """
     dataset_config = load_dataset_config(settings.dataset_config)
     validate_settings(settings, dataset_config)
@@ -353,6 +424,9 @@ def resolve_dataset(
             )
         )
     check_entries_on_disk(stages)
+    check_validation_batches(
+        stages, settings.micro_batch_size, settings.eval_iters, 1 if backend is None else backend.world_size
+    )
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),
@@ -409,10 +483,12 @@ __all__ = [
     "build_command",
     "check_dataset_unchanged",
     "check_entries_on_disk",
+    "check_validation_batches",
     "processed_rows",
     "resolve_dataset",
     "resolve_entries",
     "resolve_splits",
     "validate_settings",
+    "validation_batches_available",
     "validation_rows_of",
 ]
