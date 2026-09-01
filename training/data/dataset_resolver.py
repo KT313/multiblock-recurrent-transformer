@@ -395,9 +395,10 @@ def _ensure_prepared(
 ) -> None:
     """Verify the dataset on disk; prepare what is missing when `auto_prepare` allows it, else raise.
 
-    Auto-prepare never deletes raw data and never prompts: it runs `prepare` with `assume_yes=False` and a `confirm`
-    that always declines, so a stale or outdated raw folder fails the run with the list of folders `prepare.py`
-    would ask about and the `prepare.py prepare ... --yes` command that confirms the deletion. `should_stop` is the run's stop request (the CLI's Ctrl-C):
+    Auto-prepare never deletes or truncates raw data and never prompts: it runs `prepare` with `assume_yes=False`
+    and a `confirm` that always declines, so a stale or outdated raw folder — or a broken one whose truncation
+    would drop healthy shards — fails the run with the list of folders `prepare.py` would ask about and the
+    `prepare.py prepare ... --yes` command that confirms the repair. `should_stop` is the run's stop request (the CLI's Ctrl-C):
     the build polls it between shards and raises `BuildAborted` with everything published so far kept.
     """
     report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
@@ -422,13 +423,13 @@ def _ensure_prepared(
                     pass_workers=settings.prepare_pass_workers,
                     max_parallel_downloads=settings.prepare_max_parallel_downloads,
                     assume_yes=False,
-                    confirm=lambda _message: False,  # never delete raw from a training run
+                    confirm=lambda _message: False,  # never delete or truncate raw from a training run
                     hf_token=os.environ.get("HF_TOKEN"),
                     should_stop=should_stop,
                 )
             except ConfirmationRequired as err:
                 raise RuntimeError(
-                    f"{err.message.rstrip()}\nauto-prepare never deletes raw data; to confirm the deletion run:\n  "
+                    f"{err.message.rstrip()}\nauto-prepare never deletes or truncates raw data; to confirm the repair run:\n  "
                     + build_command(settings.dataset_config, settings.dataset_dir)
                     + " --yes"
                 ) from err

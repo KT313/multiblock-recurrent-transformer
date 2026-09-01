@@ -9,9 +9,11 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   than the config asks for now) is **deleted and downloaded again — after the user confirmed**. A folder with a
   *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix with
   :meth:`RawFolder.truncate_to_good_prefix` (the next download resumes there, with the offset and the reject
-  counters the last kept shard recorded); when no prefix can be kept it is queued for
-  the same confirmed deletion. Shards without a manifest are an error: nothing says where those rows came from, and
-  guessing would either delete data or resume from the wrong offset.
+  counters the last kept shard recorded) — unconfirmed when only the broken shard itself is dropped, but when
+  healthy shards after the broken one would be discarded too, the truncation joins the same one confirmation as
+  the deletions (they are downloaded rows lost for a repair, re-downloaded next run); when no prefix can be kept
+  the folder is queued for the confirmed deletion. Shards without a manifest are an error: nothing says where
+  those rows came from, and guessing would either delete data or resume from the wrong offset.
 * **processed** (derived, cheap): judged by the shared verdict (``lib/build/assessment.py``), which attaches the
   cheapest repair — and this step performs exactly that repair, never more. A rebuild is a deletion without
   confirmation: stale, broken, without a manifest, unlisted stray shards, built from raw shards that no longer
@@ -24,10 +26,12 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   ``.tmp`` is removed as the leftover of an interrupted build, and a leftover ``processed/<name>.old`` (the folder
   the swap already replaced) is removed without asking.
 
-Nothing is touched until every folder was inspected; the queued raw deletions are then confirmed **once** with one
-list, and only then is anything deleted or truncated. ``dry_run=True`` (``prepare.py status``) records what would be
-done and touches nothing. A refused or impossible confirmation raises :class:`ConfirmationRequired` with the same
-list — ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never deletes raw.
+Nothing is touched until every folder was inspected; the queued raw deletions and healthy-shard-dropping
+truncations are then confirmed **once** with one list, and only then is anything deleted or truncated.
+``dry_run=True`` (``prepare.py status``) records what would be done and touches nothing. A refused or impossible
+confirmation raises :class:`ConfirmationRequired` with the same list and **nothing** is changed — not even the
+unconfirmed repairs; ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never
+deletes or truncates raw.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ FolderKind = Literal["raw", "processed"]
 RepairVerb = Literal["delete", "truncate", "swap", "would_delete", "would_truncate", "would_swap"]
 Confirm = Callable[[str], bool]
 
-CONFIRMATION_HEADER = "The following raw folders will be deleted and downloaded again:"
+CONFIRMATION_HEADER = "The following raw folders will be deleted or truncated, the dropped rows downloaded again:"
 CONFIRMATION_QUESTION = "Continue? [y/N] "
 YES_ANSWERS = ("y", "yes")
 
@@ -63,9 +67,9 @@ class RepairError(RuntimeError):
 
 
 class ConfirmationRequired(RepairError):
-    """Raw folders have to be deleted but the user did not confirm — no terminal to ask on, or the answer was not
-    yes. Nothing was changed. ``message`` is the confirmation prompt (the list of folders and why), ``report`` says
-    what would have been done."""
+    """Raw folders have to be deleted or truncated past healthy shards but the user did not confirm — no terminal
+    to ask on, or the answer was not yes. Nothing was changed. ``message`` is the confirmation prompt (the list of
+    folders and why), ``report`` says what would have been done."""
 
     def __init__(self, report: RepairReport, message: str, *, interactive: bool) -> None:
         self.report = report
@@ -84,6 +88,7 @@ class RepairAction:
     kind: FolderKind
     action: RepairVerb
     reason: str
+    needs_confirmation: bool = False  # a truncation dropping healthy shards after the broken one; deletions of raw always ask
 
     def describe(self) -> str:
         verb = self.action.replace("_", " ")
@@ -114,6 +119,15 @@ class RepairReport:
         """Raw folders queued for deletion (before they are confirmed, or in a dry run)."""
         return [action for action in self.actions if action.kind == "raw" and action.action in ("delete", "would_delete")]
 
+    def raw_confirmations_planned(self) -> list[RepairAction]:
+        """The raw actions the one confirmation covers: every queued deletion, and every truncation that would drop
+        healthy shards after the broken one (a tail-only truncation repairs without asking)."""
+        return [
+            action
+            for action in self.actions
+            if action.kind == "raw" and (action.action in ("delete", "would_delete") or action.needs_confirmation)
+        ]
+
     def as_planned(self) -> RepairReport:
         """The same actions with every verb in its ``would_*`` form (nothing was performed)."""
         return RepairReport([replace(action, action=_planned_verb(action.action)) for action in self.actions])
@@ -141,8 +155,9 @@ def repair_broken_and_stale_folders(
     confirm: Confirm | None = None,
     sources: Iterable[str] | None = None,
 ) -> RepairReport:
-    """Inspect the raw and processed folder of every source in ``config`` (or of ``sources``), confirm the raw deletions once, perform
-    everything (see the module docstring) and return what was done.
+    """Inspect the raw and processed folder of every source in ``config`` (or of ``sources``), confirm the raw
+    deletions and healthy-shard-dropping truncations once, perform everything (see the module docstring) and
+    return what was done.
 
     ``assume_yes`` skips the prompt; otherwise ``confirm(message)`` decides when given, else the question is put on
     stdin when it is a terminal. Without a terminal, or on an answer other than yes, :class:`ConfirmationRequired`
@@ -158,7 +173,7 @@ def repair_broken_and_stale_folders(
         report = planned.as_planned()
         log.info("repair (dry run):\n%s", report.describe())
         return report
-    queued = planned.raw_deletions_planned()
+    queued = planned.raw_confirmations_planned()
     if queued:
         confirm_raw_deletions(queued, planned, assume_yes=assume_yes, confirm=confirm)
     perform_repairs(planned)
@@ -190,7 +205,11 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
         _plan(report, name, folder, "raw", "delete", f"broken: {problem}")
         return None
     dropped = [shard.name for shard in manifest.shards[good:]]
-    _plan(report, name, folder, "raw", "truncate", f"broken: {problem}; dropping {len(dropped)} shard(s) {dropped[0]}..{dropped[-1]}, keeping {good}")
+    healthy = len(dropped) - 1  # everything after the broken shard itself verified fine (or was never reached)
+    reason = f"broken: {problem}; dropping {len(dropped)} shard(s) {dropped[0]}..{dropped[-1]}, keeping {good}"
+    if healthy > 0:
+        reason += f" — {healthy} healthy shard(s) after the broken one are discarded and re-downloaded next run"
+    _plan(report, name, folder, "raw", "truncate", reason, needs_confirmation=healthy > 0)
     return [[shard.name, shard.rows] for shard in kept]
 
 
@@ -240,25 +259,27 @@ def _shard_list(manifest: Manifest) -> ShardList:
     return [[shard.name, shard.rows] for shard in manifest.shards]
 
 
-def _plan(report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str) -> None:
-    report.actions.append(RepairAction(source=source, folder=folder, kind=kind, action=action, reason=reason))
+def _plan(report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *, needs_confirmation: bool = False) -> None:
+    report.actions.append(RepairAction(source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation))
 
 
 # --- confirmation ----------------------------------------------------------------------------------------------------------
 
 
 def confirmation_message(queued: list[RepairAction]) -> str:
-    """The one prompt for every queued raw deletion: header, ``  <name>: <reason>`` per folder, the question."""
+    """The one prompt for every queued raw deletion and healthy-shard-dropping truncation: header,
+    ``  <name>: <reason>`` per folder, the question."""
     lines = [CONFIRMATION_HEADER, *(f"  {action.source}: {action.reason}" for action in queued), CONFIRMATION_QUESTION]
     return "\n".join(lines)
 
 
 def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, assume_yes: bool, confirm: Confirm | None) -> None:
-    """Ask once for all ``queued`` raw deletions; return when they may proceed, raise :class:`ConfirmationRequired`
-    (carrying the planned report) otherwise. ``assume_yes`` answers without asking, ``confirm`` replaces the
-    terminal prompt, and without either the question is put on stdin only when it is a terminal."""
+    """Ask once for all ``queued`` raw deletions and truncations; return when they may proceed, raise
+    :class:`ConfirmationRequired` (carrying the planned report) otherwise. ``assume_yes`` answers without asking,
+    ``confirm`` replaces the terminal prompt, and without either the question is put on stdin only when it is a
+    terminal."""
     if assume_yes:
-        log.warning("deleting %d raw folder(s) without asking (assume_yes): %s", len(queued), ", ".join(action.source for action in queued))
+        log.warning("repairing %d raw folder(s) without asking (assume_yes): %s", len(queued), ", ".join(action.source for action in queued))
         return
     message = confirmation_message(queued)
     if confirm is not None:

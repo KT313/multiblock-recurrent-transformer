@@ -137,17 +137,22 @@ def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFac
     assert not layout.raw_dir("a").exists()
 
 
-def test_broken_raw_shard_truncates_raw_and_deletes_the_processed_folder_built_from_it(
+def test_broken_raw_shard_mid_folder_truncates_after_the_one_confirmation(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Truncating to the good prefix before a mid-folder broken shard drops the healthy shards after it too — that
+    loss of downloaded rows joins the one confirmation instead of happening silently."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards
     raw = layout.raw_dir("a")
     (raw / "data-00001.parquet").write_bytes(b"corrupt")
     calls: list[str] = []
     with caplog.at_level("WARNING", logger="data_preparation"):
         report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, True))
-    assert calls == [], "a truncation is a repair, not a deletion: no confirmation"
+    assert len(calls) == 1, "healthy shards after the broken one would be dropped: the one question is asked"
+    assert calls[0].startswith(CONFIRMATION_HEADER) and calls[0].endswith(CONFIRMATION_QUESTION)
+    assert "1 healthy shard(s) after the broken one are discarded and re-downloaded next run" in calls[0]
     assert _kinds(report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
+    assert report.actions[0].needs_confirmation and not report.actions[1].needs_confirmation
     assert report.actions[0].reason.startswith("broken: unreadable shard data-00001.parquet") and "dropping 2 shard(s) data-00001.parquet..data-00002.parquet, keeping 1" in report.actions[0].reason
     assert report.actions[1].reason == "built from raw shards that no longer exist"
     assert "data-00001.parquet" in caplog.text
@@ -155,6 +160,78 @@ def test_broken_raw_shard_truncates_raw_and_deletes_the_processed_folder_built_f
     assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet"] and manifest.rows_fetched == 4
     assert sorted(path.name for path in raw.glob("*.parquet")) == ["data-00000.parquet"]
     assert not layout.processed_dir("a").exists() and report.raw_deleted() == []
+
+
+def test_truncation_dropping_only_the_broken_tail_shard_asks_nothing(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards
+    (layout.raw_dir("a") / "data-00002.parquet").write_bytes(b"corrupt")
+    calls: list[str] = []
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
+    assert calls == [], "only the broken shard itself is dropped: a repair, not a deletion"
+    assert _kinds(report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
+    assert not report.actions[0].needs_confirmation and "healthy shard(s)" not in report.actions[0].reason
+    manifest = Manifest.load(layout.raw_dir("a"))
+    assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet", "data-00001.parquet"]
+
+
+def test_refused_truncation_past_healthy_shards_changes_nothing(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)
+    (layout.raw_dir("a") / "data-00001.parquet").write_bytes(b"corrupt")
+    before = _snapshot(layout.root)
+    with pytest.raises(ConfirmationRequired) as info:
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
+    assert _snapshot(layout.root) == before, "refused: not even the prefix truncation of that folder"
+    assert _kinds(info.value.report) == [("a", "raw", "would_truncate"), ("a", "processed", "would_delete")]
+    assert [action.source for action in info.value.report.raw_confirmations_planned()] == ["a"]
+    assert info.value.report.raw_deletions_planned() == [], "a truncation is not a deletion"
+    # non-interactive without --yes: the same abort with nothing changed
+    monkeypatch.setattr(sys, "stdin", io.StringIO())  # not a tty
+    with pytest.raises(ConfirmationRequired) as info2:
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert not info2.value.interactive and _snapshot(layout.root) == before
+    # --yes proceeds without a question
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
+    assert _kinds(report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
+    manifest = Manifest.load(layout.raw_dir("a"))
+    assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet"]
+
+
+def test_dry_run_reports_would_truncate_with_the_healthy_loss_note(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)
+    (layout.raw_dir("a") / "data-00001.parquet").write_bytes(b"corrupt")
+    before = _snapshot(layout.root)
+
+    def confirm(message: str) -> bool:
+        raise AssertionError("a dry run never asks")
+
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, confirm=confirm)
+    assert _snapshot(layout.root) == before
+    assert _kinds(report) == [("a", "raw", "would_truncate"), ("a", "processed", "would_delete")]
+    assert "1 healthy shard(s) after the broken one are discarded and re-downloaded next run" in report.actions[0].reason
+    assert report.actions[0].needs_confirmation
+
+
+def test_one_prompt_covers_deletions_and_confirmable_truncations(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout, ("a", "b"), rows=12)  # 3 raw shards each
+    _edit_manifest(layout.raw_dir("a"), source_hash="changed")
+    (layout.raw_dir("b") / "data-00001.parquet").write_bytes(b"corrupt")
+    prompts: list[str] = []
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(prompts, True))
+    assert len(prompts) == 1, "one question per run, deletions and truncations together"
+    assert "a: stale: source identity or tokenizer changed" in prompts[0]
+    assert "b: broken: unreadable shard data-00001.parquet" in prompts[0] and "re-downloaded next run" in prompts[0]
+    assert not layout.raw_dir("a").exists()
+    manifest = Manifest.load(layout.raw_dir("b"))
+    assert manifest is not None and len(manifest.shards) == 1
+    assert [action.source for action in report.raw_confirmations_planned()] == ["a", "b"]
 
 
 def test_processed_covering_only_the_kept_prefix_survives_a_truncation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
