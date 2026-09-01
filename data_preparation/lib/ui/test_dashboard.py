@@ -676,7 +676,7 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     lines = [line for line in shown.splitlines() if line.strip()]
     assert lines[0].endswith("dataset status:") and lines[-1].endswith(f"done: {dataset_dir}"), shown
     build_log = (dataset_dir / "build.log").read_text()
-    assert "round 1:" in build_log and "synthetic_pretrain: kept 41 of 41 fetched rows" in build_log
+    assert "round 1:" in build_log and "synthetic_pretrain: kept 76 of 76 fetched rows" in build_log
 
 
 @pytest.mark.slow
