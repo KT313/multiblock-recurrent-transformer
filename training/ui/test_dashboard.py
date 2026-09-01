@@ -49,6 +49,28 @@ def test_factory_picks_the_fallback_when_disabled(monkeypatch: pytest.MonkeyPatc
     assert b._live is None
 
 
+def test_factory_gives_the_live_display_the_fallback_stream(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
+    """A display that disables itself after an internal error must write its plain lines where a run that never got
+    a display writes them (the CLI passes stderr) — it used to build its fallback on ``stream``, i.e. stdout, which
+    is exactly the failure path ``fallback_stream`` was added for."""
+    stream, fallback = io.StringIO(), io.StringIO()
+
+    def broken(step: int, stage_index: int) -> None:
+        raise RuntimeError("renderer broke")
+
+    with training_dashboard(
+        "r", STAGES, STEPS, TOTAL, enabled=True,  # the default `training` logger: the fallback's own lines reach it
+        log_step_interval=1, console=string_console(), stream=stream, fallback_stream=fallback, clock=clock,
+    ) as b:
+        assert isinstance(b, TrainingDashboard)
+        monkeypatch.setattr(b, "_refresh_bars", broken)
+        b.update_step(1, 0, metrics(1))  # disables the display
+        b.update_step(2, 0, metrics(2))  # from here the fallback logs the step lines
+        b.note_event("saved checkpoint x.pth")
+    assert "step 2/30" in fallback.getvalue() and "event: saved checkpoint x.pth" in fallback.getvalue()
+    assert "step 2/30" not in stream.getvalue()
+
+
 def test_factory_passes_final_frame_on(clock: FakeClock) -> None:
     console = string_console()
     with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), enabled=True, final_frame=False, console=console, clock=clock) as b:

@@ -71,7 +71,9 @@ class TrainingDashboard:
     ``console`` is for tests (a ``rich.console.Console`` over a ``StringIO``); ``clock`` is injected by the ETA
     tests. ``enabled`` is True until the dashboard disables itself after an internal error; from then on the public
     methods delegate to a :class:`NoOpDashboard` built from the same arguments (the console fallback) and
-    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run.
+    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. That
+    fallback writes to ``fallback_stream`` when one is given (the run's CLI passes stderr, so the lines of a
+    display that disabled itself mid-run land on the same stream as the log handlers' lines), else to ``stream``.
     ``final_frame`` prints the static summary once the display closed.
 
     The log file :meth:`attach` is given receives the lines the fallback would log (one per ``log_step_interval``
@@ -95,6 +97,7 @@ class TrainingDashboard:
         final_frame: bool = True,
         console: Console | None = None,
         stream: TextIO | None = None,
+        fallback_stream: TextIO | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         self._fallback = NoOpDashboard(
@@ -105,7 +108,7 @@ class TrainingDashboard:
             details=details,
             start_step=start_step,
             log_step_interval=log_step_interval,
-            stream=stream,
+            stream=fallback_stream if fallback_stream is not None else stream,
             clock=clock,
         )
         self.run_name = run_name
@@ -115,6 +118,9 @@ class TrainingDashboard:
         self.details = dict(details or {})
         self.enabled = True
         self._stream = stream if stream is not None else sys.stdout
+        # where the plain lines go once the display is gone (`write`, and the fallback's own lines through the
+        # handler `attach` installs): the run's fallback stream when it has one, else the display's own stream
+        self._fallback_stream = fallback_stream if fallback_stream is not None else self._stream
         self._console = console if console is not None else Console(file=self._stream)
         self._refresh_per_second = refresh_per_second
         self._final_frame = final_frame
@@ -160,6 +166,7 @@ class TrainingDashboard:
         final_frame: bool = True,
         console: Console | None = None,
         stream: TextIO | None = None,
+        fallback_stream: TextIO | None = None,
         clock: Clock = time.monotonic,
     ) -> Iterator[TrainingDashboard]:
         """A running dashboard with the ``training`` logger (or ``logger``) attached for the block; ``log_file``
@@ -175,6 +182,7 @@ class TrainingDashboard:
             final_frame=final_frame,
             console=console,
             stream=stream,
+            fallback_stream=fallback_stream,
             clock=clock,
         )
         # the logger first: the dashboard's own warning (a failing start, an internal error) always has a handler
@@ -384,8 +392,8 @@ class TrainingDashboard:
         """Append ``text`` (one entry per line, so tracebacks stay readable) to the log panel; plain stream when
         disabled. With ``keep`` the text is also printed, unwrapped, once the display closed."""
         if not self.enabled:
-            self._stream.write(text + "\n")
-            self._stream.flush()
+            self._fallback_stream.write(text + "\n")
+            self._fallback_stream.flush()
             return
         with self._lock:
             self._lines.extend(text.splitlines() or [""])

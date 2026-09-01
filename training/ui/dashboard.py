@@ -167,7 +167,8 @@ def training_dashboard(
     ``TRAINING_DASHBOARD`` env var and a TTY on stdout), else the :class:`NoOpDashboard` console fallback. Both
     attach the ``training`` logger (or ``logger``) for the block and append every record to ``log_file``.
     ``fallback_stream`` is where the plain-line fallback writes (default: ``stream``, then stdout) — the run's CLI
-    passes stderr so a piped run's step lines land on the same stream as the log handlers' lines."""
+    passes stderr so a piped run's step lines land on the same stream as the log handlers' lines; the live display
+    is given it too, for the fallback it switches to when it disables itself after an internal error."""
     if enabled is None:
         enabled = dashboard_enabled(stream)
     if enabled:
@@ -184,6 +185,7 @@ def training_dashboard(
             final_frame=final_frame,
             console=console,
             stream=stream,
+            fallback_stream=fallback_stream,  # a display that disables itself mid-run falls back to the same stream
             clock=clock,
         ) as board:
             yield board

@@ -363,9 +363,20 @@ class RunLogger:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
         """Release what the logger holds — the dashboard included, so the terminal is restored on an exception and
-        on a Ctrl-C too; idempotent (`close()` normally ran before)."""
-        self.wandb.finish()
-        self.resources.close()
+        on a Ctrl-C too; idempotent (`close()` normally ran before).
+
+        Every resource is released even when an earlier release raises: a failing `wandb.finish()` used to leave the
+        terminal with the dashboard's redirected streams and a hidden cursor. The first failure is the one raised
+        (the later ones would only mask it; the exception that ended the run, if any, stays its `__context__`).
+        """
+        failures: list[BaseException] = []
+        for release in (self.wandb.finish, self.resources.close):
+            try:
+                release()
+            except BaseException as failure:  # released in order, re-raised below: nothing is swallowed
+                failures.append(failure)
+        if failures:
+            raise failures[0]
 
     # --- status and events -----------------------------------------------------------------------------------------
 

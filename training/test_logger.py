@@ -803,6 +803,55 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
     assert (tmp_path / TRAIN_LOG_NAME).exists() and "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 
+class RaisingTracker(Logger):
+    """A `Logger` whose `finish()` fails, as a broken `wandb.finish()` would (disabled: wandb is never imported)."""
+
+    def __init__(self, out_dir: Path) -> None:
+        super().__init__("proj", "run", out_dir, enabled=False)
+        self.finish_calls = 0
+
+    def finish(self) -> None:
+        self.finish_calls += 1
+        raise RuntimeError("wandb finish failed")
+
+
+def _logger_with(tracker: Logger, stage_manager: StageManager, settings: Settings, run_directory: Path) -> RunLogger:
+    return RunLogger(
+        settings, run_directory, stage_manager, tracker, start_step=0, device="cpu",
+        dashboard=RecordingDashboard(), clock=FakeClock(),
+    )
+
+
+def test_exit_releases_every_resource_even_when_the_tracker_raises(tmp_path: Path) -> None:
+    """A failing `wandb.finish()` used to leave the terminal with the dashboard's redirected streams and a hidden
+    cursor: the resources are released whatever the tracker does."""
+    settings = reference_settings()
+    tracker = RaisingTracker(tmp_path)
+    run_logger = _logger_with(tracker, reference_stage_manager(settings), settings, tmp_path)
+    released: list[str] = []
+    run_logger.resources.callback(released.append, "dashboard")
+    with pytest.raises(RuntimeError, match="wandb finish failed"), run_logger:
+        pass
+    assert tracker.finish_calls == 1 and released == ["dashboard"]
+
+
+def test_exit_raises_the_first_failure_and_still_releases_the_rest(tmp_path: Path) -> None:
+    """Both teardowns fail: everything is released and the first failure is the one raised, not the last."""
+    settings = reference_settings()
+    tracker = RaisingTracker(tmp_path)
+    run_logger = _logger_with(tracker, reference_stage_manager(settings), settings, tmp_path)
+    released: list[str] = []
+
+    def failing_release() -> None:
+        released.append("dashboard")
+        raise ValueError("dashboard teardown failed")
+
+    run_logger.resources.callback(failing_release)
+    with pytest.raises(RuntimeError, match="wandb finish failed"):
+        run_logger.__exit__(None, None, None)
+    assert tracker.finish_calls == 1 and released == ["dashboard"]
+
+
 def test_close_of_a_stopped_run(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
