@@ -70,7 +70,8 @@ class RecordingFile(io.FileIO):
 
 
 class FakeHub:
-    """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings."""
+    """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings. `sha` is the
+    commit hash `REV` currently resolves to — a test moves the repo by assigning a new value."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -80,6 +81,8 @@ class FakeHub:
         self.handles: dict[str, RecordingFile] = {}
         self.listings = 0
         self.size_lookups = 0
+        self.resolutions = 0
+        self.sha = "commit-1"
 
     def add(self, name: str, rows: list[Row], fmt: str | None = None) -> None:
         path = self.root / name.replace("/", "__")
@@ -99,10 +102,15 @@ class FakeHub:
                 path.write_bytes(payload)
         self.files[name] = path
 
-    def list_repo_files(self, repo_id: str, revision: str | None, token: str | None) -> list[str]:
+    def repo_listing(self, repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
         assert (repo_id, revision) == (REPO, REV)
         self.listings += 1
-        return sorted(self.files, reverse=True) + ["README.md"]
+        return sorted(self.files, reverse=True) + ["README.md"], self.sha
+
+    def resolve_revision(self, repo_id: str, revision: str | None, token: str | None) -> str:
+        assert (repo_id, revision) == (REPO, REV)
+        self.resolutions += 1
+        return self.sha
 
     def paths_info(self, repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
         assert (repo_id, revision) == (REPO, REV)
@@ -126,7 +134,8 @@ class FakeHub:
 def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHub:
     fake = FakeHub(tmp_path / "hub")
     fake.root.mkdir()
-    monkeypatch.setattr(hub_files, "list_repo_files", fake.list_repo_files)
+    monkeypatch.setattr(hub_files, "repo_listing", fake.repo_listing)
+    monkeypatch.setattr(hub_files, "resolve_revision", fake.resolve_revision)
     monkeypatch.setattr(hub_files, "paths_info", fake.paths_info)
     monkeypatch.setattr(hub_files, "hub_download", fake.hub_download)
     monkeypatch.setattr(hub_files, "open_remote", fake.open_remote)

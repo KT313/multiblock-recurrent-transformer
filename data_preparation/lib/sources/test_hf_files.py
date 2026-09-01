@@ -433,6 +433,64 @@ def test_index_without_sizes_is_upgraded(hub: FakeHub, tmp_path: Path) -> None:
     assert hub.size_lookups == 1
 
 
+# --- the revision guard -------------------------------------------------------------------------------------------------
+
+
+def _forget_open_indexes() -> None:
+    """Simulate a fresh process: the next `FileIndex.open` loads from disk instead of the process-wide cache."""
+    hub_files._OPEN_INDEXES.clear()
+
+
+def test_index_records_the_resolved_commit_and_same_resolution_passes(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 3))
+    index_dir = tmp_path / "index"
+    fresh = FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
+    assert fresh.resolved_revision == hub.sha  # from the listing call itself, no extra resolution
+    assert hub.resolutions == 0
+    saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
+    assert saved["resolved_revision"] == hub.sha
+    _forget_open_indexes()
+    reloaded = FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
+    assert reloaded.resolved_revision == hub.sha
+    assert hub.resolutions == 1 and hub.listings == 1  # loading resolved once, never re-listed
+
+
+def test_moved_repo_fails_the_loaded_index_with_the_pin_hint(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 3))
+    index_dir = tmp_path / "index"
+    load = LOADERS["hf_files"]
+    assert _ids(load(_src(), 0, 2, index_dir=index_dir)) == ["a0", "a1"]
+    built_at = hub.sha
+    _forget_open_indexes()
+    hub.sha = "commit-2"
+    with pytest.raises(RuntimeError) as error:
+        list(load(_src(), 2, 1, index_dir=index_dir))
+    message = str(error.value)
+    assert built_at in message and "commit-2" in message
+    assert f"revision: {built_at}" in message  # the pin that keeps the downloaded raw data valid
+    assert str(index_path(index_dir, REPO, REV, "data/*.parquet")) in message
+    assert hub.listings == 1  # a mismatch never re-lists
+    # github_code shares the machinery (and here the very index): same error
+    src = _src(loader="github_code", language="x", load_kwargs={"data_files": "data/*.parquet"})
+    with pytest.raises(RuntimeError, match="file index was built at revision"):
+        list(LOADERS["github_code"](src, 0, 1, index_dir=index_dir))
+
+
+def test_legacy_index_without_revision_upgrades_once_then_guards(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 3))
+    index_dir = tmp_path / "index"
+    path = index_path(index_dir, REPO, REV, "data/*.parquet")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"files": ["data/a.parquet"], "rows": {}, "counts": {}}))  # written by the old code
+    index = FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)  # no error: adopts the current resolution
+    assert index.resolved_revision == hub.sha
+    assert json.loads(path.read_text())["resolved_revision"] == hub.sha  # persisted: guarded from now on
+    _forget_open_indexes()
+    hub.sha = "commit-2"
+    with pytest.raises(RuntimeError, match="file index was built at revision"):
+        FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
+
+
 # --- the reading contract (one dispatch, every format) ------------------------------------------------------------------
 
 

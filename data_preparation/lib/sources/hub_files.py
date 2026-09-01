@@ -25,7 +25,10 @@ rows in file order. How a file is fetched depends on its size (known from the in
 
 A :class:`FileIndex` per ``(repo, revision, glob)`` remembers the file list, the file sizes (one batched
 ``HfApi.get_paths_info`` call), the row count of every file read so far and the row-group row counts of every
-parquet footer seen, so a fetch at ``offset`` skips whole files without opening them. It is persisted as JSON under
+parquet footer seen, so a fetch at ``offset`` skips whole files without opening them. It also records the COMMIT
+the file list was taken at (the pinned ``revision`` resolved, or the default branch's head); an index loaded from
+disk is only valid while the repo still resolves to that commit — a moved repo is a hard error, never a silent
+re-list (offsets counted against the old listing would skip or duplicate rows). It is persisted as JSON under
 ``<index_dir>/<repo>@<revision>/<glob hash>.json`` when an ``index_dir`` is given (``dataset/hub_index/`` in a
 build), else kept in memory for the loader call only. Extra per-file counters (``counts[key][file]``, e.g. rows of
 one language for ``github_code``) share the index, together with the matching rows per row group of every parquet
@@ -35,8 +38,8 @@ straight to the right row group instead of re-reading the file from its start.
 Files that go through the Hub cache (and local files) are read with exact ``count`` semantics: over-reading a
 cached file costs nothing on the wire, so nothing needs to be kept.
 
-Hub access goes through the module-level functions :func:`list_repo_files`, :func:`paths_info`,
-:func:`hub_download` and :func:`open_remote` (stubbed by the tests) or through the callables of a
+Hub access goes through the module-level functions :func:`repo_listing`, :func:`resolve_revision`,
+:func:`paths_info`, :func:`hub_download` and :func:`open_remote` (stubbed by the tests) or through the callables of a
 :class:`HubFetcher`, which also holds the size threshold and the :class:`FetchStats` (bytes handed to the reader
 by the remote file objects, files downloaded / streamed).
 """
@@ -77,12 +80,22 @@ PATHS_INFO_BATCH = 500  # paths per `get_paths_info` request
 # --- Hub access (module-level so tests can stub them) --------------------------------------------------------------
 
 
-def list_repo_files(repo_id: str, revision: str | None, token: str | None) -> list[str]:
-    """All file paths of a dataset repo at ``revision`` (``HfApi.list_repo_files``)."""
+def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
+    """All file paths of a dataset repo at ``revision`` plus the commit hash that revision resolved to.
+
+    One ``HfApi.dataset_info`` call gives both (the sibling list is the file list, ``sha`` the resolved commit), so
+    recording the commit alongside the listing costs no extra request."""
     from huggingface_hub import HfApi
 
-    files: list[str] = HfApi(token=token).list_repo_files(repo_id, repo_type="dataset", revision=revision)
-    return files
+    info = HfApi(token=token).dataset_info(repo_id, revision=revision)
+    if info.sha is None:
+        raise RuntimeError(f"{repo_id}@{revision or 'main'}: the Hub returned no commit hash for the listing")
+    return [sibling.rfilename for sibling in info.siblings or []], str(info.sha)
+
+
+def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> str:
+    """The commit hash ``revision`` currently resolves to (the default branch's head when unset)."""
+    return repo_listing(repo_id, revision, token)[1]
 
 
 def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
@@ -147,6 +160,7 @@ class FileIndex:
     row_groups: dict[str, list[int]] = field(default_factory=dict)  # parquet file -> rows per row group
     # key -> parquet file -> matching rows per row group, for the prefix of row groups read so far under `key`
     group_counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    resolved_revision: str | None = None  # commit hash the file list was taken at (None: pre-recording index file)
     path: Path | None = None  # where the index is persisted (None: in memory)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -156,7 +170,9 @@ class FileIndex:
     ) -> FileIndex:
         """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it.
         A persisted index is one process-wide instance per path, so concurrent readers of the same repo files
-        (the build runs items in threads) share it; its mutations and saves are serialised by ``_lock``."""
+        (the build runs items in threads) share it; its mutations and saves are serialised by ``_lock``. An index
+        loaded from disk is checked against the repo's current revision resolution (a moved repo is an error, see
+        :meth:`_check_revision`); the process-cached instance was checked when it was first opened."""
         path = None if index_dir is None else index_path(index_dir, repo_id, revision, pattern)
         if path is None:
             index = cls._from_repo_listing(repo_id, revision, pattern, None, token)
@@ -168,6 +184,7 @@ class FileIndex:
                 index = cached
             elif path.is_file():
                 index = cls._load(repo_id, revision, pattern, path)
+                index._check_revision(token)
             else:
                 index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
             _OPEN_INDEXES[path] = index
@@ -189,20 +206,44 @@ class FileIndex:
             sizes=data.get("sizes", {}),
             row_groups=data.get("row_groups", {}),
             group_counts=data.get("group_counts", {}),
+            resolved_revision=data.get("resolved_revision"),
             path=path,
         )
+
+    def _check_revision(self, token: str | None) -> None:
+        """Fail if the repo no longer resolves to the commit the file list was taken at.
+
+        The file order and every per-file row count are only valid for that exact listing — raw-folder offsets
+        were counted against it, so silently re-listing a moved repo would skip or duplicate rows. This is the
+        one place a loaded index costs a network call (one revision resolution per index per process; a freshly
+        built index records the commit from its listing call instead). An index written before the commit was
+        recorded stores none: it adopts the current resolution once without erroring — its listing cannot be
+        verified retroactively, and failing would break every existing ``dataset/hub_index/`` tree — and is
+        guarded from then on."""
+        current = resolve_revision(self.repo_id, self.revision, token)
+        if self.resolved_revision is None:
+            self.resolved_revision = current  # one-time upgrade of a pre-recording index; persisted by open()'s save
+            return
+        if self.resolved_revision != current:
+            raise RuntimeError(
+                f"{self.repo_id}: the file index was built at revision {self.resolved_revision} but the repo now "
+                f"resolves to {current}. Pin `revision: {self.resolved_revision}` in the source config to keep "
+                f"going reproducibly (the raw data downloaded so far stays valid), or delete {self.path} (and "
+                f"consider the source's raw folder — its offsets were counted against the old listing) to re-sync."
+            )
 
     @classmethod
     def _from_repo_listing(
         cls, repo_id: str, revision: str | None, pattern: str, path: Path | None, token: str | None
     ) -> FileIndex:
-        """A fresh index: list the repo once and keep the files matching ``pattern``, sorted by path."""
-        all_files = list_repo_files(repo_id, revision, token)
+        """A fresh index: list the repo once and keep the files matching ``pattern``, sorted by path, together
+        with the commit the listing resolved to (the same call yields both)."""
+        all_files, resolved = repo_listing(repo_id, revision, token)
         matcher = glob_regex(pattern)
         files = sorted(f for f in all_files if matcher.fullmatch(f))
         if not files:
             raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no files match data_files={pattern!r}")
-        return cls(repo_id, revision, pattern, files, path=path)
+        return cls(repo_id, revision, pattern, files, resolved_revision=resolved, path=path)
 
     def ensure_sizes(self, token: str | None) -> None:
         """Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed)."""
@@ -227,6 +268,7 @@ class FileIndex:
         payload = {
             "repo_id": self.repo_id,
             "revision": self.revision,
+            "resolved_revision": self.resolved_revision,
             "pattern": self.pattern,
             "files": self.files,
             "rows": self.rows,
