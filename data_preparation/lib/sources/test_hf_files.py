@@ -432,38 +432,56 @@ def test_index_without_sizes_is_upgraded(hub: FakeHub, tmp_path: Path) -> None:
     assert hub.size_lookups == 1
 
 
-def test_parquet_iter_stops_before_later_groups(tmp_path: Path) -> None:
+def test_parquet_iter_stops_before_later_groups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "x.parquet"
     pq.write_table(pa.Table.from_pylist(_rows("r", 9)), path, row_group_size=3)
-    read: list[int] = []
+    read = _spy_read_row_group(monkeypatch)
     parquet = pq.ParquetFile(path)
-    original = parquet.read_row_group
-
-    def spy(i: int, *args: Any, **kwargs: Any) -> Any:
-        read.append(i)
-        return original(i, *args, **kwargs)
-
-    parquet.read_row_group = spy  # type: ignore[method-assign]  # spying on the instance in a test
     rows: Generator[Row, None, None] = iter_parquet(parquet, skip=4)
     assert next(rows)["id"] == "r4"
     rows.close()
-    assert read == [1]
+    assert [group for group, _ in read] == [1]
     assert parquet_row_groups(parquet) == [3, 3, 3]
+
+
+def test_parquet_row_groups_are_decoded_in_bounded_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row group is handed out in ``ROW_BATCH`` slices instead of one python list; the rows and their order are
+    exactly those of a full read, and the projection still applies."""
+    path = tmp_path / "big.parquet"
+    rows = _rows("r", 25)
+    pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=10)  # 3 row groups: 10, 10, 5
+    assert parquet_row_groups(pq.ParquetFile(path)) == [10, 10, 5]
+    sizes: list[int] = []
+    original = pq.ParquetFile.iter_batches
+
+    def spy(self: pq.ParquetFile, **kwargs: Any) -> Iterator[pa.RecordBatch]:
+        for batch in original(self, **kwargs):
+            sizes.append(batch.num_rows)
+            yield batch
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", spy)
+    monkeypatch.setattr(hub_files, "ROW_BATCH", 4)
+    assert list(iter_file(path, "big.parquet")) == pq.read_table(path).to_pylist() == rows
+    assert sizes == [4, 4, 2, 4, 4, 2, 4, 1]  # never a whole row group at once
+    sizes.clear()
+    assert list(iter_file(path, "big.parquet", skip=13)) == rows[13:]  # a skip landing inside a batch
+    assert sizes == [4, 4, 2, 4, 1]  # group 0 is skipped whole, group 1 is decoded from its start
+    assert list(iter_file(path, "big.parquet", skip=13, columns=["id"])) == [{"id": r["id"]} for r in rows[13:]]
 
 
 # --- over-read: a remote row group is kept whole ------------------------------------------------------------------------
 
 
 def _spy_read_row_group(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, list[str] | None]]:
-    """Record every ``(row group, columns)`` pulled through ``ParquetFile.read_row_group``."""
+    """Record every ``(row group, columns)`` pulled through ``ParquetFile.iter_batches``."""
     calls: list[tuple[int, list[str] | None]] = []
-    original = pq.ParquetFile.read_row_group
+    original = pq.ParquetFile.iter_batches
 
-    def spy(self: pq.ParquetFile, i: int, columns: list[str] | None = None, **kwargs: Any) -> Any:
-        calls.append((i, columns))
-        return original(self, i, columns=columns, **kwargs)
+    def spy(self: pq.ParquetFile, row_groups: list[int], columns: list[str] | None = None, **kwargs: Any) -> Any:
+        calls.append((row_groups[0], columns))
+        return original(self, row_groups=row_groups, columns=columns, **kwargs)
 
-    monkeypatch.setattr(pq.ParquetFile, "read_row_group", spy)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", spy)
     return calls
 
 

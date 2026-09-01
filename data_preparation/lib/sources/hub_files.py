@@ -9,7 +9,8 @@ rows in file order. How a file is fetched depends on its size (known from the in
   ``HF_HOME`` / ``--cache_dir``, never fetched twice), then read locally.
 * **larger parquet files** are never downloaded whole: they are opened remotely (``HfFileSystem``, HTTP range
   requests) and only the row groups covering the requested rows are read — the footer once (its row-group row
-  counts go into the index), then ``ParquetFile.read_row_group(i, columns=...)`` for each needed group. A row
+  counts go into the index), then ``ParquetFile.iter_batches(row_groups=[i], columns=...)`` for each needed group,
+  which decodes it in :data:`ROW_BATCH` slices instead of materialising it whole. A row
   group that was fetched is **kept whole**: ``count`` is a minimum and the reader keeps yielding until the end of
   the row group that satisfied it (``align_to_row_group=True``), so the rows a top-up needs next are already on disk
   and the same bytes are never downloaded twice (row groups can be large for book-like sources: gutenberg is
@@ -66,6 +67,7 @@ STREAM_FORMATS: tuple[str, ...] = (".jsonl.zst", ".jsonl.gz", ".json.gz", ".json
 
 DEFAULT_MAX_CACHED_FILE_MB = 32.0  # files up to this size go through the Hub cache whole; larger ones are read remotely by row group / streamed (a 240 MB parquet file for 20 rows is not worth caching)
 PARQUET_BLOCK_SIZE = 1 << 20  # fsspec read-ahead for remote parquet (random access: keep the over-read small)
+ROW_BATCH = 1000  # rows decoded from a parquet row group at a time (a whole group as python dicts can be hundreds of MB)
 STREAM_BLOCK_SIZE = 8 << 20  # fsspec read-ahead for sequential remote streams (fewer, larger range requests)
 STREAM_BUFFER_SIZE = 1 << 16  # local buffer in front of a remote stream (json lines / ijson decode from it)
 PATHS_INFO_BATCH = 500  # paths per `get_paths_info` request
@@ -427,16 +429,22 @@ def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | No
         if skip >= group_rows:  # every row of this group is skipped: do not read it
             skip -= group_rows
             continue
-        rows = read_row_group(parquet, group, columns)
-        yield from rows[skip:]
-        skip = 0
+        for row in read_row_group(parquet, group, columns):
+            if skip > 0:
+                skip -= 1
+                continue
+            yield row
 
 
-def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | None) -> list[Row]:
-    """``parquet.read_row_group(group, columns=columns)`` as dict rows (the single place that pulls row-group bytes)."""
-    if columns is None:
-        return parquet.read_row_group(group).to_pylist()
-    return parquet.read_row_group(group, columns=columns).to_pylist()
+def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | None) -> Iterator[Row]:
+    """Rows of one row group as dicts (the single place that pulls row-group bytes), in :data:`ROW_BATCH` slices.
+
+    A whole row group as a python list is what a book-like source cannot afford — gutenberg row groups hold ~300 MB
+    per 1,000 rows and several downloads run at once — so the group is decoded batch by batch
+    (``ParquetFile.iter_batches(row_groups=[group])``) and only one batch of dicts is alive at a time. Rows and
+    their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded."""
+    for batch in parquet.iter_batches(batch_size=ROW_BATCH, columns=columns, row_groups=[group]):
+        yield from batch.to_pylist()
 
 
 def project_row(row: Row, columns: list[str] | None) -> Row:
@@ -766,6 +774,8 @@ def _parquet_rows(
                 cursor.taken += 1
                 if cursor.satisfied and not finish_group:
                     reader.reading = False  # stopped in the middle of the group: its count stays unknown
+            if not any(reader.reading for reader in participants):
+                break  # every request that wanted this group stopped inside it: leave the rest of it undecoded
 
         is_last_group = group == len(groups) - 1
         for reader in participants:
