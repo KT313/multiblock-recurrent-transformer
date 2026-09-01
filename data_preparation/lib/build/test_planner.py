@@ -218,13 +218,32 @@ def test_the_satisfaction_cases() -> None:
     for processed_state in ("missing", "stale", "behind_raw"):
         assert _ledger(processed_state=processed_state).satisfaction() is Satisfaction.NOT_BUILT
     assert _ledger(processed_rows=10).satisfaction() is Satisfaction.SHORT_BUT_FETCHABLE
-    dry_small = _ledger(processed_rows=10, exhausted=True)
+    dry_small = _ledger(processed_rows=10, training_rows=9, exhausted=True)
     assert dry_small.satisfaction() is Satisfaction.EXHAUSTED_SMALL and dry_small.satisfaction().satisfied
-    dry_empty = _ledger(processed_rows=0, exhausted=True, skipped_malformed=100)
+    dry_empty = _ledger(processed_rows=0, training_rows=0, exhausted=True, skipped_malformed=100)
     assert dry_empty.satisfaction() is Satisfaction.EXHAUSTED_EMPTY and not dry_empty.satisfaction().satisfied
     assert "NOT ONE" in dry_empty.reason() and "100 malformed" in dry_empty.reason()
     assert "check the source's fields / converter / filter / language" in dry_empty.reason()
     assert dry_empty.epochs() is None and _ledger().epochs() == pytest.approx(70 / 90)
+
+
+def test_an_exhausted_source_whose_rows_all_go_to_the_holdout_is_failed() -> None:
+    """The training resolver holds `ceil(validation_fraction × rows)` out; an exhausted source must keep at least
+    one training row after that split, or training would fail at startup with an empty range (decision D3)."""
+    all_validation = _ledger(processed_rows=2, training_rows=0, exhausted=True)
+    assert all_validation.satisfaction() is Satisfaction.EXHAUSTED_ALL_VALIDATION
+    assert not all_validation.satisfaction().satisfied and all_validation.epochs() is None
+    assert all_validation.reason() == (
+        "exhausted, and 2 processed rows − 2 validation holdout leaves 0 training rows — "
+        "lower the source's validation_fraction or give it more rows"
+    )
+    # one surviving training row is enough: served, with the exhaustion warning
+    one_left = _ledger(processed_rows=2, training_rows=1, exhausted=True)
+    assert one_left.satisfaction() is Satisfaction.EXHAUSTED_SMALL and one_left.satisfaction().satisfied
+    # the ledger's `training_rows` mirrors the training resolver's arithmetic
+    cfg = two_stage_cfg()
+    assert training_rows_after_split(cfg, "a", 1) == 0  # ceil(0.05 × 1) = 1: the single row is all validation
+    assert training_rows_after_split(cfg, "a", 2) == 1
 
 
 def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
@@ -336,6 +355,23 @@ def test_exhausted_and_built_source_is_satisfied(layout: DatasetLayout, cfg_fact
     assert v.reason == "exhausted at 4 of 9 rows" and v.processed_rows == 4  # 9 = ceil(10 ÷ 1.2)
     (layout.processed_dir("v") / "MANIFEST.json").unlink()
     assert not source_state(cfg, "v", layout).satisfied  # exhausted alone is not enough: the raw shards must be built
+
+
+def test_prepare_fails_an_exhausted_source_the_validation_holdout_would_empty(layout: DatasetLayout, cfg_factory: CfgFactory, config_file: ConfigFile, write_local: Writer) -> None:
+    """End to end: a trained-and-validated source that runs dry with its every processed row going to the
+    training-time holdout is reported FAILED by `prepare` — training would otherwise crash at startup. A val-only
+    source holds nothing out, so any row still serves it (`test_exhausted_and_built_source_is_satisfied`)."""
+    src_dir = layout.root.parent / "one_row"
+    write_local(src_dir, [{"text": "tok_1 tok_2 tok_3"}], "parquet")
+    cfg = cfg_factory({"w": SourceConfig(kind="pretrain", loader="local", path=str(src_dir), validation_fraction=0.5)})
+    assert cfg.used_in_train("w") and cfg.used_in_val("w") and cfg.validation_fraction_of("w") == 0.5
+    report = prepare(config_file(cfg), layout.root, assume_yes=False)
+    w = _state(report, "w")
+    assert not report.complete and not w.satisfied and w.exhausted and w.processed_rows == 1
+    assert w.reason == (
+        "exhausted, and 1 processed rows − 1 validation holdout leaves 0 training rows — "
+        "lower the source's validation_fraction or give it more rows"
+    )
 
 
 def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile) -> None:

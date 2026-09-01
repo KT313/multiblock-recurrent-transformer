@@ -18,7 +18,9 @@ whose dedup or length filter dropped more than the safety margin was short forev
 loop gave up and ``prepare`` failed with no way forward), and a source that yielded *zero* processed rows but was
 exhausted counted as complete — a wrong ``fields`` / ``converter`` / ``filter`` / ``language`` reported as success.
 Now the ledger sizes a **top-up** from the observed yield (processed ÷ raw) and an exhausted source with no rows is
-a failure, as "a failed source is a failed build" says it must be.
+a failure, as "a failed source is a failed build" says it must be — and so is an exhausted source whose few rows all
+go to the training-time validation holdout (:func:`training_rows_after_split`): training would only fail at startup
+with a confusing empty-range error, so preparation's "satisfied" mirrors the split training will make.
 
 Everything here reads manifests only (no parquet footers): a processed folder's health is the shared verdict of
 ``lib/build/assessment.py`` in its manifest-only mode (``check_files=False``), so broken or stray shard files are
@@ -282,8 +284,9 @@ class Satisfaction(Enum):
     plan, the round loop and the status table all give the same answer."""
 
     OK = "ok"  # the processed folder holds at least `rows_sufficient` rows
-    EXHAUSTED_SMALL = "exhausted_small"  # the loader ran dry with fewer, but some, rows: served, with a warning
+    EXHAUSTED_SMALL = "exhausted_small"  # the loader ran dry with fewer rows, but at least one survives the training-time validation holdout: served, with a warning
     EXHAUSTED_EMPTY = "exhausted_empty"  # the loader ran dry and NOT ONE row survived the build: a config mistake
+    EXHAUSTED_ALL_VALIDATION = "exhausted_all_validation"  # the loader ran dry and the training-time validation holdout takes every processed row: training would start empty
     RAW_BROKEN = "raw_broken"  # the raw folder is stale / outdated: the repair step deletes it after confirmation
     RAW_MISSING = "raw_missing"  # nothing downloaded yet
     NOT_BUILT = "not_built"  # the processed folder is missing, stale, or behind the raw shards
@@ -291,9 +294,11 @@ class Satisfaction(Enum):
 
     @property
     def satisfied(self) -> bool:
-        """A source that ran dry with *something* on disk is served (the training sampler cycles what is there); one
-        that ran dry with *nothing* is not — its rows were all rejected, which is a wrong ``fields`` / ``converter``
-        / ``filter`` / ``language``, and a failed source is a failed build, never a silently smaller dataset."""
+        """A source that ran dry is served only when at least one row is left for *training* after the holdout the
+        training resolver will take (:func:`training_rows_after_split`) — the sampler cycles what is there. One that
+        ran dry with nothing is not: its rows were all rejected, which is a wrong ``fields`` / ``converter`` /
+        ``filter`` / ``language``; nor is one whose few rows all go to the validation holdout — training would fail
+        at startup with an empty range. A failed source is a failed build, never a silently smaller dataset."""
         return self in (Satisfaction.OK, Satisfaction.EXHAUSTED_SMALL)
 
 
@@ -388,8 +393,9 @@ class SourceLedger:
     def satisfaction(self) -> Satisfaction:
         """Satisfied = the processed manifest is current, covers every raw shard and holds at least
         :attr:`rows_sufficient` rows (so the training part after the split reaches the sequence budget) — or the
-        loader is dry and left *some* rows behind. A stale / outdated raw folder is reported (the repair step deletes
-        it after confirmation), never counted."""
+        loader is dry with at least one row left for training after the validation holdout
+        (:attr:`training_rows`; a source used only in validation holds nothing out, so any row serves it). A stale /
+        outdated raw folder is reported (the repair step deletes it after confirmation), never counted."""
         if self.raw_state not in ("missing", "current"):
             return Satisfaction.RAW_BROKEN
         if self.raw_state == "missing":
@@ -399,7 +405,11 @@ class SourceLedger:
         if self.processed_rows >= self.rows_sufficient:
             return Satisfaction.OK
         if self.exhausted:
-            return Satisfaction.EXHAUSTED_EMPTY if self.processed_rows == 0 else Satisfaction.EXHAUSTED_SMALL
+            if self.processed_rows == 0:
+                return Satisfaction.EXHAUSTED_EMPTY
+            if self.training_rows < 1:
+                return Satisfaction.EXHAUSTED_ALL_VALIDATION
+            return Satisfaction.EXHAUSTED_SMALL
         return Satisfaction.SHORT_BUT_FETCHABLE
 
     def reason(self) -> str:
@@ -420,6 +430,12 @@ class SourceLedger:
                 f"exhausted and NOT ONE of {self.raw_rows:,} raw rows survived the build "
                 f"({self.skipped_malformed:,} malformed, {self.dropped_too_long:,} too long) — "
                 "check the source's fields / converter / filter / language"
+            )
+        if case is Satisfaction.EXHAUSTED_ALL_VALIDATION:
+            held_out = self.processed_rows - self.training_rows
+            return (
+                f"exhausted, and {self.processed_rows:,} processed rows − {held_out:,} validation holdout leaves "
+                "0 training rows — lower the source's validation_fraction or give it more rows"
             )
         return f"processed rows {self.processed_rows:,} < {self.rows_sufficient:,}"
 
