@@ -39,7 +39,10 @@ from training.data.dataset_resolver import (
     build_command,
     check_dataset_unchanged,
     check_entries_on_disk,
+    check_entry_shards,
     check_validation_batches,
+    entry_rows_in_range,
+    loader_shards,
     processed_rows,
     resolve_dataset,
     resolve_entries,
@@ -384,6 +387,64 @@ def test_check_entries_on_disk_names_the_stage_key(tmp_path: Path, tiny_pretrain
         check_entries_on_disk([_stage([DataEntry("s-a", good, skip_rows=total)], [])])
     with pytest.raises(RuntimeError, match=r"stage 's' val entry 's-a': row range \[0, 0\) of .* is empty .*; the validation part"):
         check_entries_on_disk([_stage([], [DataEntry("s-a", good, max_rows=0)])])
+
+
+# --- one row per dataloader worker shard ------------------------------------------------------------------------------
+
+
+def test_loader_shards_counts_workers_and_ranks() -> None:
+    """`num_workers=0` loads in the calling process: one shard per rank, not zero."""
+    assert loader_shards(0, 1) == 1
+    assert loader_shards(0, 4) == 4
+    assert loader_shards(1, 1) == 1
+    assert loader_shards(8, 1) == 8
+    assert loader_shards(8, 2) == 16
+
+
+def test_entry_rows_in_range_clips_to_the_rows_on_disk(tiny_pretrain_dir: Path) -> None:
+    total = _rows_in(tiny_pretrain_dir)
+    good = str(tiny_pretrain_dir)
+    assert entry_rows_in_range(DataEntry("s-a", good), total) == total
+    assert entry_rows_in_range(DataEntry("s-a", good, skip_rows=2), total) == total - 2
+    assert entry_rows_in_range(DataEntry("s-a", good, max_rows=3), total) == 3
+    assert entry_rows_in_range(DataEntry("s-a", good, max_rows=total + 100), total) == total
+    assert entry_rows_in_range(DataEntry("s-a", good, skip_rows=total + 5), total) == 0
+
+
+def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_worker_count(tiny_pretrain_dir: Path) -> None:
+    """A source with fewer rows than the loader has worker shards leaves a worker with an empty shard; the mixture
+    restarts that member, gets a second `StopIteration` and the run dies inside the worker — so it is a setup error
+    naming the entry, its rows and the worker count. `dataloader_num_workers=0` is a single in-process shard and
+    can never trip it."""
+    good = str(tiny_pretrain_dir)
+    total = _rows_in(tiny_pretrain_dir)
+    stage = _stage([DataEntry("s-a", good)], [DataEntry("s-a", good, max_rows=1)])
+    check_entry_shards([stage], dataloader_num_workers=0)  # in-process: one shard, whatever the row count
+    check_entry_shards([stage], dataloader_num_workers=total)  # exactly one row per shard
+    check_entry_shards([stage], dataloader_num_workers=1)
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"stage 's' train entry 's-a': .* gives it {total} row\(s\) after the validation split, but its loader "
+            rf"deals the rows round-robin over {total + 1} shards \({total + 1} dataloader worker\(s\)\), so 1 "
+            rf"shard\(s\) would be empty and the run would fail during training\. Lower dataloader_num_workers to at "
+            rf"most {total}, or give the source more rows"
+        ),
+    ):
+        check_entry_shards([stage], dataloader_num_workers=total + 1)
+    # the training range is what counts, not the folder: the validation split narrows it
+    narrow = _stage([DataEntry("s-a", good, skip_rows=total - 2)], [])
+    check_entry_shards([narrow], dataloader_num_workers=2)
+    with pytest.raises(ValueError, match=r"gives it 2 row\(s\).*over 3 shards \(3 dataloader worker\(s\)\)"):
+        check_entry_shards([narrow], dataloader_num_workers=3)
+    # validation loaders read in-process (`num_workers=0`), so only extra ranks can starve one
+    val_only = _stage([], [DataEntry("s-b", good, max_rows=2)])
+    check_entry_shards([val_only], dataloader_num_workers=64)
+    with pytest.raises(
+        ValueError,
+        match=r"stage 's' val entry 's-b': .*over 4 shards \(0 dataloader worker\(s\) × world size 4\).*lower the world size",
+    ):
+        check_entry_shards([val_only], dataloader_num_workers=0, world_size=4)
 
 
 # --- the validation data an evaluation needs --------------------------------------------------------------------------

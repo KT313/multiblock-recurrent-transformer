@@ -8,8 +8,9 @@ holds out its first `ceil(validation_fraction_of(source) × rows)` processed row
 and trains on the rest. Rows are counted from the parquet footers of `processed/<source>` and cross-checked against
 the manifest; the same source gets the same split in every stage. The chosen `validation_rows` per source travel
 with every checkpoint next to `dataset_config_hash` and are verified on resume (`check_dataset_unchanged`).
-The split is also checked against what evaluation needs (`check_validation_batches`): a stage whose validation
-loader cannot fill one micro-batch fails here, at setup, instead of at the first evaluation step.
+The split is also checked against what the loaders and evaluation need: a stage whose validation loader cannot fill
+one micro-batch (`check_validation_batches`) and an entry with fewer rows than its loader has worker shards
+(`check_entry_shards`) fail here, at setup, instead of at the first evaluation step or mid-training in a worker.
 
 Framework-neutral apart from `data_preparation.*` (manifests, parquet footers); no torch. The only cross-over
 between the run config and the dataset config happens here.
@@ -226,6 +227,14 @@ def resolve_entries(
     )
 
 
+def entry_rows_in_range(entry: DataEntry, total_rows: int) -> int:
+    """Rows a loader actually reads from `entry`: its range `[skip_rows, skip_rows + max_rows)` clipped to the
+    `total_rows` on disk, exactly as `ParquetTextDataset` clips it."""
+    start = min(entry.skip_rows, total_rows)
+    stop = total_rows if entry.max_rows is None else min(total_rows, start + entry.max_rows)
+    return stop - start
+
+
 def check_entries_on_disk(stages: list[ResolvedStage]) -> None:
     """Direct filesystem check of every data entry, independent of manifests and of the planner: the directory
     exists, holds at least one `data-*.parquet` shard, and the entry's row range (clipped to the rows on disk as
@@ -239,14 +248,58 @@ def check_entries_on_disk(stages: list[ResolvedStage]) -> None:
                 if entry.data_dir not in rows_cache:
                     rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
                 total = rows_cache[entry.data_dir]
-                start = min(entry.skip_rows, total)
-                stop = total if entry.max_rows is None else min(total, start + entry.max_rows)
-                if stop <= start:
+                if entry_rows_in_range(entry, total) <= 0:
                     end = "end" if entry.max_rows is None else str(entry.skip_rows + entry.max_rows)
                     raise RuntimeError(
                         f"{what}: row range [{entry.skip_rows}, {end}) of {entry.data_dir} is empty ({total} rows on "
                         f"disk); the {'validation' if part == 'val' else 'training'} part of the split has no row"
                     )
+
+
+def loader_shards(num_workers: int, world_size: int) -> int:
+    """Shards a loader's datasets deal their rows over: one per dataloader worker and rank
+    (`ParquetTextDataset._shard`). `num_workers=0` loads in the calling process, which is ONE shard per rank."""
+    return world_size * max(num_workers, 1)
+
+
+def check_entry_shards(stages: list[ResolvedStage], dataloader_num_workers: int, world_size: int = 1) -> None:
+    """Fail at setup when a data entry has fewer rows than the loader has shards.
+
+    `ParquetTextDataset` deals the rows of an entry's range round-robin over `world_size × num_workers` shards, so a
+    shard is empty as soon as the range holds fewer rows than there are shards. An empty member of a
+    `WeightedMixtureDataset` is fatal mid-run: the mixture restarts a member that runs out and immediately gets a
+    second `StopIteration` from the empty shard, which Python turns into a `RuntimeError` inside the worker and kills
+    the training run. Checked for the train entries (`dataloader_num_workers`) and the validation entries (built with
+    `num_workers=0`, so one shard per rank) alike; the error names the entry, its folder, its row count and the
+    worker count.
+    """
+    rows_cache: dict[str, int] = {}
+    for stage in stages:
+        for part, entries, num_workers in (
+            ("train", stage.train_data, dataloader_num_workers),
+            ("val", stage.val_data, 0),
+        ):
+            shards = loader_shards(num_workers, world_size)
+            if shards <= 1:  # a single in-process shard reads the whole range; nothing to split
+                continue
+            for entry in entries:
+                what = f"stage {stage.name!r} {part} entry {entry.prefix!r}"
+                if entry.data_dir not in rows_cache:
+                    rows_cache[entry.data_dir] = _rows_on_disk(Path(entry.data_dir), what)
+                rows = entry_rows_in_range(entry, rows_cache[entry.data_dir])
+                if rows >= shards:
+                    continue
+                ranks = f" × world size {world_size}" if world_size > 1 else ""
+                fix = (
+                    f"Lower dataloader_num_workers to at most {rows}, or give the source more rows"
+                    if num_workers > 0
+                    else "Give the source more rows, or lower the world size"
+                )
+                raise ValueError(
+                    f"{what}: {entry.data_dir} gives it {rows} row(s) after the validation split, but its loader "
+                    f"deals the rows round-robin over {shards} shards ({num_workers} dataloader worker(s){ranks}), "
+                    f"so {shards - rows} shard(s) would be empty and the run would fail during training. {fix}"
+                )
 
 
 def validation_batches_available(entries: list[DataEntry], micro_batch_size: int, world_size: int) -> int | None:
@@ -269,9 +322,7 @@ def validation_batches_available(entries: list[DataEntry], micro_batch_size: int
         return None
     entry = entries[0]
     total = _rows_on_disk(Path(entry.data_dir), f"validation entry {entry.prefix!r}")
-    start = min(entry.skip_rows, total)
-    stop = total if entry.max_rows is None else min(total, start + entry.max_rows)
-    rows_per_rank = (stop - start) // world_size
+    rows_per_rank = entry_rows_in_range(entry, total) // world_size
     return -(-rows_per_rank // micro_batch_size)  # ceil, in integers
 
 
@@ -402,7 +453,8 @@ def resolve_dataset(
     Raises `RuntimeError` when data is missing and cannot / must not be prepared here, when a folder on disk does
     not match its manifest or leaves a used part of the split empty, or when a stage's validation loader cannot
     fill one evaluation micro-batch (`check_validation_batches`, which warns about a split shorter than
-    `eval_iters` batches).
+    `eval_iters` batches); `ValueError` when an entry has fewer rows than its loader has worker shards
+    (`check_entry_shards`).
     """
     dataset_config = load_dataset_config(settings.dataset_config)
     validate_settings(settings, dataset_config)
@@ -423,10 +475,10 @@ def resolve_dataset(
                 val_data=val_data,
             )
         )
+    world_size = 1 if backend is None else backend.world_size
     check_entries_on_disk(stages)
-    check_validation_batches(
-        stages, settings.micro_batch_size, settings.eval_iters, 1 if backend is None else backend.world_size
-    )
+    check_entry_shards(stages, settings.dataloader_num_workers, world_size)
+    check_validation_batches(stages, settings.micro_batch_size, settings.eval_iters, world_size)
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),
@@ -483,7 +535,10 @@ __all__ = [
     "build_command",
     "check_dataset_unchanged",
     "check_entries_on_disk",
+    "check_entry_shards",
     "check_validation_batches",
+    "entry_rows_in_range",
+    "loader_shards",
     "processed_rows",
     "resolve_dataset",
     "resolve_entries",
