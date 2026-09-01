@@ -13,7 +13,8 @@
         download_and_build_missing                     downloads (sources/<name>/raw) and builds (processed/<name>) at the
                                                        same time: a source is built as soon as its download finished
         stop when every source serves its budget, or when nothing more can be fetched
-    summarize_dataset_state                            the status table
+    assess_dataset_state                               the status table and its verdict, counting the repairs this
+                                                       run left undone (a dry run leaves all of them) as incomplete
 
 :func:`download_and_build_missing` is the only place with thread-pool code: a pool of ``max_parallel_downloads``
 download jobs (the ``github_code`` sources of one repo form one job, read in a single pass over the repo files) and
@@ -25,7 +26,8 @@ a failed build, never a silently smaller dataset. Ctrl-C while waiting does the 
 :class:`BuildAborted` (``prepare.py`` exits 130); everything published so far is kept and the next run resumes at
 shard granularity.
 
-``status`` is read-only: the repair step's dry report ("would repair: …") plus the same status table.
+``status`` is read-only: the repair step's dry report ("would repair: …") plus the same
+:func:`assess_dataset_state` ending, so it and ``prepare --dry_run`` cannot call the same tree differently.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from data_preparation.lib.build.planner import (
     sources_with_pending_raw_shards,
     summarize_dataset_state,
 )
-from data_preparation.lib.build.repair import Confirm, RepairReport, repair_broken_and_stale_folders
+from data_preparation.lib.build.repair import Confirm, RepairAction, RepairReport, repair_broken_and_stale_folders
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources import github_code_repo_key
@@ -88,7 +90,8 @@ def prepare(
 
     ``assume_yes`` confirms the deletion of stale / outdated raw folders without asking; otherwise ``confirm`` (or
     the terminal) is asked once and a refusal raises :class:`ConfirmationRequired` before anything is changed.
-    ``dry_run`` reports what the repair and the first round would do and writes nothing (not even the lock file).
+    ``dry_run`` reports what the repair and the first round would do and writes nothing (not even the lock file); its
+    report is the one :func:`status` gives for the same tree, the repairs it did not perform included.
     ``steps`` (a subset of :data:`STEPS`) and ``sources`` restrict the work — and the satisfaction check — to the
     named steps / sources; the returned report always covers the whole config.
     """
@@ -120,8 +123,7 @@ def prepare(
             if not another_round_can_fetch_more(config, layout, active_steps, selected):
                 break  # still short, but nothing left to download: the report names the sources
         set_status(step="status")
-        report = summarize_dataset_state(config, layout)
-    log_report(report)
+        report = assess_dataset_state(config, layout, repair_report)
     return report
 
 
@@ -132,11 +134,8 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
     repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True)
-    if repair_report.actions:
-        log.warning("would repair:\n%s", repair_report.describe(), extra={"keep": True})
-    report = summarize_dataset_state(config, layout, needs_repair=[action.source for action in repair_report.actions])
-    log_report(report)
-    return report
+    log_repair(repair_report)
+    return assess_dataset_state(config, layout, repair_report)
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------
@@ -452,9 +451,30 @@ def warn_about_overlaps(config: DatasetConfig) -> None:
         log.warning(warning)
 
 
+def outstanding_repairs(report: RepairReport) -> list[RepairAction]:
+    """The actions of a repair pass that were planned but not carried out — everything of a dry run (``would_*``),
+    nothing of a pass that performed them. They are what still stands between the tree and a complete dataset."""
+    return [action for action in report.actions if action.action.startswith("would_")]
+
+
 def log_repair(report: RepairReport) -> None:
-    if report.actions:
+    """One line per action of a repair pass: what it did, or — a dry run — what it would do."""
+    if not report.actions:
+        return
+    if outstanding_repairs(report):
+        log.warning("would repair:\n%s", report.describe(), extra={"keep": True})
+    else:
         log.info("repair:\n%s", report.describe(), extra={"keep": True})
+
+
+def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_report: RepairReport) -> DatasetReport:
+    """The verdict :func:`prepare` and :func:`status` both end with, so the two can never disagree about one tree:
+    the status table, with the sources of the repairs ``repair_report`` left undone counted as incomplete. A
+    ``status`` run and a ``prepare --dry_run`` change nothing, so their planned repairs are still outstanding; a real
+    ``prepare`` performed them before it downloaded anything and leaves none."""
+    report = summarize_dataset_state(config, layout, needs_repair=[action.source for action in outstanding_repairs(repair_report)])
+    log_report(report)
+    return report
 
 
 def log_report(report: DatasetReport) -> None:
@@ -476,7 +496,9 @@ __all__ = [
     "Job",
     "JobPool",
     "StopFlag",
+    "assess_dataset_state",
     "download_and_build_missing",
+    "outstanding_repairs",
     "prepare",
     "status",
     "wait_for_jobs",

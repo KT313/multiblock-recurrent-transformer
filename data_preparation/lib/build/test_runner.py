@@ -674,6 +674,25 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
     assert raw is not None and raw.token_count == "estimate" and raw.is_current(cfg.raw_hash("p"))
 
 
+def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Neither entry point changes the tree here, so they must not judge it differently: both end with the same
+    assessment, counting the repairs the run left undone (all of them in a dry run) as incomplete."""
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
+    assert prepare(path, layout.root, assume_yes=False).complete
+    next(layout.processed_dir("p").glob("data-*.parquet")).unlink()  # broken: the repair step would delete the folder
+    before = all_mtimes(layout.root, include_lock=True)
+
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        dry = prepare(path, layout.root, assume_yes=False, dry_run=True)
+    assert "would repair:" in caplog.text
+    assert dry.describe() == status(path, layout.root).describe()
+    assert not dry.complete and dry.needs_repair == ["p"] and dry.missing() == ["p"]
+    assert all_mtimes(layout.root, include_lock=True) == before, "neither of them touched the tree"
+    assert prepare(path, layout.root, assume_yes=False).complete  # a real run repairs, rebuilds and reports no repair
+
+
 def test_status_is_read_only_and_reports_would_repair(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture) -> None:
     path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
     prepare(path, layout.root, assume_yes=False)
