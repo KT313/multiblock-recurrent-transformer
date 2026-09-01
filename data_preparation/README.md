@@ -224,7 +224,10 @@ same rows as a full one. Changing `bloom_memory_mb` does not invalidate processe
 once (the LSH index needs every signature; documents shorter than one n-gram pass through). It is **not meant for
 large sources**: an all-or-nothing pass every time the source changes and roughly 4 GB of RAM per million kept rows
 at `num_perm: 256` — over 10 GB for fineweb-edu at the crow budget. The thesis run had it on; the crow config has it
-off. Fuzzy dedup at scale is what `datatrove` or `rensa` are for; wiring one of them in is not planned.
+off. Fuzzy dedup at scale is what `datatrove` or `rensa` are for; wiring one of them in is not planned. It applies
+to **pretrain sources only**: a config that puts an instruct source under `mode: minhash` is rejected when it is
+loaded (it would silently get exact dedup), so ask for minhash in the `processing` block of each pretrain source
+rather than in the dataset-level one.
 
 ### Repair and the confirmation rule (`lib/build/repair.py`)
 
@@ -398,7 +401,8 @@ Configured in the `processing` block (dataset-level default, per-pretrain-source
 the order they run in.
 
 - `dedup.mode`: `exact` (default; Bloom filter, `normalize`, `bloom_memory_mb`), `minhash` (exact first, then
-  MinHash/LSH; `threshold`, `num_perm`, `ngram`; not for scale) or `none`.
+  MinHash/LSH; `threshold`, `num_perm`, `ngram`; not for scale, pretrain sources only — an instruct source under
+  `minhash` is a config error) or `none`.
 - `quality_filter: true` keeps documents with ≥ 3 sentences, ≤ 30 % ALL-CAPS words, ≥ 25 % alphanumeric characters,
   ≤ 30 % repeated 2-grams and ≤ 20 % repeated 3-grams — prose heuristics, wrong for code.
 - `decontamination.enabled: true` drops documents whose 13-grams overlap more than `threshold` with a benchmark test

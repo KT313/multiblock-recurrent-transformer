@@ -118,9 +118,12 @@ class TokenizerConfig:
 
 @dataclass
 class DedupConfig:
-    """Deduplication of a source's rows (both kinds; instruct rows are hashed as instruction + input + output)."""
+    """Deduplication of a source's rows (both kinds; instruct rows are hashed as instruction + input + output).
 
-    mode: DedupMode = field(default="exact", metadata=_PROCESSED)  # minhash = exact dedup first, then MinHash/LSH near-duplicate removal (not for scale)
+    `none` and `exact` apply to both kinds, `minhash` only to pretrain sources — an instruct source configured with
+    it is rejected by `DatasetConfig._check_dedup_modes` instead of quietly getting exact dedup."""
+
+    mode: DedupMode = field(default="exact", metadata=_PROCESSED)  # minhash (pretrain sources only) = exact dedup first, then MinHash/LSH near-duplicate removal (not for scale)
     normalize: bool = field(default=True, metadata={"hash": _normalize_hash})  # exact mode: hash lowercased, whitespace-collapsed text
     # A larger filter only lowers an already negligible false-positive rate: a resource knob, never a reason to
     # rebuild a processed folder, so it is in no hash.
@@ -378,6 +381,7 @@ class DatasetConfig:
             for key in (*stage.train, *stage.val):
                 self._check_stage_key(stage.name, key)
         self._check_source_usage()
+        self._check_dedup_modes()
 
     def _check_stage_key(self, stage_name: str, key: str) -> None:
         """A stage key is the plain name of a declared source."""
@@ -403,6 +407,20 @@ class DatasetConfig:
                 raise ValueError(
                     f"source {name!r} is used in train and val but its validation_fraction is 0: nothing would be held out "
                     "(list it only in `train`, or give a positive fraction)"
+                )
+
+    def _check_dedup_modes(self) -> None:
+        """`dedup.mode: minhash` never reaches an instruct source: the near-duplicate pass runs only in the pretrain
+        branch of the build (`lib/stages/build.py`), so such a source would silently be deduplicated exactly and the
+        config would promise something it does not do. `processing` is a pretrain-only per-source field, so it is the
+        dataset-level block that reaches an instruct source — a config that wants minhash for its pretrain sources
+        gives each of them its own `processing`."""
+        for name, source in self.sources.items():
+            if source.kind == "instruct" and self.source_processing(name).dedup.mode == "minhash":
+                raise ValueError(
+                    f"source {name!r}: dedup.mode=minhash is not implemented for instruct sources (only pretrain "
+                    "sources run the near-duplicate pass) — use dedup.mode=exact, and set minhash in the "
+                    "`processing` block of each pretrain source instead of the dataset-level one"
                 )
 
     # --- source usage ----------------------------------------------------------------------------------------------

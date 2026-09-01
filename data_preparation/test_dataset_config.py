@@ -208,6 +208,7 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["sources"]["ins"].update({"input_inversions": -0.1}), r"input_inversions must be in \[0, 1\)"),
         (lambda d: d["sources"]["pre"].update({"describe_tokens_per_row": 0}), "describe_tokens_per_row"),
         (lambda d: d["sources"]["ins"].update({"processing": {"min_chars": 1}}), "processing only applies to kind pretrain"),
+        (lambda d: d.update({"processing": {"dedup": {"mode": "minhash"}}}), "source 'ins': dedup.mode=minhash is not implemented"),
         (lambda d: d["sources"]["ins"].pop("fields"), "requires fields or converter"),
         (lambda d: d["sources"]["ins"].update({"fields": {"instruction": "a"}}), "instruction and output"),
         (lambda d: d["sources"]["ins"].pop("hf_id"), "requires hf_id"),
@@ -571,6 +572,19 @@ def test_config_hash_ignores_the_bloom_budget_like_processed_hash_does() -> None
     assert _build(d).config_hash() != base
 
 
+def test_minhash_is_rejected_for_instruct_sources_and_allowed_per_pretrain_source(tmp_path: Path) -> None:
+    """The near-duplicate pass runs only in the pretrain branch of the build, so an instruct source configured with
+    `minhash` would silently be deduplicated exactly: the config is refused when it is loaded, naming the source."""
+    d = _minimal()
+    d["processing"] = {"dedup": {"mode": "minhash"}}  # the dataset-level block is what reaches the instruct source
+    with pytest.raises(ValueError, match="source 'ins': dedup.mode=minhash is not implemented for instruct sources"):
+        load_dataset_config(_write(tmp_path, d))
+    del d["processing"]
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}  # a pretrain source may ask for it
+    cfg = load_dataset_config(_write(tmp_path, d))
+    assert cfg.source_processing("pre").dedup.mode == "minhash" and cfg.source_processing("ins").dedup.mode == "exact"
+
+
 def test_schema_rejects_a_pretrain_filter_a_non_positive_check_limit_and_an_empty_validation_split() -> None:
     d = _minimal()
     d["sources"]["pre"]["filter"] = "sharegpt_quality"
@@ -670,7 +684,7 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"dedup": {"normalize": False}}),
-        lambda d: d.__setitem__("processing", {"dedup": {"mode": "minhash"}}),
+        lambda d: d["sources"]["pre"].__setitem__("processing", {"dedup": {"mode": "minhash"}}),  # pretrain only
         lambda d: d.__setitem__("processing", {"dedup": {"mode": "none"}}),
         lambda d: d.__setitem__("processing", {"quality_filter": True}),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),
@@ -683,13 +697,13 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         change(d)
         assert _build(d).processed_hash("pre") != h, change
 
-    # minhash fields count once minhash is the active mode
+    # minhash fields count once minhash is the active mode (set per pretrain source: instruct sources reject it)
     d = _minimal()
-    d["processing"] = {"dedup": {"mode": "minhash"}}
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
     minhash = _build(d).processed_hash("pre")
-    d["processing"] = {"dedup": {"mode": "minhash", "threshold": 0.5}}
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash", "threshold": 0.5}}
     assert _build(d).processed_hash("pre") != minhash
-    d["processing"] = {"dedup": {"mode": "minhash", "bloom_memory_mb": 4}}
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash", "bloom_memory_mb": 4}}
     assert _build(d).processed_hash("pre") == minhash
 
     # instruct: inversions and the shuffle default
