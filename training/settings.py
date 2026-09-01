@@ -50,6 +50,7 @@ class Settings:
     prepare_max_parallel_downloads: int = 2  # sources downloading at a time during the in-process build
     stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional
     allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config
+    allow_settings_change: bool = False  # resume although numerics-relevant settings / model config differ from the checkpoint
 
     # Run
     run_name: str = "crow-300m"

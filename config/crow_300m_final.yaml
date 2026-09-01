@@ -29,6 +29,7 @@ prepare_num_workers: 4               # sources processed at a time by the in-pro
 prepare_max_parallel_downloads: 2    # sources downloading at a time during the in-process build
 stage_base_lrs: [3e-4, 1e-4, 5e-5]   # base LR per dataset-config stage, positional: pretrain_phase1, pretrain_phase2, finetune
 allow_dataset_change: false          # allow resuming from a checkpoint written with a different dataset config
+allow_settings_change: false         # allow resuming although numerics-relevant settings / model config differ from the checkpoint
 
 # --- Run --------------------------------------------------------------------------------------------------------
 run_name: crow-300m-final            # name of the run: checkpoint file names, wandb run, resume lookup

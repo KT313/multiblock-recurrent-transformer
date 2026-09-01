@@ -47,6 +47,7 @@ from training.backend import Backend, get_backend
 from training.checkpoint import (
     CheckpointMetadata,
     checkpoint_dir,
+    check_settings_unchanged,
     checkpoint_path,
     find_latest_checkpoint,
     is_checkpoint_step,
@@ -54,7 +55,8 @@ from training.checkpoint import (
     save_training_checkpoint,
     unwrap_compiled,
 )
-from training.data import IGNORE_INDEX, build_stage_dataloaders
+from training.data.collate import IGNORE_INDEX
+from training.data.loader import build_stage_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport
@@ -116,6 +118,7 @@ def train(
         settings, run_directory, dataset, model, stage_manager, progress, backend, setup_started=started_at
     ) as logger:
         if resumed_from is None:
+            record_run_config(settings, run_directory)
             logger.log_fresh_start()
         else:
             logger.log_resume(resumed_from, progress.step)
@@ -155,13 +158,17 @@ def create_backend(settings: Settings) -> Backend:
 
 
 def prepare_run_directory(settings: Settings) -> Path:
-    """Create the run directory (`settings.out_dir`) with its `checkpoints/` folder and write `run_config.json`
-    (the settings as parsed, jsonargparse overrides applied). Returns the run directory."""
+    """Create the run directory (`settings.out_dir`) with its `checkpoints/` folder. Returns the run directory."""
     run_directory = Path(settings.out_dir)
     checkpoint_dir(run_directory).mkdir(parents=True, exist_ok=True)
+    return run_directory
+
+
+def record_run_config(settings: Settings, run_directory: Path) -> None:
+    """Write `run_config.json` (the settings as parsed, jsonargparse overrides applied) — only for a FRESH run:
+    a resume keeps the file the run was started with, the historical record of what this run is."""
     with open(run_directory / "run_config.json", "w") as f:
         json.dump(asdict(settings), f, indent=4)
-    return run_directory
 
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
@@ -241,6 +248,8 @@ def restore_checkpoint_if_resuming(
         return progress, None, None
     metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
     check_dataset_unchanged(metadata, dataset, settings.allow_dataset_change)
+    model_config = cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict()
+    check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
     progress.step = progress.resume_step = metadata.step
     backend.set_rng_state(metadata.rng)
     return progress, resume_path, metadata.data_stream

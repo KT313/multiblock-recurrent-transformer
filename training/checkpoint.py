@@ -10,7 +10,7 @@ older layouts (clean break, a standing decision): `CheckpointMetadata.from_state
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -83,6 +83,45 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
     if not candidates:
         return None
     return max(candidates, key=_step_from_name)
+
+
+# Settings whose value changes the numbers a run produces: a resume that silently mixes two configurations of these
+# is a chimera, so `restore_checkpoint_if_resuming` compares them against the checkpoint (`allow_settings_change`
+# overrides). Deliberately absent: paths, run_name, resume/logging/export knobs, `resume_warmup_steps` (a resume
+# feature by design) and the dataset config (its own hash check).
+NUMERICS_SETTINGS = (
+    "world_batch_size",
+    "micro_batch_size",
+    "seed",
+    "stage_base_lrs",
+    "warmup_steps",
+    "cooldown_steps",
+    "grad_clip",
+    "optimizer",
+    "optim_config",
+    "block_size",
+    "sort_batches_by_length",
+    "sequence_padding_multiple",
+    "precision",
+)
+
+
+def check_settings_unchanged(
+    metadata: CheckpointMetadata, settings: "Settings", model_config: dict[str, Any], allow_settings_change: bool
+) -> None:
+    """Fail a resume whose numerics-relevant settings (:data:`NUMERICS_SETTINGS`) or model config differ from what
+    the checkpoint was written with, unless `allow_settings_change` is set. `model_config` is the current model's
+    `RecurrentConfig.to_dict()`, compared whole against the stored one."""
+    current = asdict(settings)
+    changed = sorted(key for key in NUMERICS_SETTINGS if current.get(key) != metadata.settings.get(key))
+    if model_config != metadata.model_config:
+        changed.append("model_config")
+    if changed and not allow_settings_change:
+        raise ValueError(
+            f"resuming with changed {changed}: the checkpoint was written with different values; "
+            "set allow_settings_change: true to continue anyway (the run becomes a mix of two configurations)"
+        )
+
 
 
 def is_checkpoint_step(settings: Settings, done: int, stage_manager: StageManager) -> bool:

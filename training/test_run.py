@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from model import RecurrentConfig, RecurrentGPT
 from training.backend import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data import IGNORE_INDEX
+from training.data.collate import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.golden import (
     GOLDEN_RUN_PATH,
@@ -39,6 +39,7 @@ from training.run import (
     check_block_sizes_agree,
     create_backend,
     prepare_run_directory,
+    record_run_config,
     restore_checkpoint_if_resuming,
     stop_requested,
     train,
@@ -105,10 +106,12 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
 
 
-def test_prepare_run_directory_writes_run_config(tiny_settings: Settings) -> None:
+def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
     run_directory = prepare_run_directory(tiny_settings)
     assert run_directory == Path(tiny_settings.out_dir)
     assert checkpoint_dir(run_directory).is_dir()
+    assert not (run_directory / "run_config.json").exists(), "written only for a FRESH run, by record_run_config"
+    record_run_config(tiny_settings, run_directory)
     assert json.loads((run_directory / "run_config.json").read_text()) == json.loads(json.dumps(asdict(tiny_settings)))
     prepare_run_directory(tiny_settings)  # idempotent (a resumed run reuses the directory)
 
@@ -408,6 +411,36 @@ def test_same_seed_is_deterministic(full_run: dict[str, Any], tmp_path: Path, ti
         assert history[done]["loss"] == pytest.approx(full_run["history"][done]["loss"], rel=1e-5), done
 
 
+def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+) -> None:
+    """A resume that silently mixes two configurations is a chimera: numerics-relevant settings are compared
+    against the checkpoint; `allow_settings_change: true` overrides."""
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()  # leave steps to run after the resume
+    changed = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", grad_clip="0.5")
+    with pytest.raises(ValueError, match=r"resuming with changed \['grad_clip'\]"):
+        _run(changed)
+    allowed = write_tiny_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", grad_clip="0.5", allow_settings_change="true"
+    )
+    assert _run(allowed).final_step == 20
+
+
+def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """`run_config.json` is the historical record of what the run was started with; a resume must not overwrite it."""
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
+    original = json.loads((out_dir / "run_config.json").read_text())
+    assert original["log_step_interval"] != 4
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", log_step_interval="4")
+    _run(yaml_path)  # log_step_interval is not numerics-relevant: the resume runs
+    assert json.loads((out_dir / "run_config.json").read_text()) == original
+
+
+
 @pytest.mark.slow
 def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
@@ -554,7 +587,8 @@ def test_resume_with_changed_dataset_config_raises_unless_allowed(
     with pytest.raises(RuntimeError, match="dataset config hash"):
         _run(yaml_path)
     yaml_path = _no_transition_yaml(
-        tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", allow_dataset_change="true"
+        tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false",
+        allow_dataset_change="true", allow_settings_change="true",  # the fixture's checkpoint is bf16, this yaml fp32
     )
     history = _run(yaml_path).history
     assert sorted(history) == list(range(15, 21))
