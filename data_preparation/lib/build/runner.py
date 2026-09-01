@@ -420,10 +420,15 @@ def checked_steps(steps: Iterable[str]) -> set[str]:
 
 
 def checked_sources(config: DatasetConfig, sources: Iterable[str] | None) -> list[str] | None:
-    """``sources`` as a list (None for every source); unknown names are an error."""
+    """``sources`` as a list (None for every source); unknown names are an error.
+
+    Repeats are dropped, keeping the first occurrence (``prepare.py --sources a a``): a name listed twice would be
+    inspected twice by the repair step, appear twice in its confirmation list and make the second deletion of the
+    same folder fail on a directory that is no longer there.
+    """
     if sources is None:
         return None
-    selected = list(sources)
+    selected = list(dict.fromkeys(sources))
     unknown = set(selected) - set(config.sources)
     if unknown:
         raise ValueError(f"unknown sources {sorted(unknown)}")

@@ -236,6 +236,19 @@ def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_f
         prepare(path, layout.root, assume_yes=False, max_parallel_downloads=0)
 
 
+def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """`--sources a a` used to inspect `a` twice: the repair step listed it twice and deleted the same folder twice
+    (the second `rmtree` on a directory that is gone)."""
+    sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
+    cfg = cfg_factory(sources, tokens=500)
+    assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["b", "a"] and runner.checked_sources(cfg, None) is None
+    path = config_file(cfg)
+    assert prepare(path, layout.root, assume_yes=False, sources=["a", "a"]).missing() == ["b"]
+    stale = cfg_factory(sources, tokens=500, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
+    assert prepare(config_file(stale), layout.root, assume_yes=True, sources=["a", "a"]).missing() == ["b"]
+    prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root), "--sources", "a", "a"])  # the CLI too
+
+
 # --- failures and interrupts -------------------------------------------------------------------------------------------
 
 
