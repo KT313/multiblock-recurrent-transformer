@@ -107,8 +107,8 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
         settings = parse_settings(["--config", str(yaml_path)])
         optimizer_step_calls = 0
 
-        def counting_build_optimizer(name: str, params: Any, **options: Any) -> torch.optim.Optimizer:
-            optimizer = build_optimizer(name, params, **options)
+        def counting_build_optimizer(name: str, params: Any, *args: Any, **options: Any) -> torch.optim.Optimizer:
+            optimizer = build_optimizer(name, params, *args, **options)
             optimizer_class = type(optimizer)
             original_step = optimizer_class.step
 

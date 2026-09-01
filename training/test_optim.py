@@ -10,6 +10,7 @@ import torch
 
 from model import RecurrentGPT
 from training.optim import ELLISAdam, _single_tensor_modded_adamw, build_optimizer, get_param_groups, set_lr
+from training.settings import OptimizerConfig
 
 
 def _param_ids(groups: list[dict[str, Any]]) -> list[int]:
@@ -72,10 +73,46 @@ def test_plain_2d_parameter_goes_to_the_weights_group() -> None:
 @pytest.mark.parametrize("name,cls", [("AdamW", torch.optim.AdamW), ("ELLISAdam", ELLISAdam)])
 def test_build_optimizer(name: str, cls: type[torch.optim.Optimizer]) -> None:
     p = torch.nn.Parameter(torch.zeros(2))
-    opt = build_optimizer(name, [p], lr=1e-3, weight_decay=0.1, betas=(0.9, 0.95))
+    opt = build_optimizer(name, [p], OptimizerConfig(lr=1e-3, weight_decay=0.1, betas=(0.9, 0.95)))
     assert isinstance(opt, cls)
     with pytest.raises(ValueError, match="Invalid optimizer"):
-        build_optimizer("SGD", [p], lr=1e-3)
+        build_optimizer("SGD", [p], OptimizerConfig(lr=1e-3))
+
+
+def _group_options(opt: torch.optim.Optimizer) -> list[dict[str, Any]]:
+    """Every per-group option except the parameter list, tensors compared by value."""
+    return [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+
+
+def test_build_optimizer_matches_the_old_dict_path() -> None:
+    """The dataclass path hands the optimizer exactly the keyword arguments the free-form dict did: the shipped
+    ELLISAdam options give the same defaults, and an unset `eps` keeps each optimizer's own default."""
+    p = torch.nn.Parameter(torch.zeros(2))
+    config = OptimizerConfig(
+        lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
+    )
+    built = build_optimizer("ELLISAdam", [p], config)
+    q = torch.nn.Parameter(torch.zeros(2))
+    reference = ELLISAdam(
+        [q], lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
+    )
+    for group, ref_group in zip(_group_options(built), _group_options(reference), strict=True):
+        assert set(group) == set(ref_group)
+        for key, value in group.items():
+            ref = ref_group[key]
+            assert torch.equal(value, ref) if isinstance(value, torch.Tensor) else value == ref, key
+    assert built.param_groups[0]["eps"] == 1e-6  # ELLISAdam's default
+    adamw = build_optimizer("AdamW", [p], OptimizerConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95)))
+    assert adamw.param_groups[0]["eps"] == 1e-8  # torch AdamW's default
+    assert build_optimizer("AdamW", [p], OptimizerConfig(eps=1e-5)).param_groups[0]["eps"] == 1e-5
+
+
+def test_build_optimizer_rejects_ellis_only_options_for_adamw() -> None:
+    p = torch.nn.Parameter(torch.zeros(2))
+    with pytest.raises(ValueError, match=r"\['atan_adam'\] apply only to 'ELLISAdam'"):
+        build_optimizer("AdamW", [p], OptimizerConfig(atan_adam=True))
+    with pytest.raises(ValueError, match=r"\['decouple_wd'\] apply only to 'ELLISAdam'"):
+        build_optimizer("AdamW", [p], OptimizerConfig(decouple_wd=False))
 
 
 def test_set_lr_scales_by_base_lr() -> None:

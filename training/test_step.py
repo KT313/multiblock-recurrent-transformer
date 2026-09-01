@@ -27,7 +27,7 @@ from training.golden import (
     write_tiny_yaml,
 )
 from training.run import build_run_optimizer
-from training.settings import Settings, parse_settings
+from training.settings import OptimizerConfig, Settings, parse_settings
 from training.stage_manager import StageManager, TrainingStage
 from training.step import (
     BatchStream,
@@ -65,7 +65,7 @@ def reference_settings(**overrides: Any) -> Settings:
         world_batch_size=4,
         precision="32",
         optimizer="ELLISAdam",
-        optim_config=dict(
+        optim_config=OptimizerConfig(
             lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
         ),
         grad_clip=1.0,

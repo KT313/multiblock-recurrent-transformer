@@ -13,6 +13,7 @@ from training.settings import (
     NON_NEGATIVE_SETTINGS,
     POSITIVE_SETTINGS,
     REQUIRED_SETTINGS,
+    OptimizerConfig,
     Settings,
     parse_settings,
 )
@@ -49,7 +50,8 @@ CROW_EXPLICIT: dict[str, Any] = {
     "optim_config": {
         "lr": 1e-4,
         "weight_decay": 4e-5,
-        "betas": [0.9, 0.95],
+        "betas": (0.9, 0.95),
+        "eps": None,
         "update_clipping": True,
         "atan_adam": True,
         "running_init": True,
@@ -105,7 +107,7 @@ def test_parse_tiny_yaml() -> None:
     assert cfg.resume is False and cfg.wandb_enabled is False
     assert (cfg.micro_batch_size, cfg.world_batch_size) == (2, 4)
     assert cfg.optimizer == "AdamW"
-    assert cfg.optim_config["lr"] == pytest.approx(3e-4) and list(cfg.optim_config["betas"]) == [0.9, 0.95]
+    assert cfg.optim_config == OptimizerConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95))
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.eval_step_interval, cfg.eval_iters) == (2, 2, 8, 2)
     assert cfg.partial_depth_eval == [1]
 
@@ -123,8 +125,9 @@ def test_parse_crow_yaml() -> None:
 def test_crow_yaml_lists_every_settings_field() -> None:
     """The thesis run config is the template: exactly the set of `Settings` fields, nothing stale, nothing missing."""
     with open(CROW_YAML, encoding="utf-8") as fp:
-        keys = set(yaml.safe_load(fp))
-    assert keys == {f.name for f in fields(Settings)}
+        loaded = yaml.safe_load(fp)
+    assert set(loaded) == {f.name for f in fields(Settings)}
+    assert set(loaded["optim_config"]) == {f.name for f in fields(OptimizerConfig)}
 
 
 def test_crow_yaml_effective_values_are_unchanged() -> None:
@@ -213,11 +216,41 @@ def test_unknown_cli_key_is_rejected() -> None:
         parse_settings(["--config", str(TINY_YAML), "--nope", "1"])
 
 
+def test_optim_config_field_override_merges_with_yaml() -> None:
+    """`--optim_config.lr` changes one field and keeps every other YAML value — a dict-typed setting would be
+    replaced whole, silently dropping the weight decay and the ELLISAdam flags (finding H10)."""
+    cfg = parse_settings(["--config", str(CROW_YAML), "--optim_config.lr", "3e-4"])
+    assert cfg.optim_config == OptimizerConfig(
+        lr=3e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
+    )
+
+
+def test_optim_config_unknown_cli_field_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_settings(["--config", str(TINY_YAML), "--optim_config.weight_decayy", "0.1"])
+
+
+def test_optim_config_unknown_yaml_field_is_rejected(tmp_path: Path) -> None:
+    with open(TINY_YAML, encoding="utf-8") as fp:
+        loaded = yaml.safe_load(fp)
+    loaded["optim_config"]["weight_decayy"] = 0.1  # a typo'd optimizer option must fail, not be carried silently
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(yaml.safe_dump(loaded), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        parse_settings(["--config", str(bad)])
+
+
+def test_settings_rejects_a_plain_dict_optim_config() -> None:
+    """The old shape of the setting (a free-form dict) fails with a message naming it, not far away in the optimizer."""
+    with pytest.raises(ValueError, match="optim_config must be an OptimizerConfig"):
+        _settings(optim_config={"lr": 1e-4})
+
+
 def test_defaults_are_a_single_gpu_config() -> None:
     cfg = _settings()
     assert cfg.backend == "single_device" and cfg.world_batch_size % cfg.micro_batch_size == 0
     assert cfg.model_overwrite == {} and cfg.optimizer == "ELLISAdam"
-    assert cfg.optim_config == {"lr": 1e-4, "weight_decay": 4e-5, "betas": (0.9, 0.95)}
+    assert cfg.optim_config == OptimizerConfig(lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95))
     assert cfg.out_dir == "outputs" and cfg.resume is True
     assert cfg.export_to_hf is False and cfg.export_hf_path is None
     assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 2

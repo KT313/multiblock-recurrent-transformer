@@ -14,6 +14,8 @@ from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from training.settings import OptimizerConfig
+
 
 def get_param_groups(
     model: Module, weight_decay: float, no_wd_for_bias_and_norm: bool = True
@@ -47,12 +49,35 @@ def get_param_groups(
     return param_groups
 
 
-def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], **options: Any) -> Optimizer:
-    """Construct "AdamW" (torch) or "ELLISAdam" from the `optim_config` keyword arguments."""
+# `OptimizerConfig` fields that are ELLISAdam constructor arguments only; a non-default value with another
+# optimizer is a config mistake and fails loudly instead of being dropped.
+ELLIS_ONLY_OPTIONS = ("update_clipping", "atan_adam", "running_init", "decouple_wd")
+
+
+def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig) -> Optimizer:
+    """Construct "AdamW" (torch) or "ELLISAdam" from the run's `optim_config`.
+
+    `eps: None` is left out of the constructor call so each optimizer keeps its own default (ELLISAdam 1e-6,
+    torch AdamW 1e-8), exactly as a config that never mentioned `eps` did.
+    """
+    common: dict[str, Any] = {"lr": config.lr, "betas": config.betas, "weight_decay": config.weight_decay}
+    if config.eps is not None:
+        common["eps"] = config.eps
     if name == "ELLISAdam":
-        return ELLISAdam(params, **options)
+        return ELLISAdam(
+            params,
+            **common,
+            update_clipping=config.update_clipping,
+            atan_adam=config.atan_adam,
+            running_init=config.running_init,
+            decouple_wd=config.decouple_wd,
+        )
+    defaults = OptimizerConfig()
+    ellis_only_set = [k for k in ELLIS_ONLY_OPTIONS if getattr(config, k) != getattr(defaults, k)]
+    if ellis_only_set:
+        raise ValueError(f"optim_config option(s) {ellis_only_set} apply only to 'ELLISAdam', not {name!r}")
     if name == "AdamW":
-        return torch.optim.AdamW(params, **options)
+        return torch.optim.AdamW(params, **common)
     raise ValueError(f"Invalid optimizer {name!r} requested (use 'AdamW' or 'ELLISAdam').")
 
 

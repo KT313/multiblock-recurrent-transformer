@@ -181,7 +181,7 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
     assert len(optimizer.param_groups) == 3
     assert [g["base_lr"] for g in optimizer.param_groups] == [1.0, 1.0, 1.0]
     assert [g["weight_decay"] for g in optimizer.param_groups] == [0.1, 0.1, 0.0]
-    assert all(float(g["lr"]) == tiny_settings.optim_config["lr"] for g in optimizer.param_groups)
+    assert all(float(g["lr"]) == tiny_settings.optim_config.lr for g in optimizer.param_groups)
     assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))
 
 

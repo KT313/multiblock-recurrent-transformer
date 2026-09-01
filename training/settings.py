@@ -36,6 +36,27 @@ NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
 
 
 @dataclass
+class OptimizerConfig:
+    """The `optim_config:` mapping of a run config: the optimizer's constructor options, typed.
+
+    A typed dataclass (not a free-form dict) so jsonargparse merges per-field CLI overrides
+    (`--optim_config.lr 3e-4`) into the YAML values instead of replacing the whole mapping, and rejects unknown
+    field names at parse time. `lr` is NOT the schedule's LR (`stage_base_lrs` is): ELLISAdam keeps it as
+    `init_lr`, the reference of the decoupled weight decay. The last four flags exist only on ELLISAdam;
+    `training/optim.py:build_optimizer` rejects non-default values of them for any other optimizer.
+    """
+
+    lr: float = 1e-4  # constructor LR; for ELLISAdam the weight-decay reference (decay = lr / init_lr × weight_decay)
+    weight_decay: float = 4e-5
+    betas: tuple[float, float] = (0.9, 0.95)
+    eps: Optional[float] = None  # None: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)
+    update_clipping: bool = False  # ELLISAdam only: clip the update by its gradient RMS
+    atan_adam: bool = False  # ELLISAdam only: atan2 update instead of the eps-guarded division
+    running_init: bool = False  # ELLISAdam only: initialise the moments from the first gradient
+    decouple_wd: bool = True  # ELLISAdam only: weight decay relative to init_lr instead of multiplied by lr
+
+
+@dataclass
 class Settings:
     # Config references (required): everything about the data (sources, stages, token budgets, weights, tokenizer)
     # lives in the dataset config and everything about the model architecture (sizes, depth, recurrence) in the
@@ -84,7 +105,8 @@ class Settings:
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
-    optim_config: dict[str, Any] = field(default_factory=lambda: dict(lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95)))
+    optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)  # typed constructor options; CLI overrides
+    # merge per field (`--optim_config.lr 3e-4` keeps the YAML's other values), unknown names fail at parse time
     no_weight_decay_for_bias_and_norm_params: bool = True
     grad_clip: float = 1.0
     lr_schedule: str = "trapezoid"
@@ -110,6 +132,12 @@ class Settings:
     export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
 
     def __post_init__(self) -> None:
+        if not isinstance(self.optim_config, OptimizerConfig):  # dataclasses don't check types at runtime, and the
+            # old shape of this setting was a free-form dict: fail with a name, not far away in the optimizer
+            raise ValueError(
+                f"optim_config must be an OptimizerConfig, got {type(self.optim_config).__name__} "
+                f"({self.optim_config!r}); construct OptimizerConfig(**mapping) instead of passing the mapping"
+            )
         for name, why in REQUIRED_SETTINGS.items():
             if not getattr(self, name):
                 raise ValueError(f"{name} is required ({why})")

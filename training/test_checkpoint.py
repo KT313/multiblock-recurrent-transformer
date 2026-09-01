@@ -27,7 +27,7 @@ from training.checkpoint import (
     unwrap_compiled,
 )
 from training.optim import ELLISAdam, get_param_groups
-from training.settings import Settings
+from training.settings import OptimizerConfig, Settings
 from training.stage_manager import StageManager, TrainingStage
 
 TINY_MODEL_ARCHITECTURE = Path(__file__).resolve().parent.parent / "config" / "model_architecture" / "tiny.yaml"
@@ -197,7 +197,7 @@ CHANGED_NUMERICS_VALUES: dict[str, Any] = {
     "min_lr": 1e-6,
     "grad_clip": 0.5,
     "optimizer": "AdamW",
-    "optim_config": {"lr": 2e-4, "weight_decay": 4e-5, "betas": (0.9, 0.95)},
+    "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
     "block_size": 128,
     "dataloader_num_workers": 0,
@@ -283,6 +283,9 @@ def test_save_load_forward_bit_identical(
     fresh_opt = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
     restored = load_training_checkpoint(backend, path, fresh, fresh_opt)
     assert restored.step == 1 and restored.stage == 0 and restored.settings["seed"] == 42
+    # the nested optim_config dataclass round-trips as the plain dict `asdict` made of it, so the resume
+    # compatibility check compares it against `asdict(current_settings)["optim_config"]` value by value
+    assert restored.settings["optim_config"] == asdict(OptimizerConfig())
     assert restored.dataset_config_hash == "abc123" and restored.validation_rows == metadata.validation_rows
     assert restored.model_config == tiny_model.config.to_dict()
     assert torch.equal(restored.rng["torch"], metadata.rng["torch"])

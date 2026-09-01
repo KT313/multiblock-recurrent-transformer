@@ -32,7 +32,7 @@ class CheckpointMetadata:
     step: int  # optimizer steps completed when the checkpoint was written
     stage: int  # stage the run is in at `step` (the one it enters next when written before a transition)
     rng: dict[str, Any]  # `Backend.rng_state()` after evaluation and logging of `step`
-    settings: dict[str, Any]  # `asdict(Settings)` of the run
+    settings: dict[str, Any]  # `asdict(Settings)` of the run (nested dataclasses like optim_config as plain dicts)
     model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}

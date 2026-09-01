@@ -220,9 +220,10 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
 def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> Optimizer:
     """The run's optimizer: the three parameter groups of `get_param_groups`, `settings.optimizer` with
     `settings.optim_config`, wrapped by `backend.setup_optimizer`."""
-    weight_decay = settings.optim_config.get("weight_decay", 0.0)
-    param_groups = get_param_groups(model, weight_decay, settings.no_weight_decay_for_bias_and_norm_params)
-    return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, **settings.optim_config))
+    param_groups = get_param_groups(
+        model, settings.optim_config.weight_decay, settings.no_weight_decay_for_bias_and_norm_params
+    )
+    return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, settings.optim_config))
 
 
 def restore_checkpoint_if_resuming(
