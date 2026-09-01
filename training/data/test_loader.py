@@ -467,8 +467,9 @@ def test_world_batch_keeps_the_labels_of_real_instruct_rows(tokenizer: Tokenizer
     assert sorted(int((lab != IGNORE_INDEX).sum()) for _, labs, _ in out for lab in labs) == expected
 
 
-def test_package_exports_resolve() -> None:
+def test_the_data_package_re_exports_nothing() -> None:
+    """`training.data` must stay import-light: a re-export of the torch modules would load torch for everyone
+    importing `dataset_resolver` (the framework-neutral module living in this package)."""
     import training.data as pkg
 
-    for name in pkg.__all__:
-        assert getattr(pkg, name) is not None
+    assert not hasattr(pkg, "__all__") and not hasattr(pkg, "collate_fn")

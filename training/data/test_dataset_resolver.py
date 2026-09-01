@@ -217,6 +217,24 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
         assert sum(e.weight for e in train) == pytest.approx(1.0)
 
 
+FRAMEWORK_NEUTRAL_MODULES = (
+    "training.settings",
+    "training.stage_manager",
+    "training.lr_schedule",
+    "training.data.dataset_resolver",
+    "data_preparation.dataset_config",
+    "data_preparation.layout",
+)
+
+
+def test_framework_neutral_modules_do_not_load_torch() -> None:
+    """The JAX/TPU-port readiness claim, enforced: importing any of these modules must not pull in torch — also
+    not through `training/data/__init__.py`, which therefore re-exports nothing."""
+    lines = ["import importlib, sys"]
+    for module in FRAMEWORK_NEUTRAL_MODULES:
+        lines.append(f"importlib.import_module({module!r}); assert 'torch' not in sys.modules, {module!r}")
+    subprocess.run([sys.executable, "-c", "\n".join(lines)], check=True, cwd=REPO_ROOT)
+
 
 def test_same_source_same_split_in_every_stage(crow_cfg: DatasetConfig) -> None:
     layout = DatasetLayout(Path("dataset"))

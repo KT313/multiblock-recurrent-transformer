@@ -27,7 +27,8 @@ from torch.optim import Optimizer
 from model import RecurrentGPT
 from training.backend import Backend
 from training.checkpoint import unwrap_compiled
-from training.data import IGNORE_INDEX, Batch, Sample, StageDataloaders, world_batch_micro_batches
+from training.data.collate import IGNORE_INDEX, Batch, Sample
+from training.data.loader import StageDataloaders, world_batch_micro_batches
 from training.data.loader import sample_stage_batch
 from training.logger import track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
