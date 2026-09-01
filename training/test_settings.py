@@ -246,6 +246,20 @@ def test_validation_batch_divisibility() -> None:
         _settings(micro_batch_size=3, world_batch_size=8)
 
 
+def test_validation_of_nonsensical_batch_sizes() -> None:
+    """A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
+    loop of a step run zero times — the run "trained" and reported loss 0.0. Both fail at settings time now, and so
+    does a world batch smaller than one micro-batch."""
+    for bad in (0, -4):
+        with pytest.raises(ValueError, match="micro_batch_size must be positive"):
+            _settings(micro_batch_size=bad, world_batch_size=8)
+        with pytest.raises(ValueError, match="world_batch_size must be positive"):
+            _settings(micro_batch_size=4, world_batch_size=bad)
+    with pytest.raises(ValueError, match=r"world_batch_size \(4\) must be >= micro_batch_size \(8\)"):
+        _settings(micro_batch_size=8, world_batch_size=4)
+    assert _settings(micro_batch_size=8, world_batch_size=8).gradient_accumulation_steps == 1
+
+
 def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
     """`parse_settings` goes through `Settings.__post_init__`, so a bad YAML value is rejected the same way."""
     yaml = tmp_path / "bad.yaml"

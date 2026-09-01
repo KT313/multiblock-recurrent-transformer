@@ -24,6 +24,8 @@ POSITIVE_SETTINGS: dict[str, str] = {
     "eval_step_interval": "save_step_interval is the only interval 0 disables",
     "eval_iters": "validation micro-batches per depth",
     "grad_clip": "0 would zero every gradient",
+    "micro_batch_size": "sequences per forward/backward; 0 or less makes the micro-batch loop of a step run zero times",
+    "world_batch_size": "sequences per optimizer step",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
     "save_step_interval",
@@ -119,8 +121,17 @@ class Settings:
                 raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
+        if self.world_batch_size < self.micro_batch_size:
+            raise ValueError(
+                f"world_batch_size ({self.world_batch_size}) must be >= micro_batch_size ({self.micro_batch_size}): "
+                "one optimizer step is at least one micro-batch"
+            )
         if self.world_batch_size % self.micro_batch_size != 0:
-            raise ValueError("world_batch_size must be a multiple of micro_batch_size")
+            raise ValueError(
+                f"world_batch_size ({self.world_batch_size}) must be a multiple of micro_batch_size "
+                f"({self.micro_batch_size}): gradient_accumulation_steps is their integer quotient, so anything else "
+                "silently trains on fewer sequences per step than configured"
+            )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
 
