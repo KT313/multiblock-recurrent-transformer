@@ -20,9 +20,11 @@ exhausted counted as complete — a wrong ``fields`` / ``converter`` / ``filter`
 Now the ledger sizes a **top-up** from the observed yield (processed ÷ raw) and an exhausted source with no rows is
 a failure, as "a failed source is a failed build" says it must be.
 
-Everything here reads manifests only (no parquet footers): broken shards are the repair step's business
-(``lib/build/repair.py``) and the training resolver checks the folders on disk independently. Pure functions of
-``(config, layout)``; ``lib/build/runner.py`` executes them.
+Everything here reads manifests only (no parquet footers): a processed folder's health is the shared verdict of
+``lib/build/assessment.py`` in its manifest-only mode (``check_files=False``), so broken or stray shard files are
+the repair step's business (``lib/build/repair.py``, the same verdict with the files checked) and the training
+resolver checks the folders on disk independently. Pure functions of ``(config, layout)``;
+``lib/build/runner.py`` executes them.
 """
 
 from __future__ import annotations
@@ -37,9 +39,10 @@ from typing import Literal
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
+from data_preparation.lib.build.assessment import ProcessedProblem, assess_processed_folder
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
-from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
+from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state, shard_list
+from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted, rejected_rows
 
 log = get_logger(__name__)
@@ -462,26 +465,41 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     )
 
 
+# the shared verdict's manifest-level problems in the planner's vocabulary; the file-level problems (broken /
+# stray shards) never appear in manifest-only mode — they are the repair step's business
+_ASSESSED_STATE: dict[ProcessedProblem, ProcessedState] = {
+    "absent": "missing",
+    "no_manifest": "missing",
+    "unreadable_manifest": "unreadable",
+    "stale": "stale",
+}
+
+
 def _processed_state(config: DatasetConfig, name: str, layout: DatasetLayout, raw: Manifest) -> tuple[ProcessedState, int]:
-    """The state of ``processed/<name>`` against the current raw shards, and the rows it holds (0 unless current)."""
-    processed = current_processed_manifest(config, name, layout)
-    if processed is None:
-        return _unusable_processed_state(name, layout.processed_dir(name)), 0
-    if not processed_covers_raw(processed, raw):
-        return "behind_raw", processed.rows()
-    return "built", processed.rows()
+    """The state of ``processed/<name>`` against the current raw shards, and the rows it holds (0 unless current).
 
-
-def _unusable_processed_state(name: str, directory: Path) -> ProcessedState:
-    """Why ``directory`` holds no current manifest: none at all, one that cannot be read, or one from another
-    config. All three mean "build it again"; the unreadable one is the repair step's deletion (it needs no
-    confirmation, processed data is derived), reported here instead of raised."""
-    if load_processed_manifest(directory) is not None:
-        return "stale"
-    if (directory / MANIFEST_NAME).is_file():
-        log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, directory)
-        return "unreadable"
-    return "missing"
+    The folder's health is the shared verdict (:func:`~data_preparation.lib.build.assessment.assess_processed_folder`
+    with ``check_files=False``: the planner reads manifests only, see the module docstring). On top of it the
+    planner keeps its own knowledge: a manifest from another stage or with other columns is as stale as a wrong
+    hash, and a current folder that does not cover every raw shard yet is ``behind_raw`` — a pending build, not a
+    repair. An unreadable manifest is the repair step's deletion (no confirmation, processed data is derived),
+    reported here instead of raised so ``status`` / ``prepare --dry_run`` describe the very state repair heals.
+    """
+    directory = layout.processed_dir(name)
+    assessment = assess_processed_folder(config, name, directory, shard_list(raw), check_files=False)
+    state = _ASSESSED_STATE.get(assessment.problem)
+    if state is not None:
+        if assessment.problem == "unreadable_manifest":
+            log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, directory)
+        return state, 0
+    manifest = assessment.manifest
+    if manifest is None:  # unreachable: every problem without a readable manifest is mapped above
+        return "missing", 0
+    if manifest.stage != "processed" or manifest.extra.get("columns") != list(processed_columns(config.sources[name].kind)):
+        return "stale", 0
+    if not processed_covers_raw(manifest, raw):
+        return "behind_raw", manifest.rows()
+    return "built", manifest.rows()
 
 
 def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> list[SourceLedger]:

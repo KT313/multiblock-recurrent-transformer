@@ -6,9 +6,13 @@ uses (`check_files=False`)."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
+from data_preparation.lib.build import prepare, status
+from data_preparation.lib.build.planner import source_ledger
+from data_preparation.lib.build.repair import repair_broken_and_stale_folders
 from data_preparation.lib.build.assessment import (
     ProcessedAssessment,
     ProcessedProblem,
@@ -145,6 +149,83 @@ def test_covered_shards_must_be_a_prefix_of_the_raw_shards(cfg_factory: CfgFacto
     assert (assessment.problem, assessment.verdict, assessment.repair) == ("raw_changed", "broken", "rebuild")
     assert assessment.reason == "built from raw shards that no longer exist"
     assert _assess(cfg, layout, []).problem == "raw_changed"  # the raw folder disappeared entirely
+
+
+# --- every consumer reads the same verdict ------------------------------------------------------------------------------
+
+
+def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """One tree, one folder state per source: the repair step deletes exactly the folders whose cheapest repair is a
+    rebuild, and the planner's manifest-only state matches the verdict's manifest-level knowledge (file-level
+    problems are invisible to it by design — the repair dry report flags them in ``status``)."""
+    names = ("a", "b", "c", "d", "e", "f", "g")
+    cfg = with_tokenizer(cfg_factory({name: SourceConfig(kind="pretrain", loader="synthetic", seed=seed) for seed, name in enumerate(names)}))
+    for name in names:
+        download(cfg, name, layout, rows_needed=8, shard_size=4)
+        build_source(cfg, name, layout, shard_size=4)
+    _make_stale(layout.processed_dir("b"))
+    (layout.processed_dir("c") / MANIFEST_NAME).write_text("{ not json")
+    (layout.processed_dir("d") / MANIFEST_NAME).unlink()
+    (layout.processed_dir("e") / "data-00000.parquet").unlink()
+    (layout.processed_dir("f") / "data-00099.parquet").write_bytes(b"stray")
+    _make_crash_leftover(layout.processed_dir("g"))
+
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
+    would_rebuild = {action.source for action in report.actions}
+    assert all(action.kind == "processed" and action.action == "would_delete" for action in report.actions)
+    for name in names:
+        assessment = assess_processed_folder(cfg, name, layout.processed_dir(name), _raw_shards(layout, name))
+        assert (assessment.repair == "rebuild") == (name in would_rebuild), name
+    assert would_rebuild == {"b", "c", "d", "e", "f"}
+    assert {name: source_ledger(cfg, name, layout).processed_state for name in names} == {
+        "a": "built",
+        "b": "stale",
+        "c": "unreadable",
+        "d": "missing",
+        "e": "built",  # manifest-only: the missing shard file is the repair step's finding
+        "f": "built",  # manifest-only: so is the stray
+        "g": "behind_raw",  # the crash leftover looks like any pending build — which is exactly what heals it
+    }
+
+
+def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, config_file: Callable[[DatasetConfig], Path]
+) -> None:
+    """The M1 state through the entry points: ``status`` and ``prepare --dry_run`` report a pending build and no
+    repair, ``prepare`` resumes the build over the leftover and ends complete — all three from the same verdict."""
+    cfg = with_tokenizer(cfg_factory({"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=6))
+    path = config_file(cfg)
+    download(cfg, "a", layout, rows_needed=8, shard_size=4)  # 2 raw shards; rows_needed(cfg) is 8 too
+    build_source(cfg, "a", layout, shard_size=4)
+    _make_crash_leftover(layout.processed_dir("a"))
+
+    for report in (status(path, layout.root), prepare(path, layout.root, assume_yes=False, dry_run=True)):
+        assert not report.complete and report.needs_repair == []
+        state = next(source for source in report.sources if source.name == "a")
+        assert not state.satisfied and state.reason == "processed behind raw"
+    healed = prepare(path, layout.root, assume_yes=False)
+    assert healed.complete
+    manifest = Manifest.load(layout.processed_dir("a"))
+    assert manifest is not None and len(manifest.extra["input_shards"]) == 2
+    listed = {shard.name for shard in manifest.shards}
+    assert {p.name for p in layout.processed_dir("a").glob("*.parquet")} == listed
+
+
+def _make_stale(folder: Path) -> None:
+    manifest = Manifest.load(folder)
+    assert manifest is not None
+    manifest.source_hash = "old-processing"
+    manifest.save(folder)
+
+
+def _make_crash_leftover(folder: Path) -> None:
+    """Reconstruct the crash between publishing a shard and saving the manifest: the last processed shard file
+    stays on disk, the manifest no longer lists it nor covers the raw shard it came from."""
+    manifest = Manifest.load(folder)
+    assert manifest is not None and len(manifest.shards) >= 2
+    manifest.shards = manifest.shards[:-1]
+    manifest.extra["input_shards"] = manifest.extra["input_shards"][:-1]
+    manifest.save(folder)
 
 
 def test_every_problem_has_a_verdict_and_a_repair() -> None:
