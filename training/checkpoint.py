@@ -36,7 +36,7 @@ class CheckpointMetadata:
     model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
-    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: consumed rows + the transition RNG
+    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read per entry + the transition RNG
 
     def to_state(self) -> dict[str, Any]:
         """The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied)."""

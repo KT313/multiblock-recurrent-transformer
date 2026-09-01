@@ -12,10 +12,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from training.backend import SingleDeviceBackend
-from training.data.collate import IGNORE_INDEX, Batch, Sample, collate_samples
+from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
 from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
 from training.data.loader import (
-    SampleBatch,
     StageDataloaders,
     build_dataloader,
     build_stage_dataloaders,
@@ -191,7 +190,10 @@ def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenize
     entry = DataEntry("ft", str(tiny_instruct_dir), data_signature=INSTRUCT_SIGNATURE)
     for num_workers in (0, 2):
         loader = build_dataloader([entry], tokenizer, 16, 4, num_workers=num_workers, padded=False)
-        assert sum(len(batch) for batch in loader) == kept
+        batches = list(loader)
+        assert sum(len(batch.samples) for batch in batches) == kept
+        # rows READ still add up to the whole epoch across the worker shards: what the resume counters are made of
+        assert sum(batch.rows_read.get("ft", 0) for batch in batches) == len(rows)
 
 
 def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
@@ -217,8 +219,10 @@ def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) 
     assert isinstance(loaders, StageDataloaders)
     assert len(loaders.train_loaders) == len(loaders.val_loaders) == len(dataset.stages) == 3
     assert loaders.tokenizer.path == Path(dataset.tokenizer_dir)
-    samples = loaders.next_train_batch(0)
+    batch = loaders.next_train_batch(0)
+    samples = batch.samples
     assert len(samples) == tiny_settings.micro_batch_size
+    assert batch.rows_read == {"pretrain_a-synthetic_pretrain": tiny_settings.micro_batch_size}  # no row dropped
     assert [s[2] for s in samples] == ["pretrain_a-synthetic_pretrain"] * tiny_settings.micro_batch_size
     for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
         assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
@@ -241,20 +245,20 @@ def test_build_stage_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) 
 # --- StageDataloaders / sample_stage_batch ---------------------------------------------------------------------------
 
 
-def _tagged(tag: str, n: int) -> list[SampleBatch]:
+def _tagged(tag: str, n: int) -> list[WorkerBatch]:
     """A finite 'loader' yielding n one-sample worker batches tagged with `tag`."""
-    return [[(torch.full((2,), i), torch.full((2,), i), tag)] for i in range(n)]
+    return [WorkerBatch([(torch.full((2,), i), torch.full((2,), i), tag)], {tag: 1}) for i in range(n)]
 
 
-def _first(batch: SampleBatch) -> int:
+def _first(batch: WorkerBatch) -> int:
     """The counter value of a `_tagged` worker batch."""
-    return int(batch[0][0][0])
+    return int(batch.samples[0][0][0])
 
 
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
     sd = StageDataloaders([_tagged("s0", 3), _tagged("s1", 2)], [], tokenizer)
     assert [_first(sd.next_train_batch(0)) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
-    assert [s[2] for s in sd.next_train_batch(1)] == ["s1"]
+    assert [s[2] for s in sd.next_train_batch(1).samples] == ["s1"]
     assert sd._train_iterators[0] is not None and sd._train_iterators[1] is not None
 
 
@@ -296,7 +300,7 @@ def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer,
     total = _rows_in(tiny_pretrain_dir)
     loaders = StageDataloaders([build_dataloader([entry], tokenizer, 64, 1, padded=False)], [], tokenizer)
     loaders.set_resume_offsets({"pre": total - 2})
-    first_epoch = [loaders.next_train_batch(0)[0][2] for _ in range(2)]
+    first_epoch = [loaders.next_train_batch(0).samples[0][2] for _ in range(2)]
     assert first_epoch == ["pre", "pre"] and loaders.train_datasets(0)[0].resume_offset == 0
     assert len([loaders.next_train_batch(0) for _ in range(total)]) == total  # the restart reads every row
 
@@ -305,7 +309,7 @@ def test_sample_stage_batch_outside_transition_is_current(tokenizer: Tokenizer) 
     sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
     rng = random.Random(0)
     for p in (0.0, 0.5, 1.0):
-        assert [s[2] for s in sample_stage_batch(sd, 1, None, p, rng)] == ["s1"]
+        assert [s[2] for s in sample_stage_batch(sd, 1, None, p, rng).samples] == ["s1"]
 
 
 @pytest.mark.parametrize("progress", [0.0, 0.25, 0.8, 1.0])
@@ -313,7 +317,7 @@ def test_sample_stage_batch_bernoulli_frequency(progress: float, tokenizer: Toke
     sd = StageDataloaders([_tagged("s0", 5), _tagged("s1", 5)], [], tokenizer)
     rng = random.Random(123)
     n = 4000
-    tags = Counter(sample_stage_batch(sd, 1, 0, progress, rng)[0][2] for _ in range(n))
+    tags = Counter(sample_stage_batch(sd, 1, 0, progress, rng).samples[0][2] for _ in range(n))
     assert tags["s1"] / n == pytest.approx(progress, abs=0.03)
     if progress in (0.0, 1.0):
         assert len(tags) == 1
@@ -334,7 +338,7 @@ def test_sample_stage_batch_bernoulli_exact_boundary(tokenizer: Tokenizer) -> No
     """Draw u; next stage iff u < progress (so u == progress stays on the previous stage)."""
     sd = StageDataloaders([_tagged("s0", 9), _tagged("s1", 9)], [], tokenizer)
     rng = _ScriptedRandom([0.1, 0.5, 0.49999, 0.9, 0.0])
-    tags = [sample_stage_batch(sd, 1, 0, 0.5, rng)[0][2] for _ in range(5)]
+    tags = [sample_stage_batch(sd, 1, 0, 0.5, rng).samples[0][2] for _ in range(5)]
     assert tags == ["s1", "s0", "s1", "s0", "s1"]
 
 
@@ -422,8 +426,8 @@ def test_world_batch_width_does_not_depend_on_the_loader_grouping(tokenizer: Tok
 
 def test_world_batch_on_real_loader_preserves_every_sample(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
     loader = build_dataloader(entries[:1], tokenizer, 512, 4, padding_multiple=128, padded=False)
-    worker_batches: list[SampleBatch] = _batches(loader, 2)
-    samples = [s for batch in worker_batches for s in batch]
+    worker_batches: list[WorkerBatch] = _batches(loader, 2)
+    samples = [s for batch in worker_batches for s in batch.samples]
     lengths = [sample_length(s) for s in samples]
     assert lengths != sorted(lengths), "fixture must start unsorted for the test to mean anything"
     out = world_batch_micro_batches(samples, 4, tokenizer, 512, sort_by_length=True, padding_multiple=128)

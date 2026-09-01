@@ -8,7 +8,7 @@ part, run in the main process once the world batch is assembled).
 instead of re-cutting already padded batches: every micro-batch is padded exactly once, to its own longest sample.
 """
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -19,6 +19,20 @@ IGNORE_INDEX = -100  # label value of positions without a loss (padding, out-of-
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
 Batch = tuple[torch.Tensor, torch.Tensor, list[str]]  # a padded, shifted micro-batch: (input_ids, labels, data_ids)
+
+
+class WorkerBatch(NamedTuple):
+    """What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus, per
+    data entry prefix, how many rows were READ to produce them — dropped rows included.
+
+    The counts are computed in the dataloader worker and travel to the main process with the batch itself (worker
+    processes share no state with the trainer), so `training.step.BatchStream` can count consumed rows in the same
+    unit the resume path skips (`ParquetTextDataset.set_resume_offset`): rows read from disk. Counting surviving
+    samples instead would make every dropped row rewind a resume by one row.
+    """
+
+    samples: list[Sample]
+    rows_read: dict[str, int]
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -78,6 +92,26 @@ def collate_samples(
         if has_supervised_label(labels, tokenizer):
             samples.append((input_ids, labels, row["data_id"]))
     return samples
+
+
+def collate_worker_batch(
+    batch: list[dict[str, Any]],
+    tokenizer: Tokenizer,
+    block_size: int,
+    add_bos: bool = True,
+    add_eos: bool = True,
+) -> WorkerBatch:
+    """`collate_samples` plus the per-entry count of the rows that went in: the collate function of the unpadded
+    (training) loaders.
+
+    Every row of ``batch`` was read from its dataset whether or not it kept a supervised label, so ``rows_read`` —
+    unlike ``len(samples)`` — advances by rows read from disk, the unit a resume skips.
+    """
+    rows_read: dict[str, int] = {}
+    for row in batch:
+        data_id = str(row["data_id"])
+        rows_read[data_id] = rows_read.get(data_id, 0) + 1
+    return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), rows_read)
 
 
 def pad_and_shift(

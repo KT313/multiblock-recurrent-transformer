@@ -9,15 +9,19 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from model import RecurrentGPT, build_model
 from training.backend import SingleDeviceBackend
-from training.data.collate import IGNORE_INDEX, Batch
-from training.data.loader import SampleBatch, StageDataloaders, build_stage_dataloaders
+from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
+from training.data.loader import SampleBatch, StageDataloaders, build_dataloader, build_stage_dataloaders
 from training.data.collate import find_multiple
-from training.data.dataset_resolver import resolve_dataset
+from training.data.dataset_resolver import DataEntry, resolve_dataset
+from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
 from training.golden import (
     golden_exact_requested,
@@ -303,10 +307,11 @@ class _Repeat:
     def __init__(self, tag: str, batch_size: int = 1) -> None:
         self.tag, self.batch_size, self.count = tag, batch_size, 0
 
-    def __iter__(self) -> Iterator[SampleBatch]:
+    def __iter__(self) -> Iterator[WorkerBatch]:
         while True:
             self.count += 1
-            yield _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
+            samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
+            yield WorkerBatch(samples, {self.tag: len(samples)})
 
 
 class _ShortBatches:
@@ -316,11 +321,12 @@ class _ShortBatches:
     def __init__(self, tag: str, sizes: list[int]) -> None:
         self.tag, self.sizes, self.count = tag, sizes, 0
 
-    def __iter__(self) -> Iterator[SampleBatch]:
+    def __iter__(self) -> Iterator[WorkerBatch]:
         while True:
             size = self.sizes[self.count % len(self.sizes)]
             self.count += 1
-            yield _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(size)])
+            samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(size)])
+            yield WorkerBatch(samples, {self.tag: len(samples)})
 
 
 @pytest.fixture(scope="session")
@@ -530,6 +536,139 @@ def test_batch_stream_resume_does_not_repeat_rows(
     resumed.load_state_dict(state)
     assert not set(before) & set(rows(resumed, 3))
     assert rows(fresh_stream(), 3) == before  # without the state the rows are read from the top again
+
+
+# --------------------------------------------------------------------------------------------------------------
+# BatchStream state when the workers DROP rows (H7): the counter is rows READ, the unit the resume skips
+
+DROP_SIGNATURE: dict[str, Any] = {
+    "keys": ["instruction", "input", "output"],
+    "format_fn": "concatenate_instruction_input_output",
+}
+DROP_BLOCK_SIZE = 16  # cap 17 tokens: a 30-word prompt alone fills the window, its row keeps no supervised label
+DROP_EVERY = 3  # every third row of the fixture is such a prompt-only row and is dropped in the worker
+
+
+def _write_drop_parquet(directory: Path, rows: int = 200) -> None:
+    """`rows` unique instruct rows of which every `DROP_EVERY`-th tokenizes to nothing at `DROP_BLOCK_SIZE`."""
+    long_prompt = " ".join(f"tok_{i}" for i in range(30))
+    table = pa.table(
+        {
+            "instruction": [
+                long_prompt if i % DROP_EVERY == 0 else f"tok_{i % 256} tok_{(i // 256) % 256}" for i in range(rows)
+            ],
+            "input": [""] * rows,
+            "output": [f"tok_{i % 256} tok_{(i // 256) % 256} tok_{(i * 11) % 256}" for i in range(rows)],
+        }
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, directory / "data-00000.parquet")
+
+
+def _drop_survivors(rows_read: int) -> int:
+    """Survivors among the first `rows_read` fixture rows: all but the `i % DROP_EVERY == 0` ones."""
+    return rows_read - (rows_read + DROP_EVERY - 1) // DROP_EVERY
+
+
+class _RecordingLoader:
+    """Forwards a real (unpadded) train DataLoader's `WorkerBatch`es while recording every sample and row count that
+    passed through; exposes `dataset` so `StageDataloaders.train_datasets` still reaches the parquet dataset behind
+    it (which is where a resume's row offsets land)."""
+
+    def __init__(self, loader: DataLoader[Row]) -> None:
+        self.loader = loader
+        self.dataset = loader.dataset
+        self.rows_read = 0
+        self.seen: list[Sample] = []
+
+    def __iter__(self) -> Iterator[WorkerBatch]:
+        for batch in self.loader:
+            self.rows_read += sum(batch.rows_read.values())
+            self.seen.extend(batch.samples)
+            yield batch
+
+
+def _drop_stream(
+    settings: Settings, stage_manager: StageManager, data_dir: Path, tokenizer: Tokenizer
+) -> tuple[BatchStream, _RecordingLoader]:
+    """A stream over one drop-heavy entry (single shard, in-process, unsorted): rows are read in range order."""
+    loader = build_dataloader(
+        [DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE)],
+        tokenizer,
+        DROP_BLOCK_SIZE,
+        settings.micro_batch_size,
+        padded=False,
+    )
+    recording = _RecordingLoader(loader)
+    loaders = StageDataloaders([recording], [], tokenizer)
+    return BatchStream(settings, loaders, stage_manager, TrainingProgress()), recording
+
+
+def _run_world_batches(settings: Settings, stream: BatchStream, world_batches: int) -> None:
+    for _ in range(world_batches):
+        for _ in range(settings.gradient_accumulation_steps):
+            next(stream)
+        stream.progress.advance()
+
+
+def _sample_ids(samples: list[Sample]) -> list[tuple[int, ...]]:
+    """A hashable row identity: the unpadded input tokens (unique per fixture row)."""
+    return [tuple(input_ids.tolist()) for input_ids, _, _ in samples]
+
+
+def test_batch_stream_counts_rows_read_not_surviving_samples(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """The stored counter advances by rows READ from disk — dropped rows included — so `state_dict` stores exactly
+    what `set_resume_offset` will skip. Counting survivors instead undercounted by one row per drop (H7)."""
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    _write_drop_parquet(tmp_path / "drop_data")
+    stream, recording = _drop_stream(settings, stage_manager, tmp_path / "drop_data", stream_tokenizer)
+    world_batches = 3
+    _run_world_batches(settings, stream, world_batches)
+
+    # independent oracle: worker batches of `micro_batch_size` rows are pulled until each world batch has enough
+    # surviving samples, so the rows read follow from the fixture's drop pattern alone
+    expected_rows = 0
+    for j in range(1, world_batches + 1):
+        while _drop_survivors(expected_rows) < j * settings.world_batch_size:
+            expected_rows += settings.micro_batch_size
+    assert stream.state_dict()["consumed_rows"] == {"drop": expected_rows}
+    assert recording.rows_read == expected_rows
+    assert len(recording.seen) == _drop_survivors(expected_rows) < expected_rows  # counting survivors would rewind
+
+
+def test_mid_stage_resume_with_dropped_rows_repeats_and_skips_nothing(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """A resume from a mid-stage checkpoint continues at exactly the next unread row also when the workers dropped
+    rows: interrupted + resumed pulls are the very sample sequence of an uninterrupted run over the same data —
+    nothing re-read (a repeat), nothing jumped over (a skip)."""
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    data_dir = tmp_path / "drop_data"
+    _write_drop_parquet(data_dir)
+    k = 2  # world batches before the checkpoint
+
+    full, full_recording = _drop_stream(settings, stage_manager, data_dir, stream_tokenizer)
+    _run_world_batches(settings, full, 2 * k)
+    uninterrupted = _sample_ids(full_recording.seen)
+    assert len(set(uninterrupted)) == len(uninterrupted)  # unique rows: sequence equality below implies no repeats
+
+    first, first_recording = _drop_stream(settings, stage_manager, data_dir, stream_tokenizer)
+    _run_world_batches(settings, first, k)
+    state = first.state_dict()
+    before = _sample_ids(first_recording.seen)
+    assert state["consumed_rows"] == {"drop": first_recording.rows_read}
+    assert before == uninterrupted[: len(before)]  # the single-shard stream is deterministic
+
+    resumed, resumed_recording = _drop_stream(settings, stage_manager, data_dir, stream_tokenizer)
+    resumed.load_state_dict(state)
+    _run_world_batches(settings, resumed, k)
+    combined = before + _sample_ids(resumed_recording.seen)
+
+    overlap = min(len(combined), len(uninterrupted))
+    assert overlap >= 2 * k * settings.world_batch_size  # covers every trained sample of both runs
+    assert combined[:overlap] == uninterrupted[:overlap]
 
 
 # --------------------------------------------------------------------------------------------------------------

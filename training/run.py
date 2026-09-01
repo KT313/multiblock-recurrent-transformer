@@ -22,8 +22,8 @@ then the model — its parameter init is the first consumer of the global torch 
 resume, which restores the stored RNG state.
 `golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
 
-A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows consumed per data entry plus the
-transition RNG) and every train dataset starts that many rows into its range. It does NOT reproduce the order of an
+A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows READ per data entry — dropped
+rows included — plus the transition RNG) and every train dataset starts that many rows into its range. It does NOT reproduce the order of an
 uninterrupted run inside a stage — the mixture draws happen in the dataloader workers and are not replayed — so only
 a resume from a stage boundary is bit-exact (`test_resume_is_bit_exact_without_transitions`).
 

@@ -10,13 +10,21 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend import Backend
-from training.data.collate import IGNORE_INDEX, Batch, Sample, collate_fn, collate_samples, pad_and_shift
+from training.data.collate import (
+    IGNORE_INDEX,
+    Batch,
+    Sample,
+    WorkerBatch,
+    collate_fn,
+    collate_worker_batch,
+    pad_and_shift,
+)
 from training.data.dataset_resolver import DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import Tokenizer
 from training.settings import Settings
 
-SampleBatch = list[Sample]  # what an unpadded (training) loader yields: the tokenized rows of one worker batch
+SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (the `samples` half of a WorkerBatch)
 
 
 def build_dataloader(
@@ -36,8 +44,9 @@ def build_dataloader(
     `training.data.dataset_resolver`).
 
     ``padded`` (the validation loaders, and the default) yields ready ``(input_ids, labels, data_ids)`` batches;
-    ``padded=False`` (the training loaders) yields the `Sample` list of the batch, unpadded — the workers still do
-    the tokenization, the padding happens once per assembled micro-batch in `world_batch_micro_batches`.
+    ``padded=False`` (the training loaders) yields a `WorkerBatch` — the unpadded `Sample` list of the batch plus
+    the per-entry count of rows read to produce it (dropped rows included) — the workers still do the tokenization,
+    the padding happens once per assembled micro-batch in `world_batch_micro_batches`.
 
     Every entry becomes one `ParquetTextDataset` over its row range ``[skip_rows, skip_rows + max_rows)`` — the
     validation split decided by the resolver — with its ``data_signature`` (None = the text column).
@@ -65,7 +74,7 @@ def build_dataloader(
             ignore_index=ignore_index,
         )
     else:
-        collate = partial(collate_samples, tokenizer=tokenizer, block_size=block_size)
+        collate = partial(collate_worker_batch, tokenizer=tokenizer, block_size=block_size)
     return DataLoader(
         dataset,
         batch_size=micro_batch_size,
@@ -81,20 +90,21 @@ def build_dataloader(
 class StageDataloaders:
     """One train and one val loader per training stage, with lazily created and cycled train iterators.
 
-    Train loaders yield unpadded `SampleBatch`es, validation loaders padded `Batch`es; `tokenizer` is the one every
-    loader was built with and the one `world_batch_micro_batches` pads with. What a resume restores is the row
-    offsets of `set_resume_offsets` (`training.step.BatchStream` owns the bookkeeping).
+    Train loaders yield unpadded `WorkerBatch`es (surviving samples + rows read per entry), validation loaders
+    padded `Batch`es; `tokenizer` is the one every loader was built with and the one `world_batch_micro_batches`
+    pads with. What a resume restores is the row offsets of `set_resume_offsets` (`training.step.BatchStream` owns
+    the bookkeeping).
     """
 
-    train_loaders: Sequence[Iterable[SampleBatch]]
+    train_loaders: Sequence[Iterable[WorkerBatch]]
     val_loaders: Sequence[Iterable[Batch]]
     tokenizer: Tokenizer
-    _train_iterators: list[Iterator[SampleBatch] | None] = field(init=False)
+    _train_iterators: list[Iterator[WorkerBatch] | None] = field(init=False)
 
     def __post_init__(self) -> None:
         self._train_iterators = [None] * len(self.train_loaders)
 
-    def next_train_batch(self, stage_idx: int) -> SampleBatch:
+    def next_train_batch(self, stage_idx: int) -> WorkerBatch:
         """Next worker batch of ``stage_idx``'s train loader; restarts the loader when it is exhausted."""
         iterator = self._train_iterators[stage_idx]
         if iterator is None:
@@ -168,7 +178,7 @@ def sample_stage_batch(
     prev_stage_idx: int | None,
     transition_progress: float,
     rng: random.Random,
-) -> SampleBatch:
+) -> WorkerBatch:
     """Worker batch for the current step: from ``stage_idx`` with probability ``transition_progress``, else from the
     previous stage. Outside a transition (``prev_stage_idx`` is None) always from ``stage_idx``."""
     if prev_stage_idx is not None and rng.random() >= transition_progress:

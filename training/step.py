@@ -85,7 +85,9 @@ class BatchStream:
     worker batch and carries the surplus samples over to the next world batch.
 
     It is also the checkpointable part of the data path (`state_dict` / `load_state_dict`, stored as
-    `CheckpointMetadata.data_stream`): it counts the rows it consumed per data entry and keeps the transition RNG.
+    `CheckpointMetadata.data_stream`): it counts the rows READ per data entry — via `WorkerBatch.rows_read`, so a
+    row dropped in a worker for lack of a supervised label still counts, the same unit
+    `ParquetTextDataset.set_resume_offset` skips — and keeps the transition RNG.
 
     Numerics: the stream reads `progress.step` once per world batch, lazily, when the first micro-batch of that step
     is requested (after the previous step advanced the counter). Inside a stage transition each worker batch comes
@@ -107,7 +109,7 @@ class BatchStream:
         self.stage_manager = stage_manager
         self.progress = progress
         self.rng = random.Random(settings.seed + progress.step)
-        self.consumed_rows: dict[str, int] = {}  # data entry prefix (`<stage>-<source>`) -> rows delivered so far
+        self.consumed_rows: dict[str, int] = {}  # data entry prefix (`<stage>-<source>`) -> rows read so far
         self._surplus: list[Sample] = []
         self._micro_batches = self._stream()
 
@@ -118,7 +120,8 @@ class BatchStream:
         return next(self._micro_batches)
 
     def state_dict(self) -> dict[str, Any]:
-        """What a checkpoint stores: the consumed rows per data entry and the transition RNG state."""
+        """What a checkpoint stores: the rows read per data entry (dropped rows included) and the transition RNG
+        state."""
         return {"consumed_rows": dict(self.consumed_rows), "transition_rng": self.rng.getstate()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -127,21 +130,23 @@ class BatchStream:
 
         This is "no repeated rows", not "the same order": the mixture draws live inside the dataloader workers and
         are not replayed, and the worker sharding regroups the remaining rows, so a mid-stage resume trains on the
-        rows the interrupted run had not reached yet, in an order of its own. Rows dropped in a worker (no
-        supervised label) never reach this counter, so a resume may re-read — and drop again — those few rows.
+        rows the interrupted run had not reached yet, in an order of its own. The counters are rows READ
+        (`WorkerBatch.rows_read`, dropped rows included) — the unit the offsets skip — so a row dropped for lack of
+        a supervised label is not re-read either.
         """
         self.consumed_rows = {str(prefix): int(rows) for prefix, rows in state["consumed_rows"].items()}
         self.rng.setstate(state["transition_rng"])
         self.loaders.set_resume_offsets(self.consumed_rows)
 
     def _pull(self, stage: StageInfo) -> list[Sample]:
-        """One worker batch (from the transition mix), counted against its data entry."""
-        samples = sample_stage_batch(
+        """One worker batch (from the transition mix); its rows read — dropped rows included — are counted against
+        their data entries."""
+        batch = sample_stage_batch(
             self.loaders, stage.stage_idx, stage.prev_stage_idx, stage.transition_progress, self.rng
         )
-        for _, _, data_id in samples:
-            self.consumed_rows[data_id] = self.consumed_rows.get(data_id, 0) + 1
-        return samples
+        for data_id, rows in batch.rows_read.items():
+            self.consumed_rows[data_id] = self.consumed_rows.get(data_id, 0) + rows
+        return batch.samples
 
     def _stream(self) -> Iterator[Batch]:
         while True:

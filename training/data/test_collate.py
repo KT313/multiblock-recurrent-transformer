@@ -12,6 +12,7 @@ from training.data.collate import (
     IGNORE_INDEX,
     collate_fn,
     collate_samples,
+    collate_worker_batch,
     find_multiple,
     has_supervised_label,
     pad_and_shift,
@@ -163,6 +164,26 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
     assert [s[2] for s in collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)] == ["good"]
     _, _, data_ids = collate_fn(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
     assert data_ids == ["good"]
+
+
+def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Tokenizer) -> None:
+    """`rows_read` counts every row that went in per data entry — the dropped ones too — while `samples` holds only
+    the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips."""
+    batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
+    samples, rows_read = collate_worker_batch(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
+    assert rows_read == {"a": 2, "b": 2}
+    assert [s[2] for s in samples] == ["a", "b"]
+    reference = collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
+    assert len(samples) == len(reference)
+    assert all(torch.equal(s[0], r[0]) and torch.equal(s[1], r[1]) and s[2] == r[2] for s, r in zip(samples, reference))
+
+
+def test_collate_worker_batch_counts_a_fully_dropped_batch(tokenizer: Tokenizer) -> None:
+    """A worker batch whose every row was dropped still reports its rows as read (no samples, no missing rows)."""
+    samples, rows_read = collate_worker_batch(
+        [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, block_size=128, add_bos=False, add_eos=False
+    )
+    assert samples == [] and rows_read == {"a": 2}
 
 
 def test_batch_of_only_dropped_rows_is_an_error(tokenizer: Tokenizer) -> None:
