@@ -19,6 +19,7 @@ run directory in both cases):
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -217,6 +218,7 @@ def open_dashboard(
         start_step=start_step,
         log_step_interval=settings.log_step_interval,
         log_file=run_directory / TRAIN_LOG_NAME,
+        fallback_stream=sys.stderr,  # piped runs: step lines join the log handlers' lines on stderr
     )
 
 

@@ -759,7 +759,8 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     `NoOpDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
     details, the log interval, the resume step) with the `training` logger attached for the block and
     `run_directory / train.log` appended — the header records, the fallback's step lines and events all end up there
-    and on stdout; `close()` detaches it again."""
+    and on stderr (where the CLI's log handlers write too, so a piped run's story stays in one stream);
+    `close()` detaches it again."""
     monkeypatch.setenv("TRAINING_DASHBOARD", "1")
     settings = reference_settings(log_step_interval=2)
     stage_manager = two_stage_manager(settings)
@@ -784,8 +785,8 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     assert "event: resumed from" in log_text and "event: saved checkpoint" in log_text
     assert "step 6/12 | stage 0 a | " in log_text and "step 12/12 | stage 1 b | " in log_text and "step 5/12" not in log_text
     assert "Training finished after 12 steps" in log_text
-    out = capsys.readouterr().out
-    assert "step 12/12 | stage 1 b | " in out and "event: saved checkpoint" in out, "the fallback's lines go to stdout"
+    err = capsys.readouterr().err
+    assert "step 12/12 | stage 1 b | " in err and "event: saved checkpoint" in err, "the fallback's lines go to stderr"
 
 
 def test_open_dashboard_arguments(tmp_path: Path) -> None:

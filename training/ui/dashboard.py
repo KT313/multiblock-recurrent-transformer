@@ -160,11 +160,14 @@ def training_dashboard(
     final_frame: bool = True,
     console: Console | None = None,
     stream: TextIO | None = None,
+    fallback_stream: TextIO | None = None,
     clock: Clock = time.monotonic,
 ) -> Iterator[RunDashboard]:
     """The dashboard of a run: :class:`TrainingDashboard` when enabled (default: :func:`dashboard_enabled` — the
     ``TRAINING_DASHBOARD`` env var and a TTY on stdout), else the :class:`NoOpDashboard` console fallback. Both
-    attach the ``training`` logger (or ``logger``) for the block and append every record to ``log_file``."""
+    attach the ``training`` logger (or ``logger``) for the block and append every record to ``log_file``.
+    ``fallback_stream`` is where the plain-line fallback writes (default: ``stream``, then stdout) — the run's CLI
+    passes stderr so a piped run's step lines land on the same stream as the log handlers' lines."""
     if enabled is None:
         enabled = dashboard_enabled(stream)
     if enabled:
@@ -195,7 +198,7 @@ def training_dashboard(
         log_step_interval=log_step_interval,
         log_file=log_file,
         logger=logger,
-        stream=stream,
+        stream=fallback_stream if fallback_stream is not None else stream,
         clock=clock,
     ) as fallback:
         yield fallback
