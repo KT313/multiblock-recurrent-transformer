@@ -13,7 +13,6 @@ from training.data.collate import Batch
 from training.evaluation import evaluate, is_evaluation_step
 from training.settings import Settings
 from training.stage_manager import StageManager, TrainingStage
-from training.step import TrainingProgress
 from training.test_step import TINY_MODEL_ARCHITECTURE
 
 
@@ -177,8 +176,8 @@ def test_is_evaluation_step_table(settings: Settings) -> None:
     stage = TrainingStage("only", tokens=20 * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
     stage_manager = StageManager([stage], settings.world_batch_size, settings.block_size)
     assert stage_manager.total_steps == 20
-    evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, TrainingProgress(step=done), stage_manager)]
+    evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, done, stage_manager)]
     assert evaluated == [8, 16, 20]
     settings.eval_step_interval = 7
-    evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, TrainingProgress(step=done), stage_manager)]
+    evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, done, stage_manager)]
     assert evaluated == [7, 14, 20]

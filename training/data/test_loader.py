@@ -191,7 +191,7 @@ def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenize
         batches = list(loader)
         assert sum(len(batch.samples) for batch in batches) == kept
         # rows READ still add up to the whole epoch across the worker shards: what the resume counters are made of
-        assert sum(batch.rows_read.get("ft", 0) for batch in batches) == len(rows)
+        assert sum(batch.rows_read for batch in batches) == len(rows)
 
 
 def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
@@ -223,7 +223,7 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     batch = loaders.next_train_batch("synthetic_pretrain")
     samples = batch.samples
     assert len(samples) == tiny_settings.micro_batch_size
-    assert batch.rows_read == {"synthetic_pretrain": tiny_settings.micro_batch_size}  # no row dropped
+    assert batch.rows_read == tiny_settings.micro_batch_size  # no row dropped
     assert [s[2] for s in samples] == ["synthetic_pretrain"] * tiny_settings.micro_batch_size
     for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
         assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
@@ -248,7 +248,7 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
 
 def _tagged(tag: str, n: int) -> list[WorkerBatch]:
     """A finite 'loader' yielding n one-sample worker batches tagged with `tag`."""
-    return [WorkerBatch([(torch.full((2,), i), torch.full((2,), i), tag)], {tag: 1}) for i in range(n)]
+    return [WorkerBatch([(torch.full((2,), i), torch.full((2,), i), tag)], 1) for i in range(n)]
 
 
 def _first(batch: WorkerBatch) -> int:

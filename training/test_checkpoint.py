@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from model import RecurrentGPT, build_model
+from training.backend.base import unwrap_compiled
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import (
     CHECKPOINT_SUBDIR,
@@ -25,7 +26,6 @@ from training.checkpoint import (
     is_checkpoint_step,
     load_training_checkpoint,
     save_training_checkpoint,
-    unwrap_compiled,
 )
 from training.optim import ELLISAdam, get_param_groups
 from training.settings import OptimizerConfig, Settings

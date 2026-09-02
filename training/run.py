@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from torch.nn import Module
 from torch.optim import Optimizer
@@ -47,7 +47,7 @@ from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
 from training.backend import get_backend
-from training.backend.base import Backend
+from training.backend.base import Backend, plain_model
 from training.checkpoint import (
     CheckpointMetadata,
     checkpoint_dir,
@@ -57,7 +57,6 @@ from training.checkpoint import (
     is_checkpoint_step,
     load_training_checkpoint,
     save_training_checkpoint,
-    unwrap_compiled,
 )
 from training.data.collate import IGNORE_INDEX
 from training.data.loader import build_run_dataloaders
@@ -123,7 +122,7 @@ def train(
             while progress.step < stage_manager.total_steps and not stopped:
                 result = run_one_optimizer_step(settings, backend, model, optimizer, stage_manager, batches, progress)
                 progress.advance()
-                if is_evaluation_step(settings, progress, stage_manager):
+                if is_evaluation_step(settings, progress.step, stage_manager):
                     validation_loader = loaders.val_loaders[result.next_stage.stage_idx]
                     with logger.evaluating():
                         result.validation = evaluate(settings, backend, model, validation_loader)
@@ -132,7 +131,7 @@ def train(
                 stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
                 if stopped:
                     logger.status("stopping after this step, saving a checkpoint")
-                if is_checkpoint_step(settings, progress.done, stage_manager) or stopped:
+                if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
                     save_run_checkpoint(
                         settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger,
                         batches,
@@ -243,7 +242,7 @@ def restore_checkpoint_if_resuming(
         return progress, None, None
     metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
     check_dataset_unchanged(metadata, dataset, settings.allow_dataset_change)
-    model_config = cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict()
+    model_config = plain_model(model).config.to_dict()
     check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
     progress.step = progress.resume_step = metadata.step
     backend.set_rng_state(metadata.rng)
@@ -270,7 +269,7 @@ def save_run_checkpoint(
     logger: RunLogger,
     batches: BatchStream,
 ) -> None:
-    """Write the checkpoint of `progress.done` completed optimizer steps and tell the logger (the status reads
+    """Write the checkpoint of `progress.step` completed optimizer steps and tell the logger (the status reads
     `saving checkpoint` meanwhile, the path becomes a dashboard event).
 
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
@@ -280,14 +279,14 @@ def save_run_checkpoint(
     source, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
     does not promise).
     """
-    stage_end = stage_manager.stage_ending_at(progress.done - 1)
-    path = checkpoint_path(run_directory, settings.run_name, progress.done, stage_end)
+    stage_end = stage_manager.stage_ending_at(progress.step - 1)
+    path = checkpoint_path(run_directory, settings.run_name, progress.step, stage_end)
     metadata = CheckpointMetadata(
-        step=progress.done,
-        stage=stage_manager.get_stage_info(progress.done).stage_idx,
+        step=progress.step,
+        stage=stage_manager.get_stage_info(progress.step).stage_idx,
         rng=backend.rng_state(),
         settings=asdict(settings),
-        model_config=cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict(),
+        model_config=plain_model(model).config.to_dict(),
         dataset_config_hash=dataset.config_hash,
         validation_rows=dataset.validation_rows,
         data_stream=batches.state_dict(),
@@ -310,7 +309,7 @@ def export_if_requested(
         return None
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else run_directory / "hf_export"
     logger.status("exporting")
-    plain_model = cast(RecurrentGPT, unwrap_compiled(model))
-    export_to_hf(plain_model, plain_model.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
+    trained = plain_model(model)
+    export_to_hf(trained, trained.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir

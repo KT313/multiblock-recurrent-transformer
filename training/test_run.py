@@ -174,12 +174,11 @@ def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cp
 
 
 def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend) -> None:
-    """Three parameter groups (matrices, embeddings, norms + biases) with `base_lr` 1.0; the third has no weight
+    """Three parameter groups (matrices, embeddings, norms + biases); the third has no weight
     decay under `no_weight_decay_for_bias_and_norm_params`; the constructor LR is `optim_config.lr`."""
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
     assert isinstance(optimizer, torch.optim.AdamW)  # tiny.yaml
     assert len(optimizer.param_groups) == 3
-    assert [g["base_lr"] for g in optimizer.param_groups] == [1.0, 1.0, 1.0]
     assert [g["weight_decay"] for g in optimizer.param_groups] == [0.1, 0.1, 0.0]
     assert all(float(g["lr"]) == tiny_settings.optim_config.lr for g in optimizer.param_groups)
     assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))

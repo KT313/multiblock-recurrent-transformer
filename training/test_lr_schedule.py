@@ -150,13 +150,23 @@ def test_schedule_plateaus_and_cooldown_of_continuity_config() -> None:
 
 
 def test_resume_warmup_helper() -> None:
-    assert _resume_warmup(10, 10, 4, 0.0, 1e-4) == pytest.approx(0.0)
-    assert _resume_warmup(11, 10, 4, 0.0, 1e-4) == pytest.approx(0.25e-4)
-    assert _resume_warmup(11, 10, 4, 2e-5, 1e-4) == pytest.approx(2e-5 + 0.25 * 8e-5)
-    assert _resume_warmup(14, 10, 4, 0.0, 1e-4) is None  # ramp over
-    assert _resume_warmup(9, 10, 4, 0.0, 1e-4) is None  # before the resume
-    assert _resume_warmup(11, -1, 4, 0.0, 1e-4) is None  # no resume
-    assert _resume_warmup(11, 10, 0, 0.0, 1e-4) is None  # disabled
+    assert _resume_warmup(0, 4, 0.0, 1e-4) == pytest.approx(0.0)
+    assert _resume_warmup(1, 4, 0.0, 1e-4) == pytest.approx(0.25e-4)
+    assert _resume_warmup(1, 4, 2e-5, 1e-4) == pytest.approx(2e-5 + 0.25 * 8e-5)
+
+
+def test_resume_warmup_applies_only_inside_the_ramp() -> None:
+    """`get_lr_multistage` ramps for `resume_warmup_steps` steps after `resume_step` and is the plain schedule before
+    the resume, after the ramp, without a resume (`resume_step=-1`) and with the ramp disabled."""
+    sm = _tiny_manager()
+    plateau = _lr(sm, 5)
+    kw = dict(resume_step=10, resume_warmup_steps=4)
+    assert _lr(sm, 10, **kw) == pytest.approx(0.0)
+    assert _lr(sm, 11, **kw) == pytest.approx(0.25 * _lr(sm, 11))
+    assert _lr(sm, 14, **kw) == pytest.approx(_lr(sm, 14))  # ramp over
+    assert _lr(sm, 9, **kw) == pytest.approx(_lr(sm, 9))  # before the resume
+    assert _lr(sm, 5, resume_step=-1, resume_warmup_steps=4) == pytest.approx(plateau)  # no resume
+    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=0) == pytest.approx(_lr(sm, 11))  # disabled
 
 
 def test_resume_warmup_ramps_from_min_lr_to_schedule() -> None:

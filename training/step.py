@@ -18,16 +18,14 @@ from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from model import RecurrentGPT
-from training.backend.base import Backend
-from training.checkpoint import unwrap_compiled
+from training.backend.base import Backend, plain_model
 from training.data.collate import IGNORE_INDEX, Batch, Sample
 from training.data.loader import RunDataloaders, world_batch_micro_batches
 from training.logger import track_gradient_metrics
@@ -41,21 +39,16 @@ from training.stage_manager import StageInfo, StageManager
 class TrainingProgress:
     """The mutable step counter of a run, shared by the loop and the micro-batch stream.
 
-    `step` is the next optimizer step to run; `train()` calls `advance()` once right after `run_one_optimizer_step`,
-    so during a step `step` is the step being run and after `advance()` `done` is the number of completed steps.
+    `step` is the next optimizer step to run; `train()` calls `advance()` once right after `run_one_optimizer_step`.
     """
 
     step: int = 0  # next optimizer step to run
     resume_step: int = -1  # step the run was resumed at, -1 for a fresh run
 
     def advance(self) -> None:
+        """One optimizer step completed: after this `step` is the number of completed steps (evaluation, logging and
+        checkpoint intervals count these) and the index of the next step to run."""
         self.step += 1
-
-    @property
-    def done(self) -> int:
-        """After `advance()`: the number of completed optimizer steps (evaluation, logging and checkpoint intervals
-        count these)."""
-        return self.step
 
 
 @dataclass
@@ -63,7 +56,7 @@ class StepResult:
     """What one optimizer step produced."""
 
     step: int  # the optimizer step that was run
-    learning_rate: float  # scheduled LR of that step (before the per-group `base_lr` multiplier)
+    learning_rate: float  # scheduled LR of that step
     loss: Tensor  # mean of the micro-batch losses, all-reduced (identity on one device)
     log_ppl: Tensor  # mean of the micro-batch log-perplexities
     grad_norm: Tensor  # pre-clip gradient norm
@@ -150,8 +143,7 @@ class BatchStream:
         buffer = self._buffers[source]
         while not buffer:
             batch = self.loaders.next_train_batch(source)
-            for data_id, rows in batch.rows_read.items():
-                self.consumed_rows[data_id] = self.consumed_rows.get(data_id, 0) + rows
+            self.consumed_rows[source] = self.consumed_rows.get(source, 0) + batch.rows_read
             buffer.extend(batch.samples)
         return buffer.popleft()
 
@@ -204,7 +196,7 @@ def run_one_optimizer_step(
     `batches`, one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
 
     Numerics, in order: `model.step` is set on the unwrapped model (seeds the recurrence sampler), the LR is set on
-    every group (× `base_lr`); per micro-batch `backend.to_device`, `no_sync` on all but the last, autocast around
+    every group; per micro-batch `backend.to_device`, `no_sync` on all but the last, autocast around
     the forward only, `backward(loss / gradient_accumulation_steps)`, `loss_sum += loss.detach()`; then the mean
     loss must be finite, `grad_norm = backend.clip_grad_norm(...)` (pre-clip norm, must be finite), `optimizer.step()`
     only if `progress.step > 0` (the very first update is skipped, as in the thesis), `track_gradient_metrics` at
@@ -213,7 +205,7 @@ def run_one_optimizer_step(
     """
     step = progress.step
     accumulation_steps = settings.gradient_accumulation_steps
-    cast(RecurrentGPT, unwrap_compiled(model)).step = step
+    plain_model(model).step = step
     stage = stage_manager.get_stage_info(step)
     learning_rate = scheduled_learning_rate(settings, stage_manager, progress)
     set_lr(optimizer, learning_rate)

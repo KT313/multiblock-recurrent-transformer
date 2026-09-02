@@ -8,12 +8,26 @@ protocol later.
 
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
+
+from model import RecurrentGPT
+
+
+def unwrap_compiled(model: Module) -> Module:
+    """The plain module behind a `torch.compile` wrapper (state-dict keys stay stable across compiled/uncompiled
+    runs)."""
+    return getattr(model, "_orig_mod", model)
+
+
+def plain_model(model: Module) -> RecurrentGPT:
+    """The `RecurrentGPT` behind whatever `Backend.setup_model` wrapped around it (today: `torch.compile`); the loop
+    reads `.step` / `.config` on it and the export writes it."""
+    return cast(RecurrentGPT, unwrap_compiled(model))
 
 
 class Backend(Protocol):

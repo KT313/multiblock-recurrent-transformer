@@ -138,9 +138,9 @@ def run_steps(
 
 def test_training_progress_counts_steps() -> None:
     progress = TrainingProgress()
-    assert (progress.step, progress.resume_step, progress.done) == (0, -1, 0)
+    assert (progress.step, progress.resume_step) == (0, -1)
     progress.advance()
-    assert progress.step == progress.done == 1
+    assert progress.step == 1
     resumed = TrainingProgress(step=14, resume_step=14)
     resumed.advance()
     assert (resumed.step, resumed.resume_step) == (15, 14)
@@ -156,17 +156,15 @@ def test_scheduled_learning_rate_follows_warmup_and_resume(settings: Settings) -
     assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(0.0)  # ramp restarts at min_lr
 
 
-def test_learning_rate_is_set_on_all_groups_times_base_lr(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+def test_learning_rate_is_set_on_all_groups(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     assert len(optimizer.param_groups) == 3
-    for group, base_lr in zip(optimizer.param_groups, (1.0, 0.5, 2.0)):
-        group["base_lr"] = base_lr
     results = run_steps(settings, cpu_backend, model, optimizer, steps=2)
     assert results[1].learning_rate == pytest.approx(1.5e-4)  # warmup step 1 of 2
-    for group, base_lr in zip(optimizer.param_groups, (1.0, 0.5, 2.0)):
+    for group in optimizer.param_groups:
         assert torch.is_tensor(group["lr"])  # `set_lr` stores a tensor (ELLISAdam clones it)
-        assert float(group["lr"]) == pytest.approx(results[1].learning_rate * base_lr)
+        assert float(group["lr"]) == pytest.approx(results[1].learning_rate)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -311,7 +309,7 @@ class _Repeat:
         while True:
             self.count += 1
             samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
-            yield WorkerBatch(samples, {self.tag: len(samples)})
+            yield WorkerBatch(samples, len(samples))
 
 
 class _ShortBatches:
@@ -326,7 +324,7 @@ class _ShortBatches:
             size = self.sizes[self.count % len(self.sizes)]
             self.count += 1
             samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(size)])
-            yield WorkerBatch(samples, {self.tag: len(samples)})
+            yield WorkerBatch(samples, len(samples))
 
 
 @pytest.fixture(scope="session")
@@ -645,7 +643,7 @@ class _RecordingLoader:
 
     def __iter__(self) -> Iterator[WorkerBatch]:
         for batch in self.loader:
-            self.rows_read += sum(batch.rows_read.values())
+            self.rows_read += batch.rows_read
             self.seen.extend(batch.samples)
             yield batch
 

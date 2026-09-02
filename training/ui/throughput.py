@@ -37,10 +37,11 @@ class Throughput:
             return
         sample = (now - self._last_time) / advanced
         self._samples += 1
-        if self._samples <= 2 or self.seconds_per_step is None:
+        previous = self.seconds_per_step  # None for the first sample only; the check below narrows the type
+        if previous is None or self._samples <= 2:
             self.seconds_per_step = sample  # the first sample is provisional, the second replaces it
         else:
-            self.seconds_per_step = (1 - RATE_SMOOTHING) * self.seconds_per_step + RATE_SMOOTHING * sample
+            self.seconds_per_step = (1 - RATE_SMOOTHING) * previous + RATE_SMOOTHING * sample
         self._last_time = now
         self._last_step = step
 

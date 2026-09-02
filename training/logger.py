@@ -33,8 +33,7 @@ import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from model import RecurrentGPT
-from training.checkpoint import unwrap_compiled
+from training.backend.base import plain_model
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.capture import WANDB_QUIET_SETTINGS
@@ -120,11 +119,11 @@ def describe_parameters(model: Module) -> str:
     """The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
     blocks and the count of the unrolled model at the mean recurrence (`total - recurrent + recurrent * mean of
     mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped)."""
-    plain_model = cast(RecurrentGPT, unwrap_compiled(model))
-    total_parameters = num_parameters(plain_model)
-    core_blocks = cast(Iterable[Module], plain_model.transformer.core_blocks)
+    unwrapped = plain_model(model)
+    total_parameters = num_parameters(unwrapped)
+    core_blocks = cast(Iterable[Module], unwrapped.transformer.core_blocks)
     recurrent_parameters = sum(p.numel() for block in core_blocks for p in block.parameters())
-    mean_recurrence = cast(list[int], plain_model.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
+    mean_recurrence = cast(list[int], unwrapped.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
     mean_of_means = sum(mean_recurrence) / len(mean_recurrence)
     unrolled_parameters = int(total_parameters - recurrent_parameters + recurrent_parameters * mean_of_means)
     return (
@@ -143,7 +142,7 @@ class TrainingReport:
 
     run_directory: Path
     steps_completed: int  # optimizer steps run by this process (a resumed run counts from its resume step)
-    final_step: int  # completed optimizer steps of the run in total (`progress.done` at the end)
+    final_step: int  # completed optimizer steps of the run in total (`progress.step` at the end)
     resumed_from: Path | None  # the checkpoint the run resumed from, None for a fresh start
     setup_seconds: float  # from the start of the run to `RunLogger.open` (backend, dataset, loaders, model, resume)
     train_seconds: float  # from `RunLogger.open` to `RunLogger.close`
@@ -218,7 +217,7 @@ def open_dashboard(
 
 
 def _stage_for_the_bars(at_done: StageInfo) -> tuple[int, dict[str, float]]:
-    """Where the run is after `progress.done` steps, for the dashboard's bars: the index of the stage whose steps
+    """Where the run is after `progress.step` steps, for the dashboard's bars: the index of the stage whose steps
     are counting (inside a transition the stage being left, `prev_stage_idx` — the info itself already names the
     stage being entered) and the two transition keys the dashboard reads for the bar note.
 
@@ -326,7 +325,7 @@ class RunLogger:
             enabled=settings.wandb_enabled,
         )
         wandb.log_hyperparams(asdict(settings) | {"dataset_config_hash": dataset.config_hash})
-        wandb.log_summary({"num_parameters": num_parameters(unwrap_compiled(model))})
+        wandb.log_summary({"num_parameters": num_parameters(plain_model(model))})
         run_logger = cls(
             settings,
             run_directory,
@@ -427,7 +426,7 @@ class RunLogger:
     # --- steps -------------------------------------------------------------------------------------------------------
 
     def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
-        """Account one completed optimizer step (`progress.done`, i.e. after `progress.advance()`).
+        """Account one completed optimizer step (`progress.step`, after `progress.advance()`).
 
         Every step: the data ids join the composition counter, a stage transition starting or ending with this step
         becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
@@ -436,8 +435,8 @@ class RunLogger:
         added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and
         to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
-        * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR before the
-          per-group `base_lr`), `grad_norm` (pre-clip), `step` (= done);
+        * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR), `grad_norm`
+          (pre-clip), `step` (= done);
         * `seconds/step` (wall time of the last log interval per step), `tokens/second` (`world_batch_size ×
           block_size` per `seconds/step`; 0 if the interval took no measurable time), `total_tokens` (`done × tokens
           per step`, counted from step 0 also after a resume), `total_time` (seconds since `open`), `remaining_time`
@@ -453,14 +452,14 @@ class RunLogger:
         self._note_transition(result)
         validation = self._log_validation(result, progress)
         stage_index, transition = _stage_for_the_bars(result.next_stage)
-        if progress.done % self.settings.log_step_interval != 0:
-            self.dashboard.update_step(progress.done, stage_index, {})
+        if progress.step % self.settings.log_step_interval != 0:
+            self.dashboard.update_step(progress.step, stage_index, {})
             return
         metrics = self._step_metrics(result, progress, validation)
-        self.wandb.log(metrics, step=progress.done)
-        self.history[progress.done] = {name: float(value) for name, value in metrics.items()}
+        self.wandb.log(metrics, step=progress.step)
+        self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
-        self.dashboard.update_step(progress.done, stage_index, metrics | transition)
+        self.dashboard.update_step(progress.step, stage_index, metrics | transition)
 
     def _note_transition(self, result: StepResult) -> None:
         """The two transition events: after the last plain step of a stage ("starting transition") and after the
@@ -486,7 +485,7 @@ class RunLogger:
         self._evaluation_seconds = None
         self._last_validation = validation
         losses = {name: value for name, value in validation.items() if name.startswith("val_loss")}
-        self.dashboard.update_validation(progress.done, losses)
+        self.dashboard.update_validation(progress.step, losses)
         return validation
 
     def _step_metrics(
@@ -495,9 +494,9 @@ class RunLogger:
         """The metric dict of a log step (documented in `log_step`); resets the interval timer and the composition
         counter."""
         now = self._clock()
-        steps_in_interval = max(progress.done - self._interval_step, 1)  # after an off-grid resume fewer than the interval
+        steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
         seconds_per_step = (now - self._interval_started) / steps_in_interval
-        self._interval_started, self._interval_step = now, progress.done
+        self._interval_started, self._interval_step = now, progress.step
         total_samples = sum(self._sample_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
@@ -506,12 +505,12 @@ class RunLogger:
             "ppl": _to_scalar(result.log_ppl.exp()),
             "lr": result.learning_rate,
             "grad_norm": _to_scalar(result.grad_norm),
-            "step": progress.done,
+            "step": progress.step,
             "seconds/step": seconds_per_step,
             "tokens/second": self.tokens_per_step / seconds_per_step if seconds_per_step > 0 else 0.0,
-            "total_tokens": progress.done * self.tokens_per_step,
+            "total_tokens": progress.step * self.tokens_per_step,
             "total_time": now - self._train_started,
-            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.done),
+            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.step),
             "stage/current_stage": result.stage.stage_idx,
             "stage/base_lr": result.stage.base_lr,
             "stage/in_transition": int(result.stage.in_transition),
@@ -531,13 +530,13 @@ class RunLogger:
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
         ending = "stopped on request" if stopped else "finished"
-        console.info(f"Training {ending} after {progress.done} steps in {train_seconds:.1f}s.", extra=KEEP)
+        console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.status(ending)
         self.resources.close()
         return TrainingReport(
             run_directory=self.run_directory,
-            steps_completed=progress.done - self.start_step,
-            final_step=progress.done,
+            steps_completed=progress.step - self.start_step,
+            final_step=progress.step,
             resumed_from=self.resumed_from,
             setup_seconds=self.setup_seconds,
             train_seconds=train_seconds,

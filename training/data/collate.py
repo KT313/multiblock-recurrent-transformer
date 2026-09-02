@@ -22,17 +22,18 @@ Batch = tuple[torch.Tensor, torch.Tensor, list[str]]  # a padded, shifted micro-
 
 
 class WorkerBatch(NamedTuple):
-    """What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus, per
-    data entry prefix, how many rows were READ to produce them — dropped rows included.
+    """What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus how
+    many rows were READ to produce them — dropped rows included. A training loader reads exactly one source, so one
+    count is enough.
 
-    The counts are computed in the dataloader worker and travel to the main process with the batch itself (worker
+    The count is computed in the dataloader worker and travels to the main process with the batch itself (worker
     processes share no state with the trainer), so `training.step.BatchStream` can count consumed rows in the same
     unit the resume path skips (`ParquetTextDataset.set_resume_offset`): rows read from disk. Counting surviving
     samples instead would make every dropped row rewind a resume by one row.
     """
 
     samples: list[Sample]
-    rows_read: dict[str, int]
+    rows_read: int
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -101,17 +102,13 @@ def collate_worker_batch(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> WorkerBatch:
-    """`collate_samples` plus the per-entry count of the rows that went in: the collate function of the unpadded
-    (training) loaders.
+    """`collate_samples` plus the count of the rows that went in: the collate function of the unpadded (training)
+    loaders.
 
     Every row of ``batch`` was read from its dataset whether or not it kept a supervised label, so ``rows_read`` —
     unlike ``len(samples)`` — advances by rows read from disk, the unit a resume skips.
     """
-    rows_read: dict[str, int] = {}
-    for row in batch:
-        data_id = str(row["data_id"])
-        rows_read[data_id] = rows_read.get(data_id, 0) + 1
-    return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), rows_read)
+    return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), len(batch))
 
 
 def pad_and_shift(

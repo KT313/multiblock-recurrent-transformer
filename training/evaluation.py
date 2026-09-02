@@ -21,13 +21,10 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
-from model import RecurrentGPT
-from training.backend.base import Backend
-from training.checkpoint import unwrap_compiled
+from training.backend.base import Backend, plain_model
 from training.data.collate import Batch
 from training.settings import Settings
 from training.stage_manager import StageManager
-from training.step import TrainingProgress
 
 
 @torch.no_grad()
@@ -43,7 +40,7 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     the missing ones) and all-reduced (identity on one device). A loader that yields no batch at all is an error.
     """
     model.eval()
-    config = cast(RecurrentGPT, unwrap_compiled(model)).config
+    config = plain_model(model).config
     mean_recurrence = cast(list[int], config.mean_recurrence)  # broadcast to a list in RecurrentConfig.__post_init__
     depths: list[int | list[int]] = [*settings.partial_depth_eval, mean_recurrence]
     steps_per_depth = [
@@ -74,7 +71,7 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     return metrics
 
 
-def is_evaluation_step(settings: Settings, progress: TrainingProgress, stage_manager: StageManager) -> bool:
-    """Whether to evaluate after `progress.done` completed optimizer steps: every `eval_step_interval` steps and
-    after the last step."""
-    return progress.done % settings.eval_step_interval == 0 or progress.done >= stage_manager.total_steps
+def is_evaluation_step(settings: Settings, done: int, stage_manager: StageManager) -> bool:
+    """Whether to evaluate after `done` completed optimizer steps: every `eval_step_interval` steps and after the
+    last step."""
+    return done % settings.eval_step_interval == 0 or done >= stage_manager.total_steps
