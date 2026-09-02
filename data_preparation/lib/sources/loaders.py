@@ -1,20 +1,21 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Row loaders: `LOADERS[name](source, offset, count, *, token, index_dir, on_file, stats, columns,
-align_to_row_group) -> Iterator[Row]` yields raw rows starting at row `offset` of the source's deterministic order
-(`hf_files`, `hf_split`, `hf_stream`, `github_code`, `local`, `synthetic`).
+"""Row loaders: `LOADERS[name](source, offset, count, shared_parameters) -> Iterator[Row]` yields raw rows starting
+at row `offset` of the source's deterministic order (`hf_files`, `hf_split`, `hf_stream`, `github_code`, `local`,
+`synthetic`).
 
 `count` is a **minimum**: a loader yields exactly `count` rows (fewer only when the source runs dry), except that
 `hf_files` / `github_code` reading a large parquet file remotely finish the row group in which `count` was reached
 (`align_to_row_group=True`, the default) so the rows that were downloaded anyway are kept and a later fetch at
 the resulting offset never fetches those bytes again; `align_to_row_group=False` makes every loader exact. The
-caller must consume everything yielded and advance its offset by the number of rows consumed. `columns` projects the
-rows `hf_files` / `github_code` / `local` read, whatever the file format (`github_code` adds `language`, its filter
-column) — they all read through `hub_files.iter_row_batches`, the one reading contract; the other loaders yield
-every column.
+caller must consume everything yielded and advance its offset by the number of rows consumed.
 
-`index_dir` is where `hf_files` / `github_code` persist their file index (None: in memory), `on_file` is called
-with every repo file they open (progress display) and `stats` collects their download counters (`FetchStats`,
-remote bytes read). `datasets` is imported lazily so the HF cache environment can be configured before import."""
+:class:`SharedLoaderParameters` carries what the download stage hands every loader alike; each loader uses the
+members that apply to it. `columns` projects the rows `hf_files` / `github_code` / `local` read, whatever the file
+format (`github_code` adds `language`, its filter column) — they all read through `hub_files.iter_row_batches`, the
+one reading contract; the other loaders yield every column. `index_dir` is where `hf_files` / `github_code` persist
+their file index (None: in memory), `on_file` is called with every repo file they open (progress display) and
+`stats` collects their download counters (`FetchStats`, remote bytes read). `datasets` is imported lazily so the HF
+cache environment can be configured before import."""
 
 from __future__ import annotations
 
@@ -41,19 +42,24 @@ from data_preparation.lib.sources.synthetic import synthetic_row
 Row = dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SharedLoaderParameters:
+    """What the download stage hands every loader besides `(source, offset, count)`: the Hub token, where the
+    Hub loaders keep their file index (None: in memory), the callback for every repo file opened, the download
+    counters, the column projection (None: every column) and whether a remote parquet row group is finished
+    whole once `count` is reached."""
+
+    token: str | None = None
+    index_dir: Path | None = None
+    on_file: OnFile | None = None
+    stats: FetchStats | None = None
+    columns: list[str] | None = None
+    align_to_row_group: bool = True
+
+
 class Loader(Protocol):
     def __call__(
-        self,
-        source: SourceConfig,
-        offset: int,
-        count: int,
-        *,
-        token: str | None = None,
-        index_dir: Path | None = None,
-        on_file: OnFile | None = None,
-        stats: FetchStats | None = None,
-        columns: list[str] | None = None,
-        align_to_row_group: bool = True,
+        self, source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
     ) -> Iterator[Row]: ...
 
 
@@ -104,75 +110,50 @@ def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> di
 
 
 def load_hf_split(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via `split[a:b]` slicing (materialised download, deterministic order)."""
     _check_offset_count(offset, count)
     if count == 0:
         return
-    dataset = _load_dataset(**hub_load_kwargs(source, token, split=f"{source.split}[{offset}:{offset + count}]"))
+    dataset = _load_dataset(**hub_load_kwargs(source, shared_parameters.token, split=f"{source.split}[{offset}:{offset + count}]"))
     yield from _take(dataset, count)
 
 
 def load_hf_stream(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of `hf_id` via streaming with `skip(offset)` (used for instruct sources)."""
     _check_offset_count(offset, count)
     if count == 0:
         return
-    stream = _load_dataset(**hub_load_kwargs(source, token, split=source.split, streaming=True))
+    stream = _load_dataset(**hub_load_kwargs(source, shared_parameters.token, split=source.split, streaming=True))
     if offset:
         stream = stream.skip(offset)
     yield from _take(stream, count)
 
 
-def hub_file_index(source: SourceConfig, default_pattern: str | None, index_dir: Path | None, token: str | None) -> FileIndex:
+def hub_file_index(source: SourceConfig, default_pattern: str | None, shared_parameters: SharedLoaderParameters) -> FileIndex:
     """The :class:`FileIndex` of a `hf_files` / `github_code` source (`load_kwargs.data_files` or `default_pattern`)."""
     if not source.hf_id:  # validated by SourceConfig; repeated for the type checker
         raise ValueError(f"loader {source.loader} requires hf_id")
     pattern = source.load_kwargs.get("data_files", default_pattern)
     if not isinstance(pattern, str) or not pattern:
         raise ValueError(f"loader {source.loader} requires load_kwargs.data_files (a glob relative to the repo root)")
-    return FileIndex.open(source.hf_id, source.revision, pattern, index_dir, token)
+    return FileIndex.open(source.hf_id, source.revision, pattern, shared_parameters.index_dir, shared_parameters.token)
 
 
-def hub_fetcher(source: SourceConfig, token: str | None, stats: FetchStats | None) -> HubFetcher:
+def hub_fetcher(source: SourceConfig, shared_parameters: SharedLoaderParameters) -> HubFetcher:
     """The :class:`HubFetcher` of a `hf_files` / `github_code` source: `load_kwargs.max_cached_file_mb` (default
     `DEFAULT_MAX_CACHED_FILE_MB`) decides which files go through the Hub cache and which are read remotely."""
     threshold = source.load_kwargs.get(MAX_CACHED_FILE_KEY, DEFAULT_MAX_CACHED_FILE_MB)
-    return HubFetcher(token=token, max_cached_file_mb=float(threshold), stats=stats or FetchStats())
+    return HubFetcher(
+        token=shared_parameters.token, max_cached_file_mb=float(threshold), stats=shared_parameters.stats or FetchStats()
+    )
 
 
 def load_hf_files(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of the repo files matching `load_kwargs.data_files`, sorted by path.
 
@@ -185,24 +166,15 @@ def load_hf_files(
     _check_offset_count(offset, count)
     if count == 0:
         return
-    index = hub_file_index(source, None, index_dir, token)
+    index = hub_file_index(source, None, shared_parameters)
     yield from read_rows(
-        index, offset, count, on_file=on_file, fetcher=hub_fetcher(source, token, stats), columns=columns,
-        align_to_row_group=align_to_row_group,
+        index, offset, count, on_file=shared_parameters.on_file, fetcher=hub_fetcher(source, shared_parameters),
+        columns=shared_parameters.columns, align_to_row_group=shared_parameters.align_to_row_group,
     )
 
 
 def load_github_code(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """`hf_files` over `hf_id` (codeparrot/github-code-clean, default `data_files: data/*.parquet`) keeping rows of
     `source.language`.
@@ -218,10 +190,7 @@ def load_github_code(
     if count == 0:
         return
     request = GithubCodeRequest(name="", source=source, offset=offset, count=count)
-    for _, row in read_github_code_group(
-        [request], token=token, index_dir=index_dir, on_file=on_file, stats=stats, columns=columns,
-        align_to_row_group=align_to_row_group,
-    ):
+    for _, row in read_github_code_group([request], shared_parameters):
         yield row
 
 
@@ -242,14 +211,7 @@ def github_code_repo_key(source: SourceConfig) -> tuple[str | None, str | None, 
 
 
 def read_github_code_group(
-    requests: list[GithubCodeRequest],
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    requests: list[GithubCodeRequest], shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[tuple[str, Row]]:
     """Serve several `github_code` sources of **one repo** in a single pass over its files (every row group read
     at most once), yielding ``(request.name, row)``; per source exactly what `load_github_code` yields for the same
@@ -270,16 +232,17 @@ def read_github_code_group(
     if len(set(languages)) != len(languages):
         raise ValueError(f"github_code group members must have distinct languages, got {languages}")
 
-    index = hub_file_index(first, GITHUB_CODE_DATA_FILES, index_dir, token)
+    index = hub_file_index(first, GITHUB_CODE_DATA_FILES, shared_parameters)
+    columns = shared_parameters.columns
     if columns is not None and "language" not in columns:
         columns = [*columns, "language"]
     yield from read_rows_multi(
         index,
         [_language_request(r) for r in requests],
-        on_file=on_file,
-        fetcher=hub_fetcher(first, token, stats),
+        on_file=shared_parameters.on_file,
+        fetcher=hub_fetcher(first, shared_parameters),
         columns=columns,
-        align_to_row_group=align_to_row_group,
+        align_to_row_group=shared_parameters.align_to_row_group,
     )
 
 
@@ -309,16 +272,7 @@ def _iter_local_rows(directory: Path, columns: list[str] | None = None) -> Itera
 
 
 def load_local(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """Rows `offset..offset+count` of the parquet/jsonl files under `source.path` (files in sorted order), each
     projected to `columns` (None: every column) whatever the file format."""
@@ -330,20 +284,11 @@ def load_local(
     directory = Path(source.path)
     if not directory.is_dir():
         raise FileNotFoundError(f"local source directory not found: {directory}")
-    yield from islice(_iter_local_rows(directory, columns), offset, offset + count)
+    yield from islice(_iter_local_rows(directory, shared_parameters.columns), offset, offset + count)
 
 
 def load_synthetic(
-    source: SourceConfig,
-    offset: int,
-    count: int,
-    *,
-    token: str | None = None,
-    index_dir: Path | None = None,
-    on_file: OnFile | None = None,
-    stats: FetchStats | None = None,
-    columns: list[str] | None = None,
-    align_to_row_group: bool = True,
+    source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
 ) -> Iterator[Row]:
     """Deterministic random-word rows seeded by `source.seed` (`{"text"}` for pretrain/validation, instruct triple)."""
     _check_offset_count(offset, count)

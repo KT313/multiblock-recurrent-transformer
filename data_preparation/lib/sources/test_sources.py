@@ -29,7 +29,7 @@ from data_preparation.lib.sources.converters import (
     sharegpt_conversations,
     sharegpt_quality,
 )
-from data_preparation.lib.sources.loaders import LOADERS, Row, get_loader, load_local
+from data_preparation.lib.sources.loaders import LOADERS, Row, SharedLoaderParameters, get_loader, load_local
 from data_preparation.lib.sources.synthetic import VOCAB_SIZE, synthetic_row, write_synthetic_tokenizer
 
 REPO = Path(__file__).resolve().parents[3]
@@ -99,7 +99,7 @@ def _src(**kwargs: Any) -> SourceConfig:
 
 def test_hf_split_slices_and_passes_kwargs(fake_datasets: FakeDatasets) -> None:
     source = _src(load_kwargs={"name": "cfg"}, split="validation")
-    rows = list(LOADERS["hf_split"](source, 5, 3, token="tok"))
+    rows = list(LOADERS["hf_split"](source, 5, 3, SharedLoaderParameters(token="tok")))
     assert [r["id"] for r in rows] == [5, 6, 7]
     call = fake_datasets.calls[0]
     assert call == {
@@ -171,8 +171,8 @@ def test_local_projects_jsonl_and_parquet_to_the_requested_columns(tmp_path: Pat
     pq.write_table(pa.table({"text": ["b0"], "extra": [1]}), tmp_path / "b.parquet")
     (tmp_path / "a.jsonl").write_text(json.dumps({"text": "a0", "extra": 0}) + "\n")
     source = _src(loader="local", path=str(tmp_path), hf_id=None, revision=None)
-    assert list(LOADERS["local"](source, 0, 10, columns=["text"])) == [{"text": "a0"}, {"text": "b0"}]
-    assert list(LOADERS["local"](source, 0, 1, columns=["text", "missing"])) == [{"text": "a0"}]  # jsonl: absent stays absent
+    assert list(LOADERS["local"](source, 0, 10, SharedLoaderParameters(columns=["text"]))) == [{"text": "a0"}, {"text": "b0"}]
+    assert list(LOADERS["local"](source, 0, 1, SharedLoaderParameters(columns=["text", "missing"]))) == [{"text": "a0"}]  # jsonl: absent stays absent
     assert list(LOADERS["local"](source, 0, 10)) == [{"text": "a0", "extra": 0}, {"text": "b0", "extra": 1}]
 
 

@@ -365,7 +365,8 @@ One YAML entry under `sources:` plus its weight in the stages that use it. Pin t
 the Hub repo, or the commit shown on the dataset page) so row order is stable across increments; give
 `describe_tokens_per_row` a ballpark value if you care about the row column of `describe`.
 
-Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count) -> Iterator[row]`):
+Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count, shared_parameters) -> Iterator[row]`, the
+last a `SharedLoaderParameters` — token, index directory, file callback, download counters, column projection):
 
 | Loader | Use for | Notes |
 |---|---|---|

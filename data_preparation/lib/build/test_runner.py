@@ -856,9 +856,9 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     offsets: list[int] = []
     original = loaders_mod.LOADERS["synthetic"]
 
-    def spy(source: Any, offset: int, count: int, **kwargs: Any) -> Any:
+    def spy(source: Any, offset: int, count: int, shared_parameters: Any) -> Any:
         offsets.append(offset)
-        return original(source, offset, count, **kwargs)
+        return original(source, offset, count, shared_parameters)
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):

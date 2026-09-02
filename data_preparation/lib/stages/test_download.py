@@ -21,6 +21,7 @@ from data_preparation.dataset_config import DatasetConfig, SourceConfig, Tokeniz
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
+from data_preparation.lib.sources.loaders import SharedLoaderParameters
 from data_preparation.lib.sources.synthetic import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
@@ -175,19 +176,19 @@ def test_download_passes_index_dir_and_on_file_to_the_loader(
     """Hub-file loaders get `index_dir=<dataset>/hub_index` and an `on_file` callback from the download stage."""
     from data_preparation.lib.sources import loaders as loaders_mod
 
-    seen: dict[str, Any] = {}
+    seen: list[SharedLoaderParameters] = []
 
-    def fake_loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
-        seen.update(kwargs)
-        on_file = kwargs["on_file"]
-        on_file("data/x.parquet")
+    def fake_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        seen.append(shared_parameters)
+        assert shared_parameters.on_file is not None
+        shared_parameters.on_file("data/x.parquet")
         return iter([{"text": "a"}, {"text": "b"}][:count])
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", fake_loader)
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     manifest = download(cfg, "p", layout, rows_needed=2, hf_token="tok")
     assert manifest.rows() == 2
-    assert seen["index_dir"] == layout.hub_index_dir() and seen["token"] == "tok" and callable(seen["on_file"])
+    assert [p.index_dir for p in seen] == [layout.hub_index_dir()] and seen[0].token == "tok"
 
 
 def test_download_local_applies_converter_and_flags_exhaustion(
@@ -273,8 +274,8 @@ def test_download_keeps_every_row_a_loader_yields_beyond_rows_needed(
 
     calls: list[tuple[int, int, list[str] | None, bool]] = []
 
-    def group_loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
-        calls.append((offset, count, kwargs["columns"], kwargs["align_to_row_group"]))
+    def group_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        calls.append((offset, count, shared_parameters.columns, shared_parameters.align_to_row_group))
         return iter([{"text": f"row {i}"} for i in range(offset, offset + max(count, 20))])  # a 20-row "row group"
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", group_loader)
@@ -296,8 +297,8 @@ def test_download_columns_follow_the_converter_and_check_limit_bounds_over_reads
     seen: list[list[str] | None] = []
     closed: list[bool] = []
 
-    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
-        seen.append(kwargs["columns"])
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        seen.append(shared_parameters.columns)
         try:
             for i in range(offset, offset + 20):
                 yield {"question": f"q{i}", "answer": f"a{i}", "text": f"t{i}"}
@@ -697,7 +698,7 @@ def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total:
 
     offsets: list[int] = []
 
-    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
         offsets.append(offset)
         for i in range(offset, min(offset + count, total)):
             if fail_at is not None and i == fail_at:
@@ -860,7 +861,7 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
     calls: list[tuple[int, int]] = []
     closed: list[bool] = []
 
-    def loader(source: SourceConfig, offset: int, count: int, **kwargs: Any) -> Any:
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
         calls.append((offset, count))
         try:
             for i in range(offset, offset + count):
