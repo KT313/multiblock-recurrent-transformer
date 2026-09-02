@@ -11,8 +11,8 @@ rbloom's ``hash_func`` must return a Python int in ``[-2^127, 2^127 - 1]`` (``Ov
 filter seeds a 128-bit linear congruential generator with it and takes the ``k`` probe positions from successive
 states, so the value should be well mixed across all 128 bits. Python's ``hash(int)`` reduces modulo ``2^61 - 1``
 and would collide distinct 64-bit keys, and a 64-bit key with zero upper bits is a poor LCG seed, hence
-:func:`mix128`. rbloom sizes the filter as ``m = -n ln p / ln(2)^2`` bits (rounded up to whole bytes) and uses
-``k = floor(m / n x ln 2)`` probes; both are mirrored here so the printed false-positive rate is the filter's.
+:func:`mix128`. rbloom sizes the filter as ``m = -n ln p / ln(2)^2`` bits (rounded up to whole bytes);
+:func:`expected_items` inverts that so the memory budget, not a row estimate, decides the size.
 """
 
 from __future__ import annotations
@@ -68,30 +68,6 @@ def expected_items(memory_mb: int, false_positive_rate: float = TARGET_FALSE_POS
     return int(bits_for_budget(memory_mb) * math.log(2) ** 2 / -math.log(false_positive_rate))
 
 
-def probe_count(false_positive_rate: float = TARGET_FALSE_POSITIVE_RATE) -> int:
-    """The number of probes ``k`` rbloom derives for the target rate: ``floor(m / n x ln 2) = floor(-log2 p)`` (it
-    truncates rather than rounds, verified against the ``k`` in its serialised header; 9 for 0.1 %)."""
-    return int(-math.log2(false_positive_rate))
-
-
-def expected_false_positive_rate(memory_mb: int, rows: int) -> float:
-    """The classic Bloom estimate ``(1 - e^(-k rows / m))^k`` for a filter of ``memory_mb`` after ``rows`` inserts,
-    with rbloom's ``k`` for the target rate (an upper bound on the share of unique documents dropped)."""
-    if rows < 0:
-        raise ValueError(f"rows must not be negative, got {rows}")
-    m = bits_for_budget(memory_mb)
-    k = probe_count()
-    return (1.0 - math.exp(-k * rows / m)) ** k
-
-
-def _human_count(n: int) -> str:
-    """``2.6 M``-style row counts for log lines."""
-    for unit, scale in (("B", 10**9), ("M", 10**6), ("k", 10**3)):
-        if n >= scale:
-            return f"{n / scale:.1f} {unit}"
-    return str(n)
-
-
 class SeenDocuments:
     """The exact-dedup filter of one build: ``add_if_new`` per candidate row, ``add_all`` to refill from disk."""
 
@@ -112,15 +88,9 @@ class SeenDocuments:
         """Insert every hash (refilling from :func:`stored_hashes` at the start of a build)."""
         self._bloom.update(hashes)
 
-    def expected_false_positive_rate(self, rows: int) -> float:
-        """See :func:`expected_false_positive_rate` for this filter's budget."""
-        return expected_false_positive_rate(self.memory_mb, rows)
-
     def describe(self, rows_needed: int) -> str:
-        """The one-line log message printed once per source, e.g.
-        ``dedup filter: 1024 MB, ~2.6 M rows -> FPR ≈ 3e-08``."""
-        fpr = self.expected_false_positive_rate(rows_needed)
-        return f"dedup filter: {self.memory_mb} MB, ~{_human_count(rows_needed)} rows -> FPR ≈ {fpr:.0e}"
+        """The one-line log message printed once per source: ``dedup filter: 1024 MB, ~2,600,000 rows``."""
+        return f"dedup filter: {self.memory_mb} MB, ~{rows_needed:,} rows"
 
 
 def stored_hashes(parquet_files: Iterable[Path]) -> Iterator[int]:

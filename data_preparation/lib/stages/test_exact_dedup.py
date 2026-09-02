@@ -16,10 +16,8 @@ from data_preparation.lib.stages.exact_dedup import (
     TARGET_FALSE_POSITIVE_RATE,
     SeenDocuments,
     bits_for_budget,
-    expected_false_positive_rate,
     expected_items,
     mix128,
-    probe_count,
     stored_hashes,
 )
 
@@ -77,11 +75,8 @@ def test_bits_for_budget_and_expected_items() -> None:
         bits_for_budget(0)
 
 
-def test_probe_count_matches_rbloom_truncation() -> None:
-    assert probe_count(0.001) == 9  # rbloom stores k=9 for p=1e-3 (m/n x ln 2 = 9.97, truncated)
-    assert probe_count(0.01) == 6
-    assert probe_count(0.0001) == 13
-    assert probe_count(0.5) == 1
+def test_describe_names_the_budget_and_the_rows() -> None:
+    assert SeenDocuments(memory_mb=1).describe(2_600_000) == "dedup filter: 1 MB, ~2,600,000 rows"
 
 
 def test_size_in_bits_is_the_budget_within_a_byte() -> None:
@@ -90,32 +85,6 @@ def test_size_in_bits_is_the_budget_within_a_byte() -> None:
     assert seen._bloom.size_in_bits == BITS_PER_MB  # rbloom rounds up to whole bytes; 1 MB is already whole
     two = SeenDocuments(memory_mb=2)
     assert abs(two._bloom.size_in_bits - 2 * BITS_PER_MB) <= 8
-
-
-def test_expected_false_positive_rate_hand_values() -> None:
-    assert expected_false_positive_rate(1024, 0) == 0.0
-    # 1024 MB, 200 M rows: k=9, k n / m = 0.2095 -> (1 - e^-0.2095)^9 ~ 8e-7
-    fpr_200m = expected_false_positive_rate(1024, 200_000_000)
-    assert fpr_200m == pytest.approx((1 - math.exp(-9 * 200e6 / 2**33)) ** 9)
-    assert 1e-7 < fpr_200m < 1e-5
-    # 1024 MB, 600 M rows (about the design load): ~1e-3
-    fpr_600m = expected_false_positive_rate(1024, 600_000_000)
-    assert 5e-4 < fpr_600m < 2e-3
-    # 1 MB, 100 k rows: (1 - e^-(9 x 1e5 / 2^23))^9 ~ 5e-10
-    assert expected_false_positive_rate(1, 100_000) == pytest.approx((1 - math.exp(-9 * 1e5 / 2**23)) ** 9)
-    with pytest.raises(ValueError, match="negative"):
-        expected_false_positive_rate(1, -1)
-
-
-def test_describe_format() -> None:
-    seen = SeenDocuments(memory_mb=1)
-    line = seen.describe(2_600_000)
-    assert line.startswith("dedup filter: 1 MB, ~2.6 M rows -> FPR ≈ ")
-    assert line.endswith(f"{expected_false_positive_rate(1, 2_600_000):.0e}")
-    fpr_7500 = expected_false_positive_rate(1, 7_500)
-    assert seen.describe(7_500) == f"dedup filter: 1 MB, ~7.5 k rows -> FPR ≈ {fpr_7500:.0e}"
-    assert seen.describe(12).startswith("dedup filter: 1 MB, ~12 rows")
-    assert "1.2 B rows" in seen.describe(1_200_000_000)
 
 
 # --- the filter ------------------------------------------------------------------------------------------------------
@@ -155,7 +124,8 @@ def test_observed_false_positive_rate_roughly_matches_formula() -> None:
     fresh = [rng.randint(INT64_MIN, INT64_MAX) for _ in range(100_000)]  # collisions with the inserts: ~3e-9 each
     hits = sum(h in seen._bloom for h in fresh)
     observed = hits / len(fresh)
-    expected = expected_false_positive_rate(1, inserted)  # ~1e-3 -> ~100 hits
+    k = 9  # rbloom's probe count for the 0.1 % target: floor(-log2 p)
+    expected = (1 - math.exp(-k * inserted / BITS_PER_MB)) ** k  # the classic Bloom estimate: ~1e-3 -> ~100 hits
     assert expected / 3 < observed < expected * 3, (observed, expected)
 
 

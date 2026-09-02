@@ -53,6 +53,7 @@ import pyarrow.parquet as pq
 from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
 from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.abort import StopCheck, check_stop
+from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
@@ -72,9 +73,8 @@ from data_preparation.lib.stages.download import (
     current_manifest,
     current_raw_manifest,
     new_manifest,
-    shard_list,
 )
-from data_preparation.lib.storage.manifest import Manifest, ShardInfo
+from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
 from data_preparation.lib.storage.parquet import publish_shard, shard_name, text_hash64
 from data_preparation.lib.ui.dashboard import progress
 
@@ -196,7 +196,7 @@ def _build_all_at_once(
         log.warning("removing leftover %s of an interrupted build", temporary)
         shutil.rmtree(temporary)
     output.publish(survivors, shard_size)
-    output.save(shard_list(raw))
+    output.save(shard_list(raw.shards))
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
 
@@ -252,7 +252,7 @@ class ProcessedOutput:
         if manifest is not None:
             covered: list[list[Any]] = manifest.extra.get("input_shards", [])
             has_columns = manifest.extra.get("columns") == list(columns)
-            if has_columns and shard_list(raw)[: len(covered)] == covered:
+            if has_columns and shard_list(raw.shards)[: len(covered)] == covered:
                 return cls(manifest, processed_dir, is_new=False)
             why = "raw shards changed under the processed manifest" if has_columns else "processed shards predate the current columns"
             log.warning("%s: %s, rebuilding everything", name, why)
@@ -288,7 +288,7 @@ def _complete_manifest(processed_dir: Path, source_hash: str, raw: Manifest, col
     manifest = current_manifest(processed_dir, source_hash, "processed")
     if manifest is None:
         return None
-    if manifest.extra.get("columns") == list(columns) and manifest.extra.get("input_shards") == shard_list(raw):
+    if manifest.extra.get("columns") == list(columns) and manifest.extra.get("input_shards") == shard_list(raw.shards):
         return manifest
     return None
 
@@ -573,18 +573,6 @@ class Decontaminator:
             for row in rows:
                 yield row, _contaminated_by(row["text"])
             return
-        for chunk in _chunks(rows, 1024):
+        for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
             yield from zip(chunk, self._pool.map(_contaminated_by, texts, chunksize=64))
-
-
-def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
-    """``rows`` grouped into lists of ``size`` (the last one may be shorter)."""
-    chunk: list[Row] = []
-    for row in rows:
-        chunk.append(row)
-        if len(chunk) >= size:
-            yield chunk
-            chunk = []
-    if chunk:
-        yield chunk

@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.storage.parquet: HF cache setup, hashing, token estimate, parquet shard I/O."""
+"""Tests for data_preparation.lib.storage.parquet: HF cache setup, the dedup key, token estimate, parquet shard I/O."""
 
-import hashlib
 import os
 from collections.abc import Iterable
 from pathlib import Path
@@ -16,9 +15,6 @@ from data_preparation.lib.storage.parquet import (
     configure_hf_cache,
     estimate_tokens,
     list_parquet_files,
-    md5_hex,
-    normalized_hash,
-    normalized_text,
     shard_index,
     text_hash64,
 )
@@ -57,18 +53,6 @@ def test_configure_hf_cache_sets_all_vars_and_creates_dir(tmp_path: Path, monkey
 # --- pure helpers ---------------------------------------------------------------------------------------------------
 
 
-def test_md5_hex_matches_hashlib() -> None:
-    assert md5_hex("hello") == hashlib.md5(b"hello").hexdigest()
-    assert md5_hex("hello") != md5_hex("hello!")
-    assert len(md5_hex("")) == 32
-
-
-def test_md5_hex_unicode_is_stable() -> None:
-    assert md5_hex("héllo wörld") == hashlib.md5("héllo wörld".encode()).hexdigest()
-    # lone surrogates (possible in scraped text) are dropped instead of raising
-    assert md5_hex("a\ud800b") == hashlib.md5(b"ab").hexdigest()
-
-
 @pytest.mark.parametrize(
     ("text", "expected"), [("", 0), ("abc", 0), ("abcd", 1), ("a" * 4000, 1000), ("a" * 4003, 1000)]
 )
@@ -91,20 +75,27 @@ def test_shard_index() -> None:
     assert shard_index(Path("data-7.parquet")) is None
 
 
-def test_text_hash64_is_the_first_64_bits_of_the_digest() -> None:
-    assert text_hash64("Hello  World") == text_hash64("hello world") == int.from_bytes(bytes.fromhex(normalized_hash("hello world")[:16]), "big", signed=True)
+@pytest.mark.parametrize(
+    ("text", "normalized", "raw"),
+    [
+        ("hello world", 6824707963431612112, 6824707963431612112),
+        ("  Hello\t World\n\nfoo ", 8471811785197293890, -4212963777905507985),
+        ("héllo wörld", -1365678327145243118, -1365678327145243118),
+        ("a\ud800b", 1765116674205471180, 1765116674205471180),  # a lone surrogate is dropped, not an error
+        ("", -3162216497309240828, -3162216497309240828),
+    ],
+)
+def test_text_hash64_pins_the_stored_keys(text: str, normalized: int, raw: int) -> None:
+    """The `hash` column of every processed shard on disk holds these values: the function must never change them."""
+    assert text_hash64(text) == normalized and text_hash64(text, normalize=False) == raw
+
+
+def test_text_hash64_normalizes_case_and_whitespace() -> None:
+    assert text_hash64("Hello  World") == text_hash64("hello world") == text_hash64("\nHELLO\tworld\n")
     assert text_hash64("Hello  World", normalize=False) != text_hash64("hello world", normalize=False)
+    assert text_hash64("hello world") != text_hash64("hello worlds")
     assert -(2**63) <= text_hash64("x") < 2**63
     pa.array([text_hash64("x")], type=pa.int64())  # fits the parquet column type
-
-
-def test_normalized_text_and_hash() -> None:
-    assert normalized_text("  Hello\t World\n\nfoo ") == "hello world foo"
-    variants = ["Hello World", "hello   world", "\nHELLO\tworld\n", " hello world "]
-    assert len({normalized_hash(v) for v in variants}) == 1
-    assert normalized_hash("hello world") == md5_hex("hello world")
-    assert normalized_hash("hello world") != normalized_hash("hello worlds")
-
 
 
 # --- parquet shard writer -------------------------------------------------------------------------------------------

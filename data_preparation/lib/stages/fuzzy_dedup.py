@@ -27,6 +27,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from data_preparation.dataset_config import DedupConfig
+from data_preparation.lib.iteration import chunks
 from data_preparation.lib.stages.row_pipeline import get_ngrams
 
 Row = dict[str, Any]
@@ -91,18 +92,6 @@ def _signatures(texts: list[str]) -> list[Signature]:
     return [_signature(text) for text in texts]
 
 
-def _chunks(rows: Iterator[Row], size: int) -> Iterator[list[Row]]:
-    """Consecutive lists of at most ``size`` rows."""
-    chunk: list[Row] = []
-    for row in rows:
-        chunk.append(row)
-        if len(chunk) >= size:
-            yield chunk
-            chunk = []
-    if chunk:
-        yield chunk
-
-
 def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[tuple[Row, Signature]]:
     """``(row, signature)`` pairs computed in this process."""
     _init_worker(dedup.num_perm, dedup.ngram)
@@ -126,7 +115,7 @@ def _signatures_in_pool(
         return zip(chunk, pending.get())
 
     with multiprocessing.get_context("spawn").Pool(pass_workers, initializer=_init_worker, initargs=(dedup.num_perm, dedup.ngram)) as pool:
-        for chunk in _chunks(rows, chunk_size):
+        for chunk in chunks(rows, chunk_size):
             texts = [row["text"] for row in chunk]
             inflight.append((chunk, pool.apply_async(_signatures, (texts,))))
             if len(inflight) >= max_inflight:
@@ -153,6 +142,7 @@ def fuzzy_dedup(
         signatures = _signatures_in_pool(rows, dedup, pass_workers, chunk_size)
 
     start = time.monotonic()
+    rows_seen = 0  # rows up to and including the last one that went through the LSH
     for index, (row, signature) in enumerate(signatures):
         if signature.size == 0:
             stats["too_short_passed"] += 1
@@ -165,5 +155,6 @@ def fuzzy_dedup(
             lsh.insert(f"doc_{index}", minhash)
             yield row
         rows_seen = index + 1
+    if rows_seen:
         stats["near_duplicate_rate"] = stats["near_duplicates_removed"] / rows_seen
         stats["seconds"] = round(time.monotonic() - start, 3)

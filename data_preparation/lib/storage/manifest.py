@@ -17,6 +17,7 @@ import contextlib
 import json
 import platform
 import subprocess
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
@@ -158,6 +159,11 @@ class Manifest:
                 raise RuntimeError(f"unreadable manifest {path} next to shards ({err}); fix it or delete the directory") from err
             log.warning("ignoring unparsable manifest %s: %s", path, err)
             return None
+
+
+def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:
+    """``[[name, rows], ...]`` of ``shards`` — the shape a processed manifest's ``input_shards`` records."""
+    return [[shard.name, shard.rows] for shard in shards]
 
 
 def has_shards(directory: Path) -> bool:

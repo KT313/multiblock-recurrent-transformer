@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import re
+from fractions import Fraction
 from collections.abc import Callable
 from dataclasses import asdict, fields
 from math import ceil
@@ -408,7 +409,7 @@ def test_a_shuffled_source_over_the_build_cap_is_refused_at_load(tmp_path: Path)
     with pytest.raises(ValueError, match=re.escape(
         "pre: shuffle=true builds all-at-once in memory; 1,578,948 rows exceed the limit of 1,000,000. "
         "Split the source or turn shuffle off. "
-        "(Read-time shuffle for large sources is planned — see reviews/design_decisions.md D4.)"
+        "(A read-time shuffle that would lift this limit is not implemented.)"
     )):
         load_dataset_config(_write(tmp_path, d))
     assert dc.SHUFFLED_BUILD_MAX_ROWS == 1_000_000
@@ -801,7 +802,7 @@ def test_hash_payload_golden_defaults() -> None:
     }  # fmt: skip
     cfg = _build(_minimal())
     assert (cfg.max_seq_length, cfg.validation_fraction, cfg.token_count, cfg.always_range_requests) == (2048, 0.05, "tokenizer", True)
-    assert dc.SAFETY_MARGIN == 1.2
+    assert isinstance(dc.SAFETY_MARGIN, Fraction) and float(dc.SAFETY_MARGIN) == 1.2
 
 
 def test_tokenizer_hash() -> None:

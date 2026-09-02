@@ -46,13 +46,12 @@ from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.build.assessment import ProcessedProblem, assess_processed_folder
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state, shard_list
-from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
+from data_preparation.lib.storage.manifest import shard_list, Manifest
 from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted, rejected_rows
 
 log = get_logger(__name__)
 
-_MARGIN = Fraction(str(SAFETY_MARGIN))  # exact arithmetic: 50 × 1.2 is 60, not 60.000000000000007
 
 # --- rows -----------------------------------------------------------------------------------------------------------
 
@@ -69,7 +68,7 @@ def rows_needed(config: DatasetConfig, name: str) -> int:
 def rows_sufficient(config: DatasetConfig, name: str) -> int:
     """Processed rows at which a source serves its budget: ``rows_needed ÷ SAFETY_MARGIN`` (= the sequence budget
     over the training share of the rows, or the ``rows`` of a validation-only source, less the download margin)."""
-    return ceil(rows_needed(config, name) / _MARGIN)
+    return ceil(rows_needed(config, name) / SAFETY_MARGIN)
 
 
 def training_rows_after_split(config: DatasetConfig, name: str, processed_rows: int) -> int:
@@ -130,7 +129,7 @@ def current_processed_manifest(config: DatasetConfig, name: str, layout: Dataset
 
 def processed_covers_raw(processed: Manifest, raw: Manifest) -> bool:
     """Whether every raw shard has been built into ``processed`` (``extra["input_shards"]`` lists them all)."""
-    return processed.extra.get("input_shards") == [[shard.name, shard.rows] for shard in raw.shards]
+    return processed.extra.get("input_shards") == shard_list(raw.shards)
 
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
@@ -374,7 +373,7 @@ class SourceLedger:
         if self.raw_rows <= 0 or self.processed_rows <= 0:
             return 0
         observed_yield = Fraction(self.processed_rows, self.raw_rows)
-        wanted = ceil((self.rows_sufficient - self.processed_rows) * _MARGIN / observed_yield)
+        wanted = ceil((self.rows_sufficient - self.processed_rows) * SAFETY_MARGIN / observed_yield)
         if wanted <= self.rows_needed:
             return wanted
         log.warning(
@@ -498,7 +497,7 @@ def _processed_state(config: DatasetConfig, name: str, layout: DatasetLayout, ra
     reported here instead of raised so ``status`` / ``prepare --dry_run`` describe the very state repair heals.
     """
     directory = layout.processed_dir(name)
-    assessment = assess_processed_folder(config, name, directory, shard_list(raw), check_files=False)
+    assessment = assess_processed_folder(config, name, directory, shard_list(raw.shards), check_files=False)
     state = _ASSESSED_STATE.get(assessment.problem)
     if state is not None:
         if assessment.problem == "unreadable_manifest":

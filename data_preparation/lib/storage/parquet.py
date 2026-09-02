@@ -14,11 +14,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.stages.row_pipeline import normalize_text
 
 log = get_logger(__name__)
 SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
 SHARD_COMPRESSION: Literal["zstd"] = "zstd"  # every shard written from now on; older snappy shards stay readable
-_WHITESPACE = re.compile(r"\s+")
 
 
 def configure_hf_cache(cache_dir: Path | None) -> None:
@@ -35,26 +35,13 @@ def configure_hf_cache(cache_dir: Path | None) -> None:
 # --- text hashing / token estimate ----------------------------------------------------------------------------------
 
 
-def md5_hex(text: str) -> str:
-    """MD5 hex digest of ``text`` (used for exact deduplication)."""
-    return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def normalized_text(text: str) -> str:
-    """Lower-cased text with runs of whitespace collapsed to one space and stripped (exact-dedup key)."""
-    return _WHITESPACE.sub(" ", text.lower()).strip()
-
-
-def normalized_hash(text: str) -> str:
-    """MD5 of :func:`normalized_text` — the key of the normalized exact deduplication pass."""
-    return md5_hex(normalized_text(text))
-
-
 def text_hash64(text: str, normalize: bool = True) -> int:
-    """The exact-dedup key of ``text`` as a signed 64-bit integer (the first 64 bits of :func:`normalized_hash` with
-    ``normalize``, else of :func:`md5_hex`); stored as the int64 ``hash`` column of processed shards."""
-    digest = normalized_hash(text) if normalize else md5_hex(text)
-    return int.from_bytes(bytes.fromhex(digest[:16]), "big", signed=True)
+    """The exact-dedup key of ``text``: the first 64 bits of its MD5 (lone surrogates dropped) as a signed integer, the
+    int64 ``hash`` column of processed shards. ``normalize`` hashes the lower-cased text with whitespace runs collapsed
+    (:func:`normalize_text`), so casing and spacing variants of one document share the key."""
+    if normalize:
+        text = normalize_text(text)
+    return int.from_bytes(hashlib.md5(text.encode("utf-8", "ignore")).digest()[:8], "big", signed=True)
 
 
 def estimate_tokens(text: str) -> int:

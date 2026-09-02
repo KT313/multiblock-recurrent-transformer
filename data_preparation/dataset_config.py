@@ -46,7 +46,7 @@ DEFAULT_BENCHMARKS = [
     "mmlu_test",
     "winogrande_test",
 ]
-SAFETY_MARGIN = 1.2  # rows downloaded = sequence budget × this (covers what the length filter / dedup drop; planner)
+SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (covers what the length filter / dedup drop); a Fraction so 50 × 1.2 is exactly 60
 
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
 # derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
@@ -443,7 +443,7 @@ class DatasetConfig:
                 raise ValueError(
                     f"{name}: shuffle=true builds all-at-once in memory; {needed:,} rows exceed the limit of "
                     f"{SHUFFLED_BUILD_MAX_ROWS:,}. Split the source or turn shuffle off. "
-                    "(Read-time shuffle for large sources is planned — see reviews/design_decisions.md D4.)"
+                    "(A read-time shuffle that would lift this limit is not implemented.)"
                 )
 
     # --- source usage ----------------------------------------------------------------------------------------------
@@ -515,7 +515,7 @@ class DatasetConfig:
         if not self.used_in_train(source_name):
             return int(source.rows or 0)
         held_out = Fraction(str(self.validation_fraction_of(source_name)))
-        return ceil(self.sequence_budget(source_name) * Fraction(str(SAFETY_MARGIN)) / (1 - held_out))
+        return ceil(self.sequence_budget(source_name) * SAFETY_MARGIN / (1 - held_out))
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 

@@ -48,7 +48,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ShardList, assess_processed_folder
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
-from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
+from data_preparation.lib.storage.manifest import shard_list, Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.raw_folder import RawFolder
 
 log = get_logger(__name__)
@@ -187,7 +187,7 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
         return None
     good, problem = _good_prefix_length(folder, manifest)
     if problem is None:
-        return _shard_list(manifest)
+        return shard_list(manifest.shards)
     kept = manifest.shards[:good]
     if good == 0 or kept[-1].offset is None:
         _plan(report, name, folder, "raw", "delete", f"broken: {problem}")
@@ -198,7 +198,7 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
     if healthy > 0:
         reason += f" — {healthy} healthy shard(s) after the broken one are discarded and re-downloaded next run"
     _plan(report, name, folder, "raw", "truncate", reason, needs_confirmation=healthy > 0)
-    return [[shard.name, shard.rows] for shard in kept]
+    return shard_list(kept)
 
 
 def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
@@ -241,10 +241,6 @@ def _good_prefix_length(folder: Path, manifest: Manifest) -> tuple[int, str | No
         if problem is not None:
             return index, problem
     return len(manifest.shards), None
-
-
-def _shard_list(manifest: Manifest) -> ShardList:
-    return [[shard.name, shard.rows] for shard in manifest.shards]
 
 
 def _plan(report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *, needs_confirmation: bool = False) -> None:

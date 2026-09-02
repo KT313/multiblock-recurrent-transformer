@@ -32,7 +32,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources.converters import get_converter, get_filter
+from data_preparation.lib.sources.converters import get_converter, get_filter, text_or_empty
 from data_preparation.lib.sources.hub_files import FetchStats
 from data_preparation.lib.sources.loaders import (
     MAX_CACHED_FILE_KEY,
@@ -146,11 +146,6 @@ def new_manifest(
         truncated_at_tokens=truncated_at_tokens,
         versions=library_versions(),
     )
-
-
-def shard_list(manifest: Manifest) -> list[list[Any]]:
-    """``[[name, rows], ...]`` — the JSON-friendly identity of a manifest's shards (stored as ``extra["input_shards"]``)."""
-    return [[s.name, s.rows] for s in manifest.shards]
 
 
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
@@ -402,7 +397,7 @@ class _TokenStep:
         return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
 
     def _truncate_pretrain_rows(self, batch: list[Row]) -> list[Row]:
-        texts = [_text_or_empty(row.get(self._text_field)) for row in batch]
+        texts = [text_or_empty(row.get(self._text_field)) for row in batch]
         for row, text, (cut, tokens) in zip(batch, texts, self._counter.truncate_many(texts, self._max_tokens), strict=True):
             if cut != text:
                 row[self._text_field] = cut
@@ -420,10 +415,6 @@ class _TokenStep:
             row[ROW_PROGRESS_KEY] = progress._replace(dropped_too_long=self._counters.dropped_too_long)
             stored.append(row)
         return stored
-
-
-def _text_or_empty(value: object) -> str:
-    return "" if value is None else str(value)
 
 
 def _fetch_rows(
