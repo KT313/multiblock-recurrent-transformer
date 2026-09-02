@@ -34,6 +34,7 @@ data = [
 dev = [
   "pytest",
   "pytest-timeout",
+  "pytest-xdist",
   "ruff",
   "mypy",
   "basedpyright",
@@ -47,13 +48,13 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
+addopts = "-q -n 4 --dist loadgroup"  # four workers: each imports torch and builds its own tiny dataset; -n 0 runs serially
 testpaths = ["model", "training", "data_preparation"]
 pythonpath = ["."]
 markers = [
   "gpu: needs a CUDA device (skipped otherwise)",
   "slow: takes more than ~10 s",
 ]
-addopts = "-q"
 timeout = 600
 # pytest's default list contains "build", which would silently skip data_preparation/lib/build/test_*.py
 norecursedirs = [".*", "*.egg", "dist", "node_modules", "venv", ".venv", "dataset", "outputs"]

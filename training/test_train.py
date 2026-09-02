@@ -330,11 +330,12 @@ def _assert_clean_terminal(text: str, width: int) -> str:
 
 
 @pytest.mark.slow
-def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(tiny_dataset_dir: Path, tmp_path: Path) -> None:
+def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(tiny_dataset_dir: Path, short_tmp_path: Path) -> None:
     """The whole CLI with the live dashboard: exit 0, the checkpoints and `train.log` written; the screen afterwards
     shows the kept header lines and the final line once, the dashboard's static summary once (every stage ticked)
-    and then the report's summary, and nothing of the live frame."""
-    out_dir = tmp_path / "out"
+    and then the report's summary, and nothing of the live frame. (`short_tmp_path`: the 140-column screen must show
+    the checkpoint path unabridged in the events panel and the summary line.)"""
+    out_dir = short_tmp_path / "out"
     code, text = _run_cli_in_pty(_tiny_cli_arguments(tiny_dataset_dir, out_dir), width=140, height=45)
     assert code == 0, text[-3000:]
     shown = _assert_clean_terminal(text, 140)

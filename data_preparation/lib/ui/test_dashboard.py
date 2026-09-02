@@ -262,15 +262,17 @@ def test_updates_from_threads(dashboard: Dashboard) -> None:
     assert dashboard.render_text().count("200/200") == 4
 
 
-def test_header_shows_title_status_and_footer_the_log_file(tmp_path: Path) -> None:
+def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path) -> None:
+    """(`short_tmp_path`: the footer shows the log file's path unabridged at width 120.)"""
     console = Console(file=io.StringIO(), force_terminal=True, width=120)
     logger = logging.getLogger("data_preparation.test_dashboard_header")
-    with Dashboard(title="prepare tiny", enabled=True, console=console) as board, board.attach(logger, log_file=tmp_path / "build.log"):
+    log_file = short_tmp_path / "build.log"
+    with Dashboard(title="prepare tiny", enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
         set_status(round="1/5", step="download")
         board.set_status(step="build")
         first_line, *rest = board.render_text().splitlines()
         assert first_line.startswith("prepare tiny · round 1/5 · step build · 0:00:0")
-        assert rest[-1].startswith(f"log: {tmp_path / 'build.log'} · Ctrl-C stops at the next shard")
+        assert rest[-1].startswith(f"log: {log_file} · Ctrl-C stops at the next shard")
 
 
 def test_short_terminal_shrinks_the_log_panel_not_the_task_rows() -> None:
@@ -660,8 +662,9 @@ def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0,
 
 
 @pytest.mark.slow
-def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_table(tmp_path: Path) -> None:
-    dataset_dir = tmp_path / "dataset"
+def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_table(short_tmp_path: Path) -> None:
+    """(`short_tmp_path`: the final `done: <dataset dir>` line must fit one 140-column screen line.)"""
+    dataset_dir = short_tmp_path / "dataset"
     code, raw = _run_in_pty(_PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.03), width=140, height=45)
     text = raw.decode("utf-8", "replace")
     assert code == 0, text[-3000:]
