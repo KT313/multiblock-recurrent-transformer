@@ -48,10 +48,12 @@ stages:                     # the curriculum; weights per stage are > 0 and sum 
 Two source kinds: `pretrain` (one text column, `text_field`) and `instruct` (`instruction / input / output`, from a
 `fields` mapping or a `converter`). Both go through the same download and build steps; the kind only decides the
 row shape, the filters that apply and how training formats a row. Stage keys are source names, in `train` and in
-`val` alike; how a source is used decides its split at training time (below). Loading fails on unknown keys
-(removed ones — `instruct_mixtures`, `validation_tokens`, `max_chars`, `max_tokens`, `tokens_per_row_estimate` —
-get a hint saying what replaced them), weights that are zero or do not sum to 1, a source used by no stage, a
-source used only in `val` without `rows`, a training source with `rows`, and so on.
+`val` alike; how a source is used decides its split at training time (below). Loading fails on unknown keys,
+weights that are zero or do not sum to 1, a source used by no stage, a source used only in `val` without `rows`, a
+training source with `rows`, and so on. The keys of the earlier schema — `instruct_mixtures`, `validation_tokens`,
+`max_chars`, `max_tokens`, `tokens_per_row_estimate`, `<source>/validation` stage keys — are simply unknown now:
+mixing and the validation split are the training dataloader's job, rows are truncated to `max_seq_length` tokens at
+download, and the planner counts sequences.
 
 The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
 generated from it), `config/datasets/crow_300m_mini.yaml` (the same sources with tiny budgets: a real-source smoke

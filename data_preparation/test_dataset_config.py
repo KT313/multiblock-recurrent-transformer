@@ -163,18 +163,14 @@ def test_load_from_written_yaml(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda d: d.update({"instruct_mixtures": {"mix": {"sources": {"ins": 1.0}}}}), r"instruct_mixtures.*\n.*`instruct_mixtures` was removed: mixing"),
-        (lambda d: d["sources"]["pre"].update({"validation_tokens": 5}), r"validation_tokens.*\n?.*was removed"),
-        (lambda d: d.update({"processing": {"max_chars": 5}}), r"max_chars.*\n?.*was removed"),
-        (lambda d: d["sources"]["pre"].update({"tokens_per_row_estimate": 5}), r"tokens_per_row_estimate.*\n?.*describe_tokens_per_row"),
         (lambda d: d["sources"]["hold"].update({"kind": "validation"}), r"Literal\['pretrain', 'instruct'\]"),
         (lambda d: d.pop("block_size"), r"required: block_size"),
         (lambda d: d.update({"bogus": 1}), r"d\.yaml: Option 'bogus' is not accepted$"),
     ],
 )
-def test_unknown_or_removed_keys_fail_loading_with_a_clear_error(tmp_path: Path, mutate: Mutation, match: str) -> None:
-    """Removed keys must not be silently ignored: loading raises a ValueError naming the file and the key (plus a
-    hint for the keys of the old schema), never jsonargparse's usage dump + `sys.exit(2)`."""
+def test_unknown_keys_fail_loading_with_a_clear_error(tmp_path: Path, mutate: Mutation, match: str) -> None:
+    """Unknown keys must not be silently ignored: loading raises a ValueError naming the file and the key, never
+    jsonargparse's usage dump + `sys.exit(2)`."""
     d = _minimal()
     mutate(d)
     with pytest.raises(ValueError, match=match):
@@ -196,8 +192,7 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0]["val"].update({"hold": 0.0, "pre": 1.0}), "weights must be > 0"),
         (lambda d: d["stages"][0]["train"].update({"pre": 2.0, "ins": -1.0}), "weights must be > 0"),
         (lambda d: d["stages"][0]["train"].update({"pre": 0.5, "nope": 0.5}), "unknown source 'nope'"),
-        (lambda d: d["stages"][0].update({"val": {"pre/validation": 0.5, "hold": 0.5}}), "plain source names"),
-        (lambda d: d["stages"][0]["train"].update({"pre": 0.5, "pre/train": 0.5}), "plain source names"),
+        (lambda d: d["stages"][0].update({"val": {"pre/validation": 0.5, "hold": 0.5}}), "unknown source 'pre/validation'"),
         (lambda d: d.update({"block_size": 0}), "block_size must be positive"),
         (lambda d: d.update({"block_size": 4096}), r"block_size \(4096\) must be <= max_seq_length \(2048\)"),
         (lambda d: d.update({"max_seq_length": 0}), "max_seq_length"),

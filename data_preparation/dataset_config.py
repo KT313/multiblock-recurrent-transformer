@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from fractions import Fraction
 from math import ceil
@@ -51,16 +50,6 @@ SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (co
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
 # derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
 # (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
-
-# Top-level / source keys of the pre-restructure schema, with the hint shown when a YAML still uses them.
-REMOVED_KEYS: dict[str, str] = {
-    "instruct_mixtures": "mixing is the training dataloader's job: list the instruct sources with weights in the stage",
-    "validation_tokens": "the validation split is made at training time (`validation_fraction`)",
-    "max_chars": "rows are truncated to `max_seq_length` tokens when downloaded",
-    "max_tokens": "rows longer than `max_seq_length` tokens are dropped when downloaded",
-    "tokens_per_row_estimate": "the planner counts sequences; `describe_tokens_per_row` feeds only the describe table",
-}
-
 
 # --- hash annotations --------------------------------------------------------------------------------------------------
 #
@@ -391,11 +380,6 @@ class DatasetConfig:
 
     def _check_stage_key(self, stage_name: str, key: str) -> None:
         """A stage key is the plain name of a declared source."""
-        if "/" in key:
-            raise ValueError(
-                f"stage {stage_name}: {key!r}: stage keys are plain source names (`<source>/validation` and mixture "
-                "keys no longer exist; a source in both train and val is split by `validation_fraction`)"
-            )
         if key not in self.sources:
             raise ValueError(f"stage {stage_name}: unknown source {key!r}")
 
@@ -724,8 +708,8 @@ def _hashable(value: Any, hash_name: HashName) -> Any:
 def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None) -> DatasetConfig:
     """Load a dataset config YAML; `overrides` are jsonargparse `--key value` strings (nested keys with dots).
 
-    An unknown key (for instance one of `REMOVED_KEYS`) raises a `ValueError` naming the file and the key instead
-    of jsonargparse's usage dump and `sys.exit(2)`.
+    An unknown key raises a `ValueError` naming the file and the key (`<path>: <jsonargparse message>`) instead of
+    jsonargparse's usage dump and `sys.exit(2)`.
     """
     parser = ArgumentParser(description="Dataset config", exit_on_error=False)
     parser.add_class_arguments(DatasetConfig, nested_key=None)
@@ -734,12 +718,5 @@ def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None)
         if overrides:
             namespace = parser.parse_args(overrides, namespace=namespace)
     except ArgumentError as error:
-        raise ValueError(_load_error_message(path, str(error))) from error
+        raise ValueError(f"dataset config {Path(path).as_posix()}: {str(error).strip()}") from error
     return DatasetConfig(**parser.instantiate(namespace).as_dict())
-
-
-def _load_error_message(path: str | Path, error: str) -> str:
-    """`<path>: <jsonargparse message>`, plus the hint of every removed key the message mentions."""
-    message = f"dataset config {Path(path).as_posix()}: {error.strip()}"
-    hints = [f"`{key}` was removed: {hint}" for key, hint in REMOVED_KEYS.items() if re.search(rf"\b{key}\b", error)]
-    return message if not hints else message + "\n" + "\n".join(hints)
