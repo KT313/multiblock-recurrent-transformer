@@ -120,7 +120,7 @@ class RunDataloaders:
         """Next worker batch of ``source``'s loader; restarts the loader when its epoch is over.
 
         The restart can never spin on an empty range: setup guarantees at least one training row per source
-        (`check_entries_on_disk` in the resolver). Numerics: the iterator is created lazily at the first pull (and
+        (`check_entry_rows` in the resolver). Numerics: the iterator is created lazily at the first pull (and
         anew on every restart), and each `iter(DataLoader)` draws one base seed from the global torch RNG.
         """
         iterator = self._train_iterators[source]

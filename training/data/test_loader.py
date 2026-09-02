@@ -258,7 +258,7 @@ def _first(batch: WorkerBatch) -> int:
 
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
     """A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
-    `check_entries_on_disk` guarantees at least one training row per source)."""
+    `check_entry_rows` guarantees at least one training row per source)."""
     rd = RunDataloaders(["a", "b"], [_tagged("a", 3), _tagged("b", 2)], [], tokenizer)
     assert [_first(rd.next_train_batch("a")) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
     assert [s[2] for s in rd.next_train_batch("b").samples] == ["b"]
