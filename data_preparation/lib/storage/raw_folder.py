@@ -12,8 +12,8 @@ row twice).
 The append side is resumable at shard granularity: every published shard is recorded with the loader offset **and**
 the reject totals as of its last stored row (:class:`RowProgress`, carried on the row itself under
 :data:`ROW_PROGRESS_KEY` and stored in :class:`~data_preparation.lib.storage.manifest.ShardInfo`), so a stop, a
-failure or a truncation to the good prefix all leave a manifest a resume can continue from without counting any
-rejected row twice. Manifests written before those per-shard fields existed still load: a truncation then resets the
+failure or a truncation to the good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`) all leave a
+manifest a resume can continue from without counting any rejected row twice. Manifests written before those per-shard fields existed still load: a truncation then resets the
 counters to 0 and says so in the log (the folder stays usable and is never treated as stale).
 """
 
@@ -42,6 +42,15 @@ class RowProgress(NamedTuple):
     consumed: int
     skipped_malformed: int
     dropped_too_long: int
+
+
+def good_prefix_length(directory: Path, manifest: Manifest) -> tuple[int, str | None]:
+    """How many leading shards of ``manifest`` verify against ``directory``, and the first problem (None if all do)."""
+    for index, shard in enumerate(manifest.shards):
+        problem = shard_problem(directory, shard)
+        if problem is not None:
+            return index, problem
+    return len(manifest.shards), None
 
 
 # --- the folder ---------------------------------------------------------------------------------------------------------
@@ -167,22 +176,17 @@ class RawFolder:
 
     # --- repair --------------------------------------------------------------------------------------------------
 
-    def truncate_to_good_prefix(self) -> bool:
-        """Repair a raw directory with a missing / unreadable / mismatching shard by dropping that shard and
-        everything after it: the manifest keeps the good prefix, the offset **and every reject counter** become what
-        the last kept shard recorded (so the next download resumes there and counts nothing twice) and the exhaustion
-        flag is cleared. Returns False — nothing changed — when no prefix can be kept (the first shard is bad, or a
-        kept shard has no recorded offset).
+    def truncate_to(self, good_shards: int) -> None:
+        """Keep the first ``good_shards`` shards (the good prefix :func:`good_prefix_length` found) and drop the rest:
+        the manifest keeps the prefix, the offset **and every reject counter** become what the last kept shard
+        recorded (so the next download resumes there and counts nothing twice) and the exhaustion flag is cleared.
+        The prefix must hold at least one shard with a recorded offset — the repair step plans a deletion otherwise.
         """
-        good = 0
-        for shard in self.manifest.shards:
-            if shard_problem(self.directory, shard) is not None:
-                break
-            good += 1
-        if good == len(self.manifest.shards):
-            return True  # nothing wrong
-        if good == 0 or self.manifest.shards[good - 1].offset is None:
-            return False
+        good = good_shards
+        if good >= len(self.manifest.shards):
+            return  # nothing to drop
+        if good < 1 or self.manifest.shards[good - 1].offset is None:
+            raise ValueError(f"{self.name}: cannot truncate {self.directory} to {good} shard(s): no resume point")
         dropped = self.manifest.shards[good:]
         log.warning("%s: dropping %d shard(s) from %s (%s and after)", self.name, len(dropped), self.directory, dropped[0].name)
         kept = self.manifest.shards[good - 1]
@@ -197,7 +201,6 @@ class RawFolder:
                 path.unlink()
         self.save()
         self._reset_increment()
-        return True
 
     def _restore_reject_counters(self, kept: ShardInfo) -> None:
         """The reject totals as of ``kept``'s last row. A shard written before those fields existed carries none:

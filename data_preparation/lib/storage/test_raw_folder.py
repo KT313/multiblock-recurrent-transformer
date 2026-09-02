@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from data_preparation.conftest import truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.parquet import ShardWriter
@@ -129,10 +130,10 @@ def test_truncate_to_good_prefix_restores_offset_and_every_counter(tmp_path: Pat
     for index, (offset, skipped, dropped) in enumerate(((10, 3, 2), (20, 6, 4), (30, 9, 6))):
         manifest.add_shard(f"data-{index:05d}.parquet", 2, 2, offset=offset, skipped_malformed=skipped, dropped_too_long=dropped)
     folder = RawFolder(tmp_path, manifest)
-    assert folder.truncate_to_good_prefix(), "nothing broken yet"
+    assert truncate_to_good_prefix(folder), "nothing broken yet"
 
     (tmp_path / "data-00001.parquet").write_bytes(b"corrupt")
-    assert folder.truncate_to_good_prefix()
+    assert truncate_to_good_prefix(folder)
     assert [s.name for s in manifest.shards] == ["data-00000.parquet"]
     assert manifest.rows_fetched == 10 and (manifest.skipped_malformed, manifest.dropped_too_long) == (3, 2)
     assert not manifest.exhausted and manifest.check_limit_reached is None
@@ -148,7 +149,7 @@ def test_truncate_to_good_prefix_of_a_manifest_without_counters_resets_them(tmp_
     manifest.add_shard("data-00001.parquet", 2, 2, offset=20)
     (tmp_path / "data-00001.parquet").write_bytes(b"corrupt")
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        assert RawFolder(tmp_path, manifest).truncate_to_good_prefix()
+        assert truncate_to_good_prefix(RawFolder(tmp_path, manifest))
     assert manifest.rows_fetched == 10 and (manifest.skipped_malformed, manifest.dropped_too_long) == (0, 0)
     assert "written before the per-shard reject counters existed" in caplog.text
 
@@ -159,8 +160,8 @@ def test_truncate_to_good_prefix_without_a_resume_point(tmp_path: Path) -> None:
     manifest.add_shard("data-00000.parquet", 2, 2, offset=10)
     manifest.add_shard("data-00001.parquet", 2, 2, offset=20)  # file never written
     manifest.shards[0].offset = None  # a legacy manifest without offsets
-    assert not RawFolder(tmp_path, manifest).truncate_to_good_prefix()
+    assert not truncate_to_good_prefix(RawFolder(tmp_path, manifest))
     (tmp_path / "data-00000.parquet").write_bytes(b"corrupt")
     manifest.shards[0].offset = 10
-    assert not RawFolder(tmp_path, manifest).truncate_to_good_prefix(), "the first shard is bad: nothing to keep"
+    assert not truncate_to_good_prefix(RawFolder(tmp_path, manifest)), "the first shard is bad: nothing to keep"
     assert len(manifest.shards) == 2 and manifest.rows_fetched == 20, "nothing changed"

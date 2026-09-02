@@ -151,7 +151,7 @@ def test_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca
 
 
 def test_unconfirmed_raw_deletion_exits_two_with_the_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    action = RepairAction("fineweb", tmp_path / "raw", "raw", "would_delete", "outdated: max_seq_length 2048 -> 4096")
+    action = RepairAction("fineweb", tmp_path / "raw", "raw", "delete", "outdated: max_seq_length 2048 -> 4096")
     message = "The following raw folders will be deleted and downloaded again:\n  fineweb: outdated: max_seq_length 2048 -> 4096\nContinue? [y/N] "
 
     def refused(*args: object, **kwargs: object) -> None:

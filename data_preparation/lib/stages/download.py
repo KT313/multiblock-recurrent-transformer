@@ -25,7 +25,7 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
@@ -119,7 +119,7 @@ def _auto_tokenizer() -> Any:
 def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest | None:
     """The stored manifest if it matches ``source_hash`` and ``stage``; None (with a warning) if stale or absent.
     For derived folders (``processed/``, tokenizers) that the caller rebuilds; raw folders go through
-    :func:`current_raw_manifest`, which never treats a stale folder as absent."""
+    :func:`inspect_raw`, which never treats a stale folder as absent."""
     manifest = Manifest.load(directory)
     if manifest is None:
         return None
@@ -163,46 +163,38 @@ def text_row(source: SourceConfig, row: Row, name: str) -> Row:
 RawManifestState = Literal["missing", "current", "stale", "outdated"]
 
 
-def raw_manifest_state(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawManifestState:
-    """The state of ``sources/<name>/raw`` against ``config``: ``missing`` (no manifest — the folder may still hold
-    shards, which :func:`download` refuses to start over), ``stale`` (the manifest's hash differs from
-    ``config.raw_hash(name)``: loader identity, ``token_count`` or tokenizer changed), ``outdated``
-    (``config.max_seq_length`` was raised above the cap the rows were truncated / dropped at) or ``current``."""
-    return _inspect_raw(config, name, layout)[0]
+class RawInspection(NamedTuple):
+    """The state of ``sources/<name>/raw`` against the config, its manifest (None when missing) and the reason line
+    the download's refusal, the repair step's plan and the status table all phrase from."""
+
+    state: RawManifestState
+    manifest: Manifest | None
+    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: max_seq_length 2048 -> 4096"
+
+    @property
+    def current_manifest(self) -> Manifest | None:
+        """The manifest when the folder is current (the download appends to it, the build reads it), else None."""
+        return self.manifest if self.state == "current" else None
 
 
-def raw_manifest_problem(config: DatasetConfig, name: str, layout: DatasetLayout) -> str | None:
-    """Why the raw folder of ``name`` must be deleted and downloaded again (``"stale: identity/tokenizer changed"``
-    or ``"outdated: max_seq_length 2048 -> 4096"``), None when it is missing or current. The repair step lists these
-    before asking for confirmation."""
-    state, manifest = _inspect_raw(config, name, layout)
-    if state == "stale":
-        return "stale: identity/tokenizer changed"
-    if state == "outdated" and manifest is not None:
-        return f"outdated: max_seq_length {manifest.truncated_at_tokens} -> {config.max_seq_length}"
-    return None
-
-
-def current_raw_manifest(config: DatasetConfig, name: str, layout: DatasetLayout) -> Manifest | None:
-    """The raw manifest of ``name`` when it is current (see :func:`raw_manifest_state`), else None."""
-    state, manifest = _inspect_raw(config, name, layout)
-    return manifest if state == "current" else None
-
-
-def _inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> tuple[RawManifestState, Manifest | None]:
+def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawInspection:
+    """``missing`` (no manifest — the folder may still hold shards, which :func:`download` refuses to start over),
+    ``stale`` (the manifest's hash differs from ``config.raw_hash(name)``: loader identity, ``token_count`` or
+    tokenizer changed, or it is another stage's manifest), ``outdated`` (``config.max_seq_length`` was raised above
+    the cap the rows were truncated / dropped at) or ``current``."""
     manifest = Manifest.load(layout.raw_dir(name))
     if manifest is None:
-        return "missing", None
+        return RawInspection("missing", None, "missing")
     if manifest.stage != "raw" or not manifest.is_current(config.raw_hash(name)):
-        return "stale", manifest
+        return RawInspection("stale", manifest, "stale: source identity or tokenizer changed")
     if manifest.is_outdated(config.max_seq_length):
-        return "outdated", manifest
-    return "current", manifest
+        return RawInspection("outdated", manifest, f"outdated: max_seq_length {manifest.truncated_at_tokens} -> {config.max_seq_length}")
+    return RawInspection("current", manifest, "current")
 
 
 class RawFolderError(RuntimeError):
     """A raw folder that :func:`download` may not append to (stale or outdated; ``problem`` is the
-    :func:`raw_manifest_problem` string). The download never deletes raw data; the repair step does, after the user
+    :func:`inspect_raw` reason). The download never deletes raw data; the repair step does, after the user
     confirmed (``lib/build/repair.py``)."""
 
     def __init__(self, name: str, directory: Path, problem: str) -> None:
@@ -272,7 +264,7 @@ def download(
 ) -> Manifest:
     """Append raw shards until ``rows_needed`` rows are on disk (no-op if they already are).
 
-    The folder's manifest must be current (:func:`raw_manifest_state`): a stale or outdated one raises
+    The folder's manifest must be current (:func:`inspect_raw`): a stale or outdated one raises
     :class:`RawFolderError` — nothing is deleted here —, a missing one starts the folder from shard 0 (refused when
     shards without a manifest are present). ``manifest.rows_fetched`` is the loader offset reached (source rows
     consumed); for pretrain sources every row is kept (converter applied, ``text_field`` guaranteed, the text
@@ -348,10 +340,10 @@ def _raw_folder_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLayou
     (:class:`RawFolderError`) — deleting it is the repair step's decision — or holds shards without any manifest:
     nothing would say where those rows came from, and starting over would delete them."""
     out = layout.raw_dir(name)
-    state, manifest = _inspect_raw(cfg, name, layout)
-    if manifest is not None and state != "current":
-        problem = raw_manifest_problem(cfg, name, layout)
-        raise RawFolderError(name, out, problem or state)
+    inspection = inspect_raw(cfg, name, layout)
+    if inspection.manifest is not None and inspection.state != "current":
+        raise RawFolderError(name, out, inspection.reason)
+    manifest = inspection.manifest
     if manifest is None:
         if has_shards(out):
             raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")

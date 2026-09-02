@@ -172,7 +172,7 @@ def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_facto
 
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
     would_rebuild = {action.source for action in report.actions}
-    assert all(action.kind == "processed" and action.action == "would_delete" for action in report.actions)
+    assert not report.performed and all(action.kind == "processed" and action.action == "delete" for action in report.actions)
     for name in names:
         assessment = assess_processed_folder(cfg, name, layout.processed_dir(name), _raw_shards(layout, name))
         assert (assessment.repair == "rebuild") == (name in would_rebuild), name

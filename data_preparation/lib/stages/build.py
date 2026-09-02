@@ -71,7 +71,7 @@ from data_preparation.lib.stages.row_pipeline import (
 from data_preparation.lib.stages.download import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
-    current_raw_manifest,
+    inspect_raw,
     new_manifest,
 )
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
@@ -104,7 +104,7 @@ def build_source(
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
     raw_dir, processed_dir = layout.raw_dir(name), layout.processed_dir(name)
-    raw = current_raw_manifest(config, name, layout)
+    raw = inspect_raw(config, name, layout).current_manifest
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")

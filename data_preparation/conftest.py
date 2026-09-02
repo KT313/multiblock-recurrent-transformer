@@ -32,6 +32,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import file_format
 from data_preparation.lib.stages.download import prepare_tokenizer
+from data_preparation.lib.storage.raw_folder import RawFolder, good_prefix_length
 
 # Must happen before `datasets` is imported anywhere (its config reads the env at import time).
 _CACHE = tempfile.mkdtemp(prefix="hf_datasets_cache_")
@@ -263,6 +264,18 @@ def read_rows() -> Callable[[Path], list[Row]]:
         return rows
 
     return read
+
+
+def truncate_to_good_prefix(folder: RawFolder) -> bool:
+    """The repair step's truncation as one call: True when the folder verifies (nothing dropped) or was truncated
+    to its good prefix, False when no prefix can be kept (the first shard is bad, or the kept shard has no offset)."""
+    good, problem = good_prefix_length(folder.directory, folder.manifest)
+    if problem is None:
+        return True
+    if good == 0 or folder.manifest.shards[good - 1].offset is None:
+        return False
+    folder.truncate_to(good)
+    return True
 
 
 @pytest.fixture

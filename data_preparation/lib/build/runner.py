@@ -461,9 +461,9 @@ def warn_about_overlaps(config: DatasetConfig) -> None:
 
 
 def outstanding_repairs(report: RepairReport) -> list[RepairAction]:
-    """The actions of a repair pass that were planned but not carried out — everything of a dry run (``would_*``),
-    nothing of a pass that performed them. They are what still stands between the tree and a complete dataset."""
-    return [action for action in report.actions if action.action.startswith("would_")]
+    """The actions of a repair pass that were planned but not carried out — everything of a dry run, nothing of a
+    pass that performed them. They are what still stands between the tree and a complete dataset."""
+    return [] if report.performed else list(report.actions)
 
 
 def log_repair(report: RepairReport) -> None:

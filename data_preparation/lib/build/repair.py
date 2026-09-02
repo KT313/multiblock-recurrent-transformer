@@ -7,9 +7,9 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
 * **raw** (downloaded, expensive): a *stale* folder (its manifest hash differs from :meth:`DatasetConfig.raw_hash`,
   so the source identity or the tokenizer changed) or an *outdated* one (stored with a smaller ``max_seq_length``
   than the config asks for now) is **deleted and downloaded again — after the user confirmed**. A folder with a
-  *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix with
-  :meth:`RawFolder.truncate_to_good_prefix` (the next download resumes there, with the offset and the reject
-  counters the last kept shard recorded) — unconfirmed when only the broken shard itself is dropped, but when
+  *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
+  (:func:`good_prefix_length` at inspection, :meth:`RawFolder.truncate_to` when performed; the next download resumes
+  there, with the offset and the reject counters the last kept shard recorded) — unconfirmed when only the broken shard itself is dropped, but when
   healthy shards after the broken one would be discarded too, the truncation joins the same one confirmation as
   the deletions (they are downloaded rows lost for a repair, re-downloaded next run); when no prefix can be kept
   the folder is queued for the confirmed deletion. Shards without a manifest are an error: nothing says where
@@ -28,9 +28,9 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
 
 Nothing is touched until every folder was inspected; the queued raw deletions and healthy-shard-dropping
 truncations are then confirmed **once** with one list, and only then is anything deleted or truncated.
-``dry_run=True`` (``prepare.py status``) records what would be done and touches nothing. A refused or impossible
-confirmation raises :class:`ConfirmationRequired` with the same list and **nothing** is changed — not even the
-unconfirmed repairs; ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never
+``dry_run=True`` (``prepare.py status``) records what would be done and touches nothing (the report's ``performed``
+stays False). A refused or impossible confirmation raises :class:`ConfirmationRequired` with the same list and
+**nothing** is changed — not even the unconfirmed repairs; ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never
 deletes or truncates raw.
 """
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -48,13 +48,14 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ShardList, assess_processed_folder
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
-from data_preparation.lib.storage.manifest import shard_list, Manifest, has_shards, shard_problem
-from data_preparation.lib.storage.raw_folder import RawFolder
+from data_preparation.lib.storage.manifest import shard_list, Manifest, has_shards
+from data_preparation.lib.stages.download import inspect_raw
+from data_preparation.lib.storage.raw_folder import RawFolder, good_prefix_length
 
 log = get_logger(__name__)
 
 FolderKind = Literal["raw", "processed"]
-RepairVerb = Literal["delete", "truncate", "swap", "would_delete", "would_truncate", "would_swap"]
+RepairVerb = Literal["delete", "truncate", "swap"]
 Confirm = Callable[[str], bool]
 
 CONFIRMATION_HEADER = "The following raw folders will be deleted or truncated, the dropped rows downloaded again:"
@@ -81,7 +82,8 @@ class ConfirmationRequired(RepairError):
 
 @dataclass(frozen=True)
 class RepairAction:
-    """One thing the repair step did (``delete`` / ``truncate`` / ``swap``) or would do (``would_*``) to one folder."""
+    """One thing the repair step does (``delete`` / ``truncate`` / ``swap``) to one folder; whether it was done is the
+    report's :attr:`RepairReport.performed`."""
 
     source: str
     folder: Path
@@ -89,46 +91,31 @@ class RepairAction:
     action: RepairVerb
     reason: str
     needs_confirmation: bool = False  # a truncation dropping healthy shards after the broken one; deletions of raw always ask
+    keep_shards: int | None = None  # truncations: the good prefix the inspection found (`good_prefix_length`)
 
     def describe(self) -> str:
-        verb = self.action.replace("_", " ")
-        return f"{verb} {self.kind} {self.folder} ({self.source}): {self.reason}"
+        return f"{self.action} {self.kind} {self.folder} ({self.source}): {self.reason}"
 
 
 @dataclass
 class RepairReport:
-    """Every action of one repair pass, in inspection order (raw before processed, source by source)."""
+    """Every action of one repair pass, in inspection order (raw before processed, source by source), and whether
+    they were carried out (``performed``; False for a dry run and for the report a refused confirmation carries)."""
 
     actions: list[RepairAction] = field(default_factory=list)
+    performed: bool = False
 
     def describe(self) -> str:
-        """One line per action; ``"nothing to repair"`` when there is none."""
+        """One line per action (``would ...`` while not performed); ``"nothing to repair"`` when there is none."""
         if not self.actions:
             return "nothing to repair"
-        return "\n".join(action.describe() for action in self.actions)
+        prefix = "" if self.performed else "would "
+        return "\n".join(prefix + action.describe() for action in self.actions)
 
     def raw_confirmations_planned(self) -> list[RepairAction]:
         """The raw actions the one confirmation covers: every queued deletion, and every truncation that would drop
         healthy shards after the broken one (a tail-only truncation repairs without asking)."""
-        return [
-            action
-            for action in self.actions
-            if action.kind == "raw" and (action.action in ("delete", "would_delete") or action.needs_confirmation)
-        ]
-
-    def as_planned(self) -> RepairReport:
-        """The same actions with every verb in its ``would_*`` form (nothing was performed)."""
-        return RepairReport([replace(action, action=_planned_verb(action.action)) for action in self.actions])
-
-
-def _planned_verb(verb: RepairVerb) -> RepairVerb:
-    if verb == "delete":
-        return "would_delete"
-    if verb == "truncate":
-        return "would_truncate"
-    if verb == "swap":
-        return "would_swap"
-    return verb
+        return [action for action in self.actions if action.kind == "raw" and (action.action == "delete" or action.needs_confirmation)]
 
 
 # --- the step ------------------------------------------------------------------------------------------------------------
@@ -149,18 +136,16 @@ def repair_broken_and_stale_folders(
 
     ``assume_yes`` skips the prompt; otherwise ``confirm(message)`` decides when given, else the question is put on
     stdin when it is a terminal. Without a terminal, or on an answer other than yes, :class:`ConfirmationRequired`
-    is raised and nothing is changed. ``dry_run`` inspects only and reports ``would_*`` actions without raising.
-    Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
+    is raised and nothing is changed. ``dry_run`` inspects only and returns the plan (``performed`` False) without
+    raising. Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
     """
     planned = RepairReport()
     for name in config.sources if sources is None else sources:
-        raw_shards = inspect_raw_folder(config, name, layout.raw_dir(name), planned)
+        raw_shards = inspect_raw_folder(config, name, layout, planned)
         inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, planned)
         inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, planned)
     if dry_run:
-        report = planned.as_planned()
-        log.info("repair (dry run):\n%s", report.describe())
-        return report
+        return planned
     queued = planned.raw_confirmations_planned()
     if queued:
         confirm_raw_deletions(queued, planned, assume_yes=assume_yes, confirm=confirm)
@@ -171,21 +156,20 @@ def repair_broken_and_stale_folders(
 # --- inspection (read-only) ----------------------------------------------------------------------------------------------
 
 
-def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: RepairReport) -> ShardList | None:
+def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, report: RepairReport) -> ShardList | None:
     """Plan what happens to the raw folder of ``name`` and return the shards it will hold afterwards as
     ``[[name, rows], ...]`` (empty when there is no folder), or None when the folder is queued for deletion."""
-    manifest = Manifest.load(folder)
+    folder = layout.raw_dir(name)
+    inspection = inspect_raw(config, name, layout)
+    manifest = inspection.manifest
     if manifest is None:
         if has_shards(folder):
             raise RepairError(f"{name}: {folder} holds shards but no manifest; refusing to guess where the rows came from — delete the directory to download the source again")
         return []
-    if not manifest.is_current(config.raw_hash(name)):
-        _plan(report, name, folder, "raw", "delete", "stale: source identity or tokenizer changed")
+    if inspection.state != "current":
+        _plan(report, name, folder, "raw", "delete", inspection.reason)
         return None
-    if manifest.is_outdated(config.max_seq_length):
-        _plan(report, name, folder, "raw", "delete", f"outdated: max_seq_length {manifest.truncated_at_tokens} -> {config.max_seq_length}")
-        return None
-    good, problem = _good_prefix_length(folder, manifest)
+    good, problem = good_prefix_length(folder, manifest)
     if problem is None:
         return shard_list(manifest.shards)
     kept = manifest.shards[:good]
@@ -197,7 +181,7 @@ def inspect_raw_folder(config: DatasetConfig, name: str, folder: Path, report: R
     reason = f"broken: {problem}; dropping {len(dropped)} shard(s) {dropped[0]}..{dropped[-1]}, keeping {good}"
     if healthy > 0:
         reason += f" — {healthy} healthy shard(s) after the broken one are discarded and re-downloaded next run"
-    _plan(report, name, folder, "raw", "truncate", reason, needs_confirmation=healthy > 0)
+    _plan(report, name, folder, "raw", "truncate", reason, needs_confirmation=healthy > 0, keep_shards=good)
     return shard_list(kept)
 
 
@@ -234,17 +218,13 @@ def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path
         _plan(report, name, old, "processed", "delete", "leftover of a completed folder swap")
 
 
-def _good_prefix_length(folder: Path, manifest: Manifest) -> tuple[int, str | None]:
-    """How many leading shards of ``manifest`` verify against ``folder``, and the first problem (None if all do)."""
-    for index, shard in enumerate(manifest.shards):
-        problem = shard_problem(folder, shard)
-        if problem is not None:
-            return index, problem
-    return len(manifest.shards), None
-
-
-def _plan(report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *, needs_confirmation: bool = False) -> None:
-    report.actions.append(RepairAction(source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation))
+def _plan(
+    report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *,
+    needs_confirmation: bool = False, keep_shards: int | None = None,
+) -> None:  # fmt: skip
+    report.actions.append(
+        RepairAction(source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation, keep_shards=keep_shards)
+    )
 
 
 # --- confirmation ----------------------------------------------------------------------------------------------------------
@@ -272,9 +252,9 @@ def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, 
         with suspended():  # the live dashboard is cleared while the question is on the terminal
             answered_yes = input(message).strip().lower() in YES_ANSWERS
     else:
-        raise ConfirmationRequired(planned.as_planned(), message, interactive=False)
+        raise ConfirmationRequired(planned, message, interactive=False)
     if not answered_yes:
-        raise ConfirmationRequired(planned.as_planned(), message, interactive=True)
+        raise ConfirmationRequired(planned, message, interactive=True)
 
 
 # --- performing ------------------------------------------------------------------------------------------------------------
@@ -283,7 +263,7 @@ def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, 
 def perform_repairs(report: RepairReport) -> None:
     """Carry out every planned action of ``report`` in order: processed folders first (deletions and the swap of a
     complete ``.tmp`` into place — so a crash never leaves derived data next to a raw folder it no longer matches),
-    then raw truncations and deletions."""
+    then raw truncations and deletions; the report is marked ``performed``."""
     processed = [action for action in report.actions if action.kind == "processed"]
     raw = [action for action in report.actions if action.kind == "raw"]
     for action in processed + raw:
@@ -293,14 +273,14 @@ def perform_repairs(report: RepairReport) -> None:
         elif action.action == "truncate":
             log.warning("%s: truncating %s (%s)", action.source, action.folder, action.reason)
             _truncate_raw(action)
-        elif action.action == "swap":
+        else:
             log.warning("%s: renaming %s into place (%s)", action.source, action.folder, action.reason)
             action.folder.rename(action.folder.with_name(action.folder.name.removesuffix(".tmp")))
-        else:
-            raise RepairError(f"{action.source}: cannot perform a planned-only action {action.action!r} on {action.folder}")
+    report.performed = True
 
 
 def _truncate_raw(action: RepairAction) -> None:
     manifest = Manifest.load(action.folder)
-    if manifest is None or not RawFolder(action.folder, manifest).truncate_to_good_prefix():
-        raise RepairError(f"{action.source}: {action.folder} changed while repairing; could not truncate to its good prefix")
+    if manifest is None or action.keep_shards is None:
+        raise RepairError(f"{action.source}: {action.folder} has no manifest to truncate")
+    RawFolder(action.folder, manifest).truncate_to(action.keep_shards)

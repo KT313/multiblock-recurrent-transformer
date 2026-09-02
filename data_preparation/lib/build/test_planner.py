@@ -178,13 +178,13 @@ def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layou
     prepare(config_file(cfg), layout.root, assume_yes=False)
     cfg.token_count = "estimate"  # part of the raw hash: every raw folder is stale
     stale_entry = next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
-    assert stale_entry.rows_to_fetch == (0, "raw stale: the repair step deletes it after confirmation")
+    assert stale_entry.rows_to_fetch == (0, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
     outdated = two_stage_cfg()
     outdated.max_seq_length = 4096  # raised above the stored cap
     outdated_entry = next(s for s in plan_downloads(outdated, layout).sources if s.name == "a")
     assert outdated_entry.rows_to_fetch[0] == 0 and outdated_entry.rows_to_fetch[1].startswith("raw outdated")
     a = source_ledger(cfg, "a", layout)  # the status table only reports it
-    assert not a.satisfaction()[0] and a.satisfaction()[1] == "raw stale: the repair step deletes it after confirmation"
+    assert a.satisfaction() == (False, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
 
 
 
@@ -195,7 +195,7 @@ def _ledger(**overrides: Any) -> SourceLedger:
     """A ledger of a trained source with 100 raw rows fully built into 90 processed ones (budget 100 / 84)."""
     defaults: dict[str, Any] = dict(
         name="s", kind="pretrain", rows_needed=100, rows_sufficient=84, sequence_budget=70, raw_state="current",
-        raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_problem="none", processed_reason="ok",
+        raw_reason="current", raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_problem="none", processed_reason="ok",
         processed_rows=90, training_rows=90,
     )
     return SourceLedger(**{**defaults, **overrides})
@@ -215,9 +215,11 @@ def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, 
 
 def test_the_satisfaction_cases() -> None:
     assert _ledger().satisfaction() == (True, "ok")
-    assert _ledger(raw_state="stale").satisfaction() == (False, "raw stale: the repair step deletes it after confirmation")
-    assert _ledger(raw_state="outdated").satisfaction() == (False, "raw outdated: the repair step deletes it after confirmation")
-    assert _ledger(raw_state="missing", raw_rows=0).satisfaction() == (False, "raw missing")
+    stale = _ledger(raw_state="stale", raw_reason="stale: source identity or tokenizer changed")
+    assert stale.satisfaction() == (False, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
+    outdated = _ledger(raw_state="outdated", raw_reason="outdated: max_seq_length 64 -> 128")
+    assert outdated.satisfaction() == (False, "raw outdated: max_seq_length 64 -> 128; the repair step deletes it after confirmation")
+    assert _ledger(raw_state="missing", raw_reason="missing", raw_rows=0).satisfaction() == (False, "raw missing")
     for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, max_seq_length or the source changed"), ("behind_raw", "behind raw")):
         assert _ledger(processed_problem=problem, processed_reason=reason).satisfaction() == (False, f"processed {reason}")
     assert _ledger(processed_rows=10).satisfaction() == (False, "processed rows 10 < 84")

@@ -22,19 +22,17 @@ from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
 from data_preparation.lib.sources.synthetic import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
-from data_preparation.conftest import REPO, REV, FakeHub
+from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages.download import (
     _auto_tokenizer,
     RawFolderError,
     TokenCounter,
     current_manifest,
-    current_raw_manifest,
     download,
     download_github_code_group,
+    inspect_raw,
     prepare_tokenizer,
-    raw_manifest_problem,
-    raw_manifest_state,
 )
 from data_preparation.lib.stages.truncation import estimate_tokens
 
@@ -233,7 +231,7 @@ def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(
     before, rows_before = mtimes(raw), read_rows(raw)
 
     stale = cfg_factory({"p": _synthetic(seed=9)})  # a different seed -> different raw hash
-    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: identity/tokenizer changed") as info:
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: source identity or tokenizer changed") as info:
         download(stale, "p", layout, rows_needed=7, shard_size=5)
     assert isinstance(info.value, RuntimeError) and info.value.directory == raw
     outdated = replace(cfg, max_seq_length=cfg.max_seq_length * 2)
@@ -531,7 +529,7 @@ def test_download_appends_at_the_folder_cap_when_the_config_cap_is_lower(
     high = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=100))
     download(high, "p", layout, rows_needed=20, shard_size=10)
     low = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=40))
-    assert raw_manifest_state(low, "p", layout) == "current", "a lower cap never outdates the folder"
+    assert inspect_raw(low, "p", layout).state == "current", "a lower cap never outdates the folder"
     m = download(low, "p", layout, rows_needed=40, shard_size=10)
     rows = read_rows(layout.raw_dir("p"))
     assert len(rows) == 40 and m.truncated_at_tokens == 100
@@ -539,7 +537,7 @@ def test_download_appends_at_the_folder_cap_when_the_config_cap_is_lower(
     appended = rows[20:]
     assert all(counter.count(row["text"]) <= 100 for row in appended)
     assert any(counter.count(row["text"]) > 40 for row in appended), "appended rows are cut at the folder's cap, not the config's"
-    assert raw_manifest_state(high, "p", layout) == "current" and read_rows(layout.raw_dir("p"))[:20] == rows[:20]
+    assert inspect_raw(high, "p", layout).state == "current" and read_rows(layout.raw_dir("p"))[:20] == rows[:20]
 
 
 def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
@@ -644,29 +642,29 @@ def test_download_instruct_estimate_mode_drops_by_estimated_count(
     assert m.dropped_too_long == 1 and m.exhausted is True
 
 
-def test_raw_manifest_state_and_current_raw_manifest(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+def test_inspect_raw_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}, max_seq_length=64))
-    assert raw_manifest_state(cfg, "p", layout) == "missing" and current_raw_manifest(cfg, "p", layout) is None
-    assert raw_manifest_problem(cfg, "p", layout) is None
+    assert inspect_raw(cfg, "p", layout).state == "missing" and inspect_raw(cfg, "p", layout).current_manifest is None
+    assert inspect_raw(cfg, "p", layout).reason == "missing"
     m = download(cfg, "p", layout, rows_needed=5)
-    assert raw_manifest_state(cfg, "p", layout) == "current" and current_raw_manifest(cfg, "p", layout) == m
-    assert raw_manifest_problem(cfg, "p", layout) is None
+    assert inspect_raw(cfg, "p", layout).state == "current" and inspect_raw(cfg, "p", layout).current_manifest == m
+    assert inspect_raw(cfg, "p", layout).reason == "current"
 
     raised = replace(cfg, max_seq_length=4096)
-    assert raw_manifest_state(raised, "p", layout) == "outdated" and current_raw_manifest(raised, "p", layout) is None
-    assert raw_manifest_problem(raised, "p", layout) == "outdated: max_seq_length 64 -> 4096"
+    assert inspect_raw(raised, "p", layout).state == "outdated" and inspect_raw(raised, "p", layout).current_manifest is None
+    assert inspect_raw(raised, "p", layout).reason == "outdated: max_seq_length 64 -> 4096"
     lowered = replace(cfg, max_seq_length=16)
-    assert raw_manifest_state(lowered, "p", layout) == "current" and current_raw_manifest(lowered, "p", layout) == m
+    assert inspect_raw(lowered, "p", layout).state == "current" and inspect_raw(lowered, "p", layout).current_manifest == m
 
     other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic"))
-    assert raw_manifest_state(other_tokenizer, "p", layout) == "stale" and current_raw_manifest(other_tokenizer, "p", layout) is None
-    assert raw_manifest_problem(other_tokenizer, "p", layout) == "stale: identity/tokenizer changed"
-    assert raw_manifest_state(cfg_factory({"p": _synthetic(seed=1)}), "p", layout) == "stale"
+    assert inspect_raw(other_tokenizer, "p", layout).state == "stale" and inspect_raw(other_tokenizer, "p", layout).current_manifest is None
+    assert inspect_raw(other_tokenizer, "p", layout).reason == "stale: source identity or tokenizer changed"
+    assert inspect_raw(cfg_factory({"p": _synthetic(seed=1)}), "p", layout).state == "stale"
     # stale wins over outdated (the folder holds other rows altogether)
-    assert raw_manifest_state(replace(other_tokenizer, max_seq_length=4096), "p", layout) == "stale"
+    assert inspect_raw(replace(other_tokenizer, max_seq_length=4096), "p", layout).state == "stale"
     # a manifest of another stage in the raw folder is stale too
     Manifest(source="p", source_hash=cfg.raw_hash("p"), stage="processed").save(layout.raw_dir("p"))
-    assert raw_manifest_state(cfg, "p", layout) == "stale"
+    assert inspect_raw(cfg, "p", layout).state == "stale"
 
 
 def test_download_github_code_group_raises_for_an_outdated_member(
@@ -773,10 +771,10 @@ def test_truncate_raw_to_good_prefix(
     download(cfg, "p", layout, rows_needed=40, shard_size=10)
     raw = layout.raw_dir("p")
     m = Manifest.load(raw)
-    assert m is not None and RawFolder(raw, m).truncate_to_good_prefix() and len(m.shards) == 4  # nothing wrong: untouched
+    assert m is not None and truncate_to_good_prefix(RawFolder(raw, m)) and len(m.shards) == 4  # nothing wrong: untouched
 
     (raw / "data-00002.parquet").write_bytes(b"corrupt")
-    assert RawFolder(raw, m).truncate_to_good_prefix()
+    assert truncate_to_good_prefix(RawFolder(raw, m))
     assert [s.name for s in m.shards] == ["data-00000.parquet", "data-00001.parquet"] and m.rows_fetched == 20
     assert sorted(p.name for p in raw.glob("*.parquet")) == ["data-00000.parquet", "data-00001.parquet"]
     stored = Manifest.load(raw)
@@ -786,10 +784,10 @@ def test_truncate_raw_to_good_prefix(
 
     (raw / "data-00000.parquet").unlink()  # nothing to keep
     m3 = Manifest.load(raw)
-    assert m3 is not None and not RawFolder(raw, m3).truncate_to_good_prefix()
+    assert m3 is not None and not truncate_to_good_prefix(RawFolder(raw, m3))
     m3.shards[0].offset = None  # a legacy manifest without offsets: no safe resume point
     (raw / "data-00000.parquet").write_bytes(b"x")
-    assert not RawFolder(raw, m3).truncate_to_good_prefix()
+    assert not truncate_to_good_prefix(RawFolder(raw, m3))
 
 
 def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resume(
@@ -810,7 +808,7 @@ def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resum
     raw = layout.raw_dir("d")
     (raw / "data-00001.parquet").write_bytes(b"corrupt")
     broken = Manifest.load(raw)
-    assert broken is not None and RawFolder(raw, broken).truncate_to_good_prefix()
+    assert broken is not None and truncate_to_good_prefix(RawFolder(raw, broken))
     assert broken.rows_fetched == 12 and (broken.skipped_malformed, broken.dropped_too_long) == (4, 4)
 
     resumed = download(cfg, "d", layout, rows_needed=10, shard_size=4)
@@ -839,10 +837,10 @@ def test_truncating_a_manifest_without_shard_counters_resets_them(
     reloaded = Manifest.load(raw)
     assert reloaded is not None and all(s.skipped_malformed is None for s in reloaded.shards)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        assert RawFolder(raw, reloaded).truncate_to_good_prefix()
+        assert truncate_to_good_prefix(RawFolder(raw, reloaded))
     assert reloaded.rows_fetched == 20 and reloaded.skipped_malformed == 0 and reloaded.dropped_too_long == 0
     assert "written before the per-shard reject counters existed" in caplog.text
-    assert raw_manifest_state(cfg, "p", layout) == "current"  # never stale because of the missing fields
+    assert inspect_raw(cfg, "p", layout).state == "current"  # never stale because of the missing fields
 
 
 def test_download_instruct_filter_calls_the_loader_once_and_closes_it(

@@ -42,7 +42,7 @@ from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
+from data_preparation.lib.stages.download import RawManifestState, inspect_raw
 from data_preparation.lib.storage.manifest import shard_list, Manifest
 
 log = get_logger(__name__)
@@ -91,7 +91,7 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
     """Whether ``name`` has raw shards its processed folder does not cover yet (or no healthy processed folder);
     False without a current raw manifest — there is nothing to build from."""
-    raw = current_raw_manifest(config, name, layout)
+    raw = inspect_raw(config, name, layout).current_manifest
     return raw is not None and assess_processed(config, name, layout, raw).problem != "none"
 
 
@@ -202,6 +202,7 @@ class SourceLedger:
     rows_sufficient: int  # processed rows that serve the budget (:meth:`DatasetConfig.rows_sufficient`)
     sequence_budget: int  # sequences the whole run draws (weight-schedule integral; 0 when the source is not trained on)
     raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated"
+    raw_reason: str  # the state's reason line (:func:`inspect_raw`): what the plan and the status table say about it
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
     exhausted: bool  # the loader has nothing more to give (:func:`raw_is_exhausted`)
     skipped_malformed: int  # source rows the converter rejected (raw manifest)
@@ -232,9 +233,9 @@ class SourceLedger:
         covers; 0 when the loader is dry, the raw folder is the repair step's business, or the budget is served.
         Computed once per ledger (the pathological-yield warning is logged once)."""
         if self.raw_state not in ("missing", "current"):
-            return 0, f"raw {self.raw_state}: the repair step deletes it after confirmation"
+            return 0, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
         if self.raw_state == "missing":
-            return self.rows_needed, "raw missing"
+            return self.rows_needed, f"raw {self.raw_reason}"
         if self.exhausted:
             return 0, "exhausted"
         if self.raw_rows < self.rows_needed:
@@ -283,9 +284,9 @@ class SourceLedger:
         never a silently smaller dataset. A stale / outdated raw folder is reported (the repair step deletes it after
         confirmation), never counted. The reason is the status table's last column: ``"ok"``, or what is missing."""
         if self.raw_state not in ("missing", "current"):
-            return False, f"raw {self.raw_state}: the repair step deletes it after confirmation"
+            return False, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
         if self.raw_state == "missing":
-            return False, "raw missing"
+            return False, f"raw {self.raw_reason}"
         if not self.built:
             return False, f"processed {self.processed_reason}"
         if self.processed_rows >= self.rows_sufficient:
@@ -326,7 +327,8 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     its processed folder is not counted either. An unreadable processed manifest is the repair step's deletion (no
     confirmation, processed data is derived), reported instead of raised so ``status`` / ``prepare --dry_run``
     describe the very state repair heals."""
-    raw = current_raw_manifest(config, name, layout)
+    raw_inspection = inspect_raw(config, name, layout)
+    raw = raw_inspection.current_manifest
     processed = ProcessedAssessment("absent", "missing", None) if raw is None else assess_processed(config, name, layout, raw)
     if processed.problem == "unreadable_manifest":
         log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, layout.processed_dir(name))
@@ -337,7 +339,8 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
         rows_needed=config.rows_needed(name),
         rows_sufficient=config.rows_sufficient(name),
         sequence_budget=config.sequence_budget(name),
-        raw_state=raw_manifest_state(config, name, layout),
+        raw_state=raw_inspection.state,
+        raw_reason=raw_inspection.reason,
         raw_rows=0 if raw is None else raw.rows(),
         exhausted=raw is not None and raw_is_exhausted(config, name, raw),
         skipped_malformed=0 if raw is None else raw.skipped_malformed,

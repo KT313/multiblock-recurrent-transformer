@@ -32,17 +32,17 @@ from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
 
 def raw_deleted(report: RepairReport) -> list[RepairAction]:
     """Raw folders the report deleted (performed, not planned)."""
-    return [action for action in report.actions if action.kind == "raw" and action.action == "delete"]
+    return [action for action in report.actions if report.performed and action.kind == "raw" and action.action == "delete"]
 
 
 def processed_deleted(report: RepairReport) -> list[RepairAction]:
     """Processed folders the report deleted (performed, not planned)."""
-    return [action for action in report.actions if action.kind == "processed" and action.action == "delete"]
+    return [action for action in report.actions if report.performed and action.kind == "processed" and action.action == "delete"]
 
 
 def raw_deletions_planned(report: RepairReport) -> list[RepairAction]:
     """Raw folders queued for deletion (before they are confirmed, or in a dry run)."""
-    return [action for action in report.actions if action.kind == "raw" and action.action in ("delete", "would_delete")]
+    return [action for action in report.actions if action.kind == "raw" and action.action == "delete"]
 
 CfgFactory = Callable[..., DatasetConfig]
 Prep = Callable[[DatasetConfig], DatasetConfig]
@@ -200,7 +200,7 @@ def test_refused_truncation_past_healthy_shards_changes_nothing(
     with pytest.raises(ConfirmationRequired) as info:
         repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
     assert _snapshot(layout.root) == before, "refused: not even the prefix truncation of that folder"
-    assert _kinds(info.value.report) == [("a", "raw", "would_truncate"), ("a", "processed", "would_delete")]
+    assert _kinds(info.value.report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
     assert [action.source for action in info.value.report.raw_confirmations_planned()] == ["a"]
     assert raw_deletions_planned(info.value.report) == [], "a truncation is not a deletion"
     # non-interactive without --yes: the same abort with nothing changed
@@ -227,7 +227,7 @@ def test_dry_run_reports_would_truncate_with_the_healthy_loss_note(
 
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, confirm=confirm)
     assert _snapshot(layout.root) == before
-    assert _kinds(report) == [("a", "raw", "would_truncate"), ("a", "processed", "would_delete")]
+    assert _kinds(report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
     assert "1 healthy shard(s) after the broken one are discarded and re-downloaded next run" in report.actions[0].reason
     assert report.actions[0].needs_confirmation
 
@@ -427,7 +427,7 @@ def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
     tmp_snapshot = _snapshot(temporary)
 
     dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
-    assert _kinds(dry) == [("a", "processed", "would_swap"), ("a", "processed", "would_delete")]
+    assert _kinds(dry) == [("a", "processed", "swap"), ("a", "processed", "delete")]
     assert temporary.exists() and old.exists() and not processed.exists(), "a dry run touches nothing"
 
     calls: list[str] = []
@@ -479,7 +479,7 @@ def test_leftover_old_folder_is_removed_without_confirmation(cfg_factory: CfgFac
     (old / "data-00000.parquet").write_bytes(b"replaced")
     before = _snapshot(processed)
     dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
-    assert dry.actions == [RepairAction("a", old, "processed", "would_delete", "leftover of a completed folder swap")]
+    assert dry.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")]
     assert old.exists()
     calls: list[str] = []
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
@@ -537,7 +537,7 @@ def test_non_interactive_run_without_assume_yes_aborts_with_the_list_and_deletes
     assert isinstance(err, RepairError) and not err.interactive
     assert err.message == f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n{CONFIRMATION_QUESTION}"
     assert str(err).startswith(err.message.rstrip()) and "--yes" in str(err)
-    assert _kinds(err.report) == [("a", "raw", "would_delete"), ("a", "processed", "would_delete"), ("b", "processed", "would_delete")]
+    assert _kinds(err.report) == [("a", "raw", "delete"), ("a", "processed", "delete"), ("b", "processed", "delete")]
     assert raw_deleted(err.report) == [] and [action.source for action in raw_deletions_planned(err.report)] == ["a"]
 
 
@@ -595,12 +595,12 @@ def test_dry_run_reports_everything_and_touches_nothing(
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, confirm=confirm)
     assert _snapshot(layout.root) == before and sorted(str(path) for path in layout.root.rglob("*")) == listing_before
     assert _kinds(report) == [
-        ("a", "raw", "would_delete"),
-        ("a", "processed", "would_delete"),
-        ("b", "raw", "would_truncate"),
-        ("b", "processed", "would_delete"),
-        ("c", "processed", "would_delete"),
-        ("c", "processed", "would_delete"),
+        ("a", "raw", "delete"),
+        ("a", "processed", "delete"),
+        ("b", "raw", "truncate"),
+        ("b", "processed", "delete"),
+        ("c", "processed", "delete"),
+        ("c", "processed", "delete"),
     ]
     assert raw_deleted(report) == [] and processed_deleted(report) == [] and [action.source for action in raw_deletions_planned(report)] == ["a"]
     lines = report.describe().splitlines()
@@ -609,7 +609,7 @@ def test_dry_run_reports_everything_and_touches_nothing(
     assert lines[5] == f"would delete processed {leftover} (c): leftover of an interrupted all-at-once build"
     # the real run afterwards performs exactly the planned actions
     performed = repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
-    assert _kinds(performed) == [(source, kind, action.replace("would_", "")) for source, kind, action in _kinds(report)]
+    assert _kinds(performed) == _kinds(report) and performed.performed and not report.performed
     assert performed.describe().splitlines()[0] == f"delete raw {layout.raw_dir('a')} (a): stale: source identity or tokenizer changed"
     assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True).actions == []
 
@@ -620,7 +620,7 @@ def test_report_describe_and_helpers(tmp_path: Path) -> None:
         RepairAction("a", tmp_path / "processed", "processed", "delete", "built from a raw folder that is being deleted"),
         RepairAction("b", tmp_path / "raw_b", "raw", "truncate", "broken: y"),
     ]
-    report = RepairReport(actions)
+    report = RepairReport(actions, performed=True)
     assert report.describe() == "\n".join(
         [
             f"delete raw {tmp_path / 'raw'} (a): stale: x",
@@ -629,8 +629,8 @@ def test_report_describe_and_helpers(tmp_path: Path) -> None:
         ]
     )
     assert raw_deleted(report) == actions[:1] and processed_deleted(report) == actions[1:2]
-    planned = report.as_planned()
-    assert [action.action for action in planned.actions] == ["would_delete", "would_delete", "would_truncate"]
+    planned = RepairReport(actions)
+    assert planned.describe().splitlines() == ["would " + line for line in report.describe().splitlines()]
     assert raw_deleted(planned) == [] and raw_deletions_planned(planned) == planned.actions[:1]
     assert RepairReport().describe() == "nothing to repair"
     assert json.dumps([action.reason for action in planned.actions])  # reasons are plain strings for the status output

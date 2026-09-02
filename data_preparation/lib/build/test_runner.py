@@ -682,8 +682,8 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
 
     with pytest.raises(ConfirmationRequired) as excinfo:
         prepare(path, layout.root, assume_yes=False, confirm=decline)
-    planned = [action for action in excinfo.value.report.actions if action.kind == "raw" and action.action == "would_delete"]
-    assert len(asked) == 1 and "p: stale" in asked[0] and planned
+    planned = [action for action in excinfo.value.report.actions if action.kind == "raw" and action.action == "delete"]
+    assert len(asked) == 1 and "p: stale" in asked[0] and planned and not excinfo.value.report.performed
     assert all_mtimes(raw_dir) == before, "nothing was deleted"
     assert not status(path, layout.root).complete  # status shows the pending repair
 
