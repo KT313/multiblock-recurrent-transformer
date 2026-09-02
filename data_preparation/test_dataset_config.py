@@ -444,7 +444,7 @@ def test_source_processing_override() -> None:
 
 # --- hashes -----------------------------------------------------------------------------------------------------------
 
-# The hashes of the shipped configs, recorded 2026-09-01. They key data on disk: every folder under `dataset/`
+# The hashes of the shipped configs, recorded 2026-09-02 (every value hashed, `config_hash` composed). They key data on disk: every folder under `dataset/`
 # carries the `raw_hash` / `processed_hash` of the source that produced it (raw folders are the bandwidth-expensive
 # part — terabytes on the author's machine — and a mismatch makes one stale, i.e. re-downloaded after confirmation),
 # and `config_hash` is what a training checkpoint stores to detect a resume against different data. Refactoring *how*
@@ -452,77 +452,77 @@ def test_source_processing_override() -> None:
 # may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "e828f8d6061c50ae",
-        "tokenizer": "cacedea880d7ec37",
+        "config": "4ff8d9e0eed79b78",
+        "tokenizer": "262a9e169b012e3f",
         "sources": {
-            "synthetic_pretrain": ("f9645dcd93c92e0e", "ca25d628bc0fc423"),
-            "synthetic_instruct": ("7a5485356346a9a9", "af48321fbeb25a31"),
+            "synthetic_pretrain": ("5f2929b477b8deb5", "bfa35901f2819b63"),
+            "synthetic_instruct": ("dc511fc028e085bb", "912472435e0be71b"),
         },
     },
     "crow_300m_final": {
-        "config": "56a0d60c20c73e91",
-        "tokenizer": "128ca0c738434e53",
+        "config": "dc785383e72873de",
+        "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("04d5d6c0f4ef9279", "b58c044118744cc9"),
-            "wikipedia": ("a614ffc5b692de0d", "f37150fbae7ecae3"),
-            "books_gutenberg": ("d496b0abd0decd96", "f3c14b65b476c1d2"),
-            "peso": ("557afee219124346", "751c373ccb3ac143"),
-            "arxiv": ("2d9cbb89d06c547c", "981e30bb496e8308"),
-            "openwebmath": ("0ff260c644bbeefb", "ddb2f1336c1256f0"),
-            "tinygsm": ("ca8573c25a3a5d1e", "4034a2c025a97177"),
-            "algebraic_stack": ("4566347616d999a5", "21efcd652ad03986"),
-            "gsm8k": ("df9a15f2b11e2778", "3ffc84246ac300b1"),
-            "github_code_clean_python": ("bb88f17dfdaebcff", "700d56cdc7bc9a68"),
-            "github_code_clean_javascript": ("6ca946aca0178495", "c9f4ab481591e822"),
-            "github_code_clean_typescript": ("0ddb1168bcb4a4ab", "f34c443073fae9d9"),
-            "github_code_clean_java": ("0ff50c78d34a5090", "fef4875b7cc60f2a"),
-            "github_code_clean_cpp": ("18981d711ba70d0d", "a3b72c190b3b78f4"),
-            "github_code_clean_go": ("8b754a6222c3c353", "24b2488bc38d8d0a"),
-            "github_code_clean_rust": ("a3d0abda4164a28b", "f997daeef4dfb4d2"),
-            "github_code_clean_shell": ("9ec8395c504ab595", "7be5c8aaf54f400e"),
-            "github_code_clean_sql": ("d1c5d2ae0a07b2a3", "4554146610fbb315"),
-            "github_code_clean_html": ("77dd5d781104dac8", "4cdbab97251f865a"),
-            "flan": ("d2ed4c0d9137827a", "a4a0c70625517542"),
-            "metamath": ("fbabb8961fdf87ec", "6fca33db6fc6146a"),
-            "orca_math": ("4c614e6f6c99cd8d", "559c41d6dc1f9cfa"),
-            "evol_code": ("d5b8a54fa3e41a6b", "c86350f441bd855e"),
-            "code_alpaca": ("52240fa45709bde5", "ffd74a14ac575a96"),
-            "slimorca": ("36fa803348661320", "efdb90d7de8cbe11"),
-            "sharegpt": ("9121a99ff55885bb", "b6ba5e08a6d0f91b"),
-            "wizardlm": ("3a7cbbfb695c4c3d", "af9512681cc97d79"),
+            "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
+            "wikipedia": ("88792981bda37dc3", "611b044b1fc6f263"),
+            "books_gutenberg": ("6a38441c92e29847", "d23074531dae2a38"),
+            "peso": ("02767a775fd39aea", "c1dc0a6a64ca2b01"),
+            "arxiv": ("872950d929a0419e", "9a187f913e4267a7"),
+            "openwebmath": ("01346e609ae41dbf", "19ff09b05eb611e8"),
+            "tinygsm": ("5890d3380e601cfb", "078f30f5310e7d7e"),
+            "algebraic_stack": ("b1bc1bd5ac357c91", "44231c53d8156c90"),
+            "gsm8k": ("8d022aec0b13b57c", "aeee0376c7d21b16"),
+            "github_code_clean_python": ("d578e5af298ab586", "867b71889c0d2d17"),
+            "github_code_clean_javascript": ("ca3f108e57fdaa39", "d80e68baa3207e82"),
+            "github_code_clean_typescript": ("a646e3a0ec7042fc", "287ccd66625cfacf"),
+            "github_code_clean_java": ("292ca4dc2e2e9282", "4145226c073feda7"),
+            "github_code_clean_cpp": ("0c323a907842a5e1", "b5e8cadeb60080b4"),
+            "github_code_clean_go": ("583b43c5436a549f", "2cce2f77543cacd0"),
+            "github_code_clean_rust": ("c3476032d04b705b", "3bd1c5179c7af8d2"),
+            "github_code_clean_shell": ("01a88a4b67a21a00", "bd59d88a8d4820c7"),
+            "github_code_clean_sql": ("ad7f5ec861a64545", "e4e1f0b71e1f711d"),
+            "github_code_clean_html": ("9e29794cf68713b8", "1b2211db55976677"),
+            "flan": ("cc1ec9b51a98377a", "054794a2f61aa59d"),
+            "metamath": ("6cf32456d23bd938", "aab70ac36319c077"),
+            "orca_math": ("1f81ec18662555dc", "eab5870c4bc2262d"),
+            "evol_code": ("9b22c4d3257240e6", "95f6c2bed184cf10"),
+            "code_alpaca": ("978b6b4fa5f41aca", "81945b40b5c594e4"),
+            "slimorca": ("b72f0e452b19d77d", "a463705d333284f3"),
+            "sharegpt": ("ec66c69c067d1279", "dcefdbdabbd56bfd"),
+            "wizardlm": ("22478e9186080536", "7f5d471283a10980"),
         },
     },
     "crow_300m_mini": {
-        "config": "d5e7c9681c2da99d",
-        "tokenizer": "128ca0c738434e53",
+        "config": "e1dd176c640cd5fe",
+        "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("04d5d6c0f4ef9279", "b58c044118744cc9"),
-            "wikipedia": ("a614ffc5b692de0d", "f37150fbae7ecae3"),
-            "books_gutenberg": ("d496b0abd0decd96", "f3c14b65b476c1d2"),
-            "peso": ("557afee219124346", "751c373ccb3ac143"),
-            "arxiv": ("2d9cbb89d06c547c", "981e30bb496e8308"),
-            "openwebmath": ("0ff260c644bbeefb", "ddb2f1336c1256f0"),
-            "tinygsm": ("ca8573c25a3a5d1e", "4034a2c025a97177"),
-            "algebraic_stack": ("4566347616d999a5", "21efcd652ad03986"),
-            "gsm8k": ("df9a15f2b11e2778", "3ffc84246ac300b1"),
-            "github_code_clean_python": ("bb88f17dfdaebcff", "700d56cdc7bc9a68"),
-            "github_code_clean_javascript": ("6ca946aca0178495", "c9f4ab481591e822"),
-            "github_code_clean_typescript": ("0ddb1168bcb4a4ab", "f34c443073fae9d9"),
-            "github_code_clean_java": ("0ff50c78d34a5090", "fef4875b7cc60f2a"),
-            "github_code_clean_cpp": ("18981d711ba70d0d", "a3b72c190b3b78f4"),
-            "github_code_clean_go": ("8b754a6222c3c353", "24b2488bc38d8d0a"),
-            "github_code_clean_rust": ("a3d0abda4164a28b", "f997daeef4dfb4d2"),
-            "github_code_clean_shell": ("9ec8395c504ab595", "7be5c8aaf54f400e"),
-            "github_code_clean_sql": ("d1c5d2ae0a07b2a3", "4554146610fbb315"),
-            "github_code_clean_html": ("77dd5d781104dac8", "4cdbab97251f865a"),
-            "flan": ("d2ed4c0d9137827a", "a4a0c70625517542"),
-            "metamath": ("fbabb8961fdf87ec", "6fca33db6fc6146a"),
-            "orca_math": ("4c614e6f6c99cd8d", "559c41d6dc1f9cfa"),
-            "evol_code": ("d5b8a54fa3e41a6b", "c86350f441bd855e"),
-            "code_alpaca": ("52240fa45709bde5", "ffd74a14ac575a96"),
-            "slimorca": ("36fa803348661320", "efdb90d7de8cbe11"),
-            "sharegpt": ("9121a99ff55885bb", "b6ba5e08a6d0f91b"),
-            "wizardlm": ("3a7cbbfb695c4c3d", "af9512681cc97d79"),
+            "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
+            "wikipedia": ("88792981bda37dc3", "611b044b1fc6f263"),
+            "books_gutenberg": ("6a38441c92e29847", "d23074531dae2a38"),
+            "peso": ("02767a775fd39aea", "c1dc0a6a64ca2b01"),
+            "arxiv": ("872950d929a0419e", "9a187f913e4267a7"),
+            "openwebmath": ("01346e609ae41dbf", "19ff09b05eb611e8"),
+            "tinygsm": ("5890d3380e601cfb", "078f30f5310e7d7e"),
+            "algebraic_stack": ("b1bc1bd5ac357c91", "44231c53d8156c90"),
+            "gsm8k": ("8d022aec0b13b57c", "aeee0376c7d21b16"),
+            "github_code_clean_python": ("d578e5af298ab586", "867b71889c0d2d17"),
+            "github_code_clean_javascript": ("ca3f108e57fdaa39", "d80e68baa3207e82"),
+            "github_code_clean_typescript": ("a646e3a0ec7042fc", "287ccd66625cfacf"),
+            "github_code_clean_java": ("292ca4dc2e2e9282", "4145226c073feda7"),
+            "github_code_clean_cpp": ("0c323a907842a5e1", "b5e8cadeb60080b4"),
+            "github_code_clean_go": ("583b43c5436a549f", "2cce2f77543cacd0"),
+            "github_code_clean_rust": ("c3476032d04b705b", "3bd1c5179c7af8d2"),
+            "github_code_clean_shell": ("01a88a4b67a21a00", "bd59d88a8d4820c7"),
+            "github_code_clean_sql": ("ad7f5ec861a64545", "e4e1f0b71e1f711d"),
+            "github_code_clean_html": ("9e29794cf68713b8", "1b2211db55976677"),
+            "flan": ("cc1ec9b51a98377a", "054794a2f61aa59d"),
+            "metamath": ("6cf32456d23bd938", "aab70ac36319c077"),
+            "orca_math": ("1f81ec18662555dc", "eab5870c4bc2262d"),
+            "evol_code": ("9b22c4d3257240e6", "95f6c2bed184cf10"),
+            "code_alpaca": ("978b6b4fa5f41aca", "81945b40b5c594e4"),
+            "slimorca": ("b72f0e452b19d77d", "a463705d333284f3"),
+            "sharegpt": ("ec66c69c067d1279", "dcefdbdabbd56bfd"),
+            "wizardlm": ("22478e9186080536", "7f5d471283a10980"),
         },
     },
 }
@@ -589,30 +589,50 @@ class _UnannotatedField:
     value: int = 0
 
 
-def test_hash_payload_drops_defaults_recursively() -> None:
-    """Schema changes with defaults must not invalidate data on disk: only explicitly set values are hashed."""
-    assert dc.hash_payload(DedupConfig(), "processed") == {}
-    assert dc.hash_payload(DedupConfig(mode="minhash", threshold=0.5), "processed") == {"mode": "minhash", "threshold": 0.5}
-    proc = ProcessingConfig(min_chars=7, dedup=DedupConfig(mode="minhash"))
-    assert dc.hash_payload(proc, "processed") == {"min_chars": 7, "dedup": {"mode": "minhash"}}
+def test_hash_payload_hashes_every_counted_value_recursively() -> None:
+    """A field enters with its value, default or not; nested blocks are walked with the same selector."""
+    assert dc.hash_payload(DedupConfig(), "processed") == {"mode": "exact", "normalize": True}
+    assert dc.hash_payload(DedupConfig(mode="minhash", threshold=0.5), "processed") == {
+        "mode": "minhash", "normalize": True, "threshold": 0.5, "num_perm": 256, "ngram": 5,
+    }  # fmt: skip
+    proc = ProcessingConfig(min_chars=7, dedup=DedupConfig(mode="none"))
+    assert dc.hash_payload(proc, "processed") == {
+        "min_chars": 7,
+        "dedup": {"mode": "none"},
+        "quality_filter": False,
+        "decontamination": {"enabled": False, "benchmarks": list(dc.DEFAULT_BENCHMARKS), "ngram": 13, "threshold": 0.1},
+    }
     src = SourceConfig(kind="pretrain", loader="hf_files", hf_id="x/y", load_kwargs={"data_files": "*.parquet"})
-    assert dc.hash_payload(src, "raw") == {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
+    assert dc.hash_payload(src, "raw") == {
+        "kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "revision": None, "load_kwargs": {"data_files": "*.parquet"},
+        "split": "train", "text_field": "text", "language": None, "path": None, "converter": None, "fields": None, "filter": None,
+    }  # fmt: skip
+
+
+def test_changing_a_default_changes_the_processed_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Data built under an old default must not pass as current: the resolved value is hashed, not "was it set"."""
+    base = _build(_minimal())
+    monkeypatch.setattr(dc, "DEFAULT_BENCHMARKS", ["gsm8k"])  # `DecontaminationConfig.benchmarks` defaults to a copy of it
+    changed = _build(_minimal())
+    assert changed.processing.decontamination.benchmarks == ["gsm8k"] != base.processing.decontamination.benchmarks
+    assert changed.processed_hash("pre") != base.processed_hash("pre")
+    assert changed.raw_hash("pre") == base.raw_hash("pre") and changed.config_hash() != base.config_hash()
 
 
 def test_hash_payload_selects_by_annotation() -> None:
-    """`raw` and `processed` take exactly their own fields (`processed_hash` folds the raw hash in as one value);
-    `config` takes every hashed field, and nothing annotated `none`."""
+    """Each name takes exactly its own fields (`processed_hash` folds the raw hash in as one value, `config_hash`
+    the processed hashes); nothing annotated `none` enters anywhere."""
     src = SourceConfig(kind="instruct", loader="hf_stream", hf_id="x/y", fields={"instruction": "a", "output": "b"},
                        check_limit=5, rows=None, seed=7, input_inversions=0.5, describe_tokens_per_row=9)  # fmt: skip
-    assert dc.hash_payload(src, "raw") == {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}}
-    assert dc.hash_payload(src, "processed") == {"seed": 7, "input_inversions": 0.5}  # seed: not the synthetic loader
-    assert set(dc.hash_payload(src, "config")) == {
-        "kind", "loader", "hf_id", "fields", "check_limit", "seed", "input_inversions",
-    }, "config counts raw + processed + config fields, never `describe_tokens_per_row`"
+    assert set(dc.hash_payload(src, "raw")) == {
+        "kind", "loader", "hf_id", "revision", "load_kwargs", "split", "text_field", "language", "path", "converter", "fields", "filter",
+    }  # fmt: skip
+    assert dc.hash_payload(src, "processed") == {"processing": None, "seed": 7, "input_inversions": 0.5, "shuffle": None}  # seed: not the synthetic loader
+    assert dc.hash_payload(src, "config") == {"check_limit": 5, "rows": None, "validation_fraction": None}, "never `describe_tokens_per_row`"
 
     synthetic = SourceConfig(kind="pretrain", loader="synthetic", seed=7)
-    assert dc.hash_payload(synthetic, "raw") == {"kind": "pretrain", "loader": "synthetic", "seed": 7}
-    assert dc.hash_payload(synthetic, "processed") == {}
+    assert dc.hash_payload(synthetic, "raw")["seed"] == 7
+    assert "seed" not in dc.hash_payload(synthetic, "processed")
 
 
 def test_the_seed_is_raw_identity_only_for_the_synthetic_loader() -> None:
@@ -667,14 +687,16 @@ def test_the_processing_payload_keeps_only_the_active_dedup_mode() -> None:
     def payload(processing: ProcessingConfig) -> dict[str, Any]:
         return dc.hash_payload(processing, "processed")
 
-    assert payload(ProcessingConfig()) == {}
-    assert payload(ProcessingConfig(dedup=DedupConfig(bloom_memory_mb=1))) == {}  # resource knob
-    assert payload(ProcessingConfig(dedup=DedupConfig(threshold=0.5, ngram=3))) == {}  # inactive minhash fields
-    assert payload(ProcessingConfig(dedup=DedupConfig(normalize=False))) == {"dedup": {"normalize": False}}
+    exact = payload(ProcessingConfig())
+    assert exact["dedup"] == {"mode": "exact", "normalize": True}
+    assert payload(ProcessingConfig(dedup=DedupConfig(bloom_memory_mb=1))) == exact  # resource knob
+    assert payload(ProcessingConfig(dedup=DedupConfig(threshold=0.5, ngram=3))) == exact  # inactive minhash fields
+    assert payload(ProcessingConfig(dedup=DedupConfig(normalize=False)))["dedup"] == {"mode": "exact", "normalize": False}
     minhash = ProcessingConfig(min_chars=9, dedup=DedupConfig(mode="minhash", threshold=0.5, normalize=False, bloom_memory_mb=1))
-    assert payload(minhash) == {"min_chars": 9, "dedup": {"mode": "minhash", "normalize": False, "threshold": 0.5}}
-    assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", threshold=0.5))) == {"dedup": {"mode": "none"}}
-    assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", normalize=False))) == {"dedup": {"mode": "none"}}  # nothing is hashed
+    assert payload(minhash)["min_chars"] == 9
+    assert payload(minhash)["dedup"] == {"mode": "minhash", "normalize": False, "threshold": 0.5, "num_perm": 256, "ngram": 5}
+    assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", threshold=0.5)))["dedup"] == {"mode": "none"}
+    assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", normalize=False)))["dedup"] == {"mode": "none"}  # nothing is hashed
 
 
 def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
@@ -781,7 +803,7 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
 
 
 def test_hash_payload_golden_defaults() -> None:
-    """`hash_payload` drops default-valued fields, so a changed *default* re-labels data built under the old one.
+    """Every default is hashed as a value, so changing one re-labels every folder built under the old default.
     Changing any of these defaults must be a conscious, hash-breaking commit: update this golden dict with it."""
     assert asdict(ProcessingConfig()) == {
         "min_chars": 50,

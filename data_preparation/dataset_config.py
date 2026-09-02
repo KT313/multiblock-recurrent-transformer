@@ -55,8 +55,7 @@ SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in
 #
 # Every field of every config dataclass declares which of the three manifest hashes it belongs to, once, right where
 # it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `config_hash` assemble
-# their payloads from it. Before this, each hash built the dict of all non-default fields and then popped a
-# hand-maintained list of names — a table that drifted from the field list three times.
+# their payloads from it, so no hash keeps a list of field names of its own.
 #
 #   raw       identity of the downloaded rows: which rows a loader yields, in what order, and how their stored token
 #             counts are made. Keys `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so
@@ -66,8 +65,9 @@ SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in
 #             against different data is detected) counts it.
 #   none      not hashed at all: how rows are fetched or described, resource knobs — nothing that changes the data.
 #
-# `raw` and `processed` select exactly their own fields (`processed_hash` folds the raw hash in as one value, so raw
-# fields must not appear a second time); `config` counts every field annotated raw, processed *or* config.
+# Each name selects exactly the fields annotated with it; the hashes nest instead of re-walking fields:
+# `processed_hash` folds the raw hash in as one value and `config_hash` is composed of every source's processed hash,
+# the tokenizer hash and the `config` fields. Every selected field enters with its value, default or not.
 HashName = Literal["raw", "processed", "config"]
 HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "none")
 
@@ -552,16 +552,16 @@ class DatasetConfig:
 
     def config_hash(self) -> str:
         """Hash of everything that defines the training data (recorded in checkpoints so a resume with different
-        data is detected): every field annotated ``raw``, ``processed`` or ``config``, which leaves out the knobs
-        that only change how the data are fetched or described (``always_range_requests``,
-        ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``). The two processing blocks are replaced by
-        the *effective* block of each source — the view ``processed_hash`` uses, so a Bloom budget change does not
-        change this hash either."""
+        data is detected), composed of the hashes below it: every source's ``processed_hash`` (which folds in its
+        raw hash and the *effective* processing block, so a Bloom budget change does not count here either) next
+        to the source's own ``config`` fields, the tokenizer hash, and the ``config`` fields of the dataset (name,
+        stages, block size, validation fraction). The knobs that only change how data are fetched or described
+        (``always_range_requests``, ``load_kwargs.max_cached_file_mb``, ``describe_tokens_per_row``) stay out."""
         payload = hash_payload(self, "config")
-        payload.pop("processing", None)  # folded into every source's effective processing below
-        for name, source_fields in payload["sources"].items():
-            source_fields.pop("processing", None)
-            source_fields["effective_processing"] = hash_payload(self.source_processing(name), "processed")
+        payload["sources"] = {
+            name: {"processed": self.processed_hash(name), **payload["sources"][name]} for name in self.sources
+        }
+        payload["tokenizer"] = self.tokenizer_hash()
         return _stable_hash(payload)
 
     def overlap_warnings(self) -> list[str]:
@@ -626,28 +626,21 @@ def _stable_hash(payload: Any) -> str:
 
 
 def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
-    """The fields of ``obj`` that ``hash_name`` counts, as a JSON-ready dict; the input of the three hashes.
+    """The fields of ``obj`` annotated ``hash_name``, as a JSON-ready dict; the input of the three hashes.
 
-    A field is counted when its ``metadata["hash"]`` annotation says so (see "hash annotations" at the top of this
-    file): ``raw`` and ``processed`` select exactly their own fields, ``config`` selects all three kinds. A field
-    still holding its **default** value never enters — so adding a field with a default to the schema, or removing
-    one, never invalidates data on disk; only a value explicitly set to something else changes a hash. A nested
-    dataclass whose counted fields are all defaults is dropped for the same reason, and ``metadata["hash_drop"]``
-    names dict keys of a field's value that are no part of the hash (``load_kwargs.max_cached_file_mb``).
+    A field is counted when its ``metadata["hash"]`` annotation names ``hash_name`` (see "hash annotations" at the
+    top of this file), and it enters with its value whether or not that value is the default: a changed default
+    therefore invalidates data built under the old one, as it should, and adding a field to the schema changes the
+    hashes once (one rebuild). ``metadata["hash_drop"]`` names dict keys of a field's value that are no part of the
+    hash (``load_kwargs.max_cached_file_mb``).
 
     An unannotated field raises: a new schema field has to say which hash it belongs to.
     """
     out: dict[str, Any] = {}
     for f in fields(obj):
-        if not _counts_for(f, obj, hash_name):
+        if field_hash_annotation(f, obj) != hash_name:
             continue
-        value = getattr(obj, f.name)
-        if _holds_default(f, value):
-            continue
-        hashed = _hashable(value, hash_name)
-        if _is_dataclass_instance(value) and not hashed:
-            continue  # every counted field of the nested block holds its default
-        out[f.name] = _drop_keys(hashed, f.metadata.get("hash_drop", ()))
+        out[f.name] = _drop_keys(_hashable(getattr(obj, f.name), hash_name), f.metadata.get("hash_drop", ()))
     return out
 
 
@@ -664,23 +657,6 @@ def field_hash_annotation(f: Field[Any], obj: Any) -> str:
     if name not in HASH_ANNOTATIONS:
         raise ValueError(f"{type(obj).__name__}.{f.name}: unknown hash annotation {name!r}; expected one of {HASH_ANNOTATIONS}")
     return str(name)
-
-
-def _counts_for(f: Field[Any], obj: Any, hash_name: HashName) -> bool:
-    """``config`` counts every hashed field; ``raw`` / ``processed`` count only their own (``processed_hash`` folds
-    the raw hash in as a single value, so raw fields must not appear in it a second time)."""
-    annotation = field_hash_annotation(f, obj)
-    if hash_name == "config":
-        return annotation != "none"
-    return annotation == hash_name
-
-
-def _holds_default(f: Field[Any], value: Any) -> bool:
-    if f.default is not MISSING:
-        return bool(value == f.default)
-    if f.default_factory is not MISSING:
-        return bool(value == f.default_factory())
-    return False  # required field: never a default
 
 
 def _is_dataclass_instance(value: Any) -> bool:

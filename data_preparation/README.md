@@ -98,8 +98,10 @@ Which hash a setting belongs to is declared once, on the field itself: every fie
 `field(metadata={"hash": "raw" | "processed" | "config" | "none"})` annotation (a callable for the two conditional
 cases — `seed` is raw identity only for `loader: synthetic`, and a dedup field only counts for the modes that use
 it). `hash_payload` walks those annotations and the three hash methods assemble their payload from it; a new field
-without an annotation makes hashing raise. Only non-default values enter, so adding or removing a field with a
-default never invalidates data on disk.
+without an annotation makes hashing raise. Every counted field enters with its resolved value, default or not: a
+changed default invalidates the data built under the old one, and adding a field to the schema changes the hashes
+once (one rebuild). `config_hash` nests the others — every source's `processed_hash` (which folds in its `raw_hash`)
+beside the source's own `config` fields, the tokenizer hash and the dataset-level `config` fields.
 
 Shards are published **one at a time** (written to a `.tmp` file, renamed, recorded in the manifest — raw shards
 with the loader offset **and** the rejected-row totals as of their last row), so a network error, a crash or Ctrl-C
