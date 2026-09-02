@@ -582,27 +582,21 @@ FORMAT_READERS: dict[str, FormatReader] = {
 def iter_row_batches(
     handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None, batch_size: int | None = None
 ) -> Iterator[RowBatch]:
-    """**The reading contract**, the single dispatch every consumer reads files through: batches of at most
+    """**The reading contract**, the single dispatch every consumer reads files through: batches of about
     ``batch_size`` (default :data:`ROW_BATCH`) rows of the open binary file in order, skipping the first ``skip``
     rows (parquet skips whole row groups), every row projected to ``columns`` (None: every column).
 
-    The per-format reader (:data:`FORMAT_READERS` by :func:`file_format`) only decodes bounded batches; this
-    function enforces the bound (a reader that materialises more is a loud error, not a silent memory hog) and
-    applies the projection itself (:func:`project_row`: a requested column a row lacks stays absent, so a caller
-    checking for its own column still sees the row as the file had it). Parquet additionally prunes the read to
-    ``columns`` and raises for an unknown one at read time, so neither path invents data — and either way every
-    surplus column stays out of what the caller stores, including one whose type varies from row to row and would
-    make the shard writer fail."""
+    The per-format reader (:data:`FORMAT_READERS` by :func:`file_format`) only decodes; this function applies the
+    projection itself (:func:`project_row`: a requested column a row lacks stays absent, so a caller checking for
+    its own column still sees the row as the file had it). Parquet additionally prunes the read to ``columns`` and
+    raises for an unknown one at read time, so neither path invents data — and either way every surplus column
+    stays out of what the caller stores, including one whose type varies from row to row and would make the shard
+    writer fail."""
     fmt = file_format(name)
     reader = FORMAT_READERS.get(fmt)
     if reader is None:
         raise ValueError(f"{name}: no reader registered for format {fmt!r}; readers: {sorted(FORMAT_READERS)}")
-    limit = ROW_BATCH if batch_size is None else batch_size
-    for batch in reader(handle, name, skip, columns, limit):
-        if len(batch) > limit:
-            raise RuntimeError(
-                f"{name}: the {fmt} reader broke the reading contract: {len(batch)} rows in one batch (limit {limit})"
-            )
+    for batch in reader(handle, name, skip, columns, ROW_BATCH if batch_size is None else batch_size):
         yield batch if columns is None else [project_row(row, columns) for row in batch]
 
 

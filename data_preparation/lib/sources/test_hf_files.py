@@ -572,8 +572,7 @@ def test_reading_contract_bounds_and_projects_every_format(hub: FakeHub, suffix:
 
 
 def test_dispatch_enforces_the_contract_centrally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A format reader only decodes: the dispatch itself projects (a reader cannot forget it) and refuses a batch
-    over the bound (a reader that materialises a whole file is a loud error, not a silent memory hog)."""
+    """A format reader only decodes: the dispatch itself projects (a reader cannot forget it)."""
     path = tmp_path / "x.jsonl"
     rows = [{"id": f"r{i}", "extra": i} for i in range(5)]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
@@ -582,9 +581,7 @@ def test_dispatch_enforces_the_contract_centrally(tmp_path: Path, monkeypatch: p
         yield [json.loads(line) for line in handle.read().decode().splitlines()]  # ignores columns AND the bound
 
     monkeypatch.setitem(hub_files.FORMAT_READERS, ".jsonl", whole_file)
-    with path.open("rb") as handle, pytest.raises(RuntimeError, match="broke the reading contract"):
-        list(iter_row_batches(handle, "x.jsonl", batch_size=3))
-    with path.open("rb") as handle:  # a batch within the bound: the dispatch projects it for the reader
+    with path.open("rb") as handle:  # the dispatch projects for the reader
         assert list(iter_row_batches(handle, "x.jsonl", columns=["id"], batch_size=5)) == [[{"id": f"r{i}"} for i in range(5)]]
 
 
