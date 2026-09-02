@@ -14,27 +14,17 @@ import pyarrow.compute as pc
 
 Row = dict[str, Any]
 
-# the explicit annotation is what pyarrow-stubs needs to accept the list in ``pa.schema``
-_OUTPUT_FIELDS: list[tuple[str, pa.DataType]] = [
-    ("text", pa.string()),
-    ("source", pa.string()),
-    ("original_length", pa.int64()),
-]
-FILTERED_SCHEMA = pa.schema(_OUTPUT_FIELDS)
-FILTERED_SCHEMA_WITH_TOKENS = pa.schema([*_OUTPUT_FIELDS, ("tokens", pa.int64())])
 _WHITESPACE = re.compile(r"\s+")
 
 
 # --- pretrain: length filter -------------------------------------------------------------------------------------------
 
 
-def preprocess_batch(
-    batch: pa.RecordBatch, text_field: str, source_name: str, min_chars: int
-) -> tuple[pa.RecordBatch, dict[str, int]]:
+def preprocess_batch(batch: pa.RecordBatch, text_field: str, source_name: str, min_chars: int) -> tuple[list[Row], dict[str, int]]:
     """Drop null / shorter-than-``min_chars`` texts (the upper bound is the token truncation at download time).
 
-    Returns a ``FILTERED_SCHEMA`` batch (``text``, ``source``, ``original_length``) and per-batch statistics. A
-    ``tokens`` column of the input batch (the raw token counts) is carried through as a fourth column.
+    Returns the kept rows as ``{"text": ...}`` (plus ``"tokens"`` when the input batch carries the raw token counts)
+    and the batch's statistics: ``input_samples``, ``removed_invalid``, ``removed_too_short``, ``output_samples``.
     """
     if text_field not in batch.schema.names:
         raise ValueError(f"{source_name}: text_field {text_field!r} not in columns {batch.schema.names}")
@@ -49,37 +39,24 @@ def preprocess_batch(
     if stats["removed_invalid"] > 0:
         batch = batch.filter(is_valid)
         text_array = cast(pa.StringArray, batch[text_field])
-    if len(batch) == 0:
-        return _empty_filtered_batch(), stats | {"output_samples": 0}
 
-    # 2. drop texts shorter than min_chars
-    original_lengths = pc.utf8_length(text_array)
-    # pyarrow-stubs does not accept a Python int as the second operand, pyarrow does
-    is_long_enough = pc.greater_equal(original_lengths, min_chars)  # type: ignore[call-overload]
-    stats["removed_too_short"] = len(batch) - pc.sum(is_long_enough).as_py()
-    if stats["removed_too_short"] > 0:
-        batch = batch.filter(is_long_enough)
-        text_array = cast(pa.StringArray, batch[text_field])
-        original_lengths = pc.utf8_length(text_array)
-    if len(batch) == 0:
-        return _empty_filtered_batch(), stats | {"output_samples": 0}
+    # 2. drop texts shorter than min_chars (in code points, not bytes)
+    if len(batch) > 0:
+        # pyarrow-stubs does not accept a Python int as the second operand, pyarrow does
+        is_long_enough = pc.greater_equal(pc.utf8_length(text_array), min_chars)  # type: ignore[call-overload]
+        stats["removed_too_short"] = len(batch) - pc.sum(is_long_enough).as_py()
+        if stats["removed_too_short"] > 0:
+            batch = batch.filter(is_long_enough)
+            text_array = cast(pa.StringArray, batch[text_field])
 
-    arrays: list[pa.Array[Any]] = [
-        pc.cast(text_array, pa.string()),
-        pa.array([source_name] * len(batch), type=pa.string()),
-        pc.cast(original_lengths, pa.int64()),
-    ]
-    schema = FILTERED_SCHEMA
+    texts = cast(list[str], text_array.to_pylist())  # nulls are gone: the values are strings
     if "tokens" in batch.schema.names:
-        arrays.append(pc.cast(batch["tokens"], pa.int64()))
-        schema = FILTERED_SCHEMA_WITH_TOKENS
-    output = pa.RecordBatch.from_arrays(arrays, schema=schema)
-    stats["output_samples"] = len(output)
-    return output, stats
-
-
-def _empty_filtered_batch() -> pa.RecordBatch:
-    return pa.RecordBatch.from_pylist([], schema=FILTERED_SCHEMA)
+        tokens = cast(list[int], batch["tokens"].to_pylist())
+        rows: list[Row] = [{"text": text, "tokens": count} for text, count in zip(texts, tokens, strict=True)]
+    else:
+        rows = [{"text": text} for text in texts]
+    stats["output_samples"] = len(rows)
+    return rows, stats
 
 
 # --- pretrain: quality / contamination ---------------------------------------------------------------------------------

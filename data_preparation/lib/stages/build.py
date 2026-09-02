@@ -381,9 +381,9 @@ class RowPipeline:
             }
 
     def _length_filtered_rows(self, raw_dir: Path, shards: list[ShardInfo]) -> Iterator[Row]:
-        """``{text, source, original_length, tokens}`` rows of the raw shards through the length filter
-        (``preprocess_batch`` per Arrow batch: null / shorter than ``min_chars`` dropped); statistics summed into
-        ``stats["length_filter"]``, the bar advanced per raw row."""
+        """``{text, tokens}`` rows of the raw shards through the length filter (``preprocess_batch`` per Arrow batch:
+        null / shorter than ``min_chars`` dropped); statistics summed into ``stats["length_filter"]``, the bar
+        advanced per raw row."""
         text_field = self.source.text_field
         stats: dict[str, int] = self.stats["length_filter"]
         for shard in shards:
@@ -394,7 +394,7 @@ class RowPipeline:
                 for key, value in batch_stats.items():
                     stats[key] += value
                 self._advance(len(batch))
-                yield from kept.to_pylist()
+                yield from kept
 
     # --- instruct --------------------------------------------------------------------------------------------------
 

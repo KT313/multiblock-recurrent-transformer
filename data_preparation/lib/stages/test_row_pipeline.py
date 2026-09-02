@@ -22,44 +22,39 @@ def test_preprocess_batch_filters_and_counts() -> None:
         {"content": ["short", None, "x" * 50, "y" * 120, "z" * 51], "meta": [1, 2, 3, 4, 5]}
     )
     out, stats = rp.preprocess_batch(batch, "content", "mysrc", min_chars=50)
-    assert out.schema == rp.FILTERED_SCHEMA
     assert stats == {"input_samples": 5, "removed_too_short": 1, "removed_invalid": 1, "output_samples": 3}
-    rows = out.to_pylist()
-    assert [len(r["text"]) for r in rows] == [50, 120, 51], "nothing is truncated (raw is truncated at download)"
-    assert [r["original_length"] for r in rows] == [50, 120, 51]
-    assert {r["source"] for r in rows} == {"mysrc"}
+    assert [len(r["text"]) for r in out] == [50, 120, 51], "nothing is truncated (raw is truncated at download)"
+    assert all(set(r) == {"text"} for r in out), "only what the build reads"
 
 
 def test_preprocess_batch_min_chars_is_inclusive() -> None:
     batch = pa.RecordBatch.from_pydict({"text": ["a" * 49, "b" * 50, "c" * 100]})
     out, stats = rp.preprocess_batch(batch, "text", "s", min_chars=50)
     assert stats == {"input_samples": 3, "removed_too_short": 1, "removed_invalid": 0, "output_samples": 2}
-    assert [(len(r["text"]), r["original_length"]) for r in out.to_pylist()] == [(50, 50), (100, 100)]
+    assert [len(r["text"]) for r in out] == [50, 100]
 
 
 def test_preprocess_batch_carries_the_tokens_column() -> None:
     batch = pa.RecordBatch.from_pydict({"text": ["a" * 5, "b" * 50], "tokens": [2, 12]})
     out, stats = rp.preprocess_batch(batch, "text", "s", min_chars=10)
-    assert out.schema == rp.FILTERED_SCHEMA_WITH_TOKENS and stats["output_samples"] == 1
-    assert out.to_pylist() == [{"text": "b" * 50, "source": "s", "original_length": 50, "tokens": 12}]
+    assert out == [{"text": "b" * 50, "tokens": 12}] and stats["output_samples"] == 1
 
 
-def test_preprocess_batch_all_invalid_or_short_returns_empty_with_schema() -> None:
+def test_preprocess_batch_all_invalid_or_short_returns_no_rows() -> None:
     batch = pa.RecordBatch.from_pydict({"text": [None, None]})
     out, stats = rp.preprocess_batch(batch, "text", "s", 50)
-    assert len(out) == 0 and out.schema == rp.FILTERED_SCHEMA
-    assert stats["removed_invalid"] == 2 and stats["output_samples"] == 0
+    assert out == [] and stats["removed_invalid"] == 2 and stats["output_samples"] == 0
 
     batch = pa.RecordBatch.from_pydict({"text": ["tiny", "tiny2"]})
     out, stats = rp.preprocess_batch(batch, "text", "s", 50)
-    assert len(out) == 0 and stats["removed_too_short"] == 2 and stats["output_samples"] == 0
+    assert out == [] and stats["removed_too_short"] == 2 and stats["output_samples"] == 0
 
 
 def test_preprocess_batch_uses_unicode_length() -> None:
     batch = pa.RecordBatch.from_pydict({"text": ["é" * 10, "é" * 9]})
     out, stats = rp.preprocess_batch(batch, "text", "s", min_chars=10)
     assert stats["output_samples"] == 1 and stats["removed_too_short"] == 1
-    assert out.to_pylist()[0]["text"] == "é" * 10 and out.to_pylist()[0]["original_length"] == 10
+    assert out == [{"text": "é" * 10}]
 
 
 def test_preprocess_batch_missing_text_field_raises() -> None:
