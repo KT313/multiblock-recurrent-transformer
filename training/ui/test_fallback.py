@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from training.ui.fallback import NoOpDashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 from training.ui.testing import STAGES, STEPS, TOTAL, FakeClock, metrics
 
 
@@ -26,10 +25,10 @@ def test_fallback_logs_one_line_per_interval_and_writes_the_log_file(tmp_path: P
         b.note_event("no checkpoint found, starting from scratch")
         for step in range(1, 13):
             clock.advance(2)
-            b.update_step(step, 0, metrics(step, loss=3.0))
-        b.update_step(18, 0, metrics(18, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}))
+            b.update_step(step, 0, None, metrics(step, loss=3.0))
+        b.update_step(18, 0, 0.5, metrics(18))
         b.update_validation(10, {"val_loss_4": 3.25, "val_loss": 3.125})
-        b.update_step(TOTAL, 1, metrics(TOTAL))  # the last step is always logged
+        b.update_step(TOTAL, 1, None, metrics(TOTAL))  # the last step is always logged
         with b.suspended():
             pass
     lines = [line.split(": ", 1)[1] for line in stream.getvalue().splitlines()]
@@ -49,8 +48,8 @@ def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
     stream = io.StringIO()
     with NoOpDashboard.open("r", STAGES, STEPS, TOTAL, stream=stream, clock=clock) as b:
         clock.advance(18)
-        b.update_step(18, 0, {"loss": 2.0, TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5})
-        b.update_step(TOTAL, 5, {})  # an unknown stage index renders as "?"
+        b.update_step(18, 0, 0.5, {"loss": 2.0})
+        b.update_step(TOTAL, 5, None, {})  # an unknown stage index renders as "?"
         b.update_validation(TOTAL, {})
     output = stream.getvalue()
     assert "step 18/30 | stage 0 pretrain | transition 50% | loss 2.0000 | s/step 1.00s | elapsed 0:00:18 | ETA 0:00:12" in output
@@ -60,9 +59,9 @@ def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
 def test_step_line_is_none_off_the_interval_and_records_the_throughput(clock: FakeClock) -> None:
     b = NoOpDashboard("r", STAGES, STEPS, TOTAL, log_step_interval=5, clock=clock)
     clock.advance(2)
-    assert b.step_line(1, 0, {}) is None and b.throughput.seconds_per_step == 2.0
+    assert b.step_line(1, 0, None, {}) is None and b.throughput.seconds_per_step == 2.0
     clock.advance(8)
-    assert b.step_line(5, 0, {"loss": 2.0}) == "step 5/30 | stage 0 pretrain | loss 2.0000 | s/step 2.00s | elapsed 0:00:10 | ETA 0:00:50"
+    assert b.step_line(5, 0, None, {"loss": 2.0}) == "step 5/30 | stage 0 pretrain | loss 2.0000 | s/step 2.00s | elapsed 0:00:10 | ETA 0:00:50"
 
 
 def test_fallback_rejects_mismatched_stage_lists() -> None:

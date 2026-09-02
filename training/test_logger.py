@@ -44,7 +44,6 @@ from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import TRAIN_LOG_NAME
 from training.ui.fallback import NoOpDashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 
 def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:
@@ -329,13 +328,16 @@ class RecordingDashboard:
     """A `Dashboard` that records every call (`RunLogger`'s side of the dashboard API, without a display)."""
 
     def __init__(self) -> None:
-        self.steps: list[tuple[int, int, dict[str, object]]] = []  # (step, stage index, the step dict as passed)
+        # (step, stage index, transition progress or None, the step dict as passed)
+        self.steps: list[tuple[int, int, float | None, dict[str, object]]] = []
         self.validations: list[tuple[int, dict[str, object]]] = []
         self.events: list[str] = []
         self.statuses: list[str] = []
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
-        self.steps.append((step, stage_index, dict(metrics)))
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
+        self.steps.append((step, stage_index, transition, dict(metrics)))
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         self.validations.append((step, dict(losses)))
@@ -475,9 +477,9 @@ def test_log_step_history_wandb_dict_and_throughput(
         assert metrics["data_composition/source_a"] == 1.0
         assert recorded[done] == metrics and not any(torch.is_tensor(v) for v in recorded[done].values())
     shown = recording(run_logger).steps
-    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0)]
-    for (_, _, step_dict), metrics in zip(shown, run_logger.history.values()):
-        assert step_dict == metrics | {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}  # no transition here
+    assert [(step, stage, transition) for step, stage, transition, _ in shown] == [(1, 0, None), (2, 0, None), (3, 0, None)]
+    for (_, _, _, step_dict), metrics in zip(shown, run_logger.history.values()):
+        assert step_dict == metrics  # exactly the wandb dict
         assert not any(torch.is_tensor(value) for value in step_dict.values())
     assert not any(r.getMessage().startswith("step ") for r in console_records.records)
 
@@ -496,7 +498,7 @@ def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.Mon
         progress.advance()
         run_logger.log_step(result, progress)
     assert run_logger.history == {} and sorted(recorded) == [1, 2]
-    assert [step for step, _, _ in recording(run_logger).steps] == [1, 2]
+    assert [step for step, _, _, _ in recording(run_logger).steps] == [1, 2]
     assert run_logger.close(progress, None).history == {}
 
 
@@ -520,9 +522,9 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
     shown = recording(run_logger).steps
-    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
-    assert shown[0][2] == {} and shown[2][2] == {}, "nothing is read from the step's tensors at a non-log step"
-    assert shown[1][2]["loss"] == 2.0 and shown[3][2]["step"] == 4
+    assert [(step, stage) for step, stage, _, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
+    assert shown[0][3] == {} and shown[2][3] == {}, "nothing is read from the step's tensors at a non-log step"
+    assert shown[1][3]["loss"] == 2.0 and shown[3][3]["step"] == 4
     second, fourth = run_logger.history[2], run_logger.history[4]
     assert second["seconds/step"] == 1.0 and second["tokens/second"] == TOKENS_PER_STEP
     assert second["data_composition/a"] == 0.25 and second["data_composition/b"] == 0.75
@@ -552,9 +554,8 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
     ]
     assert not any("transition" in r.getMessage() for r in console_records.records)
     shown = recording(run_logger).steps
-    assert [stage for _, stage, _ in shown] == [0] * 7 + [1] * 5  # done 6, 7: a's transition steps count for a
-    assert [d[TRANSITION_FLAG_KEY] for _, _, d in shown] == [0.0] * 5 + [1.0, 1.0] + [0.0] * 5
-    assert [d[TRANSITION_PROGRESS_KEY] for _, _, d in shown][5:7] == [0.0, 0.5]
+    assert [stage for _, stage, _, _ in shown] == [0] * 7 + [1] * 5  # done 6, 7: a's transition steps count for a
+    assert [transition for _, _, transition, _ in shown] == [None] * 5 + [0.0, 0.5] + [None] * 5
     assert [run_logger.history[d]["stage/in_transition"] for d in range(1, 13)] == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
     assert [run_logger.history[d]["stage/transition_progress"] for d in (7, 8)] == [0.0, 0.5]
     assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 8 + [1] * 4
@@ -805,7 +806,7 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
         assert (board.run_name, board.stage_names, board.steps_per_stage, board.total_steps) == ("steps", ["a", "b"], [8, 4], 12)
         assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cuda:0", "precision": "32"}
         assert board.log_step_interval == 3
-        board.update_step(6, 0, {"loss": 1.0})
+        board.update_step(6, 0, None, {"loss": 1.0})
     assert (tmp_path / TRAIN_LOG_NAME).exists() and "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 

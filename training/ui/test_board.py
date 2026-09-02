@@ -15,7 +15,6 @@ from rich.live import Live
 
 from data_preparation.lib.ui.capture import LineSink
 from training.ui.board import StageBar, TrainingDashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 from training.ui.testing import (
     BOX_CHARACTERS,
     LOGGER_NAME,
@@ -59,7 +58,7 @@ def test_stage_bars_and_overall_bar(board: TrainingDashboard) -> None:
     text = board.render_text()
     assert "▶ pretrain" in text and "  instruct" in text and "overall" in text
     assert "0/20" in text and "0/10" in text and "0/30" in text
-    board.update_step(7, 0, metrics(7))
+    board.update_step(7, 0, None, metrics(7))
     text = board.render_text()
     assert "7/20" in text and "0/10" in text and "7/30" in text and " 35%" in text and " 23%" in text
     assert [task.completed for task in board.tasks] == [7, 0, 7]
@@ -67,32 +66,31 @@ def test_stage_bars_and_overall_bar(board: TrainingDashboard) -> None:
 
 
 def test_stage_transition_moves_the_highlight(board: TrainingDashboard) -> None:
-    board.update_step(18, 0, metrics(18, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}))
+    board.update_step(18, 0, 0.5, metrics(18))
     text = board.render_text()
     assert "▶ pretrain" in text and "transition → instruct 50%" in text
-    board.update_step(23, 1, metrics(23))
+    board.update_step(23, 1, None, metrics(23))
     text = board.render_text()
     assert "✓ pretrain" in text and "▶ instruct" in text
     assert "20/20" in text and "3/10" in text and "23/30" in text
     assert "transition" not in text
 
 
-def test_transition_note_survives_steps_without_transition_keys(board: TrainingDashboard) -> None:
-    """With ``log_step_interval > 1`` the transition keys arrive only with a log step's dict; the note stays until a
-    dict says the transition ended or the stage moved on."""
-    board.update_step(18, 0, metrics(18, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}))
-    board.update_step(19, 0, {})  # a non-log step: an empty dict
+def test_transition_note_follows_the_transition_argument(board: TrainingDashboard) -> None:
+    """The note shows the transition progress passed with every step (log step or not) and goes when None comes."""
+    board.update_step(18, 0, 0.5, metrics(18))
+    board.update_step(19, 0, 0.5, {})  # a non-log step: an empty dict, the transition still on
     assert "transition → instruct 50%" in board.render_text()
-    board.update_step(20, 0, metrics(20, **{TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}))
-    assert "transition" not in board.render_text(), "the step dict says the transition is over"
-    board.update_step(20, 0, metrics(20, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 1.0}))
+    board.update_step(20, 0, None, metrics(20))
+    assert "transition" not in board.render_text(), "the transition is over"
+    board.update_step(20, 0, 1.0, metrics(20))
     assert "transition → instruct 100%" in board.render_text()
-    board.update_step(21, 1, {})  # the stage moved on without a word about the transition
+    board.update_step(21, 1, None, {})  # the stage moved on
     assert "transition" not in board.render_text() and "▶ instruct" in board.render_text()
 
 
 def test_last_stage_shows_no_transition_note(board: TrainingDashboard) -> None:
-    board.update_step(29, 1, metrics(29, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.9}))
+    board.update_step(29, 1, 0.9, metrics(29))
     assert "transition" not in board.render_text()
 
 
@@ -104,14 +102,14 @@ def test_stage_names_with_markup_characters_render_literally(clock: FakeClock) -
 def test_overall_bar_eta_from_the_injected_clock(board: TrainingDashboard, clock: FakeClock) -> None:
     assert "ETA —" in board.render_text() and "? steps/s" in board.render_text()
     clock.advance(20)
-    board.update_step(10, 0, metrics(10))  # 2 s/step, 20 steps left
+    board.update_step(10, 0, None, metrics(10))  # 2 s/step, 20 steps left
     text = board.render_text()
     assert "0.50 steps/s" in text and "0:00:20 elapsed" in text and "ETA 0:00:40" in text
     assert "0:00:20" in text and "0:00:40" in text  # the metrics table's elapsed / remaining columns
 
 
 def test_metrics_table_shows_the_latest_step(board: TrainingDashboard) -> None:
-    board.update_step(5, 0, metrics(5, loss=2.5, **{"seconds/step": 0.25}))
+    board.update_step(5, 0, None, metrics(5, loss=2.5, **{"seconds/step": 0.25}))
     text = board.render_text()
     assert "step 5" in text
     assert "2.5000" in text  # loss
@@ -125,15 +123,15 @@ def test_metrics_table_shows_the_latest_step(board: TrainingDashboard) -> None:
 
 
 def test_metrics_missing_from_a_step_keep_their_last_value(board: TrainingDashboard) -> None:
-    board.update_step(1, 0, metrics(1, loss=4.0))
-    board.update_step(2, 0, {"loss": 3.5})  # a non-log step: only the loss
+    board.update_step(1, 0, None, metrics(1, loss=4.0))
+    board.update_step(2, 0, None, {"loss": 3.5})  # a non-log step: only the loss
     assert board.latest_metrics["loss"] == 3.5 and board.latest_metrics["lr"] == 3e-4
     assert "3.5000" in board.render_text()
 
 
 def test_metrics_table_uses_the_loops_own_timing_without_seconds_per_step(board: TrainingDashboard, clock: FakeClock) -> None:
     clock.advance(4)
-    board.update_step(2, 0, metrics(2))
+    board.update_step(2, 0, None, metrics(2))
     assert "2.00s" in board.render_text()
 
 
@@ -148,9 +146,9 @@ def test_validation_losses_render_per_depth(board: TrainingDashboard) -> None:
 def test_events_list_keeps_the_last_lines(clock: FakeClock) -> None:
     with TrainingDashboard("r", STAGES, STEPS, TOTAL, event_lines=2, console=string_console(), clock=clock) as b:
         assert "(no events yet)" in b.render_text()
-        b.update_step(3, 0, metrics(3))
+        b.update_step(3, 0, None, metrics(3))
         b.note_event("saved checkpoint outputs/r/checkpoints/step-00000003-r.pth")
-        b.update_step(6, 0, metrics(6))
+        b.update_step(6, 0, None, metrics(6))
         b.note_event("starting transition 0 -> 1")
         b.note_event("saved checkpoint step-00000006-r.pth")
         events = b.events()
@@ -163,7 +161,7 @@ def test_events_list_keeps_the_last_lines(clock: FakeClock) -> None:
 
 def test_bars_for_a_zero_length_stage_render(clock: FakeClock) -> None:
     with TrainingDashboard("r", ["a", "empty", "b"], [5, 0, 5], 10, console=string_console(), clock=clock) as b:
-        b.update_step(5, 2, metrics(5))
+        b.update_step(5, 2, None, metrics(5))
         text = b.render_text()
         assert "✓ a" in text and "✓ empty" in text and "0/0" in text and "▶ b" in text
 
@@ -180,7 +178,7 @@ def test_rows_never_wrap_so_the_frame_height_does_not_depend_on_the_width(clock:
     with TrainingDashboard.open(
         "run-" * 10, [long_name, "b"], STEPS, TOTAL, details=details, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock
     ) as b:
-        b.update_step(18, 0, metrics(18, **{TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}))
+        b.update_step(18, 0, 0.5, metrics(18))
         b.update_validation(10, {f"val_loss_{depth}": 3.0 for depth in range(1, 12)})
         b.note_event("saved checkpoint " + "outputs/very/long/path/" * 6 + "step-00000018-run.pth")
         b.write("a log line " * 30)
@@ -244,7 +242,7 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during(clock
         logger.info("quiet")
         logger.warning("loud")
         logger.info("table:\n%s", table, extra={"keep": True})
-        b.update_step(3, 0, metrics(3))
+        b.update_step(3, 0, None, metrics(3))
         time.sleep(0.1)  # a few live frames
         assert [line.split(": ")[-1] for line in b.lines()[:2]] == ["quiet", "loud"]
         assert len(b.kept()) == 2
@@ -261,7 +259,7 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during(clock
 def test_final_frame_can_be_turned_off(clock: FakeClock) -> None:
     console = string_console()
     with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), final_frame=False, console=console, clock=clock) as b:
-        b.update_step(3, 0, metrics(3))
+        b.update_step(3, 0, None, metrics(3))
         logging.getLogger(LOGGER_NAME).warning("only this")
     screen = screen_text(console, 120)
     assert "only this" in screen and "overall" not in screen and "grad norm" not in screen
@@ -329,7 +327,7 @@ def test_suspended_clears_the_display_for_a_prompt_and_brings_it_back(clock: Fak
     console = string_console(80)
     real_out = sys.stdout
     with TrainingDashboard("r", STAGES, STEPS, TOTAL, console=console, clock=clock) as b:
-        b.update_step(3, 0, metrics(3))
+        b.update_step(3, 0, None, metrics(3))
         live = _live_of(b)
         assert live is not None
         with b.suspended():
@@ -348,7 +346,7 @@ def test_an_exception_inside_the_block_leaves_a_clean_scrollback(clock: FakeCloc
     real_out, real_err = sys.stdout, sys.stderr
     logger = logging.getLogger(LOGGER_NAME + ".exception")
     with pytest.raises(RuntimeError, match="loop broke"), TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logger, console=console, clock=clock) as b:
-        b.update_step(7, 0, metrics(7))
+        b.update_step(7, 0, None, metrics(7))
         logger.warning("last words")
         raise RuntimeError("loop broke")
     assert sys.stdout is real_out and sys.stderr is real_err and b._live is None
@@ -380,10 +378,10 @@ def test_a_failing_update_disables_the_display_once_and_falls_back(monkeypatch: 
     ) as b:
         logging.getLogger(LOGGER_NAME).warning("before the failure")
         monkeypatch.setattr(b, "_refresh_bars", _boom)
-        b.update_step(1, 0, metrics(1))  # must not raise
+        b.update_step(1, 0, None, metrics(1))  # must not raise
         assert _is_enabled(b) is False and b._live is None
         assert sys.stdout is real_out, "the terminal is restored the moment the display is disabled"
-        b.update_step(2, 0, metrics(2))  # the fallback now logs the step lines
+        b.update_step(2, 0, None, metrics(2))  # the fallback now logs the step lines
         b.update_validation(2, {"val_loss": 3.0})
         b.note_event("saved checkpoint x.pth")
         b.set_status("training")

@@ -20,9 +20,6 @@ METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("seconds/step", "s/step"),
     ("total_tokens", "tokens"),
 )
-TRANSITION_FLAG_KEY = "stage/in_transition"
-TRANSITION_PROGRESS_KEY = "stage/transition_progress"
-
 
 def format_duration(seconds: float | None) -> str:
     """``h:mm:ss`` (``Nd hh:mm:ss`` from one day on); ``—`` for unknown / non-finite / negative values."""
@@ -91,15 +88,6 @@ def floats(values: Mapping[str, object]) -> dict[str, float]:
 def known_metrics(metrics: Mapping[str, object]) -> dict[str, float]:
     """The metric-table keys present in ``metrics`` (in table order) as floats."""
     return floats({key: metrics[key] for key, _label in METRIC_COLUMNS if key in metrics})
-
-
-def transition_of(metrics: Mapping[str, object]) -> float | None:
-    """The transition progress (0-1) when the step dict says the step is inside a transition, else None."""
-    flag = as_float(metrics.get(TRANSITION_FLAG_KEY, 0))
-    if not flag:
-        return None
-    progress = as_float(metrics.get(TRANSITION_PROGRESS_KEY, 0.0))
-    return 0.0 if progress is None else progress
 
 
 def validation_line(step: int, losses: Mapping[str, object]) -> str:

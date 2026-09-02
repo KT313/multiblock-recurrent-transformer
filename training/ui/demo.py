@@ -15,7 +15,6 @@ from rich.console import Console
 
 from training.ui.common import KEEP, log
 from training.ui.dashboard import training_dashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 DEMO_STAGES = ["pretrain", "instruct"]
 DEMO_STEPS = [30, 20]
@@ -62,10 +61,8 @@ def demo(
                     "grad_norm": rng.uniform(0.5, 1.5),
                     "tokens/second": rng.uniform(9_000, 11_000),
                     "total_tokens": step * 8_192,
-                    TRANSITION_FLAG_KEY: float(in_transition),
-                    TRANSITION_PROGRESS_KEY: (step - 27) / 4 if in_transition else 0.0,
                 }
-                board.update_step(step, stage_index, metrics)
+                board.update_step(step, stage_index, (step - 27) / 4 if in_transition else None, metrics)
                 if step == 27:
                     board.note_event("starting transition 0 -> 1 (pretrain -> instruct)")
                 if step == 30:

@@ -39,7 +39,6 @@ from training.stage_manager import StageInfo, StageManager
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import KEEP, TRAIN_LOG_NAME
 from training.ui.dashboard import RunDashboard, training_dashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -182,7 +181,9 @@ class Dashboard(Protocol):
     """The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `NoOpDashboard` (the console fallback) satisfy it; tests pass a recording fake."""
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None: ...
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None: ...
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None: ...
 
@@ -415,8 +416,9 @@ class RunLogger:
         Every step: the data ids join the composition counter, a stage transition starting or ending with this step
         becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
         `last_validation`, and the dashboard's bars move (`update_step` with the stage containing `done` — the bar
-        whose steps are counting — plus the transition keys of `done`, and — only at log steps — the metric dict; at
-        every other step an empty dict: no tensor is read there, so no device sync is added to the thesis loop). At
+        whose steps are counting —, the transition progress at `done` (None outside a transition) and — only at log
+        steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
+        added to the thesis loop). At
         log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and, with `keep_history`, to
         `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
@@ -439,19 +441,16 @@ class RunLogger:
         at_done = self.stage_manager.get_stage_info(progress.step)
         self._note_transition(result.stage, at_done)
         validation = self._log_validation(result, progress)
-        transition = {
-            TRANSITION_FLAG_KEY: float(at_done.transition_to is not None),
-            TRANSITION_PROGRESS_KEY: at_done.transition_progress,
-        }
+        transition = at_done.transition_progress if at_done.transition_to is not None else None
         if progress.step % self.settings.log_step_interval != 0:
-            self.dashboard.update_step(progress.step, at_done.stage_idx, {})
+            self.dashboard.update_step(progress.step, at_done.stage_idx, transition, {})
             return
         metrics = self._step_metrics(result, progress, validation)
         self.wandb.log(metrics, step=progress.step)
         if self.keep_history:
             self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
-        self.dashboard.update_step(progress.step, at_done.stage_idx, metrics | transition)
+        self.dashboard.update_step(progress.step, at_done.stage_idx, transition, metrics)
 
     def _note_transition(self, before: StageInfo, after: StageInfo) -> None:
         """The two transition events: after the last plain step of a stage ("starting transition") and after the

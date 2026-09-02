@@ -21,7 +21,6 @@ from training.ui.format import (
     format_metric,
     known_metrics,
     status_line,
-    transition_of,
     validation_line,
 )
 from training.ui.throughput import Throughput
@@ -123,14 +122,16 @@ class NoOpDashboard:
             return self.stage_names[stage_index]
         return "?"
 
-    def step_line(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> str | None:
+    def step_line(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> str | None:
         """Record ``step`` for the throughput estimate and return the step's log line — None at a step that is not
-        logged (every ``log_step_interval``\\ th step and the last one are)."""
+        logged (every ``log_step_interval``\\ th step and the last one are). ``transition`` is the progress of the
+        running stage transition, None outside one."""
         self.throughput.record(step)
         if step % self.log_step_interval and step < self.total_steps:
             return None
         parts = [f"step {step}/{self.total_steps}", f"stage {stage_index} {self._stage_name(stage_index)}"]
-        transition = transition_of(metrics)
         if transition is not None:
             parts.append(f"transition {transition:.0%}")
         known = known_metrics(metrics)
@@ -141,8 +142,10 @@ class NoOpDashboard:
         parts.append(f"ETA {format_duration(self.throughput.remaining(step))}")
         return " | ".join(parts)
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
-        text = self.step_line(step, stage_index, metrics)
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
+        text = self.step_line(step, stage_index, transition, metrics)
         if text is not None:
             log.info(text)
 
