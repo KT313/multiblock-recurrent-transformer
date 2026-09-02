@@ -571,78 +571,76 @@ def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
 @torch.no_grad()
 def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, torch.Tensor]:
     """Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
-    and before `zero_grad()`."""
+    and before `zero_grad()`.
+
+    One pass over the parameters in optimizer-group order (the order the `avg_RMS` sum and the
+    `local_l1_grad_norm` mean accumulate in), each parameter classified by its name once and its optimizer state
+    looked up once: `query_grad_<i>` / `ffn2_grad_<i>` number the fused-qkv and MLP-projection weights that have a
+    gradient (NaN for a non-finite one), the `*_effective_lr_<i>` keys number those among them that also have a
+    finite gradient and Adam state.
+    """
     metrics: dict[str, torch.Tensor] = {}
     dims = _qkv_dims(model)
     transformer = getattr(model, "transformer", None)
     wte_module: Optional[Module] = getattr(transformer, "wte", None)
     wte_weight: Optional[torch.Tensor] = getattr(wte_module, "weight", None)
+    names = {id(param): name for name, param in model.named_parameters()}
 
-    # Specific gradient norms
-    qkv_layer_counter, mlp_layer_counter = 0, 0
-    qkv_params: list[torch.Tensor] = []
-    proj_params: list[torch.Tensor] = []
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            if "qkv" in name and "weight" in name:
-                qkv_params.append(param)
-                if (~torch.isfinite(param.grad)).sum() == 0:
-                    if dims is not None and param.grad.numel() % dims[0] == 0:
-                        q_grad = param.grad.view(-1, dims[0])[: dims[1], :]
-                        metrics[f"query_grad_{qkv_layer_counter}"] = q_grad.norm()
-                else:
-                    metrics[f"query_grad_{qkv_layer_counter}"] = torch.as_tensor(float("NaN"))
-                qkv_layer_counter += 1
-            if "mlp" in name and "proj" in name and "weight" in name:
-                proj_params.append(param)
-                if (~torch.isfinite(param.grad)).sum() == 0:
-                    metrics[f"ffn2_grad_{mlp_layer_counter}"] = param.grad.norm()
-                else:
-                    metrics[f"ffn2_grad_{mlp_layer_counter}"] = torch.as_tensor(float("NaN"))
-                mlp_layer_counter += 1
-
-    # 2nd moment quality and effective learning rates
+    grad_qkv_layer, grad_mlp_layer = 0, 0  # `query_grad_<i>` / `ffn2_grad_<i>`
+    lr_qkv_layer, lr_mlp_layer = 0, 0  # `*_effective_lr_<i>`
     total_rms: torch.Tensor | float = 0.0
     num_params_with_grad = 0
-    qkv_layer_counter, mlp_layer_counter = 0, 0
-    params_with_finite_grad = []
+    finite_grads: list[torch.Tensor] = []
     for group in optimizer.param_groups:
         for param in group["params"]:
-            if param.grad is not None and (~torch.isfinite(param.grad)).sum() == 0:
-                params_with_finite_grad.append(param)
-                if param in optimizer.state and "exp_avg_sq" in optimizer.state[param]:
-                    exp_avg_sq = optimizer.state[param]["exp_avg_sq"]
-                    if exp_avg_sq.shape == param.grad.shape:
-                        rms = (
-                            param.grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
-                        )
-                        total_rms += rms
-                        num_params_with_grad += 1
-                        if wte_weight is not None and param is wte_weight:
-                            metrics["embed_RMS"] = rms
-
-                        if any(param is p for p in qkv_params):  # identity check, `in` would compare values
-                            qkv_lr = _reverse_engineer_adam_effective_lr(param, optimizer.state[param], group)
-                            if dims is not None and qkv_lr.numel() % dims[0] == 0:
-                                H, dim_q, dim_kv = dims
-                                qkv_lr = qkv_lr.view(-1, H)
-                                metrics[f"q_effective_lr_{qkv_layer_counter}"] = qkv_lr[:dim_q, :].mean()
-                                metrics[f"k_effective_lr_{qkv_layer_counter}"] = qkv_lr[dim_q : dim_q + dim_kv, :].mean()
-                                metrics[f"v_effective_lr_{qkv_layer_counter}"] = qkv_lr[dim_q + dim_kv :, :].mean()
-                            qkv_layer_counter += 1
-
-                        if any(param is p for p in proj_params):
-                            proj_lr = _reverse_engineer_adam_effective_lr(param, optimizer.state[param], group)
-                            metrics[f"ffn2_effective_lr_{mlp_layer_counter}"] = proj_lr.mean()
-                            mlp_layer_counter += 1
+            grad = param.grad
+            if grad is None:
+                continue
+            name = names.get(id(param), "")
+            is_qkv = "qkv" in name and "weight" in name
+            is_proj = "mlp" in name and "proj" in name and "weight" in name
+            finite = bool(torch.isfinite(grad).all())
+            if is_qkv:
+                if not finite:
+                    metrics[f"query_grad_{grad_qkv_layer}"] = torch.as_tensor(float("NaN"))
+                elif dims is not None and grad.numel() % dims[0] == 0:
+                    metrics[f"query_grad_{grad_qkv_layer}"] = grad.view(-1, dims[0])[: dims[1], :].norm()
+                grad_qkv_layer += 1
+            if is_proj:
+                metrics[f"ffn2_grad_{grad_mlp_layer}"] = grad.norm() if finite else torch.as_tensor(float("NaN"))
+                grad_mlp_layer += 1
+            if not finite:
+                continue
+            finite_grads.append(grad)
+            state = optimizer.state.get(param)
+            if state is None:
+                continue
+            exp_avg_sq = state.get("exp_avg_sq")
+            if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
+                continue
+            rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
+            total_rms += rms
+            num_params_with_grad += 1
+            if wte_weight is not None and param is wte_weight:
+                metrics["embed_RMS"] = rms
+            if is_qkv:
+                qkv_lr = _reverse_engineer_adam_effective_lr(param, state, group)
+                if dims is not None and qkv_lr.numel() % dims[0] == 0:
+                    H, dim_q, dim_kv = dims
+                    qkv_lr = qkv_lr.view(-1, H)
+                    metrics[f"q_effective_lr_{lr_qkv_layer}"] = qkv_lr[:dim_q, :].mean()
+                    metrics[f"k_effective_lr_{lr_qkv_layer}"] = qkv_lr[dim_q : dim_q + dim_kv, :].mean()
+                    metrics[f"v_effective_lr_{lr_qkv_layer}"] = qkv_lr[dim_q + dim_kv :, :].mean()
+                lr_qkv_layer += 1
+            if is_proj:
+                metrics[f"ffn2_effective_lr_{lr_mlp_layer}"] = _reverse_engineer_adam_effective_lr(param, state, group).mean()
+                lr_mlp_layer += 1
 
     if num_params_with_grad > 0:
         metrics["avg_RMS"] = torch.as_tensor(total_rms / num_params_with_grad)  # already a Tensor after one add
 
-    if len(params_with_finite_grad) > 0:
-        metrics["local_l1_grad_norm"] = torch.mean(
-            torch.stack([torch.norm(p.grad.detach(), 1.0) for p in params_with_finite_grad])
-        )
+    if finite_grads:
+        metrics["local_l1_grad_norm"] = torch.mean(torch.stack([torch.norm(grad.detach(), 1.0) for grad in finite_grads]))
 
     # Parameter norms
     metrics["l2_param_norm"] = torch.norm(torch.stack([torch.norm(p.detach()) for p in model.parameters()]))
