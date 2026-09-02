@@ -415,7 +415,8 @@ def _ensure_prepared(
 ) -> None:
     """Verify the dataset on disk; prepare what is missing when `auto_prepare` allows it, else raise.
 
-    Auto-prepare never deletes or truncates raw data and never prompts: it runs `prepare` with `assume_yes=False`
+    Auto-prepare never confirms a repair (raw deletions and truncations, processed folders whose manifest cannot be
+    parsed) and never prompts: it runs `prepare` with `assume_yes=False`
     and a `confirm` that always declines, so a stale or outdated raw folder — or a broken one whose truncation
     would drop healthy shards — fails the run with the list of folders `prepare.py` would ask about and the
     `prepare.py prepare ... --yes` command that confirms the repair. `should_stop` is the run's stop request (the CLI's Ctrl-C):
@@ -449,7 +450,7 @@ def _ensure_prepared(
                 )
             except ConfirmationRequired as err:
                 raise RuntimeError(
-                    f"{err.message.rstrip()}\nauto-prepare never deletes or truncates raw data; to confirm the repair run:\n  "
+                    f"{err.message.rstrip()}\nauto-prepare never confirms a repair; to confirm it run:\n  "
                     + build_command(settings.dataset_config, settings.dataset_dir)
                     + " --yes"
                 ) from err

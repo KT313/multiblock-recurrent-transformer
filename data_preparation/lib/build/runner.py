@@ -95,7 +95,8 @@ def prepare(
     """Materialise the dataset config at ``config_path`` under ``dataset_dir`` (see the module docstring) and return
     its status.
 
-    ``assume_yes`` confirms the deletion of stale / outdated raw folders without asking; otherwise ``confirm`` (or
+    ``assume_yes`` answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
+    cannot be parsed) without asking; otherwise ``confirm`` (or
     the terminal) is asked once and a refusal raises :class:`ConfirmationRequired` before anything is changed.
     ``dry_run`` reports what the repair and the first round would do and writes nothing (not even the lock file); its
     report is the one :func:`status` gives for the same tree, the repairs it did not perform included.

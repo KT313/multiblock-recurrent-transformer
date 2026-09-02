@@ -249,10 +249,12 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
   and the next download resumes there (when no prefix can be kept, it is queued for the same confirmed deletion).
   Shards without a manifest are an error (nothing says where those rows came from).
 - **processed** (derived, cheap): deleted without confirmation when stale, broken, without a manifest, built from
-  raw shards that no longer exist, or when its raw folder is being deleted; a leftover `.tmp` folder goes too.
+  raw shards that no longer exist, or when its raw folder is being deleted; a leftover `.tmp` folder goes too. The
+  one processed deletion that asks is a manifest that cannot be parsed: it joins the confirmation below, and the
+  build refuses such a folder until then.
 
-Nothing is touched until every folder was inspected; the queued raw deletions are confirmed **once**, with one
-list ("The following raw folders will be deleted and downloaded again: fineweb_edu: outdated: max_seq_length 2048
+Nothing is touched until every folder was inspected; the queued confirmations are answered **once**, with one
+list ("The following folders will be deleted or truncated (...): fineweb_edu: outdated: max_seq_length 2048
 -> 4096 ... Continue? [y/N]"). `--yes` answers it; without a terminal and without `--yes` the command prints the
 list and exits 2 with nothing changed. `train.py`'s auto-prepare never prompts and **never deletes raw**: it fails
 with the same list and the `prepare.py prepare --yes` command. Lowering `max_seq_length` never touches raw (rows are

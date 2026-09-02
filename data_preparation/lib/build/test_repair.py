@@ -201,7 +201,7 @@ def test_refused_truncation_past_healthy_shards_changes_nothing(
         repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
     assert _snapshot(layout.root) == before, "refused: not even the prefix truncation of that folder"
     assert _kinds(info.value.report) == [("a", "raw", "truncate"), ("a", "processed", "delete")]
-    assert [action.source for action in info.value.report.raw_confirmations_planned()] == ["a"]
+    assert [action.source for action in info.value.report.confirmations_planned()] == ["a"]
     assert raw_deletions_planned(info.value.report) == [], "a truncation is not a deletion"
     # non-interactive without --yes: the same abort with nothing changed
     monkeypatch.setattr(sys, "stdin", io.StringIO())  # not a tty
@@ -246,7 +246,7 @@ def test_one_prompt_covers_deletions_and_confirmable_truncations(
     assert not layout.raw_dir("a").exists()
     manifest = Manifest.load(layout.raw_dir("b"))
     assert manifest is not None and len(manifest.shards) == 1
-    assert [action.source for action in report.raw_confirmations_planned()] == ["a", "b"]
+    assert [action.source for action in report.confirmations_planned()] == ["a", "b"]
 
 
 def test_processed_covering_only_the_kept_prefix_survives_a_truncation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -367,14 +367,21 @@ def test_the_same_stray_on_a_complete_folder_is_still_deleted(cfg_factory: CfgFa
     assert not folder.exists()
 
 
-def test_an_unreadable_processed_manifest_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """Derived data is deleted without asking; a corrupt processed MANIFEST.json used to abort the run instead."""
+def test_an_unreadable_processed_manifest_is_deleted_only_after_confirmation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """A corrupt processed MANIFEST.json is corruption worth a look: its deletion joins the one confirmation instead
+    of going through as ordinary derived data."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     folder = layout.processed_dir("a")
     (folder / "MANIFEST.json").write_text("{ not json")
-    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
-    assert _kinds(report) == [("a", "processed", "delete")]
-    assert report.actions[0].reason == "unreadable manifest"
+    with pytest.raises(ConfirmationRequired) as info:
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
+    assert folder.exists() and "a: unreadable manifest" in info.value.message
+    assert _kinds(info.value.report) == [("a", "processed", "delete")]
+    assert [action.source for action in info.value.report.confirmations_planned()] == ["a"]
+    prompts: list[str] = []
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(prompts, True))
+    assert len(prompts) == 1 and prompts[0].startswith(CONFIRMATION_HEADER)
+    assert _kinds(report) == [("a", "processed", "delete")] and report.actions[0].reason == "unreadable manifest"
     assert not folder.exists()
 
 

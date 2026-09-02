@@ -271,6 +271,20 @@ def test_build_rebuilds_when_shards_predate_the_columns_or_raw_changed(
     assert read_rows(processed) == rows
 
 
+def test_build_refuses_a_processed_manifest_it_cannot_parse(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    """The build never deletes a folder whose manifest is corrupt: the repair step does, after confirmation."""
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local)
+    build_source(cfg, "s", layout)
+    processed = layout.processed_dir("s")
+    rows = read_rows(processed)
+    (processed / "MANIFEST.json").write_text("{ not json")
+    with pytest.raises(RuntimeError, match="cannot be parsed; the repair step deletes the folder after confirmation"):
+        build_source(cfg, "s", layout)
+    assert read_rows(processed) == rows, "nothing was deleted"
+
+
 def test_stale_rebuild_removes_the_shards_of_the_previous_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:

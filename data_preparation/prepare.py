@@ -10,14 +10,14 @@
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 
 ``prepare`` materialises a dataset config: tokenizer → repair → (download + build) rounds → status table
-(``lib/build/runner.py``). Stale or outdated raw folders are deleted and downloaded again only after a confirmation
-on the terminal; ``--yes`` answers it, and without a terminal the command prints the list and exits 2 — nothing is
+(``lib/build/runner.py``). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
+manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; ``--yes`` answers it, and without a terminal the command prints the list and exits 2 — nothing is
 changed. ``status`` prints what the repair step would do and the status table and exits 0 iff the dataset is
 complete. ``describe`` renders the config as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir``
 relocates the HuggingFace caches.
 
-Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed raw
-deletion, 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
+Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
+repair, 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
 kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
 the tables) and the final status table are printed once it closed.
 """
@@ -99,7 +99,7 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
 def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
     sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
-    sub.add_argument("--yes", "-y", action="store_true", help="delete stale / outdated raw folders without asking")
+    sub.add_argument("--yes", "-y", action="store_true", help="answer the repair confirmation (stale / outdated raw folders, unparsable processed manifests) without asking")
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
     sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")

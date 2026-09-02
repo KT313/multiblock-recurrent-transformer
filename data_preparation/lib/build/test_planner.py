@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from data_preparation.lib.build.repair import ConfirmationRequired
+
 from data_preparation.dataset_config import (
     DatasetConfig,
     ProcessingConfig,
@@ -321,8 +323,8 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
 
 def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`Manifest.load` raises next to shards — right for raw, wrong for the derived processed folder the repair step
-    deletes without asking: `status` (and `prepare --dry_run`, and training's auto-prepare) must report it."""
+    """`Manifest.load` raises next to shards — right for raw, wrong for a processed folder the repair step deletes
+    (after confirmation): `status` (and `prepare --dry_run`, and training's auto-prepare) must report it."""
     cfg = two_stage_cfg()
     path = config_file(cfg)
     prepare(path, layout.root, assume_yes=False)
@@ -336,7 +338,9 @@ def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: Dataset
 
     report = status(path, layout.root)  # used to crash with "unreadable manifest ... next to shards"
     assert not report.complete and "b" in report.missing() and "b" in report.needs_repair
-    assert prepare(path, layout.root, assume_yes=False).complete  # and the repair step heals it
+    with pytest.raises(ConfirmationRequired):  # the repair step heals it, but only after the user confirmed
+        prepare(path, layout.root, assume_yes=False)
+    assert prepare(path, layout.root, assume_yes=True).complete
 
 
 def test_short_processed_folder_is_not_satisfied(layout: DatasetLayout, config_file: ConfigFile) -> None:

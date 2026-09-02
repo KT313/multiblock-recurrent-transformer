@@ -245,9 +245,15 @@ class ProcessedOutput:
         """The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
         raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one — and
         the folder is deleted first, so no shard of the previous build survives unlisted (a per-shard publisher
-        overwrites only the names it reuses)."""
+        overwrites only the names it reuses). A manifest that cannot be parsed is never deleted here: the repair
+        step does that, after the user confirmed."""
         if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
             return cls(assessment.manifest, processed_dir, is_new=False)
+        if assessment.problem == "unreadable_manifest":
+            raise RuntimeError(
+                f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
+                "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
+            )
         if assessment.problem != "absent":
             log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
         if processed_dir.exists():

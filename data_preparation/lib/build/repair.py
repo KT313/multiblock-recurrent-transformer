@@ -18,7 +18,8 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   cheapest repair — and this step performs exactly that repair, never more. A rebuild is a deletion without
   confirmation: stale, broken, without a manifest, unlisted stray shards, built from raw shards that no longer
   exist (its ``input_shards`` is not a prefix of the raw shard list — e.g. after a truncation), or its
-  raw folder is being deleted. The one exception is the crash leftover of an interrupted per-shard build — a single
+  raw folder is being deleted — except a manifest that cannot be parsed, whose deletion joins the one
+  confirmation (corruption worth a look first). The other exception is the crash leftover of an interrupted per-shard build — a single
   unlisted file that is exactly the next shard the resumed build writes: it is left alone (the build overwrites
   it). The rename-aside swap of an all-at-once build (``lib/stages/build.py:_swap_into_place``) can be interrupted
   too: a **complete** ``processed/<name>.tmp`` (its own manifest is current and every shard verifies) next to a
@@ -26,12 +27,13 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
   ``.tmp`` is removed as the leftover of an interrupted build, and a leftover ``processed/<name>.old`` (the folder
   the swap already replaced) is removed without asking.
 
-Nothing is touched until every folder was inspected; the queued raw deletions and healthy-shard-dropping
-truncations are then confirmed **once** with one list, and only then is anything deleted or truncated.
+Nothing is touched until every folder was inspected; the queued raw deletions, healthy-shard-dropping
+truncations and unparsable-manifest deletions are then confirmed **once** with one list, and only then is anything
+deleted or truncated.
 ``dry_run=True`` (``prepare.py status``) records what would be done and touches nothing (the report's ``performed``
 stays False). A refused or impossible confirmation raises :class:`ConfirmationRequired` with the same list and
 **nothing** is changed — not even the unconfirmed repairs; ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never
-deletes or truncates raw.
+confirms a repair.
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ FolderKind = Literal["raw", "processed"]
 RepairVerb = Literal["delete", "truncate", "swap"]
 Confirm = Callable[[str], bool]
 
-CONFIRMATION_HEADER = "The following raw folders will be deleted or truncated, the dropped rows downloaded again:"
+CONFIRMATION_HEADER = "The following folders will be deleted or truncated (raw: the dropped rows are downloaded again; processed: rebuilt from raw):"
 CONFIRMATION_QUESTION = "Continue? [y/N] "
 YES_ANSWERS = ("y", "yes")
 
@@ -90,7 +92,7 @@ class RepairAction:
     kind: FolderKind
     action: RepairVerb
     reason: str
-    needs_confirmation: bool = False  # a truncation dropping healthy shards after the broken one; deletions of raw always ask
+    needs_confirmation: bool = False  # joins the one confirmation: a truncation dropping healthy shards, a processed manifest that cannot be parsed; raw deletions always ask
     keep_shards: int | None = None  # truncations: the good prefix the inspection found (`good_prefix_length`)
 
     def describe(self) -> str:
@@ -112,10 +114,11 @@ class RepairReport:
         prefix = "" if self.performed else "would "
         return "\n".join(prefix + action.describe() for action in self.actions)
 
-    def raw_confirmations_planned(self) -> list[RepairAction]:
-        """The raw actions the one confirmation covers: every queued deletion, and every truncation that would drop
-        healthy shards after the broken one (a tail-only truncation repairs without asking)."""
-        return [action for action in self.actions if action.kind == "raw" and (action.action == "delete" or action.needs_confirmation)]
+    def confirmations_planned(self) -> list[RepairAction]:
+        """The actions the one confirmation covers: every queued raw deletion, every truncation that would drop
+        healthy shards after the broken one (a tail-only truncation repairs without asking), and the deletion of a
+        processed folder whose manifest cannot be parsed."""
+        return [action for action in self.actions if (action.kind == "raw" and action.action == "delete") or action.needs_confirmation]
 
 
 # --- the step ------------------------------------------------------------------------------------------------------------
@@ -146,9 +149,9 @@ def repair_broken_and_stale_folders(
         inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, planned)
     if dry_run:
         return planned
-    queued = planned.raw_confirmations_planned()
+    queued = planned.confirmations_planned()
     if queued:
-        confirm_raw_deletions(queued, planned, assume_yes=assume_yes, confirm=confirm)
+        confirm_repairs(queued, planned, assume_yes=assume_yes, confirm=confirm)
     perform_repairs(planned)
     return planned
 
@@ -190,13 +193,16 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
     (None: the raw folder is being deleted): the shared verdict of
     :func:`~data_preparation.lib.build.assessment.assess_processed_folder` decides, and this step performs exactly
     the cheapest repair the verdict attaches — a ``rebuild`` is a deletion (derived data needs no confirmation, the
-    build writes the folder again), everything else is left alone. In particular the single crash leftover of an
+    build writes the folder again), everything else is left alone. The one deletion that asks is a manifest that
+    cannot be parsed: it joins the run's single confirmation, since corruption there is worth a look before the
+    folder goes. In particular the single crash leftover of an
     interrupted per-shard build (an unlisted file that is exactly the next shard the resumed build writes) is no
     longer treated as corruption: the build overwrites it, so deleting the whole folder would redo the entire
     cleaning for one file."""
     assessment = assess_processed_folder(config, name, folder, raw_shards)
     if assessment.repair == "rebuild":
-        _plan(report, name, folder, "processed", "delete", assessment.reason)
+        asks = assessment.problem == "unreadable_manifest"
+        _plan(report, name, folder, "processed", "delete", assessment.reason, needs_confirmation=asks)
     elif assessment.problem == "crash_leftover":
         log.info("%s: leaving %s alone (%s)", name, folder, assessment.reason)
 
@@ -237,13 +243,13 @@ def confirmation_message(queued: list[RepairAction]) -> str:
     return "\n".join(lines)
 
 
-def confirm_raw_deletions(queued: list[RepairAction], planned: RepairReport, *, assume_yes: bool, confirm: Confirm | None) -> None:
-    """Ask once for all ``queued`` raw deletions and truncations; return when they may proceed, raise
+def confirm_repairs(queued: list[RepairAction], planned: RepairReport, *, assume_yes: bool, confirm: Confirm | None) -> None:
+    """Ask once for all ``queued`` repairs (:meth:`RepairReport.confirmations_planned`); return when they may proceed, raise
     :class:`ConfirmationRequired` (carrying the planned report) otherwise. ``assume_yes`` answers without asking,
     ``confirm`` replaces the terminal prompt, and without either the question is put on stdin only when it is a
     terminal."""
     if assume_yes:
-        log.warning("repairing %d raw folder(s) without asking (assume_yes): %s", len(queued), ", ".join(action.source for action in queued))
+        log.warning("repairing %d folder(s) without asking (assume_yes): %s", len(queued), ", ".join(action.source for action in queued))
         return
     message = confirmation_message(queued)
     if confirm is not None:
