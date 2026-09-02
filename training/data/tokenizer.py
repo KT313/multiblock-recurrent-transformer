@@ -15,9 +15,9 @@ _PAD_ID_FALLBACKS = ("pad_token_id", "unk_token_id", "eos_token_id")
 def resolve_pad_id(processor: object, path: Path) -> int:
     """The id used for padding and for masking labels.
 
-    Tokenizers without a pad token (the Llama tokenizer of the thesis run) fall back to the unk token, as the thesis
-    code effectively did (`pad_id or 0` = Llama's `<unk>`), then to EOS. Pad positions in the inputs are replaced by
-    EOS in the collate function anyway; in the labels they become the ignore index.
+    Tokenizers without a pad token (the Llama tokenizer) fall back to the unk token (Llama's `<unk>`, id 0), then to
+    EOS. Pad positions in the inputs are replaced by EOS in the collate function anyway; in the labels they become
+    the ignore index.
     """
     for attr in _PAD_ID_FALLBACKS:
         token_id = cast(int | None, getattr(processor, attr, None))

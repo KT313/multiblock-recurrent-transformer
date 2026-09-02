@@ -1,7 +1,7 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """Logging of a training run: the thin wandb wrapper (`Logger`, offline by default), the gradient / parameter metric
-helpers that were logged, and `RunLogger` — every console line, timer and counter of a run in one place, driving the
-terminal dashboard and ending in a `TrainingReport`.
+helpers, and `RunLogger` — every console line, timer and counter of a run in one place, driving the terminal
+dashboard and ending in a `TrainingReport`.
 
 `RunLogger` never prints. What a run shows on the terminal goes through two channels, both owned by the dashboard of
 `training.ui` for the duration of the run (`open_dashboard`, entered by `RunLogger.open`: the live
@@ -366,8 +366,8 @@ class RunLogger:
         """Release what the logger holds — the dashboard included, so the terminal is restored on an exception and
         on a Ctrl-C too; idempotent (`close()` normally ran before).
 
-        Every resource is released even when an earlier release raises: a failing `wandb.finish()` used to leave the
-        terminal with the dashboard's redirected streams and a hidden cursor. The first failure is the one raised
+        Every resource is released even when an earlier release raises: a failing `wandb.finish()` must not leave
+        the terminal with the dashboard's redirected streams and a hidden cursor. The first failure is the one raised
         (the later ones would only mask it; the exception that ended the run, if any, stays its `__context__`).
         """
         failures: list[BaseException] = []
@@ -400,7 +400,7 @@ class RunLogger:
     @contextmanager
     def evaluating(self) -> Iterator[None]:
         """Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
-        next to the validation metrics of that step in `log_step`, as the thesis loop reported it."""
+        next to the validation metrics of that step in `log_step`."""
         started = self._clock()
         with self._status_during("evaluating"):
             try:
@@ -440,8 +440,7 @@ class RunLogger:
         `last_validation`, and the dashboard's bars move (`update_step` with the stage containing `done` — the bar
         whose steps are counting —, the transition progress at `done` (None outside a transition) and — only at log
         steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
-        added to the thesis loop). At
-        log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and, with `keep_history`, to
+        added). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and, with `keep_history`, to
         `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
         * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR), `grad_norm`

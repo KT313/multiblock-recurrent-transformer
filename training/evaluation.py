@@ -8,8 +8,7 @@ validation loader (one `iter()`, and each `iter(DataLoader)` draws a base seed f
 every depth on the batch in hand before the next batch is fetched — depths in `partial_depth_eval` order first, the
 mean recurrence last, at most `eval_iters` batches, `model.eval()` / `model.train()` around it, `torch.no_grad()`.
 Every depth therefore sees exactly the same batches (a paired comparison) and the mean is over the batches actually
-delivered, not over the planned `eval_iters` (which a short validation split cannot fill). This departs from the
-thesis loop, which iterated the loader once per depth and divided by `eval_iters`; both changes are pinned by
+delivered, not over the planned `eval_iters` (which a short validation split cannot fill). Both are pinned by
 `training/golden_tiny_run.json`.
 """
 

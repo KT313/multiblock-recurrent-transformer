@@ -58,8 +58,9 @@ the rule of ``DATA_PREP_PROGRESS``) and otherwise the :class:`~training.ui.fallb
 the same four methods: the console fallback, which writes the same log file and logs one line per
 ``log_step_interval`` steps, one per validation and one per event (so a piped or ``nohup`` run still has a readable
 log; it captures nothing). Both attach the ``training`` logger for the duration of the block: its plain stream
-handlers are swapped for the dashboard's handler plus a file handler for ``log_file`` and restored afterwards; their
-own lines go through ``training.ui.common.lines_log`` to the log file (and, for the fallback, the console).
+handlers are swapped for the dashboard's handler plus one file handler for ``log_file`` and restored afterwards; their
+own lines go through ``training.ui.common.lines_log`` — which shares that file handler — to the log file (and, for
+the fallback, the console).
 
 A dashboard failure must never end a training run: every public method of ``TrainingDashboard`` catches its own
 exceptions, closes the display (restoring the terminal), logs one warning and from then on behaves like the

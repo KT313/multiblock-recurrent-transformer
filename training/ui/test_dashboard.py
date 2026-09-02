@@ -70,8 +70,8 @@ def _check_frame(frame: str, height: int, log_lines: int, event_lines: int) -> N
 
 
 def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: FakeClock) -> None:
-    """The way ``train()`` / ``RunLogger`` will drive the dashboard (task 10 of the training restructure plan), while
-    log records, stray prints, a bare stderr write and a third-party logger with its own stderr handler fire."""
+    """The way ``train()`` / ``RunLogger`` drive the dashboard, while log records, stray prints, a bare stderr write
+    and a third-party logger with its own stderr handler fire."""
     logger = logging.getLogger("training")  # as in a run: `RunLogger` logs under `training`, the sinks too
     library = logging.getLogger("fake_datasets_library")
     library_handler = logging.StreamHandler(sys.stderr)

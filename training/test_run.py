@@ -96,7 +96,7 @@ def test_stop_requested() -> None:
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
-    """`build_stage_manager` is today's seven-argument constructor call: budgets of the resolved stages, batch and
+    """`build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
     block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
@@ -704,7 +704,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
 
 
 # --------------------------------------------------------------------------------------------------------------
-# golden run: the numerics oracle of the training-pipeline restructure (tasks/training_pipeline_restructure.md)
+# golden run: the numerics oracle of the training loop (`training/testing/golden.py`)
 
 
 @pytest.mark.slow

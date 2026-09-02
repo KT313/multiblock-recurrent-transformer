@@ -17,10 +17,9 @@
 Steps are OPTIMIZER steps (one world batch each). Nothing in `train()` touches a tensor, a device, `torch.*`, a clock
 or `print`: the numerics live in `step.py` and `evaluation.py`, device code in `backend/`, every console line, timer
 and the terminal dashboard (`training/ui/`, entered by `RunLogger.open`, torn down by its `__exit__` on every way out
-of the `with` block; `train()` only sets its status) in `logger.py`. The order of the setup is itself numerics
-(`tasks/training_pipeline_restructure.md`, section 3): seed, then the dataset and the loaders (no torch RNG draw),
-then the model — its parameter init is the first consumer of the global torch RNG — then the optimizer and the
-resume, which restores the stored RNG state.
+of the `with` block; `train()` only sets its status) in `logger.py`. The order of the setup is itself numerics: seed,
+then the dataset and the loaders (no torch RNG draw), then the model — its parameter init is the first consumer of
+the global torch RNG — then the optimizer and the resume, which restores the stored RNG state.
 `golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
 
 A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows READ per source — dropped rows
@@ -31,7 +30,7 @@ so the losses of a resumed run diverge from the uninterrupted one while the data
 (`test_stage_boundary_resume_continues_schedule_and_stream`).
 
 The CLI around this is `training/train.py`; `TrainingReport`, what `train()` returns, is defined next to `RunLogger`
-in `logger.py` (its `close()` builds it) and re-exported here.
+in `logger.py` (its `close()` builds it).
 """
 
 from __future__ import annotations

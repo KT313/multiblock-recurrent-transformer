@@ -12,7 +12,7 @@ from training.ui.throughput import Throughput
 
 MIN_LOG_LINES = 2  # the log panel never shrinks below this on a short terminal; the events panel goes down to one line
 
-# metric keys of the step dict (`RunLogger.log_step`, today's `train.py` names) shown in the metrics table, with labels
+# metric keys of the step dict (`RunLogger.log_step`) shown in the metrics table, with labels
 METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("loss", "loss"),
     ("ppl", "ppl"),
