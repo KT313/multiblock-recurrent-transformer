@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.storage.atomic import write_atomically
 
 log = get_logger(__name__)
 SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
@@ -94,9 +95,7 @@ class ShardWriter:
 
 
 def publish_shard(table: pa.Table, path: Path) -> Path:
-    """Write ``table`` to ``path`` atomically (``<path>.tmp`` then ``os.replace``) and return ``path``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
-    tmp.replace(path)
+    """Write ``table`` to ``path`` atomically (:func:`write_atomically`) and return ``path``."""
+    with write_atomically(path) as tmp:
+        pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
     return path

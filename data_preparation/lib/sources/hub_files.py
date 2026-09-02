@@ -62,6 +62,8 @@ from typing import Any, BinaryIO, cast
 
 import pyarrow.parquet as pq
 
+from data_preparation.lib.storage.atomic import write_atomically
+
 Row = dict[str, Any]
 RowBatch = list[Row]
 OnFile = Callable[[str], None]
@@ -272,7 +274,6 @@ class FileIndex:
         """Write the JSON (caller holds ``_lock``; no-op for an in-memory index)."""
         if self.path is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "repo_id": self.repo_id,
             "revision": self.revision,
@@ -285,9 +286,8 @@ class FileIndex:
             "row_groups": self.row_groups,
             "group_counts": self.group_counts,
         }
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)
+        with write_atomically(self.path) as tmp:
+            tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
         self._last_write = self.clock()
 
     def _write_if_due(self) -> None:
