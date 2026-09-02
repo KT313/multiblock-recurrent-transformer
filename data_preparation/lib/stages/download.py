@@ -19,9 +19,10 @@ manifest records ``truncated_at_tokens`` (the cap used, both kinds), ``token_cou
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,7 +33,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources.converters import get_converter, get_filter, text_or_empty
+from data_preparation.lib.sources.converters import Filter, get_converter, get_filter, text_or_empty
 from data_preparation.lib.sources.hub_files import FetchStats
 from data_preparation.lib.sources.loaders import (
     MAX_CACHED_FILE_KEY,
@@ -243,7 +244,7 @@ def fetch_source(cfg: DatasetConfig, source: SourceConfig) -> SourceConfig:
 
 @dataclass
 class _FetchCounters:
-    """What one download increment did so far (updated while ``_fetch_rows`` runs, read back by ``download``)."""
+    """What one download increment did so far (updated while :func:`_fetch` runs, read back at the end)."""
 
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
     kept: int = 0  # rows written to disk
@@ -286,35 +287,22 @@ def download(
     request (``should_stop``, checked after every shard) keeps everything fetched so far and the next call resumes
     from the last complete shard without counting anything twice.
     """
-    source = fetch_source(cfg, cfg.sources[name])
-    folder = _raw_folder_to_append_to(cfg, name, layout, should_stop=should_stop)
-
-    # nothing to do?
-    folder.reopen_if_check_limit_grew(source.check_limit)
-    if folder.exhausted:
-        log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
+    folder, increment = _plan_increment(cfg, name, layout, rows_needed, token_counter=lambda: TokenCounter(cfg, layout), should_stop=should_stop)
+    if increment is None:
         return folder.manifest
-    wanted = rows_needed - folder.rows
-    if wanted <= 0:
-        return folder.manifest
-    max_consume = None if source.check_limit is None else source.check_limit - folder.rows_fetched
-    if max_consume is not None and max_consume <= 0:
-        folder.mark_exhausted(check_limit=source.check_limit)
-        return folder.manifest
-
-    # fetch one increment and append it shard by shard
-    log.info("%s: fetching %d rows from offset %d -> %s", name, wanted, folder.rows_fetched, folder.directory)
-    counters = _FetchCounters()
-    token_step = _TokenStep(source, TokenCounter(cfg, layout), folder.cap, counters)
+    log.info("%s: fetching %d rows from offset %d -> %s", name, increment.wanted, folder.rows_fetched, folder.directory)
+    loader = get_loader(increment.source.loader)
+    fetch_stats = FetchStats()
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
-    with progress(total=wanted, desc=name, unit="row", panel="downloads") as bar:
-        rows = _fetch_rows(source, name, folder.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
-        with ShardWriter(folder.directory, shard_size, start_shard=folder.shard_count, on_shard=folder.record_shard) as writer:
-            for row, row_progress in rows:
-                folder.add(writer, row, row_progress)
-
-    _finish_increment(folder, source, counters)
-    _log_increment(name, counters, folder.manifest)
+    with progress(total=increment.wanted, desc=name, unit="row", panel="downloads") as bar:
+        postfix = _DownloadPostfix(bar, fetch_stats)
+        rows = loader(
+            increment.source, folder.rows_fetched, increment.count, token=hf_token, index_dir=layout.hub_index_dir(),
+            columns=loader_columns(increment.source), on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
+        )
+        _fetch([increment], _tagged(name, rows), bar, postfix, shard_size)
+    _finish_increment(folder, increment.source, increment.counters)
+    _log_increment(name, increment.counters, folder.manifest)
     return folder.manifest
 
 
@@ -411,101 +399,153 @@ class _TokenStep:
         return stored
 
 
-def _fetch_rows(
-    source: SourceConfig,
-    name: str,
-    offset: int,
-    wanted: int,
-    max_consume: int | None,
-    hf_token: str | None,
-    counters: _FetchCounters,
-    layout: DatasetLayout,
-    bar: Progress,
-    token_step: _TokenStep,
-) -> Iterator[StoredRow]:
-    """Rows to store for one download increment from **one** loader call, each with the progress right after it.
-    Pretrain rows are all kept, so the loader is asked for exactly ``wanted`` (or the consume budget when that is
-    smaller) and everything it yields is stored — a remote loader may finish its row group beyond the count. Instruct
-    rows may be dropped by the filter, the converter or the token step, so the loader is asked for everything up to
-    ``max_consume`` (or without bound) and consumption stops — closing the loader's generator — as soon as
-    ``wanted`` rows are kept (the token step is flushed early when its buffered rows would meet the target, so the
-    download stops exactly there; a second call would re-stream the file prefix). Either way consumption stops at
-    ``max_consume`` source rows (``check_limit``), whatever the loader yields beyond its count. The source is
-    exhausted when the loader ran dry before ``wanted`` was reached, or ``max_consume`` was. ``bar`` tracks kept rows (postfix: source
-    rows consumed, current repo file, MB read remotely)."""
-    loader = get_loader(source.loader)
-    is_instruct = source.kind == "instruct"
-    converter = get_converter(source) if is_instruct else None
-    row_filter = get_filter(source.filter) if source.filter is not None else None
-    if is_instruct and converter is None and source.loader != "synthetic":
-        raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
-    columns = loader_columns(source)
-    fetch_stats = FetchStats()
-    postfix = _DownloadPostfix(bar, fetch_stats)
+@dataclass
+class _Increment:
+    """One source's part of a download pass: what it still wants, how a source row becomes a stored row, and what
+    the pass did for it so far (:attr:`counters`)."""
 
-    consume_budget = None if max_consume is None else max_consume - counters.consumed
-    if consume_budget is not None and consume_budget <= 0:
-        counters.exhausted = True
-        return
-    if is_instruct:
-        count = UNBOUNDED_COUNT if consume_budget is None else consume_budget
-    else:
-        count = wanted if consume_budget is None else min(wanted, consume_budget)
-    rows = loader(
-        source, offset + counters.consumed, count, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns,
-        on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
-    )
+    name: str
+    source: SourceConfig
+    folder: RawFolder
+    wanted: int  # rows to keep in this pass
+    max_consume: int | None  # source rows this pass may consume (`check_limit` less the offset reached); None = no bound
+    token_step: _TokenStep
+    counters: _FetchCounters
+    converter: Callable[[Row], Row] | None  # instruct sources: the standardizing converter (None: rows are standard already)
+    row_filter: Filter | None
+
+    @property
+    def is_instruct(self) -> bool:
+        return self.source.kind == "instruct"
+
+    @property
+    def count(self) -> int:
+        """What the loader is asked for. Pretrain rows are all kept: ``wanted`` (or the consume budget when that is
+        smaller) — a remote loader may still finish its row group beyond it. Instruct rows may be dropped by the
+        filter, the converter or the token step: everything within the budget, or without bound."""
+        if self.is_instruct:
+            return UNBOUNDED_COUNT if self.max_consume is None else self.max_consume
+        return self.wanted if self.max_consume is None else min(self.wanted, self.max_consume)
+
+    @property
+    def done(self) -> bool:
+        """No more source rows are taken: the consume budget is spent (``check_limit`` bounds the source rows
+        consumed, whatever the loader yields beyond its count), or an instruct source kept its ``wanted`` rows."""
+        if self.max_consume is not None and self.counters.consumed >= self.max_consume:
+            return True
+        return self.is_instruct and self.counters.kept >= self.wanted
+
+    def convert(self, name: str, raw: Row) -> Row | None:
+        """The row to store for source row ``raw``, or None when the filter rejects it or the converter finds it
+        malformed (``ValueError``, counted in ``skipped_malformed``)."""
+        if not self.is_instruct:
+            return text_row(self.source, raw, name)
+        if self.row_filter is not None and not self.row_filter(raw):
+            return None
+        try:
+            return _instruct_row(raw, self.converter)
+        except ValueError as err:
+            self.counters.skipped_malformed += 1
+            log.debug("%s: skipping malformed row: %s", name, err)
+            return None
+
+
+def _plan_increment(
+    cfg: DatasetConfig,
+    name: str,
+    layout: DatasetLayout,
+    rows_needed: int,
+    *,
+    token_counter: Callable[[], TokenCounter],
+    should_stop: StopCheck | None,
+) -> tuple[RawFolder, _Increment | None]:
+    """Open the raw folder of ``name`` and decide what this pass fetches for it: None when there is nothing to do —
+    the source is exhausted, the rows are on disk, or its ``check_limit`` is spent (recorded as the exhaustion)."""
+    source = fetch_source(cfg, cfg.sources[name])
+    folder = _raw_folder_to_append_to(cfg, name, layout, should_stop=should_stop)
+    folder.reopen_if_check_limit_grew(source.check_limit)
+    if folder.exhausted:
+        log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
+        return folder, None
+    wanted = rows_needed - folder.rows
+    if wanted <= 0:
+        return folder, None
+    max_consume = None if source.check_limit is None else source.check_limit - folder.rows_fetched
+    if max_consume is not None and max_consume <= 0:
+        folder.mark_exhausted(check_limit=source.check_limit)
+        return folder, None
+    converter = get_converter(source) if source.kind == "instruct" else None
+    if source.kind == "instruct" and converter is None and source.loader != "synthetic":
+        raise ValueError(f"{name}: instruct source needs `fields` or `converter`")
+    row_filter = get_filter(source.filter) if source.filter is not None else None
+    counters = _FetchCounters()
+    token_step = _TokenStep(source, token_counter(), folder.cap, counters)
+    return folder, _Increment(name, source, folder, wanted, max_consume, token_step, counters, converter, row_filter)
+
+
+def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
+    """``rows`` as ``(name, row)`` pairs; closing this generator closes the loader's."""
     try:
         for raw in rows:
-            if max_consume is not None and counters.consumed >= max_consume:
-                break  # `check_limit` bounds the source rows consumed, whatever the loader yields beyond its count
-            counters.consumed += 1
-            postfix.consumed(counters.consumed)
-
-            if is_instruct:
-                if row_filter is not None and not row_filter(raw):
-                    continue
-                try:
-                    row = _instruct_row(raw, converter)
-                except ValueError as err:
-                    counters.skipped_malformed += 1
-                    log.debug("%s: skipping malformed row: %s", name, err)
-                    continue
-            else:
-                row = text_row(source, raw, name)
-            released = token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0))
-            if is_instruct and not released and counters.kept + token_step.pending >= wanted:
-                released = token_step.flush()  # the buffered rows would meet the target: stop exactly at it
-            yield from _kept(released, counters, bar)
-            if is_instruct and counters.kept >= wanted:
-                return  # enough: stop pulling (the finally closes the loader)
-        yield from _kept(token_step.flush(), counters, bar)
-        if counters.kept < wanted:
-            counters.exhausted = True  # the loader ran dry (or `max_consume` was reached) before `wanted` rows were kept
+            yield name, raw
     finally:
         close = getattr(rows, "close", None)
         if close is not None:
             close()
 
 
-def _kept(stored: list[StoredRow], counters: _FetchCounters, bar: Progress) -> Iterator[StoredRow]:
-    """The rows the token step released, counted as kept as they go to the writer."""
-    for pair in stored:
-        yield pair
-        counters.kept += 1
+def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: Progress, postfix: _DownloadPostfix, shard_size: int) -> None:
+    """One download pass: every ``(name, row)`` of ``rows`` goes to its increment — counted as consumed, converted,
+    tokenized in batches and appended shard by shard to its raw directory (one shard writer per increment) — until
+    every increment is :attr:`~_Increment.done` or the stream ends (the stream is closed either way); the token
+    batches are flushed and an increment that kept fewer rows than it wanted is exhausted. An instruct increment's
+    token step is flushed early when its buffered rows would meet the target, so it stops exactly there (a second
+    pass would re-stream the file prefix). ``bar`` tracks kept rows (postfix: source rows consumed, current repo
+    file, MB read remotely)."""
+    by_name = {increment.name: increment for increment in increments}
+    consumed_total = 0
+    with ExitStack() as stack:
+        writers = {
+            i.name: stack.enter_context(ShardWriter(i.folder.directory, shard_size, start_shard=i.folder.shard_count, on_shard=i.folder.record_shard))
+            for i in increments
+        }
+        try:
+            for name, raw in rows:
+                increment = by_name[name]
+                if increment.done:
+                    if all(i.done for i in increments):
+                        break
+                    continue  # this source is done, the others read on
+                counters = increment.counters
+                counters.consumed += 1
+                consumed_total += 1
+                postfix.consumed(consumed_total)
+                row = increment.convert(name, raw)
+                if row is None:
+                    continue
+                released = increment.token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0))
+                if increment.is_instruct and not released and counters.kept + increment.token_step.pending >= increment.wanted:
+                    released = increment.token_step.flush()  # the buffered rows would meet the target: stop exactly at it
+                _store(increment, writers[name], released, bar)
+                if all(i.done for i in increments):
+                    break  # enough: stop pulling (the finally closes the stream)
+            for increment in increments:
+                _store(increment, writers[increment.name], increment.token_step.flush(), bar)
+        finally:
+            close = getattr(rows, "close", None)
+            if close is not None:
+                close()
+    for increment in increments:
+        if increment.counters.kept < increment.wanted:
+            increment.counters.exhausted = True  # the loader ran dry (or the budget was spent) before `wanted` rows were kept
+
+
+def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], bar: Progress) -> None:
+    """The rows the token step released, appended and counted as kept."""
+    for row, row_progress in stored:
+        increment.folder.add(writer, row, row_progress)
+        increment.counters.kept += 1
         bar.update(1)
-
-
-@dataclass
-class _GroupMember:
-    """One source of a :func:`download_github_code_group` pass that still has rows to fetch."""
-
-    name: str
-    source: SourceConfig
-    folder: RawFolder
-    wanted: int
-    counters: _FetchCounters
-    token_step: _TokenStep
 
 
 def download_github_code_group(
@@ -520,83 +560,46 @@ def download_github_code_group(
 ) -> dict[str, Manifest]:
     """:func:`download` for several `github_code` sources of one repo in a **single pass** over its files: every
     row group is fetched once and its rows are dispatched to the language source that wants them (a source that
-    has its ``rows_needed[name]`` stops taking rows, the others read on). The raw shards (texts truncated by the
-    same token step), ``rows_fetched`` and ``exhausted`` of every source are exactly what separate
-    ``download`` calls would produce; shards are published and recorded per member as they fill (see
-    :func:`download`); a stale or outdated member raises :class:`RawFolderError` before anything is fetched.
-    Returns the raw manifest of every source in ``names``.
+    has its ``rows_needed[name]`` or spent its ``check_limit`` stops taking rows, the others read on). The raw
+    shards (texts truncated by the same token step), ``rows_fetched`` and ``exhausted`` of every source are exactly
+    what separate ``download`` calls would produce — the same :func:`_fetch` pass over the repo reader instead of
+    one loader; a stale or outdated member raises :class:`RawFolderError` before anything is fetched. Returns the
+    raw manifest of every source in ``names``.
     """
-    results: dict[str, Manifest] = {}
-    members: list[_GroupMember] = []
-    counter: TokenCounter | None = None
     for name in names:
-        source = fetch_source(cfg, cfg.sources[name])
-        if source.loader != "github_code" or source.check_limit is not None:
-            raise ValueError(f"{name}: download_github_code_group needs github_code sources without check_limit")
-        if members and github_code_repo_key(source) != github_code_repo_key(members[0].source):
+        source = cfg.sources[name]
+        if source.loader != "github_code":
+            raise ValueError(f"{name}: download_github_code_group needs github_code sources")
+        if github_code_repo_key(source) != github_code_repo_key(cfg.sources[names[0]]):
             raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
-        folder = _raw_folder_to_append_to(cfg, name, layout, should_stop=should_stop)
+    token_counter = functools.cache(lambda: TokenCounter(cfg, layout))
+    results: dict[str, Manifest] = {}
+    increments: list[_Increment] = []
+    for name in names:
+        folder, increment = _plan_increment(cfg, name, layout, rows_needed[name], token_counter=token_counter, should_stop=should_stop)
         results[name] = folder.manifest
-        if folder.exhausted:
-            log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
-            continue
-        wanted = rows_needed[name] - folder.rows
-        if wanted > 0:
-            counter = counter or TokenCounter(cfg, layout)
-            counters = _FetchCounters()
-            token_step = _TokenStep(source, counter, folder.cap, counters)
-            members.append(_GroupMember(name, source, folder, wanted, counters, token_step))
-    if not members:
+        if increment is not None:
+            increments.append(increment)
+    if not increments:
         return results
 
-    _fetch_group(members, layout, shard_size, hf_token)
-    for member in members:
-        _finish_increment(member.folder, member.source, member.counters)
-        _log_increment(member.name, member.counters, member.folder.manifest)
-    return results
-
-
-def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size: int, hf_token: str | None) -> None:
-    """Run the group pass and append every member's rows (through its token step) to its raw directory, one shard
-    writer per member."""
-    for member in members:
-        log.info("%s: fetching %d rows from offset %d -> %s", member.name, member.wanted, member.folder.rows_fetched, member.folder.directory)
-    requests = [GithubCodeRequest(m.name, m.source, m.folder.rows_fetched, m.wanted) for m in members]
-    columns = _union_columns([loader_columns(m.source) for m in members])
+    for i in increments:
+        log.info("%s: fetching %d rows from offset %d -> %s", i.name, i.wanted, i.folder.rows_fetched, i.folder.directory)
+    requests = [GithubCodeRequest(i.name, i.source, i.folder.rows_fetched, i.count) for i in increments]
+    columns = _union_columns([loader_columns(i.source) for i in increments])
     fetch_stats = FetchStats()
-    by_name = {m.name: m for m in members}
-    repo = members[0].source.hf_id
-    total = sum(m.wanted for m in members)
-
-    with ExitStack() as stack:
-        bar = stack.enter_context(progress(total=total, desc=f"{repo} ({len(members)} languages)", unit="row", panel="downloads"))
+    repo = increments[0].source.hf_id
+    with progress(total=sum(i.wanted for i in increments), desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads") as bar:
         postfix = _DownloadPostfix(bar, fetch_stats)
-        writers = {
-            m.name: stack.enter_context(ShardWriter(m.folder.directory, shard_size, start_shard=m.folder.shard_count, on_shard=m.folder.record_shard))
-            for m in members
-        }
         rows = read_github_code_group(
             requests, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns, on_file=postfix.on_file,
             stats=fetch_stats, align_to_row_group=True,
         )
-        for consumed_total, (name, raw) in enumerate(rows, start=1):
-            member = by_name[name]
-            member.counters.consumed += 1
-            row = text_row(member.source, raw, name)
-            _store(member, writers[name], member.token_step.add(row, RowProgress(member.counters.consumed, 0, 0)))
-            postfix.consumed(consumed_total)
-            bar.update(1)
-        for member in members:
-            _store(member, writers[member.name], member.token_step.flush())
-    for member in members:
-        if member.counters.kept < member.wanted:
-            member.counters.exhausted = True
-
-
-def _store(member: _GroupMember, writer: ShardWriter, stored: list[StoredRow]) -> None:
-    for row, row_progress in stored:
-        member.folder.add(writer, row, row_progress)
-        member.counters.kept += 1
+        _fetch(increments, rows, bar, postfix, shard_size)
+    for i in increments:
+        _finish_increment(i.folder, i.source, i.counters)
+        _log_increment(i.name, i.counters, i.folder.manifest)
+    return results
 
 
 def _union_columns(projections: list[list[str] | None]) -> list[str] | None:

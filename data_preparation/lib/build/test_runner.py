@@ -7,7 +7,6 @@ sequential, `github_code` groups, repair of broken folders."""
 from __future__ import annotations
 
 import concurrent.futures
-import importlib
 import logging
 import os
 import threading
@@ -844,7 +843,8 @@ def test_missing_processed_shards_are_repaired(cfg_factory: CfgFactory, layout: 
 def test_broken_raw_shard_is_truncated_not_redownloaded(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
+    from data_preparation.lib.sources import loaders as loaders_mod
+
     monkeypatch.setattr(runner, "download", partial(real_download, shard_size=10))
     path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=50))
     prepare(path, layout.root, assume_yes=False)
@@ -854,13 +854,13 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     last = manifest.shards[-1]
     (raw / last.name).write_bytes(b"corrupt")
     offsets: list[int] = []
-    original = download_module._fetch_rows
+    original = loaders_mod.LOADERS["synthetic"]
 
-    def spy(source: Any, name: str, offset: int, *args: Any, **kwargs: Any) -> Any:
+    def spy(source: Any, offset: int, count: int, **kwargs: Any) -> Any:
         offsets.append(offset)
-        return original(source, name, offset, *args, **kwargs)
+        return original(source, offset, count, **kwargs)
 
-    monkeypatch.setattr(download_module, "_fetch_rows", spy)
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         report = prepare(path, layout.root, assume_yes=False)
     assert report.complete and "truncating" in caplog.text

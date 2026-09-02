@@ -484,11 +484,9 @@ def test_download_github_code_group_equals_separate_downloads(
 
 
 def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "s": _synthetic(), "lim": _github("Java", check_limit=5)}))
-    with pytest.raises(ValueError, match="github_code sources without check_limit"):
+    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "s": _synthetic()}))
+    with pytest.raises(ValueError, match="needs github_code sources"):
         download_github_code_group(cfg, ["py", "s"], layout, rows_needed={"py": 1, "s": 1})
-    with pytest.raises(ValueError, match="github_code sources without check_limit"):
-        download_github_code_group(cfg, ["py", "lim"], layout, rows_needed={"py": 1, "lim": 1})
 
 
 # --- truncation at the token cap, dropped instruct rows, raw manifest state ---------------------------------------------

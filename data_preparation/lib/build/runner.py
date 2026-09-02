@@ -228,12 +228,12 @@ def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: Da
 
 def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str]]:
     """The ``github_code`` sources among ``names`` that share a repo (:func:`github_code_repo_key`), two or more
-    per group, in config order; a single source of a repo, or one with a ``check_limit`` (the group pass has none),
-    goes through the ordinary per-source download."""
+    per group, in config order; a single source of a repo goes through the ordinary per-source download (the same
+    pass over its own loader)."""
     groups: dict[tuple[str | None, str | None, str], list[str]] = {}
     for name in names:
         source = config.sources[name]
-        if source.loader == "github_code" and source.check_limit is None:
+        if source.loader == "github_code":
             groups.setdefault(github_code_repo_key(source), []).append(name)
     return [group for group in groups.values() if len(group) >= 2]
 
