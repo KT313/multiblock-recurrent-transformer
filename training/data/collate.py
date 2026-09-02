@@ -81,9 +81,9 @@ def collate_samples(
     """Format and tokenize dataset rows into unpadded ``(input_ids, labels, data_id)`` samples.
 
     Rows are truncated to ``block_size + 1`` tokens (the shift turns that into ``block_size`` positions); rows that
-    keep no supervised label (`has_supervised_label`) are DROPPED. Dropping is what replaces the thesis
-    `StopIteration("All tokens in batch are padding tokens.")`, which torch's worker loop read as "this worker is
-    done" and the single-process loop as "the epoch is over" — an unusable row now costs one row, not a loader.
+    keep no supervised label (`has_supervised_label`) are DROPPED, never raised on: a `StopIteration` out of the
+    collate function is what torch's worker loop reads as "this worker is done" and the single-process loop as "the
+    epoch is over" — dropping makes an unusable row cost one row, not a loader.
     """
     cap = block_size + 1
     samples: list[Sample] = []

@@ -2,9 +2,9 @@
 """Row -> (input_ids, labels) formatting functions, selected by ``data_signature["format_fn"]``.
 
 Every function returns two equal-length ``torch.long`` tensors. Positions that must not be supervised are set to
-``tokenizer.pad_id`` in ``labels``; the collate function turns those into the ignore index. Only the two formats the
-thesis run used exist: ``pass_text`` (pretrain sources) and ``concatenate_instruction_input_output`` (instruct
-sources, `INSTRUCT_DATA_SIGNATURE` of the dataset resolver); the upstream chat-template formats were removed.
+``tokenizer.pad_id`` in ``labels``; the collate function turns those into the ignore index. Two formats exist:
+``pass_text`` (pretrain sources) and ``concatenate_instruction_input_output`` (instruct sources,
+`INSTRUCT_DATA_SIGNATURE` of the dataset resolver).
 """
 
 from typing import Any, Callable

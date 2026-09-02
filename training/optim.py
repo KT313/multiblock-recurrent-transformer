@@ -1,8 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Optimizer used by the thesis runs: ELLISAdam (verbatim port) plus the parameter-group split.
-
-Only the options the final config sets are kept (`update_clipping`, `atan_adam`, `running_init`, `decouple_wd`);
-the other experimental switches of the upstream implementation were never enabled and are gone.
+"""The optimizer of the thesis runs, ELLISAdam (a port of the upstream implementation with its four options:
+`update_clipping`, `atan_adam`, `running_init`, `decouple_wd`), plus the parameter-group split.
 """
 
 from math import sqrt

@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The golden 20-step tiny run: the numerics oracle of the training loop (`tasks/training_pipeline_restructure.md`).
+"""The golden 20-step tiny run: the numerics oracle of the training loop.
 
 Test support, not a test module: `write_tiny_yaml` (the settings the end-to-end tests run on), `golden_run_metrics`
 (a tiny run reduced to its numerics), `record_golden_run` (writes `training/golden_tiny_run.json`) and

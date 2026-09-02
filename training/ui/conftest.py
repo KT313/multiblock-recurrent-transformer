@@ -9,7 +9,7 @@ from collections.abc import Iterator
 import pytest
 
 from training.ui.board import TrainingDashboard
-from training.ui.testing import LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, string_console
+from training.ui.testing import LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, live_board, string_console
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def clock() -> FakeClock:
 @pytest.fixture
 def board(clock: FakeClock) -> Iterator[TrainingDashboard]:
     """An enabled dashboard rendering into a StringIO console (no real terminal needed)."""
-    with TrainingDashboard.open(
+    with live_board(
         "tiny-run",
         STAGES,
         STEPS,

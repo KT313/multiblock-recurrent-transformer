@@ -2,15 +2,14 @@
 """One optimizer step of the training loop: the micro-batch stream, the scheduled learning rate and
 `run_one_optimizer_step` — the only place with autocast / backward / clipping.
 
-Everything here is numerics (see `tasks/training_pipeline_restructure.md`, section 3). The step body is a move of the
-thesis loop, bit-identical: `golden_tiny_steps.json` (dataset-independent, `test_step.py`) and `golden_tiny_run.json`
-(the 20-step tiny run, `test_run.py` / `golden.py`) pin it. The stream departs from the thesis recipe and is pinned
-as the new reference instead: ONE continuous reader per source for the whole run with per-SAMPLE source draws from a
-private `random.Random(seed + resume step)` (the thesis pulled whole worker batches from per-stage mixture loaders,
-re-reading a shared source's rows in every stage), and the world batch is assembled from unpadded samples and padded
-once per micro-batch (the thesis collated and padded per micro-batch, then re-stacked those padded batches; the
-width of a regrouped micro-batch therefore no longer depends on how the loader happened to group its rows). Steps
-are OPTIMIZER steps: one world batch of `gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
+Everything here is numerics. The step body is the thesis loop's, bit-identical: `golden_tiny_steps.json`
+(dataset-independent, `test_step.py`) and `golden_tiny_run.json` (the 20-step tiny run, `test_run.py` /
+`testing/golden.py`) pin it. The stream is the reference for the data path: ONE continuous reader per source for the
+whole run with per-SAMPLE source draws from a private `random.Random(seed + resume step)` (so a source shared by
+consecutive stages is never re-read), and the world batch is assembled from unpadded samples and padded once per
+micro-batch, to its own longest sample (so a micro-batch's width depends on its own rows, not on how the loader
+happened to group them). Steps are OPTIMIZER steps: one world batch of `gradient_accumulation_steps` micro-batches,
+one `optimizer.step()`.
 """
 
 import random

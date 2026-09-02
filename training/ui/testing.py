@@ -1,16 +1,23 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Helpers of the dashboard tests: a hand-advanced clock, StringIO consoles, the screen a real terminal would show
-(the VT emulator of the data-prep dashboard tests), a step dict, the box characters that must not survive a run."""
+(the VT emulator of the data-prep dashboard tests), a step dict, the box characters that must not survive a run,
+and the two dashboards opened in one call (constructor arguments plus `logger` / `log_file` of `running`)."""
 
 from __future__ import annotations
 
 import io
+import logging
 import math
 import re
+from contextlib import AbstractContextManager
+from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
 from data_preparation.lib.ui.test_dashboard import _Screen  # the VT emulator: what the control codes leave on screen
+from training.ui.board import TrainingDashboard
+from training.ui.fallback import ConsoleFallbackDashboard
 
 BOX_CHARACTERS = ("╭", "╰", "│")  # the events / log panels; the static summary has none
 STAGES = ["pretrain", "instruct"]
@@ -63,6 +70,21 @@ def screen_of(raw: str, width: int) -> str:
     screen = _Screen(width)
     screen.feed(raw)
     return screen.text()
+
+
+def live_board(
+    *args: Any, logger: logging.Logger | None = None, log_file: Path | None = None, **kwargs: Any
+) -> AbstractContextManager[TrainingDashboard]:
+    """A `TrainingDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended, the
+    display up."""
+    return TrainingDashboard(*args, **kwargs).running(logger, log_file=log_file)
+
+
+def fallback_board(
+    *args: Any, logger: logging.Logger | None = None, log_file: Path | None = None, **kwargs: Any
+) -> AbstractContextManager[ConsoleFallbackDashboard]:
+    """A `ConsoleFallbackDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended."""
+    return ConsoleFallbackDashboard(*args, **kwargs).running(logger, log_file=log_file)
 
 
 def metrics(step: int, loss: float = 3.0, **extra: float) -> dict[str, float]:

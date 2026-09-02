@@ -33,6 +33,7 @@ from training import logger as logger_module
 from training import run as run_module
 from training.logger import TrainingReport
 from training.run import (
+    RunState,
     build_run_model,
     build_run_optimizer,
     build_stage_manager,
@@ -95,7 +96,7 @@ def test_stop_requested() -> None:
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
-    """`build_stage_manager` is today's seven-argument constructor call: budgets of the resolved stages, batch and
+    """`build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
     block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
@@ -187,17 +188,16 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
 def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
     tiny_settings: Settings, tiny_resolved: ResolvedDataset, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """`resume: false`, and `resume: true` with no checkpoint of the run in the directory: step 0, no path, no
-    data-stream state."""
+    """`resume: false`, and `resume: true` with no checkpoint of the run in the directory: no resume point, the
+    progress stays at step 0."""
     run_directory = prepare_run_directory(tiny_settings)
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
+    stage_manager = build_stage_manager(tiny_settings, tiny_resolved, cpu_backend.world_size)
     for resume in (False, True):
         tiny_settings.resume = resume
-        progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
-            tiny_settings, run_directory, cpu_backend, tiny_model, optimizer, tiny_resolved
-        )
-        assert progress == TrainingProgress(step=0, resume_step=-1)
-        assert resumed_from is None and data_stream_state is None
+        state = RunState(tiny_settings, run_directory, cpu_backend, tiny_model, optimizer, tiny_resolved, stage_manager, TrainingProgress())
+        assert restore_checkpoint_if_resuming(state) is None
+        assert state.progress == TrainingProgress(step=0, resume_step=-1)
 
 
 def test_block_size_mismatch_with_the_dataset_config_raises(
@@ -704,7 +704,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
 
 
 # --------------------------------------------------------------------------------------------------------------
-# golden run: the numerics oracle of the training-pipeline restructure (tasks/training_pipeline_restructure.md)
+# golden run: the numerics oracle of the training loop (`training/testing/golden.py`)
 
 
 @pytest.mark.slow

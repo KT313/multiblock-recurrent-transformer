@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from rich.text import Text
 
+from training.ui.throughput import Throughput
+
 MIN_LOG_LINES = 2  # the log panel never shrinks below this on a short terminal; the events panel goes down to one line
 
-# metric keys of the step dict (`RunLogger.log_step`, today's `train.py` names) shown in the metrics table, with labels
+# metric keys of the step dict (`RunLogger.log_step`) shown in the metrics table, with labels
 METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("loss", "loss"),
     ("ppl", "ppl"),
@@ -88,6 +90,36 @@ def floats(values: Mapping[str, object]) -> dict[str, float]:
 def known_metrics(metrics: Mapping[str, object]) -> dict[str, float]:
     """The metric-table keys present in ``metrics`` (in table order) as floats."""
     return floats({key: metrics[key] for key, _label in METRIC_COLUMNS if key in metrics})
+
+
+def step_line(
+    step: int,
+    stage_index: int,
+    transition: float | None,
+    metrics: Mapping[str, object],
+    *,
+    total_steps: int,
+    stage_names: Sequence[str],
+    log_step_interval: int,
+    throughput: Throughput,
+) -> str | None:
+    """The log line of ``step`` (``step 5/30 | stage 0 pretrain | loss 3.0000 | ... | ETA 0:00:50``) — None at a
+    step that is not logged (every ``log_step_interval``\\ th step and the last one are). ``transition`` is the
+    progress of the running stage transition, None outside one; ``throughput`` (with ``step`` already recorded)
+    supplies the seconds per step when the step dict has none, the elapsed time and the ETA."""
+    if step % log_step_interval and step < total_steps:
+        return None
+    stage_name = stage_names[stage_index] if 0 <= stage_index < len(stage_names) else "?"
+    parts = [f"step {step}/{total_steps}", f"stage {stage_index} {stage_name}"]
+    if transition is not None:
+        parts.append(f"transition {transition:.0%}")
+    known = known_metrics(metrics)
+    parts += [f"{label} {format_metric(key, known[key])}" for key, label in METRIC_COLUMNS if key in known]
+    if "seconds/step" not in known and throughput.seconds_per_step is not None:
+        parts.append(f"s/step {throughput.seconds_per_step:.2f}s")
+    parts.append(f"elapsed {format_duration(throughput.elapsed)}")
+    parts.append(f"ETA {format_duration(throughput.remaining(step))}")
+    return " | ".join(parts)
 
 
 def validation_line(step: int, losses: Mapping[str, object]) -> str:
