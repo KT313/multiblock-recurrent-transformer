@@ -16,8 +16,8 @@ import pytest
 
 from training.ui.board import TrainingDashboard
 from training.ui.fallback import ConsoleFallbackDashboard
-from training.ui.testing import BOX_CHARACTERS, STAGES, STEPS, TOTAL, FakeClock, fallback_board, live_board, metrics
-from ui.testing import console_output, screen_text, string_console
+from training.ui.testing import BOX_CHARACTERS, STAGES, STEPS, TOTAL, fallback_board, live_board, metrics
+from ui.testing import FakeClock, console_output, screen_text, string_console
 
 
 def test_a_disabled_live_display_writes_its_lines_to_the_fallback_stream(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:

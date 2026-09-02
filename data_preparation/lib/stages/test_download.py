@@ -5,6 +5,7 @@ the token cap, dropped long instruct rows, resumable counters), raw manifest sta
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import logging
 from collections.abc import Callable
@@ -16,6 +17,7 @@ import os
 
 import pyarrow.parquet as pq
 import pytest
+from rich.console import Console
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
@@ -24,6 +26,7 @@ from data_preparation.lib.storage.raw_folder import RawFolder
 from data_preparation.lib.sources.loaders import SharedLoaderParameters
 from data_preparation.lib.sources.synthetic import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
+from data_preparation.lib.ui.dashboard import DataDashboard
 from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages.download import (
@@ -189,6 +192,26 @@ def test_download_passes_index_dir_and_on_file_to_the_loader(
     manifest = download(cfg, "p", layout, rows_needed=2, hf_token="tok")
     assert manifest.rows() == 2
     assert [p.index_dir for p in seen] == [layout.hub_index_dir()] and seen[0].token == "tok"
+
+
+def test_the_download_row_reports_the_bytes_the_loader_fetched(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dashboard row of a download reads the loader's `FetchStats` live and keeps the final count once closed."""
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    def fake_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        assert shared_parameters.stats is not None
+        shared_parameters.stats.bytes_fetched += 12_345
+        return iter([{"text": "a"}, {"text": "b"}][:count])
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", fake_loader)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    console = Console(file=io.StringIO(), force_terminal=True, width=120)
+    with DataDashboard(enabled=True, console=console) as board:
+        assert download(cfg, "p", layout, rows_needed=2).rows() == 2
+        (task,) = board._panels["downloads"].done
+        assert task.bytes_fetched == 12_345 and "12" not in task.postfix.values()
 
 
 def test_download_local_applies_converter_and_flags_exhaustion(

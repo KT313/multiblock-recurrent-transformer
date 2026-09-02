@@ -6,6 +6,7 @@ every supported file format, shared files between two language sources, and the 
 from __future__ import annotations
 
 import json
+import os
 import random
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
@@ -166,7 +167,7 @@ def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path
     assert opened == ["big/a.json"] and hub.downloads == [] and hub.streams == ["big/a.json"]
     read = _bytes_read(hub.handles["big/a.json"])
     assert 0 < read < size * 0.25, (read, size)
-    assert stats.bytes_read == read and stats.files_streamed == 1 and stats.files_downloaded == 0
+    assert stats.bytes_fetched == read and stats.files_streamed == 1 and stats.files_downloaded == 0
     assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {}  # not read to the end
     # top-up at an offset re-streams from the start (prefix read: still far less than the file)
     assert _ids(LOADERS["hf_files"](src, 5, 4, SharedLoaderParameters(index_dir=index_dir))) == ["a5", "a6", "a7", "a8"]
@@ -385,10 +386,20 @@ def test_fetcher_seams_and_stats(hub: FakeHub) -> None:
     assert _ids(read_rows(index, 2, 2, fetcher=fetcher, align_to_row_group=False)) == ["a2", "b0"]
     assert opened == ["data/a.parquet", "data/b.parquet"] * 2 and hub.streams == []
     assert fetcher.stats.files_streamed == 4 and fetcher.stats.files_downloaded == 0
-    assert fetcher.stats.bytes_read > 0
+    assert fetcher.stats.bytes_fetched > 0
     cached = HubFetcher(download=lambda repo, file, rev, tok: hub.files[file])
     assert _ids(read_rows(index, 0, 1, fetcher=cached)) == ["a0"]
-    assert cached.stats == FetchStats(files_downloaded=1) and hub.downloads == []
+    assert cached.stats == FetchStats(files_downloaded=1) and hub.downloads == [], "a file already in the cache: no bytes fetched"
+
+
+def test_a_file_downloaded_whole_into_the_cache_counts_its_size(hub: FakeHub) -> None:
+    hub.add("data/a.parquet", _rows("a", 3))
+    index = FileIndex.open(REPO, REV, "data/*.parquet", None, None)
+    path = hub.files["data/a.parquet"]
+    fetcher = HubFetcher(download=lambda repo, file, rev, tok: path)
+    os.utime(path, (fetcher.created + 1, fetcher.created + 1))  # the cache file is younger than the fetcher: downloaded now
+    assert _ids(read_rows(index, 0, 1, fetcher=fetcher)) == ["a0"]
+    assert fetcher.stats == FetchStats(bytes_fetched=path.stat().st_size, files_downloaded=1)
 
 
 @pytest.mark.parametrize("suffix", [".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz"])

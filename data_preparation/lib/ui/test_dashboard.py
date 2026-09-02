@@ -26,10 +26,12 @@ from rich.live import Live
 from data_preparation.lib.log import ProgressStreamHandler, configure_logging
 from data_preparation.lib.progress import NoProgress
 from ui.capture import LineSink
-from ui.testing import Screen, console_output, screen_text
+from ui.testing import FakeClock, Screen, console_output, screen_text
 from data_preparation.lib.ui.dashboard import (
     DataDashboard,
     Task,
+    _format_byte_rate,
+    _format_bytes,
     active_dashboard,
     progress,
     set_status,
@@ -81,11 +83,11 @@ def test_task_counts_and_renders_in_its_panel(dashboard: DataDashboard) -> None:
     assert isinstance(bar, Task)
     bar.update(3)
     bar.update(1)
-    bar.set_postfix({"file": "a.parquet"}, MB=7)
+    bar.set_postfix({"file": "a.parquet"}, consumed=7)
     assert bar.n == 4
     text = render_text(dashboard)
     downloads = text[text.index("downloads") : text.index("builds")]
-    assert "src" in downloads and "4/10" in downloads and "file=a.parquet, MB=7" in downloads
+    assert "src" in downloads and "4/10" in downloads and "file=a.parquet, consumed=7" in downloads
 
 
 def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: DataDashboard) -> None:
@@ -103,16 +105,17 @@ def test_empty_panels_render_idle(dashboard: DataDashboard) -> None:
 
 
 def test_finished_rows_disappear_and_count_in_the_summary(dashboard: DataDashboard) -> None:
-    gone = dashboard.task("gone", total=10, panel="downloads")
+    fetched = [3 * 2**20]
+    gone = dashboard.task("gone", total=10, panel="downloads", bytes_fetched=lambda: fetched[0])
     kept = dashboard.task("kept", total=10, panel="downloads")
     gone.update(10)
-    gone.set_postfix(MB=3)
     kept.update(4)
     gone.close()
     gone.close()  # idempotent
+    fetched[0] = 99 * 2**20  # the counter moving on after the close changes nothing: the task's bytes are frozen
     text = render_text(dashboard)
     assert "gone" not in text and "kept" in text
-    assert "14/20 rows · 3 MB" in text, "the summary counts finished and running rows (and the MB they reported)"
+    assert "14/20 rows · 3 MB" in text, "the summary counts finished and running rows (and the bytes they fetched)"
     assert [task.description for task in tasks_of(dashboard)] == ["kept"]
 
 
@@ -453,6 +456,36 @@ def _live_of(board: DataDashboard) -> Live | None:
     return board._live  # through a call: mypy would otherwise keep the narrowing of an earlier assertion
 
 
+def test_a_download_row_shows_its_bytes_and_current_speed() -> None:
+    clock = FakeClock()
+    console = Console(file=io.StringIO(), force_terminal=True, width=140)
+    fetched = [0]
+    with DataDashboard(enabled=True, console=console, refresh_per_second=50, clock=clock) as board:
+        bar = board.task("src", total=10, panel="downloads", bytes_fetched=lambda: fetched[0])
+        build = board.task("peso", total=10, panel="builds")
+        assert isinstance(bar, Task) and isinstance(build, Task)
+        assert "MB" not in render_text(board, width=140), "nothing fetched yet: an empty cell, no bytes in the summary"
+        fetched[0] = 2**20
+        text = render_text(board, width=140)
+        assert "1 MB" in text and "MB/s" not in text, "the total from the first frame; no speed from a single sample"
+        for second in range(1, 6):
+            clock.advance(1.0)
+            fetched[0] = (second + 1) * 2**20
+            text = render_text(board, width=140)
+        assert "1.2 MB/s · 6 MB" in text, "the speed over the sampled window (6 MB since the first, empty frame 5 s ago)"
+        for _ in range(5):
+            clock.advance(1.0)
+            text = render_text(board, width=140)
+        assert "0 kB/s · 6 MB" in text, "a stall: the growth slid out of the window"
+        rows = text[text.index("─ downloads") : text.index("─ log")]
+        assert "peso" in rows and rows.count("MB") == 2, "the total in the row and the summary; the build row shows none"
+        bar.close()
+        build.close()
+        assert "6 MB" in render_text(board, width=140), "the summary keeps the bytes of a finished task"
+        assert build.bytes_fetched == 0 and bar.download_rate() == 0.0
+        assert _format_bytes(3 * 2**30) == "3.00 GB" and _format_byte_rate(50 * 2**10) == "50 kB/s"
+
+
 def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=120, height=40)
     with DataDashboard(title="prepare tiny", enabled=True, console=console, refresh_per_second=50) as board:
@@ -488,12 +521,14 @@ def test_three_threads_drive_the_panels_and_the_scrollback_is_clean() -> None:
     frames: list[str] = []
     with DataDashboard(title="prepare tiny", enabled=True, console=console, log_lines=log_lines, refresh_per_second=100) as board, board.attach(logger):
         summary = progress(total=2, desc="downloads", unit="job", panel="downloads", summary=True)
+        fetched = {"fineweb_edu": 0, "wikipedia": 0}
 
         def download(name: str) -> None:
-            with progress(total=40, desc=name, unit="row", panel="downloads") as bar:
+            with progress(total=40, desc=name, unit="row", panel="downloads", bytes_fetched=lambda: fetched[name]) as bar:
                 for i in range(40):
                     bar.update(1)
-                    bar.set_postfix({"consumed": i + 1, "file": f"{name}-{i:05d}.parquet", "MB": 1})
+                    fetched[name] = (i + 1) * 2**20 // 40
+                    bar.set_postfix({"consumed": i + 1, "file": f"{name}-{i:05d}.parquet"})
                     logger.info("%s: row %d", name, i)
                     time.sleep(0.002)
             logger.info("%s: kept 40 of 40 fetched rows", name)

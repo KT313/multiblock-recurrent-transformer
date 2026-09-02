@@ -295,8 +295,8 @@ def download(
     loader = get_loader(increment.source.loader)
     fetch_stats = FetchStats()
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
-    with progress(total=increment.wanted, desc=name, unit="row", panel="downloads") as bar:
-        postfix = _DownloadPostfix(bar, fetch_stats)
+    with progress(total=increment.wanted, desc=name, unit="row", panel="downloads", bytes_fetched=lambda: fetch_stats.bytes_fetched) as bar:
+        postfix = _DownloadPostfix(bar)
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
             columns=loader_columns(increment.source),
@@ -503,7 +503,7 @@ def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: P
     batches are flushed and an increment that kept fewer rows than it wanted is exhausted. An instruct increment's
     token step is flushed early when its buffered rows would meet the target, so it stops exactly there (a second
     pass would re-stream the file prefix). ``bar`` tracks kept rows (postfix: source rows consumed, current repo
-    file, MB read remotely)."""
+    file; the bytes fetched are the counter the bar was created with)."""
     by_name = {increment.name: increment for increment in increments}
     consumed_total = 0
     with ExitStack() as stack:
@@ -591,8 +591,11 @@ def download_github_code_group(
     columns = _union_columns([loader_columns(i.source) for i in increments])
     fetch_stats = FetchStats()
     repo = increments[0].source.hf_id
-    with progress(total=sum(i.wanted for i in increments), desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads") as bar:
-        postfix = _DownloadPostfix(bar, fetch_stats)
+    with progress(
+        total=sum(i.wanted for i in increments), desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads",
+        bytes_fetched=lambda: fetch_stats.bytes_fetched,
+    ) as bar:
+        postfix = _DownloadPostfix(bar)
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats, columns=columns,
         )
@@ -624,11 +627,10 @@ def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
 
 
 class _DownloadPostfix:
-    """The download bar's postfix: source rows consumed, current repo file, MB read remotely (refreshed sparsely)."""
+    """The download bar's postfix: source rows consumed, current repo file (refreshed sparsely)."""
 
-    def __init__(self, bar: Progress, fetch_stats: FetchStats) -> None:
+    def __init__(self, bar: Progress) -> None:
         self._bar = bar
-        self._fetch_stats = fetch_stats
         self._values: dict[str, Any] = {"consumed": 0}
 
     def on_file(self, file: str) -> None:
@@ -643,8 +645,6 @@ class _DownloadPostfix:
             self._refresh()
 
     def _refresh(self) -> None:
-        if self._fetch_stats.bytes_read:
-            self._values["MB"] = f"{self._fetch_stats.bytes_read / 2**20:.0f}"
         self._bar.set_postfix(self._values, refresh=False)
 
 

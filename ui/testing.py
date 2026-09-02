@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Helpers of the dashboard tests, shared by ``data_preparation/lib/ui`` and ``training/ui``: a StringIO console
-that behaves like a terminal, its output with and without control codes, and :class:`Screen`, the VT emulator that
+"""Helpers of the dashboard tests, shared by ``data_preparation/lib/ui`` and ``training/ui``: a hand-advanced clock,
+a StringIO console that behaves like a terminal, its output with and without control codes, and :class:`Screen`, the VT emulator that
 shows what those control codes leave on a real terminal."""
 
 from __future__ import annotations
@@ -11,6 +11,19 @@ import re
 from rich.console import Console
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class FakeClock:
+    """A clock the tests advance by hand (injected as ``clock=``)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def string_console(width: int = 120, height: int | None = None) -> Console:

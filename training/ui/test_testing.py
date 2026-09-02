@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from training.ui.testing import FakeClock, metrics
+from training.ui.testing import metrics
+from ui.testing import FakeClock
 
 
 def test_fake_clock_advances_by_hand() -> None:

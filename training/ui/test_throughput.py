@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from training.ui.testing import FakeClock
 from training.ui.throughput import Throughput
+from ui.testing import FakeClock
 
 
 def test_throughput_eta_arithmetic(clock: FakeClock) -> None:

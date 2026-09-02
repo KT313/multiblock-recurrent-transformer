@@ -6,8 +6,10 @@ A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` (the live display,
 ``suspended``) with exactly one ``rich.live.Live`` display on stderr, redrawn from a cleared screen after a terminal
 resize. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
 task (bounded: at most ``max_rows`` rows plus "… and k more"), finished rows disappear and are counted in the
-panel's summary line (jobs done, rows done / wanted, MB read, elapsed), which is updated in place. All updates from
-worker threads go through one lock; the display refreshes on its own timer.
+panel's summary line (jobs done, rows done / wanted, bytes fetched, elapsed), which is updated in place. A download
+row also shows the bytes its task fetched and its current download speed (a live byte counter the task was created
+with, sampled at every frame over the last :data:`DOWNLOAD_RATE_WINDOW` seconds). All updates from worker threads
+go through one lock; the display refreshes on its own timer.
 
 While the display is up nothing may print around it (a stray line between two frames shifts the frame and leaves
 its top behind in the scrollback), so ``__enter__`` also (through :mod:`ui.capture`, which the
@@ -28,8 +30,8 @@ transient). Ctrl-C / an exception leave through the same path.
 Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create tasks)::
 
     with DataDashboard(title="prepare tiny") as dashboard, dashboard.attach(logging.getLogger("data_preparation")):
-        with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads") as bar:
-            bar.update(1); bar.set_postfix({"file": "x.parquet", "MB": 6})
+        with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads", bytes_fetched=lambda: stats.bytes_fetched) as bar:
+            bar.update(1); bar.set_postfix({"file": "x.parquet"})
 
 :class:`Task` implements ``lib.progress.Progress`` (``update`` / ``set_postfix`` / context manager / ``n`` /
 ``total``); :func:`progress` creates a task in ``panel`` of the active dashboard (``summary`` makes it the panel's
@@ -46,7 +48,8 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterable, Iterator
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -70,6 +73,7 @@ DEFAULT_MAX_ROWS = 8  # running tasks shown per panel; the rest is "… and k mo
 DEFAULT_REFRESH_PER_SECOND = 8
 DEFAULT_PANELS: tuple[str, ...] = ("downloads", "builds")  # always shown, in this order; other panel names appear on demand
 DEFAULT_PANEL = "tasks"  # tasks created without a panel name
+DOWNLOAD_RATE_WINDOW = 5.0  # seconds of byte samples behind a download row's "current" speed
 BUILD_LOG_NAME = "build.log"  # full log of every build, appended under the dataset root (`DataDashboard.attach(log_file=)`)
 STDOUT_LOGGER = "data_preparation.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = "data_preparation.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
@@ -85,13 +89,26 @@ def _format_elapsed(seconds: float) -> str:
     return str(timedelta(seconds=int(seconds)))
 
 
-def _megabytes(task: Task) -> float:
-    """The task's ``MB`` postfix value (``_DownloadPostfix`` reports the bytes read remotely there), 0 otherwise."""
-    value = task.postfix.get("MB")
-    try:
-        return float(value) if value is not None else 0.0
-    except (TypeError, ValueError):
-        return 0.0
+def _format_bytes(count: int) -> str:
+    """``320 MB``, ``1.25 GB`` from a gibibyte on."""
+    megabytes = count / 2**20
+    return f"{megabytes / 1024:,.2f} GB" if megabytes >= 1024 else f"{megabytes:,.0f} MB"
+
+
+def _format_byte_rate(bytes_per_second: float) -> str:
+    """``3.2 MB/s``, ``87 kB/s`` below a tenth of a megabyte per second."""
+    megabytes = bytes_per_second / 2**20
+    return f"{megabytes:,.1f} MB/s" if megabytes >= 0.1 else f"{bytes_per_second / 2**10:,.0f} kB/s"
+
+
+def _download_cell(task: Task) -> str:
+    """``3.2 MB/s · 320 MB`` for a task that fetched bytes (the speed once its sample window spans a second), else empty."""
+    fetched = task.bytes_fetched
+    if fetched <= 0:
+        return ""
+    rate = task.download_rate()
+    total = _format_bytes(fetched)
+    return total if rate is None else f"{_format_byte_rate(rate)} · {total}"
 
 
 class Task:
@@ -100,7 +117,8 @@ class Task:
     ``n`` counts the updates. The row is shown while the task is open and disappears on ``close``; its counts then
     live on in the panel's summary line until the next summary task (round) starts. The bar may overshoot its
     ``total`` like the download bar does (a loader finishing a remote row group); it renders full, the count shows
-    ``completed/total`` past 100 %.
+    ``completed/total`` past 100 %. ``bytes_fetched`` is a download task's live byte counter: the row shows its
+    value and the speed over the last frames, the summary line adds it up, ``close`` freezes it.
     """
 
     def __init__(
@@ -112,6 +130,7 @@ class Task:
         total: int | None,
         unit: str,
         summary: bool,
+        bytes_fetched: Callable[[], int] | None = None,
     ) -> None:
         self._dashboard = dashboard
         self._panel = panel
@@ -121,8 +140,11 @@ class Task:
         self.summary = summary
         self.completed = 0
         self.postfix: dict[str, Any] = {}
-        self.started = time.monotonic()
+        self.started = dashboard._clock()
         self.finished: float | None = None
+        self._bytes_fetched = bytes_fetched
+        self._bytes_at_close = 0
+        self._byte_samples: deque[tuple[float, int]] = deque()  # (time, bytes) of the last frames, for `download_rate`
 
     @property
     def n(self) -> int:
@@ -146,8 +168,32 @@ class Task:
         with self._dashboard._lock:
             if self.finished is not None:
                 return
-            self.finished = time.monotonic()
+            self._bytes_at_close = self.bytes_fetched
+            self.finished = self._dashboard._clock()
             self._panel.finish(self)
+
+    @property
+    def bytes_fetched(self) -> int:
+        """The bytes the task fetched so far (0 without a counter); frozen once closed."""
+        if self._bytes_fetched is None:
+            return 0
+        return self._bytes_at_close if self.closed else self._bytes_fetched()
+
+    def sample_bytes(self, now: float) -> None:
+        """Record this frame's byte count; samples older than :data:`DOWNLOAD_RATE_WINDOW` drop out."""
+        samples = self._byte_samples
+        samples.append((now, self.bytes_fetched))
+        while samples and now - samples[0][0] > DOWNLOAD_RATE_WINDOW:
+            samples.popleft()
+
+    def download_rate(self) -> float | None:
+        """Bytes per second over the sampled frames; None until they span at least a second."""
+        if len(self._byte_samples) < 2:
+            return None
+        (first_time, first_bytes), (last_time, last_bytes) = self._byte_samples[0], self._byte_samples[-1]
+        if last_time - first_time < 1.0:
+            return None
+        return (last_bytes - first_bytes) / (last_time - first_time)
 
     def elapsed(self, now: float) -> float:
         return (self.finished if self.finished is not None else now) - self.started
@@ -221,15 +267,18 @@ class _PanelState:
         table.add_column(ratio=2, min_width=10)  # bar
         table.add_column(justify="right", no_wrap=True)  # completed/total
         table.add_column(justify="right", no_wrap=True, style="progress.data.speed")  # rate
+        table.add_column(justify="right", no_wrap=True, style="progress.download")  # download speed · bytes fetched
         table.add_column(no_wrap=True, style="progress.elapsed")  # elapsed
         table.add_column(ratio=3, no_wrap=True, overflow="ellipsis", style="dim")  # postfix
         for task in tasks:
             speed = task.speed(now)
+            task.sample_bytes(now)
             table.add_row(
                 task.description,
                 ProgressBar(total=task.total, completed=min(task.completed, task.total) if task.total is not None else task.completed, pulse=task.total is None),
                 f"{task.completed:,}/{task.total:,}" if task.total is not None else f"{task.completed:,}",
                 f"? {task.unit}/s" if speed is None else f"{speed:,.0f} {task.unit}/s",
+                _download_cell(task),
                 _format_elapsed(task.elapsed(now)),
                 _format_postfix(task.postfix),
             )
@@ -237,7 +286,7 @@ class _PanelState:
 
     def _summary_line(self, now: float) -> Text:
         """``5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03`` — the round's jobs, every row of every task
-        of the round (running and finished), the MB they reported, the time since the round began."""
+        of the round (running and finished), the bytes they fetched, the time since the round began."""
         if self.idle:
             return Text("idle", style="dim")
         tasks = [*self.done, *self.active]
@@ -251,9 +300,9 @@ class _PanelState:
             totals = [task.total for task in tasks if task.total is not None]
             rows = f"{completed:,}/{sum(totals):,}" if len(totals) == len(tasks) else f"{completed:,}"
             parts.append(f"{rows} {tasks[0].unit}s")
-        megabytes = sum(_megabytes(task) for task in tasks)
-        if megabytes > 0:
-            parts.append(f"{megabytes:,.0f} MB")
+        fetched = sum(task.bytes_fetched for task in tasks)
+        if fetched > 0:
+            parts.append(_format_bytes(fetched))
         started = min([task.started for task in tasks] + ([summary.started] if summary is not None else []))
         running = bool(self.active) or (summary is not None and not summary.closed)
         end = now if running else max([task.finished or now for task in tasks] + ([summary.finished or now] if summary is not None else []))
@@ -266,7 +315,7 @@ class DataDashboard(LiveDisplay):
     ``log_lines`` lines), footer.
 
     ``enabled`` defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); ``console`` is for tests
-    (a ``rich.console.Console`` over a ``StringIO``). Exactly one dashboard is active at a time (``with`` block);
+    (a ``rich.console.Console`` over a ``StringIO``), ``clock`` too (the elapsed times and download speeds). Exactly one dashboard is active at a time (``with`` block);
     :func:`progress` and :func:`active_dashboard` find it, entering a second one raises.
     """
 
@@ -283,6 +332,7 @@ class DataDashboard(LiveDisplay):
         enabled: bool | None = None,
         console: Console | None = None,
         stream: TextIO | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(
             stream=stream if stream is not None else sys.stderr, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
@@ -292,7 +342,8 @@ class DataDashboard(LiveDisplay):
         self._max_rows = max_rows
         self._panels: dict[str, _PanelState] = {name: _PanelState(name, max_rows) for name in panels}
         self._status: dict[str, str] = {}
-        self._started_at = time.monotonic()
+        self._clock = clock
+        self._started_at = clock()
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
         self._logging_capture = LoggingCapture(self, skip=self.is_attached)
@@ -305,7 +356,7 @@ class DataDashboard(LiveDisplay):
             raise RuntimeError("a DataDashboard is already active")
         DataDashboard._active = self
         if self.enabled:
-            self._started_at = time.monotonic()
+            self._started_at = self._clock()
             self._silence_third_party_bars()
             self._capture_logging()
             self._redirect_streams()
@@ -389,14 +440,16 @@ class DataDashboard(LiveDisplay):
         unit: str = "row",
         panel: str | None = None,
         summary: bool = False,
+        bytes_fetched: Callable[[], int] | None = None,
     ) -> Progress:
         """A new row in ``panel`` (a no-op bar when the dashboard is disabled). ``summary`` makes it the panel's
-        summary task (the pool's jobs) and starts a new round of the panel's counts."""
+        summary task (the pool's jobs) and starts a new round of the panel's counts; ``bytes_fetched`` is a download
+        task's live byte counter (the row shows its bytes and current speed, the summary line adds it up)."""
         if not self.enabled:
             return NoProgress(total)
         with self._lock:
             state = self._panels.setdefault(panel or DEFAULT_PANEL, _PanelState(panel or DEFAULT_PANEL, self._max_rows))
-            task = Task(self, state, desc, total=total, unit=unit, summary=summary)
+            task = Task(self, state, desc, total=total, unit=unit, summary=summary, bytes_fetched=bytes_fetched)
             state.add(task)
         return task
 
@@ -428,7 +481,7 @@ class DataDashboard(LiveDisplay):
     # --- rendering ------------------------------------------------------------------------------------------------------
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             panels = list(self._panels.values())
             fixed_height = 2 + sum(state.height() for state in panels)  # header + footer + panels
@@ -446,12 +499,21 @@ def active_dashboard() -> DataDashboard | None:
     return DataDashboard._active
 
 
-def progress(*, total: int | None = None, desc: str = "", unit: str = "row", panel: str | None = None, summary: bool = False) -> Progress:
-    """A task in ``panel`` of the active dashboard, else a :class:`NoProgress` (which counts, shows nothing)."""
+def progress(
+    *,
+    total: int | None = None,
+    desc: str = "",
+    unit: str = "row",
+    panel: str | None = None,
+    summary: bool = False,
+    bytes_fetched: Callable[[], int] | None = None,
+) -> Progress:
+    """A task in ``panel`` of the active dashboard (see :meth:`DataDashboard.task`), else a :class:`NoProgress`
+    (which counts, shows nothing)."""
     dashboard = active_dashboard()
     if dashboard is None:
         return NoProgress(total)
-    return dashboard.task(desc, total=total, unit=unit, panel=panel, summary=summary)
+    return dashboard.task(desc, total=total, unit=unit, panel=panel, summary=summary, bytes_fetched=bytes_fetched)
 
 
 def set_status(**fields: object) -> None:

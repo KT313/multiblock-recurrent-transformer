@@ -40,8 +40,8 @@ cached file costs nothing on the wire, so nothing needs to be kept.
 
 Hub access goes through the module-level functions :func:`repo_listing`, :func:`resolve_revision`,
 :func:`paths_info`, :func:`hub_download` and :func:`open_remote` (stubbed by the tests) or through the callables of a
-:class:`HubFetcher`, which also holds the size threshold and the :class:`FetchStats` (bytes handed to the reader
-by the remote file objects, files downloaded / streamed).
+:class:`HubFetcher`, which also holds the size threshold and the :class:`FetchStats` (bytes fetched from the Hub,
+files downloaded / streamed).
 """
 
 from __future__ import annotations
@@ -376,13 +376,15 @@ def glob_regex(pattern: str) -> re.Pattern[str]:
 
 @dataclass
 class FetchStats:
-    bytes_read: int = 0  # bytes handed to the reader by remote file objects (read-ahead not included)
+    """The download counters of one fetcher (the dashboard's download row reads ``bytes_fetched`` live)."""
+
+    bytes_fetched: int = 0  # bytes fetched from the Hub: what remote file objects handed to the reader (read-ahead not included) plus files downloaded whole into the cache by this fetcher
     files_downloaded: int = 0  # files fetched whole into the Hub cache (or already there)
     files_streamed: int = 0  # files opened remotely
 
 
 class _CountingRaw(io.RawIOBase, BinaryIO):
-    """Raw file over a binary file object that adds every byte read to ``stats.bytes_read``."""
+    """Raw file over a binary file object that adds every byte read to ``stats.bytes_fetched``."""
 
     def __init__(self, inner: BinaryIO, stats: FetchStats) -> None:
         super().__init__()
@@ -393,7 +395,7 @@ class _CountingRaw(io.RawIOBase, BinaryIO):
         data = self._inner.read(len(buffer))
         n = len(data)
         buffer[:n] = data
-        self._stats.bytes_read += n
+        self._stats.bytes_fetched += n
         return n
 
     def readable(self) -> bool:
@@ -428,6 +430,7 @@ class HubFetcher:
     download: HubDownload | None = None
     remote: OpenRemote | None = None
     stats: FetchStats = field(default_factory=FetchStats)
+    created: float = field(default_factory=time.time)  # a cache file younger than this was downloaded by this fetcher
 
     def uses_cache(self, size: int) -> bool:
         """Whether a file of ``size`` bytes is fetched whole into the Hub cache (else it is read remotely)."""
@@ -448,6 +451,9 @@ class HubFetcher:
         download = self.download or hub_download
         path = download(index.repo_id, file, index.revision, self.token)
         self.stats.files_downloaded += 1
+        status = path.stat()
+        if status.st_mtime >= self.created:  # downloaded now, not found in the cache: its bytes were fetched
+            self.stats.bytes_fetched += status.st_size
         with path.open("rb") as handle:
             yield handle
 

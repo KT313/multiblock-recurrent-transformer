@@ -12,7 +12,8 @@ import pytest
 
 from training.ui.fallback import ConsoleFallbackDashboard
 from training.ui.format import step_line
-from training.ui.testing import STAGES, STEPS, TOTAL, FakeClock, fallback_board, metrics
+from training.ui.testing import STAGES, STEPS, TOTAL, fallback_board, metrics
+from ui.testing import FakeClock
 from training.ui.throughput import Throughput
 
 

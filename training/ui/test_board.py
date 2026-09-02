@@ -15,8 +15,8 @@ from rich.live import Live
 
 from ui.capture import LineSink
 from training.ui.board import StageBar, TrainingDashboard
-from training.ui.testing import BOX_CHARACTERS, LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, live_board, metrics
-from ui.testing import console_output, screen_text, string_console
+from training.ui.testing import BOX_CHARACTERS, LOGGER_NAME, STAGES, STEPS, TOTAL, live_board, metrics
+from ui.testing import FakeClock, console_output, screen_text, string_console
 
 
 def _live_of(board: TrainingDashboard) -> Live | None:

@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Helpers of the training dashboard tests: a hand-advanced clock, a step dict, the box characters that must not
+"""Helpers of the training dashboard tests: a step dict, the box characters that must not
 survive a run, and the two dashboards opened in one call (constructor arguments plus `logger` / `log_file` of
-`running`). The StringIO console and the VT emulator are the shared ones of ``ui.testing``."""
+`running`). The hand-advanced clock, the StringIO console and the VT emulator are the shared ones of ``ui.testing``."""
 
 from __future__ import annotations
 
@@ -19,19 +19,6 @@ STAGES = ["pretrain", "instruct"]
 STEPS = [20, 10]
 TOTAL = 30
 LOGGER_NAME = "training.test_dashboard"
-
-
-class FakeClock:
-    """A clock the tests advance by hand (injected as ``clock=``)."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
 
 
 def live_board(

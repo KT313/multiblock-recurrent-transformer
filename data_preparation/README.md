@@ -346,8 +346,9 @@ Two caches, with different lifetimes:
 ## Progress display and logs
 
 On a terminal `prepare` runs inside a live dashboard (`lib/ui/dashboard.py`, `rich`): a header (config, round,
-step, elapsed), a **downloads** panel (one row per running download — rows kept / wanted, rate, elapsed, source rows
-consumed, current repo file, MB read — and a summary line: jobs done, rows of the round, MB, elapsed), a **builds**
+step, elapsed), a **downloads** panel (one row per running download — rows kept / wanted, rate, current download
+speed and bytes fetched, elapsed, source rows consumed, current repo file — and a summary line: jobs done, rows of
+the round, bytes fetched, elapsed), a **builds**
 panel (one row per running build — raw rows processed, current raw shard — plus its summary line), the **log**
 panel with the latest lines, and a footer naming `dataset/build.log` (every log line goes there). Finished rows
 disappear into the summary; at most eight rows are shown per panel ("… and k more"). Resizing the terminal redraws

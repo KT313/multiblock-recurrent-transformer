@@ -14,7 +14,7 @@ members that apply to it. `columns` projects the rows `hf_files` / `github_code`
 format (`github_code` adds `language`, its filter column) — they all read through `hub_files.iter_row_batches`, the
 one reading contract; the other loaders yield every column. `index_dir` is where `hf_files` / `github_code` persist
 their file index (None: in memory), `on_file` is called with every repo file they open (progress display) and
-`stats` collects their download counters (`FetchStats`, remote bytes read). `datasets` is imported lazily so the HF
+`stats` collects their download counters (`FetchStats`, bytes fetched). `datasets` is imported lazily so the HF
 cache environment can be configured before import."""
 
 from __future__ import annotations

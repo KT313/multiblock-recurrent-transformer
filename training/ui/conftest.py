@@ -9,8 +9,8 @@ from collections.abc import Iterator
 import pytest
 
 from training.ui.board import TrainingDashboard
-from training.ui.testing import LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, live_board
-from ui.testing import string_console
+from training.ui.testing import LOGGER_NAME, STAGES, STEPS, TOTAL, live_board
+from ui.testing import FakeClock, string_console
 
 
 @pytest.fixture
