@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for data_preparation.lib.stages.row_pipeline: length filter batches, quality heuristics, contamination n-grams,
-instruct inversions and field checks (carried over from the pre-restructure pipeline tests)."""
+instruct inversions and field checks."""
 
 from typing import Any
 

@@ -39,6 +39,7 @@ from data_preparation.lib.sources.loaders import (
     MAX_CACHED_FILE_KEY,
     GithubCodeRequest,
     Row,
+    SharedLoaderParameters,
     get_loader,
     github_code_repo_key,
     read_github_code_group,
@@ -296,10 +297,11 @@ def download(
     # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
     with progress(total=increment.wanted, desc=name, unit="row", panel="downloads") as bar:
         postfix = _DownloadPostfix(bar, fetch_stats)
-        rows = loader(
-            increment.source, folder.rows_fetched, increment.count, token=hf_token, index_dir=layout.hub_index_dir(),
-            columns=loader_columns(increment.source), on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
+        shared_parameters = SharedLoaderParameters(
+            token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
+            columns=loader_columns(increment.source),
         )
+        rows = loader(increment.source, folder.rows_fetched, increment.count, shared_parameters)
         _fetch([increment], _tagged(name, rows), bar, postfix, shard_size)
     _finish_increment(folder, increment.source, increment.counters)
     _log_increment(name, increment.counters, folder.manifest)
@@ -591,10 +593,10 @@ def download_github_code_group(
     repo = increments[0].source.hf_id
     with progress(total=sum(i.wanted for i in increments), desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads") as bar:
         postfix = _DownloadPostfix(bar, fetch_stats)
-        rows = read_github_code_group(
-            requests, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns, on_file=postfix.on_file,
-            stats=fetch_stats, align_to_row_group=True,
+        shared_parameters = SharedLoaderParameters(
+            token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats, columns=columns,
         )
+        rows = read_github_code_group(requests, shared_parameters)
         _fetch(increments, rows, bar, postfix, shard_size)
     for i in increments:
         _finish_increment(i.folder, i.source, i.counters)

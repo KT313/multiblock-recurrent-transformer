@@ -621,8 +621,8 @@ import os, sys, time
 sys.path.insert(0, {root!r})
 from data_preparation.lib.sources import loaders
 original = loaders.LOADERS["synthetic"]
-def slow(source, offset, count, **kwargs):
-    for row in original(source, offset, count, **kwargs):
+def slow(source, offset, count, shared_parameters):
+    for row in original(source, offset, count, shared_parameters):
         time.sleep({row_delay})
         yield row
 loaders.LOADERS["synthetic"] = slow

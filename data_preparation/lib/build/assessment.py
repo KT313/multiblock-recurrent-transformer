@@ -3,19 +3,19 @@
 
 Several code paths judge a processed folder — the repair step (``lib/build/repair.py``), the planner
 (``lib/build/planner.py``, behind ``status`` / ``prepare --dry_run`` / ``prepare``), the build's own resume
-(``lib/stages/build.py``) and the training-side verifier. They used to judge for themselves and drifted (an
-unreadable manifest crashed ``status`` while ``prepare`` healed it; a crash leftover made the repair step delete a
-folder the resumed build would have healed). :func:`assess_processed_folder` is now the one place that knows what a
-processed folder can be, and every verdict carries the cheapest repair: ``rebuild`` (delete the folder, the build
-writes it again — derived data, no confirmation) or ``nothing``.
+(``lib/stages/build.py``) and the training-side verifier. :func:`assess_processed_folder` is the one place that
+knows what a processed folder can be, so they cannot disagree (``status`` crashing on an unreadable manifest that
+``prepare`` heals; the repair step deleting a crash leftover the resumed build would have healed), and every
+verdict carries the cheapest repair: ``rebuild`` (delete the folder, the build writes it again — derived data, no
+confirmation) or ``nothing``.
 
 The one verdict whose cheapest repair is *nothing* despite a visible anomaly deserves its name: a build that
 crashes between publishing a shard file and saving the manifest leaves exactly one unlisted file —
 ``data-{len(manifest.shards):05d}.parquet``, the very name the resumed build publishes next
 (:meth:`~data_preparation.lib.stages.build.ProcessedOutput.publish` names shards by their index and
 ``publish_shard`` replaces atomically). While raw shards are still uncovered, the resume rewrites that file from
-the same rows and the folder heals itself; deleting the whole folder for it (what the repair step used to do)
-redoes hours of cleaning for one file. The same stray on a folder that covers every raw shard is *not* resumable —
+the same rows and the folder heals itself; deleting the whole folder for it would redo hours of cleaning for one
+file. The same stray on a folder that covers every raw shard is *not* resumable —
 no build would overwrite it, the training resolver would refuse the folder — so it stays a rebuild.
 """
 

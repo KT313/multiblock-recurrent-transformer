@@ -30,7 +30,14 @@ from data_preparation.lib.sources.hub_files import (
     parquet_row_groups,
     read_rows,
 )
-from data_preparation.lib.sources.loaders import LOADERS, GithubCodeRequest, Row, hub_file_index, read_github_code_group
+from data_preparation.lib.sources.loaders import (
+    LOADERS,
+    GithubCodeRequest,
+    Row,
+    SharedLoaderParameters,
+    hub_file_index,
+    read_github_code_group,
+)
 
 def _rows(prefix: str, n: int, language: Callable[[int], str] | None = None) -> list[Row]:
     return [
@@ -65,10 +72,10 @@ def test_order_offset_count_across_files(hub: FakeHub, tmp_path: Path) -> None:
     hub.add("other/d.parquet", _rows("d", 2))  # not matched by the glob
     index_dir = tmp_path / "index"
     load = LOADERS["hf_files"]
-    assert _ids(load(_src(), 0, 100, index_dir=index_dir)) == [f"a{i}" for i in range(5)] + ["b0", "b1", "b2"] + [f"c{i}" for i in range(4)]
-    assert _ids(load(_src(), 4, 3, index_dir=index_dir)) == ["a4", "b0", "b1"]
-    assert _ids(load(_src(), 12, 5, index_dir=index_dir)) == []
-    assert _ids(load(_src(), 0, 0, index_dir=index_dir)) == []
+    assert _ids(load(_src(), 0, 100, SharedLoaderParameters(index_dir=index_dir))) == [f"a{i}" for i in range(5)] + ["b0", "b1", "b2"] + [f"c{i}" for i in range(4)]
+    assert _ids(load(_src(), 4, 3, SharedLoaderParameters(index_dir=index_dir))) == ["a4", "b0", "b1"]
+    assert _ids(load(_src(), 12, 5, SharedLoaderParameters(index_dir=index_dir))) == []
+    assert _ids(load(_src(), 0, 0, SharedLoaderParameters(index_dir=index_dir))) == []
     assert hub.listings == 1  # the file list is cached in the index
 
 
@@ -77,10 +84,10 @@ def test_second_fetch_skips_files_before_offset(hub: FakeHub, tmp_path: Path) ->
         hub.add(f"data/{name}.parquet", _rows(name, 4))
     index_dir = tmp_path / "index"
     load = LOADERS["hf_files"]
-    assert _ids(load(_src(), 0, 5, index_dir=index_dir)) == ["a0", "a1", "a2", "a3", "b0"]
+    assert _ids(load(_src(), 0, 5, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1", "a2", "a3", "b0"]
     assert hub.downloads == ["data/a.parquet", "data/b.parquet"]
     hub.downloads.clear()
-    assert _ids(load(_src(), 9, 2, index_dir=index_dir)) == ["c1", "c2"]
+    assert _ids(load(_src(), 9, 2, SharedLoaderParameters(index_dir=index_dir))) == ["c1", "c2"]
     assert hub.downloads == ["data/c.parquet"]  # a and b are skipped by their row counts; c's footer says 4 rows
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["files"] == ["data/a.parquet", "data/b.parquet", "data/c.parquet"]
@@ -92,13 +99,13 @@ def test_jsonl_counts_known_only_after_full_read(hub: FakeHub, tmp_path: Path) -
     hub.add("f/b.jsonl", _rows("b", 3))
     index_dir = tmp_path / "index"
     src = _src(load_kwargs={"data_files": "f/*.jsonl"})
-    assert _ids(LOADERS["hf_files"](src, 0, 2, index_dir=index_dir)) == ["a0", "a1"]
+    assert _ids(LOADERS["hf_files"](src, 0, 2, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1"]
     index = FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None)
     assert index.rows == {}  # a.jsonl was not read to its end
-    assert _ids(LOADERS["hf_files"](src, 1, 3, index_dir=index_dir)) == ["a1", "a2", "b0"]
+    assert _ids(LOADERS["hf_files"](src, 1, 3, SharedLoaderParameters(index_dir=index_dir))) == ["a1", "a2", "b0"]
     assert FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None).rows == {"f/a.jsonl": 3}
     hub.downloads.clear()
-    assert _ids(LOADERS["hf_files"](src, 3, 1, index_dir=index_dir)) == ["b0"]
+    assert _ids(LOADERS["hf_files"](src, 3, 1, SharedLoaderParameters(index_dir=index_dir))) == ["b0"]
     assert hub.downloads == ["f/b.jsonl"]
 
 
@@ -154,7 +161,7 @@ def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path
     stats = FetchStats()
     src = _src(load_kwargs={"data_files": "big/*.json", "max_cached_file_mb": 0.01})  # 10 KB: force the remote path
     opened: list[str] = []
-    rows = list(LOADERS["hf_files"](src, 0, 7, index_dir=index_dir, stats=stats, on_file=opened.append))
+    rows = list(LOADERS["hf_files"](src, 0, 7, SharedLoaderParameters(index_dir=index_dir, stats=stats, on_file=opened.append)))
     assert [r["id"] for r in rows] == [f"a{i}" for i in range(7)] and rows[0]["score"] == 0.5
     assert opened == ["big/a.json"] and hub.downloads == [] and hub.streams == ["big/a.json"]
     read = _bytes_read(hub.handles["big/a.json"])
@@ -162,14 +169,14 @@ def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path
     assert stats.bytes_read == read and stats.files_streamed == 1 and stats.files_downloaded == 0
     assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {}  # not read to the end
     # top-up at an offset re-streams from the start (prefix read: still far less than the file)
-    assert _ids(LOADERS["hf_files"](src, 5, 4, index_dir=index_dir)) == ["a5", "a6", "a7", "a8"]
+    assert _ids(LOADERS["hf_files"](src, 5, 4, SharedLoaderParameters(index_dir=index_dir))) == ["a5", "a6", "a7", "a8"]
     assert hub.streams == ["big/a.json", "big/a.json"]
     assert _bytes_read(hub.handles["big/a.json"]) < size * 0.3
     # reading to the end records the row count, after which a fetch past it opens nothing
-    assert len(list(LOADERS["hf_files"](src, 40, 100, index_dir=index_dir))) == 10
+    assert len(list(LOADERS["hf_files"](src, 40, 100, SharedLoaderParameters(index_dir=index_dir)))) == 10
     assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {"big/a.json": 50}
     hub.streams.clear()
-    assert _ids(LOADERS["hf_files"](src, 50, 5, index_dir=index_dir)) == []
+    assert _ids(LOADERS["hf_files"](src, 50, 5, SharedLoaderParameters(index_dir=index_dir))) == []
     assert hub.streams == []
 
 
@@ -199,7 +206,7 @@ def test_on_file_and_token_passthrough(hub: FakeHub, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(hub_files, "hub_download", download)
     opened: list[str] = []
-    assert _ids(LOADERS["hf_files"](_src(), 0, 1, token="tok", on_file=opened.append)) == ["a0"]
+    assert _ids(LOADERS["hf_files"](_src(), 0, 1, SharedLoaderParameters(token="tok", on_file=opened.append))) == ["a0"]
     assert opened == ["data/a.parquet"] and seen_tokens == ["tok"]
 
 
@@ -232,14 +239,14 @@ def test_github_code_offsets_count_language_rows_and_share_files(hub: FakeHub, t
     load = LOADERS["github_code"]
     python = _src(loader="github_code", language="Python", load_kwargs={})
     java = _src(loader="github_code", language="Java", load_kwargs={})
-    assert _ids(load(python, 0, 3, index_dir=index_dir)) == ["a0", "a3", "b0"]
-    assert _ids(load(python, 3, 2, index_dir=index_dir)) == ["b3", "c0"]
-    assert _ids(load(java, 0, 5, index_dir=index_dir)) == ["a1", "a2", "a4", "a5", "b1"]
-    assert _ids(load(java, 9, 5, index_dir=index_dir)) == ["c2", "c4", "c5"]  # Java rows: a1 a2 a4 a5 b1 b2 b4 b5 c1 c2 ...
+    assert _ids(load(python, 0, 3, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a3", "b0"]
+    assert _ids(load(python, 3, 2, SharedLoaderParameters(index_dir=index_dir))) == ["b3", "c0"]
+    assert _ids(load(java, 0, 5, SharedLoaderParameters(index_dir=index_dir))) == ["a1", "a2", "a4", "a5", "b1"]
+    assert _ids(load(java, 9, 5, SharedLoaderParameters(index_dir=index_dir))) == ["c2", "c4", "c5"]  # Java rows: a1 a2 a4 a5 b1 b2 b4 b5 c1 c2 ...
     # every file was downloaded (i.e. resolved) but the language counts let later fetches skip files
     assert hub.downloads.count("data/a.parquet") >= 1
     hub.downloads.clear()
-    assert _ids(load(python, 5, 1, index_dir=index_dir)) == ["c3"]
+    assert _ids(load(python, 5, 1, SharedLoaderParameters(index_dir=index_dir))) == ["c3"]
     assert hub.downloads == ["data/c.parquet"]  # a and b: 2 Python rows each, known from the index
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["counts"]["language=Python"] == {"data/a.parquet": 2, "data/b.parquet": 2}
@@ -256,8 +263,8 @@ def test_keyed_offset_carries_across_files_with_unknown_counts(hub: FakeHub, tmp
     hub.add("data/c.parquet", _rows("c", 6, _language))  # Python: c0 c3
     python = _src(loader="github_code", language="Python", load_kwargs={})
     load = LOADERS["github_code"]
-    assert _ids(load(python, 5, 1, index_dir=tmp_path / "index")) == ["c3"]
-    assert _ids(load(python, 5, 1, index_dir=tmp_path / "index")) == ["c3"]  # now via the recorded counts
+    assert _ids(load(python, 5, 1, SharedLoaderParameters(index_dir=tmp_path / "index"))) == ["c3"]
+    assert _ids(load(python, 5, 1, SharedLoaderParameters(index_dir=tmp_path / "index"))) == ["c3"]  # now via the recorded counts
     assert _ids(load(python, 5, 1)) == ["c3"]  # in-memory index
 
 
@@ -265,10 +272,10 @@ def test_stream_offset_beyond_a_file_carries_over(hub: FakeHub, tmp_path: Path) 
     hub.add("data/a.jsonl", _rows("a", 3))
     hub.add("data/b.jsonl", _rows("b", 3))
     src = _src(load_kwargs={"data_files": "data/*.jsonl"})
-    assert _ids(LOADERS["hf_files"](src, 4, 2, index_dir=tmp_path / "index")) == ["b1", "b2"]
+    assert _ids(LOADERS["hf_files"](src, 4, 2, SharedLoaderParameters(index_dir=tmp_path / "index"))) == ["b1", "b2"]
     saved = json.loads(index_path(tmp_path / "index", REPO, REV, "data/*.jsonl").read_text())
     assert saved["rows"] == {"data/a.jsonl": 3}  # b was left in the middle: its total is not known yet
-    assert _ids(LOADERS["hf_files"](src, 4, 2, index_dir=tmp_path / "index")) == ["b1", "b2"]
+    assert _ids(LOADERS["hf_files"](src, 4, 2, SharedLoaderParameters(index_dir=tmp_path / "index"))) == ["b1", "b2"]
 
 
 def test_github_code_data_files_override_and_language_required(hub: FakeHub) -> None:
@@ -276,7 +283,7 @@ def test_github_code_data_files_override_and_language_required(hub: FakeHub) -> 
     hub.add("data/train-00001.parquet", _rows("b", 3, _language))
     src = _src(loader="github_code", language="Python", load_kwargs={"data_files": "data/train-00001.parquet"})
     assert _ids(LOADERS["github_code"](src, 0, 5)) == ["b0"]
-    index = hub_file_index(_src(loader="github_code", language="Java", load_kwargs={}), "data/*.parquet", None, None)
+    index = hub_file_index(_src(loader="github_code", language="Java", load_kwargs={}), "data/*.parquet", SharedLoaderParameters())
     assert index.files == ["data/train-00000.parquet", "data/train-00001.parquet"]
     assert list(LOADERS["github_code"](src, 0, 0)) == []
 
@@ -333,20 +340,20 @@ def test_large_parquet_reads_only_the_needed_row_groups(hub: FakeHub, tmp_path: 
     index_dir = tmp_path / "index"
     src = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
     # 12 rows from offset 3 end inside group 1, which is yielded to its end (rows 3..19)
-    assert _ids(LOADERS["hf_files"](src, 3, 12, index_dir=index_dir)) == [f"r{i}" for i in range(3, 20)]
+    assert _ids(LOADERS["hf_files"](src, 3, 12, SharedLoaderParameters(index_dir=index_dir))) == [f"r{i}" for i in range(3, 20)]
     assert hub.downloads == [] and hub.streams == ["data/big.parquet"]
     assert _touched_groups(hub.handles["data/big.parquet"].ranges, spans, size) == {0, 1}
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["row_groups"] == {"data/big.parquet": [10] * 6} and saved["rows"] == {"data/big.parquet": 60}
     assert saved["sizes"] == {"data/big.parquet": path.stat().st_size}
     # a top-up seeks straight to the right row group (and keeps it whole)
-    assert _ids(LOADERS["hf_files"](src, 52, 5, index_dir=index_dir)) == [f"r{i}" for i in range(52, 60)]
+    assert _ids(LOADERS["hf_files"](src, 52, 5, SharedLoaderParameters(index_dir=index_dir))) == [f"r{i}" for i in range(52, 60)]
     assert hub.streams == ["data/big.parquet"] * 2 and hub.downloads == []
     assert _touched_groups(hub.handles["data/big.parquet"].ranges, spans, size) == {5}
     assert hub.size_lookups == 1 and hub.listings == 1
     # a fetch entirely past the known row count never opens the file
     hub.streams.clear()
-    assert _ids(LOADERS["hf_files"](src, 60, 5, index_dir=index_dir)) == []
+    assert _ids(LOADERS["hf_files"](src, 60, 5, SharedLoaderParameters(index_dir=index_dir))) == []
     assert hub.streams == []
 
 
@@ -391,14 +398,14 @@ def test_large_json_lines_stream_sequentially_and_reread_partial_files(hub: Fake
     index_dir = tmp_path / "index"
     src = _src(load_kwargs={"data_files": f"f/*{suffix}", **REMOTE})
     load = LOADERS["hf_files"]
-    assert _ids(load(src, 0, 2, index_dir=index_dir)) == ["a0", "a1"]
+    assert _ids(load(src, 0, 2, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1"]
     assert hub.streams == [f"f/a{suffix}"] and hub.downloads == []
     assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {}  # not read to the end
-    assert _ids(load(src, 1, 4, index_dir=index_dir)) == ["a1", "a2", "a3", "b0"]  # a is re-streamed from its start
+    assert _ids(load(src, 1, 4, SharedLoaderParameters(index_dir=index_dir))) == ["a1", "a2", "a3", "b0"]  # a is re-streamed from its start
     assert hub.streams == [f"f/a{suffix}", f"f/a{suffix}", f"f/b{suffix}"]
     assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {f"f/a{suffix}": 4}
     hub.streams.clear()
-    assert _ids(load(src, 5, 9, index_dir=index_dir)) == ["b1", "b2", "b3"]
+    assert _ids(load(src, 5, 9, SharedLoaderParameters(index_dir=index_dir))) == ["b1", "b2", "b3"]
     assert hub.streams == [f"f/b{suffix}"]  # a is skipped by its recorded count; b read to the end
     assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {f"f/a{suffix}": 4, f"f/b{suffix}": 4}
 
@@ -414,7 +421,7 @@ def test_plain_json_streams_remotely_and_reads_from_cache(hub: FakeHub) -> None:
 def test_github_code_streams_large_files(hub: FakeHub, tmp_path: Path) -> None:
     hub.add("data/a.parquet", _rows("a", 6, _language))
     src = _src(loader="github_code", language="Python", load_kwargs=REMOTE)
-    assert _ids(LOADERS["github_code"](src, 0, 5, index_dir=tmp_path / "index")) == ["a0", "a3"]
+    assert _ids(LOADERS["github_code"](src, 0, 5, SharedLoaderParameters(index_dir=tmp_path / "index"))) == ["a0", "a3"]
     assert hub.streams == ["data/a.parquet"] and hub.downloads == []
 
 
@@ -458,12 +465,12 @@ def test_moved_repo_fails_the_loaded_index_with_the_pin_hint(hub: FakeHub, tmp_p
     hub.add("data/a.parquet", _rows("a", 3))
     index_dir = tmp_path / "index"
     load = LOADERS["hf_files"]
-    assert _ids(load(_src(), 0, 2, index_dir=index_dir)) == ["a0", "a1"]
+    assert _ids(load(_src(), 0, 2, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1"]
     built_at = hub.sha
     _forget_open_indexes()
     hub.sha = "commit-2"
     with pytest.raises(RuntimeError) as error:
-        list(load(_src(), 2, 1, index_dir=index_dir))
+        list(load(_src(), 2, 1, SharedLoaderParameters(index_dir=index_dir)))
     message = str(error.value)
     assert built_at in message and "commit-2" in message
     assert f"revision: {built_at}" in message  # the pin that keeps the downloaded raw data valid
@@ -472,7 +479,7 @@ def test_moved_repo_fails_the_loaded_index_with_the_pin_hint(hub: FakeHub, tmp_p
     # github_code shares the machinery (and here the very index): same error
     src = _src(loader="github_code", language="x", load_kwargs={"data_files": "data/*.parquet"})
     with pytest.raises(RuntimeError, match="file index was built at revision"):
-        list(LOADERS["github_code"](src, 0, 1, index_dir=index_dir))
+        list(LOADERS["github_code"](src, 0, 1, SharedLoaderParameters(index_dir=index_dir)))
 
 
 def test_legacy_index_without_revision_upgrades_once_then_guards(hub: FakeHub, tmp_path: Path) -> None:
@@ -649,33 +656,33 @@ def test_remote_parquet_keeps_the_row_group_whole_and_never_rereads_it(hub: Fake
     calls = _spy_read_row_group(monkeypatch)
     load = LOADERS["hf_files"]
     # 11 rows wanted -> the whole first row group, and only that group was pulled
-    assert _ids(load(src, 0, 11, index_dir=index_dir)) == [f"r{i}" for i in range(100)]
+    assert _ids(load(src, 0, 11, SharedLoaderParameters(index_dir=index_dir))) == [f"r{i}" for i in range(100)]
     assert [g for g, _ in calls] == [0]
     assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {0}
     # the top-up starts at the boundary: group 0 is never read again
     calls.clear()
-    assert _ids(load(src, 100, 3, index_dir=index_dir)) == [f"r{i}" for i in range(100, 200)]
+    assert _ids(load(src, 100, 3, SharedLoaderParameters(index_dir=index_dir))) == [f"r{i}" for i in range(100, 200)]
     assert [g for g, _ in calls] == [1]
     assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {1}
     # exact count on request
     calls.clear()
-    assert _ids(load(src, 0, 11, index_dir=index_dir, align_to_row_group=False)) == [f"r{i}" for i in range(11)]
+    assert _ids(load(src, 0, 11, SharedLoaderParameters(index_dir=index_dir, align_to_row_group=False))) == [f"r{i}" for i in range(11)]
     assert [g for g, _ in calls] == [0]
     assert _touched_groups(hub.handles["data/books.parquet"].ranges, spans, size) == {0}
     # cached files stay exact
     cached = _src(load_kwargs={"data_files": "data/*.parquet", "max_cached_file_mb": 1024})
-    assert _ids(load(cached, 95, 11, index_dir=index_dir)) == [f"r{i}" for i in range(95, 106)]
+    assert _ids(load(cached, 95, 11, SharedLoaderParameters(index_dir=index_dir))) == [f"r{i}" for i in range(95, 106)]
 
 
 def test_columns_are_projected_for_parquet(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
     hub.add("data/a.parquet", _rows("a", 3))
     calls = _spy_read_row_group(monkeypatch)
-    rows = list(LOADERS["hf_files"](_src(), 0, 2, columns=["id"]))
+    rows = list(LOADERS["hf_files"](_src(), 0, 2, SharedLoaderParameters(columns=["id"])))
     assert rows == [{"id": "a0"}, {"id": "a1"}]
     assert calls == [(0, ["id"])]
     calls.clear()
     remote = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
-    assert list(LOADERS["hf_files"](remote, 2, 1, columns=["text"])) == [{"text": "a doc 2"}]
+    assert list(LOADERS["hf_files"](remote, 2, 1, SharedLoaderParameters(columns=["text"]))) == [{"text": "a doc 2"}]
     assert calls == [(1, ["text"])]
     assert set(next(iter(LOADERS["hf_files"](_src(), 0, 1)))) == {"id", "text", "language"}  # None: every column
 
@@ -686,10 +693,10 @@ def test_columns_are_projected_for_the_json_formats(hub: FakeHub, suffix: str) -
     hub.add(f"f/a{suffix}", _rows("a", 4))
     for load_kwargs in ({"data_files": f"f/*{suffix}"}, {"data_files": f"f/*{suffix}", **REMOTE}):
         src = _src(load_kwargs=load_kwargs)
-        assert list(LOADERS["hf_files"](src, 1, 2, columns=["id"])) == [{"id": "a1"}, {"id": "a2"}]
-        assert list(LOADERS["hf_files"](src, 0, 1, columns=["text", "id"])) == [{"text": "a doc 0", "id": "a0"}]
+        assert list(LOADERS["hf_files"](src, 1, 2, SharedLoaderParameters(columns=["id"]))) == [{"id": "a1"}, {"id": "a2"}]
+        assert list(LOADERS["hf_files"](src, 0, 1, SharedLoaderParameters(columns=["text", "id"]))) == [{"text": "a doc 0", "id": "a0"}]
         # a column the row does not have stays absent (the caller's own "row has no <column>" check still fires)
-        assert list(LOADERS["hf_files"](src, 0, 1, columns=["id", "missing"])) == [{"id": "a0"}]
+        assert list(LOADERS["hf_files"](src, 0, 1, SharedLoaderParameters(columns=["id", "missing"]))) == [{"id": "a0"}]
         assert set(next(iter(LOADERS["hf_files"](src, 0, 1)))) == {"id", "text", "language"}  # None: every column
 
 
@@ -701,7 +708,7 @@ def test_projection_keeps_a_mixed_type_surplus_column_out_of_the_shard_writer(hu
         {"id": "a1", "text": "a doc 1", "meta": ["a", "list"]},
     ])
     src = _src(load_kwargs={"data_files": "f/*.jsonl"})
-    projected = list(LOADERS["hf_files"](src, 0, 2, columns=["text"]))
+    projected = list(LOADERS["hf_files"](src, 0, 2, SharedLoaderParameters(columns=["text"])))
     assert projected == [{"text": "a doc 0"}, {"text": "a doc 1"}]
     pq.write_table(pa.Table.from_pylist(projected), tmp_path / "shard.parquet")
     with pytest.raises(pa.ArrowException):
@@ -716,19 +723,19 @@ def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_cou
     src = _src(loader="github_code", language="Python", load_kwargs=REMOTE)
     calls = _spy_read_row_group(monkeypatch)
     load = LOADERS["github_code"]
-    assert [r["id"] for r in load(src, 0, 2, index_dir=index_dir, columns=["id"])] == ["a0", "a3"]
+    assert [r["id"] for r in load(src, 0, 2, SharedLoaderParameters(index_dir=index_dir, columns=["id"]))] == ["a0", "a3"]
     assert calls == [(0, ["id", "language"]), (1, ["id", "language"])]  # `language` is added for the match
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["group_counts"] == {"language=Python": {"data/a.parquet": [1, 1]}}
     assert "language=Python" not in saved["counts"]  # the file is not finished
     calls.clear()
-    assert _ids(load(src, 2, 1, index_dir=index_dir)) == ["a6"]  # offset 2 = the two finished groups: seek to group 2
+    assert _ids(load(src, 2, 1, SharedLoaderParameters(index_dir=index_dir))) == ["a6"]  # offset 2 = the two finished groups: seek to group 2
     assert [g for g, _ in calls] == [2, 3]  # group 2 has no Python row, group 3 finishes the file
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
     assert saved["group_counts"]["language=Python"]["data/a.parquet"] == [1, 1, 0, 1]
     assert saved["counts"]["language=Python"] == {"data/a.parquet": 3} and saved["rows"] == {"data/a.parquet": 8}
     calls.clear()
-    assert _ids(load(src, 1, 5, index_dir=index_dir, align_to_row_group=False)) == ["a3", "a6"]
+    assert _ids(load(src, 1, 5, SharedLoaderParameters(index_dir=index_dir, align_to_row_group=False))) == ["a3", "a6"]
     assert [g for g, _ in calls] == [1, 2, 3]  # offset 1 lies in group 1: group 0 is skipped by its recorded count
 
 
@@ -754,13 +761,13 @@ def test_group_read_reads_every_row_group_once_and_matches_separate_loads(
     sources = {lang: _src(loader="github_code", language=lang, load_kwargs=REMOTE) for lang in ("Python", "Java", "Go")}
     wanted = {"Python": (0, 4), "Java": (1, 2), "Go": (0, 5)}
 
-    expected = {lang: _ids(LOADERS["github_code"](sources[lang], *wanted[lang], index_dir=tmp_path / "separate")) for lang in sources}
+    expected = {lang: _ids(LOADERS["github_code"](sources[lang], *wanted[lang], SharedLoaderParameters(index_dir=tmp_path / "separate"))) for lang in sources}
     assert expected == {"Python": ["a0", "a3", "a6", "b0"], "Java": ["a4", "a7"], "Go": ["a2", "a5", "b2", "b5"]}
 
     calls = _spy_read_row_group(monkeypatch)
     hub.streams.clear()
     requests = [GithubCodeRequest(lang, sources[lang], *wanted[lang]) for lang in sources]
-    got = _group_ids(read_github_code_group(requests, index_dir=tmp_path / "group", columns=["id"]))
+    got = _group_ids(read_github_code_group(requests, SharedLoaderParameters(index_dir=tmp_path / "group", columns=["id"])))
     assert got == expected
     # each file opened once, each of its four row groups read once (Go wants more than the repo has: read to the end)
     assert hub.streams == ["data/a.parquet", "data/b.parquet"]
@@ -779,12 +786,12 @@ def test_group_top_up_reads_only_the_row_groups_still_needed(hub: FakeHub, tmp_p
     python = _src(loader="github_code", language="Python", load_kwargs=REMOTE)
     java = _src(loader="github_code", language="Java", load_kwargs=REMOTE)
     first = [GithubCodeRequest("py", python, 0, 3), GithubCodeRequest("java", java, 0, 3)]
-    assert _group_ids(read_github_code_group(first, index_dir=index_dir)) == {"py": ["a0", "a3", "a6"], "java": ["a1", "a4", "a7"]}
+    assert _group_ids(read_github_code_group(first, SharedLoaderParameters(index_dir=index_dir))) == {"py": ["a0", "a3", "a6"], "java": ["a1", "a4", "a7"]}
     calls = _spy_read_row_group(monkeypatch)
     hub.streams.clear()
     # python continues at 3 (b0 ...), java is satisfied: only file b is opened, starting at its first group
     top_up = [GithubCodeRequest("py", python, 3, 1), GithubCodeRequest("java", java, 3, 0)]
-    assert _group_ids(read_github_code_group(top_up, index_dir=index_dir)) == {"py": ["b0"]}
+    assert _group_ids(read_github_code_group(top_up, SharedLoaderParameters(index_dir=index_dir))) == {"py": ["b0"]}
     assert hub.streams == ["data/b.parquet"] and [g for g, _ in calls] == [0]
 
 
@@ -792,7 +799,7 @@ def test_group_exhausted_language_does_not_stop_the_others(hub: FakeHub, tmp_pat
     hub.add("data/a.parquet", _rows("a", 6, _three_languages))  # Python a0 a3, Java a1 a4, Go a2 a5
     sources = {lang: _src(loader="github_code", language=lang, load_kwargs={}) for lang in ("Python", "Java", "Rust")}
     requests = [GithubCodeRequest(lang, src, 0, 2) for lang, src in sources.items()]
-    got = _group_ids(read_github_code_group(requests, index_dir=tmp_path / "index"))
+    got = _group_ids(read_github_code_group(requests, SharedLoaderParameters(index_dir=tmp_path / "index")))
     assert got == {"Python": ["a0", "a3"], "Java": ["a1", "a4"]}  # Rust: nothing, the others are complete
     saved = json.loads(index_path(tmp_path / "index", REPO, REV, "data/*.parquet").read_text())
     assert saved["counts"]["language=Rust"] == {"data/a.parquet": 0}
