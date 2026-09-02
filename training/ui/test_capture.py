@@ -13,13 +13,13 @@ from pathlib import Path
 import pytest
 
 from data_preparation.lib.ui.capture import LineSink
+from data_preparation.lib.ui.capture import DashboardLogHandler
 from training.ui.capture import (
     QUIET_ENV,
     STDERR_LOGGER,
     STDOUT_LOGGER,
     WANDB_QUIET_SETTINGS,
     WARNINGS_LOGGER,
-    DashboardLogHandler,
     TerminalCapture,
     attach_logger,
     format_warning,

@@ -16,25 +16,21 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from data_preparation.lib import sources
 from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
-from data_preparation.lib.sources import (
+from data_preparation.lib.sources.converters import (
     CONVERTERS,
     FILTERS,
-    LOADERS,
-    Row,
     fields_converter,
     first_two_turns,
     get_converter,
     get_filter,
-    get_loader,
     gsm8k_question_answer,
     instruction_input_output,
     sharegpt_conversations,
     sharegpt_quality,
-    synthetic_row,
-    write_synthetic_tokenizer,
 )
+from data_preparation.lib.sources.loaders import LOADERS, Row, get_loader, load_local
+from data_preparation.lib.sources.synthetic import VOCAB_SIZE, synthetic_row, write_synthetic_tokenizer
 
 REPO = Path(__file__).resolve().parents[3]
 CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config" / "datasets" / "tiny.yaml"]
@@ -218,7 +214,7 @@ def test_write_synthetic_tokenizer(tmp_path: Path) -> None:
     tokenizer = AutoTokenizer.from_pretrained(str(tmp_path / "tok"))
     assert tokenizer.convert_tokens_to_ids(["<pad>", "<bos>", "<eos>", "tok_0", "tok_255"]) == [0, 1, 2, 3, 258]
     assert tokenizer.encode("tok_1 tok_2", add_special_tokens=False) == [4, 5]
-    assert len(tokenizer) == sources.VOCAB_SIZE == 259
+    assert len(tokenizer) == VOCAB_SIZE == 259
 
 
 # --- registries -------------------------------------------------------------------------------------------------------
@@ -226,7 +222,7 @@ def test_write_synthetic_tokenizer(tmp_path: Path) -> None:
 
 def test_registry_names_and_unknown() -> None:
     assert set(LOADERS) == {"hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"}
-    assert get_loader("local") is sources.load_local
+    assert get_loader("local") is load_local
     with pytest.raises(ValueError, match="hf_split"):
         get_loader("nope")
     with pytest.raises(ValueError, match="sharegpt_quality"):

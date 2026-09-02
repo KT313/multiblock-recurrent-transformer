@@ -60,6 +60,3 @@ def _holder(path: Path) -> str:
         return f"pid {record.get('pid')} on {record.get('host')} since {record.get('since')}"
     except (OSError, ValueError):
         return "holder unknown"
-
-
-__all__ = ["BUILD_LOCK_NAME", "BuildLocked", "build_lock"]

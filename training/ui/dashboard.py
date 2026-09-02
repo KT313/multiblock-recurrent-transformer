@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Terminal dashboard for one training run: stage bars, the latest metrics, validation losses, events and a log panel
-— one live layout, and nothing else on the terminal while it is up. The public API of ``training/ui/``; the parts
-live in the sibling modules (``common``, ``format``, ``throughput``, ``capture``, ``fallback``, ``board``, ``demo``).
+— one live layout, and nothing else on the terminal while it is up. This module opens it (:func:`training_dashboard`);
+the parts live in the sibling modules (``common``, ``format``, ``throughput``, ``capture``, ``fallback``, ``board``, ``demo``).
 
 Built on ``rich`` (the only training package that imports it), the sibling of ``data_preparation/lib/ui/dashboard.py``
 (with which it shares the console capture of ``data_preparation/lib/ui/capture.py``: the line sinks, the log handler,
@@ -78,68 +78,9 @@ from typing import TextIO
 
 from rich.console import Console
 
-from training.ui.board import DEFAULT_EVENT_LINES, DEFAULT_LOG_LINES, DEFAULT_REFRESH_PER_SECOND, StageBar, TrainingDashboard
-from training.ui.capture import (
-    QUIET_ENV,
-    STDERR_LOGGER,
-    STDOUT_LOGGER,
-    WANDB_QUIET_SETTINGS,
-    WARNINGS_LOGGER,
-    DashboardLogHandler,
-    LogSink,
-    TerminalCapture,
-    attach_logger,
-    format_warning,
-)
-from training.ui.common import ENV_VAR, TRAIN_LOG_NAME, TRAINING_LOGGER_NAME, Clock, dashboard_enabled
+from training.ui.board import TrainingDashboard
+from training.ui.common import Clock, dashboard_enabled
 from training.ui.fallback import NoOpDashboard
-from training.ui.format import (
-    METRIC_COLUMNS,
-    MIN_LOG_LINES,
-    TRANSITION_FLAG_KEY,
-    TRANSITION_PROGRESS_KEY,
-    fit_panel_heights,
-    format_duration,
-    format_metric,
-    format_tokens,
-)
-from training.ui.throughput import RATE_SMOOTHING, Throughput
-
-__all__ = [
-    "DEFAULT_EVENT_LINES",
-    "DEFAULT_LOG_LINES",
-    "DEFAULT_REFRESH_PER_SECOND",
-    "ENV_VAR",
-    "METRIC_COLUMNS",
-    "MIN_LOG_LINES",
-    "QUIET_ENV",
-    "RATE_SMOOTHING",
-    "STDERR_LOGGER",
-    "STDOUT_LOGGER",
-    "TRAINING_LOGGER_NAME",
-    "TRAIN_LOG_NAME",
-    "TRANSITION_FLAG_KEY",
-    "TRANSITION_PROGRESS_KEY",
-    "WANDB_QUIET_SETTINGS",
-    "WARNINGS_LOGGER",
-    "Clock",
-    "DashboardLogHandler",
-    "LogSink",
-    "NoOpDashboard",
-    "RunDashboard",
-    "StageBar",
-    "TerminalCapture",
-    "Throughput",
-    "TrainingDashboard",
-    "attach_logger",
-    "dashboard_enabled",
-    "fit_panel_heights",
-    "format_duration",
-    "format_metric",
-    "format_tokens",
-    "format_warning",
-    "training_dashboard",
-]
 
 RunDashboard = TrainingDashboard | NoOpDashboard  # what `training_dashboard` yields; the type of `RunLogger`'s field
 

@@ -37,20 +37,15 @@ from model import RecurrentGPT
 from training.checkpoint import unwrap_compiled
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
-from training.ui.common import KEEP
-from training.ui.dashboard import (
-    TRAIN_LOG_NAME,
-    TRANSITION_FLAG_KEY,
-    TRANSITION_PROGRESS_KEY,
-    WANDB_QUIET_SETTINGS,
-    RunDashboard,
-    training_dashboard,
-)
+from training.ui.capture import WANDB_QUIET_SETTINGS
+from training.ui.common import KEEP, TRAIN_LOG_NAME
+from training.ui.dashboard import RunDashboard, training_dashboard
+from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
 
-    from training.backend import Backend
+    from training.backend.base import Backend
     from training.data.dataset_resolver import ResolvedDataset
     from training.step import StepResult, TrainingProgress  # `step.py` imports `track_gradient_metrics` from here
 

@@ -28,7 +28,7 @@ from data_preparation.dataset_config import (
 )
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.build import DatasetReport
+from data_preparation.lib.build.planner import DatasetReport
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
 from training.checkpoint import CheckpointMetadata
 from training.data.dataset_resolver import (

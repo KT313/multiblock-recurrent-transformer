@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.sources import N_WORD_TOKENS, SPECIALS
+from data_preparation.lib.sources.synthetic import N_WORD_TOKENS, SPECIALS
 from training.data.tokenizer import Tokenizer
 
 

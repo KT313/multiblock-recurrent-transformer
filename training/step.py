@@ -26,7 +26,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from model import RecurrentGPT
-from training.backend import Backend
+from training.backend.base import Backend
 from training.checkpoint import unwrap_compiled
 from training.data.collate import IGNORE_INDEX, Batch, Sample
 from training.data.loader import RunDataloaders, world_batch_micro_batches

@@ -46,7 +46,8 @@ from torch.optim import Optimizer
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
-from training.backend import Backend, get_backend
+from training.backend import get_backend
+from training.backend.base import Backend
 from training.checkpoint import (
     CheckpointMetadata,
     checkpoint_dir,
@@ -64,26 +65,10 @@ from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchan
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport
 from training.optim import build_optimizer, get_param_groups
-from training.run_lock import RunDirectoryLocked, run_directory_lock
+from training.run_lock import run_directory_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
-
-__all__ = [
-    "RunDirectoryLocked",
-    "TrainingReport",
-    "build_run_model",
-    "build_run_optimizer",
-    "build_stage_manager",
-    "check_block_sizes_agree",
-    "create_backend",
-    "export_if_requested",
-    "prepare_run_directory",
-    "restore_checkpoint_if_resuming",
-    "save_run_checkpoint",
-    "stop_requested",
-    "train",
-]
 
 
 def train(

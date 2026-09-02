@@ -32,18 +32,17 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources import (
-    FetchStats,
+from data_preparation.lib.sources.converters import get_converter, get_filter
+from data_preparation.lib.sources.hub_files import FetchStats
+from data_preparation.lib.sources.loaders import (
+    MAX_CACHED_FILE_KEY,
     GithubCodeRequest,
     Row,
-    get_converter,
-    get_filter,
     get_loader,
     github_code_repo_key,
     read_github_code_group,
-    write_synthetic_tokenizer,
 )
-from data_preparation.lib.sources.loaders import MAX_CACHED_FILE_KEY
+from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.truncation import truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
@@ -680,23 +679,3 @@ def _bounded(rows: Iterator[Row], limit: int | None) -> Generator[Row, None, Non
         close = getattr(rows, "close", None)
         if close is not None:
             close()
-
-
-__all__ = [
-    "DEFAULT_SHARD_SIZE",
-    "RawFolderError",
-    "RawManifestState",
-    "TokenCounter",
-    "current_manifest",
-    "current_raw_manifest",
-    "download",
-    "download_github_code_group",
-    "fetch_source",
-    "loader_columns",
-    "new_manifest",
-    "prepare_tokenizer",
-    "raw_manifest_problem",
-    "raw_manifest_state",
-    "shard_list",
-    "text_row",
-]

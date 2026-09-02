@@ -133,14 +133,3 @@ def _more_raw_follows(covered: ShardList, raw_shards: ShardList) -> bool:
     """Whether the covered raw shards are a *proper* prefix of the raw shard list — a resumed build has work left,
     so its next publish overwrites the crash leftover. A folder that covers everything gets no further publish."""
     return len(covered) < len(raw_shards) and raw_shards[: len(covered)] == covered
-
-
-__all__ = [
-    "CheapestRepair",
-    "ProcessedAssessment",
-    "ProcessedProblem",
-    "ShardList",
-    "Verdict",
-    "assess_processed_folder",
-    "next_shard_to_write",
-]

@@ -35,21 +35,20 @@ from types import FrameType
 if __name__ == "__main__":  # allow `python data_preparation/prepare.py` without installing the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data_preparation.lib.build import (  # noqa: E402
+from data_preparation.dataset_config import load_dataset_config  # noqa: E402
+from data_preparation.layout import DatasetLayout  # noqa: E402
+from data_preparation.lib.abort import BuildAborted  # noqa: E402
+from data_preparation.lib.build.describe import describe, leading_comment  # noqa: E402
+from data_preparation.lib.build.repair import ConfirmationRequired  # noqa: E402
+from data_preparation.lib.build.runner import (  # noqa: E402
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
     DEFAULT_NUM_WORKERS,
     DEFAULT_PASS_WORKERS,
     STEPS,
-    BuildAborted,
-    ConfirmationRequired,
-    describe,
-    leading_comment,
     prepare,
     status,
 )
 from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
-from data_preparation.dataset_config import load_dataset_config  # noqa: E402
-from data_preparation.layout import DatasetLayout  # noqa: E402
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger  # noqa: E402
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard  # noqa: E402
 

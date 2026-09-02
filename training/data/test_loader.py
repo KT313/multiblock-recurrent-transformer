@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
 from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset, resolve_dataset
 from training.data.loader import (

@@ -22,9 +22,9 @@ from unittest import mock
 
 import torch
 
-from data_preparation.lib.build import prepare
+from data_preparation.lib.build.runner import prepare
 from training import run as run_module
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.optim import build_optimizer
 from training.run import train
@@ -193,21 +193,3 @@ def golden_mismatches(expected: Any, actual: Any, *, exact: bool, path: str = ""
     if isinstance(expected, float) and not exact and key not in GOLDEN_ALWAYS_EXACT_KEYS:
         return [] if _floats_agree(expected, actual) else [f"{path}: {expected!r} != {actual!r}"]
     return [] if expected == actual else [f"{path}: {expected!r} != {actual!r}"]
-
-
-__all__ = [
-    "GOLDEN_ALWAYS_EXACT_KEYS",
-    "GOLDEN_EXACT_ENV",
-    "GOLDEN_PER_STEP_KEYS",
-    "GOLDEN_RELATIVE_TOLERANCE",
-    "GOLDEN_RUN_PATH",
-    "TINY_DATASET_YAML",
-    "TINY_YAML",
-    "golden_exact_requested",
-    "golden_mismatches",
-    "golden_run_json",
-    "golden_run_metrics",
-    "record_golden_run",
-    "single_thread_deterministic",
-    "write_tiny_yaml",
-]

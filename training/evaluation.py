@@ -22,7 +22,7 @@ from torch import Tensor
 from torch.nn import Module
 
 from model import RecurrentGPT
-from training.backend import Backend
+from training.backend.base import Backend
 from training.checkpoint import unwrap_compiled
 from training.data.collate import Batch
 from training.settings import Settings

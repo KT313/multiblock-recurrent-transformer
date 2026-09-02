@@ -26,7 +26,7 @@ from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, Sou
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
-from data_preparation.lib.build import prepare, status
+from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import BuildLocked, build_lock
 from data_preparation.lib.build.planner import DownloadPlan, plan_downloads, rows_needed, rows_sufficient
 from data_preparation.lib.build.repair import ConfirmationRequired

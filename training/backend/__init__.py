@@ -15,6 +15,3 @@ def get_backend(name: str = "single_device", **kwargs: Any) -> Backend:
     if name not in BACKENDS:
         raise ValueError(f"Unknown backend {name!r}; available: {sorted(BACKENDS)}")
     return BACKENDS[name](**kwargs)
-
-
-__all__ = ["Backend", "SingleDeviceBackend", "get_backend"]

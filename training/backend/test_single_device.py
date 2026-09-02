@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 import torch
 
-from training.backend import BACKENDS, Backend, SingleDeviceBackend, get_backend
+from training.backend import BACKENDS, get_backend
+from training.backend.base import Backend
+from training.backend.single_device import SingleDeviceBackend
 from training.backend.single_device import PRECISIONS, _set_torch_flags
 
 

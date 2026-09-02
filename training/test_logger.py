@@ -18,7 +18,7 @@ from rich.console import Console
 
 from data_preparation.dataset_config import DatasetConfig
 from model import RecurrentGPT
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.data.dataset_resolver import ResolvedDataset
 from training.logger import (
     CONSOLE_LOGGER_NAME,
@@ -40,14 +40,11 @@ from training.settings import Settings
 from training.stage_manager import StageManager, TrainingStage
 from training.step import StepResult, TrainingProgress
 from training.test_step import reference_settings, reference_stage_manager
-from training.ui.dashboard import (
-    TRAIN_LOG_NAME,
-    TRANSITION_FLAG_KEY,
-    TRANSITION_PROGRESS_KEY,
-    WANDB_QUIET_SETTINGS,
-    NoOpDashboard,
-    TrainingDashboard,
-)
+from training.ui.board import TrainingDashboard
+from training.ui.capture import WANDB_QUIET_SETTINGS
+from training.ui.common import TRAIN_LOG_NAME
+from training.ui.fallback import NoOpDashboard
+from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 
 def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:

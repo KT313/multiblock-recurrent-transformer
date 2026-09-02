@@ -16,7 +16,8 @@ from data_preparation import prepare
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.build import STEPS, DatasetReport
+from data_preparation.lib.build.planner import DatasetReport
+from data_preparation.lib.build.runner import STEPS
 from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

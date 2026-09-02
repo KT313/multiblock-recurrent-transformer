@@ -13,14 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from training.ui.dashboard import (
-    TRANSITION_FLAG_KEY,
-    TRANSITION_PROGRESS_KEY,
-    NoOpDashboard,
-    RunDashboard,
-    TrainingDashboard,
-    training_dashboard,
-)
+from training.ui.board import TrainingDashboard
+from training.ui.dashboard import RunDashboard, training_dashboard
+from training.ui.fallback import NoOpDashboard
+from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 from training.ui.testing import (
     BOX_CHARACTERS,
     LOGGER_NAME,

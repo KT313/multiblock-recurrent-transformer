@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from torch.utils.data import DataLoader, IterableDataset
 
-from training.backend import Backend
+from training.backend.base import Backend
 from training.data.collate import (
     IGNORE_INDEX,
     Batch,

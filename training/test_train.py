@@ -24,13 +24,13 @@ import pytest
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.log import ProgressStreamHandler
 from training import train as train_module
-from training.backend import Backend
+from training.backend.base import Backend
 from training.checkpoint import checkpoint_dir
 from training.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
 from training.train import StopRequest, main, stop_on_interrupt
-from training.ui.dashboard import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
+from training.ui.common import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
 from training.ui.testing import BOX_CHARACTERS, screen_of, strip_ansi
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

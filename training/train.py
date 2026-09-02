@@ -37,8 +37,7 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
 from training.settings import parse_settings
-from training.ui.common import KEEP
-from training.ui.dashboard import TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
+from training.ui.common import KEEP, TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
 
 EXIT_INTERRUPTED = 130
 

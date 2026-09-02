@@ -16,7 +16,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import RecurrentConfig, RecurrentGPT
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data.collate import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
@@ -48,7 +48,7 @@ from training.run_lock import RunDirectoryLocked, run_directory_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
-from training.ui.dashboard import TRAIN_LOG_NAME
+from training.ui.common import TRAIN_LOG_NAME
 
 History = dict[int, dict[str, float]]
 

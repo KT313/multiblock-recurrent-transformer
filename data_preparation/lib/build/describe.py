@@ -254,6 +254,3 @@ def _tokens(n: int) -> str:
 
 def _yn(flag: bool) -> str:
     return "on" if flag else "off"
-
-
-__all__ = ["GENERATED_WITH", "describe", "leading_comment"]

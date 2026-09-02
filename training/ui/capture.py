@@ -17,29 +17,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
 
-from data_preparation.lib.ui.capture import (  # generic, shared with the data-prep dashboard
-    DashboardLogHandler,
-    LineSink,
-    LoggingCapture,
-    LogSink,
-    StreamCapture,
-)
+from data_preparation.lib.ui.capture import LoggingCapture, LogSink, StreamCapture  # generic, shared with the data-prep dashboard
 from data_preparation.lib.ui.capture import attach_logger as _attach_logger
 from training.ui.common import TRAINING_LOGGER_NAME
-
-__all__ = [
-    "QUIET_ENV",
-    "STDERR_LOGGER",
-    "STDOUT_LOGGER",
-    "WANDB_QUIET_SETTINGS",
-    "WARNINGS_LOGGER",
-    "DashboardLogHandler",
-    "LineSink",
-    "LogSink",
-    "TerminalCapture",
-    "attach_logger",
-    "format_warning",
-]
 
 STDOUT_LOGGER = f"{TRAINING_LOGGER_NAME}.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = f"{TRAINING_LOGGER_NAME}.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)

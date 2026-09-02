@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model import RecurrentGPT, build_model
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
 from training.data.loader import RunDataloaders, SampleBatch, build_dataloader, build_run_dataloaders
 from training.data.collate import find_multiple

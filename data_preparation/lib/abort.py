@@ -18,6 +18,3 @@ def check_stop(should_stop: StopCheck | None) -> None:
     """Raise :class:`BuildAborted` when ``should_stop`` says so (None: never)."""
     if should_stop is not None and should_stop():
         raise BuildAborted("build cancelled")
-
-
-__all__ = ["BuildAborted", "StopCheck", "check_stop"]

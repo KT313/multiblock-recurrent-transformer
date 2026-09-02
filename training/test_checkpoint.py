@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from model import RecurrentGPT, build_model
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import (
     CHECKPOINT_SUBDIR,
     PARAM_GROUPING_SETTING,

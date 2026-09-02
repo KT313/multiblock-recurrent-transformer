@@ -59,8 +59,9 @@ from data_preparation.lib.build.planner import (
 from data_preparation.lib.build.repair import Confirm, RepairAction, RepairReport, repair_broken_and_stale_folders
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources import github_code_repo_key
-from data_preparation.lib.stages import build_source, download, download_github_code_group, prepare_tokenizer
+from data_preparation.lib.sources.loaders import github_code_repo_key
+from data_preparation.lib.stages.build import build_source
+from data_preparation.lib.stages.download import download, download_github_code_group, prepare_tokenizer
 from data_preparation.lib.ui.dashboard import progress, set_status
 
 log = get_logger(__name__)
@@ -501,22 +502,3 @@ def log_report(report: DatasetReport) -> None:
         elif not source.satisfied:
             log.warning("%s: %s", source.name, source.reason)
     log.info("dataset status:\n%s", report.describe(), extra={"keep": True})  # keep: printed unwrapped into the scrollback
-
-
-__all__ = [
-    "DEFAULT_MAX_PARALLEL_DOWNLOADS",
-    "DEFAULT_NUM_WORKERS",
-    "DEFAULT_PASS_WORKERS",
-    "MAX_ROUNDS",
-    "STEPS",
-    "BuildAborted",
-    "Job",
-    "JobPool",
-    "StopFlag",
-    "assess_dataset_state",
-    "download_and_build_missing",
-    "outstanding_repairs",
-    "prepare",
-    "status",
-    "wait_for_jobs",
-]

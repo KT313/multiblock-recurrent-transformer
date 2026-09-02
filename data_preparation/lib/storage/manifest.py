@@ -224,16 +224,3 @@ def _git_sha() -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
-
-
-__all__ = [
-    "MANIFEST_NAME",
-    "Manifest",
-    "ShardInfo",
-    "Stage",
-    "library_versions",
-    "has_shards",
-    "shard_problem",
-    "shard_rows",
-    "shard_tokens",
-]

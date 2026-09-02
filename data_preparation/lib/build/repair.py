@@ -308,20 +308,3 @@ def _truncate_raw(action: RepairAction) -> None:
     manifest = Manifest.load(action.folder)
     if manifest is None or not RawFolder(action.folder, manifest).truncate_to_good_prefix():
         raise RepairError(f"{action.source}: {action.folder} changed while repairing; could not truncate to its good prefix")
-
-
-__all__ = [
-    "CONFIRMATION_HEADER",
-    "CONFIRMATION_QUESTION",
-    "ConfirmationRequired",
-    "RepairAction",
-    "RepairError",
-    "RepairReport",
-    "confirm_raw_deletions",
-    "confirmation_message",
-    "inspect_processed_folder",
-    "inspect_raw_folder",
-    "inspect_swap_leftovers",
-    "perform_repairs",
-    "repair_broken_and_stale_folders",
-]

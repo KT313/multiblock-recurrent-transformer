@@ -84,6 +84,3 @@ def _cut_before_token(text: str, offsets: Offsets, index: int) -> str:
     """``text`` cut where token ``index`` starts — always strictly shorter than ``text`` so the recount loop ends."""
     start, _ = offsets[index]
     return text[: min(start, len(text) - 1)]
-
-
-__all__ = ["CHARS_PER_TOKEN_ESTIMATE", "PRE_CUT_CHARS_PER_TOKEN", "truncate_many"]

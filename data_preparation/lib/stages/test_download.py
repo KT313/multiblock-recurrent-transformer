@@ -20,7 +20,7 @@ from data_preparation.dataset_config import DatasetConfig, SourceConfig, Tokeniz
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
-from data_preparation.lib.sources import synthetic_row
+from data_preparation.lib.sources.synthetic import synthetic_row
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.abort import BuildAborted

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from model import RecurrentGPT
-from training.backend import SingleDeviceBackend
+from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import Batch
 from training.evaluation import evaluate, is_evaluation_step
 from training.settings import Settings

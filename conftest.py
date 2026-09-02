@@ -19,7 +19,7 @@ if "PYTEST_XDIST_WORKER_COUNT" in os.environ:
 
 from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
-from data_preparation.lib.build import prepare
+from data_preparation.lib.build.runner import prepare
 from model import RecurrentGPT
 
 REPO_ROOT = Path(__file__).resolve().parent

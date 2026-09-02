@@ -31,7 +31,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
 from data_preparation.lib.abort import StopCheck
-from data_preparation.lib.build import ConfirmationRequired, prepare, status, summarize_dataset_state
+from data_preparation.lib.build.planner import summarize_dataset_state
+from data_preparation.lib.build.repair import ConfirmationRequired
+from data_preparation.lib.build.runner import prepare, status
 from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
@@ -552,27 +554,3 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
         log.warning("%s; continuing because allow_dataset_change is set", message)
         return
     raise RuntimeError(f"{message}. Set allow_dataset_change: true to resume anyway.")
-
-
-__all__ = [
-    "INSTRUCT_DATA_SIGNATURE",
-    "TRAIN_LOADER_NUM_WORKERS",
-    "DataEntry",
-    "ResolvedDataset",
-    "ResolvedStage",
-    "build_command",
-    "check_dataset_unchanged",
-    "check_entries_on_disk",
-    "check_entry_shards",
-    "check_validation_batches",
-    "entry_rows_in_range",
-    "loader_shards",
-    "processed_rows",
-    "resolve_dataset",
-    "resolve_splits",
-    "resolve_train_sources",
-    "resolve_val_entries",
-    "validate_settings",
-    "validation_batches_available",
-    "validation_rows_of",
-]
