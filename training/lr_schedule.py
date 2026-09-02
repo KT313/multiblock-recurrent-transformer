@@ -13,29 +13,27 @@ def _scheduled_lr(
 ) -> float:
     """The schedule without the resume warmup: global warmup at the start, global cooldown at the end, the per-stage
     base LR in between and a linear interpolation between the adjacent base LRs inside a stage transition."""
-    stage_info = stage_manager.get_stage_info(step)
+    stages = stage_manager.stages
 
-    # Global warmup (beginning of first stage): towards the first stage's base LR — inside the first transition
-    # `stage_info.base_lr` would already be the next stage's, and the ramp must not change its target midway.
+    # Global warmup (beginning of first stage): towards the first stage's base LR
     if step < warmup_steps:
-        return stage_manager.stages[0].base_lr * step / warmup_steps
+        return stages[0].base_lr * step / warmup_steps
 
     if step > max_steps:
         return min_lr
     # Global cooldown (end of last stage)
     if step > (max_steps - cooldown_steps):
-        final_lr = stage_manager.stages[-1].base_lr
-        return max(final_lr * (max_steps - step) / cooldown_steps, min_lr)
+        return max(stages[-1].base_lr * (max_steps - step) / cooldown_steps, min_lr)
 
-    # During transition: interpolate between stage LRs
-    if stage_info.in_transition and stage_info.prev_base_lr is not None:
-        interpolated_lr = stage_info.prev_base_lr + (stage_info.base_lr - stage_info.prev_base_lr) * (
-            stage_info.transition_progress
-        )
-        return max(interpolated_lr, min_lr)
+    stage_info = stage_manager.get_stage_info(step)
+    base_lr = stages[stage_info.stage_idx].base_lr
+    # During transition: interpolate from the current stage's base LR to the entering stage's
+    if stage_info.transition_to is not None:
+        entering_lr = stages[stage_info.transition_to].base_lr
+        return max(base_lr + (entering_lr - base_lr) * stage_info.transition_progress, min_lr)
 
     # Within stage: constant plateau at the stage's base LR
-    return max(stage_info.base_lr, min_lr)
+    return max(base_lr, min_lr)
 
 
 def _resume_warmup(steps_since_resume: int, resume_warmup_steps: int, min_lr: float, target_lr: float) -> float:

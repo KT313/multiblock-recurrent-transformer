@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import fields
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -54,7 +53,6 @@ from training.data.dataset_resolver import (
 )
 from training.data.datasets import ParquetTextDataset
 from training.settings import Settings
-from training.stage_manager import TrainingStage
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CROW_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"
@@ -580,22 +578,14 @@ def test_data_entry_defaults() -> None:
     assert (entry.weight, entry.data_signature, entry.skip_rows, entry.max_rows) == (1.0, None, 0, None)
 
 
-def test_training_stages(tiny_dataset_dir: Path) -> None:
-    """`training_stages()` hands the stage manager the budget, LR, transition and sampling weights of every stage
-    and nothing about the data on disk (the entries stay in `ResolvedStage` / `ResolvedDataset`)."""
+def test_resolved_stages_carry_the_schedule_of_every_stage(tiny_dataset_dir: Path) -> None:
+    """`ResolvedDataset.stages` is what the stage manager takes: budget, LR, transition and sampling weights per
+    stage next to the validation entries."""
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
-    stages = resolved.training_stages()
-    assert len(stages) == 3 and all(isinstance(s, TrainingStage) for s in stages)
-    assert stages == [
-        TrainingStage(
-            name=s.name, tokens=s.tokens, base_lr=s.base_lr, transition_pct=s.transition_pct, train_weights=s.train_weights
-        )
-        for s in resolved.stages
-    ]
-    assert stages[0].train_weights is not resolved.stages[0].train_weights  # a copy: the manager cannot mutate it
+    stages = resolved.stages
+    assert len(stages) == 3 and all(isinstance(s, ResolvedStage) for s in stages)
     assert (stages[2].name, stages[2].tokens, stages[2].base_lr, stages[2].transition_pct) == ("finetune", 4096, 5e-5, 0.0)
     assert stages[2].train_weights == {"synthetic_instruct": 1.0}
-    assert {f.name for f in fields(TrainingStage)} == {"name", "tokens", "base_lr", "transition_pct", "train_weights"}
 
 
 def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path) -> None:

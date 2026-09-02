@@ -7,16 +7,17 @@ from typing import Any
 import pytest
 
 from training.lr_schedule import SCHEDULES, _resume_warmup, get_lr_multistage
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 
 TPS = 4 * 256  # tokens per optimizer step of the tiny config
 
 
 def _tiny_manager(warmup: int = 2, cooldown: int = 2) -> StageManager:
     stages = [
-        TrainingStage("a", tokens=8 * TPS, base_lr=3e-4, transition_pct=0.25),
-        TrainingStage("b", tokens=8 * TPS, base_lr=1e-4, transition_pct=0.25),
-        TrainingStage("c", tokens=4 * TPS, base_lr=5e-5, transition_pct=0.0),
+        resolved_stage("a", tokens=8 * TPS, base_lr=3e-4, transition_pct=0.25),
+        resolved_stage("b", tokens=8 * TPS, base_lr=1e-4, transition_pct=0.25),
+        resolved_stage("c", tokens=4 * TPS, base_lr=5e-5, transition_pct=0.0),
     ]
     return StageManager(stages, world_batch_size=4, block_size=256, warmup_steps=warmup, cooldown_steps=cooldown)
 
@@ -103,19 +104,19 @@ def test_warmup_and_cooldown_boundaries_are_continuous_with_the_plateau() -> Non
 
 def test_zero_length_transition_switches_lr_hard_at_the_boundary() -> None:
     tps = 4 * 256
-    stages = [TrainingStage("a", 8 * tps, base_lr=3e-4, transition_pct=0.05), TrainingStage("b", 8 * tps, base_lr=1e-4)]
+    stages = [resolved_stage("a", 8 * tps, base_lr=3e-4, transition_pct=0.05), resolved_stage("b", 8 * tps, base_lr=1e-4)]
     sm = StageManager(stages, world_batch_size=4, block_size=256)
-    assert sm.boundaries[0].transition_start_step == sm.boundaries[0].transition_end_step == 8
+    assert sm.boundaries[0].transition_start_step == sm.boundaries[0].end_step == 8
     assert [_lr(sm, s) for s in (6, 7, 8, 9)] == pytest.approx([3e-4, 3e-4, 1e-4, 1e-4])
 
 
 def _continuity_manager() -> StageManager:
     tps = 8 * 128
     stages = [
-        TrainingStage("s0", tokens=100 * tps, base_lr=1e-3, transition_pct=0.1),  # transition 10 steps
-        TrainingStage("s1", tokens=60 * tps, base_lr=2e-4, transition_pct=0.25),  # transition 15 steps
-        TrainingStage("s2", tokens=40 * tps, base_lr=6e-4, transition_pct=0.5),  # transition 20 steps
-        TrainingStage("s3", tokens=30 * tps, base_lr=1e-4, transition_pct=0.0),
+        resolved_stage("s0", tokens=100 * tps, base_lr=1e-3, transition_pct=0.1),  # transition 10 steps
+        resolved_stage("s1", tokens=60 * tps, base_lr=2e-4, transition_pct=0.25),  # transition 15 steps
+        resolved_stage("s2", tokens=40 * tps, base_lr=6e-4, transition_pct=0.5),  # transition 20 steps
+        resolved_stage("s3", tokens=30 * tps, base_lr=1e-4, transition_pct=0.0),
     ]
     return StageManager(stages, world_batch_size=8, block_size=128, warmup_steps=5, cooldown_steps=10)
 
@@ -124,16 +125,17 @@ def test_multistage_schedule_is_continuous_at_every_boundary() -> None:
     sm = _continuity_manager()
     lrs = [_lr(sm, s) for s in range(sm.total_steps + 1)]
     increments = [1e-3 / 5, 1e-4 / 10]
-    for b, nxt in zip(sm.boundaries[:-1], sm.boundaries[1:]):
-        n = b.transition_end_step - b.transition_start_step
-        increments.append(abs(nxt.base_lr - b.base_lr) / n)
+    pairs = list(zip(sm.stages, sm.stages[1:], sm.boundaries))  # (stage, next stage, the stage's boundary)
+    for stage, nxt, b in pairs:
+        n = b.end_step - b.transition_start_step
+        increments.append(abs(nxt.base_lr - stage.base_lr) / n)
     max_jump = max(increments)
     for step in range(1, len(lrs)):
         assert abs(lrs[step] - lrs[step - 1]) <= max_jump * (1 + 1e-9), f"jump at step {step}"
     # transitions hit the exact stage base LRs at both ends
-    for b, nxt in zip(sm.boundaries[:-1], sm.boundaries[1:]):
-        assert lrs[b.transition_start_step] == pytest.approx(b.base_lr)
-        assert lrs[b.transition_end_step] == pytest.approx(nxt.base_lr)
+    for stage, nxt, b in pairs:
+        assert lrs[b.transition_start_step] == pytest.approx(stage.base_lr)
+        assert lrs[b.end_step] == pytest.approx(nxt.base_lr)
     # plateaus between warmup/transitions are flat at the stage LR
     assert all(lr == pytest.approx(1e-3) for lr in lrs[5:88])
     assert all(lr == pytest.approx(2e-4) for lr in lrs[100:145])

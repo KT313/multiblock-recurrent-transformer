@@ -134,7 +134,7 @@ def train(
                 result = run_one_optimizer_step(settings, backend, model, optimizer, stage_manager, batches, progress)
                 progress.advance()
                 if is_evaluation_step(settings, progress.step, stage_manager):
-                    validation_loader = loaders.val_loaders[result.next_stage.stage_idx]
+                    validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
                     with logger.evaluating():
                         result.validation = evaluate(settings, backend, model, validation_loader)
                 logger.log_step(result, progress)
@@ -178,7 +178,7 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
     """The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries."""
     return StageManager(
-        dataset.training_stages(),
+        dataset.stages,
         world_batch_size=settings.world_batch_size,
         block_size=settings.block_size,
         world_size=world_size,
@@ -284,8 +284,8 @@ def save_run_checkpoint(
     `saving checkpoint` meanwhile, the path becomes a dashboard event).
 
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
-    step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is in at `done`, i.e. the one it
-    enters next when written before a transition. Numerics: called after evaluation and logging of the step, so the
+    step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is heading for at `done`
+    (`StageManager.entering_stage_at`: the one it enters when written as a transition starts). Numerics: called after evaluation and logging of the step, so the
     stored RNG state includes the evaluation draws; `batches.state_dict()` adds the rows the run has consumed per
     source, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
     does not promise).
@@ -294,7 +294,7 @@ def save_run_checkpoint(
     path = checkpoint_path(run_directory, settings.run_name, progress.step, stage_end)
     metadata = CheckpointMetadata(
         step=progress.step,
-        stage=stage_manager.get_stage_info(progress.step).stage_idx,
+        stage=stage_manager.entering_stage_at(progress.step),
         rng=backend.rng_state(),
         settings=asdict(settings),
         model_config=plain_model(model).config.to_dict(),

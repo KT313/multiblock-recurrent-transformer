@@ -40,7 +40,6 @@ from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
 from training.settings import Settings
-from training.stage_manager import TrainingStage
 
 if TYPE_CHECKING:  # annotation only: this module stays torch-free, `training.checkpoint` imports torch
     from training.checkpoint import CheckpointMetadata
@@ -85,9 +84,10 @@ class _MainRankBarrier(Protocol):
 
 @dataclass
 class ResolvedStage:
-    """One training stage: its sampling weights over the run-wide train sources (`ResolvedDataset.train_sources`)
-    and its validation entries resolved on disk. The stage structure changes the WEIGHTS only — the train readers
-    themselves run once per source for the whole run."""
+    """One training stage: its token budget, base LR and transition length (what `training.stage_manager` turns into
+    step boundaries), its sampling weights over the run-wide train sources (`ResolvedDataset.train_sources`) and its
+    validation entries resolved on disk. The stage structure changes the WEIGHTS only — the train readers themselves
+    run once per source for the whole run."""
 
     name: str
     tokens: int
@@ -106,21 +106,6 @@ class ResolvedDataset:
     train_sources: list[DataEntry]  # one entry per source any stage trains on, in dataset-config order; each is
     # read by ONE loader for the whole run (rows validation_rows -> end), so stages sharing a source never re-read
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
-
-    def training_stages(self) -> list[TrainingStage]:
-        """The stages as `training.stage_manager.StageManager` takes them: name, token budget, base LR, transition
-        length and train weights per stage (the manager interpolates the weights per step in `data_weights`; the
-        data entries stay here, it never reads them)."""
-        return [
-            TrainingStage(
-                name=stage.name,
-                tokens=stage.tokens,
-                base_lr=stage.base_lr,
-                transition_pct=stage.transition_pct,
-                train_weights=dict(stage.train_weights),
-            )
-            for stage in self.stages
-        ]
 
 
 def build_command(dataset_config: str, dataset_dir: str) -> str:

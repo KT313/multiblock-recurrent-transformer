@@ -28,7 +28,6 @@ from training.logger import (
     TrainingReport,
     _qkv_dims,
     _reverse_engineer_adam_effective_lr,
-    _stage_for_the_bars,
     _to_scalar,
     describe_parameters,
     num_parameters,
@@ -37,7 +36,8 @@ from training.logger import (
 )
 from training.optim import ELLISAdam, get_param_groups
 from training.settings import Settings
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 from training.step import StepResult, TrainingProgress
 from training.test_step import reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
@@ -282,8 +282,8 @@ STEP_KEYS = {
 def two_stage_manager(settings: Settings) -> StageManager:
     """Two stages with a transition between them (stage a: 8 steps, the last 25 % transitioning; stage b: 4 steps)."""
     stages = [
-        TrainingStage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
-        TrainingStage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
+        resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
+        resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
     return StageManager(stages, settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
 
@@ -305,7 +305,6 @@ def fake_result(
         log_ppl=torch.tensor(loss),
         grad_norm=torch.tensor(0.5),
         stage=stage_manager.get_stage_info(step),
-        next_stage=stage_manager.get_stage_info(step + 1),
         data_ids=data_ids if data_ids is not None else ["source_a"] * 4,
         metrics=metrics or {},
         validation=validation,
@@ -352,7 +351,7 @@ def string_console_dashboard(stage_manager: StageManager, log_step_interval: int
     """A real `TrainingDashboard` rendering into a StringIO (never entered: no live display, no terminal capture)."""
     return TrainingDashboard(
         "steps",
-        [b.stage_name for b in stage_manager.boundaries],
+        [s.name for s in stage_manager.stages],
         [b.end_step - b.start_step for b in stage_manager.boundaries],
         stage_manager.total_steps,
         details={"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"},
@@ -537,9 +536,9 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
 ) -> None:
     """Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
     done and one "transition complete" event after step 8 is done (worded as the thesis loop printed them, with the
-    stage names); no console record for them. The bars get the stage at `done`: the index of the stage whose steps
-    are counting (a until 8 steps are done, b from then on) and the transition keys of `done` — while `history` keeps
-    the `stage/*` metrics of the step trained on, one step behind, as the thesis logged them."""
+    stage names); no console record for them. The bars get the stage containing `done` (a until 8 steps are done, b
+    from then on) and the transition keys of `done` — while `history` keeps the `stage/*` metrics of the step trained
+    on, one step behind: `stage/current_stage` is the stage containing that step, also inside its transition."""
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
@@ -558,18 +557,7 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
     assert [d[TRANSITION_PROGRESS_KEY] for _, _, d in shown][5:7] == [0.0, 0.5]
     assert [run_logger.history[d]["stage/in_transition"] for d in range(1, 13)] == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
     assert [run_logger.history[d]["stage/transition_progress"] for d in (7, 8)] == [0.0, 0.5]
-    assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 6 + [1] * 6
-
-
-def test_stage_for_the_bars() -> None:
-    """Inside a transition the info names the stage being entered; the bars count the steps of the stage being left."""
-    settings = reference_settings()
-    stage_manager = two_stage_manager(settings)
-    assert _stage_for_the_bars(stage_manager.get_stage_info(5)) == (0, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(6)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(7)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(8)) == (1, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(12))[0] == 1  # past the last step: the last stage
+    assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 8 + [1] * 4
 
 
 def test_evaluating_times_the_validation_and_log_step_reports_it(

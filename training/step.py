@@ -61,7 +61,6 @@ class StepResult:
     log_ppl: Tensor  # mean of the micro-batch log-perplexities
     grad_norm: Tensor  # pre-clip gradient norm
     stage: StageInfo  # stage info at `step` (what the step trained on)
-    next_stage: StageInfo  # stage info at `step + 1` (transition log lines, the stage evaluation / checkpoints use)
     data_ids: list[str]  # one entry per sample of the world batch (data composition)
     metrics: dict[str, Tensor] = field(default_factory=dict)  # `track_gradient_metrics` at log steps, else {}
     validation: dict[str, Tensor] | None = None  # filled by `train()` when it is an evaluation step
@@ -246,7 +245,6 @@ def run_one_optimizer_step(
         log_ppl=log_ppl,
         grad_norm=grad_norm,
         stage=stage,
-        next_stage=stage_manager.get_stage_info(step + 1),
         data_ids=data_ids,
         metrics=metrics,
     )

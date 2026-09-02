@@ -196,12 +196,12 @@ def open_dashboard(
 ) -> AbstractContextManager[RunDashboard]:
     """The run's dashboard (`training.ui.training_dashboard`): the live display when stdout is a terminal and
     `TRAINING_DASHBOARD` is not `0`, the one-line-per-`log_step_interval` console fallback otherwise; one bar per
-    stage (`stage_manager.boundaries`) plus the overall bar, the header naming the run, the model and dataset config
-    (file names without `.yaml`), the device and precision; every record appended to `run_directory / train.log`.
-    `start_step` (the resume step) keeps the ETA honest after a resume."""
+    stage (named after `stage_manager.stages`, sized by its boundary) plus the overall bar, the header naming the
+    run, the model and dataset config (file names without `.yaml`), the device and precision; every record appended
+    to `run_directory / train.log`. `start_step` (the resume step) keeps the ETA honest after a resume."""
     return training_dashboard(
         settings.run_name,
-        [boundary.stage_name for boundary in stage_manager.boundaries],
+        [stage.name for stage in stage_manager.stages],
         [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries],
         stage_manager.total_steps,
         details={
@@ -215,27 +215,6 @@ def open_dashboard(
         log_file=run_directory / TRAIN_LOG_NAME,
         fallback_stream=sys.stderr,  # piped runs: step lines join the log handlers' lines on stderr
     )
-
-
-def _stage_for_the_bars(at_done: StageInfo) -> tuple[int, dict[str, float]]:
-    """Where the run is after `progress.step` steps, for the dashboard's bars: the index of the stage whose steps
-    are counting (inside a transition the stage being left, `prev_stage_idx` — the info itself already names the
-    stage being entered) and the two transition keys the dashboard reads for the bar note.
-
-    `at_done` is `result.next_stage`, the stage at `done` (the same info the checkpoint's `stage` and the validation
-    loader use). wandb and `history` keep `result.stage`, the stage the step trained on, in their `stage/*` metrics as
-    the thesis logged them; at a log step the dashboard's copy of the step dict gets these two keys instead, so the
-    bar note and the marker agree.
-    """
-    if at_done.in_transition and at_done.prev_stage_idx is not None:
-        stage_index = at_done.prev_stage_idx
-    else:
-        stage_index = at_done.stage_idx
-    transition = {
-        TRANSITION_FLAG_KEY: float(at_done.in_transition),
-        TRANSITION_PROGRESS_KEY: at_done.transition_progress,
-    }
-    return stage_index, transition
 
 
 class RunLogger:
@@ -435,10 +414,11 @@ class RunLogger:
 
         Every step: the data ids join the composition counter, a stage transition starting or ending with this step
         becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
-        `last_validation`, and the dashboard's bars move (`update_step` with the stage at `done` and — only at log
-        steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
-        added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and,
-        with `keep_history`, to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
+        `last_validation`, and the dashboard's bars move (`update_step` with the stage containing `done` — the bar
+        whose steps are counting — plus the transition keys of `done`, and — only at log steps — the metric dict; at
+        every other step an empty dict: no tensor is read there, so no device sync is added to the thesis loop). At
+        log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and, with `keep_history`, to
+        `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
         * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR), `grad_norm`
           (pre-clip), `step` (= done);
@@ -447,39 +427,47 @@ class RunLogger:
           per step`, counted from step 0 also after a resume), `total_time` (seconds since `open`), `remaining_time`
           (`seconds/step × steps left`);
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition` (0/1), `stage/transition_progress`,
-          `stage/stage_progress` — the stage info the step trained on (`result.stage`);
+          `stage/stage_progress` — the stage info the step trained on (`result.stage`): `current_stage` is the stage
+          whose boundary contains the step, the same stage `stage_progress` and `base_lr` describe, also inside the
+          transition window at its end (the stage being entered is only visible through `in_transition`);
         * `data_composition/<data id>`: the fraction of world-batch samples since the last log step per data id (they
           sum to 1; the counter resets here);
         * the gradient / parameter metrics of `track_gradient_metrics` (`result.metrics`) and the validation metrics
           (`val_loss*`, `val_ppl*`, `val_time`) when this step evaluated.
         """
         self._sample_counter.update(result.data_ids)
-        self._note_transition(result)
+        at_done = self.stage_manager.get_stage_info(progress.step)
+        self._note_transition(result.stage, at_done)
         validation = self._log_validation(result, progress)
-        stage_index, transition = _stage_for_the_bars(result.next_stage)
+        transition = {
+            TRANSITION_FLAG_KEY: float(at_done.transition_to is not None),
+            TRANSITION_PROGRESS_KEY: at_done.transition_progress,
+        }
         if progress.step % self.settings.log_step_interval != 0:
-            self.dashboard.update_step(progress.step, stage_index, {})
+            self.dashboard.update_step(progress.step, at_done.stage_idx, {})
             return
         metrics = self._step_metrics(result, progress, validation)
         self.wandb.log(metrics, step=progress.step)
         if self.keep_history:
             self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
-        self.dashboard.update_step(progress.step, stage_index, metrics | transition)
+        self.dashboard.update_step(progress.step, at_done.stage_idx, metrics | transition)
 
-    def _note_transition(self, result: StepResult) -> None:
+    def _note_transition(self, before: StageInfo, after: StageInfo) -> None:
         """The two transition events: after the last plain step of a stage ("starting transition") and after the
-        last transition step ("transition complete"). `result.stage` is the info at the step, `result.next_stage` at
-        the step after; inside a transition the info already names the next stage."""
-        before, after = result.stage, result.next_stage
-        if after.in_transition and not before.in_transition:
-            leaving = self.stage_manager.boundaries[cast(int, after.prev_stage_idx)].stage_name
+        last transition step ("transition complete"). `before` is the info at the step that trained, `after` the
+        one at `done`, the step after it."""
+        stages = self.stage_manager.stages
+        if after.transition_to is not None and before.transition_to is None:
+            leaving, entering = stages[after.stage_idx], stages[after.transition_to]
             self.dashboard.note_event(
-                f"starting transition {after.prev_stage_idx} -> {after.stage_idx} ({leaving} -> {after.stage_name}), "
-                f"LR {cast(float, after.prev_base_lr):.2e} -> {after.base_lr:.2e}"
+                f"starting transition {after.stage_idx} -> {after.transition_to} ({leaving.name} -> {entering.name}), "
+                f"LR {leaving.base_lr:.2e} -> {entering.base_lr:.2e}"
             )
-        elif before.in_transition and not after.in_transition:
-            self.dashboard.note_event(f"transition complete, now in stage {after.stage_idx} ({after.stage_name})")
+        elif before.transition_to is not None and after.transition_to is None:
+            self.dashboard.note_event(
+                f"transition complete, now in stage {after.stage_idx} ({stages[after.stage_idx].name})"
+            )
 
     def _log_validation(self, result: StepResult, progress: TrainingProgress) -> dict[str, float] | None:
         """The validation metrics of this step as floats plus `val_time`, shown on the dashboard (the `val_loss*`
@@ -518,8 +506,8 @@ class RunLogger:
             "total_time": now - self._train_started,
             "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.step),
             "stage/current_stage": result.stage.stage_idx,
-            "stage/base_lr": result.stage.base_lr,
-            "stage/in_transition": int(result.stage.in_transition),
+            "stage/base_lr": self.stage_manager.stages[result.stage.stage_idx].base_lr,
+            "stage/in_transition": int(result.stage.transition_to is not None),
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }

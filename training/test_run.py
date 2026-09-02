@@ -99,7 +99,7 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
-    assert sm.stages == tiny_resolved.training_stages()
+    assert sm.stages is tiny_resolved.stages
     assert (sm.world_batch_size, sm.block_size, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.block_size, 1)
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
@@ -364,8 +364,9 @@ def test_logged_lr_follows_the_multistage_schedule(full_run: dict[str, Any]) -> 
     expected = {1: 0.0, 2: 1.5e-4, 3: 3e-4, 7: 3e-4, 8: 2e-4, 9: 1e-4, 15: 1e-4, 16: 7.5e-5, 17: 5e-5, 20: 2.5e-5}
     for done, lr in expected.items():
         assert history[done]["lr"] == pytest.approx(lr), done
-    # inside a transition the stage info already names the next stage (steps 6-7 -> stage 1, 14-15 -> stage 2)
-    assert [history[d]["stage/current_stage"] for d in (1, 6, 7, 8, 9, 14, 15, 17)] == [0, 0, 1, 1, 1, 1, 2, 2]
+    # `stage/current_stage` is the stage containing the step, inside its transition too (steps 6-7 -> stage 0,
+    # 14-15 -> stage 1); the metrics at `done` describe step `done - 1`
+    assert [history[d]["stage/current_stage"] for d in (1, 6, 7, 8, 9, 14, 15, 17)] == [0, 0, 0, 0, 1, 1, 1, 2]
     assert [history[d]["stage/in_transition"] for d in (6, 7, 8, 9, 15, 16, 17)] == [0, 1, 1, 0, 1, 1, 0]
     assert history[8]["stage/transition_progress"] == pytest.approx(0.5)
 

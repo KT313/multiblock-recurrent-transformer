@@ -32,7 +32,8 @@ from training.testing.golden import (
 )
 from training.run import build_run_optimizer
 from training.settings import OptimizerConfig, Settings, parse_settings
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 from training.step import (
     BatchStream,
     StepResult,
@@ -85,7 +86,7 @@ def reference_settings(**overrides: Any) -> Settings:
 
 def reference_stage_manager(settings: Settings, steps: int = 10) -> StageManager:
     """One stage of `steps` optimizer steps (no transition): LR 0 at step 0, 1.5e-4 at step 1, 3e-4 from step 2."""
-    stage = TrainingStage("only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
+    stage = resolved_stage("only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
     return StageManager([stage], settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
 
 
@@ -246,13 +247,13 @@ def test_data_ids_has_world_batch_size_entries(settings: Settings, cpu_backend: 
 
 
 def test_stage_infos_and_metrics(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
-    """`stage` / `next_stage` are the manager's infos at `step` and `step + 1`; gradient metrics only at log steps."""
+    """`stage` is the manager's info at `step`; gradient metrics only at log steps."""
     settings.log_step_interval = 2
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     stage_manager = reference_stage_manager(settings)
     results = run_steps(settings, cpu_backend, model, optimizer, steps=2)
-    assert results[0].stage == stage_manager.get_stage_info(0) and results[0].next_stage == stage_manager.get_stage_info(1)
+    assert results[0].stage == stage_manager.get_stage_info(0) and results[1].stage == stage_manager.get_stage_info(1)
     assert results[0].metrics == {}  # done = 1, not a log step
     assert "l2_param_norm" in results[1].metrics and "avg_RMS" in results[1].metrics  # done = 2
 
@@ -337,9 +338,9 @@ def _abc_stage_manager(settings: Settings) -> StageManager:
     """The tiny stage boundaries ((0,8,6,8), (8,16,14,16), (16,20)) with one fake source per stage: `a` in stage 0,
     `b` in stage 1, `c` in stage 2 — hand-made so no dataset is resolved for the stream tests."""
     stages = [
-        TrainingStage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 1.0}),
-        TrainingStage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
-        TrainingStage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
+        resolved_stage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 1.0}),
+        resolved_stage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
+        resolved_stage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
     ]
     return StageManager(stages, settings.world_batch_size, settings.block_size)
 
@@ -503,7 +504,7 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
     parquet = loaders.train_dataset("synthetic_pretrain")
     assert parquet is not None
@@ -521,7 +522,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
     not reached, while a stream that only restarts the loaders serves the very same rows again."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
     def fresh_stream() -> BatchStream:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -557,7 +558,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     every sample up to there and beyond is a distinct row (until the source genuinely wraps around)."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
     pretrain = loaders.train_dataset("synthetic_pretrain")
@@ -582,7 +583,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
     `settings.seed`, and each source's reader walks its range in order)."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
     def batches(world_batches: int) -> list[Batch]:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -650,7 +651,7 @@ class _RecordingLoader:
 
 def _drop_stage_manager(settings: Settings) -> StageManager:
     """One long stage drawing every sample from the `drop` source."""
-    stage = TrainingStage(
+    stage = resolved_stage(
         "only", tokens=100 * settings.world_batch_size * settings.block_size, base_lr=1e-4, transition_pct=0.0,
         train_weights={"drop": 1.0},
     )
