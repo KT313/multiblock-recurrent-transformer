@@ -19,7 +19,7 @@ The stage list lives in the dataset config (`config/datasets/<name>.yaml`,
 
 The run config contributes one base learning rate per stage, positionally, as
 `stage_base_lrs: [3e-4, 1e-4, 5e-5]`; `training/data/dataset_resolver.py` joins
-the two into the `TrainingStage` list the stage manager consumes. A single-stage
+the two into the `ResolvedStage` list the stage manager consumes. A single-stage
 run is one entry with `transition_pct: 0.0`.
 
 ## Transitions

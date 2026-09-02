@@ -14,7 +14,6 @@ dependencies = [
   "safetensors>=0.4.3",
   "jsonargparse[signatures]>=4.49",
   "wandb",
-  "tqdm",
   "rich>=13",
   "rbloom>=1.5.4",
   "pyyaml",           # model/config.py reads the architecture YAML
@@ -39,7 +38,6 @@ dev = [
   "mypy",
   "basedpyright",
   "pandas-stubs",
-  "types-tqdm",
   "pyarrow-stubs",
   "types-pyyaml>=6.0.12.20260815",
 ]
@@ -76,7 +74,7 @@ strict = true
 warn_unreachable = true
 # third-party packages without (complete) stubs
 [[tool.mypy.overrides]]
-module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*", "tqdm.*"]
+module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]

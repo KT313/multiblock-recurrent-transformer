@@ -2,8 +2,7 @@
 """Logging for the data preparation package.
 
 Every module logs under the ``data_preparation`` hierarchy (``get_logger(__name__)``); ``configure_logging`` attaches
-one stream handler to that root, so ``prepare.py`` and ``training/train.py`` share the same configuration. The
-handler writes through :func:`data_preparation.lib.progress.write_line` so records do not garble progress bars.
+one stream handler to that root, so ``prepare.py`` and ``training/train.py`` share the same configuration.
 """
 
 from __future__ import annotations

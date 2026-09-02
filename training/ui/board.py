@@ -174,6 +174,7 @@ class TrainingDashboard:
         if not self._open:
             return
         self._open = False
+        self._drop_console_lines()  # a demoted board's console handler (`_disable`) ends with the display
         if not self.enabled:
             return  # `_disable` already tore the display down and printed the kept lines
         try:
