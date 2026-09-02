@@ -69,7 +69,18 @@ class Manifest:
     truncated_at_tokens: int | None = None
     versions: dict[str, str] = field(default_factory=dict)
     created: str = field(default_factory=_utc_now_iso)
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)  # what no field below types: a tokenizer manifest's kind / hf_id / revision
+    # Processed manifests (on disk under `extra`, see `to_dict`): what the folder was built from and how.
+    input_shards: list[list[Any]] = field(default_factory=list)  # [[raw shard name, rows], ...] built so far, in raw order
+    columns: list[str] = field(default_factory=list)  # the processed column set the shards were written with
+    shuffled: bool = False  # built all at once and shuffled (`shuffle_seed`) instead of appended per raw shard
+    shuffle_seed: int | None = None
+    stats: dict[str, Any] = field(default_factory=dict)  # the row pipeline's counters (`stages/build.py`)
+    # Raw manifests (on disk under `extra`; `RawFolder` is the only writer): where the next download resumes.
+    exhausted: bool = False  # the loader ran dry, or `check_limit_reached` stopped the reads
+    check_limit_reached: int | None = None  # the `check_limit` that exhausted the source (a grown limit reopens it)
+    skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
+    dropped_too_long: int = 0  # rows with more than the folder's token cap
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
@@ -123,14 +134,38 @@ class Manifest:
     # --- (de)serialisation -------------------------------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """The JSON layout: the stage's typed fields live under ``extra`` (a processed manifest's ``seed`` is
+        ``shuffle_seed``, a raw manifest's ``check_limit`` is ``check_limit_reached``, written only when set)."""
+        payload = asdict(self)
+        extra: dict[str, Any] = payload.pop("extra")
+        typed = {name: payload.pop(name) for name in _PROCESSED_FIELDS + _RAW_FIELDS}
+        if self.stage == "processed":
+            extra.update({key: typed[name] for key, name in _PROCESSED_KEYS.items()})
+        elif self.stage == "raw":
+            extra.update(skipped_malformed=typed["skipped_malformed"], dropped_too_long=typed["dropped_too_long"])
+            if self.exhausted:
+                extra["exhausted"] = True
+            if self.check_limit_reached is not None:
+                extra["check_limit"] = self.check_limit_reached
+        payload["extra"] = extra
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Manifest:
-        """Build from a JSON dict; unknown keys (from newer versions) are ignored."""
+        """Build from a JSON dict (the layout of :meth:`to_dict`); unknown keys (from newer versions) are ignored."""
         kwargs = _known_fields_only(payload, cls)
         raw_shards: list[dict[str, Any]] = kwargs.get("shards", [])
         kwargs["shards"] = [ShardInfo(**_known_fields_only(shard, ShardInfo)) for shard in raw_shards]
+        extra = dict(kwargs.get("extra", {}))
+        for key, name in {**_PROCESSED_KEYS, **_RAW_KEYS}.items():
+            if key in extra:
+                kwargs[name] = extra.pop(key)
+        for name in ("skipped_malformed", "dropped_too_long"):
+            kwargs[name] = int(kwargs.get(name) or 0)
+        if kwargs.get("check_limit_reached") is not None:
+            kwargs["check_limit_reached"] = int(kwargs["check_limit_reached"])
+        kwargs["exhausted"] = bool(kwargs.get("exhausted", False))
+        kwargs["extra"] = extra
         return cls(**kwargs)
 
     def save(self, directory: Path) -> Path:
@@ -159,6 +194,15 @@ class Manifest:
                 raise RuntimeError(f"unreadable manifest {path} next to shards ({err}); fix it or delete the directory") from err
             log.warning("ignoring unparsable manifest %s: %s", path, err)
             return None
+
+
+# on-disk key under `extra` -> field
+_PROCESSED_KEYS = {"input_shards": "input_shards", "columns": "columns", "shuffled": "shuffled", "seed": "shuffle_seed", "stats": "stats"}
+_RAW_KEYS = {
+    "exhausted": "exhausted", "check_limit": "check_limit_reached", "skipped_malformed": "skipped_malformed", "dropped_too_long": "dropped_too_long",
+}  # fmt: skip
+_PROCESSED_FIELDS = tuple(_PROCESSED_KEYS.values())
+_RAW_FIELDS = tuple(_RAW_KEYS.values())
 
 
 def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:

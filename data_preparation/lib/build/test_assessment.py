@@ -206,7 +206,7 @@ def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     healed = prepare(path, layout.root, assume_yes=False)
     assert healed.complete
     manifest = Manifest.load(layout.processed_dir("a"))
-    assert manifest is not None and len(manifest.extra["input_shards"]) == 2
+    assert manifest is not None and len(manifest.input_shards) == 2
     listed = {shard.name for shard in manifest.shards}
     assert {p.name for p in layout.processed_dir("a").glob("*.parquet")} == listed
 
@@ -224,7 +224,7 @@ def _make_crash_leftover(folder: Path) -> None:
     manifest = Manifest.load(folder)
     assert manifest is not None and len(manifest.shards) >= 2
     manifest.shards = manifest.shards[:-1]
-    manifest.extra["input_shards"] = manifest.extra["input_shards"][:-1]
+    manifest.input_shards = manifest.input_shards[:-1]
     manifest.save(folder)
 
 

@@ -12,7 +12,7 @@ Two write modes:
 
 * **per raw shard, resumable** (pretrain sources without ``shuffle``): the survivors of one raw shard are published
   before the next raw shard is read and the processed manifest records the raw shard as covered
-  (``extra["input_shards"]``), so a failure or a stop request (``should_stop``, checked between raw shards) loses at
+  (``input_shards``), so a failure or a stop request (``should_stop``, checked between raw shards) loses at
   most one raw shard of work and the next call resumes behind the last covered one. New raw shards are deduplicated
   against the rows already on disk: the dedup filter (:class:`SeenDocuments`, a Bloom filter under
   ``dedup.bloom_memory_mb``) is refilled from the ``hash`` column of the processed shards at the start of every
@@ -124,7 +124,7 @@ def build_source(
                 output.save([])  # an exhausted raw folder with zero shards still gets its processed manifest
             return output.manifest
 
-    stats: dict[str, Any] = output.manifest.extra["stats"]
+    stats = output.manifest.stats
     seen = SeenDocuments(memory_mb=processing.dedup.bloom_memory_mb) if processing.dedup.mode != "none" else None
     if seen is not None:
         if not output.is_new:
@@ -165,7 +165,7 @@ def _build_per_raw_shard(
         pipeline.stats["input_rows"] += shard.rows
         survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
         output.publish(survivors, shard_size)
-        output.save([*output.manifest.extra["input_shards"], [shard.name, shard.rows]])
+        output.save([*output.manifest.input_shards, [shard.name, shard.rows]])
         first_row_index += shard.rows
         check_stop(should_stop)
 
@@ -187,7 +187,7 @@ def _build_all_at_once(
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
         rows = fuzzy_dedup(rows, pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.pass_workers)
     survivors = list(rows)
-    if output.manifest.extra["shuffled"]:
+    if output.manifest.shuffled:
         random.Random(pipeline.source.seed).shuffle(survivors)
     check_stop(should_stop)
 
@@ -250,8 +250,8 @@ class ProcessedOutput:
         the previous build survives unlisted (a per-shard publisher overwrites only the names it reuses)."""
         manifest = current_manifest(processed_dir, source_hash, "processed")
         if manifest is not None:
-            covered: list[list[Any]] = manifest.extra.get("input_shards", [])
-            has_columns = manifest.extra.get("columns") == list(columns)
+            covered = manifest.input_shards
+            has_columns = manifest.columns == list(columns)
             if has_columns and shard_list(raw.shards)[: len(covered)] == covered:
                 return cls(manifest, processed_dir, is_new=False)
             why = "raw shards changed under the processed manifest" if has_columns else "processed shards predate the current columns"
@@ -263,7 +263,7 @@ class ProcessedOutput:
 
     def covered(self) -> int:
         """Raw shards the manifest already covers."""
-        return len(self.manifest.extra["input_shards"])
+        return len(self.manifest.input_shards)
 
     def stored_hashes(self) -> Iterator[int]:
         """The exact-dedup keys of every processed row on disk, in manifest order (refills the dedup filter)."""
@@ -277,7 +277,7 @@ class ProcessedOutput:
             self.manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
 
     def save(self, covered: list[list[Any]]) -> None:
-        self.manifest.extra["input_shards"] = list(covered)
+        self.manifest.input_shards = list(covered)
         self.manifest.save(self.directory)
         self.is_new = False
 
@@ -288,7 +288,7 @@ def _complete_manifest(processed_dir: Path, source_hash: str, raw: Manifest, col
     manifest = current_manifest(processed_dir, source_hash, "processed")
     if manifest is None:
         return None
-    if manifest.extra.get("columns") == list(columns) and manifest.extra.get("input_shards") == shard_list(raw.shards):
+    if manifest.columns == list(columns) and manifest.input_shards == shard_list(raw.shards):
         return manifest
     return None
 
@@ -311,13 +311,10 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
         stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
         stats["removed_empty"] = 0  # rows without instruction or output after stripping
         stats["removed_too_long"] = 0  # rows over `max_seq_length` tokens (a safety net; the download already drops them)
-    manifest.extra = {
-        "input_shards": [],
-        "columns": list(processed_columns(source.kind)),
-        "shuffled": config.shuffle_of(name),
-        "seed": source.seed,
-        "stats": stats,
-    }
+    manifest.columns = list(processed_columns(source.kind))
+    manifest.shuffled = config.shuffle_of(name)
+    manifest.shuffle_seed = source.seed
+    manifest.stats = stats
     return manifest
 
 

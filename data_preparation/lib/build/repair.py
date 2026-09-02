@@ -17,7 +17,7 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
 * **processed** (derived, cheap): judged by the shared verdict (``lib/build/assessment.py``), which attaches the
   cheapest repair — and this step performs exactly that repair, never more. A rebuild is a deletion without
   confirmation: stale, broken, without a manifest, unlisted stray shards, built from raw shards that no longer
-  exist (its ``extra["input_shards"]`` is not a prefix of the raw shard list — e.g. after a truncation), or its
+  exist (its ``input_shards`` is not a prefix of the raw shard list — e.g. after a truncation), or its
   raw folder is being deleted. The one exception is the crash leftover of an interrupted per-shard build — a single
   unlisted file that is exactly the next shard the resumed build writes: it is left alone (the build overwrites
   it). The rename-aside swap of an all-at-once build (``lib/stages/build.py:_swap_into_place``) can be interrupted

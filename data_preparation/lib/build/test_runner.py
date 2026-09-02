@@ -89,7 +89,7 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
     assert h.rows_needed == 4 and h.raw_rows == 4 and h.epochs is None
     assert i.kind == "instruct" and i.satisfied
     processed_i = Manifest.load(layout.processed_dir("i"))
-    assert processed_i is not None and processed_i.extra["columns"] == ["instruction", "input", "output", "tokens", "hash"]
+    assert processed_i is not None and processed_i.columns == ["instruction", "input", "output", "tokens", "hash"]
 
 
 # --- rounds ----------------------------------------------------------------------------------------------------------

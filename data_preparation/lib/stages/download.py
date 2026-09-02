@@ -13,7 +13,7 @@ smaller ``max_seq_length`` than the config asks for, :meth:`Manifest.is_outdated
 What a raw row is: pretrain rows carry ``text_field`` **truncated at the token boundary** ``max_seq_length`` (the
 stored ``tokens`` is the true count of the stored text, see ``truncation.py``); instruct rows carry ``instruction /
 input / output`` with ``tokens`` = the count of their concatenation, uncapped — a row longer than ``max_seq_length``
-is not stored at all (``extra["dropped_too_long"]``; cutting an answer would be worse than losing the row). The raw
+is not stored at all (``dropped_too_long``; cutting an answer would be worse than losing the row). The raw
 manifest records ``truncated_at_tokens`` (the cap used, both kinds), ``token_count`` and the tokenizer name.
 """
 
@@ -279,8 +279,8 @@ def download(
     truncated to ``max_seq_length`` tokens with its true count in ``tokens``); for instruct sources the converter and
     filter run at download time and only standardized ``{instruction, input, output}`` rows of at most
     ``max_seq_length`` tokens are stored — malformed rows (converter raises ``ValueError``) are skipped and counted in
-    ``extra["skipped_malformed"]``, longer rows in ``extra["dropped_too_long"]``; ``check_limit`` bounds the number
-    of source rows inspected in total. A loader that yields fewer rows than requested sets ``extra["exhausted"]`` (a
+    ``skipped_malformed``, longer rows in ``dropped_too_long``; ``check_limit`` bounds the number
+    of source rows inspected in total. A loader that yields fewer rows than requested sets ``exhausted`` (a
     source smaller than its budget is cycled by the training sampler).
 
     ``rows_needed`` is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
@@ -522,7 +522,7 @@ def download_github_code_group(
     """:func:`download` for several `github_code` sources of one repo in a **single pass** over its files: every
     row group is fetched once and its rows are dispatched to the language source that wants them (a source that
     has its ``rows_needed[name]`` stops taking rows, the others read on). The raw shards (texts truncated by the
-    same token step), ``rows_fetched`` and ``extra["exhausted"]`` of every source are exactly what separate
+    same token step), ``rows_fetched`` and ``exhausted`` of every source are exactly what separate
     ``download`` calls would produce; shards are published and recorded per member as they fill (see
     :func:`download`); a stale or outdated member raises :class:`RawFolderError` before anything is fetched.
     Returns the raw manifest of every source in ``names``.

@@ -153,7 +153,7 @@ def test_download_synthetic_appends_incrementally(
     raw = layout.raw_dir("p")
     m1 = download(cfg, "p", layout, rows_needed=25, shard_size=10)
     assert [s.rows for s in m1.shards] == [10, 10, 5] and m1.rows_fetched == 25 and m1.stage == "raw"
-    assert m1.source_hash == cfg.raw_hash("p") and not m1.extra.get("exhausted")
+    assert m1.source_hash == cfg.raw_hash("p") and not m1.exhausted
     assert Manifest.load(raw) == m1
     first = mtimes(raw)
 
@@ -198,7 +198,7 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     write_local(src_dir, [{"question": f"q{i}", "answer": f"a{i}", "extra": i} for i in range(7)], "parquet")
     cfg = with_tokenizer(cfg_factory({"g": _local(src_dir, converter="gsm8k_question_answer")}))
     m = download(cfg, "g", layout, rows_needed=10, shard_size=4)
-    assert m.rows() == 7 and m.rows_fetched == 7 and m.extra["exhausted"] is True
+    assert m.rows() == 7 and m.rows_fetched == 7 and m.exhausted is True
     rows = read_rows(layout.raw_dir("g"))
     assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6}
     assert m.token_count == "tokenizer" and m.tokenizer == "synthetic" and m.tokens() == sum(r["tokens"] for r in rows)
@@ -303,7 +303,7 @@ def test_download_columns_follow_the_converter_and_check_limit_bounds_over_reads
     m = download(cfg, "lim", layout, rows_needed=3)
     assert seen == [None, ["text"]]
     assert m.rows() == 5 and m.rows_fetched == 5 and closed == [True, True]  # consumption stopped at check_limit
-    assert download(cfg, "lim", layout, rows_needed=8).extra["exhausted"] is True and len(seen) == 2
+    assert download(cfg, "lim", layout, rows_needed=8).exhausted is True and len(seen) == 2
 
 
 # --- download: instruct ------------------------------------------------------------------------------------------------
@@ -328,7 +328,7 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     src = _local(src_dir, kind="instruct", fields={"instruction": "q", "output": "a", "input": "ctx"})
     cfg = with_tokenizer(cfg_factory({"i": src}))
     m = download(cfg, "i", layout, rows_needed=3, shard_size=10)
-    assert m.rows() == 3 and m.rows_fetched == 5 and m.extra["skipped_malformed"] == 2
+    assert m.rows() == 3 and m.rows_fetched == 5 and m.skipped_malformed == 2
     assert read_rows(layout.raw_dir("i")) == [
         {"instruction": "what", "input": "", "output": "that", "tokens": 2},
         {"instruction": "how", "input": "background", "output": "so", "tokens": 3},
@@ -346,10 +346,10 @@ def test_download_instruct_filter_reads_the_source_once(
     cfg = with_tokenizer(cfg_factory({"s": src}))
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
     # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
-    assert m.rows() == 3 and m.rows_fetched == 6 and not m.extra.get("exhausted")
+    assert m.rows() == 3 and m.rows_fetched == 6 and not m.exhausted
     assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.raw_dir("s")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
-    assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.extra["exhausted"] is True
+    assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.exhausted is True
 
 
 def test_download_instruct_check_limit_bounds_inspected_rows(
@@ -360,19 +360,19 @@ def test_download_instruct_check_limit_bounds_inspected_rows(
     src = _local(src_dir, kind="instruct", converter="instruction_input_output", check_limit=4)
     cfg = with_tokenizer(cfg_factory({"l": src}))
     m = download(cfg, "l", layout, rows_needed=3, shard_size=10)
-    assert m.rows() == 3 and m.rows_fetched == 3 and not m.extra.get("exhausted")
+    assert m.rows() == 3 and m.rows_fetched == 3 and not m.exhausted
     m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
-    assert m.rows() == 4 and m.rows_fetched == 4 and m.extra["exhausted"] is True and m.extra["check_limit"] == 4
+    assert m.rows() == 4 and m.rows_fetched == 4 and m.exhausted is True and m.check_limit_reached == 4
     assert download(cfg, "l", layout, rows_needed=8, shard_size=10) == m
 
     # check_limit is not part of the raw hash: a grown limit reads further instead of re-downloading
     cfg.sources["l"] = _local(src_dir, kind="instruct", converter="instruction_input_output", check_limit=6)
     m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
-    assert m.rows() == 6 and m.rows_fetched == 6 and m.extra["exhausted"] is True and m.extra["check_limit"] == 6
+    assert m.rows() == 6 and m.rows_fetched == 6 and m.exhausted is True and m.check_limit_reached == 6
     assert [s.rows for s in m.shards] == [3, 1, 2]  # appended, nothing rewritten
     cfg.sources["l"] = _local(src_dir, kind="instruct", converter="instruction_input_output")
     m = download(cfg, "l", layout, rows_needed=8, shard_size=10)
-    assert m.rows() == 8 and not m.extra.get("exhausted") and "check_limit" not in m.extra
+    assert m.rows() == 8 and not m.exhausted and m.check_limit_reached is None
 
 
 def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader) -> None:
@@ -430,7 +430,7 @@ def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> di
         assert manifest is not None
         state[name] = {
             "rows_fetched": manifest.rows_fetched,
-            "exhausted": manifest.extra.get("exhausted", False),
+            "exhausted": manifest.exhausted,
             "shards": [(s.name, s.rows) for s in manifest.shards],
             "rows": read_rows(layout.raw_dir(name)),
         }
@@ -613,10 +613,10 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
         download(cfg, "d", layout, rows_needed=10, shard_size=4, should_stop=lambda: True)  # checked after each shard
     partial = Manifest.load(layout.raw_dir("d"))
     assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12)]  # kept rows i = 2, 5, 8, 11
-    assert partial.rows_fetched == 12 and partial.extra == {"skipped_malformed": 4, "dropped_too_long": 4}
+    assert partial.rows_fetched == 12 and (partial.skipped_malformed, partial.dropped_too_long) == (4, 4)
 
     m = download(cfg, "d", layout, rows_needed=10, shard_size=4)
-    assert m.rows() == 10 and m.rows_fetched == 30 and m.extra["skipped_malformed"] == 10 and m.extra["dropped_too_long"] == 10
+    assert m.rows() == 10 and m.rows_fetched == 30 and m.skipped_malformed == 10 and m.dropped_too_long == 10
     assert m.truncated_at_tokens == 5
     rows = read_rows(layout.raw_dir("d"))
     assert [r["instruction"] for r in rows] == [f"i{i}" for i in range(30) if i % 3 == 2]
@@ -625,7 +625,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "d", other, rows_needed=10, shard_size=4)
-    assert reference.extra == m.extra and reference.rows_fetched == m.rows_fetched
+    assert (reference.skipped_malformed, reference.dropped_too_long) == (m.skipped_malformed, m.dropped_too_long) and reference.rows_fetched == m.rows_fetched
     assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m.shards]
     assert read_rows(other.raw_dir("d")) == rows
 
@@ -641,7 +641,7 @@ def test_download_instruct_estimate_mode_drops_by_estimated_count(
     stored = read_rows(layout.raw_dir("e"))
     assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0]))}]
     assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20}))
-    assert m.extra["dropped_too_long"] == 1 and m.extra["exhausted"] is True
+    assert m.dropped_too_long == 1 and m.exhausted is True
 
 
 def test_raw_manifest_state_and_current_raw_manifest(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -714,7 +714,7 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     raw = layout.raw_dir("p")
     m = Manifest.load(raw)
     assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
-    assert m.rows() == 20 and not m.extra.get("exhausted") and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
+    assert m.rows() == 20 and not m.exhausted and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
 
     # the next call resumes at the last complete shard; the loader is asked from offset 20 and nothing is lost
     _failing_loader(monkeypatch, fail_at=None)
@@ -742,7 +742,7 @@ def test_download_instruct_shard_offsets_count_consumed_source_rows(
     cfg = with_tokenizer(cfg_factory({"l": _local(src_dir, kind="instruct", converter="instruction_input_output")}))
     m = download(cfg, "l", layout, rows_needed=6, shard_size=2)
     assert [(s.rows, s.offset) for s in m.shards] == [(2, 4), (2, 8), (2, 12)] and m.rows_fetched == 12
-    assert m.extra["skipped_malformed"] == 6
+    assert m.skipped_malformed == 6
 
 
 def test_download_stops_within_one_shard_when_asked(
@@ -802,7 +802,7 @@ def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resum
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
     cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, max_seq_length=5))
     full = download(cfg, "d", layout, rows_needed=10, shard_size=4)
-    assert full.extra == {"skipped_malformed": 10, "dropped_too_long": 10} and full.rows_fetched == 30
+    assert (full.skipped_malformed, full.dropped_too_long) == (10, 10) and full.rows_fetched == 30
     shards = [(s.rows, s.offset, s.skipped_malformed, s.dropped_too_long) for s in full.shards]
     assert shards == [(4, 12, 4, 4), (4, 24, 8, 8), (2, 30, 10, 10)]  # per shard: the totals up to its last stored row
     rows = read_rows(layout.raw_dir("d"))
@@ -811,10 +811,10 @@ def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resum
     (raw / "data-00001.parquet").write_bytes(b"corrupt")
     broken = Manifest.load(raw)
     assert broken is not None and RawFolder(raw, broken).truncate_to_good_prefix()
-    assert broken.rows_fetched == 12 and broken.extra == {"skipped_malformed": 4, "dropped_too_long": 4}
+    assert broken.rows_fetched == 12 and (broken.skipped_malformed, broken.dropped_too_long) == (4, 4)
 
     resumed = download(cfg, "d", layout, rows_needed=10, shard_size=4)
-    assert resumed.extra == full.extra and resumed.rows_fetched == 30
+    assert (resumed.skipped_malformed, resumed.dropped_too_long) == (10, 10) and resumed.rows_fetched == 30
     assert [(s.rows, s.offset, s.skipped_malformed, s.dropped_too_long) for s in resumed.shards] == shards
     assert read_rows(raw) == rows
 
@@ -832,7 +832,7 @@ def test_truncating_a_manifest_without_shard_counters_resets_them(
     assert legacy is not None
     for shard in legacy.shards:  # a manifest from before the fields existed
         shard.skipped_malformed = shard.dropped_too_long = None
-    legacy.extra["skipped_malformed"] = legacy.extra["dropped_too_long"] = 7
+    legacy.skipped_malformed = legacy.dropped_too_long = 7
     legacy.save(raw)
 
     (raw / "data-00002.parquet").write_bytes(b"corrupt")
@@ -840,7 +840,7 @@ def test_truncating_a_manifest_without_shard_counters_resets_them(
     assert reloaded is not None and all(s.skipped_malformed is None for s in reloaded.shards)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         assert RawFolder(raw, reloaded).truncate_to_good_prefix()
-    assert reloaded.rows_fetched == 20 and reloaded.extra["skipped_malformed"] == 0 and reloaded.extra["dropped_too_long"] == 0
+    assert reloaded.rows_fetched == 20 and reloaded.skipped_malformed == 0 and reloaded.dropped_too_long == 0
     assert "written before the per-shard reject counters existed" in caplog.text
     assert raw_manifest_state(cfg, "p", layout) == "current"  # never stale because of the missing fields
 
@@ -873,7 +873,7 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
     src = _synthetic(kind="instruct", converter="instruction_input_output", filter="every_fourth")
     cfg = with_tokenizer(cfg_factory({"s": src}))
     m = download(cfg, "s", layout, rows_needed=20, shard_size=10)
-    assert m.rows() == 20 and m.rows_fetched == 77 and not m.extra.get("exhausted")
+    assert m.rows() == 20 and m.rows_fetched == 77 and not m.exhausted
     assert calls == [(0, 2**62)] and closed == [True], "one call, closed after the 20th kept row"
     m2 = download(cfg, "s", layout, rows_needed=25, shard_size=10)
     assert m2.rows() == 25 and calls[1] == (77, 2**62)

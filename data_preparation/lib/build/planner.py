@@ -48,7 +48,6 @@ from data_preparation.lib.build.assessment import ProcessedProblem, assess_proce
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, current_raw_manifest, raw_manifest_state
 from data_preparation.lib.storage.manifest import shard_list, Manifest
-from data_preparation.lib.storage.raw_folder import check_limit_reached, is_exhausted, rejected_rows
 
 log = get_logger(__name__)
 
@@ -93,9 +92,9 @@ def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
 def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
     """Whether the loader of ``name`` has nothing more to give: the raw manifest says exhausted — unless it was
     exhausted by a ``check_limit`` that has since grown or been removed (``download`` reads on then)."""
-    if not is_exhausted(raw):
+    if not raw.exhausted:
         return False
-    reached = check_limit_reached(raw)
+    reached = raw.check_limit_reached
     if reached is None:
         return True
     limit = config.sources[name].check_limit
@@ -122,14 +121,14 @@ def current_processed_manifest(config: DatasetConfig, name: str, layout: Dataset
     manifest = load_processed_manifest(layout.processed_dir(name))
     if manifest is None or manifest.stage != "processed" or not manifest.is_current(config.processed_hash(name)):
         return None
-    if manifest.extra.get("columns") != list(processed_columns(config.sources[name].kind)):
+    if manifest.columns != list(processed_columns(config.sources[name].kind)):
         return None
     return manifest
 
 
 def processed_covers_raw(processed: Manifest, raw: Manifest) -> bool:
-    """Whether every raw shard has been built into ``processed`` (``extra["input_shards"]`` lists them all)."""
-    return processed.extra.get("input_shards") == shard_list(raw.shards)
+    """Whether every raw shard has been built into ``processed`` (``input_shards`` lists them all)."""
+    return processed.input_shards == shard_list(raw.shards)
 
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
@@ -456,7 +455,7 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     folder that is not current contributes nothing (its rows are about to be deleted or were never downloaded), so
     its processed folder is not counted either."""
     raw = current_raw_manifest(config, name, layout)
-    skipped, dropped = (0, 0) if raw is None else rejected_rows(raw)
+    skipped, dropped = (0, 0) if raw is None else (raw.skipped_malformed, raw.dropped_too_long)
     processed: tuple[ProcessedState, int] = ("missing", 0) if raw is None else _processed_state(config, name, layout, raw)
     processed_state, processed_rows = processed
     return SourceLedger(
@@ -506,7 +505,7 @@ def _processed_state(config: DatasetConfig, name: str, layout: DatasetLayout, ra
     manifest = assessment.manifest
     if manifest is None:  # unreachable: every problem without a readable manifest is mapped above
         return "missing", 0
-    if manifest.stage != "processed" or manifest.extra.get("columns") != list(processed_columns(config.sources[name].kind)):
+    if manifest.stage != "processed" or manifest.columns != list(processed_columns(config.sources[name].kind)):
         return "stale", 0
     if not processed_covers_raw(manifest, raw):
         return "behind_raw", manifest.rows()

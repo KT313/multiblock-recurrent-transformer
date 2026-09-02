@@ -29,7 +29,7 @@ from data_preparation.dataset_config import DatasetConfig
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name
 
-ShardList = list[list[Any]]  # ``[[shard name, rows], ...]`` — the shape of ``processed`` manifests' ``extra["input_shards"]``
+ShardList = list[list[Any]]  # ``[[shard name, rows], ...]`` — the shape of a processed manifest's ``input_shards``
 
 ProcessedProblem = Literal[
     "none",  # healthy: current manifest, every listed shard verifies, nothing unlisted, raw prefix intact
@@ -41,7 +41,7 @@ ProcessedProblem = Literal[
     "stale",  # manifest hash != the config's processed hash
     "broken_shard",  # a listed shard is missing, unreadable, or has the wrong row count
     "stray_shards",  # unlisted shard file(s) no resumed build would overwrite
-    "raw_changed",  # ``extra["input_shards"]`` is no longer a prefix of the raw shard list
+    "raw_changed",  # ``input_shards`` is no longer a prefix of the raw shard list
 ]
 
 Verdict = Literal["ok", "missing", "resumable", "stale", "broken"]
@@ -111,7 +111,7 @@ def assess_processed_folder(
         return ProcessedAssessment("raw_deleted", "built from a raw folder that is being deleted", manifest)
     if not manifest.is_current(config.processed_hash(name)):
         return ProcessedAssessment("stale", "stale: processing settings, max_seq_length or the source changed", manifest)
-    covered: ShardList = manifest.extra.get("input_shards", [])
+    covered = manifest.input_shards
     if check_files:
         for shard in manifest.shards:
             problem = shard_problem(folder, shard)

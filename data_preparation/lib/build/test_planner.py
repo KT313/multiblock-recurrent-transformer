@@ -168,9 +168,9 @@ def test_raw_is_exhausted_honours_a_grown_check_limit() -> None:
     cfg = two_stage_cfg()
     manifest = Manifest(source="i", source_hash="x", stage="raw")
     assert not raw_is_exhausted(cfg, "i", manifest)
-    manifest.extra["exhausted"] = True
+    manifest.exhausted = True
     assert raw_is_exhausted(cfg, "i", manifest)  # exhausted by the loader
-    manifest.extra["check_limit"] = 5
+    manifest.check_limit_reached = 5
     cfg.sources["i"].check_limit = 5
     assert raw_is_exhausted(cfg, "i", manifest)  # exhausted by the limit that still applies
     cfg.sources["i"].check_limit = 10

@@ -81,10 +81,10 @@ def test_build_length_filter_drops_short_and_keeps_stats(
     rows = read_rows(layout.processed_dir("s"))
     assert [r["text"] for r in rows] == ["ok " * 5, _words(6), "y" * 7, "z" * 8], "short / null dropped, nothing truncated"
     assert [r["tokens"] for r in rows] == [5, 6, 1, 1], "the raw counts are reused as they are"
-    assert m.extra["stats"]["length_filter"] == {"input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "output_samples": 4}
-    assert m.extra["stats"]["input_rows"] == 6 and m.rows() == 4
-    assert m.extra["input_shards"] == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
-    assert m.extra["columns"] == ["text", "source", "tokens", "hash"] and m.extra["shuffled"] is False
+    assert m.stats["length_filter"] == {"input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "output_samples": 4}
+    assert m.stats["input_rows"] == 6 and m.rows() == 4
+    assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
+    assert m.columns == ["text", "source", "tokens", "hash"] and m.shuffled is False
 
 
 def test_build_writes_a_manifest_even_when_every_row_is_dropped(
@@ -92,8 +92,8 @@ def test_build_writes_a_manifest_even_when_every_row_is_dropped(
 ) -> None:
     cfg = _prepare(cfg_factory, layout, local_dir, ["a", "b"], with_tokenizer, write=write_local, processing=ProcessingConfig(min_chars=5))
     m = build_source(cfg, "s", layout)
-    assert m.shards == [] and m.rows() == 0 and m.tokens() == 0 and m.extra["stats"]["length_filter"]["output_samples"] == 0
-    assert m.extra["input_shards"] == [["data-00000.parquet", 2]] and Manifest.load(layout.processed_dir("s")) == m
+    assert m.shards == [] and m.rows() == 0 and m.tokens() == 0 and m.stats["length_filter"]["output_samples"] == 0
+    assert m.input_shards == [["data-00000.parquet", 2]] and Manifest.load(layout.processed_dir("s")) == m
     assert build_source(cfg, "s", layout) == m
 
 
@@ -106,17 +106,17 @@ def test_build_of_an_exhausted_raw_dir_with_zero_shards_writes_an_empty_manifest
     src = SourceConfig(kind="instruct", loader="local", path=str(local_dir), converter="instruction_input_output")
     cfg = with_tokenizer(cfg_factory({"i": src}))
     raw = download(cfg, "i", layout, rows_needed=5)
-    assert raw.shards == [] and raw.extra["exhausted"] is True
+    assert raw.shards == [] and raw.exhausted is True
     m = build_source(cfg, "i", layout)
     stored = Manifest.load(layout.processed_dir("i"))
-    assert stored == m and m.shards == [] and m.extra["input_shards"] == [] and m.is_current(cfg.processed_hash("i"))
+    assert stored == m and m.shards == [] and m.input_shards == [] and m.is_current(cfg.processed_hash("i"))
     # the same for a per-shard (unshuffled pretrain) build
     write_local(local_dir / "empty", [], "jsonl")
     cfg2 = with_tokenizer(cfg_factory({"p": SourceConfig(kind="pretrain", loader="local", path=str(local_dir / "empty"))}))
     raw2 = download(cfg2, "p", layout, rows_needed=5)
-    assert raw2.shards == [] and raw2.extra["exhausted"] is True
+    assert raw2.shards == [] and raw2.exhausted is True
     m2 = build_source(cfg2, "p", layout)
-    assert Manifest.load(layout.processed_dir("p")) == m2 and m2.shards == [] and m2.extra["input_shards"] == []
+    assert Manifest.load(layout.processed_dir("p")) == m2 and m2.shards == [] and m2.input_shards == []
 
 
 def test_build_exact_dedup_tokens_and_idempotence(
@@ -134,8 +134,8 @@ def test_build_exact_dedup_tokens_and_idempotence(
     assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
     assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
     assert [(s.rows, s.tokens) for s in m.shards] == [(2, 8), (1, 64)] and m.tokens() == 72
-    assert m.extra["stats"]["dedup"] == {"mode": "exact", "duplicates_removed": 2}
-    assert m.extra["input_shards"] == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
+    assert m.stats["dedup"] == {"mode": "exact", "duplicates_removed": 2}
+    assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
     before = mtimes(processed)
     assert build_source(cfg, "s", layout, shard_size=2) == m and mtimes(processed) == before
 
@@ -178,7 +178,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     assert "s: dedup filter: 1 MB, ~7 rows" in caplog.text, "the test config's 1 MB budget, sized for the raw rows"
     processed = layout.processed_dir("s")
     old_rows = read_rows(processed)
-    assert len(old_rows) == 6 and m1.extra["stats"]["input_rows"] == 7 and m1.extra["columns"] == ["text", "source", "tokens", "hash"]
+    assert len(old_rows) == 6 and m1.stats["input_rows"] == 7 and m1.columns == ["text", "source", "tokens", "hash"]
     before = mtimes(processed)
 
     # append: duplicates of old rows plus new ones (the duplicates sit in a NEW raw shard, their originals in OLD processed shards)
@@ -194,8 +194,8 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     monkeypatch.setattr(TokenCounter, "count_many", spy)
     m2 = build_source(cfg, "s", layout, shard_size=4)
     assert sum(counted) == 0, "raw token counts reused, nothing tokenized"
-    assert m2.extra["stats"]["dedup"]["duplicates_removed"] == 3 and m2.extra["stats"]["input_rows"] == 11
-    assert m2.extra["input_shards"] == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 1, 3, 1])]
+    assert m2.stats["dedup"]["duplicates_removed"] == 3 and m2.stats["input_rows"] == 11
+    assert m2.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 1, 3, 1])]
     after = mtimes(processed)
     assert {k: after[k] for k in before} == before, "old processed shards were not rewritten"
     new_rows = read_rows(processed)
@@ -211,7 +211,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     download(cfg, "s", fresh, rows_needed=11, shard_size=3)
     m_fresh = build_source(cfg, "s", fresh, shard_size=4)
     assert read_rows(fresh.processed_dir("s")) == new_rows
-    assert m_fresh.tokens() == m2.tokens() and m_fresh.extra["stats"] == m2.extra["stats"]
+    assert m_fresh.tokens() == m2.tokens() and m_fresh.stats == m2.stats
     assert [sh.rows for sh in m_fresh.shards] == [3, 3, 1, 1], "same layout: one processed shard per raw shard"
 
 
@@ -226,18 +226,18 @@ def test_incremental_build_with_quality_filter_equals_a_full_pass(
     cfg = _prepare(cfg_factory, layout, local_dir, [bad_caps, "Another good text. It has sentences. Three of them here."],
                    with_tokenizer, write=write_local, processing=proc, max_seq_length=500, shard_size=2)  # fmt: skip
     m1 = build_source(cfg, "s", layout)
-    assert m1.rows() == 1 and m1.extra["stats"]["quality_filter"]["filtered_count"] == 1
+    assert m1.rows() == 1 and m1.stats["quality_filter"]["filtered_count"] == 1
     write_local(local_dir, [{"text": GOOD}], "parquet")
     download(cfg, "s", layout, rows_needed=3, shard_size=2)
     m2 = build_source(cfg, "s", layout)
     incremental = read_rows(layout.processed_dir("s"))
-    assert [r["text"] for r in incremental][-1] == GOOD and m2.extra["stats"]["dedup"]["duplicates_removed"] == 0
+    assert [r["text"] for r in incremental][-1] == GOOD and m2.stats["dedup"]["duplicates_removed"] == 0
 
     fresh = DatasetLayout(tmp_path / "fresh")
     prepare_tokenizer(cfg, fresh)
     download(cfg, "s", fresh, rows_needed=3, shard_size=2)
     m_fresh = build_source(cfg, "s", fresh)
-    assert read_rows(fresh.processed_dir("s")) == incremental and m_fresh.extra["stats"] == m2.extra["stats"]
+    assert read_rows(fresh.processed_dir("s")) == incremental and m_fresh.stats == m2.stats
 
 
 def test_build_rebuilds_when_shards_predate_the_columns_or_raw_changed(
@@ -252,22 +252,22 @@ def test_build_rebuilds_when_shards_predate_the_columns_or_raw_changed(
     # a processed directory from before the current columns: rebuilt from the raw shards (no download)
     legacy = Manifest.load(processed)
     assert legacy is not None
-    del legacy.extra["columns"]
+    legacy.columns = []
     legacy.save(processed)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         rebuilt = build_source(cfg, "s", layout)
-    assert "predate the current columns" in caplog.text and rebuilt.extra["columns"] == m.extra["columns"]
+    assert "predate the current columns" in caplog.text and rebuilt.columns == m.columns
     assert read_rows(processed) == rows
 
     # raw shards that are no longer a prefix of what was covered: everything is rebuilt
     caplog.clear()
     changed = Manifest.load(processed)
     assert changed is not None
-    changed.extra["input_shards"][0][1] = 99
+    changed.input_shards[0][1] = 99
     changed.save(processed)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         rebuilt = build_source(cfg, "s", layout)
-    assert "raw shards changed" in caplog.text and rebuilt.extra["input_shards"] == m.extra["input_shards"]
+    assert "raw shards changed" in caplog.text and rebuilt.input_shards == m.input_shards
     assert read_rows(processed) == rows
 
 
@@ -312,7 +312,7 @@ def test_build_quality_filter_only_when_enabled(
     download(on, "s", layout, rows_needed=2)
     m = build_source(on, "s", layout)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
-    assert m.extra["stats"]["quality_filter"] == {"enabled": True, "filtered_count": 1, "rejection_reasons": {"too_few_sentences": 1}}
+    assert m.stats["quality_filter"] == {"enabled": True, "filtered_count": 1, "rejection_reasons": {"too_few_sentences": 1}}
 
 
 @pytest.mark.parametrize("pass_workers", [1, 2])
@@ -339,7 +339,7 @@ def test_build_decontamination_only_when_enabled(
     download(on, "s", layout, rows_needed=3)
     m = build_source(on, "s", layout, pass_workers=pass_workers)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
-    assert m.extra["stats"]["decontamination"] == {"enabled": True, "contaminated_count": 2, "contaminated_by_benchmark": {"gsm8k_test": 2}}
+    assert m.stats["decontamination"] == {"enabled": True, "contaminated_count": 2, "contaminated_by_benchmark": {"gsm8k_test": 2}}
     assert calls == [(["gsm8k_test", "mmlu_test"], 13, str(layout.benchmark_cache_dir()))]
 
 
@@ -376,7 +376,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     # one (`near`); rows too short for an n-gram are not all collapsed onto the first of them
     assert [r["text"] for r in read_rows(processed)] == [base, other, partial, short_a, short_b]
     assert not processed.with_name("s.tmp").exists()
-    dedup_stats = dict(m.extra["stats"]["dedup"])
+    dedup_stats = dict(m.stats["dedup"])
     assert dedup_stats.pop("seconds") >= 0
     assert dedup_stats == {
         "mode": "minhash", "duplicates_removed": 2, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 1,
@@ -388,7 +388,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     write_local(local_dir, [{"text": other.replace("other5", "x")}], "parquet")
     download(cfg, "s", layout, rows_needed=9)
     m2 = build_source(cfg, "s", layout)
-    assert m2.extra["stats"]["input_rows"] == 9 and m2.extra["stats"]["dedup"]["near_duplicates_removed"] == 2
+    assert m2.stats["input_rows"] == 9 and m2.stats["dedup"]["near_duplicates_removed"] == 2
     assert [r["text"] for r in read_rows(processed)] == [base, other, partial, short_a, short_b]
 
 
@@ -424,14 +424,14 @@ def test_build_publishes_per_raw_shard_and_resumes_after_a_stop(
     with pytest.raises(BuildAborted):
         build_source(cfg, "s", layout, should_stop=stop_after_two)
     partial = Manifest.load(processed)
-    assert partial is not None and partial.extra["input_shards"] == [["data-00000.parquet", 3], ["data-00001.parquet", 3]]
-    assert [s.rows for s in partial.shards] == [3, 3] and partial.extra["stats"]["input_rows"] == 6
+    assert partial is not None and partial.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]]
+    assert [s.rows for s in partial.shards] == [3, 3] and partial.stats["input_rows"] == 6
     assert len(read_rows(processed)) == 6
 
     m = build_source(cfg, "s", layout)  # resumes behind the covered raw shards
-    assert m.extra["input_shards"] == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])]
-    assert [s.rows for s in m.shards] == [3, 3, 3] and m.extra["stats"]["input_rows"] == 10
-    assert m.extra["stats"]["dedup"]["duplicates_removed"] == 1
+    assert m.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])]
+    assert [s.rows for s in m.shards] == [3, 3, 3] and m.stats["input_rows"] == 10
+    assert m.stats["dedup"]["duplicates_removed"] == 1
     assert [r["text"] for r in read_rows(processed)] == texts[:9]
 
 
@@ -444,15 +444,15 @@ def test_pretrain_source_with_shuffle_is_built_all_at_once_in_seeded_order(
     out = [r["text"] for r in read_rows(layout.processed_dir("s"))]
     expected = list(texts)
     random.Random(5).shuffle(expected)
-    assert out == expected != texts and m.extra["shuffled"] is True and [s.rows for s in m.shards] == [5, 5, 2]
-    assert m.extra["input_shards"] == [[f"data-{i:05d}.parquet", 4] for i in range(3)]
+    assert out == expected != texts and m.shuffled is True and [s.rows for s in m.shards] == [5, 5, 2]
+    assert m.input_shards == [[f"data-{i:05d}.parquet", 4] for i in range(3)]
     # a top-up rebuilds the whole folder in the seeded order of the larger list
     write_local(local_dir, [{"text": _words(6, 100)}], "parquet")
     download(cfg, "s", layout, rows_needed=13, shard_size=4)
     m2 = build_source(cfg, "s", layout, shard_size=5)
     expected = texts + [_words(6, 100)]
     random.Random(5).shuffle(expected)
-    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == expected and m2.extra["stats"]["input_rows"] == 13
+    assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == expected and m2.stats["input_rows"] == 13
 
 
 # --- instruct: all-at-once shuffled build --------------------------------------------------------------------------------
@@ -480,9 +480,9 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     m = build_source(cfg, "i", layout, shard_size=8)
     out = read_rows(processed)
     assert [set(r) for r in out] == [{"instruction", "input", "output", "tokens", "hash"}] * 20
-    assert m.extra["columns"] == ["instruction", "input", "output", "tokens", "hash"] and m.extra["shuffled"] is True and m.extra["seed"] == 3
-    assert m.extra["stats"] == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
-    assert m.extra["input_shards"] == [["data-00000.parquet", 8], ["data-00001.parquet", 8], ["data-00002.parquet", 8]]
+    assert m.columns == ["instruction", "input", "output", "tokens", "hash"] and m.shuffled is True and m.shuffle_seed == 3
+    assert m.stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
+    assert m.input_shards == [["data-00000.parquet", 8], ["data-00001.parquet", 8], ["data-00002.parquet", 8]]
     assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 6
     assert all(r["hash"] == text_hash64(instruct_text(r)) for r in out)
     expected = [{**_instruct_row(i), "tokens": 6} for i in range(20)]
@@ -527,11 +527,11 @@ def test_instruct_inversions_are_seeded_per_row_and_survive_a_resume(
     with pytest.raises(BuildAborted):
         build_source(cfg, "i", layout, should_stop=stop_after_two)
     partial = Manifest.load(layout.processed_dir("i"))
-    assert partial is not None and len(partial.extra["input_shards"]) == 2
+    assert partial is not None and len(partial.input_shards) == 2
     m = build_source(cfg, "i", layout)
     resumed = read_rows(layout.processed_dir("i"))
     inverted = [r for r in resumed if r["instruction"].startswith("Given this output")]
-    assert 4 <= len(inverted) <= 20 and m.extra["stats"]["inverted"] == len(inverted) and m.extra["shuffled"] is False
+    assert 4 <= len(inverted) <= 20 and m.stats["inverted"] == len(inverted) and m.shuffled is False
     counter = TokenCounter(cfg, layout)
     assert all(r["tokens"] == counter.count(instruct_text(r)) != 6 for r in inverted), "tokens recounted"
     assert [r["instruction"] for r in resumed if not r["instruction"].startswith("Given")] == [
@@ -563,10 +563,10 @@ def test_instruct_rows_over_the_cap_are_dropped_and_counted(
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, max_seq_length=8)
     raw = download(cfg, "i", layout, rows_needed=10)
     assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [6] * 5, "rows over the cap are dropped at download, never truncated"
-    assert raw.extra["dropped_too_long"] == 5 and raw.extra["exhausted"] is True
+    assert raw.dropped_too_long == 5 and raw.exhausted is True
     m = build_source(cfg, "i", layout)
     out = read_rows(layout.processed_dir("i"))
-    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.extra["stats"]["removed_too_long"] == 0  # the build's safety net has nothing left to do
+    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.stats["removed_too_long"] == 0  # the build's safety net has nothing left to do
 
 
 def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(

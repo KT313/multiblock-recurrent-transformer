@@ -2,13 +2,12 @@
 """``RawFolder``: the one object that owns the bookkeeping of a ``sources/<source>/raw/`` directory.
 
 A raw manifest records more than its shards: the loader offset reached (``rows_fetched``, where the next download
-resumes), how many source rows were rejected on the way (``extra["skipped_malformed"]`` /
-``extra["dropped_too_long"]``), whether the loader ran dry (``extra["exhausted"]``, possibly because a
-``check_limit`` was reached) and the token cap the stored rows were cut at (``truncated_at_tokens``). Three code
-paths change all of that — the per-source download, the ``github_code`` group pass and the repair step's truncation
-— and each used to do it by hand; they drifted (a truncation reset the offset but not the reject counters, so a
-repair-then-resume counted those rows twice). :class:`RawFolder` is now the only place that reads or writes these
-keys, and every one of the three goes through it.
+resumes), how many source rows were rejected on the way (``skipped_malformed`` / ``dropped_too_long``), whether the
+loader ran dry (``exhausted``, possibly because a ``check_limit`` was reached: ``check_limit_reached``) and the token
+cap the stored rows were cut at (``truncated_at_tokens``). Three code paths change all of that — the per-source
+download, the ``github_code`` group pass and the repair step's truncation — and :class:`RawFolder` is the only
+writer of these fields, so the offset and the reject counters always move together (a resume never counts a rejected
+row twice).
 
 The append side is resumable at shard granularity: every published shard is recorded with the loader offset **and**
 the reject totals as of its last stored row (:class:`RowProgress`, carried on the row itself under
@@ -32,12 +31,6 @@ log = get_logger(__name__)
 
 Row = dict[str, Any]
 
-# The bookkeeping keys of a raw manifest's `extra` dict; nothing outside this module spells them.
-EXHAUSTED = "exhausted"  # the loader ran dry, or `check_limit` was reached
-CHECK_LIMIT = "check_limit"  # the `check_limit` that stopped the reads (a grown limit reopens the source)
-SKIPPED_MALFORMED = "skipped_malformed"  # instruct rows whose converter raised ValueError
-DROPPED_TOO_LONG = "dropped_too_long"  # rows with more than the folder's token cap
-
 ROW_PROGRESS_KEY = "_progress"  # private row key: the fetch progress right after this row (stripped before it is written)
 
 
@@ -49,25 +42,6 @@ class RowProgress(NamedTuple):
     consumed: int
     skipped_malformed: int
     dropped_too_long: int
-
-
-# --- read-only queries (the planner reads a manifest it did not open a folder for) -------------------------------------
-
-
-def is_exhausted(manifest: Manifest) -> bool:
-    """Whether the manifest says the loader had nothing more to give."""
-    return bool(manifest.extra.get(EXHAUSTED))
-
-
-def check_limit_reached(manifest: Manifest) -> int | None:
-    """The ``check_limit`` that exhausted the source, or None when the loader itself ran dry."""
-    reached = manifest.extra.get(CHECK_LIMIT)
-    return None if reached is None else int(reached)
-
-
-def rejected_rows(manifest: Manifest) -> tuple[int, int]:
-    """``(skipped_malformed, dropped_too_long)`` recorded so far."""
-    return int(manifest.extra.get(SKIPPED_MALFORMED, 0)), int(manifest.extra.get(DROPPED_TOO_LONG, 0))
 
 
 # --- the folder ---------------------------------------------------------------------------------------------------------
@@ -91,7 +65,7 @@ class RawFolder:
     def _reset_increment(self) -> None:
         """(Re)base the append bookkeeping on what the manifest holds right now."""
         self.start_offset = self.manifest.rows_fetched
-        self._skipped_before, self._dropped_before = rejected_rows(self.manifest)
+        self._skipped_before, self._dropped_before = self.manifest.skipped_malformed, self.manifest.dropped_too_long
         self._last = RowProgress(0, 0, 0)  # progress at the row most recently handed to the writer
 
     # --- state ---------------------------------------------------------------------------------------------------
@@ -123,7 +97,7 @@ class RawFolder:
 
     @property
     def exhausted(self) -> bool:
-        return is_exhausted(self.manifest)
+        return self.manifest.exhausted
 
     @property
     def shard_count(self) -> int:
@@ -135,13 +109,13 @@ class RawFolder:
         """A source marked exhausted because its ``check_limit`` was reached may be read further when the limit grew
         (or was removed): ``check_limit`` is not part of the raw hash, so the manifest is not stale, only its flag.
         Kept in memory — the increment that follows saves it."""
-        reached = check_limit_reached(self.manifest)
+        reached = self.manifest.check_limit_reached
         if not self.exhausted or reached is None:
             return
         if check_limit is None or check_limit > reached:
             log.info("%s: check_limit grew from %s to %s, source no longer exhausted", self.name, reached, check_limit)
-            self.manifest.extra[EXHAUSTED] = False
-            del self.manifest.extra[CHECK_LIMIT]
+            self.manifest.exhausted = False
+            self.manifest.check_limit_reached = None
 
     def mark_exhausted(self, *, check_limit: int | None = None) -> None:
         """Record that there is nothing more to fetch and save; ``check_limit`` names the limit that stopped the
@@ -150,9 +124,9 @@ class RawFolder:
         self.save()
 
     def _set_exhausted(self, check_limit: int | None) -> None:
-        self.manifest.extra[EXHAUSTED] = True
+        self.manifest.exhausted = True
         if check_limit is not None:
-            self.manifest.extra[CHECK_LIMIT] = check_limit
+            self.manifest.check_limit_reached = check_limit
 
     # --- appending -----------------------------------------------------------------------------------------------
 
@@ -184,8 +158,8 @@ class RawFolder:
 
     def _store(self, progress: RowProgress) -> None:
         self.manifest.rows_fetched = self.start_offset + progress.consumed
-        self.manifest.extra[SKIPPED_MALFORMED] = self._skipped_before + progress.skipped_malformed
-        self.manifest.extra[DROPPED_TOO_LONG] = self._dropped_before + progress.dropped_too_long
+        self.manifest.skipped_malformed = self._skipped_before + progress.skipped_malformed
+        self.manifest.dropped_too_long = self._dropped_before + progress.dropped_too_long
         self.save()
 
     def save(self) -> None:
@@ -215,8 +189,8 @@ class RawFolder:
         self.manifest.shards = self.manifest.shards[:good]
         self.manifest.rows_fetched = int(kept.offset or 0)
         self._restore_reject_counters(kept)
-        self.manifest.extra.pop(EXHAUSTED, None)
-        self.manifest.extra.pop(CHECK_LIMIT, None)
+        self.manifest.exhausted = False
+        self.manifest.check_limit_reached = None
         for path in list_parquet_files(self.directory):
             index = shard_index(path)
             if index is not None and index >= good:
@@ -233,5 +207,5 @@ class RawFolder:
                 "%s: %s was written before the per-shard reject counters existed; resetting skipped_malformed / "
                 "dropped_too_long to 0 (they may undercount after the resume)", self.name, self.directory,
             )
-        self.manifest.extra[SKIPPED_MALFORMED] = int(kept.skipped_malformed or 0)
-        self.manifest.extra[DROPPED_TOO_LONG] = int(kept.dropped_too_long or 0)
+        self.manifest.skipped_malformed = int(kept.skipped_malformed or 0)
+        self.manifest.dropped_too_long = int(kept.dropped_too_long or 0)

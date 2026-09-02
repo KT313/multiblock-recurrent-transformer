@@ -339,7 +339,7 @@ def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
     assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet", "data-00001.parquet", "data-00002.parquet"]
     # reconstruct the crash state by hand: the shard file of the third raw shard is on disk, the manifest save never ran
     manifest.shards = manifest.shards[:2]
-    manifest.extra["input_shards"] = manifest.extra["input_shards"][:2]
+    manifest.input_shards = manifest.input_shards[:2]
     manifest.save(processed)
     stray = processed / "data-00002.parquet"
     assert stray.exists()
@@ -351,7 +351,7 @@ def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
 
     resumed = build_source(cfg, "a", layout, shard_size=4)  # the resumed build overwrites the stray and completes
     assert [shard.name for shard in resumed.shards] == ["data-00000.parquet", "data-00001.parquet", "data-00002.parquet"]
-    assert len(resumed.extra["input_shards"]) == 3 and read_rows(processed) == complete_rows, "no data lost"
+    assert len(resumed.input_shards) == 3 and read_rows(processed) == complete_rows, "no data lost"
     assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False).actions == []
 
 
@@ -391,7 +391,7 @@ def test_processed_input_shards_must_be_a_prefix_of_the_raw_shards(cfg_factory: 
     processed = layout.processed_dir("a")
     manifest = Manifest.load(processed)
     assert manifest is not None
-    manifest.extra["input_shards"] = [["data-00000.parquet", 3], ["data-00001.parquet", 4]]  # row count of shard 0 differs
+    manifest.input_shards = [["data-00000.parquet", 3], ["data-00001.parquet", 4]]  # row count of shard 0 differs
     manifest.save(processed)
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
     assert _kinds(report) == [("a", "processed", "delete")] and report.actions[0].reason == "built from raw shards that no longer exist"
