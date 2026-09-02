@@ -69,7 +69,8 @@ class TrainingDashboard(LiveDisplay):
     ``console`` is for tests (a ``rich.console.Console`` over a ``StringIO``); ``clock`` is injected by the ETA
     tests. ``enabled`` is True until the dashboard disables itself after an internal error; from then on the public
     methods keep only what the console fallback does — the lines on :data:`~training.ui.common.lines_log` — and
-    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. Those
+    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. A terminal
+    that dies mid-run closes the display the same way and the run continues headless (:mod:`ui.display`). Those
     lines go to ``fallback_stream`` when one is given (the run's CLI passes stderr, so the lines of a display that
     disabled itself mid-run land on the same stream as the log handlers' lines), else to ``stream``.
     ``final_frame`` prints the static summary once the display closed.
@@ -123,11 +124,13 @@ class TrainingDashboard(LiveDisplay):
         self._latest: dict[str, float] = {}
         self._validation: tuple[int, dict[str, float]] | None = None
         self._console_lines: logging.Handler | None = None  # the dashboard lines' way to the console once disabled
+        self._torn_down = False  # `_disable` already closed the display (`close` has nothing left to do)
         self._render_error: BaseException | None = None  # set on the Live thread, handled on the caller's thread
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
         self._open = False
+        self.logger = log
         self._capture = TerminalCapture(self, skip=self.is_attached)
         self._refresh_bars(start_step, 0)
 
@@ -166,7 +169,7 @@ class TrainingDashboard(LiveDisplay):
             return
         self._open = False
         self._drop_console_lines()  # a demoted board's console handler (`_disable`) ends with the display
-        if not self.enabled:
+        if self._torn_down:
             return  # `_disable` already tore the display down and printed the kept lines
         try:
             self._teardown()
@@ -200,6 +203,7 @@ class TrainingDashboard(LiveDisplay):
         if not self.enabled:
             return
         self.enabled = False
+        self._torn_down = True
         with suppress(Exception):  # the display is already broken; nothing left to clean up if the teardown fails too
             self._teardown()
         with suppress(Exception):

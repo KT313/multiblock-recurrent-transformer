@@ -26,7 +26,7 @@ from rich.live import Live
 from data_preparation.lib.log import ProgressStreamHandler, configure_logging
 from data_preparation.lib.progress import NoProgress
 from ui.capture import LineSink
-from ui.testing import FakeClock, Screen, console_output, screen_text
+from ui.testing import DyingFile, FakeClock, Screen, console_output, screen_text
 from data_preparation.lib.ui.dashboard import (
     DataDashboard,
     Task,
@@ -486,6 +486,33 @@ def test_a_download_row_shows_its_bytes_and_current_speed() -> None:
         assert _format_bytes(3 * 2**30) == "3.00 GB" and _format_byte_rate(50 * 2**10) == "50 kB/s"
 
 
+def test_a_dead_terminal_closes_the_display_and_the_build_continues(tmp_path: Path) -> None:
+    file = DyingFile()
+    console = Console(file=file, force_terminal=True, width=100)
+    log_file = tmp_path / "build.log"
+    real_err = sys.stderr
+    with DataDashboard(enabled=True, console=console, refresh_per_second=50) as board, board.attach(logging.getLogger("data_preparation"), log_file=log_file):
+        bar = board.task("src", total=10, panel="downloads")
+        file.die()
+        live = _live_of(board)
+        assert live is not None
+        live.refresh()
+        assert board.headless and not board.enabled and _live_of(board) is None
+        bar.update(3)
+        logger = logging.getLogger("data_preparation.test_dead_terminal")
+        logger.setLevel(logging.INFO)
+        logger.info("still working")
+        logger.warning("a kept line after the loss")
+        print("a stray print")
+        assert sys.stderr is not real_err, "the capture stays on: stray output goes to the log, never to the dead terminal"
+        assert isinstance(board.task("late", total=1), NoProgress)
+    assert sys.stderr is real_err
+    text = log_file.read_text()
+    assert "terminal gone ([Errno 5] Input/output error): the display is closed, the run continues headless; its log: " in text
+    assert "still working" in text and "a stray print" in text
+    assert "a kept line" not in file.getvalue() and file.refused >= 1, "nothing reached the dead terminal"
+
+
 def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=120, height=40)
     with DataDashboard(title="prepare tiny", enabled=True, console=console, refresh_per_second=50) as board:
@@ -584,9 +611,12 @@ prepare.main(["prepare", "--dataset_config", "config/datasets/tiny.yaml", "--dat
 """
 
 
-def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0, terminate_after: float | None = None) -> tuple[int, bytes]:
+def _run_in_pty(
+    script: str, *, width: int, height: int, timeout: float = 120.0, terminate_after: float | None = None, close_after: float | None = None
+) -> tuple[int, bytes]:
     """Run ``python -c script`` on a pseudo-terminal of the given size; the exit code and everything it wrote.
-    ``terminate_after`` sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run)."""
+    ``terminate_after`` sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run);
+    ``close_after`` closes the terminal instead (the window closed: SIGHUP and EIO for the child)."""
     pid, fd = pty.fork()
     if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -597,7 +627,19 @@ def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0,
     output = bytearray()
     deadline = time.monotonic() + timeout
     terminate_at: float | None = None
+    close_at: float | None = None
     while True:
+        if close_at is not None and time.monotonic() > close_at:
+            os.close(fd)  # the terminal is gone; the child must finish on its own
+            while True:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+                if waited == pid:
+                    return os.waitstatus_to_exitcode(status), bytes(output)
+                if time.monotonic() > deadline:
+                    os.kill(pid, 9)
+                    _, status = os.waitpid(pid, 0)
+                    return os.waitstatus_to_exitcode(status), bytes(output)
+                time.sleep(0.1)
         ready, _, _ = select.select([fd], [], [], 0.1)
         if ready:
             try:
@@ -609,6 +651,8 @@ def _run_in_pty(script: str, *, width: int, height: int, timeout: float = 120.0,
             output += chunk
             if terminate_after is not None and terminate_at is None and b"downloads" in output:  # the first frame is up
                 terminate_at = time.monotonic() + terminate_after
+            if close_after is not None and close_at is None and b"downloads" in output:
+                close_at = time.monotonic() + close_after
         if terminate_at is not None and time.monotonic() > terminate_at:
             os.kill(pid, 15)
             terminate_at = None
@@ -639,6 +683,17 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     assert lines[0].endswith("dataset status:") and lines[-1].endswith(f"done: {dataset_dir}"), shown
     build_log = (dataset_dir / "build.log").read_text()
     assert "round 1:" in build_log and "synthetic_pretrain: kept 76 of 76 fetched rows" in build_log
+
+
+@pytest.mark.slow
+def test_a_closed_terminal_does_not_end_the_run(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.03)
+    code, _raw = _run_in_pty(script, width=140, height=45, close_after=0.5)
+    assert code == 0, "the run finished on its own after its terminal closed"
+    build_log = (dataset_dir / "build.log").read_text()
+    assert "terminal gone (" in build_log and "the run continues headless" in build_log, build_log[-2000:]
+    assert f"done: {dataset_dir}" in build_log, build_log[-500:]
 
 
 @pytest.mark.slow

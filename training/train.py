@@ -16,7 +16,9 @@ live display on a TTY, the one-line-per-`log_step_interval` fallback when piped 
 nothing prints twice; a first Ctrl-C / SIGTERM and an exception both leave through the dashboard's `__exit__`
 (frame erased, kept lines and the static summary printed), and the report's summary is printed after that.
 
-Exit codes: 0 finished, 1 failed (logged with its traceback), 130 interrupted.
+Exit codes: 0 finished, 1 failed (logged with its traceback), 3 another training run on the same `out_dir` (or the
+data preparation this one needs) is still running — one run at a time, `data_preparation/lib/build/lock.py`; the
+message names its pid and start time —, 130 interrupted.
 """
 
 from __future__ import annotations
@@ -34,12 +36,14 @@ from types import FrameType
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python training/train.py` from the repo root
 
 from data_preparation.lib.abort import BuildAborted
+from data_preparation.lib.build.lock import RunLocked
 from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
 from training.settings import parse_settings
 from training.ui.common import KEEP, TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
 
 EXIT_INTERRUPTED = 130
+EXIT_ALREADY_RUNNING = 3
 
 log = logging.getLogger(f"{TRAINING_LOGGER_NAME}.train")
 
@@ -118,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
     with stop_on_interrupt() as should_stop:
         try:
             report = train(settings, should_stop=should_stop, started_at=started_at)
+        except RunLocked as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_ALREADY_RUNNING
         except (KeyboardInterrupt, BuildAborted):
             log.warning("training interrupted; checkpoints and published dataset shards are kept, rerun to resume")
             return EXIT_INTERRUPTED

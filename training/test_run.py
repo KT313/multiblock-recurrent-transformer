@@ -45,7 +45,7 @@ from training.run import (
     stop_requested,
     train,
 )
-from training.run_lock import RunDirectoryLocked, run_directory_lock
+from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
@@ -124,7 +124,7 @@ def test_train_refuses_a_run_directory_another_run_holds(
     """`train()` takes the run-directory lock right after creating the directory and holds it for the whole run: a
     second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
     `train.log` and `run_config.json` with the first one."""
-    with run_directory_lock(Path(tiny_settings.out_dir)), pytest.raises(RunDirectoryLocked, match="already using"):
+    with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
     assert list(checkpoint_dir(Path(tiny_settings.out_dir)).glob("*.pth")) == [], "nothing ran"
 

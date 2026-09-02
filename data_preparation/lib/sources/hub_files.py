@@ -41,13 +41,16 @@ cached file costs nothing on the wire, so nothing needs to be kept.
 Hub access goes through the module-level functions :func:`repo_listing`, :func:`resolve_revision`,
 :func:`paths_info`, :func:`hub_download` and :func:`open_remote` (stubbed by the tests) or through the callables of a
 :class:`HubFetcher`, which also holds the size threshold and the :class:`FetchStats` (bytes fetched from the Hub,
-files downloaded / streamed).
+files downloaded / streamed). Every Hub request is bounded by :data:`HUB_REQUEST_TIMEOUT` (:func:`configure_hub_http`,
+run by the four entry points before their first request): huggingface_hub's shared HTTP client has no timeout of its
+own, and a connection into a dead tunnel would otherwise wait forever — a source must fail loudly instead.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
+import functools
 import io
 import itertools
 import json
@@ -84,6 +87,19 @@ INDEX_SAVE_INTERVAL_SECONDS = 30.0  # how often at most a persisted FileIndex is
 # --- Hub access (module-level so tests can stub them) --------------------------------------------------------------
 
 
+HUB_REQUEST_TIMEOUT = 30.0  # seconds to connect, and between two reads, of any Hub request (listing, sizes, downloads)
+
+
+@functools.cache
+def configure_hub_http() -> None:
+    """Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
+    The library passes its own, shorter timeouts to range reads and cache downloads; the repo listing and the size
+    lookup (``HfApi.dataset_info`` / ``get_paths_info``) rely on the client's, which is unset by default."""
+    from huggingface_hub import get_session
+
+    get_session().timeout = HUB_REQUEST_TIMEOUT
+
+
 def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
     """All file paths of a dataset repo at ``revision`` plus the commit hash that revision resolved to.
 
@@ -91,6 +107,7 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
     recording the commit alongside the listing costs no extra request."""
     from huggingface_hub import HfApi
 
+    configure_hub_http()
     info = HfApi(token=token).dataset_info(repo_id, revision=revision)
     if info.sha is None:
         raise RuntimeError(f"{repo_id}@{revision or 'main'}: the Hub returned no commit hash for the listing")
@@ -107,6 +124,7 @@ def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str 
     from huggingface_hub import HfApi
     from huggingface_hub.hf_api import RepoFile
 
+    configure_hub_http()
     api = HfApi(token=token)
     sizes: dict[str, int] = {}
     for start in range(0, len(paths), PATHS_INFO_BATCH):
@@ -125,6 +143,7 @@ def hub_download(repo_id: str, filename: str, revision: str | None, token: str |
     """Download one repo file into the Hub cache (no-op if cached) and return its local path."""
     from huggingface_hub import hf_hub_download
 
+    configure_hub_http()
     return Path(hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", revision=revision, token=token))
 
 
@@ -132,6 +151,7 @@ def open_remote(repo_id: str, filename: str, revision: str | None, token: str | 
     """Open one repo file for random-access reading over HTTP (``HfFileSystem``; nothing is cached on disk)."""
     from huggingface_hub import HfFileSystem
 
+    configure_hub_http()
     at = f"@{revision}" if revision else ""
     fs = HfFileSystem(token=token)
     # fsspec's file classes derive from io.IOBase and are not declared BinaryIO in its stubs; they are binary files

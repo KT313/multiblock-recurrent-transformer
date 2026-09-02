@@ -3,7 +3,7 @@
 
     create_backend                    device, precision, torch flags — then `seed_everything`
     prepare_run_directory             out_dir/checkpoints, run_config.json
-    run_directory_lock                one training run per out_dir, held until the run is over (`run_lock.py`)
+    run_lock                          one training run per out_dir, held until the run is over (`data_preparation/lib/build/lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
@@ -64,7 +64,7 @@ from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchan
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport
 from training.optim import build_optimizer, get_param_groups
-from training.run_lock import run_directory_lock
+from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
@@ -116,8 +116,9 @@ def train(
     clock lives in `RunLogger`.
     `keep_history` is a test knob: with it `report.history` holds every log step's metric dict (the golden run and
     the end-to-end tests read it); the CLI leaves it off, so a long run does not accumulate its metrics in memory.
-    The run directory is locked for the whole run (`training.run_lock`): a second run pointed at the same `out_dir`
-    fails with `RunDirectoryLocked` instead of sharing checkpoints, `train.log` and `run_config.json` with this one.
+    The run directory is locked for the whole run (`data_preparation/lib/build/lock.py`, the build lock's twin): a
+    second run pointed at the same `out_dir` fails with `RunLocked` (naming the running one's start time and pid)
+    instead of sharing checkpoints, `train.log` and `run_config.json` with this one.
 
     Numerics: the setup order (module docstring) and the loop body — the step, the evaluation after it at
     evaluation steps, the checkpoint after evaluation and logging so the stored RNG state includes the evaluation
@@ -126,7 +127,7 @@ def train(
     backend = backend or create_backend(settings)
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
-    with run_directory_lock(run_directory):  # one run per out_dir; released on every way out, exception included
+    with run_lock(run_directory / TRAIN_LOCK_NAME, "training"):  # one run per out_dir; released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
         loaders = build_run_dataloaders(settings, dataset, backend)

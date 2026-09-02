@@ -11,12 +11,13 @@ import time
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from rich.live import Live
 
 from ui.capture import LineSink
 from training.ui.board import StageBar, TrainingDashboard
 from training.ui.testing import BOX_CHARACTERS, LOGGER_NAME, STAGES, STEPS, TOTAL, live_board, metrics
-from ui.testing import FakeClock, console_output, screen_text, string_console
+from ui.testing import DyingFile, FakeClock, console_output, screen_text, string_console
 
 
 def _live_of(board: TrainingDashboard) -> Live | None:
@@ -197,6 +198,27 @@ def test_short_terminal_shrinks_the_log_panel_then_the_events_panel(clock: FakeC
     assert "event 2" in short and "event 7" in short, "the events panel is untouched while the log panel can shrink"
     assert "line 19" in shorter and "line 18" in shorter and "line 17" not in shorter, "the log panel at its minimum"
     assert "event 7" in shorter and "event 4" in shorter and "event 3" not in shorter, "then the events panel shrinks"
+
+
+def test_a_dead_terminal_closes_the_display_and_training_continues(tmp_path: Path, clock: FakeClock) -> None:
+    file = DyingFile()
+    console = Console(file=file, force_terminal=True, width=100)
+    log_file = tmp_path / "train.log"
+    with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
+        b.update_step(1, 0, None, metrics(1))
+        file.die()
+        live = _live_of(b)
+        assert live is not None
+        live.refresh()
+        assert b.headless and not _is_enabled(b) and _live_of(b) is None
+        b.update_step(2, 0, None, metrics(2))
+        b.note_event("checkpoint written")
+        b.set_status("evaluating")
+        b.write("a kept line after the loss", keep=True)
+    text = log_file.read_text()
+    assert "terminal gone ([Errno 5] Input/output error): the display is closed, the run continues headless; its log: " in text
+    assert "step 2/30" in text and "event: checkpoint written" in text
+    assert "a kept line" not in file.getvalue() and "overall" not in file.getvalue()[-300:] and file.refused >= 1, "nothing reached the dead terminal"
 
 
 def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen(clock: FakeClock) -> None:

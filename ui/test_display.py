@@ -5,16 +5,19 @@ suspension, and the one-row text."""
 from __future__ import annotations
 
 import io
+import logging
+import os
+import signal
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from rich.console import Console, ConsoleOptions, Group, RenderResult
-from rich.live import Live
 from rich.text import Text
 
 from ui.display import LiveDisplay, ResizeAwareLive, line
-from ui.testing import console_output, screen_text, string_console
+from ui.testing import DyingFile, console_output, screen_text, string_console
 
 
 class MinimalDisplay(LiveDisplay):
@@ -36,7 +39,7 @@ class MinimalDisplay(LiveDisplay):
             yield Group(line("header", style="bold"), self._render_log(self._log_lines), self._footer("hint"))
 
 
-def _live_of(display: LiveDisplay) -> Live | None:
+def _live_of(display: LiveDisplay) -> ResizeAwareLive | None:
     return display._live  # through a call: mypy would otherwise keep the narrowing of an earlier assertion
 
 
@@ -156,3 +159,66 @@ def test_the_display_of_a_dashboard_redraws_after_a_resize(display: MinimalDispl
     live.refresh()
     assert _clears(console) == 1
     assert screen_text(console, 100).count("header") == 1, "one frame on the screen: the old one is wiped"
+
+
+# --- a dead terminal -----------------------------------------------------------------------------------------------------
+
+
+def _dying_display() -> tuple[MinimalDisplay, DyingFile]:
+    file = DyingFile()
+    display = MinimalDisplay(Console(file=file, force_terminal=True, width=80, height=24))
+    display._start_live()
+    return display, file
+
+
+def test_a_write_that_fails_closes_the_display_and_the_run_goes_on(caplog: pytest.LogCaptureFixture) -> None:
+    display, file = _dying_display()
+    live = _live_of(display)
+    assert live is not None
+    file.die()
+    with caplog.at_level(logging.WARNING, logger="ui.display"):
+        live.refresh()  # what the refresh thread does 4-8 times a second
+        assert display.headless and not display.enabled and _live_of(display) is None
+        assert display._console.file is not file and display._plain_stream is not file
+        display.write("later", keep=True)
+        display._print_kept()
+        display._stop_live()
+        display._terminal_lost("again")
+    assert [record.getMessage() for record in caplog.records] == [
+        "terminal gone ([Errno 5] Input/output error): the display is closed, the run continues headless"
+    ], "one warning, the second loss is a no-op"
+    assert file.refused >= 1 and display.lines() == [], "nothing reached the dead terminal after the loss; `write` is plain"
+
+
+def test_a_loss_noticed_while_stopping_is_handled_too() -> None:
+    display, file = _dying_display()
+    file.die()
+    display._stop_live()  # rich's teardown writes: the frame erase, the cursor
+    assert display.headless and _live_of(display) is None
+
+
+def test_a_pending_loss_left_by_a_signal_handler_is_acted_on_at_the_next_refresh(caplog: pytest.LogCaptureFixture) -> None:
+    display, file = _dying_display()
+    live = _live_of(display)
+    assert live is not None
+    live.terminal_lost_pending = "SIGHUP: the terminal closed"
+    with caplog.at_level(logging.WARNING, logger="ui.display"):
+        live.refresh()
+    assert display.headless and "terminal gone (SIGHUP: the terminal closed)" in caplog.text
+
+
+def test_sighup_marks_the_terminal_lost_instead_of_ending_the_process() -> None:
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers are installed on the main thread only")
+    previous = signal.getsignal(signal.SIGHUP)
+    display, file = _dying_display()
+    live = _live_of(display)
+    assert live is not None
+    assert signal.getsignal(signal.SIGHUP) is not previous, "the display's handler is installed"
+    os.kill(os.getpid(), signal.SIGHUP)
+    assert live.terminal_lost_pending == "SIGHUP: the terminal closed"
+    assert display._console.file is not file, "the handler already silenced the terminal"
+    live.refresh()
+    assert display.headless
+    display._stop_live()
+    assert signal.getsignal(signal.SIGHUP) is previous, "the previous handler is back once the display stopped"

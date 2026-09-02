@@ -26,7 +26,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
-from data_preparation.lib.build.lock import BuildLocked, build_lock
+from data_preparation.lib.build.lock import RunLocked, build_lock
 from data_preparation.lib.build.planner import DownloadPlan, plan_downloads
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
@@ -644,7 +644,7 @@ def test_pending_sources_that_need_no_download_are_built_right_away(
 
 
 def test_prepare_fails_fast_while_another_build_holds_the_lock(layout: DatasetLayout, tmp_path: Path) -> None:
-    with build_lock(layout.root), pytest.raises(BuildLocked, match=f"pid {os.getpid()}") as excinfo:
+    with build_lock(layout.root), pytest.raises(RunLocked, match=f"pid {os.getpid()}") as excinfo:
         prepare(TINY, layout.root, assume_yes=False)
     assert "remove" not in str(excinfo.value)  # the OS releases the lock when the holder dies
     assert not (layout.root / "sources").exists()

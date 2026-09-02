@@ -125,10 +125,12 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
 - `prepare` materialises the config (missing parts only; a second run is a no-op). `--sources` / `--steps` restrict
   it, `--dry_run` prints what the repair step and the first round would do and writes nothing (not even the lock).
   Exit codes: 0 ok, 1 a failed source (logged with its traceback; the other jobs stop at their next shard — a
-  failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 130
-  Ctrl-C (every running step stops at its next shard, everything published is kept; rerun to resume). One build at a
-  time per dataset directory (`dataset/.build.lock`; a second `prepare` or a `train.py` auto-prepare on the same
-  directory fails fast naming the holder's pid and host).
+  failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 3
+  another data preparation still running, 130 Ctrl-C (every running step stops at its next shard, everything
+  published is kept; rerun to resume). One run at a time (`dataset/.build.lock`, `lib/build/lock.py`; training holds
+  `<out_dir>/.train.lock` the same way): a second `prepare` or a `train.py` auto-prepare on the same directory exits 3
+  right away, naming the running one's start time and pid and how to stop it (`kill -INT <pid>`); the lock is the
+  OS's, released when the holder ends, so it never goes stale.
 - `status` is read-only: what the repair step *would* do plus the status table (rows needed / raw / processed /
   epochs / state / reason per source and the tokenizer); exit 0 iff the dataset is complete. A source the repair
   step would touch counts as incomplete.
@@ -358,7 +360,9 @@ stray prints land in the log panel, the libraries' own bars are silenced. Warnin
 status) are *kept* and printed once, unwrapped, after the display closed — the scrollback of a run is those lines
 and the final table, no frame. Ctrl-C and SIGTERM (`tools/capped_download.sh`) leave the same way. When stderr is
 not a terminal (`nohup`, redirects) or `DATA_PREP_PROGRESS=0` is set, there is no dashboard and plain timestamped
-log lines are written instead.
+log lines are written instead. A terminal that dies mid-run (closed window, dropped SSH session) does not end the
+run: the display closes itself and the run continues headless — `tail -f dataset/build.log` shows it; start long
+runs under tmux to come back to a live display.
 
 ## Training auto-prepares
 

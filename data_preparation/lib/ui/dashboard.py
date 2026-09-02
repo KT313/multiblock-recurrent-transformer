@@ -39,7 +39,8 @@ one summary task, e.g. the jobs of a pool) and returns the no-op ``NoProgress`` 
 clears the display around a terminal prompt.
 
 Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal — the same rule as ``lib.progress``): no live display,
-no capture, tasks are no-ops and the log handler writes plain lines to stderr.
+no capture, tasks are no-ops and the log handler writes plain lines to stderr. A terminal that dies mid-run closes
+the display and the run continues headless with ``build.log`` as its output (:mod:`ui.display`).
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
+from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import NoProgress, Progress, progress_enabled
 from ui.capture import DashboardLogHandler, LoggingCapture, StreamCapture, attach_logger
 from ui.display import LiveDisplay
@@ -338,7 +340,9 @@ class DataDashboard(LiveDisplay):
             stream=stream if stream is not None else sys.stderr, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
         )
         self.enabled = progress_enabled(stream) if enabled is None else enabled
+        self.logger = get_logger(__name__)
         self.title = title or "data preparation"
+        self._opened = False  # the display was set up by `__enter__` (torn down by `__exit__` even once headless)
         self._max_rows = max_rows
         self._panels: dict[str, _PanelState] = {name: _PanelState(name, max_rows) for name in panels}
         self._status: dict[str, str] = {}
@@ -356,6 +360,7 @@ class DataDashboard(LiveDisplay):
             raise RuntimeError("a DataDashboard is already active")
         DataDashboard._active = self
         if self.enabled:
+            self._opened = True
             self._started_at = self._clock()
             self._silence_third_party_bars()
             self._capture_logging()
@@ -367,7 +372,7 @@ class DataDashboard(LiveDisplay):
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
     ) -> None:
         DataDashboard._active = None
-        if not self.enabled:
+        if not self._opened:
             return
         try:
             self._stop_live()

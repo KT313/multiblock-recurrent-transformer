@@ -5,6 +5,7 @@ shows what those control codes leave on a real terminal."""
 
 from __future__ import annotations
 
+import errno
 import io
 import re
 
@@ -24,6 +25,24 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class DyingFile(io.StringIO):
+    """A terminal that goes away: after :meth:`die` every write raises ``EIO``, as a closed pty does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dead = False
+        self.refused = 0  # writes attempted after the death
+
+    def die(self) -> None:
+        self.dead = True
+
+    def write(self, text: str) -> int:
+        if self.dead:
+            self.refused += 1
+            raise OSError(errno.EIO, "Input/output error")
+        return super().write(text)
 
 
 def string_console(width: int = 120, height: int | None = None) -> Console:

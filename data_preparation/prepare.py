@@ -17,8 +17,9 @@ complete. ``describe`` renders the config as Markdown (``docs/data_mixture.md`` 
 relocates the HuggingFace caches.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
-repair, 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
-kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
+repair, 3 another data preparation is still running (one run at a time: ``lib/build/lock.py``; the message names its
+pid and start time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything
+published is kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
 the tables) and the final status table are printed once it closed.
 """
 
@@ -39,6 +40,7 @@ from data_preparation.dataset_config import load_dataset_config  # noqa: E402
 from data_preparation.layout import DatasetLayout  # noqa: E402
 from data_preparation.lib.abort import BuildAborted  # noqa: E402
 from data_preparation.lib.build.describe import describe, leading_comment  # noqa: E402
+from data_preparation.lib.build.lock import RunLocked  # noqa: E402
 from data_preparation.lib.build.repair import ConfirmationRequired  # noqa: E402
 from data_preparation.lib.build.runner import (  # noqa: E402
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
@@ -58,6 +60,7 @@ TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
 DEFAULT_DATASET_DIR = Path("dataset")
 
 EXIT_CONFIRMATION_REQUIRED = 2
+EXIT_ALREADY_RUNNING = 3
 EXIT_INTERRUPTED = 130
 
 
@@ -171,6 +174,9 @@ def main(argv: list[str] | None = None) -> None:
     except ConfirmationRequired as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(EXIT_CONFIRMATION_REQUIRED) from None
+    except RunLocked as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(EXIT_ALREADY_RUNNING) from None
     except Exception:
         log.exception("%s failed", args.command)
         raise SystemExit(1) from None

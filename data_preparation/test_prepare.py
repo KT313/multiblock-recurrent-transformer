@@ -7,12 +7,14 @@ from __future__ import annotations
 import logging
 import shutil
 from collections.abc import Iterator
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from data_preparation import prepare
+from data_preparation.lib.build.lock import build_lock
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
@@ -192,3 +194,13 @@ def test_tiny_end_to_end(tmp_path: Path, tiny_dataset_config: DatasetConfig) -> 
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # rebuilds from raw
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
+
+
+def test_prepare_exits_3_while_another_run_holds_the_build_lock(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = tmp_path / "dataset"
+    with build_lock(root), pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
+    assert exc.value.code == prepare.EXIT_ALREADY_RUNNING
+    err = capsys.readouterr().err
+    assert "data preparation expects one run at a time on this system; one is already running (started " in err
+    assert f"kill -INT {os.getpid()}" in err

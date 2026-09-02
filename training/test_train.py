@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from data_preparation.lib.abort import BuildAborted
+from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, Holder, RunLocked
 from data_preparation.lib.log import ProgressStreamHandler
 from training import train as train_module
 from training.backend.base import Backend
@@ -116,6 +117,17 @@ def test_main_parses_argv_trains_and_prints_the_report(
     assert before <= call["started_at"] <= time.time()
     assert capsys.readouterr().out.strip() == report.summary()
     assert any(isinstance(h, ProgressStreamHandler) for h in detached_training_handlers.handlers)
+
+
+def test_main_returns_3_while_another_training_run_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    holder = Holder("training", 4242, "host", "2026-09-03T00:00:00+00:00")
+    locked = RunLocked(tmp_path / "out" / TRAIN_LOCK_NAME, "training", holder)  # what `train()` raises off its lock
+    monkeypatch.setattr(train_module, "train", FakeTrain(error=locked))
+    assert main(["--config", str(yaml_path)]) == 3
+    err = capsys.readouterr().err
+    assert "training expects one run at a time on this system; one is already running (started " in err and "kill -INT 4242" in err
 
 
 def test_main_returns_130_for_a_stopped_run(monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

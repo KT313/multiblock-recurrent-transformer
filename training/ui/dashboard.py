@@ -44,7 +44,8 @@ and handlers are restored, the kept lines are printed and then one static final 
 validation, events; ``final_frame=False`` turns it off): the scrollback of a run is exactly the kept lines followed
 by that summary, never a frozen or duplicated frame. A SIGTERM must be turned into ``KeyboardInterrupt`` by the CLI
 (as ``prepare.py`` does) to leave through the same path. ``TrainingDashboard.suspended`` clears the display around
-a terminal prompt.
+a terminal prompt. A terminal that dies mid-run (closed window, dropped SSH session, SIGHUP) closes the display
+and the run continues headless with ``train.log`` as its output (:mod:`ui.display`).
 
 Usage (``RunLogger`` / ``train()`` open it once through ``training.logger.open_dashboard``)::
 

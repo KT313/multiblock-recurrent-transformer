@@ -20,9 +20,11 @@ from data_preparation.conftest import REPO, REV, FakeHub, RecordingFile
 from data_preparation.dataset_config import SourceConfig
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import (
+    HUB_REQUEST_TIMEOUT,
     FetchStats,
     FileIndex,
     HubFetcher,
+    configure_hub_http,
     file_format,
     index_path,
     iter_file,
@@ -390,6 +392,16 @@ def test_fetcher_seams_and_stats(hub: FakeHub) -> None:
     cached = HubFetcher(download=lambda repo, file, rev, tok: hub.files[file])
     assert _ids(read_rows(index, 0, 1, fetcher=cached)) == ["a0"]
     assert cached.stats == FetchStats(files_downloaded=1) and hub.downloads == [], "a file already in the cache: no bytes fetched"
+
+
+def test_every_hub_request_is_bounded_by_the_request_timeout() -> None:
+    import httpx
+    from huggingface_hub import get_session
+
+    configure_hub_http()
+    assert get_session().timeout == httpx.Timeout(HUB_REQUEST_TIMEOUT)
+    configure_hub_http()  # idempotent (cached): no second configuration
+    assert configure_hub_http.cache_info().hits >= 1
 
 
 def test_a_file_downloaded_whole_into_the_cache_counts_its_size(hub: FakeHub) -> None:
