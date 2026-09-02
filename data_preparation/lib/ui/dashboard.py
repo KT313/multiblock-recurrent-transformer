@@ -2,15 +2,15 @@
 """Terminal dashboard for the preparation stages: one live layout — header, a **downloads** panel, a **builds**
 panel, the **log** panel, a footer — and nothing else on the terminal while it is up.
 
-Built on ``rich`` (the only module that imports it). A :class:`Dashboard` owns exactly one ``rich.live.Live``
-display on stderr. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
+A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` (the live display, the log panel, the kept lines,
+``suspended``) with exactly one ``rich.live.Live`` display on stderr. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
 task (bounded: at most ``max_rows`` rows plus "… and k more"), finished rows disappear and are counted in the
 panel's summary line (jobs done, rows done / wanted, MB read, elapsed), which is updated in place. All updates from
 worker threads go through one lock; the display refreshes on its own timer.
 
 While the display is up nothing may print around it (a stray line between two frames shifts the frame and leaves
-its top behind in the scrollback), so ``__enter__`` also (through the sibling :mod:`data_preparation.lib.ui.capture`,
-which the training dashboard uses too)
+its top behind in the scrollback), so ``__enter__`` also (through :mod:`ui.capture`, which the
+training dashboard uses too)
 
 * routes *every* ``logging`` record into the log panel: a handler on the root logger, while the plain
   ``StreamHandler``\\s that libraries such as ``huggingface_hub`` / ``datasets`` put on their own loggers are
@@ -26,7 +26,7 @@ transient). Ctrl-C / an exception leave through the same path.
 
 Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create tasks)::
 
-    with Dashboard(title="prepare tiny") as dashboard, dashboard.attach(logging.getLogger("data_preparation")):
+    with DataDashboard(title="prepare tiny") as dashboard, dashboard.attach(logging.getLogger("data_preparation")):
         with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads") as bar:
             bar.update(1); bar.set_postfix({"file": "x.parquet", "MB": 6})
 
@@ -44,9 +44,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
 import time
-from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
@@ -55,14 +53,14 @@ from types import TracebackType
 from typing import Any, TextIO, TypeVar
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
-from rich.live import Live
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
 from data_preparation.lib.progress import NoProgress, Progress, progress_enabled
-from data_preparation.lib.ui.capture import DashboardLogHandler, LoggingCapture, StreamCapture, attach_logger
+from ui.capture import DashboardLogHandler, LoggingCapture, StreamCapture, attach_logger
+from ui.display import LiveDisplay
 
 T = TypeVar("T")
 
@@ -71,7 +69,7 @@ DEFAULT_MAX_ROWS = 8  # running tasks shown per panel; the rest is "… and k mo
 DEFAULT_REFRESH_PER_SECOND = 8
 DEFAULT_PANELS: tuple[str, ...] = ("downloads", "builds")  # always shown, in this order; other panel names appear on demand
 DEFAULT_PANEL = "tasks"  # tasks created without a panel name
-BUILD_LOG_NAME = "build.log"  # full log of every build, appended under the dataset root (`Dashboard.attach(log_file=)`)
+BUILD_LOG_NAME = "build.log"  # full log of every build, appended under the dataset root (`DataDashboard.attach(log_file=)`)
 STDOUT_LOGGER = "data_preparation.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = "data_preparation.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
 FOOTER_HINT = "Ctrl-C stops at the next shard; everything published so far is kept"
@@ -106,7 +104,7 @@ class Task:
 
     def __init__(
         self,
-        dashboard: Dashboard,
+        dashboard: DataDashboard,
         panel: _PanelState,
         description: str,
         *,
@@ -262,7 +260,7 @@ class _PanelState:
         return Text(" · ".join(parts), style="bold" if running else "dim")
 
 
-class Dashboard:
+class DataDashboard(LiveDisplay):
     """Live terminal display: header, one panel per task group (``downloads``, ``builds``, …), the log panel (last
     ``log_lines`` lines), footer.
 
@@ -271,7 +269,7 @@ class Dashboard:
     :func:`progress` and :func:`active_dashboard` find it, entering a second one raises.
     """
 
-    _active: Dashboard | None = None
+    _active: DataDashboard | None = None
 
     def __init__(
         self,
@@ -285,22 +283,15 @@ class Dashboard:
         console: Console | None = None,
         stream: TextIO | None = None,
     ) -> None:
+        super().__init__(
+            stream=stream if stream is not None else sys.stderr, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
+        )
         self.enabled = progress_enabled(stream) if enabled is None else enabled
         self.title = title or "data preparation"
-        self._stream = stream if stream is not None else sys.stderr
-        self._console = console if console is not None else Console(file=self._stream)
-        self._refresh_per_second = refresh_per_second
         self._max_rows = max_rows
-        self._log_lines = log_lines
-        self._lock = threading.RLock()  # every task / panel / line mutation and every render
         self._panels: dict[str, _PanelState] = {name: _PanelState(name, max_rows) for name in panels}
-        self._lines: deque[str] = deque(maxlen=log_lines)
-        self._kept: list[str] = []
         self._status: dict[str, str] = {}
-        self._log_file: Path | None = None
         self._started_at = time.monotonic()
-        self._live: Live | None = None
-        self._attached: list[str] = []
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
         self._logging_capture = LoggingCapture(self, skip=self.is_attached)
@@ -308,10 +299,10 @@ class Dashboard:
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
-    def __enter__(self) -> Dashboard:
-        if Dashboard._active is not None:
-            raise RuntimeError("a Dashboard is already active")
-        Dashboard._active = self
+    def __enter__(self) -> DataDashboard:
+        if DataDashboard._active is not None:
+            raise RuntimeError("a DataDashboard is already active")
+        DataDashboard._active = self
         if self.enabled:
             self._started_at = time.monotonic()
             self._silence_third_party_bars()
@@ -323,55 +314,20 @@ class Dashboard:
     def __exit__(
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        Dashboard._active = None
+        DataDashboard._active = None
         if not self.enabled:
             return
         try:
             self._stop_live()
         finally:
-            self._restore_streams()
+            self._release_streams()
             self._release_logging()
             self._restore_third_party_bars()
         self._print_kept()
 
-    def _start_live(self) -> None:
-        self._live = Live(
-            self, console=self._console, refresh_per_second=self._refresh_per_second, transient=True,
-            redirect_stdout=False, redirect_stderr=False,
-        )
-        self._live.start()
-
-    def _stop_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()  # transient: the frame is erased, the cursor is back where the display began
-            self._live = None
-
-    @contextmanager
-    def suspended(self) -> Iterator[None]:
-        """Clear the display and give the terminal back (a confirmation prompt); it comes back afterwards."""
-        if self._live is None:
-            yield
-            return
-        self._stop_live()
-        self._restore_streams()
-        try:
-            yield
-        finally:
-            self._redirect_streams()
-            self._start_live()
-
-    def _print_kept(self) -> None:
-        """The kept records, unwrapped, once, after the display closed — on the console's own file, plainly."""
-        with self._lock:
-            kept, self._kept = self._kept, []
-        file = self._console.file
-        for text in kept:
-            file.write(text + "\n")
-        file.flush()
-
     @property
     def is_active(self) -> bool:
-        return Dashboard._active is self
+        return DataDashboard._active is self
 
     # --- what else could reach the terminal ----------------------------------------------------------------------------
 
@@ -409,7 +365,7 @@ class Dashboard:
     def _capture_logging(self) -> None:
         """Every ``logging`` record into the panel: the dashboard's handler on the root logger, and every plain
         console ``StreamHandler`` of every logger (``huggingface_hub`` and ``datasets`` install one on theirs at
-        import) detached until :meth:`_release_logging` (:class:`~data_preparation.lib.ui.capture.LoggingCapture`)."""
+        import) detached until :meth:`_release_logging` (:class:`~ui.capture.LoggingCapture`)."""
         self._logging_capture.start()
 
     def _release_logging(self) -> None:
@@ -419,7 +375,7 @@ class Dashboard:
         """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""
         self._stream_capture.redirect()
 
-    def _restore_streams(self) -> None:
+    def _release_streams(self) -> None:
         self._stream_capture.release()
 
     # --- tasks, status and log lines ------------------------------------------------------------------------------------
@@ -448,26 +404,9 @@ class Dashboard:
         with self._lock:
             self._status.update({key: str(value) for key, value in fields.items()})
 
-    def write(self, text: str, *, keep: bool = False) -> None:
-        """Append ``text`` (one entry per line, so tracebacks stay readable) to the log panel; plain stderr when
-        disabled. With ``keep`` the text is also printed, unwrapped, once the display closed."""
-        if not self.enabled:
-            self._stream.write(text + "\n")
-            self._stream.flush()
-            return
-        with self._lock:
-            self._lines.extend(text.splitlines() or [""])
-            if keep:
-                self._kept.append(text)
-
     def log_handler(self, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> DashboardLogHandler:
         """A logging handler for this dashboard (see :class:`DashboardLogHandler`); :meth:`attach` installs it."""
         return DashboardLogHandler(self, level, keep_level)
-
-    def is_attached(self, logger_name: str) -> bool:
-        """Whether records of ``logger_name`` reach the panel through a handler :meth:`attach` installed."""
-        with self._lock:
-            return any(logger_name == name or logger_name.startswith(name + ".") for name in self._attached)
 
     @contextmanager
     def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> Iterator[None]:
@@ -493,18 +432,17 @@ class Dashboard:
             panels = list(self._panels.values())
             fixed_height = 2 + sum(state.height() for state in panels)  # header + footer + panels
             log_height = max(3, min(self._log_lines, options.size.height - fixed_height - 2))
-            lines = list(self._lines)[-log_height:]
-            body = Text("\n".join(lines) or "(no log output yet)", no_wrap=True, overflow="ellipsis")
             status = "".join(f" · {key} {value}" for key, value in self._status.items())
             header = Text.assemble((self.title, "bold"), status, (f" · {_format_elapsed(now - self._started_at)}", "dim"), no_wrap=True, overflow="ellipsis")
-            footer = Text(" · ".join(([f"log: {self._log_file}"] if self._log_file is not None else []) + [FOOTER_HINT]), style="dim", no_wrap=True, overflow="ellipsis")
             rendered = [state.render(now) for state in panels]
-        yield Group(header, *rendered, Panel(body, title="log", title_align="left", border_style="dim", padding=(0, 1)), footer)
+            log_panel = self._render_log(log_height)
+            footer = self._footer(FOOTER_HINT)
+        yield Group(header, *rendered, log_panel, footer)
 
 
-def active_dashboard() -> Dashboard | None:
-    """The dashboard of the enclosing ``with Dashboard()`` block, if any."""
-    return Dashboard._active
+def active_dashboard() -> DataDashboard | None:
+    """The dashboard of the enclosing ``with DataDashboard()`` block, if any."""
+    return DataDashboard._active
 
 
 def progress(*, total: int | None = None, desc: str = "", unit: str = "row", panel: str | None = None, summary: bool = False) -> Progress:

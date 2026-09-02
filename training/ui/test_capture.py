@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.ui.capture import DashboardLogHandler, LineSink, attach_logger
+from ui.capture import DashboardLogHandler, LineSink, attach_logger
 from training.ui.capture import (
     QUIET_ENV,
     STDERR_LOGGER,

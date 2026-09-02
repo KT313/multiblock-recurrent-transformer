@@ -13,21 +13,10 @@ from pathlib import Path
 import pytest
 from rich.live import Live
 
-from data_preparation.lib.ui.capture import LineSink
+from ui.capture import LineSink
 from training.ui.board import StageBar, TrainingDashboard
-from training.ui.testing import (
-    BOX_CHARACTERS,
-    LOGGER_NAME,
-    STAGES,
-    STEPS,
-    TOTAL,
-    FakeClock,
-    console_output,
-    live_board,
-    metrics,
-    screen_text,
-    string_console,
-)
+from training.ui.testing import BOX_CHARACTERS, LOGGER_NAME, STAGES, STEPS, TOTAL, FakeClock, live_board, metrics
+from ui.testing import console_output, screen_text, string_console
 
 
 def _live_of(board: TrainingDashboard) -> Live | None:

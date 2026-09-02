@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 
-from rich.text import Text
 
 from training.ui.throughput import Throughput
 
@@ -136,8 +135,3 @@ def event_line(text: str) -> str:
 def status_line(text: str) -> str:
     """The (DEBUG) log line of a status change: ``status: evaluating``."""
     return f"status: {text}"
-
-
-def line(text: str, style: str = "") -> Text:
-    """One terminal row: never wraps, cropped with an ellipsis; markup in ``text`` is not interpreted."""
-    return Text(text, style=style, no_wrap=True, overflow="ellipsis")

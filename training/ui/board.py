@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import sys
-import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -19,13 +18,12 @@ from typing import TextIO
 
 from rich import box
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
-from rich.live import Live
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-from data_preparation.lib.ui.capture import attach_logger
+from ui.capture import attach_logger
 from training.ui.capture import TerminalCapture, line_handler, run_log_handlers
 from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
@@ -36,12 +34,12 @@ from training.ui.format import (
     format_duration,
     format_metric,
     known_metrics,
-    line,
     status_line,
     step_line,
     validation_line,
 )
 from training.ui.throughput import Throughput
+from ui.display import LiveDisplay, line
 
 DEFAULT_LOG_LINES = 12
 DEFAULT_EVENT_LINES = 6
@@ -65,7 +63,7 @@ class StageBar:
         return 100.0 if self.total <= 0 else 100.0 * min(self.completed, self.total) / self.total
 
 
-class TrainingDashboard:
+class TrainingDashboard(LiveDisplay):
     """Live terminal display of one training run (layout and capture: see :mod:`training.ui.dashboard`).
 
     ``console`` is for tests (a ``rich.console.Console`` over a ``StringIO``); ``clock`` is injected by the ETA
@@ -108,19 +106,15 @@ class TrainingDashboard:
         self.total_steps = total_steps
         self.details = dict(details or {})
         self.log_step_interval = max(int(log_step_interval), 1)
-        self.enabled = True
-        self._stream = stream if stream is not None else sys.stdout
+        super().__init__(
+            stream=stream if stream is not None else sys.stdout, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
+        )
         # where the plain lines go once the display is gone (`write`, and the dashboard lines from then on): the
         # run's fallback stream when it has one, else the display's own stream
-        self._fallback_stream = fallback_stream if fallback_stream is not None else self._stream
-        self._console = console if console is not None else Console(file=self._stream)
-        self._refresh_per_second = refresh_per_second
+        if fallback_stream is not None:
+            self._plain_stream = fallback_stream
         self._final_frame = final_frame
         self._throughput = Throughput(total_steps, start_step=start_step, clock=clock)  # the bars' ETA and the lines
-        self._lock = threading.RLock()  # every mutation (loop thread) and every render (Live thread)
-        self._log_lines = log_lines
-        self._lines: deque[str] = deque(maxlen=log_lines)
-        self._kept: list[str] = []
         self._events: deque[str] = deque(maxlen=event_lines)
         self._status = "starting"
         self._step = start_step
@@ -128,14 +122,11 @@ class TrainingDashboard:
         self._transition: float | None = None  # progress of the running stage transition (the bar note), else None
         self._latest: dict[str, float] = {}
         self._validation: tuple[int, dict[str, float]] | None = None
-        self._log_file: Path | None = None
-        self._attached_logger: str | None = None  # the logger `attach` routes into the panel, while attached
         self._console_lines: logging.Handler | None = None  # the dashboard lines' way to the console once disabled
         self._render_error: BaseException | None = None  # set on the Live thread, handled on the caller's thread
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
-        self._live: Live | None = None
         self._open = False
         self._capture = TerminalCapture(self, skip=self.is_attached)
         self._refresh_bars(start_step, 0)
@@ -184,22 +175,6 @@ class TrainingDashboard:
         if self._final_frame:
             self._console.print(self.render_summary())
 
-    def _start_live(self) -> None:
-        self._live = Live(
-            self,
-            console=self._console,
-            refresh_per_second=self._refresh_per_second,
-            transient=True,
-            redirect_stdout=False,
-            redirect_stderr=False,
-        )
-        self._live.start(refresh=True)  # the first frame right away, not after the first refresh interval
-
-    def _stop_live(self) -> None:
-        live, self._live = self._live, None
-        if live is not None:
-            live.stop()  # transient: the frame is erased, the cursor is back where the display began
-
     def _teardown(self) -> None:
         """Undo ``__enter__``; never called with the lock held — ``Live.stop`` joins its refresh thread, which may
         be waiting for the lock."""
@@ -213,28 +188,11 @@ class TrainingDashboard:
         if self._console.file is sys.stdout or self._console.file is sys.stderr:
             self._console.file = self._console.file
 
-    @contextmanager
-    def suspended(self) -> Iterator[None]:
-        """Clear the display and give the terminal (streams included) back for a prompt; it comes back afterwards."""
-        if self._live is None:
-            yield
-            return
-        self._stop_live()
+    def _release_streams(self) -> None:
         self._capture.release_streams()
-        try:
-            yield
-        finally:
-            self._capture.redirect_streams()
-            self._start_live()
 
-    def _print_kept(self) -> None:
-        """The kept records, unwrapped, once, after the display closed — on the console's own file, plainly."""
-        with self._lock:
-            kept, self._kept = self._kept, []
-        file = self._console.file
-        for text in kept:
-            file.write(text + "\n")
-        file.flush()
+    def _redirect_streams(self) -> None:
+        self._capture.redirect_streams()
 
     def _disable(self, error: BaseException) -> None:
         """Close the display after an internal error; from now on this behaves like the console fallback (the
@@ -246,7 +204,7 @@ class TrainingDashboard:
             self._teardown()
         with suppress(Exception):
             self._print_kept()
-        self._console_lines = line_handler(self._fallback_stream)
+        self._console_lines = line_handler(self._plain_stream)
         lines_log.addHandler(self._console_lines)
         log.warning(
             "training dashboard disabled after an internal error (training continues with the console fallback): %r",
@@ -356,25 +314,6 @@ class TrainingDashboard:
 
     # --- log lines ----------------------------------------------------------------------------------------------------
 
-    def write(self, text: str, *, keep: bool = False) -> None:
-        """Append ``text`` (one entry per line, so tracebacks stay readable) to the log panel; plain stream when
-        disabled. With ``keep`` the text is also printed, unwrapped, once the display closed."""
-        if not self.enabled:
-            self._fallback_stream.write(text + "\n")
-            self._fallback_stream.flush()
-            return
-        with self._lock:
-            self._lines.extend(text.splitlines() or [""])
-            if keep:
-                self._kept.append(text)
-
-    def is_attached(self, logger_name: str) -> bool:
-        """Whether records of ``logger_name`` reach the panel through the handler :meth:`attach` installed (the
-        root-logger handler of the capture skips those, or the panel would show them twice)."""
-        with self._lock:
-            attached = self._attached_logger
-        return attached is not None and (logger_name == attached or logger_name.startswith(attached + "."))
-
     @contextmanager
     def attach(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[None]:
         """Route ``logger`` (default: the ``training`` logger) into the panel and ``log_file`` (named in the footer),
@@ -384,7 +323,7 @@ class TrainingDashboard:
         without the CLI's logging setup keeps its lines)."""
         target = logger if logger is not None else logging.getLogger(TRAINING_LOGGER_NAME)
         with self._lock:
-            self._attached_logger = target.name
+            self._attached.append(target.name)
             if log_file is not None:
                 self._log_file = log_file
         try:
@@ -392,20 +331,10 @@ class TrainingDashboard:
                 yield
         finally:
             with self._lock:
-                self._attached_logger = None
+                self._attached.remove(target.name)
             self._drop_console_lines()
 
     # --- state for tests ------------------------------------------------------------------------------------------------
-
-    def lines(self) -> list[str]:
-        """The log lines currently shown (newest last)."""
-        with self._lock:
-            return list(self._lines)
-
-    def kept(self) -> list[str]:
-        """The kept records not yet printed (they are printed when the display closes)."""
-        with self._lock:
-            return list(self._kept)
 
     def events(self) -> list[str]:
         """The event lines currently shown (newest last)."""
@@ -434,7 +363,7 @@ class TrainingDashboard:
                 events_shown, log_shown = fit_panel_heights(options.max_height - fixed_height - 1, events_wanted, self._log_lines)
                 events = self._render_events(events_shown)
                 log_panel = self._render_log(log_shown)
-                footer = line(f"log: {self._log_file}" if self._log_file is not None else "", style="dim")
+                footer = self._footer()
             yield Group(fixed, events, log_panel, footer)
         except Exception as error:  # runs on the Live thread: report, let the next public call disable the display
             self._render_error = error
@@ -521,15 +450,3 @@ class TrainingDashboard:
         events = list(self._events)[-height:]
         body = line("\n".join(events) or "(no events yet)")
         return Panel(body, title="events", title_align="left", border_style="dim", padding=(0, 1))
-
-    def _render_log(self, height: int) -> RenderableType:
-        lines = list(self._lines)[-height:]
-        body = line("\n".join(lines) or "(no log output yet)")
-        return Panel(body, title="log", title_align="left", border_style="dim", padding=(0, 1))
-
-    def render_text(self, width: int = 120, height: int = 50) -> str:
-        """The current display as plain text (tests, or a snapshot for a log file)."""
-        console = Console(width=width, height=height, force_terminal=False, color_system=None)
-        with console.capture() as capture:
-            console.print(self)
-        return capture.get()

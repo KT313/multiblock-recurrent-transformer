@@ -31,7 +31,8 @@ from training.logger import TrainingReport
 from training.settings import Settings
 from training.train import StopRequest, main, stop_on_interrupt
 from training.ui.common import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
-from training.ui.testing import BOX_CHARACTERS, screen_of, strip_ansi
+from training.ui.testing import BOX_CHARACTERS
+from ui.testing import screen_of, strip_ansi
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

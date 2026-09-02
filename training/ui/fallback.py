@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
-from data_preparation.lib.ui.capture import attach_logger
+from ui.capture import attach_logger
 from training.ui.capture import run_log_handlers
 from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log
 from training.ui.format import event_line, status_line, step_line, validation_line

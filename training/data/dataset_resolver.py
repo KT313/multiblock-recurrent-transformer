@@ -39,7 +39,7 @@ from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dat
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
-from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard
+from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 from training.settings import Settings
 
 if TYPE_CHECKING:  # annotation only: this module stays torch-free, `training.checkpoint` imports torch
@@ -435,7 +435,7 @@ def _ensure_prepared(
 
     log.info("dataset %s is incomplete, preparing missing data (%s)", dataset_config.name, missing)
     if backend is None or backend.is_main:
-        with Dashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
+        with DataDashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
             try:
                 prepare(
                     settings.dataset_config,

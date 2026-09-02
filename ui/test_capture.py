@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.ui.capture import (
+from ui.capture import (
     DashboardLogHandler,
     LineSink,
     LoggingCapture,

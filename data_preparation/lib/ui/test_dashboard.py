@@ -25,9 +25,10 @@ from rich.live import Live
 
 from data_preparation.lib.log import ProgressStreamHandler, configure_logging
 from data_preparation.lib.progress import NoProgress
-from data_preparation.lib.ui.capture import LineSink
+from ui.capture import LineSink
+from ui.testing import Screen, console_output, screen_text
 from data_preparation.lib.ui.dashboard import (
-    Dashboard,
+    DataDashboard,
     Task,
     active_dashboard,
     progress,
@@ -38,19 +39,7 @@ from data_preparation.lib.ui.dashboard import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def lines_of(board: Dashboard) -> list[str]:
-    """The log lines the dashboard currently shows (newest last)."""
-    with board._lock:
-        return list(board._lines)
-
-
-def kept_of(board: Dashboard) -> list[str]:
-    """The kept records not printed yet (they are printed when the display closes)."""
-    with board._lock:
-        return list(board._kept)
-
-
-def tasks_of(board: Dashboard) -> list[Task]:
+def tasks_of(board: DataDashboard) -> list[Task]:
     """The open tasks of every panel (summary tasks included)."""
     with board._lock:
         tasks: list[Task] = []
@@ -61,107 +50,22 @@ def tasks_of(board: Dashboard) -> list[Task]:
         return tasks
 
 
-def panel_names_of(board: Dashboard) -> list[str]:
+def panel_names_of(board: DataDashboard) -> list[str]:
     with board._lock:
         return list(board._panels)
 
 
-def render_text(board: Dashboard, width: int = 120, height: int = 50) -> str:
+def render_text(board: DataDashboard, width: int = 120, height: int = 50) -> str:
     """The dashboard's current display as plain text."""
-    console = Console(width=width, height=height, force_terminal=False, color_system=None)
-    with console.capture() as capture:
-        console.print(board)
-    return capture.get()
+    return board.render_text(width, height)
 
 
 @pytest.fixture
-def dashboard() -> Iterator[Dashboard]:
+def dashboard() -> Iterator[DataDashboard]:
     """An enabled dashboard rendering into a StringIO console (no real terminal needed)."""
     console = Console(file=io.StringIO(), force_terminal=True, width=120)
-    with Dashboard(enabled=True, console=console, log_lines=3, max_rows=4, refresh_per_second=50) as board:
+    with DataDashboard(enabled=True, console=console, log_lines=3, max_rows=4, refresh_per_second=50) as board:
         yield board
-
-
-def _console_output(console: Console) -> str:
-    file = console.file
-    assert isinstance(file, io.StringIO)
-    return file.getvalue()
-
-
-class _Screen:
-    """A minimal terminal emulator (CR, LF, cursor up/down, erase line, SGR ignored) with unbounded scrollback:
-    what the dashboard's control codes leave on the screen, as a real terminal would show it."""
-
-    _CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
-
-    def __init__(self, width: int) -> None:
-        self.width = width
-        self.lines: list[list[str]] = [[]]
-        self.row = 0
-        self.col = 0
-
-    def _line(self, row: int) -> list[str]:
-        while len(self.lines) <= row:
-            self.lines.append([])
-        return self.lines[row]
-
-    def feed(self, data: str) -> None:
-        i = 0
-        while i < len(data):
-            ch = data[i]
-            if ch == "\x1b":
-                match = self._CSI.match(data, i)
-                if match is None:
-                    i += 1
-                    continue
-                params, command = match.group(1), match.group(2)
-                n = int(params) if params.isdigit() else 1
-                if command == "A":
-                    self.row = max(0, self.row - n)
-                elif command == "B":
-                    self.row += n
-                elif command == "C":
-                    self.col += n
-                elif command == "D":
-                    self.col = max(0, self.col - n)
-                elif command == "K":
-                    line = self._line(self.row)
-                    if params in ("", "0"):
-                        del line[self.col :]
-                    else:
-                        line.clear()
-                elif command == "J":
-                    del self.lines[self.row + 1 :]
-                    del self._line(self.row)[self.col :]
-                i = match.end()
-                continue
-            if ch == "\r":
-                self.col = 0
-            elif ch == "\n":
-                self.row += 1
-                self.col = 0
-                self._line(self.row)
-            elif ch == "\b":
-                self.col = max(0, self.col - 1)
-            elif ch >= " ":
-                if self.col >= self.width:
-                    self.row += 1
-                    self.col = 0
-                line = self._line(self.row)
-                while len(line) <= self.col:
-                    line.append(" ")
-                line[self.col] = ch
-                self.col += 1
-            i += 1
-
-    def text(self) -> str:
-        return "\n".join("".join(line).rstrip() for line in self.lines).rstrip("\n")
-
-
-def _screen_text(console: Console, width: int) -> str:
-    screen = _Screen(width)
-    screen.feed(_console_output(console))
-    return screen.text()
 
 
 def _outside_frames(screen_text: str) -> str:
@@ -172,7 +76,7 @@ def _outside_frames(screen_text: str) -> str:
 # --- tasks and panels ---------------------------------------------------------------------------------------------------
 
 
-def test_task_counts_and_renders_in_its_panel(dashboard: Dashboard) -> None:
+def test_task_counts_and_renders_in_its_panel(dashboard: DataDashboard) -> None:
     bar = dashboard.task("src", total=10, unit="row", panel="downloads")
     assert isinstance(bar, Task)
     bar.update(3)
@@ -184,7 +88,7 @@ def test_task_counts_and_renders_in_its_panel(dashboard: Dashboard) -> None:
     assert "src" in downloads and "4/10" in downloads and "file=a.parquet, MB=7" in downloads
 
 
-def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: Dashboard) -> None:
+def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: DataDashboard) -> None:
     dashboard.task("b", total=1, panel="builds")
     dashboard.task("d", total=1, panel="downloads")
     dashboard.task("t", total=1)
@@ -193,12 +97,12 @@ def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: 
     assert panel_names_of(dashboard) == ["downloads", "builds", "tasks"]
 
 
-def test_empty_panels_render_idle(dashboard: Dashboard) -> None:
+def test_empty_panels_render_idle(dashboard: DataDashboard) -> None:
     text = render_text(dashboard)
     assert text.count("idle") == 2 and "(no log output yet)" in text
 
 
-def test_finished_rows_disappear_and_count_in_the_summary(dashboard: Dashboard) -> None:
+def test_finished_rows_disappear_and_count_in_the_summary(dashboard: DataDashboard) -> None:
     gone = dashboard.task("gone", total=10, panel="downloads")
     kept = dashboard.task("kept", total=10, panel="downloads")
     gone.update(10)
@@ -212,7 +116,7 @@ def test_finished_rows_disappear_and_count_in_the_summary(dashboard: Dashboard) 
     assert [task.description for task in tasks_of(dashboard)] == ["kept"]
 
 
-def test_summary_task_starts_a_round_and_is_updated_in_place(dashboard: Dashboard) -> None:
+def test_summary_task_starts_a_round_and_is_updated_in_place(dashboard: DataDashboard) -> None:
     summary = dashboard.task("downloads", total=3, unit="job", panel="downloads", summary=True)
     first = dashboard.task("a", total=5, panel="downloads")
     first.update(5)
@@ -229,7 +133,7 @@ def test_summary_task_starts_a_round_and_is_updated_in_place(dashboard: Dashboar
     assert text.count("jobs done") == 1 and "0/2 jobs done" in text and "5/5 rows" not in text, "a new round resets the counts"
 
 
-def test_rows_are_bounded_per_panel(dashboard: Dashboard) -> None:
+def test_rows_are_bounded_per_panel(dashboard: DataDashboard) -> None:
     bars = [dashboard.task(f"src_{i}", total=10, panel="downloads") for i in range(6)]
     text = render_text(dashboard)
     assert "src_3" in text and "src_4" not in text and "… and 2 more" in text
@@ -238,20 +142,20 @@ def test_rows_are_bounded_per_panel(dashboard: Dashboard) -> None:
     assert "src_4" in text and "… and 1 more" in text
 
 
-def test_overshoot_past_total_renders(dashboard: Dashboard) -> None:
+def test_overshoot_past_total_renders(dashboard: DataDashboard) -> None:
     bar = dashboard.task("src", total=11, panel="downloads")
     bar.update(1000)
     assert "1,000/11" in render_text(dashboard)
 
 
-def test_indeterminate_task_without_total(dashboard: Dashboard) -> None:
+def test_indeterminate_task_without_total(dashboard: DataDashboard) -> None:
     bar = dashboard.task("counting", total=None, unit="row")
     bar.update(42)
     text = render_text(dashboard)
     assert "counting" in text and "42 " in text and "42 rows" in text
 
 
-def test_updates_after_close_keep_counting_but_the_row_is_gone(dashboard: Dashboard) -> None:
+def test_updates_after_close_keep_counting_but_the_row_is_gone(dashboard: DataDashboard) -> None:
     bar = dashboard.task("gone", total=2)
     assert isinstance(bar, Task)
     bar.close()
@@ -260,7 +164,7 @@ def test_updates_after_close_keep_counting_but_the_row_is_gone(dashboard: Dashbo
     assert bar.n == 1 and tasks_of(dashboard) == [] and "gone" not in render_text(dashboard)
 
 
-def test_updates_from_threads(dashboard: Dashboard) -> None:
+def test_updates_from_threads(dashboard: DataDashboard) -> None:
     bars = [dashboard.task(f"worker {i}", total=200, panel="builds") for i in range(4)]
 
     def work(bar_index: int) -> None:
@@ -282,7 +186,7 @@ def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path)
     console = Console(file=io.StringIO(), force_terminal=True, width=120)
     logger = logging.getLogger("data_preparation.test_dashboard_header")
     log_file = short_tmp_path / "build.log"
-    with Dashboard(title="prepare tiny", enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
+    with DataDashboard(title="prepare tiny", enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
         set_status(round="1/5", step="download")
         board.set_status(step="build")
         first_line, *rest = render_text(board).splitlines()
@@ -292,7 +196,7 @@ def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path)
 
 def test_short_terminal_shrinks_the_log_panel_not_the_task_rows() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
-    with Dashboard(enabled=True, console=console, log_lines=12, max_rows=8) as board:
+    with DataDashboard(enabled=True, console=console, log_lines=12, max_rows=8) as board:
         for i in range(20):
             board.write(f"line {i}")
         bars = [board.task(f"src_{i}", total=1, panel="downloads") for i in range(8)]
@@ -308,32 +212,32 @@ def test_short_terminal_shrinks_the_log_panel_not_the_task_rows() -> None:
 # --- log panel and kept records ---------------------------------------------------------------------------------------
 
 
-def test_log_panel_keeps_last_lines(dashboard: Dashboard) -> None:
+def test_log_panel_keeps_last_lines(dashboard: DataDashboard) -> None:
     for i in range(5):
         dashboard.write(f"line {i}")
-    assert lines_of(dashboard) == ["line 2", "line 3", "line 4"]
+    assert dashboard.lines() == ["line 2", "line 3", "line 4"]
     text = render_text(dashboard)
     assert "line 4" in text and "line 0" not in text
 
 
-def test_every_record_reaches_the_panel_once_while_the_display_is_up(dashboard: Dashboard) -> None:
+def test_every_record_reaches_the_panel_once_while_the_display_is_up(dashboard: DataDashboard) -> None:
     logging.getLogger("data_preparation.test_dashboard").warning("hello %d", 7)  # no handler of its own: the root one
     logging.getLogger("some_library").warning("careful")
-    first, second = lines_of(dashboard)
+    first, second = dashboard.lines()
     assert "WARNING data_preparation.test_dashboard: hello 7" in first and "WARNING some_library: careful" in second
-    assert kept_of(dashboard) == [first, second]
+    assert dashboard.kept() == [first, second]
 
 
-def test_markup_in_log_lines_is_not_interpreted(dashboard: Dashboard) -> None:
+def test_markup_in_log_lines_is_not_interpreted(dashboard: DataDashboard) -> None:
     dashboard.write("path [bold]x[/bold] and [red]")
     assert "[bold]x[/bold]" in render_text(dashboard)
 
 
-def test_multi_line_records_become_one_panel_line_each(dashboard: Dashboard) -> None:
+def test_multi_line_records_become_one_panel_line_each(dashboard: DataDashboard) -> None:
     dashboard.write("Traceback:\n  File x\nValueError: boom")
-    assert lines_of(dashboard) == ["Traceback:", "  File x", "ValueError: boom"]
+    assert dashboard.lines() == ["Traceback:", "  File x", "ValueError: boom"]
     dashboard.write("")
-    assert lines_of(dashboard)[-1] == ""
+    assert dashboard.lines()[-1] == ""
 
 
 def test_kept_records_are_printed_once_after_the_display_closed_not_during() -> None:
@@ -341,41 +245,41 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during() -> 
     logger = logging.getLogger("data_preparation.test_dashboard_keep")
     logger.setLevel(logging.INFO)
     table = "a  b  c" + " " * 200 + "end"
-    with Dashboard(enabled=True, console=console, refresh_per_second=50) as board, board.attach(logger):
+    with DataDashboard(enabled=True, console=console, refresh_per_second=50) as board, board.attach(logger):
         logger.info("quiet")
         logger.warning("loud")
         logger.info("table:\n%s", table, extra={"keep": True})
         board.task("src", total=1, panel="downloads").update(1)
         time.sleep(0.1)  # a few live frames
-        assert [line.split(": ")[-1] for line in lines_of(board)[:2]] == ["quiet", "loud"]
-        assert len(kept_of(board)) == 2
-        assert "loud" not in _outside_frames(_screen_text(console, 100)), "nothing is printed while the display is up"
-    screen = _screen_text(console, 100)
+        assert [line.split(": ")[-1] for line in board.lines()[:2]] == ["quiet", "loud"]
+        assert len(board.kept()) == 2
+        assert "loud" not in _outside_frames(screen_text(console, 100)), "nothing is printed while the display is up"
+    screen = screen_text(console, 100)
     assert screen.count("WARNING data_preparation.test_dashboard_keep: loud") == 1 and "quiet" not in screen
-    assert _console_output(console).count(table) == 1 and screen.count("end") == 1, "kept multi-line records are written unwrapped, once"
+    assert console_output(console).count(table) == 1 and screen.count("end") == 1, "kept multi-line records are written unwrapped, once"
     assert "╭" not in screen and "src" not in screen, "the display is transient: no frame is left behind"
     assert screen.index("loud") < screen.index("end")
-    assert kept_of(board) == []
+    assert board.kept() == []
 
 
 def test_disabled_dashboard_is_plain() -> None:
     stream = io.StringIO()
     real_out = sys.stdout
-    with Dashboard(enabled=False, stream=stream) as board:
+    with DataDashboard(enabled=False, stream=stream) as board:
         assert isinstance(board.task("x", total=1), NoProgress)
         handler = board.log_handler()
         record = logging.LogRecord("data_preparation.x", logging.INFO, __file__, 1, "plain %s", ("msg",), None)
         handler.emit(record)
         assert sys.stdout is real_out, "disabled: no capture"
     assert "INFO data_preparation.x: plain msg" in stream.getvalue()
-    assert lines_of(board) == []
+    assert board.lines() == []
 
 
 def test_enabled_follows_env_and_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATA_PREP_PROGRESS", "0")
-    assert Dashboard(stream=io.StringIO()).enabled is False
+    assert DataDashboard(stream=io.StringIO()).enabled is False
     monkeypatch.setenv("DATA_PREP_PROGRESS", "1")
-    assert Dashboard(stream=io.StringIO()).enabled is False  # StringIO is not a TTY
+    assert DataDashboard(stream=io.StringIO()).enabled is False  # StringIO is not a TTY
 
 
 # --- the active dashboard and the progress() drop-in --------------------------------------------------------------------
@@ -389,7 +293,7 @@ def test_progress_uses_active_dashboard_else_fallback(monkeypatch: pytest.Monkey
     with suspended():
         pass
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
-    with Dashboard(enabled=True, console=console) as board:
+    with DataDashboard(enabled=True, console=console) as board:
         assert active_dashboard() is board
         bar = progress(total=2, desc="inside", unit="step", panel="builds")
         assert isinstance(bar, Task)
@@ -399,9 +303,9 @@ def test_progress_uses_active_dashboard_else_fallback(monkeypatch: pytest.Monkey
 
 def test_a_second_dashboard_inside_the_block_raises() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
-    outer = Dashboard(enabled=True, console=console)
+    outer = DataDashboard(enabled=True, console=console)
     with outer:
-        with pytest.raises(RuntimeError, match="already active"), Dashboard(enabled=True, console=console):
+        with pytest.raises(RuntimeError, match="already active"), DataDashboard(enabled=True, console=console):
             pass
         with pytest.raises(RuntimeError, match="already active"), outer:
             pass
@@ -420,12 +324,12 @@ def test_attach_swaps_the_stream_handler_and_writes_the_log_file(tmp_path: Path)
     logger.addHandler(stream_handler)
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
     log_file = tmp_path / "logs" / "build.log"
-    with Dashboard(enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
+    with DataDashboard(enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
         assert stream_handler not in logger.handlers and len(logger.handlers) == 2
         assert board.is_attached("data_preparation.test_dashboard_attach.child") and not board.is_attached("data_preparation")
         logger.info("inside %d", 1)
     assert logger.handlers == [stream_handler], "the plain handler is restored, the dashboard handlers removed"
-    assert "inside 1" in log_file.read_text() and lines_of(board)[-1].endswith("inside 1")
+    assert "inside 1" in log_file.read_text() and board.lines()[-1].endswith("inside 1")
     assert stream_handler.stream.getvalue() == ""
     logger.removeHandler(stream_handler)
 
@@ -433,7 +337,7 @@ def test_attach_swaps_the_stream_handler_and_writes_the_log_file(tmp_path: Path)
 def test_attach_keeps_the_root_logger_usable_after_configure_logging(tmp_path: Path) -> None:
     root = configure_logging()
     before = list(root.handlers)
-    with Dashboard(enabled=False, stream=io.StringIO()) as board, board.attach(root):
+    with DataDashboard(enabled=False, stream=io.StringIO()) as board, board.attach(root):
         assert all(not isinstance(h, ProgressStreamHandler) for h in root.handlers)
     assert root.handlers == before
 
@@ -443,7 +347,7 @@ def test_attach_restores_handlers_when_the_body_raises() -> None:
     logger.propagate = False
     stream_handler = ProgressStreamHandler(io.StringIO())
     logger.addHandler(stream_handler)
-    board = Dashboard(enabled=False, stream=io.StringIO())
+    board = DataDashboard(enabled=False, stream=io.StringIO())
     with pytest.raises(RuntimeError, match="boom"), board, board.attach(logger):
         assert stream_handler not in logger.handlers
         raise RuntimeError("boom")
@@ -457,7 +361,7 @@ def test_disabled_dashboard_with_threads_logs_each_record_once() -> None:
     logger.propagate = False
     logger.setLevel(logging.INFO)
     logger.addHandler(ProgressStreamHandler(io.StringIO()))  # the plain handler `attach` swaps out
-    with Dashboard(enabled=False, stream=stream) as board, board.attach(logger):
+    with DataDashboard(enabled=False, stream=stream) as board, board.attach(logger):
         threads = [threading.Thread(target=logger.info, args=("record %d", i)) for i in range(8)]
         for t in threads:
             t.start()
@@ -472,9 +376,9 @@ def test_records_of_attached_loggers_land_in_the_panel_once() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
     logger = logging.getLogger("data_preparation.test_dashboard_once")
     logger.setLevel(logging.INFO)
-    with Dashboard(enabled=True, console=console) as board, board.attach(logging.getLogger("data_preparation")):
+    with DataDashboard(enabled=True, console=console) as board, board.attach(logging.getLogger("data_preparation")):
         logger.info("just once")
-        assert [line for line in lines_of(board) if "just once" in line] == lines_of(board)[-1:]
+        assert [line for line in board.lines() if "just once" in line] == board.lines()[-1:]
 
 
 # --- what else could reach the terminal -------------------------------------------------------------------------------------
@@ -487,11 +391,11 @@ def test_third_party_console_handlers_are_detached_while_the_display_is_up() -> 
     library.addHandler(plain)
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
     try:
-        with Dashboard(enabled=True, console=console) as board:
+        with DataDashboard(enabled=True, console=console) as board:
             assert library.handlers == [], "the plain handler would print behind the display"
             library.warning("repo card missing")
-            assert lines_of(board)[-1].endswith("WARNING fake_hub_library: repo card missing")
-            assert kept_of(board)[-1].endswith("repo card missing")
+            assert board.lines()[-1].endswith("WARNING fake_hub_library: repo card missing")
+            assert board.kept()[-1].endswith("repo card missing")
         assert library.handlers == [plain]
     finally:
         library.removeHandler(plain)
@@ -500,7 +404,7 @@ def test_third_party_console_handlers_are_detached_while_the_display_is_up() -> 
 def test_stdout_and_stderr_are_captured_while_the_display_is_up() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=100)
     real_out, real_err = sys.stdout, sys.stderr
-    with Dashboard(enabled=True, console=console) as board:
+    with DataDashboard(enabled=True, console=console) as board:
         streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
         assert all(isinstance(stream, LineSink) for stream in streams)
         assert not sys.stderr.isatty()
@@ -509,14 +413,14 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up() -> None:
         # what `warnings.showwarning` writes to sys.stderr (pytest records warnings itself, so it is written by hand)
         sys.stderr.write(warnings.formatwarning("careful", UserWarning, "x.py", 1))
         print("partial", end="")  # no newline: flushed when the display closes
-        lines = lines_of(board)
+        lines = board.lines()
         assert any(line.endswith("INFO data_preparation.stdout: stray print") for line in lines)
         assert any(line.endswith("WARNING data_preparation.stderr: bar 100%") for line in lines), "a carriage return discards the line so far"
         assert any("WARNING data_preparation.stderr: x.py:1: UserWarning: careful" in line for line in lines)
-        assert kept_of(board) and all("stray print" not in text for text in kept_of(board)), "stdout lines are not kept, stderr lines are"
+        assert board.kept() and all("stray print" not in text for text in board.kept()), "stdout lines are not kept, stderr lines are"
     assert sys.stdout is real_out and sys.stderr is real_err
-    assert lines_of(board)[-1].endswith("INFO data_preparation.stdout: partial")
-    screen = _screen_text(console, 100)
+    assert board.lines()[-1].endswith("INFO data_preparation.stdout: partial")
+    screen = screen_text(console, 100)
     assert "bar 100%" in screen and "careful" in screen and "stray print" not in screen
 
 
@@ -524,7 +428,7 @@ def test_third_party_bars_are_silenced_while_the_display_is_up(monkeypatch: pyte
     monkeypatch.delenv("HF_HUB_DISABLE_PROGRESS_BARS", raising=False)
     monkeypatch.setenv("HF_DATASETS_DISABLE_PROGRESS_BARS", "0")
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
-    with Dashboard(enabled=True, console=console):
+    with DataDashboard(enabled=True, console=console):
         assert os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] == "1" and os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] == "1"
     assert "HF_HUB_DISABLE_PROGRESS_BARS" not in os.environ and os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] == "0"
 
@@ -532,20 +436,20 @@ def test_third_party_bars_are_silenced_while_the_display_is_up(monkeypatch: pyte
 def test_suspended_clears_the_display_for_a_prompt_and_brings_it_back(monkeypatch: pytest.MonkeyPatch) -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
     real_out = sys.stdout
-    with Dashboard(enabled=True, console=console) as board:
+    with DataDashboard(enabled=True, console=console) as board:
         board.task("src", total=1, panel="downloads")
         live = _live_of(board)
         assert live is not None
         with suspended():
             assert _live_of(board) is None and sys.stdout is real_out, "the terminal belongs to the prompt"
-            assert "src" not in _screen_text(console, 80), "the frame is erased while suspended"
+            assert "src" not in screen_text(console, 80), "the frame is erased while suspended"
         stdout: object = sys.stdout
         restarted = _live_of(board)
         assert restarted is not None and restarted is not live and isinstance(stdout, LineSink)
         assert "src" in render_text(board)
 
 
-def _live_of(board: Dashboard) -> Live | None:
+def _live_of(board: DataDashboard) -> Live | None:
     return board._live  # through a call: mypy would otherwise keep the narrowing of an earlier assertion
 
 
@@ -568,7 +472,7 @@ def test_three_threads_drive_the_panels_and_the_scrollback_is_clean() -> None:
     logger.setLevel(logging.INFO)
     log_lines = 4
     frames: list[str] = []
-    with Dashboard(title="prepare tiny", enabled=True, console=console, log_lines=log_lines, refresh_per_second=100) as board, board.attach(logger):
+    with DataDashboard(title="prepare tiny", enabled=True, console=console, log_lines=log_lines, refresh_per_second=100) as board, board.attach(logger):
         summary = progress(total=2, desc="downloads", unit="job", panel="downloads", summary=True)
 
         def download(name: str) -> None:
@@ -605,11 +509,11 @@ def test_three_threads_drive_the_panels_and_the_scrollback_is_clean() -> None:
         assert "peso" not in panels and "fineweb_edu" not in panels, "finished rows are removed"
         assert "2/2 jobs done · 80/80 rows · 2 MB" in final and "30/30 rows" in final
         assert final.splitlines()[0].startswith("prepare tiny")
-        assert lines_of(board)[-1].endswith("wikipedia: kept 40 of 40 fetched rows") or lines_of(board)[-1].endswith("fineweb_edu: kept 40 of 40 fetched rows")
+        assert board.lines()[-1].endswith("wikipedia: kept 40 of 40 fetched rows") or board.lines()[-1].endswith("fineweb_edu: kept 40 of 40 fetched rows")
         logger.info("dataset status:\nsource  kind\na  b\ndataset complete", extra={"keep": True})
     assert any("consumed=" in frame and "shard=" in frame for frame in frames), "downloads and the build were live at the same time"
     assert len(console.export_text()) > 0
-    screen = _screen_text(console, 120)
+    screen = screen_text(console, 120)
     assert screen.count("dataset complete") == 1 and screen.count("source  kind") == 1, screen
     assert "╭" not in screen and "jobs done" not in screen and "row/s" not in screen and "consumed=" not in screen, screen
 
@@ -677,7 +581,7 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
     assert "╭─ downloads" in plain and "jobs done" in plain and "row/s" in plain, "the live dashboard did run, with download rows"
     assert re.search(r"│ synthetic_(pretrain|instruct) +[━╺╸ ]+ +\d+/\d+ ", plain), "a download row: name, bar, rows/wanted"
-    screen = _Screen(140)
+    screen = Screen(140)
     screen.feed(text)
     shown = screen.text()
     assert shown.count("dataset status:") == 1 and shown.count("dataset complete") == 1, shown
@@ -695,7 +599,7 @@ def test_sigterm_in_a_pseudo_terminal_clears_the_display_and_exits_130(tmp_path:
     code, raw = _run_in_pty(script, width=140, height=45, terminate_after=0.5)
     text = raw.decode("utf-8", "replace")
     assert code == 130, text[-3000:]
-    screen = _Screen(140)
+    screen = Screen(140)
     screen.feed(text)
     shown = screen.text()
     assert "╭" not in shown and "│" not in shown and "jobs done" not in shown, shown

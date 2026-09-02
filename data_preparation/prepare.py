@@ -50,7 +50,7 @@ from data_preparation.lib.build.runner import (  # noqa: E402
 )
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger  # noqa: E402
 from data_preparation.lib.sources.hf_cache import configure_hf_cache  # noqa: E402
-from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard  # noqa: E402
+from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -114,7 +114,7 @@ def run_prepare(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
-    with Dashboard(title=f"prepare {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
+    with DataDashboard(title=f"prepare {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
         log.info("preparing dataset config %s under %s", args.dataset_config, layout.root)
         report = prepare(
             args.dataset_config,

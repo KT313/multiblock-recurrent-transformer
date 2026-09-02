@@ -828,7 +828,7 @@ def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, mon
         assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"}
         assert board.log_step_interval == 3
         board.update_step(6, 0, None, {"loss": 1.0})
-    assert not _display_is_up(board) and board._fallback_stream is sys.stderr
+    assert not _display_is_up(board) and board._plain_stream is sys.stderr
     assert "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 

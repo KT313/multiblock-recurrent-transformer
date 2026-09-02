@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from rich.console import Console, Group
 
 from training.ui.format import (
     as_float,
@@ -14,7 +13,6 @@ from training.ui.format import (
     format_metric,
     format_tokens,
     known_metrics,
-    line,
     status_line,
     validation_line,
 )
@@ -72,12 +70,3 @@ def test_step_dict_readers_accept_anything_float_like() -> None:
     assert as_float(Scalar()) == 2.5 and as_float("3") == 3.0 and as_float("x") is None and as_float(None) is None
     assert floats({"a": 1, "b": "nope", "c": Scalar()}) == {"a": 1.0, "c": 2.5}
     assert known_metrics({"loss": 3, "unknown": 1.0, "lr": "bad", "ppl": Scalar()}) == {"loss": 3.0, "ppl": 2.5}
-
-
-def test_line_never_wraps_and_keeps_markup_literal() -> None:
-    console = Console(width=20, force_terminal=False, color_system=None)
-    with console.capture() as capture:
-        # inside a Group, as in the frame: `console.print(Text)` itself re-joins the text and drops `no_wrap`
-        console.print(Group(line("[bold]x[/bold] " + "y" * 40, style="dim")))
-    (rendered,) = capture.get().splitlines()
-    assert rendered.startswith("[bold]x[/bold] yyy") and rendered.endswith("…") and len(rendered) == 20

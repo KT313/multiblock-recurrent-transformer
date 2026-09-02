@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from data_preparation.lib.progress import DISABLING_VALUES
+from ui.enabled import display_enabled
 
 ENV_VAR = "TRAINING_DASHBOARD"
 TRAINING_LOGGER_NAME = "training"  # the logger hierarchy of `training/`; `open()` attaches it by default
@@ -34,12 +33,4 @@ lines_log.propagate = False
 
 def dashboard_enabled(stream: TextIO | None = None) -> bool:
     """False when ``TRAINING_DASHBOARD=0`` (or ``false``/``no``/``off``) or when ``stream`` (stdout) is not a TTY."""
-    env_value = os.environ.get(ENV_VAR, "1").strip().lower()
-    if env_value in DISABLING_VALUES:
-        return False
-    if stream is None:
-        stream = sys.stdout
-    isatty = getattr(stream, "isatty", None)
-    if isatty is None:
-        return False
-    return bool(isatty())
+    return display_enabled(ENV_VAR, sys.stdout if stream is None else stream)

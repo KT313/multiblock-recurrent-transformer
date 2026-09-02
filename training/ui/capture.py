@@ -4,7 +4,7 @@ root-logger handler, the detached third-party console handlers, the ``warnings.s
 / ``sys.stderr`` line sinks and the wandb environment variables, all for the duration of the display.
 
 The generic half — the line sink, the dashboard log handler, ``attach_logger`` and the logging / stream capture
-themselves — lives in :mod:`data_preparation.lib.ui.capture`, shared with the data-prep dashboard; this module adds
+themselves — lives in :mod:`ui.capture`, shared with the data-prep dashboard; this module adds
 what only a training run needs: the ``training.*`` logger names, the run's log-file and console handlers
 (:func:`run_log_handlers`), the ``warnings`` hook and the wandb environment."""
 
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from data_preparation.lib.log import LOG_FORMAT
-from data_preparation.lib.ui.capture import LoggingCapture, LogSink, StreamCapture  # generic, shared with the data-prep dashboard
+from ui.capture import LoggingCapture, LogSink, StreamCapture  # generic, shared with the data-prep dashboard
 from training.ui.common import TRAINING_LOGGER_NAME, lines_log
 
 STDOUT_LOGGER = f"{TRAINING_LOGGER_NAME}.stdout"  # lines written to sys.stdout while the display is up (INFO)

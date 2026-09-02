@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from training.ui.demo import demo, main
-from training.ui.testing import BOX_CHARACTERS, console_output, screen_of, screen_text, string_console, strip_ansi
+from training.ui.testing import BOX_CHARACTERS
+from ui.testing import console_output, screen_of, screen_text, string_console, strip_ansi
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # the fallback captures nothing: without the filter pytest would list the demo's deliberate `warnings.warn` in its summary
