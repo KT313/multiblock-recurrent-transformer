@@ -22,7 +22,7 @@ Three things a live display must survive, fixed here once for both dashboards:
   :class:`DashboardLogHandler` closes the other end: its ``handleError`` writes to the saved real stderr and never
   re-enters ``logging``.
 * **``sys.stdout.fileno()``.** A bare ``io.TextIOBase`` has none, so anything asking the current stdout for its file
-  descriptor used to fail for the whole run; :meth:`LineSink.fileno` answers with the saved real stream's.
+  descriptor would fail for the whole run; :meth:`LineSink.fileno` answers with the saved real stream's.
 * **loggers created while the walk runs.** wandb's background threads create loggers, so
   ``logging.root.manager.loggerDict`` may change size during iteration; :func:`existing_loggers` snapshots it while
   holding the ``logging`` module's own lock.

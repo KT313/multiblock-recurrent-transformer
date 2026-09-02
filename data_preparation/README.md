@@ -82,7 +82,9 @@ Both trees are shared by every dataset config (stages 1 and 2 of the thesis conf
 `processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
 (`lib/storage/manifest.py`): the hash of the settings that produced it, rows and tokens per shard, the loader
 offset and the rejected-row totals after each raw shard, how tokens were counted and — for raw — `truncated_at_tokens`,
-the cap the rows were cut or dropped at. One object owns a raw folder's bookkeeping (`lib/storage/raw_folder.py`:
+the cap the rows were cut or dropped at. The stage-specific fields are typed on `Manifest`: a raw manifest carries
+`exhausted`, `check_limit_reached`, `skipped_malformed` and `dropped_too_long`, a processed one `input_shards`,
+`columns`, `shuffled`, `shuffle_seed` and `stats`. One object owns a raw folder's bookkeeping (`lib/storage/raw_folder.py`:
 `RawFolder` — the cap, the loader offset, the `skipped_malformed` / `dropped_too_long` counters, the exhaustion flag
 and the truncation to a good prefix); the per-source download, the `github_code` group pass and the repair step all
 go through it, so a repair followed by a resume restores every counter instead of only the offset.
@@ -167,7 +169,7 @@ defaults). Sources with nothing to download are built right away, every other so
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
 overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
-no longer the larger of the two.
+not the larger of the two.
 
 A round is normally enough. A second one happens when a loader returned fewer rows than asked without being
 exhausted, or when the length filter and the dedup dropped more than the 20 % safety margin covers — and it really
@@ -238,7 +240,8 @@ rather than in the dataset-level one.
 ### Repair and the confirmation rule (`lib/build/repair.py`)
 
 Before anything is downloaded or built, one pass over every source folder decides what has to go, and one
-report says what it did:
+report (`RepairReport`) lists every action with whether it was carried out (`performed`; False for `status` /
+`--dry_run` and for the report a refused confirmation carries):
 
 - **raw** (downloaded, expensive): a *stale* folder (identity or tokenizer changed) or an *outdated* one
   (`max_seq_length` raised above `truncated_at_tokens`) is deleted and downloaded again — **only after the user
@@ -276,25 +279,25 @@ The `× 1.2` covers what the length filter and the dedup drop, the division keep
 sequence budget after the resolver holds `validation_fraction` out. There is no tokens-per-row estimate anywhere in
 this arithmetic (`describe_tokens_per_row` on a source feeds only the row column of `describe`).
 
-Whether a source is **satisfied** is one `SourceLedger.satisfaction()` case, and the plan, the round loop and the
-status table all read it:
+Whether a source is **satisfied** is `SourceLedger.satisfaction()` — `(satisfied, reason)`, the reason being the
+status table's last column — and the plan, the round loop and the status table all read it:
 
-| case | when | satisfied |
+| reason | when | satisfied |
 |---|---|---|
-| `OK` | processed rows ≥ `rows_sufficient` | yes |
-| `EXHAUSTED_SMALL` | the loader ran dry with fewer, but some, rows | yes, with a warning (the sampler cycles them) |
-| `EXHAUSTED_EMPTY` | the loader ran dry and **not one** row survived the build | **no** — a wrong `fields` / `converter` / `filter` / `language`, and a failed source is a failed build |
-| `SHORT_BUT_FETCHABLE` | too few processed rows, the loader has more | no — the next round tops it up |
-| `NOT_BUILT` | `processed/` missing, stale or behind the raw shards | no — build it |
-| `RAW_MISSING` / `RAW_BROKEN` | nothing downloaded / stale or outdated raw | no — download, or let the repair step delete it |
+| `ok` | processed rows ≥ `rows_sufficient` | yes |
+| `exhausted at N of M rows` | the loader ran dry with fewer, but some, training rows | yes, state `exhausted` (the sampler cycles them) |
+| `exhausted and NOT ONE of N raw rows survived the build` | the loader ran dry and every row was rejected | **no** — a wrong `fields` / `converter` / `filter` / `language`, and a failed source is a failed build |
+| `exhausted, and … leaves 0 training rows` | the few rows all go to the validation holdout | **no** — lower the source's `validation_fraction` or give it more rows |
+| `processed rows N < M` | too few processed rows, the loader has more | no — the next round tops it up |
+| `processed <reason>` | `processed/` missing, stale or behind the raw shards | no — build it |
+| `raw <reason>` | nothing downloaded / stale or outdated raw | no — download, or let the repair step delete it |
 
 The consequence to keep in mind: **the weights mix rows, not tokens.** The realised token share of a source in a
 stage is proportional to `weight × mean_tokens_per_row` (rows capped at `block_size`), so a stage's token mix is
 `weight × mean_tokens_per_row ÷ block_size`-weighted. Example: `block_size` 2048, one 1 B-token stage,
 `{fineweb: 0.5 (~1000 tokens/row), gsm8k: 0.5 (~300 tokens/row, 7.5 k rows)}` — the stage draws 488 k sequences,
 244 k rows of each source, a realised token mix of about 77 / 23, and gsm8k is cycled ~33 times (`epochs` 33 in the
-status table). The planner downloads 293 k fineweb rows for it (244 k × 1.2), not the 600 k the old token-based
-planner asked for. Set weights with the row lengths of the sources in mind; `docs/data_mixture.md` prints
+status table). The planner downloads 293 k fineweb rows for it (244 k × 1.2). Set weights with the row lengths of the sources in mind; `docs/data_mixture.md` prints
 tokens, sequences and an estimated row count per source and stage.
 
 ### The validation split happens at training time

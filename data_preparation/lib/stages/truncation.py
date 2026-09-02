@@ -1,9 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Truncate document text at a token boundary so the stored text has at most ``max_tokens`` tokens.
 
-Raw shards used to store the full text of every document and only cap the *count* at ``max_seq_length``; the
-download step now cuts the text itself, so the stored count is the true count of the stored text and storage is
-bounded. The token definition is the one of ``TokenCounter`` in ``stages/download.py``: the config tokenizer with
+The download step cuts the text itself rather than storing the whole document with a capped count, so the
+stored count is the true count of the stored text and storage is bounded. The token definition is the one of ``TokenCounter`` in ``stages/download.py``: the config tokenizer with
 ``add_special_tokens=False`` (no bos/eos), or ``len(text) // 4`` in ``token_count: estimate`` mode.
 
 Invariants of :func:`truncate_many` (tested): the returned text is a prefix of the

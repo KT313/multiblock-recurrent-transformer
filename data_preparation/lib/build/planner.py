@@ -8,7 +8,7 @@ source's weight schedule over the stage token budgets, ÷ ``block_size`` — its
 next stage's weight) / 2``; the 1.2 safety margin comes on top).
 That is the planner's unit: :meth:`DatasetConfig.rows_needed` turns it into a download target and
 :meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it. There is no tokens-per-row estimate anywhere in this arithmetic: a source whose rows
-are shorter than ``block_size`` is no longer over-downloaded, and the realised **token** mix of a stage is
+are shorter than ``block_size`` is not over-downloaded, and the realised **token** mix of a stage is
 ``weight × mean_tokens_per_row ÷ block_size``-weighted (the README says so; ``describe.py`` prints an estimate from
 ``describe_tokens_per_row`` for the token table only).
 
