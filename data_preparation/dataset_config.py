@@ -21,14 +21,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from jsonargparse import ArgumentError, ArgumentParser, Namespace
+from jsonargparse import ArgumentError, ArgumentParser
 
 SourceKind = Literal["pretrain", "instruct"]
 LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
@@ -740,12 +739,7 @@ def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None)
             namespace = parser.parse_args(overrides, namespace=namespace)
     except ArgumentError as error:
         raise ValueError(_load_error_message(path, str(error))) from error
-    instantiate: Callable[[Namespace], Namespace | dict[str, Any]] = (
-        getattr(parser, "instantiate", None) or parser.instantiate_classes  # jsonargparse >=4.49 / older
-    )
-    instantiated = instantiate(namespace)
-    values = instantiated.as_dict() if isinstance(instantiated, Namespace) else instantiated
-    return DatasetConfig(**values)
+    return DatasetConfig(**parser.instantiate(namespace).as_dict())
 
 
 def _load_error_message(path: str | Path, error: str) -> str:

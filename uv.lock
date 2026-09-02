@@ -1175,7 +1175,7 @@ requires-dist = [
     { name = "datasketch", marker = "extra == 'data'" },
     { name = "huggingface-hub" },
     { name = "ijson", marker = "extra == 'data'", specifier = ">=3.5.1" },
-    { name = "jsonargparse", extras = ["signatures"], specifier = ">=4.27.6" },
+    { name = "jsonargparse", extras = ["signatures"], specifier = ">=4.49" },
     { name = "numpy", specifier = "<2.0" },
     { name = "pyarrow", specifier = ">=15" },
     { name = "pyyaml" },

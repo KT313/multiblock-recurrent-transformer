@@ -6,10 +6,10 @@ batches of `world_batch_size × block_size` tokens. Defaults make a run on one l
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
-from jsonargparse import ActionConfigFile, ArgumentParser, Namespace  # type: ignore[attr-defined]
+from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
 
 # The value rules of `Settings`, as three tables read by one loop each in `Settings.__post_init__` (the same idea as
 # `SOURCE_FIELD_SCOPES` in `data_preparation/dataset_config.py`, one size smaller): a field that must be set, one
@@ -184,9 +184,4 @@ def parse_settings(args: Optional[list[str]] = None) -> Settings:
     parser.add_class_arguments(Settings, nested_key=None)
     ns = parser.parse_args(args)
     ns.pop("config", None)
-    instantiate: Callable[[Namespace], Namespace | dict[str, Any]] = (
-        getattr(parser, "instantiate", None) or parser.instantiate_classes  # jsonargparse >=4.49 / older
-    )
-    instantiated = instantiate(ns)
-    values = instantiated.as_dict() if isinstance(instantiated, Namespace) else instantiated
-    return Settings(**values)
+    return Settings(**parser.instantiate(ns).as_dict())
