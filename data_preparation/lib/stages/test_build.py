@@ -267,7 +267,7 @@ def test_build_rebuilds_when_shards_predate_the_columns_or_raw_changed(
     changed.save(processed)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         rebuilt = build_source(cfg, "s", layout)
-    assert "raw shards changed" in caplog.text and rebuilt.input_shards == m.input_shards
+    assert "raw shards that no longer exist" in caplog.text and rebuilt.input_shards == m.input_shards
     assert read_rows(processed) == rows
 
 

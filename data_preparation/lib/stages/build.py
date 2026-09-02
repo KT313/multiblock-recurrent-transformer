@@ -53,6 +53,7 @@ import pyarrow.parquet as pq
 from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
 from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.abort import StopCheck, check_stop
+from data_preparation.lib.build.assessment import ProcessedAssessment, assess_processed_folder
 from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
@@ -70,7 +71,6 @@ from data_preparation.lib.stages.row_pipeline import (
 from data_preparation.lib.stages.download import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
-    current_manifest,
     current_raw_manifest,
     new_manifest,
 )
@@ -107,17 +107,16 @@ def build_source(
     raw = current_raw_manifest(config, name, layout)
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
-    columns = processed_columns(source.kind)
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")
+    assessment = assess_processed_folder(config, name, processed_dir, shard_list(raw.shards), check_files=False)
 
     if all_at_once:
-        stored = _complete_manifest(processed_dir, source_hash, raw, columns)
-        if stored is not None:
-            return stored
+        if assessment.problem == "none" and assessment.manifest is not None:
+            return assessment.manifest  # built from exactly the current raw shards
         output = ProcessedOutput(_fresh_manifest(config, name, source_hash), _temporary_dir(processed_dir), is_new=True)
         pending = list(raw.shards)
     else:
-        output = ProcessedOutput.resume(config, name, source_hash, processed_dir, raw, columns)
+        output = ProcessedOutput.resume(config, name, source_hash, processed_dir, assessment)
         pending = raw.shards[output.covered() :]
         if not pending:
             if output.is_new:
@@ -242,20 +241,15 @@ class ProcessedOutput:
     is_new: bool
 
     @classmethod
-    def resume(
-        cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, raw: Manifest, columns: tuple[str, ...]
-    ) -> ProcessedOutput:
-        """The stored manifest if new raw shards can be appended to it (current hash, expected columns, covered
-        shards a prefix of the raw shards); otherwise a fresh one — and the folder is deleted first, so no shard of
-        the previous build survives unlisted (a per-shard publisher overwrites only the names it reuses)."""
-        manifest = current_manifest(processed_dir, source_hash, "processed")
-        if manifest is not None:
-            covered = manifest.input_shards
-            has_columns = manifest.columns == list(columns)
-            if has_columns and shard_list(raw.shards)[: len(covered)] == covered:
-                return cls(manifest, processed_dir, is_new=False)
-            why = "raw shards changed under the processed manifest" if has_columns else "processed shards predate the current columns"
-            log.warning("%s: %s, rebuilding everything", name, why)
+    def resume(cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, assessment: ProcessedAssessment) -> ProcessedOutput:
+        """The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
+        raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one — and
+        the folder is deleted first, so no shard of the previous build survives unlisted (a per-shard publisher
+        overwrites only the names it reuses)."""
+        if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
+            return cls(assessment.manifest, processed_dir, is_new=False)
+        if assessment.problem != "absent":
+            log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
         if processed_dir.exists():
             log.info("%s: removing %s before the rebuild", name, processed_dir)
             shutil.rmtree(processed_dir)
@@ -280,17 +274,6 @@ class ProcessedOutput:
         self.manifest.input_shards = list(covered)
         self.manifest.save(self.directory)
         self.is_new = False
-
-
-def _complete_manifest(processed_dir: Path, source_hash: str, raw: Manifest, columns: tuple[str, ...]) -> Manifest | None:
-    """The stored manifest of an all-at-once folder if it was built from exactly the current raw shards, else None
-    (the folder is rebuilt whole)."""
-    manifest = current_manifest(processed_dir, source_hash, "processed")
-    if manifest is None:
-        return None
-    if manifest.columns == list(columns) and manifest.input_shards == shard_list(raw.shards):
-        return manifest
-    return None
 
 
 def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manifest:

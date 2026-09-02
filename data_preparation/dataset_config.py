@@ -505,8 +505,7 @@ class DatasetConfig:
 
     def rows_needed(self, source_name: str) -> int:
         """Raw rows to download for the source — THE definition of the planner's row requirement
-        (`lib/build/planner.py:rows_needed` delegates here, and `_check_shuffled_build_sizes` reads the same number,
-        so the two cannot drift). A source used for training (and maybe validation): ``ceil(sequence_budget ×
+        (`_check_shuffled_build_sizes` reads the same number). A source used for training (and maybe validation): ``ceil(sequence_budget ×
         SAFETY_MARGIN ÷ (1 − validation_fraction_of(name)))`` — the margin covers what the length filter and the
         dedup drop, the division keeps the *training* part at the sequence budget after the training resolver holds
         ``validation_fraction`` of the processed rows out. A source used only for validation: its ``rows``. Exact
@@ -516,6 +515,11 @@ class DatasetConfig:
             return int(source.rows or 0)
         held_out = Fraction(str(self.validation_fraction_of(source_name)))
         return ceil(self.sequence_budget(source_name) * SAFETY_MARGIN / (1 - held_out))
+
+    def rows_sufficient(self, source_name: str) -> int:
+        """Processed rows at which a source serves its budget: ``rows_needed ÷ SAFETY_MARGIN`` (the sequence budget
+        over the training share of the rows, or the ``rows`` of a validation-only source, less the download margin)."""
+        return ceil(self.rows_needed(source_name) / SAFETY_MARGIN)
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 

@@ -53,6 +53,7 @@ from data_preparation.lib.build.planner import (
     build_is_pending,
     every_source_satisfies_its_budget,
     plan_downloads,
+    selected_sources,
     sources_with_pending_raw_shards,
     summarize_dataset_state,
 )
@@ -210,7 +211,7 @@ class Job:
 
 def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None) -> list[Job]:
     """One job per source with rows to fetch — the ``github_code`` sources of one repo grouped into one. The
-    download takes a **target** (``rows_needed=``), so every job is asked for :attr:`SourceDownload.rows_target`:
+    download takes a **target** (``rows_needed=``), so every job is asked for :attr:`SourceLedger.rows_target`:
     the rows already on disk plus the ones the plan wants added (more than the budget in a top-up round)."""
     to_fetch = download_plan.to_fetch()
     rows_needed = {source.name: source.rows_target for source in to_fetch}
@@ -429,19 +430,10 @@ def checked_steps(steps: Iterable[str]) -> set[str]:
 
 
 def checked_sources(config: DatasetConfig, sources: Iterable[str] | None) -> list[str] | None:
-    """``sources`` as a list (None for every source); unknown names are an error.
-
-    Repeats are dropped, keeping the first occurrence (``prepare.py --sources a a``): a name listed twice would be
-    inspected twice by the repair step, appear twice in its confirmation list and make the second deletion of the
-    same folder fail on a directory that is no longer there.
-    """
-    if sources is None:
-        return None
-    selected = list(dict.fromkeys(sources))
-    unknown = set(selected) - set(config.sources)
-    if unknown:
-        raise ValueError(f"unknown sources {sorted(unknown)}")
-    return selected
+    """``sources`` in config order, each once (None for every source); unknown names are an error. A name listed
+    twice (``prepare.py --sources a a``) would otherwise be inspected twice by the repair step, appear twice in its
+    confirmation list and make the second deletion of the same folder fail on a directory that is no longer there."""
+    return None if sources is None else selected_sources(config, sources)
 
 
 def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_workers: int) -> None:
@@ -497,8 +489,9 @@ def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_re
 def log_report(report: DatasetReport) -> None:
     """The status table (kept in the scrollback) plus one warning per exhausted or unsatisfied source."""
     for source in report.sources:
-        if source.satisfied and source.exhausted:
-            log.warning("%s: source exhausted (%s); the training sampler cycles the rows on disk", source.name, source.reason)
-        elif not source.satisfied:
-            log.warning("%s: %s", source.name, source.reason)
+        satisfied, reason = source.satisfaction()
+        if satisfied and source.exhausted:
+            log.warning("%s: source exhausted (%s); the training sampler cycles the rows on disk", source.name, reason)
+        elif not satisfied:
+            log.warning("%s: %s", source.name, reason)
     log.info("dataset status:\n%s", report.describe(), extra={"keep": True})  # keep: printed unwrapped into the scrollback

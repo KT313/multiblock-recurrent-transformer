@@ -225,7 +225,7 @@ def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path
     leftover ``processed/<name>.old`` (the folder a swap already replaced) is removed without asking."""
     temporary = processed_dir.with_name(processed_dir.name + ".tmp")
     if temporary.exists():
-        if not processed_dir.exists() and assess_processed_folder(config, name, temporary, raw_shards).verdict == "ok":
+        if not processed_dir.exists() and assess_processed_folder(config, name, temporary, raw_shards).problem == "none":
             _plan(report, name, temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place")
         else:
             _plan(report, name, temporary, "processed", "delete", "leftover of an interrupted all-at-once build")

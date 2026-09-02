@@ -28,7 +28,7 @@ from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import BuildLocked, build_lock
-from data_preparation.lib.build.planner import DownloadPlan, plan_downloads, rows_needed, rows_sufficient
+from data_preparation.lib.build.planner import DownloadPlan, plan_downloads
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.download import download as real_download
@@ -85,9 +85,9 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
     report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and [s.name for s in report.sources] == ["p", "h", "i"]
     p, h, i = report.sources
-    assert p.rows_needed == 600 and p.raw_rows == 600 and p.processed_rows >= 500 and p.epochs is not None
-    assert h.rows_needed == 4 and h.raw_rows == 4 and h.epochs is None
-    assert i.kind == "instruct" and i.satisfied
+    assert p.rows_needed == 600 and p.raw_rows == 600 and p.processed_rows >= 500 and p.epochs() is not None
+    assert h.rows_needed == 4 and h.raw_rows == 4 and h.epochs() is None
+    assert i.kind == "instruct" and i.satisfaction()[0]
     processed_i = Manifest.load(layout.processed_dir("i"))
     assert processed_i is not None and processed_i.columns == ["instruction", "input", "output", "tokens", "hash"]
 
@@ -109,7 +109,7 @@ def test_a_download_that_falls_short_gets_a_second_round(
         return real_download(config, name, *args, rows_needed=asked, **kwargs)
 
     monkeypatch.setattr(runner, "download", half_the_first_time)
-    needed = rows_needed(cfg, "p")  # 500 sequences × 1.2 ÷ 0.95 (the factory validates on the trained source too) = 632
+    needed = cfg.rows_needed("p")  # 500 sequences × 1.2 ÷ 0.95 (the factory validates on the trained source too) = 632
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and calls == [needed, needed] == [632, 632]
@@ -136,8 +136,8 @@ def test_a_source_still_short_after_max_rounds_is_reported(
     assert not report.complete and calls == runner.MAX_ROUNDS == 5
     assert f"round {runner.MAX_ROUNDS}:" in caplog.text and f"round {runner.MAX_ROUNDS + 1}" not in caplog.text
     (p,) = report.sources
-    sufficient = rows_sufficient(cfg, "p")
-    assert not p.satisfied and p.reason == f"processed rows 5 < {sufficient}" and f"p: processed rows 5 < {sufficient}" in caplog.text
+    sufficient = cfg.rows_sufficient("p")
+    assert not p.satisfaction()[0] and p.satisfaction()[1] == f"processed rows 5 < {sufficient}" and f"p: processed rows 5 < {sufficient}" in caplog.text
 
 
 def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
@@ -153,11 +153,11 @@ def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
     write_local(src_dir, rows, "parquet")
     cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500)
-    needed, sufficient = rows_needed(cfg, "d"), rows_sufficient(cfg, "d")
+    needed, sufficient = cfg.rows_needed("d"), cfg.rows_sufficient("d")
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (d,) = report.sources
-    assert report.complete and d.satisfied and not d.exhausted and d.reason == "ok"
+    assert report.complete and d.satisfaction()[0] and not d.exhausted and d.satisfaction()[1] == "ok"
     assert (needed, sufficient) == (632, 527) and d.processed_rows >= sufficient
     assert d.raw_rows > needed, "the top-up fetched beyond the budget, sized from the observed yield"
     assert "round 2: 1 source(s) short" in caplog.text  # round 1 did not serve the budget
@@ -182,10 +182,10 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         report = prepare(path, layout.root, assume_yes=False)
     (i,) = report.sources
-    assert not report.complete and not i.satisfied and i.exhausted and (i.raw_rows, i.processed_rows) == (0, 0)
-    assert "NOT ONE" in i.reason and "20 malformed" in i.reason
-    assert "check the source's fields / converter / filter / language" in i.reason
-    assert report.missing() == ["i"] and f"i: {i.reason}" in caplog.text
+    assert not report.complete and not i.satisfaction()[0] and i.exhausted and (i.raw_rows, i.processed_rows) == (0, 0)
+    assert "NOT ONE" in i.satisfaction()[1] and "20 malformed" in i.satisfaction()[1]
+    assert "check the source's fields / converter / filter / language" in i.satisfaction()[1]
+    assert report.missing() == ["i"] and f"i: {i.satisfaction()[1]}" in caplog.text
     assert status(path, layout.root).describe().endswith("dataset INCOMPLETE"), "`status` says the same"
     with pytest.raises(SystemExit) as exit_code:
         prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root)])
@@ -201,8 +201,8 @@ def test_exhausted_source_is_complete_with_a_warning(
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (s,) = report.sources
-    assert report.complete and s.satisfied and s.exhausted and s.processed_rows == 2  # the duplicates went
-    assert f"s: source exhausted (exhausted at 2 of {rows_sufficient(cfg, 's'):,} rows)" in caplog.text
+    assert report.complete and s.satisfaction()[0] and s.exhausted and s.processed_rows == 2  # the duplicates went
+    assert f"s: source exhausted (exhausted at 2 of {cfg.rows_sufficient('s'):,} rows)" in caplog.text
     assert "round 2" not in caplog.text
 
 
@@ -216,7 +216,7 @@ def test_steps_download_then_build(cfg_factory: CfgFactory, layout: DatasetLayou
     assert not report.complete and report.tokenizer_complete and report.missing() == ["p", "h"]
     assert (layout.raw_dir("p") / "MANIFEST.json").is_file() and (layout.raw_dir("h") / "MANIFEST.json").is_file()
     assert not layout.processed_dir("p").exists() and not layout.processed_dir("h").exists()
-    assert [s.reason for s in report.sources] == ["processed missing", "processed missing"]
+    assert [s.satisfaction()[1] for s in report.sources] == ["processed missing", "processed missing"]
     report = prepare(path, layout.root, assume_yes=False, steps=["build"])
     assert report.complete
     with pytest.raises(ValueError, match="unknown steps"):
@@ -239,11 +239,11 @@ def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_f
 
 
 def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`--sources a a` used to inspect `a` twice: the repair step listed it twice and deleted the same folder twice
-    (the second `rmtree` on a directory that is gone)."""
+    """`--sources a a` would otherwise inspect `a` twice: the repair step would list it twice and delete the same
+    folder twice (the second `rmtree` on a directory that is gone). The selection is in config order."""
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
     cfg = cfg_factory(sources, tokens=500)
-    assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["b", "a"] and runner.checked_sources(cfg, None) is None
+    assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["a", "b"] and runner.checked_sources(cfg, None) is None
     path = config_file(cfg)
     assert prepare(path, layout.root, assume_yes=False, sources=["a", "a"]).missing() == ["b"]
     stale = cfg_factory(sources, tokens=500, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
@@ -358,7 +358,7 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
     monkeypatch.setattr(runner, "download", real_download)
     assert prepare(path, layout.root, assume_yes=False).complete  # resumes behind the published shard
     raw = Manifest.load(layout.raw_dir("p"))
-    assert raw is not None and [s.rows for s in raw.shards] == [100, rows_needed(cfg, "p") - 100]
+    assert raw is not None and [s.rows for s in raw.shards] == [100, cfg.rows_needed("p") - 100]
 
 
 def test_an_outer_should_stop_is_honoured(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
@@ -604,7 +604,7 @@ def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resum
     monkeypatch.setattr(runner, "build_source", real_build)
     assert prepare(path, layout.root, assume_yes=False).complete
     raw = Manifest.load(layout.raw_dir("s1"))
-    assert raw is not None and [s.rows for s in raw.shards] == [100, rows_needed(cfg, "s1") - 100]  # resumed, not restarted
+    assert raw is not None and [s.rows for s in raw.shards] == [100, cfg.rows_needed("s1") - 100]  # resumed, not restarted
 
 
 def test_steps_download_only_never_builds_as_a_follow_up(
@@ -613,7 +613,7 @@ def test_steps_download_only_never_builds_as_a_follow_up(
     built: list[str] = []
     monkeypatch.setattr(runner, "build_source", lambda config, name, *args, **kwargs: built.append(name))
     report = prepare(config_file(_three_sources(cfg_factory)), layout.root, assume_yes=False, steps=["tokenizer", "download"])
-    assert built == [] and not report.complete and all(source.reason == "processed missing" for source in report.sources)
+    assert built == [] and not report.complete and all(source.satisfaction()[1] == "processed missing" for source in report.sources)
 
 
 def test_pending_sources_that_need_no_download_are_built_right_away(

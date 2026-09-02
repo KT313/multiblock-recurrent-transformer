@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from data_preparation.dataset_config import DatasetConfig
+from data_preparation.layout import processed_columns
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name
 
@@ -38,48 +39,36 @@ ProcessedProblem = Literal[
     "unreadable_manifest",  # MANIFEST.json exists but cannot be parsed
     "no_manifest",  # shard files without a manifest
     "raw_deleted",  # the raw folder the shards were built from is being deleted
-    "stale",  # manifest hash != the config's processed hash
+    "stale",  # manifest hash != the config's processed hash, another stage's manifest, or other columns
     "broken_shard",  # a listed shard is missing, unreadable, or has the wrong row count
     "stray_shards",  # unlisted shard file(s) no resumed build would overwrite
     "raw_changed",  # ``input_shards`` is no longer a prefix of the raw shard list
+    "behind_raw",  # current, but raw shards remain to be built (a pending build, not a repair)
 ]
 
-Verdict = Literal["ok", "missing", "resumable", "stale", "broken"]
 CheapestRepair = Literal["nothing", "rebuild"]
 
-_VERDICTS: dict[ProcessedProblem, Verdict] = {
-    "none": "ok",
-    "absent": "missing",
-    "crash_leftover": "resumable",
-    "unreadable_manifest": "broken",
-    "no_manifest": "broken",
-    "raw_deleted": "broken",
-    "stale": "stale",
-    "broken_shard": "broken",
-    "stray_shards": "broken",
-    "raw_changed": "broken",
-}
+# the problems a rebuild heals; the others are healthy, not built yet, pending, or healed by the resumed build
+_REBUILD: frozenset[ProcessedProblem] = frozenset(
+    {"unreadable_manifest", "no_manifest", "raw_deleted", "stale", "broken_shard", "stray_shards", "raw_changed"}
+)
 
 
 @dataclass(frozen=True)
 class ProcessedAssessment:
-    """The health of one processed folder: the fine-grained problem (for consumers with extra knowledge of their
-    own), one reason line, and the manifest when it was readable. :attr:`verdict` and :attr:`repair` derive from
-    the problem, so a verdict can never disagree with the repair attached to it."""
+    """The health of one processed folder: the fine-grained problem, one reason line (it reads as the tail of
+    ``processed <reason>`` in the status table), and the manifest when it was readable. :attr:`repair` derives
+    from the problem, so it can never disagree with it."""
 
     problem: ProcessedProblem
     reason: str
     manifest: Manifest | None
 
     @property
-    def verdict(self) -> Verdict:
-        return _VERDICTS[self.problem]
-
-    @property
     def repair(self) -> CheapestRepair:
         """The cheapest repair that heals the folder: ``rebuild`` = delete it and build again (derived data, no
-        confirmation); ``nothing`` = healthy, not built yet, or the resumed build heals it by itself."""
-        return "rebuild" if self.verdict in ("stale", "broken") else "nothing"
+        confirmation); ``nothing`` = healthy, not built yet, pending, or the resumed build heals it by itself."""
+        return "rebuild" if self.problem in _REBUILD else "nothing"
 
 
 def next_shard_to_write(manifest: Manifest) -> str:
@@ -96,8 +85,8 @@ def assess_processed_folder(
     ``[[name, rows], ...]`` (None: the raw folder is being deleted).
 
     ``check_files=True`` (the repair step) also verifies the listed shard files (parquet footers) and looks for
-    unlisted ones; ``check_files=False`` (the planner) reads the manifest only, so ``broken_shard``, ``stray_shards``
-    and ``crash_leftover`` are never reported — broken files are the repair step's business.
+    unlisted ones; ``check_files=False`` (the planner, the build) reads the manifest only, so ``broken_shard``,
+    ``stray_shards`` and ``crash_leftover`` are never reported — broken files are the repair step's business.
     """
     try:
         manifest = Manifest.load(folder)
@@ -106,11 +95,15 @@ def assess_processed_folder(
     if manifest is None:
         if has_shards(folder):
             return ProcessedAssessment("no_manifest", "no manifest", None)
-        return ProcessedAssessment("absent", "nothing built yet", None)
+        return ProcessedAssessment("absent", "missing", None)
     if raw_shards is None:
         return ProcessedAssessment("raw_deleted", "built from a raw folder that is being deleted", manifest)
+    if manifest.stage != "processed":
+        return ProcessedAssessment("stale", f"stale: a {manifest.stage} manifest where a processed one belongs", manifest)
     if not manifest.is_current(config.processed_hash(name)):
         return ProcessedAssessment("stale", "stale: processing settings, max_seq_length or the source changed", manifest)
+    if manifest.columns != list(processed_columns(config.sources[name].kind)):
+        return ProcessedAssessment("stale", "stale: the shards predate the current columns", manifest)
     covered = manifest.input_shards
     if check_files:
         for shard in manifest.shards:
@@ -126,6 +119,8 @@ def assess_processed_folder(
             return ProcessedAssessment("stray_shards", f"unlisted shard(s): {', '.join(unlisted)}", manifest)
     if raw_shards[: len(covered)] != covered:
         return ProcessedAssessment("raw_changed", "built from raw shards that no longer exist", manifest)
+    if len(covered) < len(raw_shards):
+        return ProcessedAssessment("behind_raw", "behind raw", manifest)
     return ProcessedAssessment("none", "ok", manifest)
 
 
