@@ -14,6 +14,7 @@ from typing import Any
 
 import os
 
+import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
@@ -220,6 +221,14 @@ def test_download_projects_to_the_text_field_and_requires_it(
     with pytest.raises(ValueError, match="no 'text' column"):
         download(bad, "c", other, rows_needed=1)
 
+
+
+def test_a_written_shard_holds_only_the_row_columns(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """The fetch progress travels next to the row, never in it: no bookkeeping column reaches the shard."""
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
+    download(cfg, "p", layout, rows_needed=3, shard_size=5)
+    (shard,) = sorted(layout.raw_dir("p").glob("data-*.parquet"))
+    assert pq.read_schema(shard).names == ["text", "tokens"]
 
 
 def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(

@@ -10,9 +10,8 @@ writer of these fields, so the offset and the reject counters always move togeth
 row twice).
 
 The append side is resumable at shard granularity: every published shard is recorded with the loader offset **and**
-the reject totals as of its last stored row (:class:`RowProgress`, carried on the row itself under
-:data:`ROW_PROGRESS_KEY` and stored in :class:`~data_preparation.lib.storage.manifest.ShardInfo`), so a stop, a
-failure or a truncation to the good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`) all leave a
+the reject totals as of its last stored row (:class:`RowProgress`, handed to :meth:`RawFolder.add` next to the row
+and stored in :class:`~data_preparation.lib.storage.manifest.ShardInfo`), so a stop, a failure or a truncation to the good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`) all leave a
 manifest a resume can continue from without counting any rejected row twice. Manifests written before those per-shard fields existed still load: a truncation then resets the
 counters to 0 and says so in the log (the folder stays usable and is never treated as stale).
 """
@@ -30,9 +29,6 @@ from data_preparation.lib.storage.parquet import ShardWriter, list_parquet_files
 log = get_logger(__name__)
 
 Row = dict[str, Any]
-
-ROW_PROGRESS_KEY = "_progress"  # private row key: the fetch progress right after this row (stripped before it is written)
-
 
 class RowProgress(NamedTuple):
     """Where an increment stood when a stored row was produced: the loader offset after it and how many rows before
@@ -139,9 +135,9 @@ class RawFolder:
 
     # --- appending -----------------------------------------------------------------------------------------------
 
-    def add(self, writer: ShardWriter, row: Row) -> None:
-        """Hand ``row`` (tagged with :data:`ROW_PROGRESS_KEY` by the caller's token step) to ``writer``."""
-        self._last = row.pop(ROW_PROGRESS_KEY)
+    def add(self, writer: ShardWriter, row: Row, progress: RowProgress) -> None:
+        """Hand ``row`` to ``writer``; ``progress`` is where the fetch stood right after it (recorded with the shard)."""
+        self._last = progress
         writer.add(row)
 
     def record_shard(self, path: Path) -> None:

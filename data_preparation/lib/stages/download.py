@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -47,7 +47,7 @@ from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.truncation import estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
-from data_preparation.lib.storage.raw_folder import ROW_PROGRESS_KEY, RawFolder, RowProgress
+from data_preparation.lib.storage.raw_folder import RawFolder, RowProgress
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
@@ -310,8 +310,8 @@ def download(
     with progress(total=wanted, desc=name, unit="row", panel="downloads") as bar:
         rows = _fetch_rows(source, name, folder.rows_fetched, wanted, max_consume, hf_token, counters, layout, bar, token_step)
         with ShardWriter(folder.directory, shard_size, start_shard=folder.shard_count, on_shard=folder.record_shard) as writer:
-            for row in rows:
-                folder.add(writer, row)
+            for row, row_progress in rows:
+                folder.add(writer, row, row_progress)
 
     _finish_increment(folder, source, counters)
     _log_increment(name, counters, folder.manifest)
@@ -352,19 +352,20 @@ def _raw_folder_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLayou
 
 
 UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop consuming once `wanted` rows are kept
+StoredRow = tuple[Row, RowProgress]  # a row ready to store, with where the fetch stood right after it
 
 TOKEN_BATCH = 256  # rows tokenized per tokenizer call while downloading
 
 
 class _TokenStep:
     """The token step of a download, fed row by row and batching :data:`TOKEN_BATCH` rows per tokenizer call:
-    ``add(row)`` returns the rows ready to store once a batch is full (else ``[]``), ``flush()`` the rest.
+    ``add(row, progress)`` returns the rows ready to store once a batch is full (else ``[]``), ``flush()`` the rest;
+    every returned row comes with the :class:`RowProgress` right after it.
 
     Pretrain rows: ``text_field`` is truncated at token ``max_tokens`` (``truncation.py``) and ``tokens`` is the
     true count of the stored text. Instruct rows: ``tokens`` counts instruction + input + output uncapped; a row over
-    ``max_tokens`` is dropped (``counters.dropped_too_long``), never cut. Every stored row's
-    :data:`ROW_PROGRESS_KEY` gets the drop count of the rows before it (exact per row, so a resume never double
-    counts).
+    ``max_tokens`` is dropped (``counters.dropped_too_long``), never cut, and every stored row's progress carries the
+    drop count of the rows before it (exact per row, so a resume never double counts).
     """
 
     def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _FetchCounters) -> None:
@@ -373,39 +374,40 @@ class _TokenStep:
         self._counters = counters
         self._is_instruct = source.kind == "instruct"
         self._text_field = source.text_field
-        self._batch: list[Row] = []
+        self._batch: list[StoredRow] = []
 
-    def add(self, row: Row, at_most: int | None = None) -> list[Row]:
-        """Buffer ``row``; a full batch — :data:`TOKEN_BATCH` rows, or ``at_most`` rows when that is smaller (the rows
-        an instruct download still needs, so it stops exactly at its target) — is released."""
-        self._batch.append(row)
-        batch_size = TOKEN_BATCH if at_most is None else min(TOKEN_BATCH, max(at_most, 1))
-        return self.flush() if len(self._batch) >= batch_size else []
+    @property
+    def pending(self) -> int:
+        """Rows buffered for the next tokenizer call."""
+        return len(self._batch)
 
-    def flush(self) -> list[Row]:
+    def add(self, row: Row, progress: RowProgress) -> list[StoredRow]:
+        """Buffer ``row``; a full batch (:data:`TOKEN_BATCH` rows) is released."""
+        self._batch.append((row, progress))
+        return self.flush() if len(self._batch) >= TOKEN_BATCH else []
+
+    def flush(self) -> list[StoredRow]:
         batch, self._batch = self._batch, []
         if not batch:
             return []
         return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
 
-    def _truncate_pretrain_rows(self, batch: list[Row]) -> list[Row]:
-        texts = [text_or_empty(row.get(self._text_field)) for row in batch]
-        for row, text, (cut, tokens) in zip(batch, texts, self._counter.truncate_many(texts, self._max_tokens), strict=True):
+    def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
+        texts = [text_or_empty(row.get(self._text_field)) for row, _ in batch]
+        for (row, _), text, (cut, tokens) in zip(batch, texts, self._counter.truncate_many(texts, self._max_tokens), strict=True):
             if cut != text:
                 row[self._text_field] = cut
             row["tokens"] = tokens
         return batch
 
-    def _drop_long_instruct_rows(self, batch: list[Row]) -> list[Row]:
-        stored: list[Row] = []
-        for row, tokens in zip(batch, self._counter.count_many([instruct_text(row) for row in batch]), strict=True):
+    def _drop_long_instruct_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
+        stored: list[StoredRow] = []
+        for (row, before), tokens in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
             if tokens > self._max_tokens:
                 self._counters.dropped_too_long += 1
                 continue
             row["tokens"] = tokens
-            progress: RowProgress = row[ROW_PROGRESS_KEY]
-            row[ROW_PROGRESS_KEY] = progress._replace(dropped_too_long=self._counters.dropped_too_long)
-            stored.append(row)
+            stored.append((row, RowProgress(before.consumed, before.skipped_malformed, self._counters.dropped_too_long)))
         return stored
 
 
@@ -420,15 +422,17 @@ def _fetch_rows(
     layout: DatasetLayout,
     bar: Progress,
     token_step: _TokenStep,
-) -> Iterator[Row]:
-    """Rows to store for one download increment from **one** loader call: pretrain rows are all kept, so the loader
-    is asked for exactly ``wanted``; instruct rows may be dropped by the filter, the converter or the token step, so
-    the loader is asked for everything up to ``max_consume`` (or without bound) and consumption stops — closing the
-    loader's generator — as soon as ``wanted`` rows are kept (the token step's last batch is sized to the remaining
-    need; a second call would re-stream the file prefix). Everything a loader yields is kept — it may finish a
-    remote row group beyond ``count``. The
-    source is exhausted when the loader ran dry before ``wanted`` was reached, or ``max_consume`` was. ``bar`` tracks
-    kept rows (postfix: source rows consumed, current repo file, MB read remotely)."""
+) -> Iterator[StoredRow]:
+    """Rows to store for one download increment from **one** loader call, each with the progress right after it.
+    Pretrain rows are all kept, so the loader is asked for exactly ``wanted`` (or the consume budget when that is
+    smaller) and everything it yields is stored — a remote loader may finish its row group beyond the count. Instruct
+    rows may be dropped by the filter, the converter or the token step, so the loader is asked for everything up to
+    ``max_consume`` (or without bound) and consumption stops — closing the loader's generator — as soon as
+    ``wanted`` rows are kept (the token step is flushed early when its buffered rows would meet the target, so the
+    download stops exactly there; a second call would re-stream the file prefix). Either way consumption stops at
+    ``max_consume`` source rows (``check_limit``), whatever the loader yields beyond its count. The source is
+    exhausted when the loader ran dry before ``wanted`` was reached, or ``max_consume`` was. ``bar`` tracks kept rows (postfix: source
+    rows consumed, current repo file, MB read remotely)."""
     loader = get_loader(source.loader)
     is_instruct = source.kind == "instruct"
     converter = get_converter(source) if is_instruct else None
@@ -446,16 +450,15 @@ def _fetch_rows(
     if is_instruct:
         count = UNBOUNDED_COUNT if consume_budget is None else consume_budget
     else:
-        count = wanted
-    rows: Generator[Row, None, None] = _bounded(
-        loader(
-            source, offset + counters.consumed, count, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns,
-            on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
-        ),
-        consume_budget,
+        count = wanted if consume_budget is None else min(wanted, consume_budget)
+    rows = loader(
+        source, offset + counters.consumed, count, token=hf_token, index_dir=layout.hub_index_dir(), columns=columns,
+        on_file=postfix.on_file, stats=fetch_stats, align_to_row_group=True,
     )
     try:
         for raw in rows:
+            if max_consume is not None and counters.consumed >= max_consume:
+                break  # `check_limit` bounds the source rows consumed, whatever the loader yields beyond its count
             counters.consumed += 1
             postfix.consumed(counters.consumed)
 
@@ -470,21 +473,25 @@ def _fetch_rows(
                     continue
             else:
                 row = text_row(source, raw, name)
-            row[ROW_PROGRESS_KEY] = RowProgress(counters.consumed, counters.skipped_malformed, 0)
-            yield from _kept(token_step.add(row, wanted - counters.kept if is_instruct else None), counters, bar)
+            released = token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0))
+            if is_instruct and not released and counters.kept + token_step.pending >= wanted:
+                released = token_step.flush()  # the buffered rows would meet the target: stop exactly at it
+            yield from _kept(released, counters, bar)
             if is_instruct and counters.kept >= wanted:
                 return  # enough: stop pulling (the finally closes the loader)
         yield from _kept(token_step.flush(), counters, bar)
         if counters.kept < wanted:
             counters.exhausted = True  # the loader ran dry (or `max_consume` was reached) before `wanted` rows were kept
     finally:
-        rows.close()
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
 
 
-def _kept(stored: list[Row], counters: _FetchCounters, bar: Progress) -> Iterator[Row]:
+def _kept(stored: list[StoredRow], counters: _FetchCounters, bar: Progress) -> Iterator[StoredRow]:
     """The rows the token step released, counted as kept as they go to the writer."""
-    for row in stored:
-        yield row
+    for pair in stored:
+        yield pair
         counters.kept += 1
         bar.update(1)
 
@@ -576,8 +583,7 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
             member = by_name[name]
             member.counters.consumed += 1
             row = text_row(member.source, raw, name)
-            row[ROW_PROGRESS_KEY] = RowProgress(member.counters.consumed, 0, 0)
-            _store(member, writers[name], member.token_step.add(row))
+            _store(member, writers[name], member.token_step.add(row, RowProgress(member.counters.consumed, 0, 0)))
             postfix.consumed(consumed_total)
             bar.update(1)
         for member in members:
@@ -587,9 +593,9 @@ def _fetch_group(members: list[_GroupMember], layout: DatasetLayout, shard_size:
             member.counters.exhausted = True
 
 
-def _store(member: _GroupMember, writer: ShardWriter, stored: list[Row]) -> None:
-    for row in stored:
-        member.folder.add(writer, row)
+def _store(member: _GroupMember, writer: ShardWriter, stored: list[StoredRow]) -> None:
+    for row, row_progress in stored:
+        member.folder.add(writer, row, row_progress)
         member.counters.kept += 1
 
 
@@ -644,21 +650,3 @@ def loader_columns(source: SourceConfig) -> list[str] | None:
     if source.kind == "instruct" or get_converter(source) is not None:
         return None
     return [source.text_field]
-
-
-def _bounded(rows: Iterator[Row], limit: int | None) -> Generator[Row, None, None]:
-    """``rows`` up to ``limit`` (None: all), closing the loader's generator when stopping early."""
-    if limit is None:
-        yield from rows
-        return
-    taken = 0
-    try:
-        for row in rows:
-            if taken >= limit:
-                return
-            yield row
-            taken += 1
-    finally:
-        close = getattr(rows, "close", None)
-        if close is not None:
-            close()

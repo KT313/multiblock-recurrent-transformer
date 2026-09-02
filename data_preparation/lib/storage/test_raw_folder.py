@@ -17,7 +17,6 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import (
-    ROW_PROGRESS_KEY,
     RawFolder,
     RowProgress,
 )
@@ -97,7 +96,7 @@ def test_appending_records_offset_and_reject_counters_per_shard(tmp_path: Path) 
     folder = RawFolder(tmp_path, _manifest(rows_fetched=100, skipped_malformed=5, dropped_too_long=1))
     with ShardWriter(tmp_path, 2, start_shard=0, on_shard=folder.record_shard) as writer:
         for consumed, skipped, dropped in ((3, 1, 0), (6, 1, 2), (9, 4, 2), (11, 4, 3)):
-            folder.add(writer, {"text": "x", "tokens": 1, ROW_PROGRESS_KEY: RowProgress(consumed, skipped, dropped)})
+            folder.add(writer, {"text": "x", "tokens": 1}, RowProgress(consumed, skipped, dropped))
     folder.finish(RowProgress(12, 4, 3), exhausted=False)
 
     stored = Manifest.load(tmp_path)
@@ -109,7 +108,7 @@ def test_appending_records_offset_and_reject_counters_per_shard(tmp_path: Path) 
 def test_record_shard_checks_the_stop_request(tmp_path: Path) -> None:
     folder = RawFolder(tmp_path, _manifest(), should_stop=lambda: True)
     with pytest.raises(BuildAborted), ShardWriter(tmp_path, 1, start_shard=0, on_shard=folder.record_shard) as writer:
-        folder.add(writer, {"text": "x", "tokens": 1, ROW_PROGRESS_KEY: RowProgress(1, 0, 0)})
+        folder.add(writer, {"text": "x", "tokens": 1}, RowProgress(1, 0, 0))
     stored = Manifest.load(tmp_path)
     assert stored is not None and stored.rows() == 1, "the shard is published and recorded before the stop"
 
