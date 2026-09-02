@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
+from rich.text import Text
 
-from ui.display import LiveDisplay, line
+from ui.display import LiveDisplay, ResizeAwareLive, line
 from ui.testing import console_output, screen_text, string_console
 
 
@@ -111,3 +112,47 @@ def test_line_never_wraps_and_keeps_markup_literal() -> None:
         console.print(Group(line("[bold]x[/bold] " + "y" * 40, style="dim")))
     (rendered,) = capture.get().splitlines()
     assert rendered.startswith("[bold]x[/bold] yyy") and rendered.endswith("…") and len(rendered) == 20
+
+
+# --- the display after a terminal resize -------------------------------------------------------------------------------
+
+
+def _clears(console: Console) -> int:
+    return console_output(console).count("\x1b[2J\x1b[H")
+
+
+def test_a_frame_for_a_new_terminal_size_is_preceded_by_a_clear_screen() -> None:
+    console = string_console(80, height=24)
+    live = ResizeAwareLive(Text("frame"), console=console, auto_refresh=False, transient=True)
+    live.start(refresh=True)
+    live.refresh()
+    assert _clears(console) == 0 and "\x1b[2J" not in console_output(console), "the same size: rich's cursor-up erase"
+    console.size = (60, 20)
+    live.refresh()
+    assert _clears(console) == 1
+    assert console_output(console).rstrip().endswith("\x1b[2J\x1b[Hframe"), "the clear comes right before the frame"
+    live.refresh()
+    assert _clears(console) == 1, "the size is now the frame's: cursor-up erase again"
+    live.stop()
+    assert screen_text(console, 60) == "", "transient: the frame is gone"
+
+
+def test_a_non_interactive_console_never_clears() -> None:
+    console = Console(file=io.StringIO(), force_terminal=False, width=80, height=24)
+    live = ResizeAwareLive(Text("frame"), console=console, auto_refresh=False, transient=True)
+    live.start(refresh=True)
+    console.size = (60, 20)
+    live.refresh()
+    live.stop()
+    assert "\x1b[2J" not in console_output(console)
+
+
+def test_the_display_of_a_dashboard_redraws_after_a_resize(display: MinimalDisplay) -> None:
+    console = display._console
+    live = _live_of(display)
+    assert live is not None
+    live.refresh()
+    console.size = (100, 30)
+    live.refresh()
+    assert _clears(console) == 1
+    assert screen_text(console, 100).count("header") == 1, "one frame on the screen: the old one is wiped"

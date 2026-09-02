@@ -199,6 +199,20 @@ def test_short_terminal_shrinks_the_log_panel_then_the_events_panel(clock: FakeC
     assert "event 7" in shorter and "event 4" in shorter and "event 3" not in shorter, "then the events panel shrinks"
 
 
+def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen(clock: FakeClock) -> None:
+    console = string_console(120, height=40)
+    with live_board("tiny-run", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), console=console, clock=clock) as b:
+        live = _live_of(b)
+        assert live is not None
+        live.refresh()
+        assert "\x1b[2J" not in console_output(console), "the same size: the previous frame is erased with cursor-up"
+        console.size = (100, 30)
+        live.refresh()
+        live.refresh()
+        assert console_output(console).count("\x1b[2J\x1b[H") == 1, "one clear per size change, right before the frame"
+        assert screen_text(console, 100).count("tiny-run") == 1, "one frame on the screen: no leftovers of the wider one"
+
+
 # --- log lines and kept records ------------------------------------------------------------------------------------------------
 
 

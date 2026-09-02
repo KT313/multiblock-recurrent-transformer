@@ -9,6 +9,14 @@ A subclass renders the frame (``__rich_console__``, under ``_lock``), opens and 
 capture) and hands the streams back and forth around a prompt (:meth:`LiveDisplay._release_streams` /
 :meth:`LiveDisplay._redirect_streams`). Every mutation and every render holds ``_lock``: the caller's threads write,
 the Live thread reads.
+
+The display survives a terminal resize (:class:`ResizeAwareLive`): rich re-reads the terminal size at every refresh,
+so the next frame already fits the new size; what breaks is the erase of the previous frame, which rich does by
+moving the cursor up as many lines as that frame had — after a resize the terminal has wrapped or reflowed those
+lines, the count is wrong and the new frame lands over leftovers. A frame drawn for a size other than the previous
+frame's is therefore preceded by a clear-screen + cursor-home instead: it starts at the top of a clean screen, and
+every frame after it is erased correctly again. The check runs on the refresh timer (no ``SIGWINCH`` handler, so
+it works from any thread and in tests); its one visible cost is that a resize wipes what stood above the frame.
 """
 
 from __future__ import annotations
@@ -18,17 +26,38 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
-from rich.console import Console, ConsoleOptions, RenderResult
+from rich.console import Console, ConsoleDimensions, ConsoleOptions, ConsoleRenderable, RenderResult
+from rich.control import Control
 from rich.live import Live
 from rich.panel import Panel
+from rich.segment import ControlType
 from rich.text import Text
 
 
 def line(text: str, style: str = "") -> Text:
     """One terminal row: never wraps, cropped with an ellipsis; markup in ``text`` is not interpreted."""
     return Text(text, style=style, no_wrap=True, overflow="ellipsis")
+
+
+class ResizeAwareLive(Live):
+    """``rich.live.Live`` whose frame is redrawn from a cleared screen when the terminal size changed since the
+    previous frame (the module docstring says why); otherwise rich's own cursor-up erase is kept."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._frame_size: ConsoleDimensions | None = None  # the terminal size the previous frame was drawn for
+
+    def process_renderables(self, renderables: list[ConsoleRenderable]) -> list[ConsoleRenderable]:
+        renderables = super().process_renderables(renderables)  # interactive: [erase the previous frame, ..., the frame]
+        if not self.console.is_interactive:
+            return renderables
+        size = self.console.size
+        if self._frame_size is not None and size != self._frame_size:
+            renderables[0] = Control(ControlType.CLEAR, ControlType.HOME)
+        self._frame_size = size
+        return renderables
 
 
 class LiveDisplay:
@@ -56,7 +85,7 @@ class LiveDisplay:
     # --- the display ------------------------------------------------------------------------------------------------
 
     def _start_live(self) -> None:
-        self._live = Live(
+        self._live = ResizeAwareLive(
             self,
             console=self._console,
             refresh_per_second=self._refresh_per_second,

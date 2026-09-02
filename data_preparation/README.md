@@ -350,7 +350,8 @@ step, elapsed), a **downloads** panel (one row per running download — rows kep
 consumed, current repo file, MB read — and a summary line: jobs done, rows of the round, MB, elapsed), a **builds**
 panel (one row per running build — raw rows processed, current raw shard — plus its summary line), the **log**
 panel with the latest lines, and a footer naming `dataset/build.log` (every log line goes there). Finished rows
-disappear into the summary; at most eight rows are shown per panel ("… and k more"). Nothing else reaches the
+disappear into the summary; at most eight rows are shown per panel ("… and k more"). Resizing the terminal redraws
+the frame from a cleared screen (both dashboards; `ui/display.py`). Nothing else reaches the
 terminal while the display is up: every `logging` record (the HuggingFace libraries' included), `warnings` and
 stray prints land in the log panel, the libraries' own bars are silenced. Warnings and the tables (plan, repair,
 status) are *kept* and printed once, unwrapped, after the display closed — the scrollback of a run is those lines

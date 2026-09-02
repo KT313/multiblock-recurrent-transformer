@@ -3,7 +3,8 @@
 panel, the **log** panel, a footer — and nothing else on the terminal while it is up.
 
 A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` (the live display, the log panel, the kept lines,
-``suspended``) with exactly one ``rich.live.Live`` display on stderr. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
+``suspended``) with exactly one ``rich.live.Live`` display on stderr, redrawn from a cleared screen after a terminal
+resize. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
 task (bounded: at most ``max_rows`` rows plus "… and k more"), finished rows disappear and are counted in the
 panel's summary line (jobs done, rows done / wanted, MB read, elapsed), which is updated in place. All updates from
 worker threads go through one lock; the display refreshes on its own timer.

@@ -30,8 +30,8 @@ def strip_ansi(text: str) -> str:
 
 
 class Screen:
-    """A minimal terminal emulator (CR, LF, cursor up/down, erase line, SGR ignored) with unbounded scrollback:
-    what the dashboard's control codes leave on the screen, as a real terminal would show it."""
+    """A minimal terminal emulator (CR, LF, cursor up/down, home, erase line / screen, SGR ignored) with unbounded
+    scrollback: what the dashboard's control codes leave on the screen, as a real terminal would show it."""
 
     _CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
 
@@ -72,8 +72,16 @@ class Screen:
                     else:
                         line.clear()
                 elif command == "J":
-                    del self.lines[self.row + 1 :]
-                    del self._line(self.row)[self.col :]
+                    if params == "2":  # erase the whole screen (the cursor stays)
+                        for line in self.lines:
+                            line.clear()
+                    else:
+                        del self.lines[self.row + 1 :]
+                        del self._line(self.row)[self.col :]
+                elif command == "H":  # cursor to `row;col` (1-based), the top left by default
+                    row, _, col = params.partition(";")
+                    self.row, self.col = max(int(row or 1) - 1, 0), max(int(col or 1) - 1, 0)
+                    self._line(self.row)
                 i = match.end()
                 continue
             if ch == "\r":

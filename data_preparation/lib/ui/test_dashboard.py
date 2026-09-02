@@ -453,6 +453,20 @@ def _live_of(board: DataDashboard) -> Live | None:
     return board._live  # through a call: mypy would otherwise keep the narrowing of an earlier assertion
 
 
+def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen() -> None:
+    console = Console(file=io.StringIO(), force_terminal=True, width=120, height=40)
+    with DataDashboard(title="prepare tiny", enabled=True, console=console, refresh_per_second=50) as board:
+        live = _live_of(board)
+        assert live is not None
+        live.refresh()
+        assert "\x1b[2J" not in console_output(console), "the same size: the previous frame is erased with cursor-up"
+        console.size = (100, 30)
+        live.refresh()
+        live.refresh()
+        assert console_output(console).count("\x1b[2J\x1b[H") == 1, "one clear per size change, right before the frame"
+        assert screen_text(console, 100).count("prepare tiny") == 1, "one frame on the screen: no leftovers of the wider one"
+
+
 # --- the whole thing: threads, refreshes, scrollback ------------------------------------------------------------------------
 
 

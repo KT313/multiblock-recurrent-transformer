@@ -8,7 +8,8 @@ Built on ``rich``, the sibling of ``data_preparation/lib/ui/dashboard.py``: both
 :class:`ui.display.LiveDisplay` (the live display, the log panel, the kept lines, ``suspended``) and share the console
 capture of ``ui/capture.py`` (the line sinks, the log handler, ``attach_logger`` and the logging / stream captures).
 A :class:`~training.ui.board.TrainingDashboard` owns exactly
-one *transient* ``rich.live.Live`` display on stdout that renders, top to bottom: a header (run name, model / dataset
+one *transient* ``rich.live.Live`` display on stdout (redrawn from a cleared screen after a terminal resize) that
+renders, top to bottom: a header (run name, model / dataset
 config names, device / precision, the current status), one progress bar per training stage plus an overall bar
 (optimizer steps, ETA from a smoothed steps-per-second estimate), a table with the metrics of the latest optimizer
 step, the latest validation losses per recurrence depth, the last few events (checkpoints, resume point, stage
