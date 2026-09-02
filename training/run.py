@@ -9,6 +9,7 @@
     build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
     build_run_model                   architecture yaml + overrides, block-size check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
+    RunState                          the objects above in one place for the helpers below
     restore_checkpoint_if_resuming    latest / explicit checkpoint -> model, optimizer, RNG state, progress
     loop                              run_one_optimizer_step -> advance -> evaluate -> log -> checkpoint (or stop)
     export_if_requested               the HuggingFace folder, once training finished
@@ -36,7 +37,7 @@ in `logger.py` (its `close()` builds it) and re-exported here.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,33 @@ from training.run_lock import run_directory_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
+
+
+@dataclass(frozen=True)
+class RunState:
+    """The run once it is set up: what the setup helpers produced, handed to `restore_checkpoint_if_resuming`,
+    `save_run_checkpoint` and `export_if_requested` as one argument. Built once in `train()` (after the optimizer,
+    the last of the setup order — the order itself is numerics, see the module docstring); every member keeps its
+    identity for the whole run, `progress` is the one whose content moves (a resume sets its step, the loop
+    advances it)."""
+
+    settings: Settings
+    run_directory: Path
+    backend: Backend
+    model: Module
+    optimizer: Optimizer
+    dataset: ResolvedDataset
+    stage_manager: StageManager
+    progress: TrainingProgress
+
+
+@dataclass(frozen=True)
+class ResumePoint:
+    """Where a resumed run continues from: the checkpoint it was restored from and the data-stream state stored in
+    it (None in a checkpoint written before the stream existed), for `BatchStream.load_state_dict`."""
+
+    checkpoint: Path
+    data_stream: dict[str, Any] | None
 
 
 def train(
@@ -106,9 +134,9 @@ def train(
         try:
             model = build_run_model(settings, backend, run_directory)
             optimizer = build_run_optimizer(settings, model, backend)
-            progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
-                settings, run_directory, backend, model, optimizer, dataset
-            )
+            state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
+            resume = restore_checkpoint_if_resuming(state)
+            progress = state.progress
 
             with RunLogger.open(
                 settings,
@@ -121,14 +149,14 @@ def train(
                 setup_started=started_at,
                 keep_history=keep_history,
             ) as logger:
-                if resumed_from is None:
+                if resume is None:
                     record_run_config(settings, run_directory)
                     logger.log_fresh_start()
                 else:
-                    logger.log_resume(resumed_from, progress.step)
+                    logger.log_resume(resume.checkpoint, progress.step)
                 batches = BatchStream(settings, loaders, stage_manager, progress)
-                if data_stream_state is not None:
-                    batches.load_state_dict(data_stream_state)
+                if resume is not None and resume.data_stream is not None:
+                    batches.load_state_dict(resume.data_stream)
                 logger.status("training")
                 stopped = False
                 while progress.step < stage_manager.total_steps and not stopped:
@@ -146,11 +174,8 @@ def train(
                     if stopped:
                         logger.status("stopping after this step, saving a checkpoint")
                     if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
-                        save_run_checkpoint(
-                            settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress,
-                            logger, batches,
-                        )
-                export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
+                        save_run_checkpoint(state, logger, batches)
+                export_dir = None if stopped else export_if_requested(state, logger)
                 return logger.close(progress, export_dir, stopped=stopped)
         finally:
             loaders.close()  # the loader workers stop now, on every way out, not when the GC finds the iterators
@@ -228,41 +253,34 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
     return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, settings.optim_config))
 
 
-def restore_checkpoint_if_resuming(
-    settings: Settings,
-    run_directory: Path,
-    backend: Backend,
-    model: Module,
-    optimizer: Optimizer,
-    dataset: ResolvedDataset,
-) -> tuple[TrainingProgress, Path | None, dict[str, Any] | None]:
-    """The progress to start at, the checkpoint it was restored from and the data-stream state stored in it (None,
-    None: a fresh run at step 0).
+def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
+    """Restore the run from its checkpoint when it resumes, and say where from; None for a fresh run at step 0
+    (`state.progress` untouched).
 
     With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` under the run
     directory; a run without one starts fresh. Loading restores the model and optimizer state, verifies the dataset
     against the checkpoint (`check_dataset_unchanged`: config hash and validation split), restores the RNG state
     (numerics: the stored state includes the evaluation draws of the checkpoint's step) and sets
-    `progress.step = progress.resume_step = checkpoint step` — the resume warmup derives from it. The data-stream
-    state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the draw RNG, which
-    the stream would otherwise re-seed with `seed + resume step`).
+    `progress.step = progress.resume_step = checkpoint step` — the resume warmup derives from it. The returned
+    data-stream state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the draw RNG,
+    which the stream would otherwise re-seed with `seed + resume step`).
     """
-    progress = TrainingProgress()
+    settings = state.settings
     if not settings.resume:
-        return progress, None, None
+        return None
     if settings.resume_checkpoint_path:
         resume_path: Path | None = Path(settings.resume_checkpoint_path)
     else:
-        resume_path = find_latest_checkpoint(run_directory, settings.run_name)
+        resume_path = find_latest_checkpoint(state.run_directory, settings.run_name)
     if resume_path is None:
-        return progress, None, None
-    metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
-    check_dataset_unchanged(metadata, dataset, settings.allow_dataset_change)
-    model_config = plain_model(model).config.to_dict()
+        return None
+    metadata = load_training_checkpoint(state.backend, resume_path, state.model, state.optimizer)
+    check_dataset_unchanged(metadata, state.dataset, settings.allow_dataset_change)
+    model_config = plain_model(state.model).config.to_dict()
     check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
-    progress.step = progress.resume_step = metadata.step
-    backend.set_rng_state(metadata.rng)
-    return progress, resume_path, metadata.data_stream
+    state.progress.step = state.progress.resume_step = metadata.step
+    state.backend.set_rng_state(metadata.rng)
+    return ResumePoint(resume_path, metadata.data_stream)
 
 
 # --- inside the loop -------------------------------------------------------------------------------------------------
@@ -273,59 +291,48 @@ def stop_requested(should_stop: StopCheck | None) -> bool:
     return should_stop is not None and should_stop()
 
 
-def save_run_checkpoint(
-    settings: Settings,
-    run_directory: Path,
-    backend: Backend,
-    model: Module,
-    optimizer: Optimizer,
-    dataset: ResolvedDataset,
-    stage_manager: StageManager,
-    progress: TrainingProgress,
-    logger: RunLogger,
-    batches: BatchStream,
-) -> None:
-    """Write the checkpoint of `progress.step` completed optimizer steps and tell the logger (the status reads
+def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> None:
+    """Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger (the status reads
     `saving checkpoint` meanwhile, the path becomes a dashboard event).
 
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
     step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is heading for at `done`
-    (`StageManager.entering_stage_at`: the one it enters when written as a transition starts). Numerics: called after evaluation and logging of the step, so the
-    stored RNG state includes the evaluation draws; `batches.state_dict()` adds the rows the run has consumed per
-    source, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
-    does not promise).
+    (`StageManager.entering_stage_at`: the one it enters when written as a transition starts). Numerics: called
+    after evaluation and logging of the step, so the stored RNG state includes the evaluation draws;
+    `batches.state_dict()` adds the rows the run has consumed per source, so a resume trains on rows it has not seen
+    (`BatchStream.load_state_dict` says what that does and does not promise).
     """
+    settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
     stage_end = stage_manager.stage_ending_at(progress.step - 1)
-    path = checkpoint_path(run_directory, settings.run_name, progress.step, stage_end)
+    path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end)
     metadata = CheckpointMetadata(
         step=progress.step,
         stage=stage_manager.entering_stage_at(progress.step),
-        rng=backend.rng_state(),
+        rng=state.backend.rng_state(),
         settings=asdict(settings),
-        model_config=plain_model(model).config.to_dict(),
-        dataset_config_hash=dataset.config_hash,
-        validation_rows=dataset.validation_rows,
+        model_config=plain_model(state.model).config.to_dict(),
+        dataset_config_hash=state.dataset.config_hash,
+        validation_rows=state.dataset.validation_rows,
         data_stream=batches.state_dict(),
     )
     with logger.saving_checkpoint():
-        save_training_checkpoint(backend, path, model, optimizer, metadata)
+        save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
     logger.log_checkpoint(path)
 
 
 # --- after the loop --------------------------------------------------------------------------------------------------
 
 
-def export_if_requested(
-    settings: Settings, run_directory: Path, model: Module, dataset: ResolvedDataset, logger: RunLogger
-) -> Path | None:
+def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
     """With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`) from
     the unwrapped model and the dataset's tokenizer, tell the logger (status `exporting`, then the export event) and
     return the folder; None otherwise."""
+    settings = state.settings
     if not settings.export_to_hf:
         return None
-    export_dir = Path(settings.export_hf_path) if settings.export_hf_path else run_directory / "hf_export"
+    export_dir = Path(settings.export_hf_path) if settings.export_hf_path else state.run_directory / "hf_export"
     logger.status("exporting")
-    trained = plain_model(model)
-    export_to_hf(trained, trained.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
+    trained = plain_model(state.model)
+    export_to_hf(trained, trained.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir
