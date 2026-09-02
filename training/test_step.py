@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
-from training.data.loader import RunDataloaders, SampleBatch, build_dataloader, build_run_dataloaders
+from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import DataEntry, resolve_dataset
 from training.data.datasets import Row
@@ -363,7 +363,7 @@ def _stream_setup(
     settings = parse_settings(
         ["--config", str(yaml_path), "--micro_batch_size", str(batch_size)]  # 4 / batch_size micro-batches per step
     )
-    loaders = RunDataloaders(list("abc"), [_Repeat(t, batch_size) for t in "abc"], [], tokenizer)
+    loaders = RunDataloaders({t: _Repeat(t, batch_size) for t in "abc"}, [], tokenizer, {})
     return settings, loaders, _abc_stage_manager(settings)
 
 
@@ -412,7 +412,7 @@ def test_batch_stream_draw_rng_is_seeded_with_the_start_step(
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
 
     def mix(start_step: int) -> list[str]:
-        loaders = RunDataloaders(list("abc"), [_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
+        loaders = RunDataloaders({tag: _Repeat(tag) for tag in "abc"}, [], stream_tokenizer, {})
         progress = TrainingProgress(step=start_step)
         stream = BatchStream(settings, loaders, stage_manager, progress)
         progress.step = 15
@@ -450,7 +450,7 @@ def test_batch_stream_fills_the_world_batch_from_short_worker_batches(
     holds one and carrying leftover samples over in the buffer."""
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
     assert (settings.gradient_accumulation_steps, settings.world_batch_size) == (2, 4)
-    loaders = RunDataloaders(list("abc"), [_ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"], [], stream_tokenizer)
+    loaders = RunDataloaders({tag: _ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"}, [], stream_tokenizer, {})
     progress = TrainingProgress()
     stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(6):
@@ -489,7 +489,7 @@ def test_batch_stream_state_round_trip(tmp_path: Path, tiny_dataset_dir: Path, s
     state = stream.state_dict()
     continued = _tags(stream, 12)
 
-    fresh_loaders = RunDataloaders(list("abc"), [_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
+    fresh_loaders = RunDataloaders({tag: _Repeat(tag) for tag in "abc"}, [], stream_tokenizer, {})
     resumed = BatchStream(settings, fresh_loaders, stage_manager, TrainingProgress(step=15))
     resumed.load_state_dict(state)
     assert resumed.state_dict()["consumed_rows"] == state["consumed_rows"]
@@ -506,13 +506,13 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    parquet = loaders.train_dataset("synthetic_pretrain")
-    assert parquet is not None
+    parquet = loaders.datasets["synthetic_pretrain"]
     state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate()}
     stream.load_state_dict(state)
-    assert parquet.resume_offset == 5  # wrapped around one epoch
-    other = loaders.train_dataset("synthetic_instruct")
-    assert other is not None and other.resume_offset == 0  # untouched sources stay at the start
+    assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
+    next(stream)  # stage 0 draws from the pretrain source only: its reader starts now
+    assert parquet.resume_offset == 5 and loaders.pending_offsets == {}  # wrapped around one epoch
+    assert loaders.datasets["synthetic_instruct"].resume_offset == 0  # untouched sources stay at the start
 
 
 def test_batch_stream_resume_does_not_repeat_rows(
@@ -561,8 +561,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    pretrain = loaders.train_dataset("synthetic_pretrain")
-    assert pretrain is not None
+    pretrain = loaders.datasets["synthetic_pretrain"]
     steps = 13  # well into stage 1 (the boundary is step 8), before the transition into finetune (step 14)
     assert steps * settings.world_batch_size <= pretrain.num_rows, "fixture too small to distinguish from a wrap"
     seen: list[tuple[int, ...]] = []
@@ -633,12 +632,10 @@ def _drop_survivors(rows_read: int) -> int:
 
 class _RecordingLoader:
     """Forwards a real (unpadded) train DataLoader's `WorkerBatch`es while recording every sample and row count that
-    passed through; exposes `dataset` so `RunDataloaders.train_dataset` still reaches the parquet dataset behind
-    it (which is where a resume's row offsets land)."""
+    passed through."""
 
     def __init__(self, loader: DataLoader[Row]) -> None:
         self.loader = loader
-        self.dataset = loader.dataset
         self.rows_read = 0
         self.seen: list[Sample] = []
 
@@ -660,15 +657,10 @@ def _drop_stage_manager(settings: Settings) -> StageManager:
 
 def _drop_stream(settings: Settings, data_dir: Path, tokenizer: Tokenizer) -> tuple[BatchStream, _RecordingLoader]:
     """A stream over one drop-heavy source (single shard, in-process, unsorted): rows are read in range order."""
-    loader = build_dataloader(
-        [DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE)],
-        tokenizer,
-        DROP_BLOCK_SIZE,
-        settings.micro_batch_size,
-        padded=False,
-    )
+    parquet = entry_dataset(DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE))
+    loader = dataloader_over(parquet, tokenizer, DROP_BLOCK_SIZE, settings.micro_batch_size, padded=False)
     recording = _RecordingLoader(loader)
-    loaders = RunDataloaders(["drop"], [recording], [], tokenizer)
+    loaders = RunDataloaders({"drop": recording}, [], tokenizer, {"drop": parquet})
     return BatchStream(settings, loaders, _drop_stage_manager(settings), TrainingProgress()), recording
 
 

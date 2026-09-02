@@ -3,7 +3,7 @@ import itertools
 import math
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, TypeVar
+from typing import Any, Iterable, TypeVar, cast
 
 import pyarrow.parquet as pq
 import pytest
@@ -17,6 +17,8 @@ from training.data.loader import (
     RunDataloaders,
     build_dataloader,
     build_run_dataloaders,
+    dataloader_over,
+    entry_dataset,
     sample_length,
     world_batch_micro_batches,
 )
@@ -218,7 +220,11 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     assert isinstance(loaders, RunDataloaders)
     assert loaders.train_sources == ["synthetic_pretrain", "synthetic_instruct"]  # dataset-config order
     assert len(loaders.train_loaders) == 2 and len(loaders.val_loaders) == len(dataset.stages) == 3
-    assert all(isinstance(loader, DataLoader) and loader.num_workers == TRAIN_LOADER_NUM_WORKERS for loader in loaders.train_loaders)
+    assert all(isinstance(loader, DataLoader) and loader.num_workers == TRAIN_LOADER_NUM_WORKERS for loader in loaders.train_loaders.values())
+    assert list(loaders.datasets) == loaders.train_sources
+    for source, parquet in loaders.datasets.items():
+        assert isinstance(parquet, ParquetTextDataset) and parquet.prefix == source
+        assert cast(DataLoader[Row], loaders.train_loaders[source]).dataset is parquet
     assert loaders.tokenizer.path == Path(dataset.tokenizer_dir)
     batch = loaders.next_train_batch("synthetic_pretrain")
     samples = batch.samples
@@ -259,24 +265,21 @@ def _first(batch: WorkerBatch) -> int:
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
     """A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
     `check_entry_rows` guarantees at least one training row per source)."""
-    rd = RunDataloaders(["a", "b"], [_tagged("a", 3), _tagged("b", 2)], [], tokenizer)
+    rd = RunDataloaders({"a": _tagged("a", 3), "b": _tagged("b", 2)}, [], tokenizer, {})
     assert [_first(rd.next_train_batch("a")) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
     assert [s[2] for s in rd.next_train_batch("b").samples] == ["b"]
     assert rd._train_iterators["a"] is not None and rd._train_iterators["b"] is not None
 
 
-def test_post_init_creates_one_slot_per_source_and_validates_alignment(tokenizer: Tokenizer) -> None:
-    rd = RunDataloaders(["a", "b", "c"], [_tagged(tag, 1) for tag in "abc"], [], tokenizer)
+def test_post_init_creates_one_slot_per_source_in_order(tokenizer: Tokenizer) -> None:
+    rd = RunDataloaders({tag: _tagged(tag, 1) for tag in "abc"}, [], tokenizer, {})
     assert rd._train_iterators == {"a": None, "b": None, "c": None}
-    assert RunDataloaders([], [], [], tokenizer)._train_iterators == {}
-    with pytest.raises(ValueError, match="unique and aligned"):
-        RunDataloaders(["a", "b"], [_tagged("a", 1)], [], tokenizer)
-    with pytest.raises(ValueError, match="unique and aligned"):
-        RunDataloaders(["a", "a"], [_tagged("a", 1), _tagged("a", 1)], [], tokenizer)
+    assert rd.train_sources == ["a", "b", "c"] and rd.pending_offsets == {}
+    assert RunDataloaders({}, [], tokenizer, {})._train_iterators == {}
 
 
 def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
-    rd = RunDataloaders(["a", "b"], [_tagged("a", 3), _tagged("b", 3)], [], tokenizer)
+    rd = RunDataloaders({"a": _tagged("a", 3), "b": _tagged("b", 3)}, [], tokenizer, {})
     assert rd._train_iterators == {"a": None, "b": None}
     rd.next_train_batch("b")
     assert rd._train_iterators["a"] is None
@@ -284,44 +287,50 @@ def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
     assert _first(rd.next_train_batch("a")) == 0
 
 
-def test_train_dataset_reaches_through_a_real_loader_only(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    rd = RunDataloaders(
-        ["pre", "ft"],
-        [_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries[1:], tokenizer, 2, padded=False)],
-        [],
-        tokenizer,
-    )
-    dataset = rd.train_dataset("pre")
-    assert isinstance(dataset, ParquetTextDataset) and dataset.prefix == "pre"
-    assert RunDataloaders(["a"], [_tagged("a", 1)], [], tokenizer).train_dataset("a") is None  # a plain list of batches
-
-
-def test_set_resume_offsets_and_clear_resume_offset(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    rd = RunDataloaders(
-        ["pre", "ft"],
-        [_loader(entries[:1], tokenizer, 2, padded=False), _loader(entries[1:], tokenizer, 2, padded=False)],
-        [],
-        tokenizer,
-    )
+def test_set_resume_offsets_are_applied_when_the_iterator_starts(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    """The offsets wait in `pending_offsets` and land on a source's dataset right before its first iterator is
+    created; a source without a pending offset starts at 0."""
+    pre, ft = entry_dataset(entries[0]), entry_dataset(entries[1])
+    loaders: dict[str, Iterable[WorkerBatch]] = {
+        "pre": dataloader_over(pre, tokenizer, 64, 2, padded=False),
+        "ft": dataloader_over(ft, tokenizer, 64, 2, padded=False),
+    }
+    rd = RunDataloaders(loaders, [], tokenizer, {"pre": pre, "ft": ft})
     rd.set_resume_offsets({"pre": 3, "gone": 9})  # a name no source has is ignored
-    pre, ft = rd.train_dataset("pre"), rd.train_dataset("ft")
-    assert pre is not None and ft is not None
-    assert (pre.resume_offset, ft.resume_offset) == (3, 0)
-    rd.clear_resume_offset("pre")
-    assert (pre.resume_offset, ft.resume_offset) == (0, 0)
+    assert rd.pending_offsets == {"pre": 3} and (pre.resume_offset, ft.resume_offset) == (0, 0)
+    rd.next_train_batch("pre")
+    assert rd.pending_offsets == {} and pre.resume_offset == 3
+    rd.next_train_batch("ft")
+    assert ft.resume_offset == 0
 
 
 def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
     """The first epoch after a resume starts at the offset; once it ends, the loader reads its whole range again."""
-    entry = DataEntry("pre", str(tiny_pretrain_dir))
+    parquet = entry_dataset(DataEntry("pre", str(tiny_pretrain_dir)))
     total = _rows_in(tiny_pretrain_dir)
-    rd = RunDataloaders(["pre"], [build_dataloader([entry], tokenizer, 64, 1, padded=False)], [], tokenizer)
+    rd = RunDataloaders({"pre": dataloader_over(parquet, tokenizer, 64, 1, padded=False)}, [], tokenizer, {"pre": parquet})
     rd.set_resume_offsets({"pre": total - 2})
     first_epoch = [rd.next_train_batch("pre").samples[0][2] for _ in range(2)]
-    dataset = rd.train_dataset("pre")
-    assert dataset is not None
-    assert first_epoch == ["pre", "pre"] and dataset.resume_offset == 0
+    assert first_epoch == ["pre", "pre"] and parquet.resume_offset == total - 2  # the offset holds for its epoch
     assert len([rd.next_train_batch("pre") for _ in range(total)]) == total  # the restart reads every row
+    assert parquet.resume_offset == 0
+
+
+def test_close_shuts_down_the_worker_iterators(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
+    """`close()` stops the worker processes of every live train iterator right away and forgets the iterators;
+    a fake without workers and a second call are no-ops."""
+    parquet = entry_dataset(DataEntry("pre", str(tiny_pretrain_dir)))
+    loader = dataloader_over(parquet, tokenizer, 64, 1, num_workers=1, padded=False)
+    rd = RunDataloaders({"pre": loader, "fake": _tagged("fake", 2)}, [], tokenizer, {"pre": parquet})
+    rd.next_train_batch("pre")
+    rd.next_train_batch("fake")
+    workers = cast(Any, rd._train_iterators["pre"])._workers  # the worker processes of the live iterator
+    assert all(worker.is_alive() for worker in workers)
+    rd.close()
+    assert rd._train_iterators == {"pre": None, "fake": None}
+    assert not any(worker.is_alive() for worker in workers)
+    rd.close()
+    assert _first(rd.next_train_batch("fake")) == 0  # a fresh iterator after close
 
 
 # --- world_batch_micro_batches ----------------------------------------------------------------------------------------

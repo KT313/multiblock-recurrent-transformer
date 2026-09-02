@@ -374,11 +374,14 @@ def test_resume_offset_starts_the_next_epoch_inside_the_range(small_dir: Path) -
     assert [r["text"] for r in ds] == [f"row {i}" for i in range(7, 23)]
 
 
-def test_resume_offset_is_one_shot(small_dir: Path) -> None:
-    """A permanent offset would hide the rows before it in every later epoch."""
+def test_resume_offset_holds_until_it_is_set_back(small_dir: Path) -> None:
+    """The dataset keeps the offset for every epoch until it is set back to 0 (`RunDataloaders` does that before
+    the second epoch after a resume: a permanent offset would hide the rows before it)."""
     ds = ParquetTextDataset(small_dir, "small")
     ds.set_resume_offset(20)
-    assert len(list(ds)) == 3 and ds.resume_offset == 0
+    assert len(list(ds)) == 3 and ds.resume_offset == 20
+    assert len(list(ds)) == 3
+    ds.set_resume_offset(0)
     assert [r["text"] for r in ds] == [f"row {i}" for i in range(23)]
 
 

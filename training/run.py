@@ -103,52 +103,57 @@ def train(
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
         loaders = build_run_dataloaders(settings, dataset, backend)
-        model = build_run_model(settings, backend, run_directory)
-        optimizer = build_run_optimizer(settings, model, backend)
-        progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
-            settings, run_directory, backend, model, optimizer, dataset
-        )
+        try:
+            model = build_run_model(settings, backend, run_directory)
+            optimizer = build_run_optimizer(settings, model, backend)
+            progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
+                settings, run_directory, backend, model, optimizer, dataset
+            )
 
-        with RunLogger.open(
-            settings,
-            run_directory,
-            dataset,
-            model,
-            stage_manager,
-            progress,
-            backend,
-            setup_started=started_at,
-            keep_history=keep_history,
-        ) as logger:
-            if resumed_from is None:
-                record_run_config(settings, run_directory)
-                logger.log_fresh_start()
-            else:
-                logger.log_resume(resumed_from, progress.step)
-            batches = BatchStream(settings, loaders, stage_manager, progress)
-            if data_stream_state is not None:
-                batches.load_state_dict(data_stream_state)
-            logger.status("training")
-            stopped = False
-            while progress.step < stage_manager.total_steps and not stopped:
-                result = run_one_optimizer_step(settings, backend, model, optimizer, stage_manager, batches, progress)
-                progress.advance()
-                if is_evaluation_step(settings, progress.step, stage_manager):
-                    validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
-                    with logger.evaluating():
-                        result.validation = evaluate(settings, backend, model, validation_loader)
-                logger.log_step(result, progress)
-                # a request arriving during the last step changes nothing: the run is finished, not stopped
-                stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
-                if stopped:
-                    logger.status("stopping after this step, saving a checkpoint")
-                if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
-                    save_run_checkpoint(
-                        settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger,
-                        batches,
+            with RunLogger.open(
+                settings,
+                run_directory,
+                dataset,
+                model,
+                stage_manager,
+                progress,
+                backend,
+                setup_started=started_at,
+                keep_history=keep_history,
+            ) as logger:
+                if resumed_from is None:
+                    record_run_config(settings, run_directory)
+                    logger.log_fresh_start()
+                else:
+                    logger.log_resume(resumed_from, progress.step)
+                batches = BatchStream(settings, loaders, stage_manager, progress)
+                if data_stream_state is not None:
+                    batches.load_state_dict(data_stream_state)
+                logger.status("training")
+                stopped = False
+                while progress.step < stage_manager.total_steps and not stopped:
+                    result = run_one_optimizer_step(
+                        settings, backend, model, optimizer, stage_manager, batches, progress
                     )
-            export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
-            return logger.close(progress, export_dir, stopped=stopped)
+                    progress.advance()
+                    if is_evaluation_step(settings, progress.step, stage_manager):
+                        validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
+                        with logger.evaluating():
+                            result.validation = evaluate(settings, backend, model, validation_loader)
+                    logger.log_step(result, progress)
+                    # a request arriving during the last step changes nothing: the run is finished, not stopped
+                    stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
+                    if stopped:
+                        logger.status("stopping after this step, saving a checkpoint")
+                    if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
+                        save_run_checkpoint(
+                            settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress,
+                            logger, batches,
+                        )
+                export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
+                return logger.close(progress, export_dir, stopped=stopped)
+        finally:
+            loaders.close()  # the loader workers stop now, on every way out, not when the GC finds the iterators
 
 
 # --- setup -----------------------------------------------------------------------------------------------------------
