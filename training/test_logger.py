@@ -28,7 +28,6 @@ from training.logger import (
     TrainingReport,
     _qkv_dims,
     _reverse_engineer_adam_effective_lr,
-    _stage_for_the_bars,
     _to_scalar,
     describe_parameters,
     num_parameters,
@@ -37,14 +36,14 @@ from training.logger import (
 )
 from training.optim import ELLISAdam, get_param_groups
 from training.settings import Settings
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 from training.step import StepResult, TrainingProgress
 from training.test_step import reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import TRAIN_LOG_NAME
 from training.ui.fallback import NoOpDashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 
 def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:
@@ -282,8 +281,8 @@ STEP_KEYS = {
 def two_stage_manager(settings: Settings) -> StageManager:
     """Two stages with a transition between them (stage a: 8 steps, the last 25 % transitioning; stage b: 4 steps)."""
     stages = [
-        TrainingStage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
-        TrainingStage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
+        resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
+        resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
     return StageManager(stages, settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
 
@@ -305,7 +304,6 @@ def fake_result(
         log_ppl=torch.tensor(loss),
         grad_norm=torch.tensor(0.5),
         stage=stage_manager.get_stage_info(step),
-        next_stage=stage_manager.get_stage_info(step + 1),
         data_ids=data_ids if data_ids is not None else ["source_a"] * 4,
         metrics=metrics or {},
         validation=validation,
@@ -316,7 +314,7 @@ def fake_result(
 def resolved(tiny_dataset_config: DatasetConfig) -> ResolvedDataset:
     """Only `config_hash` is read by `RunLogger.open` (the wandb hyperparameters)."""
     return ResolvedDataset(
-        config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}
+        config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}, rows_on_disk={}
     )
 
 
@@ -330,13 +328,16 @@ class RecordingDashboard:
     """A `Dashboard` that records every call (`RunLogger`'s side of the dashboard API, without a display)."""
 
     def __init__(self) -> None:
-        self.steps: list[tuple[int, int, dict[str, object]]] = []  # (step, stage index, the step dict as passed)
+        # (step, stage index, transition progress or None, the step dict as passed)
+        self.steps: list[tuple[int, int, float | None, dict[str, object]]] = []
         self.validations: list[tuple[int, dict[str, object]]] = []
         self.events: list[str] = []
         self.statuses: list[str] = []
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
-        self.steps.append((step, stage_index, dict(metrics)))
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
+        self.steps.append((step, stage_index, transition, dict(metrics)))
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         self.validations.append((step, dict(losses)))
@@ -352,7 +353,7 @@ def string_console_dashboard(stage_manager: StageManager, log_step_interval: int
     """A real `TrainingDashboard` rendering into a StringIO (never entered: no live display, no terminal capture)."""
     return TrainingDashboard(
         "steps",
-        [b.stage_name for b in stage_manager.boundaries],
+        [s.name for s in stage_manager.stages],
         [b.end_step - b.start_step for b in stage_manager.boundaries],
         stage_manager.total_steps,
         details={"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"},
@@ -389,6 +390,7 @@ def open_run_logger(
         dashboard=dashboard if dashboard is not None else RecordingDashboard(),
         clock=clock,
         setup_started=setup_started,
+        keep_history=True,
     )
 
 
@@ -475,11 +477,29 @@ def test_log_step_history_wandb_dict_and_throughput(
         assert metrics["data_composition/source_a"] == 1.0
         assert recorded[done] == metrics and not any(torch.is_tensor(v) for v in recorded[done].values())
     shown = recording(run_logger).steps
-    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0)]
-    for (_, _, step_dict), metrics in zip(shown, run_logger.history.values()):
-        assert step_dict == metrics | {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}  # no transition here
+    assert [(step, stage, transition) for step, stage, transition, _ in shown] == [(1, 0, None), (2, 0, None), (3, 0, None)]
+    for (_, _, _, step_dict), metrics in zip(shown, run_logger.history.values()):
+        assert step_dict == metrics  # exactly the wandb dict
         assert not any(torch.is_tensor(value) for value in step_dict.values())
     assert not any(r.getMessage().startswith("step ") for r in console_records.records)
+
+
+def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without `keep_history` (the CLI's default) `history` stays empty while wandb and the dashboard still get every
+    log step's metric dict: a long run does not hold its metrics in memory."""
+    recorded = _record_wandb_logs(monkeypatch)
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    run_logger = _logger_with(Logger("p", "r", tmp_path, enabled=False), stage_manager, settings, tmp_path)
+    assert run_logger.keep_history is False
+    progress = TrainingProgress()
+    for _ in range(2):
+        result = fake_result(stage_manager, progress.step, loss=2.0)
+        progress.advance()
+        run_logger.log_step(result, progress)
+    assert run_logger.history == {} and sorted(recorded) == [1, 2]
+    assert [step for step, _, _, _ in recording(run_logger).steps] == [1, 2]
+    assert run_logger.close(progress, None).history == {}
 
 
 def test_log_interval_composition_fractions_sum_to_one_and_reset(
@@ -502,9 +522,9 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
     shown = recording(run_logger).steps
-    assert [(step, stage) for step, stage, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
-    assert shown[0][2] == {} and shown[2][2] == {}, "nothing is read from the step's tensors at a non-log step"
-    assert shown[1][2]["loss"] == 2.0 and shown[3][2]["step"] == 4
+    assert [(step, stage) for step, stage, _, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
+    assert shown[0][3] == {} and shown[2][3] == {}, "nothing is read from the step's tensors at a non-log step"
+    assert shown[1][3]["loss"] == 2.0 and shown[3][3]["step"] == 4
     second, fourth = run_logger.history[2], run_logger.history[4]
     assert second["seconds/step"] == 1.0 and second["tokens/second"] == TOKENS_PER_STEP
     assert second["data_composition/a"] == 0.25 and second["data_composition/b"] == 0.75
@@ -518,9 +538,9 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
 ) -> None:
     """Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
     done and one "transition complete" event after step 8 is done (worded as the thesis loop printed them, with the
-    stage names); no console record for them. The bars get the stage at `done`: the index of the stage whose steps
-    are counting (a until 8 steps are done, b from then on) and the transition keys of `done` — while `history` keeps
-    the `stage/*` metrics of the step trained on, one step behind, as the thesis logged them."""
+    stage names); no console record for them. The bars get the stage containing `done` (a until 8 steps are done, b
+    from then on) and the transition keys of `done` — while `history` keeps the `stage/*` metrics of the step trained
+    on, one step behind: `stage/current_stage` is the stage containing that step, also inside its transition."""
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
@@ -534,23 +554,11 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
     ]
     assert not any("transition" in r.getMessage() for r in console_records.records)
     shown = recording(run_logger).steps
-    assert [stage for _, stage, _ in shown] == [0] * 7 + [1] * 5  # done 6, 7: a's transition steps count for a
-    assert [d[TRANSITION_FLAG_KEY] for _, _, d in shown] == [0.0] * 5 + [1.0, 1.0] + [0.0] * 5
-    assert [d[TRANSITION_PROGRESS_KEY] for _, _, d in shown][5:7] == [0.0, 0.5]
+    assert [stage for _, stage, _, _ in shown] == [0] * 7 + [1] * 5  # done 6, 7: a's transition steps count for a
+    assert [transition for _, _, transition, _ in shown] == [None] * 5 + [0.0, 0.5] + [None] * 5
     assert [run_logger.history[d]["stage/in_transition"] for d in range(1, 13)] == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
     assert [run_logger.history[d]["stage/transition_progress"] for d in (7, 8)] == [0.0, 0.5]
-    assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 6 + [1] * 6
-
-
-def test_stage_for_the_bars() -> None:
-    """Inside a transition the info names the stage being entered; the bars count the steps of the stage being left."""
-    settings = reference_settings()
-    stage_manager = two_stage_manager(settings)
-    assert _stage_for_the_bars(stage_manager.get_stage_info(5)) == (0, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(6)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(7)) == (0, {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(8)) == (1, {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0})
-    assert _stage_for_the_bars(stage_manager.get_stage_info(12))[0] == 1  # past the last step: the last stage
+    assert [run_logger.history[d]["stage/current_stage"] for d in range(1, 13)] == [0] * 8 + [1] * 4
 
 
 def test_evaluating_times_the_validation_and_log_step_reports_it(
@@ -798,7 +806,7 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
         assert (board.run_name, board.stage_names, board.steps_per_stage, board.total_steps) == ("steps", ["a", "b"], [8, 4], 12)
         assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cuda:0", "precision": "32"}
         assert board.log_step_interval == 3
-        board.update_step(6, 0, {"loss": 1.0})
+        board.update_step(6, 0, None, {"loss": 1.0})
     assert (tmp_path / TRAIN_LOG_NAME).exists() and "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 

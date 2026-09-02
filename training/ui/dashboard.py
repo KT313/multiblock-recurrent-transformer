@@ -48,7 +48,7 @@ Usage (``RunLogger`` / ``train()`` wrap the run once — see ``tasks/training_pi
                             details={"model": "crow-300m-final", "dataset": "crow_300m_final", "device": "cuda:0",
                                      "precision": "bf16-mixed"}, log_step_interval=settings.log_step_interval) as board:
         board.note_event("resumed from step-00000100-run.pth at step 100")
-        board.update_step(step, stage_index, metrics)            # every optimizer step, O(1), never raises
+        board.update_step(step, stage_index, transition, metrics)  # every optimizer step, O(1), never raises
         board.update_validation(step, {"val_loss_4": 3.2, "val_loss": 3.1})
         board.set_status("saving checkpoint")
 

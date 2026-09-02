@@ -20,7 +20,7 @@ from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data.collate import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
-from training.golden import (
+from training.testing.golden import (
     GOLDEN_RUN_PATH,
     TINY_DATASET_YAML,
     golden_exact_requested,
@@ -55,7 +55,7 @@ History = dict[int, dict[str, float]]
 
 def _run(yaml_path: Path, backend: SingleDeviceBackend | None = None) -> TrainingReport:
     """Run training on the yaml (the backend of the settings unless one is given) and return its report."""
-    return train(parse_settings(["--config", str(yaml_path)]), backend=backend)
+    return train(parse_settings(["--config", str(yaml_path)]), backend=backend, keep_history=True)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -99,7 +99,7 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
-    assert sm.stages == tiny_resolved.training_stages()
+    assert sm.stages is tiny_resolved.stages
     assert (sm.world_batch_size, sm.block_size, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.block_size, 1)
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
@@ -174,12 +174,11 @@ def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cp
 
 
 def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend) -> None:
-    """Three parameter groups (matrices, embeddings, norms + biases) with `base_lr` 1.0; the third has no weight
+    """Three parameter groups (matrices, embeddings, norms + biases); the third has no weight
     decay under `no_weight_decay_for_bias_and_norm_params`; the constructor LR is `optim_config.lr`."""
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
     assert isinstance(optimizer, torch.optim.AdamW)  # tiny.yaml
     assert len(optimizer.param_groups) == 3
-    assert [g["base_lr"] for g in optimizer.param_groups] == [1.0, 1.0, 1.0]
     assert [g["weight_decay"] for g in optimizer.param_groups] == [0.1, 0.1, 0.0]
     assert all(float(g["lr"]) == tiny_settings.optim_config.lr for g in optimizer.param_groups)
     assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(tiny_model.parameters()))
@@ -204,7 +203,7 @@ def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
 def test_block_size_mismatch_with_the_dataset_config_raises(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", block_size="128")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", block_size=128)
     with pytest.raises(ValueError, match="block_size 128 of the run config does not match block_size 256 of dataset config") as excinfo:
         _run(yaml_path, cpu_backend)
     assert "'config/datasets/tiny.yaml'" in str(excinfo.value)  # the dataset config as the run config names it
@@ -213,7 +212,7 @@ def test_block_size_mismatch_with_the_dataset_config_raises(
 def test_block_size_mismatch_with_the_model_architecture_raises(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite="{block_size: 128}")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite={"block_size": 128})
     with pytest.raises(ValueError, match="block_size 256 of the run config does not match block_size 128 of the model architecture"):
         _run(yaml_path, cpu_backend)
 
@@ -221,7 +220,7 @@ def test_block_size_mismatch_with_the_model_architecture_raises(
 def test_non_finite_loss_terminates(
     tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision='"32"')
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32")
     forward = RecurrentGPT.forward
 
     def nan_forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
@@ -238,7 +237,7 @@ def test_non_finite_loss_terminates(
 def test_non_finite_grad_norm_terminates(
     tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision='"32"')
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32")
     monkeypatch.setattr(SingleDeviceBackend, "clip_grad_norm", lambda self, model, max_norm: torch.tensor(float("inf")))
     with pytest.raises(RuntimeError, match="Gradient norm is non-finite at step 0"):
         _run(yaml_path, cpu_backend)
@@ -254,7 +253,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
     """One uninterrupted tiny run shared by the assertions below (module-scoped: a few seconds on CPU)."""
     tmp = tmp_path_factory.mktemp("full_run")
     out_dir = tmp / "out"
-    yaml_path = write_tiny_yaml(tmp, tiny_dataset_dir, out_dir, export_to_hf="true")
+    yaml_path = write_tiny_yaml(tmp, tiny_dataset_dir, out_dir, export_to_hf=True)
     mp = pytest.MonkeyPatch()
     optimizer_steps: list[int] = []  # one entry per optimizer.step() call (tiny.yaml uses AdamW)
     adamw_step = torch.optim.AdamW.step
@@ -365,8 +364,9 @@ def test_logged_lr_follows_the_multistage_schedule(full_run: dict[str, Any]) -> 
     expected = {1: 0.0, 2: 1.5e-4, 3: 3e-4, 7: 3e-4, 8: 2e-4, 9: 1e-4, 15: 1e-4, 16: 7.5e-5, 17: 5e-5, 20: 2.5e-5}
     for done, lr in expected.items():
         assert history[done]["lr"] == pytest.approx(lr), done
-    # inside a transition the stage info already names the next stage (steps 6-7 -> stage 1, 14-15 -> stage 2)
-    assert [history[d]["stage/current_stage"] for d in (1, 6, 7, 8, 9, 14, 15, 17)] == [0, 0, 1, 1, 1, 1, 2, 2]
+    # `stage/current_stage` is the stage containing the step, inside its transition too (steps 6-7 -> stage 0,
+    # 14-15 -> stage 1); the metrics at `done` describe step `done - 1`
+    assert [history[d]["stage/current_stage"] for d in (1, 6, 7, 8, 9, 14, 15, 17)] == [0, 0, 0, 0, 1, 1, 1, 2]
     assert [history[d]["stage/in_transition"] for d in (6, 7, 8, 9, 15, 16, 17)] == [0, 1, 1, 0, 1, 1, 0]
     assert history[8]["stage/transition_progress"] == pytest.approx(0.5)
 
@@ -433,11 +433,11 @@ def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()  # leave steps to run after the resume
-    changed = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", grad_clip="0.5")
+    changed = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, grad_clip=0.5)
     with pytest.raises(ValueError, match=r"resuming with changed \['grad_clip'\]"):
         _run(changed)
     allowed = write_tiny_yaml(
-        tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", grad_clip="0.5", allow_settings_change="true"
+        tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, grad_clip=0.5, allow_settings_change=True
     )
     assert _run(allowed).final_step == 20
 
@@ -449,7 +449,7 @@ def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
     original = json.loads((out_dir / "run_config.json").read_text())
     assert original["log_step_interval"] != 4
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", log_step_interval="4")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4)
     _run(yaml_path)  # log_step_interval is not numerics-relevant: the resume runs
     assert json.loads((out_dir / "run_config.json").read_text()) == original
 
@@ -469,7 +469,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
     latest = find_latest_checkpoint(out_dir, "tiny")
     assert latest is not None and latest.name == "step-00000014-tiny-stage-1_end.pth"
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False)
     report = _run(yaml_path)
     history = report.history
 
@@ -491,14 +491,14 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     assert final["validation_rows"] == full_run["validation_rows"]  # the resumed run kept the split
 
 
-def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
+def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
     """tiny.yaml without transitions; fp32 because bf16 autocast is very slow on the CPU and precision is
     irrelevant for the bit-exactness claim."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     dataset_yaml = tmp_path / "tiny_dataset.yaml"
     dataset_yaml.write_text(TINY_DATASET_YAML.read_text().replace("transition_pct: 0.25", "transition_pct: 0.0"))
     return write_tiny_yaml(
-        tmp_path, tiny_dataset_dir, out_dir, precision='"32"', dataset_config=str(dataset_yaml), **overrides
+        tmp_path, tiny_dataset_dir, out_dir, precision="32", dataset_config=str(dataset_yaml), **overrides
     )
 
 
@@ -522,7 +522,7 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
         tmp_path / "resumed",
         tiny_dataset_dir,
         resumed_dir,
-        resume="true",
+        resume=True,
         resume_checkpoint_path=str(checkpoint_dir(full_dir) / "step-00000008-tiny-stage-0_end.pth"),
     )
     history = _run(yaml_path).history
@@ -553,7 +553,7 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
         return dict(state["data_stream"]["consumed_rows"])
 
     full_dir = tmp_path / "full" / "out"
-    options = {"save_step_interval": "4", "export_to_hf": "false"}
+    options: dict[str, Any] = {"save_step_interval": 4, "export_to_hf": False}
     _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
     # 12 steps of 4 rows, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the source and
     # only change its weight, so the counter keeps counting across the stage boundary at step 8)
@@ -563,7 +563,7 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
     _run(
         _no_transition_yaml(
-            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume="true", resume_checkpoint_path=str(mid), **options
+            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid), **options
         )
     )
     # the resumed run added its 8 steps on top of the stored counters instead of counting from zero
@@ -579,10 +579,10 @@ def test_resume_from_explicit_checkpoint_path_with_resume_warmup(
         tmp_path,
         tiny_dataset_dir,
         tmp_path / "fresh_out",
-        resume="true",
+        resume=True,
         resume_checkpoint_path=str(ckpt),
-        resume_warmup_steps="2",
-        export_to_hf="false",
+        resume_warmup_steps=2,
+        export_to_hf=False,
     )
     report = _run(yaml_path)
     history = report.history
@@ -601,12 +601,12 @@ def test_resume_with_changed_dataset_config_raises_unless_allowed(
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
-    yaml_path = _no_transition_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
+    yaml_path = _no_transition_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False)
     with pytest.raises(RuntimeError, match="dataset config hash"):
         _run(yaml_path)
     yaml_path = _no_transition_yaml(
-        tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false",
-        allow_dataset_change="true", allow_settings_change="true",  # the fixture's checkpoint is bf16, this yaml fp32
+        tmp_path / "allowed", tiny_dataset_dir, out_dir, resume=True, export_to_hf=False,
+        allow_dataset_change=True, allow_settings_change=True,  # the fixture's checkpoint is bf16, this yaml fp32
     )
     history = _run(yaml_path).history
     assert sorted(history) == list(range(15, 21))
@@ -626,11 +626,11 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
     k = state["validation_rows"]["synthetic_pretrain"]
     state["validation_rows"]["synthetic_pretrain"] = k + 1
     torch.save(state, latest)
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume="true", export_to_hf="false")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False)
     with pytest.raises(RuntimeError, match=f"validation rows per source: 'synthetic_pretrain': checkpoint {k + 1}, now {k}"):
         _run(yaml_path)
     (tmp_path / "allowed").mkdir()
-    yaml_path = write_tiny_yaml(tmp_path / "allowed", tiny_dataset_dir, out_dir, resume="true", export_to_hf="false", allow_dataset_change="true")
+    yaml_path = write_tiny_yaml(tmp_path / "allowed", tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, allow_dataset_change=True)
     history = _run(yaml_path).history
     assert sorted(history) == list(range(15, 21))
     final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
@@ -661,9 +661,9 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     """A stop request after step 5 (inside stage 0): the loop saves `step-00000005-tiny.pth`, skips the export and
     returns a stopped report of 5 steps; `resume: true` then continues from that checkpoint to the end and exports."""
     out_dir = tmp_path / "out"
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision='"32"', export_to_hf="true")
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=True)
     should_stop = StopAfterPolls(5)
-    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop)
+    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
     assert should_stop.count == 5  # polled once per completed step, nothing before the loop
     assert report.stopped is True
     assert (report.steps_completed, report.final_step, report.resumed_from) == (5, 5, None)
@@ -676,8 +676,8 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     assert (stored["step"], stored["stage"]) == (5, 0)
 
     (tmp_path / "resumed").mkdir()
-    resumed_yaml = write_tiny_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, precision='"32"', export_to_hf="true", resume="true")
-    resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend)
+    resumed_yaml = write_tiny_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, precision="32", export_to_hf=True, resume=True)
+    resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
     assert resumed.resumed_from == checkpoint_dir(out_dir) / "step-00000005-tiny.pth"
     assert (resumed.steps_completed, resumed.final_step, resumed.stopped) == (15, 20, False)
     assert sorted(resumed.history) == list(range(6, 21))
@@ -696,7 +696,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     """A stop request after step 6, the last plain step of stage 0: the stage-end checkpoint is the one written,
     not a second file."""
     out_dir = tmp_path / "out"
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision='"32"')
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32")
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(6))
     assert report.stopped and report.final_step == 6
     assert [p.name for p in report.checkpoints_written] == ["step-00000006-tiny-stage-0_end.pth"]
@@ -712,7 +712,7 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
     """Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
 
     The golden is a refactor guard, not a promise about CPU training: it was recorded in fp32 on the CPU with one
-    thread and deterministic algorithms (torch 2.13.0+cu130, see `training.golden.record_golden_run`), so it catches
+    thread and deterministic algorithms (torch 2.13.0+cu130, see `training.testing.golden.record_golden_run`), so it catches
     a changed operation order, an extra RNG draw or a moved forward pass in the loop. It does NOT exercise the bf16
     autocast path used for real training (the bf16 "finite / same seed" tests above are the only cover there).
     Every float is compared with `rel=1e-5`; `GOLDEN_EXACT=1` compares with `==` (bit-identical on the recording

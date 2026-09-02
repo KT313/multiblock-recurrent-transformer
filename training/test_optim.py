@@ -23,7 +23,6 @@ def test_param_groups_cover_every_parameter_exactly_once(tiny_model: RecurrentGP
     assert len(ids) == len(set(ids))
     assert set(ids) == {id(p) for p in tiny_model.parameters()}
     assert len(groups) == 3
-    assert all(g["base_lr"] == 1.0 for g in groups)
 
 
 def test_no_wd_group_is_exactly_bias_and_norm_params(tiny_model: RecurrentGPT) -> None:
@@ -115,15 +114,12 @@ def test_build_optimizer_rejects_ellis_only_options_for_adamw() -> None:
         build_optimizer("AdamW", [p], OptimizerConfig(decouple_wd=False))
 
 
-def test_set_lr_scales_by_base_lr() -> None:
+def test_set_lr_sets_a_tensor_lr_on_every_group() -> None:
     p1, p2 = torch.nn.Parameter(torch.zeros(1)), torch.nn.Parameter(torch.zeros(1))
-    opt = torch.optim.AdamW([{"params": [p1], "base_lr": 1.0}, {"params": [p2], "base_lr": 0.5}], lr=1.0)
+    opt = torch.optim.AdamW([{"params": [p1]}, {"params": [p2]}], lr=1.0)
     set_lr(opt, 2e-4)
-    assert float(opt.param_groups[0]["lr"]) == pytest.approx(2e-4)
-    assert float(opt.param_groups[1]["lr"]) == pytest.approx(1e-4)
-    opt.param_groups[1].pop("base_lr")  # groups without the multiplier get the plain LR
-    set_lr(opt, 3e-4)
-    assert float(opt.param_groups[1]["lr"]) == pytest.approx(3e-4)
+    assert all(torch.is_tensor(g["lr"]) for g in opt.param_groups)
+    assert [float(g["lr"]) for g in opt.param_groups] == pytest.approx([2e-4, 2e-4])
 
 
 def _reference_ellis_adam_step(

@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from model import RecurrentGPT, build_model
+from training.backend.base import unwrap_compiled
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import (
     CHECKPOINT_SUBDIR,
@@ -25,11 +26,11 @@ from training.checkpoint import (
     is_checkpoint_step,
     load_training_checkpoint,
     save_training_checkpoint,
-    unwrap_compiled,
 )
 from training.optim import ELLISAdam, get_param_groups
 from training.settings import OptimizerConfig, Settings
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 
 TINY_MODEL_ARCHITECTURE = Path(__file__).resolve().parent.parent / "config" / "model_architecture" / "tiny.yaml"
 TINY_DATASET_CONFIG = Path(__file__).resolve().parent.parent / "config" / "datasets" / "tiny.yaml"
@@ -170,8 +171,8 @@ def test_is_checkpoint_step_table() -> None:
     step after the last plain step of a stage (`stage_ending_at`). Two stages of 12 + 8 optimizer steps (4 × 256
     tokens each, no transition): stage 0 ends with step 12, the run with step 20."""
     stages = [
-        TrainingStage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
-        TrainingStage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
+        resolved_stage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
+        resolved_stage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
     ]
     stage_manager = StageManager(stages, world_batch_size=4, block_size=256)
     assert stage_manager.total_steps == 20 and stage_manager.stage_ending_at(11) == 0

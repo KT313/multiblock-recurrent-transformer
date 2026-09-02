@@ -22,7 +22,6 @@ def get_param_groups(
     """Split parameters into weights / embeddings / scale-and-norm groups, as upstream did.
 
     Group order matters for checkpoints: 0 = matrices, 1 = embeddings (+ tied lm_head), 2 = norms and biases.
-    Every group carries `base_lr` (a per-group multiplier applied to the scheduled LR by `set_lr`).
     """
     weights_group: list[Tensor] = []
     embedding_group: list[Tensor] = []
@@ -39,9 +38,9 @@ def get_param_groups(
             raise ValueError(f"param {name} could not be matched to an optim group")
 
     param_groups = [
-        {"params": weights_group, "base_lr": 1.0, "weight_decay": weight_decay},
-        {"params": embedding_group, "base_lr": 1.0, "weight_decay": weight_decay},
-        {"params": scale_and_norm_group, "base_lr": 1.0, "weight_decay": weight_decay},
+        {"params": weights_group, "weight_decay": weight_decay},
+        {"params": embedding_group, "weight_decay": weight_decay},
+        {"params": scale_and_norm_group, "weight_decay": weight_decay},
     ]
     if no_wd_for_bias_and_norm:
         param_groups[-1]["weight_decay"] = 0.0
@@ -81,9 +80,10 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:
-    """Apply the scheduled learning rate to every group, scaled by the group's `base_lr` multiplier."""
+    """Apply the scheduled learning rate to every group, as a tensor (ELLISAdam stores its LR as a float32 tensor and
+    clones it in its step; torch AdamW accepts a tensor LR on CUDA too)."""
     for group in optimizer.param_groups:
-        group["lr"] = torch.as_tensor(lr * group.get("base_lr", 1.0))
+        group["lr"] = torch.as_tensor(lr)
 
 
 class ELLISAdam(Optimizer):

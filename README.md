@@ -49,7 +49,7 @@ from the config) and `docs/multistage_training.md` for the stage mechanism.
 
 ```
 model/             architecture (RecurrentGPT, config, HF export)
-training/          train.py (CLI), run.py (train()), step.py (one optimizer step), evaluation.py, checkpoint.py, logger.py (RunLogger, TrainingReport), ui/ (terminal dashboard, train.log), golden.py, settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
+training/          train.py (CLI), run.py (train()), step.py (one optimizer step), evaluation.py, checkpoint.py, logger.py (RunLogger, TrainingReport), ui/ (terminal dashboard, train.log), testing/golden.py (the golden run), settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
 data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
 dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers

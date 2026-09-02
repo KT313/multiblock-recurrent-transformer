@@ -167,11 +167,11 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
 
 
 def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Tokenizer) -> None:
-    """`rows_read` counts every row that went in per data entry — the dropped ones too — while `samples` holds only
+    """`rows_read` counts every row that went in — the dropped ones too — while `samples` holds only
     the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips."""
     batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
     samples, rows_read = collate_worker_batch(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
-    assert rows_read == {"a": 2, "b": 2}
+    assert rows_read == 4
     assert [s[2] for s in samples] == ["a", "b"]
     reference = collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
     assert len(samples) == len(reference)
@@ -183,7 +183,7 @@ def test_collate_worker_batch_counts_a_fully_dropped_batch(tokenizer: Tokenizer)
     samples, rows_read = collate_worker_batch(
         [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, block_size=128, add_bos=False, add_eos=False
     )
-    assert samples == [] and rows_read == {"a": 2}
+    assert samples == [] and rows_read == 2
 
 
 def test_batch_of_only_dropped_rows_is_an_error(tokenizer: Tokenizer) -> None:

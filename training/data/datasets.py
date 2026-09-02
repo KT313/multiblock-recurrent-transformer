@@ -30,9 +30,10 @@ class ParquetTextDataset(IterableDataset[Row]):
     dealt round-robin across ``world * num_workers`` shards: shard ``rank * num_workers + worker_id`` takes every
     ``num_shards``-th row of the range, so all shards together yield every row of the range exactly once.
 
-    ``set_resume_offset`` starts the NEXT epoch that many rows into the range — how a resume skips the rows the
-    interrupted run already trained on. It is one-shot: ``__iter__`` clears it, so every later epoch is the whole
-    range again (a permanent offset would hide the rows before it forever).
+    ``set_resume_offset`` starts every following epoch that many rows into the range — how a resume skips the rows
+    the interrupted run already trained on. `training.data.loader.RunDataloaders` sets it right before the first
+    epoch after a resume and back to 0 before every later one (a permanent offset would hide the rows before it
+    forever).
     """
 
     def __init__(
@@ -73,8 +74,8 @@ class ParquetTextDataset(IterableDataset[Row]):
         return self.num_rows
 
     def set_resume_offset(self, rows: int) -> None:
-        """Skip the first `rows` rows of the range in the next epoch (taken modulo the range, so more consumed rows
-        than the range holds wrap around to where the last epoch stood)."""
+        """Skip the first `rows` rows of the range in every following epoch (taken modulo the range, so more
+        consumed rows than the range holds wrap around to where the last epoch stood)."""
         if rows < 0:
             raise ValueError(f"{self.prefix}: resume offset must be non-negative, got {rows}")
         self.resume_offset = rows % self.num_rows if self.num_rows else 0
@@ -121,7 +122,7 @@ class ParquetTextDataset(IterableDataset[Row]):
 
     def __iter__(self) -> Iterator[Row]:
         shard_id, num_shards = self._shard()
-        offset, self.resume_offset = self.resume_offset, 0  # one-shot: only this epoch starts inside the range
+        offset = self.resume_offset
         keys: list[str] = list(self.data_signature["keys"])
         logger.info(
             f"{self.prefix}: shard {shard_id}/{num_shards} over rows [{self.start + offset}, {self.stop}) "
@@ -140,7 +141,10 @@ class ParquetTextDataset(IterableDataset[Row]):
 
 
 class WeightedMixtureDataset(IterableDataset[T], Generic[T]):
-    """Draws each row from one of several datasets with fixed probabilities; exhausted datasets restart."""
+    """Draws each row from one of several datasets with fixed probabilities (a seeded draw per row) until every
+    member is read once: an exhausted member leaves the draw — its weight is dropped, the others renormalise — so
+    one `__iter__` yields every row of every member exactly once and then stops. The validation loaders of a stage
+    with several validation sources read this, and `evaluate` scores the batches it gets."""
 
     def __init__(self, datasets: Sequence[Iterable[T]], weights: Sequence[float], seed: int) -> None:
         if len(datasets) != len(weights) or not datasets:
@@ -153,12 +157,10 @@ class WeightedMixtureDataset(IterableDataset[T], Generic[T]):
     def __iter__(self) -> Iterator[T]:
         rng = random.Random(self.seed)
         iterators = [iter(ds) for ds in self.datasets]
-        indices = range(len(self.datasets))
-        while True:
-            (idx,) = rng.choices(indices, weights=self.weights, k=1)
+        remaining = list(range(len(self.datasets)))  # members with rows left, in construction order
+        while remaining:
+            (idx,) = rng.choices(remaining, weights=[self.weights[i] for i in remaining], k=1)
             try:
                 yield next(iterators[idx])
             except StopIteration:
-                logger.info(f"Dataset '{getattr(self.datasets[idx], 'prefix', idx)}' exhausted, restarting.")
-                iterators[idx] = iter(self.datasets[idx])
-                yield next(iterators[idx])
+                remaining.remove(idx)

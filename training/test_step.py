@@ -18,12 +18,12 @@ from torch.utils.data import DataLoader
 from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
-from training.data.loader import RunDataloaders, SampleBatch, build_dataloader, build_run_dataloaders
+from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import DataEntry, resolve_dataset
 from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
-from training.golden import (
+from training.testing.golden import (
     golden_exact_requested,
     golden_mismatches,
     golden_run_json,
@@ -32,7 +32,8 @@ from training.golden import (
 )
 from training.run import build_run_optimizer
 from training.settings import OptimizerConfig, Settings, parse_settings
-from training.stage_manager import StageManager, TrainingStage
+from training.stage_manager import StageManager
+from training.testing.stages import resolved_stage
 from training.step import (
     BatchStream,
     StepResult,
@@ -85,7 +86,7 @@ def reference_settings(**overrides: Any) -> Settings:
 
 def reference_stage_manager(settings: Settings, steps: int = 10) -> StageManager:
     """One stage of `steps` optimizer steps (no transition): LR 0 at step 0, 1.5e-4 at step 1, 3e-4 from step 2."""
-    stage = TrainingStage("only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
+    stage = resolved_stage("only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
     return StageManager([stage], settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
 
 
@@ -138,9 +139,9 @@ def run_steps(
 
 def test_training_progress_counts_steps() -> None:
     progress = TrainingProgress()
-    assert (progress.step, progress.resume_step, progress.done) == (0, -1, 0)
+    assert (progress.step, progress.resume_step) == (0, -1)
     progress.advance()
-    assert progress.step == progress.done == 1
+    assert progress.step == 1
     resumed = TrainingProgress(step=14, resume_step=14)
     resumed.advance()
     assert (resumed.step, resumed.resume_step) == (15, 14)
@@ -156,17 +157,15 @@ def test_scheduled_learning_rate_follows_warmup_and_resume(settings: Settings) -
     assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(0.0)  # ramp restarts at min_lr
 
 
-def test_learning_rate_is_set_on_all_groups_times_base_lr(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+def test_learning_rate_is_set_on_all_groups(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     assert len(optimizer.param_groups) == 3
-    for group, base_lr in zip(optimizer.param_groups, (1.0, 0.5, 2.0)):
-        group["base_lr"] = base_lr
     results = run_steps(settings, cpu_backend, model, optimizer, steps=2)
     assert results[1].learning_rate == pytest.approx(1.5e-4)  # warmup step 1 of 2
-    for group, base_lr in zip(optimizer.param_groups, (1.0, 0.5, 2.0)):
+    for group in optimizer.param_groups:
         assert torch.is_tensor(group["lr"])  # `set_lr` stores a tensor (ELLISAdam clones it)
-        assert float(group["lr"]) == pytest.approx(results[1].learning_rate * base_lr)
+        assert float(group["lr"]) == pytest.approx(results[1].learning_rate)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -248,13 +247,13 @@ def test_data_ids_has_world_batch_size_entries(settings: Settings, cpu_backend: 
 
 
 def test_stage_infos_and_metrics(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
-    """`stage` / `next_stage` are the manager's infos at `step` and `step + 1`; gradient metrics only at log steps."""
+    """`stage` is the manager's info at `step`; gradient metrics only at log steps."""
     settings.log_step_interval = 2
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     stage_manager = reference_stage_manager(settings)
     results = run_steps(settings, cpu_backend, model, optimizer, steps=2)
-    assert results[0].stage == stage_manager.get_stage_info(0) and results[0].next_stage == stage_manager.get_stage_info(1)
+    assert results[0].stage == stage_manager.get_stage_info(0) and results[1].stage == stage_manager.get_stage_info(1)
     assert results[0].metrics == {}  # done = 1, not a log step
     assert "l2_param_norm" in results[1].metrics and "avg_RMS" in results[1].metrics  # done = 2
 
@@ -311,7 +310,7 @@ class _Repeat:
         while True:
             self.count += 1
             samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
-            yield WorkerBatch(samples, {self.tag: len(samples)})
+            yield WorkerBatch(samples, len(samples))
 
 
 class _ShortBatches:
@@ -326,7 +325,7 @@ class _ShortBatches:
             size = self.sizes[self.count % len(self.sizes)]
             self.count += 1
             samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(size)])
-            yield WorkerBatch(samples, {self.tag: len(samples)})
+            yield WorkerBatch(samples, len(samples))
 
 
 @pytest.fixture(scope="session")
@@ -339,9 +338,9 @@ def _abc_stage_manager(settings: Settings) -> StageManager:
     """The tiny stage boundaries ((0,8,6,8), (8,16,14,16), (16,20)) with one fake source per stage: `a` in stage 0,
     `b` in stage 1, `c` in stage 2 — hand-made so no dataset is resolved for the stream tests."""
     stages = [
-        TrainingStage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 1.0}),
-        TrainingStage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
-        TrainingStage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
+        resolved_stage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 1.0}),
+        resolved_stage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
+        resolved_stage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
     ]
     return StageManager(stages, settings.world_batch_size, settings.block_size)
 
@@ -358,13 +357,13 @@ def _stream_setup(
         tmp_path,
         tiny_dataset_dir,
         tmp_path / "out",
-        sort_batches_by_length=str(sort).lower(),
-        sequence_padding_multiple=str(padding_multiple),
+        sort_batches_by_length=sort,
+        sequence_padding_multiple=padding_multiple,
     )
     settings = parse_settings(
         ["--config", str(yaml_path), "--micro_batch_size", str(batch_size)]  # 4 / batch_size micro-batches per step
     )
-    loaders = RunDataloaders(list("abc"), [_Repeat(t, batch_size) for t in "abc"], [], tokenizer)
+    loaders = RunDataloaders({t: _Repeat(t, batch_size) for t in "abc"}, [], tokenizer, {})
     return settings, loaders, _abc_stage_manager(settings)
 
 
@@ -413,7 +412,7 @@ def test_batch_stream_draw_rng_is_seeded_with_the_start_step(
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
 
     def mix(start_step: int) -> list[str]:
-        loaders = RunDataloaders(list("abc"), [_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
+        loaders = RunDataloaders({tag: _Repeat(tag) for tag in "abc"}, [], stream_tokenizer, {})
         progress = TrainingProgress(step=start_step)
         stream = BatchStream(settings, loaders, stage_manager, progress)
         progress.step = 15
@@ -451,7 +450,7 @@ def test_batch_stream_fills_the_world_batch_from_short_worker_batches(
     holds one and carrying leftover samples over in the buffer."""
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
     assert (settings.gradient_accumulation_steps, settings.world_batch_size) == (2, 4)
-    loaders = RunDataloaders(list("abc"), [_ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"], [], stream_tokenizer)
+    loaders = RunDataloaders({tag: _ShortBatches(tag, [2, 0, 1, 2, 3]) for tag in "abc"}, [], stream_tokenizer, {})
     progress = TrainingProgress()
     stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(6):
@@ -490,7 +489,7 @@ def test_batch_stream_state_round_trip(tmp_path: Path, tiny_dataset_dir: Path, s
     state = stream.state_dict()
     continued = _tags(stream, 12)
 
-    fresh_loaders = RunDataloaders(list("abc"), [_Repeat(tag) for tag in "abc"], [], stream_tokenizer)
+    fresh_loaders = RunDataloaders({tag: _Repeat(tag) for tag in "abc"}, [], stream_tokenizer, {})
     resumed = BatchStream(settings, fresh_loaders, stage_manager, TrainingProgress(step=15))
     resumed.load_state_dict(state)
     assert resumed.state_dict()["consumed_rows"] == state["consumed_rows"]
@@ -505,15 +504,15 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    parquet = loaders.train_dataset("synthetic_pretrain")
-    assert parquet is not None
+    parquet = loaders.datasets["synthetic_pretrain"]
     state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate()}
     stream.load_state_dict(state)
-    assert parquet.resume_offset == 5  # wrapped around one epoch
-    other = loaders.train_dataset("synthetic_instruct")
-    assert other is not None and other.resume_offset == 0  # untouched sources stay at the start
+    assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
+    next(stream)  # stage 0 draws from the pretrain source only: its reader starts now
+    assert parquet.resume_offset == 5 and loaders.pending_offsets == {}  # wrapped around one epoch
+    assert loaders.datasets["synthetic_instruct"].resume_offset == 0  # untouched sources stay at the start
 
 
 def test_batch_stream_resume_does_not_repeat_rows(
@@ -523,7 +522,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
     not reached, while a stream that only restarts the loaders serves the very same rows again."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
     def fresh_stream() -> BatchStream:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -559,11 +558,10 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     every sample up to there and beyond is a distinct row (until the source genuinely wraps around)."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    pretrain = loaders.train_dataset("synthetic_pretrain")
-    assert pretrain is not None
+    pretrain = loaders.datasets["synthetic_pretrain"]
     steps = 13  # well into stage 1 (the boundary is step 8), before the transition into finetune (step 14)
     assert steps * settings.world_batch_size <= pretrain.num_rows, "fixture too small to distinguish from a wrap"
     seen: list[tuple[int, ...]] = []
@@ -584,7 +582,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
     `settings.seed`, and each source's reader walks its range in order)."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.training_stages(), settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
     def batches(world_batches: int) -> list[Batch]:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -634,25 +632,23 @@ def _drop_survivors(rows_read: int) -> int:
 
 class _RecordingLoader:
     """Forwards a real (unpadded) train DataLoader's `WorkerBatch`es while recording every sample and row count that
-    passed through; exposes `dataset` so `RunDataloaders.train_dataset` still reaches the parquet dataset behind
-    it (which is where a resume's row offsets land)."""
+    passed through."""
 
     def __init__(self, loader: DataLoader[Row]) -> None:
         self.loader = loader
-        self.dataset = loader.dataset
         self.rows_read = 0
         self.seen: list[Sample] = []
 
     def __iter__(self) -> Iterator[WorkerBatch]:
         for batch in self.loader:
-            self.rows_read += sum(batch.rows_read.values())
+            self.rows_read += batch.rows_read
             self.seen.extend(batch.samples)
             yield batch
 
 
 def _drop_stage_manager(settings: Settings) -> StageManager:
     """One long stage drawing every sample from the `drop` source."""
-    stage = TrainingStage(
+    stage = resolved_stage(
         "only", tokens=100 * settings.world_batch_size * settings.block_size, base_lr=1e-4, transition_pct=0.0,
         train_weights={"drop": 1.0},
     )
@@ -661,15 +657,10 @@ def _drop_stage_manager(settings: Settings) -> StageManager:
 
 def _drop_stream(settings: Settings, data_dir: Path, tokenizer: Tokenizer) -> tuple[BatchStream, _RecordingLoader]:
     """A stream over one drop-heavy source (single shard, in-process, unsorted): rows are read in range order."""
-    loader = build_dataloader(
-        [DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE)],
-        tokenizer,
-        DROP_BLOCK_SIZE,
-        settings.micro_batch_size,
-        padded=False,
-    )
+    parquet = entry_dataset(DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE))
+    loader = dataloader_over(parquet, tokenizer, DROP_BLOCK_SIZE, settings.micro_batch_size, padded=False)
     recording = _RecordingLoader(loader)
-    loaders = RunDataloaders(["drop"], [recording], [], tokenizer)
+    loaders = RunDataloaders({"drop": recording}, [], tokenizer, {"drop": parquet})
     return BatchStream(settings, loaders, _drop_stage_manager(settings), TrainingProgress()), recording
 
 

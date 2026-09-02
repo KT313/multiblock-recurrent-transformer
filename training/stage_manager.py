@@ -1,72 +1,52 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Multi-stage training manager: stage boundaries, transitions and stage-dependent data weights.
 
-All steps are OPTIMIZER steps (one world batch of `world_batch_size * block_size` tokens each). Step counts are
-therefore independent of the world size; `world_size` is only used for the per-device token summary and for the
-sanity check that the world batch splits evenly across devices.
+The stages are the resolver's `ResolvedStage`s (token budget, base LR, transition length, sampling weights); the
+manager turns budgets into optimizer-step boundaries and weights into a per-step schedule. All steps are OPTIMIZER
+steps (one world batch of `world_batch_size * block_size` tokens each), so step counts are independent of the world
+size; `world_size` only feeds the sanity check that the world batch splits evenly across devices.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-
-@dataclass
-class TrainingStage:
-    """One stage of the curriculum: token budget, base LR, transition length and the sampling weights over the
-    run's train sources (the data entries themselves live in the resolver's `ResolvedStage` / `ResolvedDataset`;
-    the manager turns budgets into step boundaries and weights into a per-step schedule)."""
-
-    name: str
-    tokens: int
-    base_lr: float
-    transition_pct: float = 0.05  # transition OUT of this stage, as a fraction of this stage's tokens
-    train_weights: dict[str, float] = field(default_factory=dict)  # source name -> sampling weight (sum 1); the
-    # stream draws every sample's source from `StageManager.data_weights`, which interpolates these per step
+from training.data.dataset_resolver import ResolvedStage
 
 
 @dataclass
 class StageInfo:
-    """Information about the current training stage and transition state."""
+    """Where a step stands: the stage whose boundary contains it (half-open: the first step of a stage belongs to
+    it, its `end_step` to the next), the progress through that stage, and — inside the transition window at the
+    end of the stage — the stage being entered and the progress through the window."""
 
-    stage_idx: int  # Current stage index (0-based)
-    stage_name: str
-    base_lr: float
-    in_transition: bool
-    transition_progress: float  # Progress through transition (0-1), 0 if not in transition
-    stage_progress: float  # Progress through current stage (0-1)
-    prev_stage_idx: Optional[int]  # Previous stage index (None if not transitioning)
-    prev_base_lr: Optional[float]  # Previous stage's base LR (None if not transitioning)
+    stage_idx: int  # index of the stage whose boundary contains the step
+    stage_progress: float  # progress through that stage (0-1)
+    transition_to: Optional[int]  # index of the next stage while inside the transition window, else None
+    transition_progress: float  # progress through the transition window (0-1), 0 outside it
 
 
 @dataclass
 class StageBoundary:
-    """Step boundaries for a single training stage."""
+    """Step boundaries of one stage: `[start_step, end_step)`, with the transition to the next stage occupying the
+    window `[transition_start_step, end_step)` at its end (empty when `transition_start_step == end_step`)."""
 
-    stage_idx: int
-    stage_name: str
-    start_step: int  # First step of this stage (inclusive)
-    end_step: int  # Last step of this stage (exclusive)
-    transition_start_step: int  # Step where transition to next stage begins
-    transition_end_step: int  # Step where transition to next stage ends
-    base_lr: float
-    tokens: int
+    start_step: int  # first step of this stage (inclusive)
+    end_step: int  # last step of this stage (exclusive); the transition to the next stage ends here too
+    transition_start_step: int  # first step of the transition window at the end of the stage
 
     def is_in_stage(self, step: int) -> bool:
-        """Check if step is within this stage (including transition)."""
+        """Whether `step` is within this stage (its transition window included)."""
         return self.start_step <= step < self.end_step
 
     def is_in_transition(self, step: int) -> bool:
-        """Check if step is in the transition period to the next stage."""
-        return self.transition_start_step <= step < self.transition_end_step
+        """Whether `step` is inside the transition window to the next stage."""
+        return self.transition_start_step <= step < self.end_step
 
     def get_transition_progress(self, step: int) -> float:
-        """Progress through the transition period (0-1); 0 if not in transition."""
+        """Progress through the transition window (0-1); 0 outside it."""
         if not self.is_in_transition(step):
             return 0.0
-        transition_length = self.transition_end_step - self.transition_start_step
-        if transition_length == 0:
-            return 0.0
-        return (step - self.transition_start_step) / transition_length
+        return (step - self.transition_start_step) / (self.end_step - self.transition_start_step)
 
     def get_stage_progress(self, step: int) -> float:
         """Progress through the stage (0-1); 0 before the stage, 1 after it."""
@@ -85,7 +65,7 @@ class StageManager:
 
     def __init__(
         self,
-        stages: list[TrainingStage],
+        stages: list[ResolvedStage],
         world_batch_size: int,
         block_size: int,
         world_size: int = 1,
@@ -132,14 +112,7 @@ class StageManager:
             end_step = current_step + stage_steps
             boundaries.append(
                 StageBoundary(
-                    stage_idx=idx,
-                    stage_name=stage.name,
-                    start_step=start_step,
-                    end_step=end_step,
-                    transition_start_step=end_step - transition_steps,
-                    transition_end_step=end_step,
-                    base_lr=stage.base_lr,
-                    tokens=stage.tokens,
+                    start_step=start_step, end_step=end_step, transition_start_step=end_step - transition_steps
                 )
             )
             current_step = end_step
@@ -149,15 +122,15 @@ class StageManager:
         """Warmup must end before the first stage's transition starts (the ramp targets the first stage's base LR)
         and cooldown must fit inside the last stage; every stage must be at least one step long, with its transition
         shorter than the stage."""
-        for boundary in self.boundaries:
+        for stage, boundary in zip(self.stages, self.boundaries):
             stage_steps = boundary.end_step - boundary.start_step
             if stage_steps < 1:
                 raise ValueError(
-                    f"stage {boundary.stage_name!r} is shorter than one optimizer step ({boundary.tokens} tokens < "
+                    f"stage {stage.name!r} is shorter than one optimizer step ({stage.tokens} tokens < "
                     f"{self.tokens_per_step} per step); increase its tokens or lower world_batch_size"
                 )
-            if boundary.transition_end_step - boundary.transition_start_step >= stage_steps:
-                raise ValueError(f"stage {boundary.stage_name!r}: the transition must be shorter than the stage")
+            if boundary.end_step - boundary.transition_start_step >= stage_steps:
+                raise ValueError(f"stage {stage.name!r}: the transition must be shorter than the stage")
         if self.warmup_steps > 0:
             plain_first_stage_steps = self.boundaries[0].transition_start_step - self.boundaries[0].start_step
             if self.warmup_steps >= plain_first_stage_steps:
@@ -175,55 +148,37 @@ class StageManager:
                 )
 
     def get_stage_info(self, step: int) -> StageInfo:
-        """Stage/transition state at `step`. Inside a transition the info already names the NEXT stage."""
-        for boundary in self.boundaries:
+        """Stage/transition state at `step`: the stage whose boundary contains it and, inside that stage's transition
+        window, the stage being entered. Past the last stage: the last stage, complete."""
+        for idx, boundary in enumerate(self.boundaries):
             if boundary.is_in_stage(step):
-                in_transition = boundary.is_in_transition(step)
-                prev_stage_idx = None
-                prev_base_lr = None
-                current_stage_idx = boundary.stage_idx
-                current_stage_name = boundary.stage_name
-                current_base_lr = boundary.base_lr
-
-                if in_transition:
-                    # Transitions are stored at the END of a stage: we are leaving this stage and entering the next.
-                    prev_stage_idx = boundary.stage_idx
-                    prev_base_lr = boundary.base_lr
-                    if boundary.stage_idx + 1 < len(self.boundaries):
-                        next_boundary = self.boundaries[boundary.stage_idx + 1]
-                        current_stage_idx = next_boundary.stage_idx
-                        current_stage_name = next_boundary.stage_name
-                        current_base_lr = next_boundary.base_lr
-
+                in_transition = boundary.is_in_transition(step)  # never true for the last stage (no window)
                 return StageInfo(
-                    stage_idx=current_stage_idx,
-                    stage_name=current_stage_name,
-                    base_lr=current_base_lr,
-                    in_transition=in_transition,
-                    transition_progress=boundary.get_transition_progress(step),
+                    stage_idx=idx,
                     stage_progress=boundary.get_stage_progress(step),
-                    prev_stage_idx=prev_stage_idx,
-                    prev_base_lr=prev_base_lr,
+                    transition_to=idx + 1 if in_transition else None,
+                    transition_progress=boundary.get_transition_progress(step),
                 )
-
-        # Past all stages: report the last stage as complete
-        last_boundary = self.boundaries[-1]
         return StageInfo(
-            stage_idx=last_boundary.stage_idx,
-            stage_name=last_boundary.stage_name,
-            base_lr=last_boundary.base_lr,
-            in_transition=False,
-            transition_progress=0.0,
-            stage_progress=1.0,
-            prev_stage_idx=None,
-            prev_base_lr=None,
+            stage_idx=len(self.boundaries) - 1, stage_progress=1.0, transition_to=None, transition_progress=0.0
         )
 
+    def entering_stage_at(self, step: int) -> int:
+        """Index of the stage whose data the run is heading for at `step`: the stage being entered inside a transition
+        window, otherwise the stage containing the step.
+
+        The validation loader of an evaluation after `step` completed steps and the `stage` a checkpoint of that
+        step records follow it, so a stage-end checkpoint (written as the transition starts) names the stage it
+        enters and a transition step is validated on the incoming stage's split.
+        """
+        info = self.get_stage_info(step)
+        return info.stage_idx if info.transition_to is None else info.transition_to
+
     def data_weights(self, step: int) -> dict[str, float]:
-        """Sampling weight per train source at optimizer step `step` (from `TrainingStage.train_weights`).
+        """Sampling weight per train source at optimizer step `step` (from `ResolvedStage.train_weights`).
 
         Outside a transition: the current stage's constants. Inside one: the linear interpolation
-        ``(1 − p) × previous stage's weight + p × next stage's weight`` with ``p = transition_progress``, over the
+        ``(1 − p) × current stage's weight + p × entering stage's weight`` with ``p = transition_progress``, over the
         union of both stages' sources — a source leaving the mixture ramps to 0, one entering ramps from 0, and a
         source in neither stage is absent (weight 0, never drawn). Each stage's weights sum to 1, so the
         interpolated weights do too. This is the stage structure's ONLY effect on the training data: the per-source
@@ -231,13 +186,13 @@ class StageManager:
         """
         info = self.get_stage_info(step)
         current = self.stages[info.stage_idx].train_weights
-        if info.prev_stage_idx is None:
+        if info.transition_to is None:
             return dict(current)
-        previous = self.stages[info.prev_stage_idx].train_weights
+        entering = self.stages[info.transition_to].train_weights
         progress = info.transition_progress
         return {
-            name: (1.0 - progress) * previous.get(name, 0.0) + progress * current.get(name, 0.0)
-            for name in {**previous, **current}
+            name: (1.0 - progress) * current.get(name, 0.0) + progress * entering.get(name, 0.0)
+            for name in {**current, **entering}
         }
 
     def stage_ending_at(self, step: int) -> int | None:
@@ -245,9 +200,9 @@ class StageManager:
 
         The training loop writes the `-stage-{i}_end` checkpoint after that step.
         """
-        for boundary in self.boundaries[:-1]:  # the last stage has no transition after it
+        for idx, boundary in enumerate(self.boundaries[:-1]):  # the last stage has no transition after it
             if step == boundary.transition_start_step - 1:
-                return boundary.stage_idx
+                return idx
         return None
 
     def get_stage_summary(self) -> str:
@@ -259,21 +214,19 @@ class StageManager:
         lines.append(f"  World size: {self.world_size}")
         lines.append("")
 
-        for boundary in self.boundaries:
+        for idx, (stage, boundary) in enumerate(zip(self.stages, self.boundaries)):
             stage_steps = boundary.end_step - boundary.start_step
-            transition_steps = boundary.transition_end_step - boundary.transition_start_step
+            transition_steps = boundary.end_step - boundary.transition_start_step
             main_steps = stage_steps - transition_steps
 
-            lines.append(f"Stage {boundary.stage_idx}: {boundary.stage_name}")
-            lines.append(
-                f"  Token budget: {boundary.tokens:,} total ({boundary.tokens // self.world_size:,} per device)"
-            )
+            lines.append(f"Stage {idx}: {stage.name}")
+            lines.append(f"  Token budget: {stage.tokens:,}")
             lines.append(f"  Optimizer steps: {stage_steps:,} (steps {boundary.start_step:,} - {boundary.end_step:,})")
             lines.append(f"    - Main training: {main_steps:,} steps")
-            if boundary.stage_idx < len(self.stages) - 1:
-                transition_pct = self.stages[boundary.stage_idx].transition_pct * 100
+            if idx < len(self.stages) - 1:
+                transition_pct = stage.transition_pct * 100
                 lines.append(f"    - Transition OUT: {transition_steps:,} steps ({transition_pct:.1f}% of current stage)")
-            lines.append(f"  Base LR: {boundary.base_lr:.2e}")
+            lines.append(f"  Base LR: {stage.base_lr:.2e}")
             lines.append("")
 
         return "\n".join(lines)

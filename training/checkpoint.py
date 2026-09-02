@@ -17,7 +17,7 @@ from typing import Any, Optional
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from training.backend.base import Backend
+from training.backend.base import Backend, unwrap_compiled
 from training.settings import Settings
 from training.stage_manager import StageManager
 
@@ -193,12 +193,6 @@ def is_checkpoint_step(settings: Settings, done: int, stage_manager: StageManage
     save_at_last_step = settings.save_last_step and done >= stage_manager.total_steps
     save_at_stage_end = stage_manager.stage_ending_at(done - 1) is not None
     return save_at_interval or save_at_last_step or save_at_stage_end
-
-
-def unwrap_compiled(model: Module) -> Module:
-    """The plain module behind a `torch.compile` wrapper (state-dict keys stay stable across compiled/uncompiled
-    runs; the loop reads `.step` / `.config` on it)."""
-    return getattr(model, "_orig_mod", model)
 
 
 def save_training_checkpoint(

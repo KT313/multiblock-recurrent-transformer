@@ -16,7 +16,6 @@ import pytest
 from training.ui.board import TrainingDashboard
 from training.ui.dashboard import RunDashboard, training_dashboard
 from training.ui.fallback import NoOpDashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 from training.ui.testing import (
     BOX_CHARACTERS,
     LOGGER_NAME,
@@ -60,8 +59,8 @@ def test_factory_gives_the_live_display_the_fallback_stream(monkeypatch: pytest.
     ) as b:
         assert isinstance(b, TrainingDashboard)
         monkeypatch.setattr(b, "_refresh_bars", broken)
-        b.update_step(1, 0, metrics(1))  # disables the display
-        b.update_step(2, 0, metrics(2))  # from here the fallback logs the step lines
+        b.update_step(1, 0, None, metrics(1))  # disables the display
+        b.update_step(2, 0, None, metrics(2))  # from here the fallback logs the step lines
         b.note_event("saved checkpoint x.pth")
     assert "step 2/30" in fallback.getvalue() and "event: saved checkpoint x.pth" in fallback.getvalue()
     assert "step 2/30" not in stream.getvalue()
@@ -70,7 +69,7 @@ def test_factory_gives_the_live_display_the_fallback_stream(monkeypatch: pytest.
 def test_factory_passes_final_frame_on(clock: FakeClock) -> None:
     console = string_console()
     with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), enabled=True, final_frame=False, console=console, clock=clock) as b:
-        b.update_step(3, 0, metrics(3))
+        b.update_step(3, 0, None, metrics(3))
     assert "overall" not in screen_text(console, 120)
 
 
@@ -126,11 +125,8 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
             for step in range(1, TOTAL + 1):  # progress.step after advance()
                 clock.advance(0.5)
                 stage_index = 0 if step <= STEPS[0] else 1
-                in_transition = 18 <= step <= 20
-                step_metrics = metrics(step, loss=4.0 - step * 0.05)
-                if in_transition:
-                    step_metrics |= {TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: (step - 18) / 2}
-                board.update_step(step, stage_index, step_metrics)  # RunLogger.log_step, every step
+                transition = (step - 18) / 2 if 18 <= step <= 20 else None
+                board.update_step(step, stage_index, transition, metrics(step, loss=4.0 - step * 0.05))  # every step
                 logger.info("step %d: grad metrics", step)
                 if step == 18:
                     board.note_event("starting transition 0 -> 1 (pretrain -> instruct)")
@@ -194,20 +190,20 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
 
 
 def _drive_scripted_run(board: RunDashboard, clock: FakeClock, logger: logging.Logger) -> None:
-    """The same calls on either dashboard, the way ``RunLogger`` makes them: the metric dict (with the transition
-    keys) at log steps only, ``{}`` at the others, validations, events and two records of the attached logger."""
+    """The same calls on either dashboard, the way ``RunLogger`` makes them: the transition progress at every step,
+    the metric dict at log steps only, ``{}`` at the others, validations, events and two records of the attached
+    logger."""
     board.note_event("no checkpoint found, starting from scratch")
     logger.info("Total training steps: %d", TOTAL, extra={"keep": True})
     board.set_status("training")
     for step in range(1, TOTAL + 1):
         clock.advance(0.5)
         stage_index = 0 if step <= STEPS[0] else 1
+        transition = (step - 18) / 2 if 18 <= step <= 20 else None
         if step % 5:
-            board.update_step(step, stage_index, {})
+            board.update_step(step, stage_index, transition, {})
             continue
-        in_transition = 18 <= step <= 20
-        transition = {TRANSITION_FLAG_KEY: float(in_transition), TRANSITION_PROGRESS_KEY: (step - 18) / 2 if in_transition else 0.0}
-        board.update_step(step, stage_index, metrics(step, loss=4.0 - step * 0.05) | transition)
+        board.update_step(step, stage_index, transition, metrics(step, loss=4.0 - step * 0.05))
         if step % 10 == 0:
             board.update_validation(step, {"val_loss_4": 3.5, "val_loss": 3.4})
         if step == 20:

@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import fields
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -38,11 +37,11 @@ from training.data.dataset_resolver import (
     ResolvedStage,
     build_command,
     check_dataset_unchanged,
-    check_entries_on_disk,
-    check_entry_shards,
+    check_entries,
     check_validation_batches,
     entry_rows_in_range,
     loader_shards,
+    processed_row_counts,
     processed_rows,
     resolve_dataset,
     resolve_splits,
@@ -54,7 +53,6 @@ from training.data.dataset_resolver import (
 )
 from training.data.datasets import ParquetTextDataset
 from training.settings import Settings
-from training.stage_manager import TrainingStage
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CROW_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "crow_300m_final.yaml"
@@ -316,8 +314,16 @@ def test_crow_split_fractions(crow_cfg: DatasetConfig) -> None:
     assert all(validation_rows_of(crow_cfg, name, 1000) == 0 for name in ("wikipedia", "gsm8k", "tinygsm", "arxiv"))
 
 
+def test_processed_row_counts_reads_every_source_once_by_directory(
+    tiny_dataset_config: DatasetConfig, tiny_layout: DatasetLayout
+) -> None:
+    rows = processed_row_counts(tiny_dataset_config, tiny_layout)
+    assert set(rows) == {str(tiny_layout.processed_dir(name)) for name in ("synthetic_pretrain", "synthetic_instruct")}
+    assert all(count == processed_rows(Path(directory), "x") for directory, count in rows.items())
+
+
 def test_resolve_splits_on_the_tiny_dataset(tiny_dataset_config: DatasetConfig, tiny_layout: DatasetLayout) -> None:
-    splits = resolve_splits(tiny_dataset_config, tiny_layout)
+    splits = resolve_splits(tiny_dataset_config, tiny_layout, processed_row_counts(tiny_dataset_config, tiny_layout))
     assert set(splits) == {"synthetic_pretrain", "synthetic_instruct"}
     for name, validation in splits.items():
         total = _rows_in(tiny_layout.processed_dir(name))
@@ -392,23 +398,20 @@ def _stage(val: list[DataEntry]) -> ResolvedStage:
     return ResolvedStage(name="s", tokens=1, base_lr=1e-4, transition_pct=0.0, train_weights={}, val_data=val)
 
 
-def test_check_entries_on_disk_names_the_entry(tmp_path: Path, tiny_pretrain_dir: Path) -> None:
+def test_check_entries_names_the_entry_with_an_empty_range(tiny_pretrain_dir: Path) -> None:
+    """The row counts come from `processed_row_counts` (which already refused a missing or shard-less folder), so
+    the check is pure arithmetic over the mapping: every entry's range must hold a row."""
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
-    check_entries_on_disk([DataEntry("a", good, skip_rows=total - 1)], [_stage([DataEntry("s-a", good, max_rows=1)])])
-    check_entries_on_disk([DataEntry("a", good)], [_stage([DataEntry("s-a", good)])])  # full range twice is fine
-    missing = str(tmp_path / "nope")
-    with pytest.raises(FileNotFoundError, match=f"train source 'a': processed folder {re.escape(missing)} does not exist"):
-        check_entries_on_disk([DataEntry("a", missing)], [])
-    (tmp_path / "empty").mkdir()
-    with pytest.raises(FileNotFoundError, match="stage 's' val entry 's-b': .* holds no data-\\*.parquet shard"):
-        check_entries_on_disk([], [_stage([DataEntry("s-b", str(tmp_path / "empty"))])])
+    rows = {good: total}
+    check_entries([DataEntry("a", good, skip_rows=total - 1)], [_stage([DataEntry("s-a", good, max_rows=1)])], rows)
+    check_entries([DataEntry("a", good)], [_stage([DataEntry("s-a", good)])], rows)  # full range twice is fine
     # an empty training range is the error that makes the stream's restart-on-exhaustion safe: a source that runs
     # dry mid-run is restarted, which would spin forever on a range without a single row
     with pytest.raises(RuntimeError, match=rf"train source 'a': row range \[{total}, end\) of .* is empty \({total} rows on disk\); the training part"):
-        check_entries_on_disk([DataEntry("a", good, skip_rows=total)], [])
+        check_entries([DataEntry("a", good, skip_rows=total)], [], rows)
     with pytest.raises(RuntimeError, match=r"stage 's' val entry 's-a': row range \[0, 0\) of .* is empty .*; the validation part"):
-        check_entries_on_disk([], [_stage([DataEntry("s-a", good, max_rows=0)])])
+        check_entries([], [_stage([DataEntry("s-a", good, max_rows=0)])], rows)
 
 
 # --- one row per dataloader worker shard ------------------------------------------------------------------------------
@@ -440,12 +443,13 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
     loaders in-process, so with one device everything is a single shard and only a larger world can starve one."""
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
+    rows = {good: total}
     train = [DataEntry("a", good), DataEntry("narrow", good, skip_rows=total - 2)]
     stage = _stage([DataEntry("s-a", good, max_rows=1)])
-    check_entry_shards(train, [stage])  # world size 1: one shard per loader, whatever the row count
-    check_entry_shards(train, [stage], world_size=1)
+    check_entries(train, [stage], rows)  # world size 1: one shard per loader, whatever the row count
+    check_entries(train, [stage], rows, world_size=1)
     # the training range is what counts, not the folder: the validation split narrows `narrow` to 2 rows
-    check_entry_shards([DataEntry("narrow", good, skip_rows=total - 2)], [], world_size=2)
+    check_entries([DataEntry("narrow", good, skip_rows=total - 2)], [], rows, world_size=2)
     with pytest.raises(
         ValueError,
         match=(
@@ -454,34 +458,36 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
             r"empty and the run would fail during training\. Give the source more rows, or lower the world size"
         ),
     ):
-        check_entry_shards([DataEntry("narrow", good, skip_rows=total - 2)], [], world_size=3)
+        check_entries([DataEntry("narrow", good, skip_rows=total - 2)], [], rows, world_size=3)
     # validation loaders read in-process (`num_workers=0`): one shard per rank
     val_only = _stage([DataEntry("s-b", good, max_rows=2)])
-    check_entry_shards([], [val_only], world_size=2)
+    check_entries([], [val_only], rows, world_size=2)
     with pytest.raises(
         ValueError,
         match=r"stage 's' val entry 's-b': .*over 4 shards \(0 dataloader worker\(s\) × world size 4\).*lower the world size",
     ):
-        check_entry_shards([], [val_only], world_size=4)
+        check_entries([], [val_only], rows, world_size=4)
 
 
 # --- the validation data an evaluation needs --------------------------------------------------------------------------
 
 
-def test_validation_batches_available_counts_only_finite_loaders(tiny_pretrain_dir: Path) -> None:
-    """A one-entry validation loader is one finite epoch over its row range (`ceil(rows / micro_batch_size)`
-    batches, the rows dealt over `world_size` shards); a loader over several entries mixes them through
-    `WeightedMixtureDataset`, which restarts exhausted members and therefore never runs out (`None`)."""
+def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pretrain_dir: Path) -> None:
+    """A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
+    batches, the rows of every entry dealt over `world_size` shards); several entries are read once each through
+    `WeightedMixtureDataset`."""
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], micro_batch_size=2, world_size=4) == 1
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], micro_batch_size=2, world_size=4) == 0
-    assert validation_batches_available([DataEntry("s-a", good)], micro_batch_size=1, world_size=1) == total
-    assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], 4, 1) == 1  # a short last batch
-    mixture = [DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)]
-    assert validation_batches_available(mixture, micro_batch_size=4, world_size=1) is None  # restarts, never short
+    rows = {good: total}
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], rows, micro_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=4) == 1
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, micro_batch_size=2, world_size=4) == 0
+    assert validation_batches_available([DataEntry("s-a", good)], rows, micro_batch_size=1, world_size=1) == total
+    assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], rows, 4, 1) == 1  # a short last batch
+    mixture = [DataEntry("s-a", good, max_rows=5), DataEntry("s-b", good, max_rows=2)]
+    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=1) == 2  # 7 rows once
+    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
 
 
 def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
@@ -491,25 +497,26 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     error naming the stage, the entries and both numbers; fewer batches than `eval_iters` is a warning (`evaluate`
     averages the batches it gets), and enough data passes silently."""
     good = str(tiny_pretrain_dir)
+    rows = {good: _rows_in(tiny_pretrain_dir)}
     stage = _stage([DataEntry("s-a", good, max_rows=4)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
+        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], micro_batch_size=8, eval_iters=1)  # one short batch is still a batch
+        check_validation_batches([stage], rows, micro_batch_size=8, eval_iters=1)  # one short batch is still a batch
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], micro_batch_size=2, eval_iters=5)
+        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=5)
     assert "stage s: its validation data (s-a) yields 2 micro-batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
     # nothing at all reaches a rank (here: 4 rows dealt over 8 ranks, the last two get none) is the hard error
     with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
-        check_validation_batches([stage], micro_batch_size=2, eval_iters=1, world_size=8)
-    # a validation loader that mixes several sources restarts them and is never short, whatever the row counts are
+        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=1, world_size=8)
+    # a validation loader that mixes several sources reads each of them once: it is checked like a single one
     mixed = _stage([DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         caplog.clear()
-        check_validation_batches([mixed], micro_batch_size=8, eval_iters=50)
-    assert caplog.text == ""
+        check_validation_batches([mixed], rows, micro_batch_size=8, eval_iters=50)
+    assert "stage s: its validation data (s-a, s-b) yields 1 micro-batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
 
 
 def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
@@ -570,7 +577,8 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert [e.prefix for e in resolved.train_sources] == ["synthetic_pretrain", "synthetic_instruct"]  # config order
     assert resolved.train_sources[0].data_dir == str(tiny_layout.processed_dir("synthetic_pretrain"))
     assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_instruct"))
-    assert resolved.validation_rows == resolve_splits(resolved.config, tiny_layout)
+    assert resolved.validation_rows == resolve_splits(resolved.config, tiny_layout, resolved.rows_on_disk)
+    assert resolved.rows_on_disk == processed_row_counts(resolved.config, tiny_layout)
     for entry in resolved.train_sources + [e for stage in resolved.stages for e in stage.val_data]:
         assert list(Path(entry.data_dir).glob("*.parquet")), entry
 
@@ -580,22 +588,14 @@ def test_data_entry_defaults() -> None:
     assert (entry.weight, entry.data_signature, entry.skip_rows, entry.max_rows) == (1.0, None, 0, None)
 
 
-def test_training_stages(tiny_dataset_dir: Path) -> None:
-    """`training_stages()` hands the stage manager the budget, LR, transition and sampling weights of every stage
-    and nothing about the data on disk (the entries stay in `ResolvedStage` / `ResolvedDataset`)."""
+def test_resolved_stages_carry_the_schedule_of_every_stage(tiny_dataset_dir: Path) -> None:
+    """`ResolvedDataset.stages` is what the stage manager takes: budget, LR, transition and sampling weights per
+    stage next to the validation entries."""
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
-    stages = resolved.training_stages()
-    assert len(stages) == 3 and all(isinstance(s, TrainingStage) for s in stages)
-    assert stages == [
-        TrainingStage(
-            name=s.name, tokens=s.tokens, base_lr=s.base_lr, transition_pct=s.transition_pct, train_weights=s.train_weights
-        )
-        for s in resolved.stages
-    ]
-    assert stages[0].train_weights is not resolved.stages[0].train_weights  # a copy: the manager cannot mutate it
+    stages = resolved.stages
+    assert len(stages) == 3 and all(isinstance(s, ResolvedStage) for s in stages)
     assert (stages[2].name, stages[2].tokens, stages[2].base_lr, stages[2].transition_pct) == ("finetune", 4096, 5e-5, 0.0)
     assert stages[2].train_weights == {"synthetic_instruct": 1.0}
-    assert {f.name for f in fields(TrainingStage)} == {"name", "tokens", "base_lr", "transition_pct", "train_weights"}
 
 
 def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path) -> None:
@@ -622,7 +622,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     assert list(layout.processed_dir("synthetic_pretrain").glob("*.parquet"))
     assert list(layout.processed_dir("synthetic_instruct").glob("*.parquet"))
     assert Path(resolved.tokenizer_dir).is_dir()
-    assert resolved.validation_rows == resolve_splits(resolved.config, layout) and min(resolved.validation_rows.values()) >= 1
+    assert resolved.validation_rows == resolve_splits(resolved.config, layout, resolved.rows_on_disk) and min(resolved.validation_rows.values()) >= 1
     # a second resolve finds everything complete and does not build again
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="data_preparation"):
@@ -720,6 +720,7 @@ def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedData
         stages=[],
         train_sources=[],
         validation_rows=validation_rows,
+        rows_on_disk={},
     )
 
 

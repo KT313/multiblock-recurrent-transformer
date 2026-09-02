@@ -26,7 +26,7 @@ from data_preparation.lib.log import ProgressStreamHandler
 from training import train as train_module
 from training.backend.base import Backend
 from training.checkpoint import checkpoint_dir
-from training.golden import write_tiny_yaml
+from training.testing.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
 from training.train import StopRequest, main, stop_on_interrupt

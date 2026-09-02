@@ -262,14 +262,14 @@ def test_files_and_row_groups_outside_range_are_not_read(ranged_dir: Path, monke
     assert opened == ["data-00001.parquet"]
 
 
-def test_range_length_is_the_epoch_and_mixture_cycles_inside_it(ranged_dir: Path) -> None:
-    """The class does not cycle itself: one __iter__ is one epoch over the range. WeightedMixtureDataset restarts
-    an exhausted member, which replays the range from its start and never leaves it."""
+def test_range_length_is_the_epoch_and_a_mixture_reads_it_once(ranged_dir: Path) -> None:
+    """The class does not cycle itself: one __iter__ is one epoch over the range, and a WeightedMixtureDataset over
+    it ends with that epoch."""
     ds = ParquetTextDataset(ranged_dir, "p", skip_rows=6, max_rows=4)
     assert _texts(ds) == _texts(ds) == _docs(6, 10)
     mixture = WeightedMixtureDataset([ds], [1.0], seed=0)
     rows = [str(r["text"]) for r in itertools.islice(iter(mixture), 10)]
-    assert rows == _docs(6, 10) + _docs(6, 10) + _docs(6, 8)
+    assert rows == _docs(6, 10)
 
 
 # --- WeightedMixtureDataset -------------------------------------------------------------------------------------------
@@ -299,7 +299,7 @@ def test_mixture_normalises_weights() -> None:
 
 
 def test_mixture_frequencies_match_weights() -> None:
-    members = [_Counting("a", 1000), _Counting("b", 1000), _Counting("c", 1000)]
+    members = [_Counting("a", 50_000), _Counting("b", 50_000), _Counting("c", 50_000)]  # no member runs out
     ds = WeightedMixtureDataset(members, [0.6, 0.3, 0.1], seed=1)
     n = 20_000
     counts = Counter(item[0] for item in itertools.islice(iter(ds), n))
@@ -308,17 +308,20 @@ def test_mixture_frequencies_match_weights() -> None:
         assert counts[prefix] / n == pytest.approx(w, abs=0.01)
 
 
-def test_mixture_restarts_exhausted_members() -> None:
+def test_mixture_drops_exhausted_members_and_ends_with_the_last() -> None:
+    """An exhausted member leaves the draw (never restarted), the others carry on with renormalised weights, and
+    the mixture ends once every member is read: every item of every member exactly once, in the member's order."""
     a, b = _Counting("a", 4), _Counting("b", 1000)
     ds = WeightedMixtureDataset([a, b], [0.5, 0.5], seed=3)
-    items = list(itertools.islice(iter(ds), 60))
-    a_items = [i for p, i in items if p == "a"]
-    assert len(a_items) > 4 and a.starts > 1
-    # after restarting, 'a' is replayed from the beginning, in order
-    assert a_items == [i % 4 for i in range(len(a_items))]
-    # every member's order is preserved
-    b_items = [i for p, i in items if p == "b"]
-    assert b_items == list(range(len(b_items)))
+    items = list(iter(ds))
+    assert len(items) == 1004 and a.starts == 1 and b.starts == 1
+    assert [i for p, i in items if p == "a"] == [0, 1, 2, 3]
+    assert [i for p, i in items if p == "b"] == list(range(1000))
+    first_b_after_a = items.index(("a", 3)) + 1
+    assert all(p == "b" for p, _ in items[first_b_after_a:])  # only b is left to draw from
+    # the draws up to the first exhaustion are the plain weighted draw: the same seed gives the same prefix
+    again = list(itertools.islice(iter(WeightedMixtureDataset([_Counting("a", 4), _Counting("b", 1000)], [0.5, 0.5], seed=3)), first_b_after_a))
+    assert again == items[:first_b_after_a]
 
 
 def test_mixture_deterministic_under_seed() -> None:
@@ -374,11 +377,14 @@ def test_resume_offset_starts_the_next_epoch_inside_the_range(small_dir: Path) -
     assert [r["text"] for r in ds] == [f"row {i}" for i in range(7, 23)]
 
 
-def test_resume_offset_is_one_shot(small_dir: Path) -> None:
-    """A permanent offset would hide the rows before it in every later epoch."""
+def test_resume_offset_holds_until_it_is_set_back(small_dir: Path) -> None:
+    """The dataset keeps the offset for every epoch until it is set back to 0 (`RunDataloaders` does that before
+    the second epoch after a resume: a permanent offset would hide the rows before it)."""
     ds = ParquetTextDataset(small_dir, "small")
     ds.set_resume_offset(20)
-    assert len(list(ds)) == 3 and ds.resume_offset == 0
+    assert len(list(ds)) == 3 and ds.resume_offset == 20
+    assert len(list(ds)) == 3
+    ds.set_resume_offset(0)
     assert [r["text"] for r in ds] == [f"row {i}" for i in range(23)]
 
 

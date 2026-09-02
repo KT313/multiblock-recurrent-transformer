@@ -6,8 +6,6 @@ from __future__ import annotations
 from rich.console import Console, Group
 
 from training.ui.format import (
-    TRANSITION_FLAG_KEY,
-    TRANSITION_PROGRESS_KEY,
     as_float,
     event_line,
     fit_panel_heights,
@@ -18,7 +16,6 @@ from training.ui.format import (
     known_metrics,
     line,
     status_line,
-    transition_of,
     validation_line,
 )
 
@@ -75,9 +72,6 @@ def test_step_dict_readers_accept_anything_float_like() -> None:
     assert as_float(Scalar()) == 2.5 and as_float("3") == 3.0 and as_float("x") is None and as_float(None) is None
     assert floats({"a": 1, "b": "nope", "c": Scalar()}) == {"a": 1.0, "c": 2.5}
     assert known_metrics({"loss": 3, "unknown": 1.0, "lr": "bad", "ppl": Scalar()}) == {"loss": 3.0, "ppl": 2.5}
-    assert transition_of({}) is None and transition_of({TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.5}) is None
-    assert transition_of({TRANSITION_FLAG_KEY: 1.0, TRANSITION_PROGRESS_KEY: 0.5}) == 0.5
-    assert transition_of({TRANSITION_FLAG_KEY: True}) == 0.0, "in a transition without progress: 0"
 
 
 def test_line_never_wraps_and_keeps_markup_literal() -> None:

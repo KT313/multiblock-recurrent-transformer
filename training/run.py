@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from torch.nn import Module
 from torch.optim import Optimizer
@@ -47,7 +47,7 @@ from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
 from training.backend import get_backend
-from training.backend.base import Backend
+from training.backend.base import Backend, plain_model
 from training.checkpoint import (
     CheckpointMetadata,
     checkpoint_dir,
@@ -57,7 +57,6 @@ from training.checkpoint import (
     is_checkpoint_step,
     load_training_checkpoint,
     save_training_checkpoint,
-    unwrap_compiled,
 )
 from training.data.collate import IGNORE_INDEX
 from training.data.loader import build_run_dataloaders
@@ -77,6 +76,7 @@ def train(
     backend: Backend | None = None,
     should_stop: StopCheck | None = None,
     started_at: float | None = None,
+    keep_history: bool = False,
 ) -> TrainingReport:
     """Run the training run described by `settings` and return its report.
 
@@ -87,6 +87,8 @@ def train(
     `resume: true` continues from there.
     `started_at` is the caller's clock reading at the start of the run (`report.setup_seconds`); the run's own
     clock lives in `RunLogger`.
+    `keep_history` is a test knob: with it `report.history` holds every log step's metric dict (the golden run and
+    the end-to-end tests read it); the CLI leaves it off, so a long run does not accumulate its metrics in memory.
     The run directory is locked for the whole run (`training.run_lock`): a second run pointed at the same `out_dir`
     fails with `RunDirectoryLocked` instead of sharing checkpoints, `train.log` and `run_config.json` with this one.
 
@@ -101,44 +103,57 @@ def train(
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
         loaders = build_run_dataloaders(settings, dataset, backend)
-        model = build_run_model(settings, backend, run_directory)
-        optimizer = build_run_optimizer(settings, model, backend)
-        progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
-            settings, run_directory, backend, model, optimizer, dataset
-        )
+        try:
+            model = build_run_model(settings, backend, run_directory)
+            optimizer = build_run_optimizer(settings, model, backend)
+            progress, resumed_from, data_stream_state = restore_checkpoint_if_resuming(
+                settings, run_directory, backend, model, optimizer, dataset
+            )
 
-        with RunLogger.open(
-            settings, run_directory, dataset, model, stage_manager, progress, backend, setup_started=started_at
-        ) as logger:
-            if resumed_from is None:
-                record_run_config(settings, run_directory)
-                logger.log_fresh_start()
-            else:
-                logger.log_resume(resumed_from, progress.step)
-            batches = BatchStream(settings, loaders, stage_manager, progress)
-            if data_stream_state is not None:
-                batches.load_state_dict(data_stream_state)
-            logger.status("training")
-            stopped = False
-            while progress.step < stage_manager.total_steps and not stopped:
-                result = run_one_optimizer_step(settings, backend, model, optimizer, stage_manager, batches, progress)
-                progress.advance()
-                if is_evaluation_step(settings, progress, stage_manager):
-                    validation_loader = loaders.val_loaders[result.next_stage.stage_idx]
-                    with logger.evaluating():
-                        result.validation = evaluate(settings, backend, model, validation_loader)
-                logger.log_step(result, progress)
-                # a request arriving during the last step changes nothing: the run is finished, not stopped
-                stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
-                if stopped:
-                    logger.status("stopping after this step, saving a checkpoint")
-                if is_checkpoint_step(settings, progress.done, stage_manager) or stopped:
-                    save_run_checkpoint(
-                        settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress, logger,
-                        batches,
+            with RunLogger.open(
+                settings,
+                run_directory,
+                dataset,
+                model,
+                stage_manager,
+                progress,
+                backend,
+                setup_started=started_at,
+                keep_history=keep_history,
+            ) as logger:
+                if resumed_from is None:
+                    record_run_config(settings, run_directory)
+                    logger.log_fresh_start()
+                else:
+                    logger.log_resume(resumed_from, progress.step)
+                batches = BatchStream(settings, loaders, stage_manager, progress)
+                if data_stream_state is not None:
+                    batches.load_state_dict(data_stream_state)
+                logger.status("training")
+                stopped = False
+                while progress.step < stage_manager.total_steps and not stopped:
+                    result = run_one_optimizer_step(
+                        settings, backend, model, optimizer, stage_manager, batches, progress
                     )
-            export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
-            return logger.close(progress, export_dir, stopped=stopped)
+                    progress.advance()
+                    if is_evaluation_step(settings, progress.step, stage_manager):
+                        validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
+                        with logger.evaluating():
+                            result.validation = evaluate(settings, backend, model, validation_loader)
+                    logger.log_step(result, progress)
+                    # a request arriving during the last step changes nothing: the run is finished, not stopped
+                    stopped = stop_requested(should_stop) and progress.step < stage_manager.total_steps
+                    if stopped:
+                        logger.status("stopping after this step, saving a checkpoint")
+                    if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
+                        save_run_checkpoint(
+                            settings, run_directory, backend, model, optimizer, dataset, stage_manager, progress,
+                            logger, batches,
+                        )
+                export_dir = None if stopped else export_if_requested(settings, run_directory, model, dataset, logger)
+                return logger.close(progress, export_dir, stopped=stopped)
+        finally:
+            loaders.close()  # the loader workers stop now, on every way out, not when the GC finds the iterators
 
 
 # --- setup -----------------------------------------------------------------------------------------------------------
@@ -168,7 +183,7 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
     """The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries."""
     return StageManager(
-        dataset.training_stages(),
+        dataset.stages,
         world_batch_size=settings.world_batch_size,
         block_size=settings.block_size,
         world_size=world_size,
@@ -243,7 +258,7 @@ def restore_checkpoint_if_resuming(
         return progress, None, None
     metadata = load_training_checkpoint(backend, resume_path, model, optimizer)
     check_dataset_unchanged(metadata, dataset, settings.allow_dataset_change)
-    model_config = cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict()
+    model_config = plain_model(model).config.to_dict()
     check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
     progress.step = progress.resume_step = metadata.step
     backend.set_rng_state(metadata.rng)
@@ -270,24 +285,24 @@ def save_run_checkpoint(
     logger: RunLogger,
     batches: BatchStream,
 ) -> None:
-    """Write the checkpoint of `progress.done` completed optimizer steps and tell the logger (the status reads
+    """Write the checkpoint of `progress.step` completed optimizer steps and tell the logger (the status reads
     `saving checkpoint` meanwhile, the path becomes a dashboard event).
 
     `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
-    step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is in at `done`, i.e. the one it
-    enters next when written before a transition. Numerics: called after evaluation and logging of the step, so the
+    step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is heading for at `done`
+    (`StageManager.entering_stage_at`: the one it enters when written as a transition starts). Numerics: called after evaluation and logging of the step, so the
     stored RNG state includes the evaluation draws; `batches.state_dict()` adds the rows the run has consumed per
     source, so a resume trains on rows it has not seen (`BatchStream.load_state_dict` says what that does and
     does not promise).
     """
-    stage_end = stage_manager.stage_ending_at(progress.done - 1)
-    path = checkpoint_path(run_directory, settings.run_name, progress.done, stage_end)
+    stage_end = stage_manager.stage_ending_at(progress.step - 1)
+    path = checkpoint_path(run_directory, settings.run_name, progress.step, stage_end)
     metadata = CheckpointMetadata(
-        step=progress.done,
-        stage=stage_manager.get_stage_info(progress.done).stage_idx,
+        step=progress.step,
+        stage=stage_manager.entering_stage_at(progress.step),
         rng=backend.rng_state(),
         settings=asdict(settings),
-        model_config=cast(RecurrentGPT, unwrap_compiled(model)).config.to_dict(),
+        model_config=plain_model(model).config.to_dict(),
         dataset_config_hash=dataset.config_hash,
         validation_rows=dataset.validation_rows,
         data_stream=batches.state_dict(),
@@ -310,7 +325,7 @@ def export_if_requested(
         return None
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else run_directory / "hf_export"
     logger.status("exporting")
-    plain_model = cast(RecurrentGPT, unwrap_compiled(model))
-    export_to_hf(plain_model, plain_model.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
+    trained = plain_model(model)
+    export_to_hf(trained, trained.config, export_dir, tokenizer_dir=dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir

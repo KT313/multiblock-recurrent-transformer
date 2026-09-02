@@ -33,14 +33,12 @@ import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from model import RecurrentGPT
-from training.checkpoint import unwrap_compiled
+from training.backend.base import plain_model
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import KEEP, TRAIN_LOG_NAME
 from training.ui.dashboard import RunDashboard, training_dashboard
-from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -120,11 +118,11 @@ def describe_parameters(model: Module) -> str:
     """The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
     blocks and the count of the unrolled model at the mean recurrence (`total - recurrent + recurrent * mean of
     mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped)."""
-    plain_model = cast(RecurrentGPT, unwrap_compiled(model))
-    total_parameters = num_parameters(plain_model)
-    core_blocks = cast(Iterable[Module], plain_model.transformer.core_blocks)
+    unwrapped = plain_model(model)
+    total_parameters = num_parameters(unwrapped)
+    core_blocks = cast(Iterable[Module], unwrapped.transformer.core_blocks)
     recurrent_parameters = sum(p.numel() for block in core_blocks for p in block.parameters())
-    mean_recurrence = cast(list[int], plain_model.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
+    mean_recurrence = cast(list[int], unwrapped.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
     mean_of_means = sum(mean_recurrence) / len(mean_recurrence)
     unrolled_parameters = int(total_parameters - recurrent_parameters + recurrent_parameters * mean_of_means)
     return (
@@ -143,7 +141,7 @@ class TrainingReport:
 
     run_directory: Path
     steps_completed: int  # optimizer steps run by this process (a resumed run counts from its resume step)
-    final_step: int  # completed optimizer steps of the run in total (`progress.done` at the end)
+    final_step: int  # completed optimizer steps of the run in total (`progress.step` at the end)
     resumed_from: Path | None  # the checkpoint the run resumed from, None for a fresh start
     setup_seconds: float  # from the start of the run to `RunLogger.open` (backend, dataset, loaders, model, resume)
     train_seconds: float  # from `RunLogger.open` to `RunLogger.close`
@@ -152,7 +150,8 @@ class TrainingReport:
     checkpoints_written: list[Path]  # every checkpoint saved by this process, in order
     export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf` (and after a stop)
     stopped: bool = False  # the run stopped on request (`should_stop` of `train()`, the CLI's Ctrl-C) before its last step
-    history: dict[int, dict[str, float]] = field(default_factory=dict)  # `RunLogger.log_step`'s metrics per logged step
+    history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step: `RunLogger.log_step`'s
+    # metrics, only with `train(keep_history=True)` (a test knob); empty otherwise
 
     def summary(self) -> str:
         """The lines the CLI prints after `train()` returned."""
@@ -182,7 +181,9 @@ class Dashboard(Protocol):
     """The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `NoOpDashboard` (the console fallback) satisfy it; tests pass a recording fake."""
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None: ...
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None: ...
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None: ...
 
@@ -196,12 +197,12 @@ def open_dashboard(
 ) -> AbstractContextManager[RunDashboard]:
     """The run's dashboard (`training.ui.training_dashboard`): the live display when stdout is a terminal and
     `TRAINING_DASHBOARD` is not `0`, the one-line-per-`log_step_interval` console fallback otherwise; one bar per
-    stage (`stage_manager.boundaries`) plus the overall bar, the header naming the run, the model and dataset config
-    (file names without `.yaml`), the device and precision; every record appended to `run_directory / train.log`.
-    `start_step` (the resume step) keeps the ETA honest after a resume."""
+    stage (named after `stage_manager.stages`, sized by its boundary) plus the overall bar, the header naming the
+    run, the model and dataset config (file names without `.yaml`), the device and precision; every record appended
+    to `run_directory / train.log`. `start_step` (the resume step) keeps the ETA honest after a resume."""
     return training_dashboard(
         settings.run_name,
-        [boundary.stage_name for boundary in stage_manager.boundaries],
+        [stage.name for stage in stage_manager.stages],
         [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries],
         stage_manager.total_steps,
         details={
@@ -215,27 +216,6 @@ def open_dashboard(
         log_file=run_directory / TRAIN_LOG_NAME,
         fallback_stream=sys.stderr,  # piped runs: step lines join the log handlers' lines on stderr
     )
-
-
-def _stage_for_the_bars(at_done: StageInfo) -> tuple[int, dict[str, float]]:
-    """Where the run is after `progress.done` steps, for the dashboard's bars: the index of the stage whose steps
-    are counting (inside a transition the stage being left, `prev_stage_idx` — the info itself already names the
-    stage being entered) and the two transition keys the dashboard reads for the bar note.
-
-    `at_done` is `result.next_stage`, the stage at `done` (the same info the checkpoint's `stage` and the validation
-    loader use). wandb and `history` keep `result.stage`, the stage the step trained on, in their `stage/*` metrics as
-    the thesis logged them; at a log step the dashboard's copy of the step dict gets these two keys instead, so the
-    bar note and the marker agree.
-    """
-    if at_done.in_transition and at_done.prev_stage_idx is not None:
-        stage_index = at_done.prev_stage_idx
-    else:
-        stage_index = at_done.stage_idx
-    transition = {
-        TRANSITION_FLAG_KEY: float(at_done.in_transition),
-        TRANSITION_PROGRESS_KEY: at_done.transition_progress,
-    }
-    return stage_index, transition
 
 
 class RunLogger:
@@ -261,6 +241,7 @@ class RunLogger:
         dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
+        keep_history: bool = False,
     ) -> None:
         self.settings = settings
         self.run_directory = run_directory
@@ -278,7 +259,8 @@ class RunLogger:
                 open_dashboard(settings, run_directory, stage_manager, start_step=start_step, device=device)
             )
         )
-        self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats
+        self.keep_history = keep_history  # a test knob: fill `history` (the CLI does not keep every log step)
+        self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats, if kept
         self.checkpoints_written: list[Path] = []
         self.resumed_from: Path | None = None
         self.tokens_per_step = settings.world_batch_size * settings.block_size
@@ -308,6 +290,7 @@ class RunLogger:
         dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
+        keep_history: bool = False,
     ) -> RunLogger:
         """Open the run's logging once the setup is done: the wandb run with the hyperparameters (the settings plus
         `dataset_config_hash`) and the `num_parameters` summary, then the dashboard (`open_dashboard`, unless a
@@ -316,7 +299,7 @@ class RunLogger:
 
         `progress.step` is the step training starts at (the resume step), `backend.device` names the device;
         `setup_started` is the clock reading at the start of the run (`setup_seconds` of the report; 0 if not given).
-        `clock` is `time.time` unless a test injects a fake.
+        `clock` is `time.time` unless a test injects a fake; `keep_history` fills `history` (a test knob too).
         """
         wandb = Logger(
             settings.logger_project,
@@ -326,7 +309,7 @@ class RunLogger:
             enabled=settings.wandb_enabled,
         )
         wandb.log_hyperparams(asdict(settings) | {"dataset_config_hash": dataset.config_hash})
-        wandb.log_summary({"num_parameters": num_parameters(unwrap_compiled(model))})
+        wandb.log_summary({"num_parameters": num_parameters(plain_model(model))})
         run_logger = cls(
             settings,
             run_directory,
@@ -337,6 +320,7 @@ class RunLogger:
             dashboard=dashboard,
             clock=clock,
             setup_started=setup_started,
+            keep_history=keep_history,
         )
         console.info(stage_manager.get_stage_summary(), extra=KEEP)
         console.info(
@@ -427,54 +411,62 @@ class RunLogger:
     # --- steps -------------------------------------------------------------------------------------------------------
 
     def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
-        """Account one completed optimizer step (`progress.done`, i.e. after `progress.advance()`).
+        """Account one completed optimizer step (`progress.step`, after `progress.advance()`).
 
         Every step: the data ids join the composition counter, a stage transition starting or ending with this step
         becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
-        `last_validation`, and the dashboard's bars move (`update_step` with the stage at `done` and — only at log
+        `last_validation`, and the dashboard's bars move (`update_step` with the stage containing `done` — the bar
+        whose steps are counting —, the transition progress at `done` (None outside a transition) and — only at log
         steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
-        added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and
-        to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
+        added to the thesis loop). At
+        log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and, with `keep_history`, to
+        `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
-        * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR before the
-          per-group `base_lr`), `grad_norm` (pre-clip), `step` (= done);
+        * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR), `grad_norm`
+          (pre-clip), `step` (= done);
         * `seconds/step` (wall time of the last log interval per step), `tokens/second` (`world_batch_size ×
           block_size` per `seconds/step`; 0 if the interval took no measurable time), `total_tokens` (`done × tokens
           per step`, counted from step 0 also after a resume), `total_time` (seconds since `open`), `remaining_time`
           (`seconds/step × steps left`);
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition` (0/1), `stage/transition_progress`,
-          `stage/stage_progress` — the stage info the step trained on (`result.stage`);
+          `stage/stage_progress` — the stage info the step trained on (`result.stage`): `current_stage` is the stage
+          whose boundary contains the step, the same stage `stage_progress` and `base_lr` describe, also inside the
+          transition window at its end (the stage being entered is only visible through `in_transition`);
         * `data_composition/<data id>`: the fraction of world-batch samples since the last log step per data id (they
           sum to 1; the counter resets here);
         * the gradient / parameter metrics of `track_gradient_metrics` (`result.metrics`) and the validation metrics
           (`val_loss*`, `val_ppl*`, `val_time`) when this step evaluated.
         """
         self._sample_counter.update(result.data_ids)
-        self._note_transition(result)
+        at_done = self.stage_manager.get_stage_info(progress.step)
+        self._note_transition(result.stage, at_done)
         validation = self._log_validation(result, progress)
-        stage_index, transition = _stage_for_the_bars(result.next_stage)
-        if progress.done % self.settings.log_step_interval != 0:
-            self.dashboard.update_step(progress.done, stage_index, {})
+        transition = at_done.transition_progress if at_done.transition_to is not None else None
+        if progress.step % self.settings.log_step_interval != 0:
+            self.dashboard.update_step(progress.step, at_done.stage_idx, transition, {})
             return
         metrics = self._step_metrics(result, progress, validation)
-        self.wandb.log(metrics, step=progress.done)
-        self.history[progress.done] = {name: float(value) for name, value in metrics.items()}
+        self.wandb.log(metrics, step=progress.step)
+        if self.keep_history:
+            self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
-        self.dashboard.update_step(progress.done, stage_index, metrics | transition)
+        self.dashboard.update_step(progress.step, at_done.stage_idx, transition, metrics)
 
-    def _note_transition(self, result: StepResult) -> None:
+    def _note_transition(self, before: StageInfo, after: StageInfo) -> None:
         """The two transition events: after the last plain step of a stage ("starting transition") and after the
-        last transition step ("transition complete"). `result.stage` is the info at the step, `result.next_stage` at
-        the step after; inside a transition the info already names the next stage."""
-        before, after = result.stage, result.next_stage
-        if after.in_transition and not before.in_transition:
-            leaving = self.stage_manager.boundaries[cast(int, after.prev_stage_idx)].stage_name
+        last transition step ("transition complete"). `before` is the info at the step that trained, `after` the
+        one at `done`, the step after it."""
+        stages = self.stage_manager.stages
+        if after.transition_to is not None and before.transition_to is None:
+            leaving, entering = stages[after.stage_idx], stages[after.transition_to]
             self.dashboard.note_event(
-                f"starting transition {after.prev_stage_idx} -> {after.stage_idx} ({leaving} -> {after.stage_name}), "
-                f"LR {cast(float, after.prev_base_lr):.2e} -> {after.base_lr:.2e}"
+                f"starting transition {after.stage_idx} -> {after.transition_to} ({leaving.name} -> {entering.name}), "
+                f"LR {leaving.base_lr:.2e} -> {entering.base_lr:.2e}"
             )
-        elif before.in_transition and not after.in_transition:
-            self.dashboard.note_event(f"transition complete, now in stage {after.stage_idx} ({after.stage_name})")
+        elif before.transition_to is not None and after.transition_to is None:
+            self.dashboard.note_event(
+                f"transition complete, now in stage {after.stage_idx} ({stages[after.stage_idx].name})"
+            )
 
     def _log_validation(self, result: StepResult, progress: TrainingProgress) -> dict[str, float] | None:
         """The validation metrics of this step as floats plus `val_time`, shown on the dashboard (the `val_loss*`
@@ -486,7 +478,7 @@ class RunLogger:
         self._evaluation_seconds = None
         self._last_validation = validation
         losses = {name: value for name, value in validation.items() if name.startswith("val_loss")}
-        self.dashboard.update_validation(progress.done, losses)
+        self.dashboard.update_validation(progress.step, losses)
         return validation
 
     def _step_metrics(
@@ -495,9 +487,9 @@ class RunLogger:
         """The metric dict of a log step (documented in `log_step`); resets the interval timer and the composition
         counter."""
         now = self._clock()
-        steps_in_interval = max(progress.done - self._interval_step, 1)  # after an off-grid resume fewer than the interval
+        steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
         seconds_per_step = (now - self._interval_started) / steps_in_interval
-        self._interval_started, self._interval_step = now, progress.done
+        self._interval_started, self._interval_step = now, progress.step
         total_samples = sum(self._sample_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
@@ -506,15 +498,15 @@ class RunLogger:
             "ppl": _to_scalar(result.log_ppl.exp()),
             "lr": result.learning_rate,
             "grad_norm": _to_scalar(result.grad_norm),
-            "step": progress.done,
+            "step": progress.step,
             "seconds/step": seconds_per_step,
             "tokens/second": self.tokens_per_step / seconds_per_step if seconds_per_step > 0 else 0.0,
-            "total_tokens": progress.done * self.tokens_per_step,
+            "total_tokens": progress.step * self.tokens_per_step,
             "total_time": now - self._train_started,
-            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.done),
+            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.step),
             "stage/current_stage": result.stage.stage_idx,
-            "stage/base_lr": result.stage.base_lr,
-            "stage/in_transition": int(result.stage.in_transition),
+            "stage/base_lr": self.stage_manager.stages[result.stage.stage_idx].base_lr,
+            "stage/in_transition": int(result.stage.transition_to is not None),
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }
@@ -531,13 +523,13 @@ class RunLogger:
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
         ending = "stopped on request" if stopped else "finished"
-        console.info(f"Training {ending} after {progress.done} steps in {train_seconds:.1f}s.", extra=KEEP)
+        console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.status(ending)
         self.resources.close()
         return TrainingReport(
             run_directory=self.run_directory,
-            steps_completed=progress.done - self.start_step,
-            final_step=progress.done,
+            steps_completed=progress.step - self.start_step,
+            final_step=progress.step,
             resumed_from=self.resumed_from,
             setup_seconds=self.setup_seconds,
             train_seconds=train_seconds,
@@ -579,78 +571,76 @@ def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
 @torch.no_grad()
 def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, torch.Tensor]:
     """Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
-    and before `zero_grad()`."""
+    and before `zero_grad()`.
+
+    One pass over the parameters in optimizer-group order (the order the `avg_RMS` sum and the
+    `local_l1_grad_norm` mean accumulate in), each parameter classified by its name once and its optimizer state
+    looked up once: `query_grad_<i>` / `ffn2_grad_<i>` number the fused-qkv and MLP-projection weights that have a
+    gradient (NaN for a non-finite one), the `*_effective_lr_<i>` keys number those among them that also have a
+    finite gradient and Adam state.
+    """
     metrics: dict[str, torch.Tensor] = {}
     dims = _qkv_dims(model)
     transformer = getattr(model, "transformer", None)
     wte_module: Optional[Module] = getattr(transformer, "wte", None)
     wte_weight: Optional[torch.Tensor] = getattr(wte_module, "weight", None)
+    names = {id(param): name for name, param in model.named_parameters()}
 
-    # Specific gradient norms
-    qkv_layer_counter, mlp_layer_counter = 0, 0
-    qkv_params: list[torch.Tensor] = []
-    proj_params: list[torch.Tensor] = []
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            if "qkv" in name and "weight" in name:
-                qkv_params.append(param)
-                if (~torch.isfinite(param.grad)).sum() == 0:
-                    if dims is not None and param.grad.numel() % dims[0] == 0:
-                        q_grad = param.grad.view(-1, dims[0])[: dims[1], :]
-                        metrics[f"query_grad_{qkv_layer_counter}"] = q_grad.norm()
-                else:
-                    metrics[f"query_grad_{qkv_layer_counter}"] = torch.as_tensor(float("NaN"))
-                qkv_layer_counter += 1
-            if "mlp" in name and "proj" in name and "weight" in name:
-                proj_params.append(param)
-                if (~torch.isfinite(param.grad)).sum() == 0:
-                    metrics[f"ffn2_grad_{mlp_layer_counter}"] = param.grad.norm()
-                else:
-                    metrics[f"ffn2_grad_{mlp_layer_counter}"] = torch.as_tensor(float("NaN"))
-                mlp_layer_counter += 1
-
-    # 2nd moment quality and effective learning rates
+    grad_qkv_layer, grad_mlp_layer = 0, 0  # `query_grad_<i>` / `ffn2_grad_<i>`
+    lr_qkv_layer, lr_mlp_layer = 0, 0  # `*_effective_lr_<i>`
     total_rms: torch.Tensor | float = 0.0
     num_params_with_grad = 0
-    qkv_layer_counter, mlp_layer_counter = 0, 0
-    params_with_finite_grad = []
+    finite_grads: list[torch.Tensor] = []
     for group in optimizer.param_groups:
         for param in group["params"]:
-            if param.grad is not None and (~torch.isfinite(param.grad)).sum() == 0:
-                params_with_finite_grad.append(param)
-                if param in optimizer.state and "exp_avg_sq" in optimizer.state[param]:
-                    exp_avg_sq = optimizer.state[param]["exp_avg_sq"]
-                    if exp_avg_sq.shape == param.grad.shape:
-                        rms = (
-                            param.grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
-                        )
-                        total_rms += rms
-                        num_params_with_grad += 1
-                        if wte_weight is not None and param is wte_weight:
-                            metrics["embed_RMS"] = rms
-
-                        if any(param is p for p in qkv_params):  # identity check, `in` would compare values
-                            qkv_lr = _reverse_engineer_adam_effective_lr(param, optimizer.state[param], group)
-                            if dims is not None and qkv_lr.numel() % dims[0] == 0:
-                                H, dim_q, dim_kv = dims
-                                qkv_lr = qkv_lr.view(-1, H)
-                                metrics[f"q_effective_lr_{qkv_layer_counter}"] = qkv_lr[:dim_q, :].mean()
-                                metrics[f"k_effective_lr_{qkv_layer_counter}"] = qkv_lr[dim_q : dim_q + dim_kv, :].mean()
-                                metrics[f"v_effective_lr_{qkv_layer_counter}"] = qkv_lr[dim_q + dim_kv :, :].mean()
-                            qkv_layer_counter += 1
-
-                        if any(param is p for p in proj_params):
-                            proj_lr = _reverse_engineer_adam_effective_lr(param, optimizer.state[param], group)
-                            metrics[f"ffn2_effective_lr_{mlp_layer_counter}"] = proj_lr.mean()
-                            mlp_layer_counter += 1
+            grad = param.grad
+            if grad is None:
+                continue
+            name = names.get(id(param), "")
+            is_qkv = "qkv" in name and "weight" in name
+            is_proj = "mlp" in name and "proj" in name and "weight" in name
+            finite = bool(torch.isfinite(grad).all())
+            if is_qkv:
+                if not finite:
+                    metrics[f"query_grad_{grad_qkv_layer}"] = torch.as_tensor(float("NaN"))
+                elif dims is not None and grad.numel() % dims[0] == 0:
+                    metrics[f"query_grad_{grad_qkv_layer}"] = grad.view(-1, dims[0])[: dims[1], :].norm()
+                grad_qkv_layer += 1
+            if is_proj:
+                metrics[f"ffn2_grad_{grad_mlp_layer}"] = grad.norm() if finite else torch.as_tensor(float("NaN"))
+                grad_mlp_layer += 1
+            if not finite:
+                continue
+            finite_grads.append(grad)
+            state = optimizer.state.get(param)
+            if state is None:
+                continue
+            exp_avg_sq = state.get("exp_avg_sq")
+            if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
+                continue
+            rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
+            total_rms += rms
+            num_params_with_grad += 1
+            if wte_weight is not None and param is wte_weight:
+                metrics["embed_RMS"] = rms
+            if is_qkv:
+                qkv_lr = _reverse_engineer_adam_effective_lr(param, state, group)
+                if dims is not None and qkv_lr.numel() % dims[0] == 0:
+                    H, dim_q, dim_kv = dims
+                    qkv_lr = qkv_lr.view(-1, H)
+                    metrics[f"q_effective_lr_{lr_qkv_layer}"] = qkv_lr[:dim_q, :].mean()
+                    metrics[f"k_effective_lr_{lr_qkv_layer}"] = qkv_lr[dim_q : dim_q + dim_kv, :].mean()
+                    metrics[f"v_effective_lr_{lr_qkv_layer}"] = qkv_lr[dim_q + dim_kv :, :].mean()
+                lr_qkv_layer += 1
+            if is_proj:
+                metrics[f"ffn2_effective_lr_{lr_mlp_layer}"] = _reverse_engineer_adam_effective_lr(param, state, group).mean()
+                lr_mlp_layer += 1
 
     if num_params_with_grad > 0:
         metrics["avg_RMS"] = torch.as_tensor(total_rms / num_params_with_grad)  # already a Tensor after one add
 
-    if len(params_with_finite_grad) > 0:
-        metrics["local_l1_grad_norm"] = torch.mean(
-            torch.stack([torch.norm(p.grad.detach(), 1.0) for p in params_with_finite_grad])
-        )
+    if finite_grads:
+        metrics["local_l1_grad_norm"] = torch.mean(torch.stack([torch.norm(grad.detach(), 1.0) for grad in finite_grads]))
 
     # Parameter norms
     metrics["l2_param_norm"] = torch.norm(torch.stack([torch.norm(p.detach()) for p in model.parameters()]))

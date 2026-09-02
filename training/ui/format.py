@@ -20,9 +20,6 @@ METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("seconds/step", "s/step"),
     ("total_tokens", "tokens"),
 )
-TRANSITION_FLAG_KEY = "stage/in_transition"
-TRANSITION_PROGRESS_KEY = "stage/transition_progress"
-
 
 def format_duration(seconds: float | None) -> str:
     """``h:mm:ss`` (``Nd hh:mm:ss`` from one day on); ``—`` for unknown / non-finite / negative values."""
@@ -45,23 +42,22 @@ def format_tokens(count: float) -> str:
     return f"{count:.0f}"
 
 
+# format strings per metric key of the step dict; `total_tokens` goes through `format_tokens`, anything else `.4g`
+METRIC_FORMATS: dict[str, str] = {
+    "loss": "{:.4f}",
+    "ppl": "{:.2f}",
+    "lr": "{:.2e}",
+    "grad_norm": "{:.3f}",
+    "tokens/second": "{:,.0f}",
+    "seconds/step": "{:.2f}s",
+}
+
+
 def format_metric(key: str, value: float) -> str:
     """The table / fallback-line rendering of one metric of the step dict."""
-    if key == "loss":
-        return f"{value:.4f}"
-    if key == "ppl":
-        return f"{value:.2f}"
-    if key == "lr":
-        return f"{value:.2e}"
-    if key == "grad_norm":
-        return f"{value:.3f}"
-    if key == "tokens/second":
-        return f"{value:,.0f}"
-    if key == "seconds/step":
-        return f"{value:.2f}s"
     if key == "total_tokens":
         return format_tokens(value)
-    return f"{value:.4g}"
+    return METRIC_FORMATS.get(key, "{:.4g}").format(value)
 
 
 def fit_panel_heights(available: int, events: int, log: int) -> tuple[int, int]:
@@ -91,22 +87,7 @@ def floats(values: Mapping[str, object]) -> dict[str, float]:
 
 def known_metrics(metrics: Mapping[str, object]) -> dict[str, float]:
     """The metric-table keys present in ``metrics`` (in table order) as floats."""
-    known: dict[str, float] = {}
-    for key, _label in METRIC_COLUMNS:
-        if key in metrics:
-            value = as_float(metrics[key])
-            if value is not None:
-                known[key] = value
-    return known
-
-
-def transition_of(metrics: Mapping[str, object]) -> float | None:
-    """The transition progress (0-1) when the step dict says the step is inside a transition, else None."""
-    flag = as_float(metrics.get(TRANSITION_FLAG_KEY, 0))
-    if not flag:
-        return None
-    progress = as_float(metrics.get(TRANSITION_PROGRESS_KEY, 0.0))
-    return 0.0 if progress is None else progress
+    return floats({key: metrics[key] for key, _label in METRIC_COLUMNS if key in metrics})
 
 
 def validation_line(step: int, losses: Mapping[str, object]) -> str:

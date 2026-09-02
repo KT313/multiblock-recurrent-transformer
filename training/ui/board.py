@@ -30,7 +30,6 @@ from training.ui.common import TRAINING_LOGGER_NAME, Clock, log
 from training.ui.fallback import NoOpDashboard
 from training.ui.format import (
     METRIC_COLUMNS,
-    TRANSITION_FLAG_KEY,
     event_line,
     fit_panel_heights,
     floats,
@@ -39,7 +38,6 @@ from training.ui.format import (
     known_metrics,
     line,
     status_line,
-    transition_of,
     validation_line,
 )
 
@@ -309,12 +307,15 @@ class TrainingDashboard:
 
     # --- the API train() drives ------------------------------------------------------------------------------------
 
-    def update_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
-        """``step`` optimizer steps are done, the run is in stage ``stage_index``; ``metrics`` is the step dict
-        (only the :data:`METRIC_COLUMNS` keys and the ``stage/`` transition keys are read, missing keys keep their
-        last value). O(1): a few bar updates and a dict merge; the display redraws on its own timer."""
-        if not self._guarded(lambda: self._apply_step(step, stage_index, metrics)):
-            self._fallback.update_step(step, stage_index, metrics)
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
+        """``step`` optimizer steps are done, the run is in stage ``stage_index``, ``transition`` is the progress
+        (0-1) of the running transition out of it or None; ``metrics`` is the step dict (only the
+        :data:`METRIC_COLUMNS` keys are read, missing keys keep their last value). O(1): a few bar updates and a dict
+        merge; the display redraws on its own timer."""
+        if not self._guarded(lambda: self._apply_step(step, stage_index, transition, metrics)):
+            self._fallback.update_step(step, stage_index, transition, metrics)
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """The validation losses measured after ``step`` (one entry per recurrence depth, e.g. ``val_loss_4``)."""
@@ -331,18 +332,17 @@ class TrainingDashboard:
         if not self._guarded(lambda: self._apply_status(text)):
             self._fallback.set_status(text)
 
-    def _apply_step(self, step: int, stage_index: int, metrics: Mapping[str, object]) -> None:
+    def _apply_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
         known = known_metrics(metrics)
         with self._lock:
-            if TRANSITION_FLAG_KEY in metrics:
-                self._transition = transition_of(metrics)  # the step dict says: in a transition (its progress) or not
-            elif stage_index != self._stage_index:
-                self._transition = None  # a step dict without the keys (a non-log step), but the stage moved on
+            self._transition = transition
             self._step = step
             self._stage_index = stage_index
             self._latest.update(known)
             self._refresh_bars(step, stage_index)
-            file_line = self._fallback.step_line(step, stage_index, metrics)  # also records the throughput
+            file_line = self._fallback.step_line(step, stage_index, transition, metrics)  # also records the throughput
         if file_line is not None:
             self._log_line(logging.INFO, file_line)
 
