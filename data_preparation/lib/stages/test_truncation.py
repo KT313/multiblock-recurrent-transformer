@@ -20,9 +20,13 @@ from data_preparation.lib.stages.truncation import (
     CHARS_PER_TOKEN_ESTIMATE,
     PRE_CUT_CHARS_PER_TOKEN,
     truncate_many,
-    truncate_to_token_cap,
 )
 from data_preparation.lib.storage.parquet import estimate_tokens
+
+
+def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> tuple[str, int]:
+    """`truncate_many` for one text."""
+    return truncate_many([text], max_tokens, tokenizer)[0]
 
 CORPUS = [
     "the quick brown fox jumps over the lazy dog " * 20,

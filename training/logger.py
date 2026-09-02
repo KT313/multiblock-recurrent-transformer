@@ -37,6 +37,7 @@ from model import RecurrentGPT
 from training.checkpoint import unwrap_compiled
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
+from training.ui.common import KEEP
 from training.ui.dashboard import (
     TRAIN_LOG_NAME,
     TRANSITION_FLAG_KEY,
@@ -54,7 +55,6 @@ if TYPE_CHECKING:
     from training.step import StepResult, TrainingProgress  # `step.py` imports `track_gradient_metrics` from here
 
 CONSOLE_LOGGER_NAME = "training.logger"  # under the `training` hierarchy; named explicitly, not via `__name__`
-KEEP = {"keep": True}  # `extra=` of the records that must survive in the terminal scrollback under a live dashboard
 
 console = logging.getLogger(CONSOLE_LOGGER_NAME)
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from training.ui.common import log
+from training.ui.common import KEEP, log
 from training.ui.dashboard import training_dashboard
 from training.ui.format import TRANSITION_FLAG_KEY, TRANSITION_PROGRESS_KEY
 
@@ -48,7 +48,7 @@ def demo(
         ) as board:
             board.note_event("no checkpoint found, starting from scratch")
             board.set_status("training")
-            log.info("Total training steps: %d (4 micro-batches each)", total_steps, extra={"keep": True})
+            log.info("Total training steps: %d (4 micro-batches each)", total_steps, extra=KEEP)
             loss = 6.0
             for step in range(1, total_steps + 1):
                 time.sleep(pause)

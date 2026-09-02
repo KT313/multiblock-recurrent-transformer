@@ -34,12 +34,16 @@ from data_preparation.lib.build.planner import (
     rows_needed,
     rows_sufficient,
     source_ledger,
-    source_state,
     sources_with_pending_raw_shards,
     summarize_dataset_state,
     training_rows_after_split,
 )
 from data_preparation.lib.storage.manifest import Manifest
+
+
+def source_state(cfg: DatasetConfig, name: str, layout: DatasetLayout) -> SourceState:
+    """One source's row of the status table."""
+    return source_ledger(cfg, name, layout).state()
 
 CfgFactory = Callable[..., DatasetConfig]
 ConfigFile = Callable[[DatasetConfig], Path]

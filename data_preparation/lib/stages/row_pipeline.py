@@ -159,11 +159,6 @@ def instruct_text(row: Row) -> str:
     return f"{row['instruction']}\n{row.get('input') or ''}\n{row['output']}"
 
 
-def check_length(tokens: int, max_tokens: int) -> bool:
-    """Keep an instruct row whose measured token count does not exceed ``max_tokens`` (``max_seq_length``)."""
-    return tokens <= max_tokens
-
-
 def create_input_inversion(row: Row) -> Row:
     """Ask for the instruction given the output (swap direction); unchanged when instruction or output is missing
     or empty."""

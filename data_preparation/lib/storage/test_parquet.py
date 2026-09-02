@@ -3,8 +3,9 @@
 
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,8 +21,6 @@ from data_preparation.lib.storage.parquet import (
     normalized_text,
     shard_index,
     text_hash64,
-    write_dict_rows,
-    write_parquet_shards,
 )
 
 
@@ -111,154 +110,44 @@ def test_normalized_text_and_hash() -> None:
 # --- parquet shard writer -------------------------------------------------------------------------------------------
 
 
-def _batches(sizes: list[int], start: int = 0) -> Iterator[pa.RecordBatch]:
-    i = start
-    for n in sizes:
-        yield pa.RecordBatch.from_pydict({"x": list(range(i, i + n))})
-        i += n
+def _write_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, *, start_shard: int = 0) -> list[str]:
+    """Write dict rows as shards through `ShardWriter`; the names of the published shards, in order."""
+    published: list[Path] = []
+    with ShardWriter(out_dir, shard_size, start_shard=start_shard, on_shard=published.append) as writer:
+        for row in rows:
+            writer.add(row)
+    return [path.name for path in published]
 
 
-def test_write_parquet_shards_rechunks_to_exact_shard_size(tmp_path: Path) -> None:
-    n = write_parquet_shards(_batches([7, 1, 9, 3]), tmp_path / "out", shard_size=5)
-    tables = _read_all(tmp_path / "out")
-    assert n == 4 and len(tables) == 4
-    assert [t.num_rows for t in tables] == [5, 5, 5, 5]
-    assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
-    assert pa.concat_tables(tables)["x"].to_pylist() == list(range(20))
+def test_shard_writer_writes_shards_of_shard_size_and_appends(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert _write_rows(({"text": f"t{i}", "n": i} for i in range(12)), out, shard_size=5) == [f"data-{i:05d}.parquet" for i in range(3)]
+    tables = _read_all(out)
+    assert [t.num_rows for t in tables] == [5, 5, 2]
+    merged = pa.concat_tables(tables)
+    assert merged.column_names == ["text", "n"] and merged["n"].to_pylist() == list(range(12))
+    assert _write_rows([{"text": "x", "n": 99}], out, 5, start_shard=3) == ["data-00003.parquet"]
+    assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(4)]
+    assert _write_rows([], out, 5, start_shard=1) == []  # nothing written: shards >= 1 are still cleared (append mode replaces them)
+    assert [p.name for p in list_parquet_files(out)] == ["data-00000.parquet"]
 
 
-def test_write_parquet_shards_last_shard_is_remainder(tmp_path: Path) -> None:
-    n = write_parquet_shards(_batches([4, 4, 4]), tmp_path / "out", shard_size=5)
-    assert n == 3
-    assert [t.num_rows for t in _read_all(tmp_path / "out")] == [5, 5, 2]
-
-
-def test_write_parquet_shards_single_big_batch_split(tmp_path: Path) -> None:
-    n = write_parquet_shards(_batches([23]), tmp_path / "out", shard_size=10)
-    assert n == 3
-    assert [t.num_rows for t in _read_all(tmp_path / "out")] == [10, 10, 3]
-    assert pa.concat_tables(_read_all(tmp_path / "out"))["x"].to_pylist() == list(range(23))
-
-
-def test_write_parquet_shards_accepts_tables_and_skips_empty(tmp_path: Path) -> None:
-    items: list[pa.RecordBatch | pa.Table] = [
-        pa.table({"x": [1, 2]}),
-        pa.RecordBatch.from_pydict({"x": []}),
-        pa.table({"x": [3]}),
-    ]
-    n = write_parquet_shards(items, tmp_path / "out", shard_size=100)
-    assert n == 1
-    assert _read_all(tmp_path / "out")[0]["x"].to_pylist() == [1, 2, 3]
-
-
-def test_write_parquet_shards_empty_input_writes_nothing_but_creates_dir(tmp_path: Path) -> None:
-    n = write_parquet_shards([], tmp_path / "out", shard_size=5)
-    assert n == 0 and (tmp_path / "out").is_dir()
+def test_shard_writer_empty_input_writes_nothing_but_creates_dir(tmp_path: Path) -> None:
+    assert _write_rows([], tmp_path / "out", shard_size=5) == [] and (tmp_path / "out").is_dir()
     assert list_parquet_files(tmp_path / "out") == []
 
 
-def test_write_parquet_shards_rejects_bad_arguments(tmp_path: Path) -> None:
+def test_shard_writer_rejects_bad_arguments(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="shard_size"):
-        write_parquet_shards([], tmp_path / "out", shard_size=0)
+        ShardWriter(tmp_path / "out", shard_size=0, on_shard=lambda path: None)
     with pytest.raises(ValueError, match="start_shard"):
-        write_parquet_shards([], tmp_path / "out", shard_size=1, start_shard=-1)
+        ShardWriter(tmp_path / "out", shard_size=1, start_shard=-1, on_shard=lambda path: None)
 
 
-def test_write_parquet_shards_failure_leaves_out_dir_untouched(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    write_parquet_shards(_batches([3]), out, shard_size=5)
-    before = {p.name: p.read_bytes() for p in out.iterdir()}
-
-    def failing() -> Iterator[pa.RecordBatch]:
-        yield from _batches([6, 6])  # enough for two complete shards in the temp dir
-        raise RuntimeError("stream broke")
-
-    with pytest.raises(RuntimeError, match="stream broke"):
-        write_parquet_shards(failing(), out, shard_size=5)
-    assert not (tmp_path / "out.tmp").exists()
-    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
-    assert not list(tmp_path.glob("**/*.parquet.tmp"))
-    # a fresh directory is not created on failure either
-    with pytest.raises(RuntimeError):
-        write_parquet_shards(failing(), tmp_path / "fresh", shard_size=5)
-    assert not (tmp_path / "fresh").exists() and not (tmp_path / "fresh.tmp").exists()
-
-
-def test_write_parquet_shards_overwrite_clears_stale_shards(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert write_parquet_shards(_batches([20]), out, shard_size=5) == 4
-    (out / "MANIFEST.json").write_text("{}")
-    assert write_parquet_shards(_batches([7]), out, shard_size=5) == 2
-    assert sorted(p.name for p in out.iterdir()) == ["MANIFEST.json", "data-00000.parquet", "data-00001.parquet"]
-    assert pa.concat_tables(_read_all(out))["x"].to_pylist() == list(range(7))
-
-
-def test_write_parquet_shards_append_keeps_lower_and_removes_higher(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert write_parquet_shards(_batches([20]), out, shard_size=5) == 4  # data-00000 .. data-00003
-    n = write_parquet_shards(_batches([7], start=100), out, shard_size=5, start_shard=2)
-    assert n == 2
-    assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(4)]
-    assert pa.concat_tables(_read_all(out))["x"].to_pylist() == list(range(10)) + list(range(100, 107))
-    # pure append: start at the current count, nothing is removed
-    assert write_parquet_shards(_batches([2], start=500), out, shard_size=5, start_shard=4) == 1
-    assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(5)]
-    assert _read_all(out)[4]["x"].to_pylist() == [500, 501]
-
-
-def test_write_parquet_shards_clears_leftover_tmp_dir(tmp_path: Path) -> None:
-    leftover = tmp_path / "out.tmp"
-    leftover.mkdir()
-    (leftover / "data-00009.parquet").write_bytes(b"garbage")
-    (leftover / "junk.txt").write_bytes(b"")
-    assert write_parquet_shards(_batches([3]), tmp_path / "out", shard_size=5) == 1
-    assert not leftover.exists()
-    assert [p.name for p in (tmp_path / "out").iterdir()] == ["data-00000.parquet"]
-
-
-def test_write_dict_rows(tmp_path: Path) -> None:
-    rows = ({"text": f"t{i}", "n": i} for i in range(12))
-    n = write_dict_rows(rows, tmp_path / "out", shard_size=5)
-    tables = _read_all(tmp_path / "out")
-    assert n == 3 and [t.num_rows for t in tables] == [5, 5, 2]
-    merged = pa.concat_tables(tables)
-    assert merged.column_names == ["text", "n"]
-    assert merged["n"].to_pylist() == list(range(12))
-    assert write_dict_rows(({"text": "x", "n": 99} for _ in range(1)), tmp_path / "out", 5, start_shard=3) == 1
-    assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
-
-
-def test_shard_writer_matches_write_dict_rows_and_appends(tmp_path: Path) -> None:
-    write_dict_rows(({"n": i} for i in range(12)), tmp_path / "ref", shard_size=5)
-    with ShardWriter(tmp_path / "out", shard_size=5) as writer:
-        for i in range(12):
-            writer.add({"n": i})
-    assert writer.written == 3
-    assert [t.to_pylist() for t in _read_all(tmp_path / "out")] == [t.to_pylist() for t in _read_all(tmp_path / "ref")]
-    with ShardWriter(tmp_path / "out", shard_size=5, start_shard=3) as writer:
-        writer.add({"n": 99})
-    assert [p.name for p in list_parquet_files(tmp_path / "out")] == [f"data-{i:05d}.parquet" for i in range(4)]
-    with ShardWriter(tmp_path / "out", shard_size=5, start_shard=1) as writer:
-        pass  # nothing written: shards >= 1 are still cleared (append mode replaces them)
-    assert [p.name for p in list_parquet_files(tmp_path / "out")] == ["data-00000.parquet"]
-
-
-def test_shard_writer_failure_leaves_out_dir_untouched(tmp_path: Path) -> None:
-    write_dict_rows(({"n": i} for i in range(3)), tmp_path / "out", shard_size=5)
-    with pytest.raises(RuntimeError, match="boom"), ShardWriter(tmp_path / "out", shard_size=2) as writer:
-        for i in range(5):
-            writer.add({"n": i})
-        raise RuntimeError("boom")
-    assert [p.name for p in list_parquet_files(tmp_path / "out")] == ["data-00000.parquet"]
-    assert _read_all(tmp_path / "out")[0].num_rows == 3 and not (tmp_path / "out.tmp").exists()
-    with pytest.raises(ValueError, match="shard_size"):
-        ShardWriter(tmp_path / "out", shard_size=0)
-
-
-def test_shard_writer_per_shard_mode_publishes_each_shard_and_keeps_them_on_failure(tmp_path: Path) -> None:
+def test_shard_writer_publishes_each_shard_and_keeps_them_on_failure(tmp_path: Path) -> None:
     published: list[str] = []
     out = tmp_path / "out"
-    write_dict_rows(({"n": i} for i in range(7)), out, shard_size=2)  # 4 shards; the writer appends at 2
+    _write_rows(({"n": i} for i in range(7)), out, shard_size=2)  # 4 shards; the writer appends at 2
     (out / "data-00003.parquet.tmp").write_bytes(b"leftover")
 
     def on_shard(path: Path) -> None:
@@ -266,7 +155,6 @@ def test_shard_writer_per_shard_mode_publishes_each_shard_and_keeps_them_on_fail
         assert path.is_file() and 1 <= pq.read_table(path).num_rows <= 2
 
     with pytest.raises(RuntimeError, match="boom"), ShardWriter(out, shard_size=2, start_shard=2, on_shard=on_shard) as writer:
-        assert writer.per_shard
         for i in range(5):
             writer.add({"m": i})
             if i == 3:
@@ -274,7 +162,7 @@ def test_shard_writer_per_shard_mode_publishes_each_shard_and_keeps_them_on_fail
         raise RuntimeError("boom")  # the buffered 5th row is discarded, the published shards stay
     assert [p.name for p in list_parquet_files(out)] == [f"data-{i:05d}.parquet" for i in range(4)]
     assert [t.to_pylist() for t in _read_all(out)][2:] == [[{"m": 0}, {"m": 1}], [{"m": 2}, {"m": 3}]]
-    assert not (tmp_path / "out.tmp").exists() and not list(out.glob("*.tmp"))
+    assert not list(out.glob("*.tmp"))
 
     with ShardWriter(out, shard_size=2, start_shard=2, on_shard=on_shard) as writer:  # stale shards >= 2 cleared
         writer.add({"m": 9})

@@ -37,10 +37,10 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
 from training.settings import parse_settings
+from training.ui.common import KEEP
 from training.ui.dashboard import TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
 
 EXIT_INTERRUPTED = 130
-KEEP = {"keep": True}  # `extra=` of the records that must survive in the terminal scrollback under a live dashboard
 
 log = logging.getLogger(f"{TRAINING_LOGGER_NAME}.train")
 

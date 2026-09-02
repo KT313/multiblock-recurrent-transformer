@@ -37,6 +37,10 @@ FINETUNE_SHARES = {"flan": 0.40, "metamath": 0.15, "orca_math": 0.10, "evol_code
 Mutation = Callable[[dict[str, Any]], Any]
 
 
+def _sources_of_kind(cfg: DatasetConfig, kind: str) -> list[str]:
+    return [name for name, source in cfg.sources.items() if source.kind == kind]
+
+
 def _minimal() -> dict[str, Any]:
     """A small valid config as a plain dict (mutated by the validation tests): `pre` is trained and validated on
     (split), `hold` is validation-only (needs `rows`), `ins` is an instruct source trained and validated on."""
@@ -117,12 +121,12 @@ def test_crow_config_matches_thesis_run() -> None:
     cfg = load_dataset_config(CROW)
     assert [s.name for s in cfg.stages] == ["pretrain_phase1", "pretrain_phase2", "finetune"]
     assert [s.tokens for s in cfg.stages] == [3_300_000_000, 1_500_000_000, 150_000_000]
-    assert len(cfg.sources_of_kind("pretrain")) == 19
-    assert len(cfg.sources_of_kind("instruct")) == 8
+    assert len(_sources_of_kind(cfg, "pretrain")) == 19
+    assert len(_sources_of_kind(cfg, "instruct")) == 8
     assert all(stage.val == {"fineweb_edu": 1.0} for stage in cfg.stages[:2])
     assert cfg.stages[2].train == FINETUNE_SHARES and cfg.stages[2].val == FINETUNE_SHARES
-    assert all(cfg.sources[name].input_inversions == 0.05 for name in cfg.sources_of_kind("instruct"))
-    assert all(cfg.sources[name].input_inversions == 0.0 for name in cfg.sources_of_kind("pretrain"))
+    assert all(cfg.sources[name].input_inversions == 0.05 for name in _sources_of_kind(cfg, "instruct"))
+    assert all(cfg.sources[name].input_inversions == 0.0 for name in _sources_of_kind(cfg, "pretrain"))
     assert (cfg.token_count, cfg.max_seq_length, cfg.block_size, cfg.validation_fraction) == ("tokenizer", 2048, 2048, 0.05)
     assert cfg.processing.dedup.mode == "exact" and cfg.processing.dedup.bloom_memory_mb == 1024
     assert not cfg.processing.quality_filter and not cfg.processing.decontamination.enabled
@@ -440,12 +444,6 @@ def test_source_processing_override() -> None:
     assert cfg.source_processing("pre") is not cfg.processing
     cfg = _build(_minimal())
     assert cfg.source_processing("pre") is cfg.processing and cfg.source_processing("ins") is cfg.processing
-
-
-def test_sources_of_kind() -> None:
-    cfg = _build(_minimal())
-    assert cfg.sources_of_kind("pretrain") == ["pre", "hold"]
-    assert cfg.sources_of_kind("instruct") == ["ins"]
 
 
 # --- hashes -----------------------------------------------------------------------------------------------------------
@@ -843,7 +841,7 @@ def test_config_hash_ignores_fetch_and_describe_knobs() -> None:
 
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:
-    names = set(dc.dataset_config_fields())
+    names = {f.name for f in fields(DatasetConfig)}
     assert {"name", "tokenizer", "sources", "stages", "block_size", "max_seq_length", "validation_fraction", "processing"} <= names
     assert "instruct_mixtures" not in names
     cfg = _build(_minimal())

@@ -5,7 +5,6 @@ Only the options the final config sets are kept (`update_clipping`, `atan_adam`,
 the other experimental switches of the upstream implementation were never enabled and are gone.
 """
 
-import copy
 from math import sqrt
 from typing import Any, Callable, Iterable, overload
 
@@ -109,7 +108,7 @@ class ELLISAdam(Optimizer):
     ) -> None:
         defaults = dict(
             lr=torch.tensor(lr, dtype=torch.float32),
-            init_lr=copy.deepcopy(lr),
+            init_lr=lr,
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
@@ -119,14 +118,6 @@ class ELLISAdam(Optimizer):
             decouple_wd=decouple_wd,
         )
         super().__init__(params, defaults)
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        super().__setstate__(state)
-        for group in self.param_groups:
-            for p in group["params"]:
-                p_state = self.state.get(p, [])
-                if len(p_state) != 0 and not torch.is_tensor(p_state["step"]):
-                    p_state["step"] = torch.tensor(float(p_state["step"]), dtype=torch.float32)
 
     @torch.no_grad()
     def _init_group(

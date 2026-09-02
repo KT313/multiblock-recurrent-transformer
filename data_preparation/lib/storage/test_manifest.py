@@ -14,9 +14,14 @@ from data_preparation.lib.storage.manifest import (
     Manifest,
     ShardInfo,
     library_versions,
+    shard_problem,
     shard_rows,
-    verify_shards,
 )
+
+
+def verify_shards(directory: Path, manifest: Manifest) -> list[str]:
+    """The `shard_problem` of every shard of `manifest` that has one."""
+    return [problem for shard in manifest.shards if (problem := shard_problem(directory, shard)) is not None]
 
 
 def _manifest() -> Manifest:

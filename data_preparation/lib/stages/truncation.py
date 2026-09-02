@@ -6,7 +6,7 @@ download step now cuts the text itself, so the stored count is the true count of
 bounded. The token definition is the one of ``TokenCounter`` in ``stages/download.py``: the config tokenizer with
 ``add_special_tokens=False`` (no bos/eos), or ``len(text) // 4`` in ``token_count: estimate`` mode.
 
-Invariants of :func:`truncate_to_token_cap` / :func:`truncate_many` (tested): the returned text is a prefix of the
+Invariants of :func:`truncate_many` (tested): the returned text is a prefix of the
 input; the returned count equals the tokenizer's count of the returned text; the count is ``<= max_tokens``.
 """
 
@@ -35,18 +35,12 @@ PRE_CUT_CHARS_PER_TOKEN = 32
 Offsets = list[tuple[int, int]]
 
 
-def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> tuple[str, int]:
-    """``(prefix, count)``: the longest prefix this function finds with at most ``max_tokens`` tokens and its count.
-
-    ``tokenizer`` None is the ``token_count: estimate`` mode: the text is cut at ``CHARS_PER_TOKEN_ESTIMATE *
-    max_tokens`` characters and counted as ``len // CHARS_PER_TOKEN_ESTIMATE``. See :func:`truncate_many` for the
-    tokenizer mode; this is the single-text form of it.
-    """
-    return truncate_many([text], max_tokens, tokenizer)[0]
-
-
 def truncate_many(texts: list[str], max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> list[tuple[str, int]]:
-    """:func:`truncate_to_token_cap` for a batch (one batched tokenizer call per round instead of one per text).
+    """``(prefix, count)`` per text: the longest prefix this function finds with at most ``max_tokens`` tokens and its
+    count (one batched tokenizer call per round instead of one per text).
+
+    ``tokenizer`` None is the ``token_count: estimate`` mode: each text is cut at ``CHARS_PER_TOKEN_ESTIMATE *
+    max_tokens`` characters and counted as ``len // CHARS_PER_TOKEN_ESTIMATE``.
 
     Tokenizer mode: each text is pre-cut (:data:`PRE_CUT_CHARS_PER_TOKEN`), tokenized with character offsets and,
     when it has more than ``max_tokens`` tokens, cut where token number ``max_tokens`` (0-based) starts. The cut
@@ -92,4 +86,4 @@ def _cut_before_token(text: str, offsets: Offsets, index: int) -> str:
     return text[: min(start, len(text) - 1)]
 
 
-__all__ = ["CHARS_PER_TOKEN_ESTIMATE", "PRE_CUT_CHARS_PER_TOKEN", "truncate_many", "truncate_to_token_cap"]
+__all__ = ["CHARS_PER_TOKEN_ESTIMATE", "PRE_CUT_CHARS_PER_TOKEN", "truncate_many"]

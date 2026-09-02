@@ -107,18 +107,6 @@ class RepairReport:
             return "nothing to repair"
         return "\n".join(action.describe() for action in self.actions)
 
-    def raw_deleted(self) -> list[RepairAction]:
-        """Raw folders that were deleted (performed, not planned)."""
-        return [action for action in self.actions if action.kind == "raw" and action.action == "delete"]
-
-    def processed_deleted(self) -> list[RepairAction]:
-        """Processed folders that were deleted (performed, not planned)."""
-        return [action for action in self.actions if action.kind == "processed" and action.action == "delete"]
-
-    def raw_deletions_planned(self) -> list[RepairAction]:
-        """Raw folders queued for deletion (before they are confirmed, or in a dry run)."""
-        return [action for action in self.actions if action.kind == "raw" and action.action in ("delete", "would_delete")]
-
     def raw_confirmations_planned(self) -> list[RepairAction]:
         """The raw actions the one confirmation covers: every queued deletion, and every truncation that would drop
         healthy shards after the broken one (a tail-only truncation repairs without asking)."""

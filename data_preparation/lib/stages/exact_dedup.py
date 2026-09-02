@@ -101,19 +101,6 @@ class SeenDocuments:
         # rbloom's stub leaves hash_func unannotated (``hash_func=__builtins__.hash``); the contract is int -> int
         self._bloom = Bloom(self.expected_items, TARGET_FALSE_POSITIVE_RATE, hash_func=mix128)
 
-    @property
-    def size_in_bits(self) -> int:
-        """The allocated bit-array size (rbloom rounds the budget up to whole bytes)."""
-        return self._bloom.size_in_bits
-
-    @property
-    def approx_items(self) -> float:
-        """rbloom's estimate of the number of distinct hashes inserted (from the fill ratio)."""
-        return self._bloom.approx_items
-
-    def __contains__(self, hash64: int) -> bool:
-        return hash64 in self._bloom
-
     def add_if_new(self, hash64: int) -> bool:
         """Insert ``hash64``; True iff it was not seen before (a false positive reports a new hash as seen)."""
         if hash64 in self._bloom:

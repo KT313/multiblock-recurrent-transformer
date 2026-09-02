@@ -168,11 +168,10 @@ def test_check_contamination_with_planted_13gram_overlap() -> None:
 # --- instruct rows -----------------------------------------------------------------------------------------------------
 
 
-def test_instruct_text_and_check_length() -> None:
+def test_instruct_text() -> None:
     assert rp.instruct_text({"instruction": "a", "input": "b", "output": "c"}) == "a\nb\nc"
     assert rp.instruct_text({"instruction": "a", "input": None, "output": "c"}) == "a\n\nc"
     assert rp.instruct_text({"instruction": "a", "output": "c"}) == "a\n\nc"
-    assert rp.check_length(10, 10) and not rp.check_length(11, 10)
 
 
 def test_create_input_inversion_with_and_without_input() -> None:

@@ -523,31 +523,6 @@ class Dashboard:
                 with self._lock:
                     self._attached.remove(logger.name)
 
-    def lines(self) -> list[str]:
-        """The log lines currently shown (newest last)."""
-        with self._lock:
-            return list(self._lines)
-
-    def kept(self) -> list[str]:
-        """The kept records not yet printed (they are printed when the display closes)."""
-        with self._lock:
-            return list(self._kept)
-
-    @property
-    def tasks(self) -> list[Task]:
-        """The open tasks of every panel (summary tasks included)."""
-        with self._lock:
-            tasks: list[Task] = []
-            for state in self._panels.values():
-                if state.summary is not None and not state.summary.closed:
-                    tasks.append(state.summary)
-                tasks.extend(state.active)
-            return tasks
-
-    def panel_names(self) -> list[str]:
-        with self._lock:
-            return list(self._panels)
-
     # --- rendering ------------------------------------------------------------------------------------------------------
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
@@ -563,13 +538,6 @@ class Dashboard:
             footer = Text(" · ".join(([f"log: {self._log_file}"] if self._log_file is not None else []) + [FOOTER_HINT]), style="dim", no_wrap=True, overflow="ellipsis")
             rendered = [state.render(now) for state in panels]
         yield Group(header, *rendered, Panel(body, title="log", title_align="left", border_style="dim", padding=(0, 1)), footer)
-
-    def render_text(self, width: int = 120, height: int = 50) -> str:
-        """The current display as plain text (tests, or a snapshot for a log file)."""
-        console = Console(width=width, height=height, force_terminal=False, color_system=None)
-        with console.capture() as capture:
-            console.print(self)
-        return capture.get()
 
 
 def active_dashboard() -> Dashboard | None:

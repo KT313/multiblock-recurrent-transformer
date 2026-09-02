@@ -29,6 +29,21 @@ from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import download
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
 
+
+def raw_deleted(report: RepairReport) -> list[RepairAction]:
+    """Raw folders the report deleted (performed, not planned)."""
+    return [action for action in report.actions if action.kind == "raw" and action.action == "delete"]
+
+
+def processed_deleted(report: RepairReport) -> list[RepairAction]:
+    """Processed folders the report deleted (performed, not planned)."""
+    return [action for action in report.actions if action.kind == "processed" and action.action == "delete"]
+
+
+def raw_deletions_planned(report: RepairReport) -> list[RepairAction]:
+    """Raw folders queued for deletion (before they are confirmed, or in a dry run)."""
+    return [action for action in report.actions if action.kind == "raw" and action.action in ("delete", "would_delete")]
+
 CfgFactory = Callable[..., DatasetConfig]
 Prep = Callable[[DatasetConfig], DatasetConfig]
 Snapshot = dict[str, int]
@@ -90,7 +105,7 @@ def test_healthy_folders_are_left_alone(cfg_factory: CfgFactory, with_tokenizer:
     calls: list[str] = []
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, True))
     assert report.actions == [] and report.describe() == "nothing to repair" and calls == []
-    assert report.raw_deleted() == [] and report.processed_deleted() == []
+    assert raw_deleted(report) == [] and processed_deleted(report) == []
     assert _snapshot(layout.root) == before
 
 
@@ -121,7 +136,7 @@ def test_stale_raw_is_deleted_with_its_processed_folder_after_confirmation(
     assert report.actions[0].reason == "stale: source identity or tokenizer changed"
     assert report.actions[1].reason == "built from a raw folder that is being deleted"
     assert not layout.raw_dir("a").exists() and not layout.processed_dir("a").exists()
-    assert [action.source for action in report.raw_deleted()] == ["a"] and [action.folder for action in report.processed_deleted()] == [layout.processed_dir("a")]
+    assert [action.source for action in raw_deleted(report)] == ["a"] and [action.folder for action in processed_deleted(report)] == [layout.processed_dir("a")]
 
 
 def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -159,7 +174,7 @@ def test_broken_raw_shard_mid_folder_truncates_after_the_one_confirmation(
     manifest = Manifest.load(raw)
     assert manifest is not None and [shard.name for shard in manifest.shards] == ["data-00000.parquet"] and manifest.rows_fetched == 4
     assert sorted(path.name for path in raw.glob("*.parquet")) == ["data-00000.parquet"]
-    assert not layout.processed_dir("a").exists() and report.raw_deleted() == []
+    assert not layout.processed_dir("a").exists() and raw_deleted(report) == []
 
 
 def test_truncation_dropping_only_the_broken_tail_shard_asks_nothing(
@@ -187,7 +202,7 @@ def test_refused_truncation_past_healthy_shards_changes_nothing(
     assert _snapshot(layout.root) == before, "refused: not even the prefix truncation of that folder"
     assert _kinds(info.value.report) == [("a", "raw", "would_truncate"), ("a", "processed", "would_delete")]
     assert [action.source for action in info.value.report.raw_confirmations_planned()] == ["a"]
-    assert info.value.report.raw_deletions_planned() == [], "a truncation is not a deletion"
+    assert raw_deletions_planned(info.value.report) == [], "a truncation is not a deletion"
     # non-interactive without --yes: the same abort with nothing changed
     monkeypatch.setattr(sys, "stdin", io.StringIO())  # not a tty
     with pytest.raises(ConfirmationRequired) as info2:
@@ -491,7 +506,7 @@ def test_one_prompt_for_two_queued_raw_folders(cfg_factory: CfgFactory, with_tok
         f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n  c: outdated: max_seq_length 16 -> 64\n{CONFIRMATION_QUESTION}"
     ]
     assert prompts[0].endswith("Continue? [y/N] ")
-    assert [action.source for action in report.raw_deleted()] == ["a", "c"] and [action.source for action in report.processed_deleted()] == ["a", "c"]
+    assert [action.source for action in raw_deleted(report)] == ["a", "c"] and [action.source for action in processed_deleted(report)] == ["a", "c"]
     assert not layout.raw_dir("a").exists() and not layout.raw_dir("c").exists()
     assert layout.raw_dir("b").exists() and layout.processed_dir("b").exists()
 
@@ -504,7 +519,7 @@ def test_assume_yes_deletes_without_asking(cfg_factory: CfgFactory, with_tokeniz
         raise AssertionError("must not be asked")
 
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True, confirm=confirm)
-    assert [action.source for action in report.raw_deleted()] == ["a"] and not layout.raw_dir("a").exists()
+    assert [action.source for action in raw_deleted(report)] == ["a"] and not layout.raw_dir("a").exists()
 
 
 def test_non_interactive_run_without_assume_yes_aborts_with_the_list_and_deletes_nothing(
@@ -523,7 +538,7 @@ def test_non_interactive_run_without_assume_yes_aborts_with_the_list_and_deletes
     assert err.message == f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n{CONFIRMATION_QUESTION}"
     assert str(err).startswith(err.message.rstrip()) and "--yes" in str(err)
     assert _kinds(err.report) == [("a", "raw", "would_delete"), ("a", "processed", "would_delete"), ("b", "processed", "would_delete")]
-    assert err.report.raw_deleted() == [] and [action.source for action in err.report.raw_deletions_planned()] == ["a"]
+    assert raw_deleted(err.report) == [] and [action.source for action in raw_deletions_planned(err.report)] == ["a"]
 
 
 def test_declined_answer_on_the_terminal_aborts_and_deletes_nothing(
@@ -547,7 +562,7 @@ def test_declined_answer_on_the_terminal_aborts_and_deletes_nothing(
     # an explicit "yes" on the terminal proceeds
     monkeypatch.setattr("builtins.input", lambda prompt: " Yes ")
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
-    assert [action.source for action in report.raw_deleted()] == ["a"] and not layout.raw_dir("a").exists()
+    assert [action.source for action in raw_deleted(report)] == ["a"] and not layout.raw_dir("a").exists()
 
 
 def test_confirm_callable_declining_aborts(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -587,7 +602,7 @@ def test_dry_run_reports_everything_and_touches_nothing(
         ("c", "processed", "would_delete"),
         ("c", "processed", "would_delete"),
     ]
-    assert report.raw_deleted() == [] and report.processed_deleted() == [] and [action.source for action in report.raw_deletions_planned()] == ["a"]
+    assert raw_deleted(report) == [] and processed_deleted(report) == [] and [action.source for action in raw_deletions_planned(report)] == ["a"]
     lines = report.describe().splitlines()
     assert lines[0] == f"would delete raw {layout.raw_dir('a')} (a): stale: source identity or tokenizer changed"
     assert lines[2].startswith(f"would truncate raw {layout.raw_dir('b')} (b): broken: unreadable shard data-00002.parquet")
@@ -613,9 +628,9 @@ def test_report_describe_and_helpers(tmp_path: Path) -> None:
             f"truncate raw {tmp_path / 'raw_b'} (b): broken: y",
         ]
     )
-    assert report.raw_deleted() == actions[:1] and report.processed_deleted() == actions[1:2]
+    assert raw_deleted(report) == actions[:1] and processed_deleted(report) == actions[1:2]
     planned = report.as_planned()
     assert [action.action for action in planned.actions] == ["would_delete", "would_delete", "would_truncate"]
-    assert planned.raw_deleted() == [] and planned.raw_deletions_planned() == planned.actions[:1]
+    assert raw_deleted(planned) == [] and raw_deletions_planned(planned) == planned.actions[:1]
     assert RepairReport().describe() == "nothing to repair"
     assert json.dumps([action.reason for action in planned.actions])  # reasons are plain strings for the status output

@@ -60,7 +60,6 @@ from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
-    check_length,
     check_quality,
     create_input_inversion,
     has_required_fields,
@@ -122,7 +121,7 @@ def build_source(
         pending = raw.shards[output.covered() :]
         if not pending:
             if output.is_new:
-                output.save(raw, [])  # an exhausted raw folder with zero shards still gets its processed manifest
+                output.save([])  # an exhausted raw folder with zero shards still gets its processed manifest
             return output.manifest
 
     stats: dict[str, Any] = output.manifest.extra["stats"]
@@ -166,7 +165,7 @@ def _build_per_raw_shard(
         pipeline.stats["input_rows"] += shard.rows
         survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
         output.publish(survivors, shard_size)
-        output.save(raw, [*output.manifest.extra["input_shards"], [shard.name, shard.rows]])
+        output.save([*output.manifest.extra["input_shards"], [shard.name, shard.rows]])
         first_row_index += shard.rows
         check_stop(should_stop)
 
@@ -197,7 +196,7 @@ def _build_all_at_once(
         log.warning("removing leftover %s of an interrupted build", temporary)
         shutil.rmtree(temporary)
     output.publish(survivors, shard_size)
-    output.save(raw, shard_list(raw))
+    output.save(shard_list(raw))
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
 
@@ -277,9 +276,8 @@ class ProcessedOutput:
             path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))
             self.manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
 
-    def save(self, raw: Manifest, covered: list[list[Any]]) -> None:
+    def save(self, covered: list[list[Any]]) -> None:
         self.manifest.extra["input_shards"] = list(covered)
-        self.manifest.rows_fetched = raw.rows_fetched
         self.manifest.save(self.directory)
         self.is_new = False
 
@@ -443,7 +441,7 @@ class RowPipeline:
                     if not has_required_fields(row):
                         self.stats["removed_empty"] += 1
                         continue
-                    if not check_length(int(row["tokens"]), self.max_seq_length):
+                    if int(row["tokens"]) > self.max_seq_length:
                         self.stats["removed_too_long"] += 1
                         continue
                     yield {

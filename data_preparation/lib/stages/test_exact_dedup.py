@@ -86,10 +86,10 @@ def test_probe_count_matches_rbloom_truncation() -> None:
 
 def test_size_in_bits_is_the_budget_within_a_byte() -> None:
     seen = SeenDocuments(memory_mb=1)
-    assert abs(seen.size_in_bits - BITS_PER_MB) <= 8
-    assert seen.size_in_bits == BITS_PER_MB  # rbloom rounds up to whole bytes; 1 MB is already whole
+    assert abs(seen._bloom.size_in_bits - BITS_PER_MB) <= 8
+    assert seen._bloom.size_in_bits == BITS_PER_MB  # rbloom rounds up to whole bytes; 1 MB is already whole
     two = SeenDocuments(memory_mb=2)
-    assert abs(two.size_in_bits - 2 * BITS_PER_MB) <= 8
+    assert abs(two._bloom.size_in_bits - 2 * BITS_PER_MB) <= 8
 
 
 def test_expected_false_positive_rate_hand_values() -> None:
@@ -125,11 +125,11 @@ def test_add_if_new_first_true_then_false() -> None:
     seen = SeenDocuments(memory_mb=1)
     assert seen.add_if_new(42) is True
     assert seen.add_if_new(42) is False
-    assert 42 in seen
+    assert 42 in seen._bloom
     assert seen.add_if_new(-42) is True
     assert seen.add_if_new(INT64_MIN) is True
     assert seen.add_if_new(INT64_MIN) is False
-    assert 0.5 < seen.approx_items < 6
+    assert 0.5 < seen._bloom.approx_items < 6
 
 
 def test_no_false_negatives() -> None:
@@ -137,7 +137,7 @@ def test_no_false_negatives() -> None:
     hashes = _random_hashes(5_000, seed=2)
     assert all(seen.add_if_new(h) for h in hashes[:2_500])
     seen.add_all(hashes[2_500:])
-    assert all(h in seen for h in hashes)
+    assert all(h in seen._bloom for h in hashes)
     assert not any(seen.add_if_new(h) for h in hashes)
 
 
@@ -153,7 +153,7 @@ def test_observed_false_positive_rate_roughly_matches_formula() -> None:
     rng = random.Random(3)
     seen.add_all(rng.randint(INT64_MIN, INT64_MAX) for _ in range(inserted))
     fresh = [rng.randint(INT64_MIN, INT64_MAX) for _ in range(100_000)]  # collisions with the inserts: ~3e-9 each
-    hits = sum(h in seen for h in fresh)
+    hits = sum(h in seen._bloom for h in fresh)
     observed = hits / len(fresh)
     expected = expected_false_positive_rate(1, inserted)  # ~1e-3 -> ~100 hits
     assert expected / 3 < observed < expected * 3, (observed, expected)

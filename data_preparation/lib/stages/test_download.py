@@ -35,7 +35,6 @@ from data_preparation.lib.stages.download import (
     prepare_tokenizer,
     raw_manifest_problem,
     raw_manifest_state,
-    require_manifest,
 )
 from data_preparation.lib.storage.parquet import estimate_tokens
 
@@ -236,11 +235,10 @@ def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(
     stale = cfg_factory({"p": _synthetic(seed=9)})  # a different seed -> different raw hash
     with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: identity/tokenizer changed") as info:
         download(stale, "p", layout, rows_needed=7, shard_size=5)
-    assert isinstance(info.value, RuntimeError) and info.value.state == "stale" and info.value.directory == raw
+    assert isinstance(info.value, RuntimeError) and info.value.directory == raw
     outdated = replace(cfg, max_seq_length=cfg.max_seq_length * 2)
     with pytest.raises(RawFolderError, match=r"p: raw folder .* is outdated: max_seq_length 64 -> 128") as info:
         download(outdated, "p", layout, rows_needed=7, shard_size=5)
-    assert info.value.state == "outdated" and info.value.problem == "outdated: max_seq_length 64 -> 128"
     assert "download never deletes raw" in str(info.value)
     assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == m, "nothing deleted or rewritten"
     # a lowered cap is fine: the rows are at most 64 tokens long, which is more than the config now needs
@@ -397,8 +395,6 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
         assert current_manifest(tmp_path, "h", "processed") is None
     assert "manifest stage 'raw' != 'processed'" in caplog.text
     assert current_manifest(tmp_path, "other", "raw") is None
-    with pytest.raises(FileNotFoundError, match="no current raw manifest"):
-        require_manifest(tmp_path / "missing", "h", "raw", "s")
     payload = json.loads((tmp_path / "MANIFEST.json").read_text())
     assert payload["stage"] == "raw"
 

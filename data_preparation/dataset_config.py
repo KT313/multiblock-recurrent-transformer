@@ -478,9 +478,6 @@ class DatasetConfig:
         override = self.sources[source_name].processing
         return override if override is not None else self.processing
 
-    def sources_of_kind(self, kind: SourceKind) -> list[str]:
-        return [name for name, source in self.sources.items() if source.kind == kind]
-
     # --- budgets ---------------------------------------------------------------------------------------------------
 
     def sequence_budget(self, source_name: str) -> int:
@@ -718,11 +715,6 @@ def _hashable(value: Any, hash_name: HashName) -> Any:
     if isinstance(value, (list, tuple)):
         return [_hashable(v, hash_name) for v in value]
     return value
-
-
-def dataset_config_fields() -> list[str]:
-    """Top-level field names (used by the settings/CLI layer to recognise dataset-config keys)."""
-    return [f.name for f in fields(DatasetConfig)]
 
 
 def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None) -> DatasetConfig:

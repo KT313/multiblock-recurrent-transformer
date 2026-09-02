@@ -38,6 +38,42 @@ from data_preparation.lib.ui.dashboard import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def lines_of(board: Dashboard) -> list[str]:
+    """The log lines the dashboard currently shows (newest last)."""
+    with board._lock:
+        return list(board._lines)
+
+
+def kept_of(board: Dashboard) -> list[str]:
+    """The kept records not printed yet (they are printed when the display closes)."""
+    with board._lock:
+        return list(board._kept)
+
+
+def tasks_of(board: Dashboard) -> list[Task]:
+    """The open tasks of every panel (summary tasks included)."""
+    with board._lock:
+        tasks: list[Task] = []
+        for state in board._panels.values():
+            if state.summary is not None and not state.summary.closed:
+                tasks.append(state.summary)
+            tasks.extend(state.active)
+        return tasks
+
+
+def panel_names_of(board: Dashboard) -> list[str]:
+    with board._lock:
+        return list(board._panels)
+
+
+def render_text(board: Dashboard, width: int = 120, height: int = 50) -> str:
+    """The dashboard's current display as plain text."""
+    console = Console(width=width, height=height, force_terminal=False, color_system=None)
+    with console.capture() as capture:
+        console.print(board)
+    return capture.get()
+
+
 @pytest.fixture
 def dashboard() -> Iterator[Dashboard]:
     """An enabled dashboard rendering into a StringIO console (no real terminal needed)."""
@@ -143,7 +179,7 @@ def test_task_counts_and_renders_in_its_panel(dashboard: Dashboard) -> None:
     bar.update(1)
     bar.set_postfix({"file": "a.parquet"}, MB=7)
     assert bar.n == 4
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     downloads = text[text.index("downloads") : text.index("builds")]
     assert "src" in downloads and "4/10" in downloads and "file=a.parquet, MB=7" in downloads
 
@@ -152,13 +188,13 @@ def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: 
     dashboard.task("b", total=1, panel="builds")
     dashboard.task("d", total=1, panel="downloads")
     dashboard.task("t", total=1)
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert text.index("─ downloads") < text.index("─ builds") < text.index("─ tasks") < text.index("─ log")
-    assert dashboard.panel_names() == ["downloads", "builds", "tasks"]
+    assert panel_names_of(dashboard) == ["downloads", "builds", "tasks"]
 
 
 def test_empty_panels_render_idle(dashboard: Dashboard) -> None:
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert text.count("idle") == 2 and "(no log output yet)" in text
 
 
@@ -170,10 +206,10 @@ def test_finished_rows_disappear_and_count_in_the_summary(dashboard: Dashboard) 
     kept.update(4)
     gone.close()
     gone.close()  # idempotent
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert "gone" not in text and "kept" in text
     assert "14/20 rows · 3 MB" in text, "the summary counts finished and running rows (and the MB they reported)"
-    assert [task.description for task in dashboard.tasks] == ["kept"]
+    assert [task.description for task in tasks_of(dashboard)] == ["kept"]
 
 
 def test_summary_task_starts_a_round_and_is_updated_in_place(dashboard: Dashboard) -> None:
@@ -182,36 +218,36 @@ def test_summary_task_starts_a_round_and_is_updated_in_place(dashboard: Dashboar
     first.update(5)
     first.close()
     summary.update(1)
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert text.count("jobs done") == 1 and "1/3 jobs done · 5/5 rows" in text
     summary.update(2)
     summary.close()
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert text.count("jobs done") == 1 and "3/3 jobs done · 5/5 rows" in text, "closed: the round's summary stays"
     dashboard.task("downloads", total=2, unit="job", panel="downloads", summary=True)
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert text.count("jobs done") == 1 and "0/2 jobs done" in text and "5/5 rows" not in text, "a new round resets the counts"
 
 
 def test_rows_are_bounded_per_panel(dashboard: Dashboard) -> None:
     bars = [dashboard.task(f"src_{i}", total=10, panel="downloads") for i in range(6)]
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert "src_3" in text and "src_4" not in text and "… and 2 more" in text
     bars[0].close()
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert "src_4" in text and "… and 1 more" in text
 
 
 def test_overshoot_past_total_renders(dashboard: Dashboard) -> None:
     bar = dashboard.task("src", total=11, panel="downloads")
     bar.update(1000)
-    assert "1,000/11" in dashboard.render_text()
+    assert "1,000/11" in render_text(dashboard)
 
 
 def test_indeterminate_task_without_total(dashboard: Dashboard) -> None:
     bar = dashboard.task("counting", total=None, unit="row")
     bar.update(42)
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert "counting" in text and "42 " in text and "42 rows" in text
 
 
@@ -219,7 +255,7 @@ def test_iteration_updates_and_closes(dashboard: Dashboard) -> None:
     bar = dashboard.task("iter", total=3, leave=False, iterable=[1, 2, 3])
     assert list(bar) == [1, 2, 3]
     assert isinstance(bar, Task) and bar.n == 3
-    assert dashboard.tasks == []
+    assert tasks_of(dashboard) == []
 
 
 def test_iterable_gives_the_total(dashboard: Dashboard) -> None:
@@ -231,7 +267,7 @@ def test_iterable_gives_the_total(dashboard: Dashboard) -> None:
 def test_set_description(dashboard: Dashboard) -> None:
     bar = dashboard.task("before", total=1)
     bar.set_description("after")
-    text = dashboard.render_text()
+    text = render_text(dashboard)
     assert "after" in text and "before" not in text
 
 
@@ -242,7 +278,7 @@ def test_updates_after_close_keep_counting_but_the_row_is_gone(dashboard: Dashbo
     bar.update(1)
     bar.set_postfix(a=1)
     bar.set_description("late")
-    assert bar.n == 1 and dashboard.tasks == [] and "late" not in dashboard.render_text()
+    assert bar.n == 1 and tasks_of(dashboard) == [] and "late" not in render_text(dashboard)
 
 
 def test_updates_from_threads(dashboard: Dashboard) -> None:
@@ -258,8 +294,8 @@ def test_updates_from_threads(dashboard: Dashboard) -> None:
         t.start()
     for t in threads:
         t.join()
-    assert all(t.completed == 200 for t in dashboard.tasks)
-    assert dashboard.render_text().count("200/200") == 4
+    assert all(t.completed == 200 for t in tasks_of(dashboard))
+    assert render_text(dashboard).count("200/200") == 4
 
 
 def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path) -> None:
@@ -270,7 +306,7 @@ def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path)
     with Dashboard(title="prepare tiny", enabled=True, console=console) as board, board.attach(logger, log_file=log_file):
         set_status(round="1/5", step="download")
         board.set_status(step="build")
-        first_line, *rest = board.render_text().splitlines()
+        first_line, *rest = render_text(board).splitlines()
         assert first_line.startswith("prepare tiny · round 1/5 · step build · 0:00:0")
         assert rest[-1].startswith(f"log: {log_file} · Ctrl-C stops at the next shard")
 
@@ -281,8 +317,8 @@ def test_short_terminal_shrinks_the_log_panel_not_the_task_rows() -> None:
         for i in range(20):
             board.write(f"line {i}")
         bars = [board.task(f"src_{i}", total=1, panel="downloads") for i in range(8)]
-        tall = board.render_text(width=100, height=60)
-        short = board.render_text(width=100, height=24)  # header + footer + 8 rows in panels leave 6 log lines
+        tall = render_text(board, width=100, height=60)
+        short = render_text(board, width=100, height=24)  # header + footer + 8 rows in panels leave 6 log lines
         assert "line 8" in tall and "line 19" in tall
         assert "line 13" not in short and "line 14" in short and "line 19" in short, "the log panel keeps the newest lines"
         assert all(f"src_{i}" in short for i in range(8))
@@ -296,29 +332,29 @@ def test_short_terminal_shrinks_the_log_panel_not_the_task_rows() -> None:
 def test_log_panel_keeps_last_lines(dashboard: Dashboard) -> None:
     for i in range(5):
         dashboard.write(f"line {i}")
-    assert dashboard.lines() == ["line 2", "line 3", "line 4"]
-    text = dashboard.render_text()
+    assert lines_of(dashboard) == ["line 2", "line 3", "line 4"]
+    text = render_text(dashboard)
     assert "line 4" in text and "line 0" not in text
 
 
 def test_every_record_reaches_the_panel_once_while_the_display_is_up(dashboard: Dashboard) -> None:
     logging.getLogger("data_preparation.test_dashboard").warning("hello %d", 7)  # no handler of its own: the root one
     logging.getLogger("some_library").warning("careful")
-    first, second = dashboard.lines()
+    first, second = lines_of(dashboard)
     assert "WARNING data_preparation.test_dashboard: hello 7" in first and "WARNING some_library: careful" in second
-    assert dashboard.kept() == [first, second]
+    assert kept_of(dashboard) == [first, second]
 
 
 def test_markup_in_log_lines_is_not_interpreted(dashboard: Dashboard) -> None:
     dashboard.write("path [bold]x[/bold] and [red]")
-    assert "[bold]x[/bold]" in dashboard.render_text()
+    assert "[bold]x[/bold]" in render_text(dashboard)
 
 
 def test_multi_line_records_become_one_panel_line_each(dashboard: Dashboard) -> None:
     dashboard.write("Traceback:\n  File x\nValueError: boom")
-    assert dashboard.lines() == ["Traceback:", "  File x", "ValueError: boom"]
+    assert lines_of(dashboard) == ["Traceback:", "  File x", "ValueError: boom"]
     dashboard.write("")
-    assert dashboard.lines()[-1] == ""
+    assert lines_of(dashboard)[-1] == ""
 
 
 def test_kept_records_are_printed_once_after_the_display_closed_not_during() -> None:
@@ -332,15 +368,15 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during() -> 
         logger.info("table:\n%s", table, extra={"keep": True})
         board.task("src", total=1, panel="downloads").update(1)
         time.sleep(0.1)  # a few live frames
-        assert [line.split(": ")[-1] for line in board.lines()[:2]] == ["quiet", "loud"]
-        assert len(board.kept()) == 2
+        assert [line.split(": ")[-1] for line in lines_of(board)[:2]] == ["quiet", "loud"]
+        assert len(kept_of(board)) == 2
         assert "loud" not in _outside_frames(_screen_text(console, 100)), "nothing is printed while the display is up"
     screen = _screen_text(console, 100)
     assert screen.count("WARNING data_preparation.test_dashboard_keep: loud") == 1 and "quiet" not in screen
     assert _console_output(console).count(table) == 1 and screen.count("end") == 1, "kept multi-line records are written unwrapped, once"
     assert "╭" not in screen and "src" not in screen, "the display is transient: no frame is left behind"
     assert screen.index("loud") < screen.index("end")
-    assert board.kept() == []
+    assert kept_of(board) == []
 
 
 def test_disabled_dashboard_is_plain() -> None:
@@ -353,7 +389,7 @@ def test_disabled_dashboard_is_plain() -> None:
         handler.emit(record)
         assert sys.stdout is real_out, "disabled: no capture"
     assert "INFO data_preparation.x: plain msg" in stream.getvalue()
-    assert board.lines() == []
+    assert lines_of(board) == []
 
 
 def test_enabled_follows_env_and_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -378,7 +414,7 @@ def test_progress_uses_active_dashboard_else_fallback(monkeypatch: pytest.Monkey
         assert active_dashboard() is board
         bar = progress(total=2, desc="inside", unit="step", leave=False, panel="builds")
         assert isinstance(bar, Task)
-        assert "inside" in board.render_text()
+        assert "inside" in render_text(board)
     assert active_dashboard() is None
 
 
@@ -419,7 +455,7 @@ def test_attach_swaps_the_stream_handler_and_writes_the_log_file(tmp_path: Path)
         assert board.is_attached("data_preparation.test_dashboard_attach.child") and not board.is_attached("data_preparation")
         logger.info("inside %d", 1)
     assert logger.handlers == [stream_handler], "the plain handler is restored, the dashboard handlers removed"
-    assert "inside 1" in log_file.read_text() and board.lines()[-1].endswith("inside 1")
+    assert "inside 1" in log_file.read_text() and lines_of(board)[-1].endswith("inside 1")
     assert stream_handler.stream.getvalue() == ""
     logger.removeHandler(stream_handler)
 
@@ -468,7 +504,7 @@ def test_records_of_attached_loggers_land_in_the_panel_once() -> None:
     logger.setLevel(logging.INFO)
     with Dashboard(enabled=True, console=console) as board, board.attach(logging.getLogger("data_preparation")):
         logger.info("just once")
-        assert [line for line in board.lines() if "just once" in line] == board.lines()[-1:]
+        assert [line for line in lines_of(board) if "just once" in line] == lines_of(board)[-1:]
 
 
 # --- what else could reach the terminal -------------------------------------------------------------------------------------
@@ -484,8 +520,8 @@ def test_third_party_console_handlers_are_detached_while_the_display_is_up() -> 
         with Dashboard(enabled=True, console=console) as board:
             assert library.handlers == [], "the plain handler would print behind the display"
             library.warning("repo card missing")
-            assert board.lines()[-1].endswith("WARNING fake_hub_library: repo card missing")
-            assert board.kept()[-1].endswith("repo card missing")
+            assert lines_of(board)[-1].endswith("WARNING fake_hub_library: repo card missing")
+            assert kept_of(board)[-1].endswith("repo card missing")
         assert library.handlers == [plain]
     finally:
         library.removeHandler(plain)
@@ -503,13 +539,13 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up() -> None:
         # what `warnings.showwarning` writes to sys.stderr (pytest records warnings itself, so it is written by hand)
         sys.stderr.write(warnings.formatwarning("careful", UserWarning, "x.py", 1))
         print("partial", end="")  # no newline: flushed when the display closes
-        lines = board.lines()
+        lines = lines_of(board)
         assert any(line.endswith("INFO data_preparation.stdout: stray print") for line in lines)
         assert any(line.endswith("WARNING data_preparation.stderr: bar 100%") for line in lines), "a carriage return discards the line so far"
         assert any("WARNING data_preparation.stderr: x.py:1: UserWarning: careful" in line for line in lines)
-        assert board.kept() and all("stray print" not in text for text in board.kept()), "stdout lines are not kept, stderr lines are"
+        assert kept_of(board) and all("stray print" not in text for text in kept_of(board)), "stdout lines are not kept, stderr lines are"
     assert sys.stdout is real_out and sys.stderr is real_err
-    assert board.lines()[-1].endswith("INFO data_preparation.stdout: partial")
+    assert lines_of(board)[-1].endswith("INFO data_preparation.stdout: partial")
     screen = _screen_text(console, 100)
     assert "bar 100%" in screen and "careful" in screen and "stray print" not in screen
 
@@ -536,7 +572,7 @@ def test_suspended_clears_the_display_for_a_prompt_and_brings_it_back(monkeypatc
         stdout: object = sys.stdout
         restarted = _live_of(board)
         assert restarted is not None and restarted is not live and isinstance(stdout, LineSink)
-        assert "src" in board.render_text()
+        assert "src" in render_text(board)
 
 
 def _live_of(board: Dashboard) -> Live | None:
@@ -586,20 +622,20 @@ def test_three_threads_drive_the_panels_and_the_scrollback_is_clean() -> None:
         for thread in threads:
             thread.start()
         while any(thread.is_alive() for thread in threads):
-            frame = board.render_text(width=120, height=40)  # a snapshot under the lock, like a refresh
+            frame = render_text(board, width=120, height=40)  # a snapshot under the lock, like a refresh
             frames.append(frame)
             _check_frame(frame, log_lines)
             time.sleep(0.005)
         for thread in threads:
             thread.join()
         summary.close()
-        final = board.render_text(width=120, height=40)
+        final = render_text(board, width=120, height=40)
         _check_frame(final, log_lines)
         panels = final[final.index("─ downloads") : final.index("─ log")]
         assert "peso" not in panels and "fineweb_edu" not in panels, "finished rows are removed"
         assert "2/2 jobs done · 80/80 rows · 2 MB" in final and "30/30 rows" in final
         assert final.splitlines()[0].startswith("prepare tiny")
-        assert board.lines()[-1].endswith("wikipedia: kept 40 of 40 fetched rows") or board.lines()[-1].endswith("fineweb_edu: kept 40 of 40 fetched rows")
+        assert lines_of(board)[-1].endswith("wikipedia: kept 40 of 40 fetched rows") or lines_of(board)[-1].endswith("fineweb_edu: kept 40 of 40 fetched rows")
         logger.info("dataset status:\nsource  kind\na  b\ndataset complete", extra={"keep": True})
     assert any("consumed=" in frame and "shard=" in frame for frame in frames), "downloads and the build were live at the same time"
     assert len(console.export_text()) > 0

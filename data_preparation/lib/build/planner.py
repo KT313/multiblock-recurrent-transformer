@@ -519,11 +519,6 @@ def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Itera
     return [source_ledger(config, name, layout) for name in _selected(config, sources)]
 
 
-def source_state(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceState:
-    """One source's row of the status table (:meth:`SourceLedger.state`)."""
-    return source_ledger(config, name, layout).state()
-
-
 def every_source_satisfies_its_budget(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> bool:
     """Whether every source (all, or ``sources``) is satisfied (:meth:`SourceLedger.satisfaction`)."""
     return all(ledger.satisfaction().satisfied for ledger in read_ledgers(config, layout, sources=sources))
@@ -585,7 +580,6 @@ __all__ = [
     "rows_needed",
     "rows_sufficient",
     "source_ledger",
-    "source_state",
     "sources_with_pending_raw_shards",
     "summarize_dataset_state",
     "tokenizer_is_prepared",

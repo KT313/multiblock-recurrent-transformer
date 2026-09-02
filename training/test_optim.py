@@ -336,24 +336,6 @@ def test_ellis_adam_state_dict_round_trip() -> None:
     assert torch.equal(p, q)
 
 
-def test_setstate_converts_integer_steps_to_tensors() -> None:
-    """Checkpoints from older torch versions store `step` as a python int; `__setstate__` upgrades it."""
-    p = torch.nn.Parameter(torch.tensor([1.0]))
-    p.grad = torch.tensor([0.5])
-    opt = ELLISAdam([p], lr=0.1)
-    opt.step()
-    sd = copy.deepcopy(opt.state_dict())
-    sd["state"][0]["step"] = 1
-    q = torch.nn.Parameter(torch.tensor([1.0]))
-    opt2 = ELLISAdam([q], lr=0.1)
-    opt2.load_state_dict(sd)
-    step = opt2.state[q]["step"]
-    assert torch.is_tensor(step) and step.dtype == torch.float32 and step.item() == 1.0
-    q.grad = torch.tensor([0.5])
-    opt2.step()  # still usable afterwards
-    assert opt2.state[q]["step"].item() == 2.0
-
-
 def test_ellis_adam_on_tiny_model_reduces_loss(tiny_model: RecurrentGPT) -> None:
     """`weight_decay` is a per-step fraction under `decouple_wd` (the final run used 4e-5); with 0.1 the parameters
     shrink 10 % every step and the loss rises, so use the real setting here."""

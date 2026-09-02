@@ -154,14 +154,6 @@ def shard_list(manifest: Manifest) -> list[list[Any]]:
     return [[s.name, s.rows] for s in manifest.shards]
 
 
-def require_manifest(directory: Path, source_hash: str, stage: str, what: str) -> Manifest:
-    """Like ``current_manifest`` but a missing or stale manifest is an error (the previous stage has to run first)."""
-    manifest = current_manifest(directory, source_hash, stage)
-    if manifest is None:
-        raise FileNotFoundError(f"{what}: no current {stage} manifest in {directory}; run the {stage} stage first")
-    return manifest
-
-
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
     """Apply a pretrain source's converter (if any) and check that ``text_field`` is present."""
     converter = get_converter(source)
@@ -215,19 +207,17 @@ def _inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> tup
 
 
 class RawFolderError(RuntimeError):
-    """A raw folder that :func:`download` may not append to: ``state`` is ``stale`` or ``outdated``, ``problem`` the
-    :func:`raw_manifest_problem` string. The download never deletes raw data; the repair step does, after the user
+    """A raw folder that :func:`download` may not append to (stale or outdated; ``problem`` is the
+    :func:`raw_manifest_problem` string). The download never deletes raw data; the repair step does, after the user
     confirmed (``lib/build/repair.py``)."""
 
-    def __init__(self, name: str, directory: Path, state: RawManifestState, problem: str) -> None:
+    def __init__(self, name: str, directory: Path, problem: str) -> None:
         super().__init__(
             f"{name}: raw folder {directory} is {problem}; it must be deleted and downloaded again — "
             "the download never deletes raw data, run the repair step (it asks for confirmation)"
         )
         self.name = name
         self.directory = directory
-        self.state = state
-        self.problem = problem
 
 
 # --- tokenizer ---------------------------------------------------------------------------------------------------------
@@ -367,7 +357,7 @@ def _raw_folder_to_append_to(cfg: DatasetConfig, name: str, layout: DatasetLayou
     state, manifest = _inspect_raw(cfg, name, layout)
     if manifest is not None and state != "current":
         problem = raw_manifest_problem(cfg, name, layout)
-        raise RawFolderError(name, out, state, problem or state)
+        raise RawFolderError(name, out, problem or state)
     if manifest is None:
         if has_shards(out):
             raise RuntimeError(f"{name}: {out} holds shards but no manifest; delete the directory to download the source again")
@@ -631,16 +621,6 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
     return union
 
 
-def raw_text_of(cfg: DatasetConfig, name: str) -> Callable[[Row], str]:
-    """What the ``tokens`` column of a raw row counts: the stored ``text_field`` for pretrain documents, instruction
-    + input + output for instruct rows."""
-    source = cfg.sources[name]
-    if source.kind == "instruct":
-        return instruct_text
-    text_field = source.text_field
-    return lambda row: _text_or_empty(row.get(text_field))
-
-
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
     """The standardized ``{instruction, input, output}`` row for ``raw``.
 
@@ -717,8 +697,6 @@ __all__ = [
     "prepare_tokenizer",
     "raw_manifest_problem",
     "raw_manifest_state",
-    "raw_text_of",
-    "require_manifest",
     "shard_list",
     "text_row",
 ]

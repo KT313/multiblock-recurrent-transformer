@@ -186,16 +186,6 @@ def shard_tokens(path: Path) -> int:
     return 0 if total is None else int(total)
 
 
-def verify_shards(directory: Path, manifest: Manifest) -> list[str]:
-    """Problems between ``manifest`` and the files in ``directory``: missing shards, row-count mismatches."""
-    problems: list[str] = []
-    for shard in manifest.shards:
-        problem = shard_problem(directory, shard)
-        if problem is not None:
-            problems.append(problem)
-    return problems
-
-
 def shard_problem(directory: Path, shard: ShardInfo) -> str | None:
     """Why ``shard`` does not match its file in ``directory`` (missing, unreadable, row count), or None."""
     path = directory / shard.name
@@ -246,5 +236,4 @@ __all__ = [
     "shard_problem",
     "shard_rows",
     "shard_tokens",
-    "verify_shards",
 ]

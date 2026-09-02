@@ -31,7 +31,6 @@ from data_preparation.lib.sources.hub_files import (
     parquet_row_groups,
     read_rows,
 )
-from data_preparation.lib.storage.parquet import write_dict_rows
 
 def _rows(prefix: str, n: int, language: Callable[[int], str] | None = None) -> list[Row]:
     return [
@@ -707,9 +706,9 @@ def test_projection_keeps_a_mixed_type_surplus_column_out_of_the_shard_writer(hu
     src = _src(load_kwargs={"data_files": "f/*.jsonl"})
     projected = list(LOADERS["hf_files"](src, 0, 2, columns=["text"]))
     assert projected == [{"text": "a doc 0"}, {"text": "a doc 1"}]
-    assert write_dict_rows(projected, tmp_path / "shards", shard_size=2) == 1
+    pq.write_table(pa.Table.from_pylist(projected), tmp_path / "shard.parquet")
     with pytest.raises(pa.ArrowException):
-        write_dict_rows(list(LOADERS["hf_files"](src, 0, 2)), tmp_path / "unprojected", shard_size=2)
+        pa.Table.from_pylist(list(LOADERS["hf_files"](src, 0, 2)))
 
 
 def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_counts(
