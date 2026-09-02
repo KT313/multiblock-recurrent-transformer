@@ -305,10 +305,11 @@ def check_entry_shards(what: str, part: Part, entry: DataEntry, total: int, worl
     """Fail at setup when a data entry has fewer rows than its loader has shards.
 
     `ParquetTextDataset` deals the rows of an entry's range round-robin over `world_size × num_workers` shards, so
-    a shard is empty as soon as the range holds fewer rows than there are shards — fatal mid-run: the restart of an
-    exhausted loader (train) or mixture member (validation) immediately gets a second `StopIteration` from the
-    empty shard, which Python turns into a `RuntimeError` and kills the training run. Train loaders run one worker
-    per source (`TRAIN_LOADER_NUM_WORKERS`) and validation loaders in-process, so both have `world_size` shards:
+    a shard is empty as soon as the range holds fewer rows than there are shards — fatal mid-run for a train
+    source: the restart of its exhausted loader immediately gets a second `StopIteration` from the empty shard,
+    which Python turns into a `RuntimeError` and kills the training run; for a validation entry the rank with the
+    empty shard would score different data than the others. Train loaders run one worker per source
+    (`TRAIN_LOADER_NUM_WORKERS`) and validation loaders in-process, so both have `world_size` shards:
     with one device this reduces to the at-least-one-row guarantee `check_entry_rows` already gives, and only a
     larger world can starve a shard. The error names the entry, its folder, its row count and the shard count.
     """
@@ -329,27 +330,18 @@ def check_entry_shards(what: str, part: Part, entry: DataEntry, total: int, worl
 
 def validation_batches_available(
     entries: list[DataEntry], rows_on_disk: Mapping[str, int], micro_batch_size: int, world_size: int
-) -> int | None:
-    """How many micro-batches one evaluation can draw from a stage's validation loader; `None` = unbounded.
+) -> int:
+    """How many micro-batches one evaluation can draw from a stage's validation loader.
 
-    What `training.data.loader.build_dataloader` builds decides this, and the two cases differ fundamentally:
-
-    * ONE entry: the loader reads that single `ParquetTextDataset` directly. One `__iter__` is one epoch over the
-      entry's row range and then stops, so the loader is FINITE — `ceil(rows / micro_batch_size)` batches (the last
-      one short; `drop_last` is off). This is the case that can come up short of `eval_iters`.
-    * SEVERAL entries: the loader reads a `WeightedMixtureDataset`, which restarts every member that runs out and
-      therefore never raises `StopIteration`. Such a loader always delivers `eval_iters` batches (with repeated
-      rows once the smallest member has wrapped around), so there is nothing to check — hence `None`.
-
+    One `__iter__` of the loader `training.data.loader.build_dataloader` builds is one pass over every entry's row
+    range — a single `ParquetTextDataset`, or the `WeightedMixtureDataset` of several, which yields every member's
+    rows once — and then stops: `ceil(rows / micro_batch_size)` batches, the last one short (`drop_last` is off).
     Rows are dealt round-robin over `world_size × num_workers` shards (`ParquetTextDataset`); validation loaders run
-    with `num_workers=0`, so each rank reads every `world_size`-th row and the smallest shard holds
+    with `num_workers=0`, so each rank reads every `world_size`-th row of every entry and the smallest shard holds
     `rows // world_size` of them. The row range is clipped to the rows on disk (`rows_on_disk`, keyed by directory)
     exactly as the dataset clips it.
     """
-    if len(entries) != 1:
-        return None
-    entry = entries[0]
-    rows_per_rank = entry_rows_in_range(entry, rows_on_disk[entry.data_dir]) // world_size
+    rows_per_rank = sum(entry_rows_in_range(entry, rows_on_disk[entry.data_dir]) // world_size for entry in entries)
     return -(-rows_per_rank // micro_batch_size)  # ceil, in integers
 
 
@@ -366,13 +358,10 @@ def check_validation_batches(
     entries and both numbers — `evaluate` would otherwise raise in the middle of the run, at the first evaluation
     step. Fewer than `eval_iters` batches is only a warning: the loader still hands out a last, short batch, and
     `evaluate` averages the batches it actually receives, so the reported loss stays correct — it is just measured
-    on less data than the config asks for. Loaders that mix several sources are unbounded (see
-    `validation_batches_available`) and are never reported.
+    on less data than the config asks for.
     """
     for stage in stages:
         available = validation_batches_available(stage.val_data, rows_on_disk, micro_batch_size, world_size)
-        if available is None:
-            continue
         entries = ", ".join(entry.prefix for entry in stage.val_data)
         rank = f" per rank (world size {world_size})" if world_size > 1 else ""
         if available == 0:

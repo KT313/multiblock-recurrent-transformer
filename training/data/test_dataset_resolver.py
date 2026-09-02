@@ -472,10 +472,10 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
 # --- the validation data an evaluation needs --------------------------------------------------------------------------
 
 
-def test_validation_batches_available_counts_only_finite_loaders(tiny_pretrain_dir: Path) -> None:
-    """A one-entry validation loader is one finite epoch over its row range (`ceil(rows / micro_batch_size)`
-    batches, the rows dealt over `world_size` shards); a loader over several entries mixes them through
-    `WeightedMixtureDataset`, which restarts exhausted members and therefore never runs out (`None`)."""
+def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pretrain_dir: Path) -> None:
+    """A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
+    batches, the rows of every entry dealt over `world_size` shards); several entries are read once each through
+    `WeightedMixtureDataset`."""
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
@@ -485,8 +485,9 @@ def test_validation_batches_available_counts_only_finite_loaders(tiny_pretrain_d
     assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, micro_batch_size=2, world_size=4) == 0
     assert validation_batches_available([DataEntry("s-a", good)], rows, micro_batch_size=1, world_size=1) == total
     assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], rows, 4, 1) == 1  # a short last batch
-    mixture = [DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)]
-    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=1) is None  # restarts, never short
+    mixture = [DataEntry("s-a", good, max_rows=5), DataEntry("s-b", good, max_rows=2)]
+    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=1) == 2  # 7 rows once
+    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
 
 
 def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
@@ -510,12 +511,12 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     # nothing at all reaches a rank (here: 4 rows dealt over 8 ranks, the last two get none) is the hard error
     with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
         check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=1, world_size=8)
-    # a validation loader that mixes several sources restarts them and is never short, whatever the row counts are
+    # a validation loader that mixes several sources reads each of them once: it is checked like a single one
     mixed = _stage([DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         caplog.clear()
         check_validation_batches([mixed], rows, micro_batch_size=8, eval_iters=50)
-    assert caplog.text == ""
+    assert "stage s: its validation data (s-a, s-b) yields 1 micro-batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
 
 
 def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(

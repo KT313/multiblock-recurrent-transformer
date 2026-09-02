@@ -12,7 +12,13 @@ from torch.utils.data import DataLoader
 
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
-from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset, resolve_dataset
+from training.data.dataset_resolver import (
+    TRAIN_LOADER_NUM_WORKERS,
+    DataEntry,
+    ResolvedDataset,
+    resolve_dataset,
+    validation_batches_available,
+)
 from training.data.loader import (
     RunDataloaders,
     build_dataloader,
@@ -135,11 +141,35 @@ def test_single_spec_batches(tokenizer: Tokenizer, entries: list[DataEntry], tin
 MIXTURE_BLOCK_SIZE = 128
 
 
-def test_mixture_loader_mixes_and_is_infinite(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
+    tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path, tiny_instruct_dir: Path
+) -> None:
+    """The draws follow the weights while every member has rows; the loader ends once each member was read once."""
     loader = _loader(entries, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
-    ids = Counter(itertools.chain.from_iterable(b[2] for b in _batches(loader, 200)))
-    assert set(ids) == {"pre", "ft"}
-    assert ids["pre"] / 400 == pytest.approx(0.7, abs=0.06)
+    batches = list(loader)
+    pre_rows, ft_rows = _rows_in(tiny_pretrain_dir), _rows_in(tiny_instruct_dir)
+    assert len(batches) == math.ceil((pre_rows + ft_rows) / 2)
+    ids = Counter(itertools.chain.from_iterable(b[2] for b in batches))
+    assert ids == {"pre": pre_rows, "ft": ft_rows}
+    first = Counter(itertools.chain.from_iterable(b[2] for b in batches[:10]))  # 20 rows, both members still in
+    assert first["pre"] / 20 == pytest.approx(0.7, abs=0.2)
+
+
+def test_validation_mixture_is_finite_and_matches_the_batch_count(
+    tokenizer: Tokenizer, tiny_pretrain_dir: Path, tiny_instruct_dir: Path
+) -> None:
+    """A two-entry validation stage: the loader is finite, its batch count is what `validation_batches_available`
+    promised at setup, and the smaller member's rows appear exactly once."""
+    stage_entries = [
+        DataEntry("s-pre", str(tiny_pretrain_dir), weight=0.7, max_rows=10),
+        DataEntry("s-ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE, max_rows=3),
+    ]
+    rows = {str(tiny_pretrain_dir): _rows_in(tiny_pretrain_dir), str(tiny_instruct_dir): _rows_in(tiny_instruct_dir)}
+    loader = _loader(stage_entries, tokenizer, 4, seed=0, block_size=MIXTURE_BLOCK_SIZE)
+    batches = list(loader)
+    assert len(batches) == validation_batches_available(stage_entries, rows, micro_batch_size=4, world_size=1) == 4
+    ids = Counter(itertools.chain.from_iterable(b[2] for b in batches))
+    assert ids == {"s-pre": 10, "s-ft": 3}
 
 
 def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
