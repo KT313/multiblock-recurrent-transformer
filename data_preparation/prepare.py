@@ -48,8 +48,8 @@ from data_preparation.lib.build.runner import (  # noqa: E402
     prepare,
     status,
 )
-from data_preparation.lib.storage.parquet import configure_hf_cache  # noqa: E402
 from data_preparation.lib.log import ROOT_LOGGER_NAME, configure_logging, get_logger  # noqa: E402
+from data_preparation.lib.sources.hf_cache import configure_hf_cache  # noqa: E402
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, Dashboard  # noqa: E402
 
 log = get_logger(__name__)

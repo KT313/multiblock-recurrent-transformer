@@ -19,9 +19,9 @@ from data_preparation.lib.stages import truncation
 from data_preparation.lib.stages.truncation import (
     CHARS_PER_TOKEN_ESTIMATE,
     PRE_CUT_CHARS_PER_TOKEN,
+    estimate_tokens,
     truncate_many,
 )
-from data_preparation.lib.storage.parquet import estimate_tokens
 
 
 def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> tuple[str, int]:
@@ -229,8 +229,9 @@ def test_pre_cut_does_not_change_the_result_of_ordinary_text(
 # --- estimate mode -----------------------------------------------------------------------------------------------------
 
 
-def test_estimate_constant_matches_estimate_tokens() -> None:
-    assert all(estimate_tokens("x" * n) == n // CHARS_PER_TOKEN_ESTIMATE for n in range(50))
+@pytest.mark.parametrize(("text", "expected"), [("", 0), ("abc", 0), ("abcd", 1), ("a" * 4000, 1000), ("a" * 4003, 1000)])
+def test_estimate_tokens_is_chars_div_4(text: str, expected: int) -> None:
+    assert estimate_tokens(text) == expected
 
 
 def test_estimate_mode_cuts_at_chars_per_token_times_cap() -> None:

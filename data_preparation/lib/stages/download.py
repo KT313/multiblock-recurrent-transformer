@@ -44,9 +44,9 @@ from data_preparation.lib.sources.loaders import (
 )
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.stages.row_pipeline import instruct_text
-from data_preparation.lib.stages.truncation import truncate_many
+from data_preparation.lib.stages.truncation import estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
-from data_preparation.lib.storage.parquet import ShardWriter, estimate_tokens
+from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import ROW_PROGRESS_KEY, RawFolder, RowProgress
 from data_preparation.lib.ui.dashboard import progress
 

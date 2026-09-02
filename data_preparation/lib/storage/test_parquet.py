@@ -1,7 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.storage.parquet: HF cache setup, the dedup key, token estimate, parquet shard I/O."""
+"""Tests for data_preparation.lib.storage.parquet: shard naming and the shard writer."""
 
-import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -12,52 +11,13 @@ import pytest
 
 from data_preparation.lib.storage.parquet import (
     ShardWriter,
-    configure_hf_cache,
-    estimate_tokens,
     list_parquet_files,
     shard_index,
-    text_hash64,
 )
 
 
 def _read_all(out_dir: Path) -> list[pa.Table]:
     return [pq.read_table(f) for f in list_parquet_files(out_dir)]
-
-
-# --- CLI / environment ----------------------------------------------------------------------------------------------
-
-
-
-def test_configure_hf_cache_none_leaves_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
-        monkeypatch.delenv(var, raising=False)
-    configure_hf_cache(None)
-    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
-        assert var not in os.environ
-
-
-def test_configure_hf_cache_sets_all_vars_and_creates_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # setenv *before* the call records the original value (or its absence) so monkeypatch restores it; a
-    # delenv afterwards would "restore" the value the test itself set and leak the temp cache path into the
-    # rest of the session, and delenv(raising=False) on an absent variable records nothing at all
-    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
-        monkeypatch.setenv(var, "placeholder")
-    cache = tmp_path / "hf_cache"
-    configure_hf_cache(cache)
-    assert cache.is_dir()
-    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
-        assert os.environ[var] == str(cache.resolve())
-
-
-
-# --- pure helpers ---------------------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"), [("", 0), ("abc", 0), ("abcd", 1), ("a" * 4000, 1000), ("a" * 4003, 1000)]
-)
-def test_estimate_tokens_is_chars_div_4(text: str, expected: object) -> None:
-    assert estimate_tokens(text) == expected
 
 
 def test_list_parquet_files_sorted_any_name(tmp_path: Path) -> None:
@@ -73,29 +33,6 @@ def test_shard_index() -> None:
     assert shard_index(Path("/x/data-123456.parquet")) == 123456
     assert shard_index(Path("other.parquet")) is None
     assert shard_index(Path("data-7.parquet")) is None
-
-
-@pytest.mark.parametrize(
-    ("text", "normalized", "raw"),
-    [
-        ("hello world", 6824707963431612112, 6824707963431612112),
-        ("  Hello\t World\n\nfoo ", 8471811785197293890, -4212963777905507985),
-        ("héllo wörld", -1365678327145243118, -1365678327145243118),
-        ("a\ud800b", 1765116674205471180, 1765116674205471180),  # a lone surrogate is dropped, not an error
-        ("", -3162216497309240828, -3162216497309240828),
-    ],
-)
-def test_text_hash64_pins_the_stored_keys(text: str, normalized: int, raw: int) -> None:
-    """The `hash` column of every processed shard on disk holds these values: the function must never change them."""
-    assert text_hash64(text) == normalized and text_hash64(text, normalize=False) == raw
-
-
-def test_text_hash64_normalizes_case_and_whitespace() -> None:
-    assert text_hash64("Hello  World") == text_hash64("hello world") == text_hash64("\nHELLO\tworld\n")
-    assert text_hash64("Hello  World", normalize=False) != text_hash64("hello world", normalize=False)
-    assert text_hash64("hello world") != text_hash64("hello worlds")
-    assert -(2**63) <= text_hash64("x") < 2**63
-    pa.array([text_hash64("x")], type=pa.int64())  # fits the parquet column type
 
 
 # --- parquet shard writer -------------------------------------------------------------------------------------------

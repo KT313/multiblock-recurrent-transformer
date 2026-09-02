@@ -57,7 +57,7 @@ from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
-from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes
+from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
@@ -75,7 +75,7 @@ from data_preparation.lib.stages.download import (
     new_manifest,
 )
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
-from data_preparation.lib.storage.parquet import publish_shard, shard_name, text_hash64
+from data_preparation.lib.storage.parquet import publish_shard, shard_name
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)

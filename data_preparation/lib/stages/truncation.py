@@ -14,14 +14,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from data_preparation.lib.storage.parquet import estimate_tokens
-
 if TYPE_CHECKING:  # transformers is imported lazily by the tokenizer stage (HF cache env must be settable first)
     from transformers import PreTrainedTokenizerFast
 
-# ``token_count: estimate`` counts ``len(text) // CHARS_PER_TOKEN_ESTIMATE``. Must match ``estimate_tokens`` in
-# ``storage/parquet.py`` (asserted in the tests).
-CHARS_PER_TOKEN_ESTIMATE = 4
+CHARS_PER_TOKEN_ESTIMATE = 4  # ``token_count: estimate`` counts ``len(text) // CHARS_PER_TOKEN_ESTIMATE``
 
 # Before tokenizing, a text is cut at ``PRE_CUT_CHARS_PER_TOKEN * max_tokens`` characters so the tokenizer cost per
 # document is bounded (a Gutenberg book is millions of characters, the cap a few thousand tokens). English prose
@@ -33,6 +29,11 @@ CHARS_PER_TOKEN_ESTIMATE = 4
 PRE_CUT_CHARS_PER_TOKEN = 32
 
 Offsets = list[tuple[int, int]]
+
+
+def estimate_tokens(text: str) -> int:
+    """The ``token_count: estimate`` count: characters / :data:`CHARS_PER_TOKEN_ESTIMATE`."""
+    return len(text) // CHARS_PER_TOKEN_ESTIMATE
 
 
 def truncate_many(texts: list[str], max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> list[tuple[str, int]]:

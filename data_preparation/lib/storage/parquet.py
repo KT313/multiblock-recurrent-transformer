@@ -1,10 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Helpers shared by the data preparation stages: HF cache setup, hashing, token estimate, parquet shard I/O."""
+"""Parquet shard files: the ``data-NNNNN.parquet`` naming, listing, atomic publishing and the incremental writer."""
 
 from __future__ import annotations
 
-import hashlib
-import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -14,42 +12,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.row_pipeline import normalize_text
 
 log = get_logger(__name__)
 SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
 SHARD_COMPRESSION: Literal["zstd"] = "zstd"  # every shard written from now on; older snappy shards stay readable
-
-
-def configure_hf_cache(cache_dir: Path | None) -> None:
-    """Point every HuggingFace cache at ``cache_dir``; must run before ``datasets``/``transformers`` are imported."""
-    if cache_dir is None:
-        return
-    cache_dir = cache_dir.expanduser().resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
-        os.environ[var] = str(cache_dir)
-    log.info("using HuggingFace cache %s", cache_dir)
-
-
-# --- text hashing / token estimate ----------------------------------------------------------------------------------
-
-
-def text_hash64(text: str, normalize: bool = True) -> int:
-    """The exact-dedup key of ``text``: the first 64 bits of its MD5 (lone surrogates dropped) as a signed integer, the
-    int64 ``hash`` column of processed shards. ``normalize`` hashes the lower-cased text with whitespace runs collapsed
-    (:func:`normalize_text`), so casing and spacing variants of one document share the key."""
-    if normalize:
-        text = normalize_text(text)
-    return int.from_bytes(hashlib.md5(text.encode("utf-8", "ignore")).digest()[:8], "big", signed=True)
-
-
-def estimate_tokens(text: str) -> int:
-    """Cheap token count estimate (characters / 4)."""
-    return len(text) // 4
-
-
-# --- shard files -----------------------------------------------------------------------------------------------------
 
 
 def list_parquet_files(directory: Path) -> list[Path]:

@@ -36,7 +36,7 @@ from data_preparation.lib.stages.download import (
     raw_manifest_problem,
     raw_manifest_state,
 )
-from data_preparation.lib.storage.parquet import estimate_tokens
+from data_preparation.lib.stages.truncation import estimate_tokens
 
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 

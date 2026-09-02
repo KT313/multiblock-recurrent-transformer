@@ -19,10 +19,34 @@ from data_preparation.lib.stages.exact_dedup import (
     expected_items,
     mix128,
     stored_hashes,
+    text_hash64,
 )
 
 INT64_MIN = -(1 << 63)
 INT64_MAX = (1 << 63) - 1
+
+
+@pytest.mark.parametrize(
+    ("text", "normalized", "raw"),
+    [
+        ("hello world", 6824707963431612112, 6824707963431612112),
+        ("  Hello\t World\n\nfoo ", 8471811785197293890, -4212963777905507985),
+        ("héllo wörld", -1365678327145243118, -1365678327145243118),
+        ("a\ud800b", 1765116674205471180, 1765116674205471180),  # a lone surrogate is dropped, not an error
+        ("", -3162216497309240828, -3162216497309240828),
+    ],
+)
+def test_text_hash64_pins_the_stored_keys(text: str, normalized: int, raw: int) -> None:
+    """The `hash` column of every processed shard on disk holds these values: the function must never change them."""
+    assert text_hash64(text) == normalized and text_hash64(text, normalize=False) == raw
+
+
+def test_text_hash64_normalizes_case_and_whitespace() -> None:
+    assert text_hash64("Hello  World") == text_hash64("hello world") == text_hash64("\nHELLO\tworld\n")
+    assert text_hash64("Hello  World", normalize=False) != text_hash64("hello world", normalize=False)
+    assert text_hash64("hello world") != text_hash64("hello worlds")
+    assert -(2**63) <= text_hash64("x") < 2**63
+    pa.array([text_hash64("x")], type=pa.int64())  # fits the parquet column type
 
 
 def _random_hashes(count: int, seed: int) -> list[int]:

@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The exact-dedup "seen" set as a Bloom filter under a fixed memory budget.
+"""The exact-dedup key of a document and the "seen" set of one build as a Bloom filter under a fixed memory budget.
 
 A Python ``set[int]`` costs ~100 B per entry, tens of GB at the 200 B-token scale; :class:`SeenDocuments` wraps an
 ``rbloom.Bloom`` whose bit array is sized from ``memory_mb`` alone (bits = MB x 2^23) and costs O(1) per document.
@@ -17,6 +17,7 @@ and would collide distinct 64-bit keys, and a 64-bit key with zero upper bits is
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -25,6 +26,8 @@ from typing import cast
 import pyarrow.parquet as pq
 from rbloom import Bloom
 
+from data_preparation.lib.stages.row_pipeline import normalize_text
+
 TARGET_FALSE_POSITIVE_RATE = 0.001
 """The false-positive rate the filter is sized for when it holds exactly :func:`expected_items` documents."""
 
@@ -32,6 +35,15 @@ BITS_PER_MB = 1 << 23
 
 _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15  # splitmix64's golden-ratio increment
+
+
+def text_hash64(text: str, normalize: bool = True) -> int:
+    """The exact-dedup key of ``text``: the first 64 bits of its MD5 (lone surrogates dropped) as a signed integer, the
+    int64 ``hash`` column of processed shards. ``normalize`` hashes the lower-cased text with whitespace runs collapsed
+    (:func:`normalize_text`), so casing and spacing variants of one document share the key."""
+    if normalize:
+        text = normalize_text(text)
+    return int.from_bytes(hashlib.md5(text.encode("utf-8", "ignore")).digest()[:8], "big", signed=True)
 
 
 def _splitmix64(x: int) -> int:
