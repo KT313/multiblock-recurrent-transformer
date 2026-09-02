@@ -389,6 +389,7 @@ def open_run_logger(
         dashboard=dashboard if dashboard is not None else RecordingDashboard(),
         clock=clock,
         setup_started=setup_started,
+        keep_history=True,
     )
 
 
@@ -480,6 +481,24 @@ def test_log_step_history_wandb_dict_and_throughput(
         assert step_dict == metrics | {TRANSITION_FLAG_KEY: 0.0, TRANSITION_PROGRESS_KEY: 0.0}  # no transition here
         assert not any(torch.is_tensor(value) for value in step_dict.values())
     assert not any(r.getMessage().startswith("step ") for r in console_records.records)
+
+
+def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without `keep_history` (the CLI's default) `history` stays empty while wandb and the dashboard still get every
+    log step's metric dict: a long run does not hold its metrics in memory."""
+    recorded = _record_wandb_logs(monkeypatch)
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    run_logger = _logger_with(Logger("p", "r", tmp_path, enabled=False), stage_manager, settings, tmp_path)
+    assert run_logger.keep_history is False
+    progress = TrainingProgress()
+    for _ in range(2):
+        result = fake_result(stage_manager, progress.step, loss=2.0)
+        progress.advance()
+        run_logger.log_step(result, progress)
+    assert run_logger.history == {} and sorted(recorded) == [1, 2]
+    assert [step for step, _, _ in recording(run_logger).steps] == [1, 2]
+    assert run_logger.close(progress, None).history == {}
 
 
 def test_log_interval_composition_fractions_sum_to_one_and_reset(

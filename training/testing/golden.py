@@ -15,25 +15,23 @@ import json
 import os
 import tempfile
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 import torch
+import yaml
 
 from data_preparation.lib.build.runner import prepare
-from training import run as run_module
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.optim import build_optimizer
 from training.run import train
 from training.settings import parse_settings
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
 TINY_DATASET_YAML = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
-GOLDEN_RUN_PATH = Path(__file__).resolve().parent / "golden_tiny_run.json"
+GOLDEN_RUN_PATH = REPO_ROOT / "training" / "golden_tiny_run.json"
 
 GOLDEN_EXACT_ENV = "GOLDEN_EXACT"  # `GOLDEN_EXACT=1`: compare every float with `==` instead of rel 1e-5
 GOLDEN_RELATIVE_TOLERANCE = 1e-5
@@ -41,22 +39,13 @@ GOLDEN_PER_STEP_KEYS = ("loss", "grad_norm", "lr")
 GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
 
 
-def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: str) -> Path:
-    """`config/tiny.yaml` with `dataset_dir` / `out_dir` rewritten and optional `key: value` line replacements (a key
-    the file does not have is appended); returns the path of the written yaml (`tmp_path / tiny.yaml`)."""
-    lines = []
-    for line in TINY_YAML.read_text().splitlines():
-        key = line.split(":")[0].strip() if ":" in line and not line.startswith(" ") else None
-        if key == "out_dir":
-            line = f"out_dir: {out_dir}"
-        elif key == "dataset_dir":
-            line = f"dataset_dir: {tiny_dataset_dir}"
-        elif key in overrides:
-            line = f"{key}: {overrides.pop(key)}"
-        lines.append(line)
-    lines += [f"{k}: {v}" for k, v in overrides.items()]
+def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
+    """`config/tiny.yaml` with `dataset_dir` / `out_dir` rewritten and `overrides` set as plain values (a key the
+    file does not have is added at the end); returns the path of the written yaml (`tmp_path / tiny.yaml`)."""
+    settings: dict[str, Any] = yaml.safe_load(TINY_YAML.read_text())
+    settings.update({"out_dir": str(out_dir), "dataset_dir": str(tiny_dataset_dir), **overrides})
     path = tmp_path / "tiny.yaml"
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
     return path
 
 
@@ -80,47 +69,33 @@ def single_thread_deterministic() -> Iterator[None]:
         torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
 
 
+def optimizer_steps_taken(optimizer_state: dict[str, Any]) -> int:
+    """The number of `optimizer.step()` calls behind a checkpoint's optimizer state dict: the `step` counter of its
+    first parameter (a tensor for ELLISAdam and torch AdamW alike; every parameter gets a gradient every step, so
+    all counters agree)."""
+    per_parameter = optimizer_state["state"]
+    return int(per_parameter[min(per_parameter)]["step"])
+
+
 def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
     """The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms), reduced to its numerics.
 
     `config/tiny.yaml` with `precision: "32"`, `wandb_enabled: false`, `export_to_hf: false`,
     `resume: false` and `out_dir` in a temporary directory, through
-    `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"))`. Returns
+    `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. Returns
     `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss, val_loss_<depth>...]}}, "checkpoints": [file names],
     "optimizer_steps": number of optimizer.step() calls, "parameter_norms": {name: L2 norm in the final checkpoint}}`.
-    The per-step values are `report.history`; the `optimizer.step()` calls are counted by wrapping the optimizer
-    `training.run.build_optimizer` returns (the only probe inside the run).
+    The per-step values are `report.history`; the `optimizer.step()` calls are read from the final checkpoint's
+    optimizer state (`optimizer_steps_taken`). Nothing is probed inside the run.
     """
-    with tempfile.TemporaryDirectory() as tmp, single_thread_deterministic(), ExitStack() as probes:
+    with tempfile.TemporaryDirectory() as tmp, single_thread_deterministic():
         tmp_path = Path(tmp)
         out_dir = tmp_path / "out"
         yaml_path = write_tiny_yaml(
-            tmp_path,
-            tiny_dataset_dir,
-            out_dir,
-            precision='"32"',
-            wandb_enabled="false",
-            export_to_hf="false",
-            resume="false",
+            tmp_path, tiny_dataset_dir, out_dir, precision="32", wandb_enabled=False, export_to_hf=False, resume=False
         )
         settings = parse_settings(["--config", str(yaml_path)])
-        optimizer_step_calls = 0
-
-        def counting_build_optimizer(name: str, params: Any, *args: Any, **options: Any) -> torch.optim.Optimizer:
-            optimizer = build_optimizer(name, params, *args, **options)
-            optimizer_class = type(optimizer)
-            original_step = optimizer_class.step
-
-            def counting_step(self: torch.optim.Optimizer, *args: Any, **kwargs: Any) -> Any:
-                nonlocal optimizer_step_calls
-                optimizer_step_calls += 1
-                return original_step(self, *args, **kwargs)
-
-            probes.enter_context(mock.patch.object(optimizer_class, "step", counting_step))
-            return optimizer
-
-        probes.enter_context(mock.patch.object(run_module, "build_optimizer", counting_build_optimizer))
-        report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"))
+        report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)
 
         steps: dict[str, dict[str, float]] = {}
         for done, metrics in sorted(report.history.items()):
@@ -129,13 +104,13 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
             steps[str(done)] = step_metrics
         final_checkpoint = find_latest_checkpoint(out_dir, settings.run_name)
         assert final_checkpoint is not None
-        final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)["model"]
+        final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
         return {
             "steps": steps,
             "checkpoints": sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")),
-            "optimizer_steps": optimizer_step_calls,
+            "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),
             "parameter_norms": {
-                name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state.items()
+                name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state["model"].items()
             },
         }
 
@@ -150,7 +125,7 @@ def record_golden_run() -> Path:
     training loop, or when the tiny dataset changes (the fixture depends on `config/datasets/tiny.yaml` and the data
     pipeline: the synthetic rows, dedup, the instruct shuffle and input inversions, the 5 % validation split):
 
-        uv run python -c "from training.golden import record_golden_run; record_golden_run()"
+        uv run python -c "from training.testing.golden import record_golden_run; record_golden_run()"
 
     Builds the tiny dataset into a temporary directory first (as the `tiny_dataset_dir` fixture does). The committed
     fixture was recorded with torch 2.13.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic

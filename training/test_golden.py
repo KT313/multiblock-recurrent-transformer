@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the golden-run helpers (`training.golden`): the tiny-yaml writer, the comparison and the
+"""Tests for the golden-run helpers (`training.testing.golden`): the tiny-yaml writer, the comparison and the
 single-thread / deterministic block. The golden run itself is `test_run.py::test_golden_tiny_run`."""
 
 import json
@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
-from training.golden import (
+from training.testing.golden import (
     GOLDEN_RUN_PATH,
     golden_exact_requested,
     golden_mismatches,
@@ -20,13 +21,14 @@ from training.settings import parse_settings
 
 
 def test_write_tiny_yaml_rewrites_paths_and_overrides(tmp_path: Path) -> None:
-    """`out_dir` / `dataset_dir` are rewritten, an existing key is replaced in place, a new key is appended, and the
-    result parses as settings."""
-    path = write_tiny_yaml(tmp_path, tmp_path / "data", tmp_path / "out", precision='"32"', resume_warmup_steps="2")
+    """`out_dir` / `dataset_dir` are rewritten, an existing key is replaced in place (a string value that looks like
+    a number stays a string), a new key is appended, and the result parses as settings."""
+    path = write_tiny_yaml(tmp_path, tmp_path / "data", tmp_path / "out", precision="32", resume_warmup_steps=2)
     assert path == tmp_path / "tiny.yaml"
     text = path.read_text()
-    assert f"out_dir: {tmp_path / 'out'}\n" in text and f"dataset_dir: {tmp_path / 'data'}\n" in text
-    assert text.count("precision:") == 1 and 'precision: "32"' in text
+    written = yaml.safe_load(text)
+    assert written["out_dir"] == str(tmp_path / "out") and written["dataset_dir"] == str(tmp_path / "data")
+    assert text.count("precision:") == 1 and written["precision"] == "32"
     assert text.rstrip().endswith("resume_warmup_steps: 2")  # appended: tiny.yaml has no such key
     settings = parse_settings(["--config", str(path)])
     assert settings.precision == "32" and settings.resume_warmup_steps == 2 and settings.run_name == "tiny"

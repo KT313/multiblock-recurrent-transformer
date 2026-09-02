@@ -23,7 +23,7 @@ from training.data.collate import find_multiple
 from training.data.dataset_resolver import DataEntry, resolve_dataset
 from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
-from training.golden import (
+from training.testing.golden import (
     golden_exact_requested,
     golden_mismatches,
     golden_run_json,
@@ -356,8 +356,8 @@ def _stream_setup(
         tmp_path,
         tiny_dataset_dir,
         tmp_path / "out",
-        sort_batches_by_length=str(sort).lower(),
-        sequence_padding_multiple=str(padding_multiple),
+        sort_batches_by_length=sort,
+        sequence_padding_multiple=padding_multiple,
     )
     settings = parse_settings(
         ["--config", str(yaml_path), "--micro_batch_size", str(batch_size)]  # 4 / batch_size micro-batches per step

@@ -76,6 +76,7 @@ def train(
     backend: Backend | None = None,
     should_stop: StopCheck | None = None,
     started_at: float | None = None,
+    keep_history: bool = False,
 ) -> TrainingReport:
     """Run the training run described by `settings` and return its report.
 
@@ -86,6 +87,8 @@ def train(
     `resume: true` continues from there.
     `started_at` is the caller's clock reading at the start of the run (`report.setup_seconds`); the run's own
     clock lives in `RunLogger`.
+    `keep_history` is a test knob: with it `report.history` holds every log step's metric dict (the golden run and
+    the end-to-end tests read it); the CLI leaves it off, so a long run does not accumulate its metrics in memory.
     The run directory is locked for the whole run (`training.run_lock`): a second run pointed at the same `out_dir`
     fails with `RunDirectoryLocked` instead of sharing checkpoints, `train.log` and `run_config.json` with this one.
 
@@ -107,7 +110,15 @@ def train(
         )
 
         with RunLogger.open(
-            settings, run_directory, dataset, model, stage_manager, progress, backend, setup_started=started_at
+            settings,
+            run_directory,
+            dataset,
+            model,
+            stage_manager,
+            progress,
+            backend,
+            setup_started=started_at,
+            keep_history=keep_history,
         ) as logger:
             if resumed_from is None:
                 record_run_config(settings, run_directory)

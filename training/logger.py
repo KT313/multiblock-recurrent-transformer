@@ -151,7 +151,8 @@ class TrainingReport:
     checkpoints_written: list[Path]  # every checkpoint saved by this process, in order
     export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf` (and after a stop)
     stopped: bool = False  # the run stopped on request (`should_stop` of `train()`, the CLI's Ctrl-C) before its last step
-    history: dict[int, dict[str, float]] = field(default_factory=dict)  # `RunLogger.log_step`'s metrics per logged step
+    history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step: `RunLogger.log_step`'s
+    # metrics, only with `train(keep_history=True)` (a test knob); empty otherwise
 
     def summary(self) -> str:
         """The lines the CLI prints after `train()` returned."""
@@ -260,6 +261,7 @@ class RunLogger:
         dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
+        keep_history: bool = False,
     ) -> None:
         self.settings = settings
         self.run_directory = run_directory
@@ -277,7 +279,8 @@ class RunLogger:
                 open_dashboard(settings, run_directory, stage_manager, start_step=start_step, device=device)
             )
         )
-        self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats
+        self.keep_history = keep_history  # a test knob: fill `history` (the CLI does not keep every log step)
+        self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats, if kept
         self.checkpoints_written: list[Path] = []
         self.resumed_from: Path | None = None
         self.tokens_per_step = settings.world_batch_size * settings.block_size
@@ -307,6 +310,7 @@ class RunLogger:
         dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
+        keep_history: bool = False,
     ) -> RunLogger:
         """Open the run's logging once the setup is done: the wandb run with the hyperparameters (the settings plus
         `dataset_config_hash`) and the `num_parameters` summary, then the dashboard (`open_dashboard`, unless a
@@ -315,7 +319,7 @@ class RunLogger:
 
         `progress.step` is the step training starts at (the resume step), `backend.device` names the device;
         `setup_started` is the clock reading at the start of the run (`setup_seconds` of the report; 0 if not given).
-        `clock` is `time.time` unless a test injects a fake.
+        `clock` is `time.time` unless a test injects a fake; `keep_history` fills `history` (a test knob too).
         """
         wandb = Logger(
             settings.logger_project,
@@ -336,6 +340,7 @@ class RunLogger:
             dashboard=dashboard,
             clock=clock,
             setup_started=setup_started,
+            keep_history=keep_history,
         )
         console.info(stage_manager.get_stage_summary(), extra=KEEP)
         console.info(
@@ -432,8 +437,8 @@ class RunLogger:
         becomes a dashboard event, a set `result.validation` becomes the dashboard's validation row and the report's
         `last_validation`, and the dashboard's bars move (`update_step` with the stage at `done` and — only at log
         steps — the metric dict; at every other step an empty dict: no tensor is read there, so no device sync is
-        added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and
-        to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
+        added to the thesis loop). At log steps (`done % log_step_interval == 0`) the metric dict goes to wandb and,
+        with `keep_history`, to `history[done]` (as floats); the fallback dashboard turns it into its one console line:
 
         * `loss` (mean micro-batch loss), `ppl` (exp of the mean log-perplexity), `lr` (scheduled LR), `grad_norm`
           (pre-clip), `step` (= done);
@@ -457,7 +462,8 @@ class RunLogger:
             return
         metrics = self._step_metrics(result, progress, validation)
         self.wandb.log(metrics, step=progress.step)
-        self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
+        if self.keep_history:
+            self.history[progress.step] = {name: float(value) for name, value in metrics.items()}
         self._last_loss = float(metrics["loss"])
         self.dashboard.update_step(progress.step, stage_index, metrics | transition)
 
