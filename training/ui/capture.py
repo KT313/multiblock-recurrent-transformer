@@ -3,9 +3,10 @@
 root-logger handler, the detached third-party console handlers, the ``warnings.showwarning`` hook, the ``sys.stdout``
 / ``sys.stderr`` line sinks and the wandb environment variables, all for the duration of the display.
 
-The generic half — the line sink, the dashboard log handler, :func:`attach_logger` and the logging / stream capture
+The generic half — the line sink, the dashboard log handler, ``attach_logger`` and the logging / stream capture
 themselves — lives in :mod:`data_preparation.lib.ui.capture`, shared with the data-prep dashboard; this module adds
-what only a training run needs: the ``training.*`` logger names, the ``warnings`` hook and the wandb environment."""
+what only a training run needs: the ``training.*`` logger names, the run's log-file and console handlers
+(:func:`run_log_handlers`), the ``warnings`` hook and the wandb environment."""
 
 from __future__ import annotations
 
@@ -17,9 +18,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
 
+from data_preparation.lib.log import LOG_FORMAT
 from data_preparation.lib.ui.capture import LoggingCapture, LogSink, StreamCapture  # generic, shared with the data-prep dashboard
-from data_preparation.lib.ui.capture import attach_logger as _attach_logger
-from training.ui.common import TRAINING_LOGGER_NAME
+from training.ui.common import TRAINING_LOGGER_NAME, lines_log
 
 STDOUT_LOGGER = f"{TRAINING_LOGGER_NAME}.stdout"  # lines written to sys.stdout while the display is up (INFO)
 STDERR_LOGGER = f"{TRAINING_LOGGER_NAME}.stderr"  # lines written to sys.stderr while the display is up (WARNING: kept)
@@ -54,14 +55,42 @@ class _ShowWarning(Protocol):
     ) -> None: ...
 
 
-@contextmanager
-def attach_logger(sink: LogSink, logger: logging.Logger, log_file: Path | None) -> Iterator[logging.FileHandler | None]:
-    """Route ``logger`` into ``sink`` for the duration of the block (the body of the training dashboard's ``open``).
+def line_handler(stream_or_file: TextIO | Path) -> logging.Handler:
+    """A handler for the dashboards' lines (:data:`~training.ui.common.lines_log`): a ``FileHandler`` appending to a
+    path or a ``StreamHandler`` on a stream, both in the ``LOG_FORMAT`` the ``training`` records are written in, so
+    ``train.log`` and the console read as one log."""
+    handler: logging.Handler
+    if isinstance(stream_or_file, Path):
+        stream_or_file.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(stream_or_file, encoding="utf-8")
+    else:
+        handler = logging.StreamHandler(stream_or_file)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    return handler
 
-    :func:`data_preparation.lib.ui.capture.attach_logger` with ``ensure_info_level``: a logger whose effective level
-    is above INFO is lowered to INFO for the block — the training dashboard lives on INFO records."""
-    with _attach_logger(sink, logger, log_file, ensure_info_level=True) as file_handler:
-        yield file_handler
+
+@contextmanager
+def run_log_handlers(logger: logging.Logger, log_file: Path | None, stream: TextIO | None) -> Iterator[None]:
+    """The run's log file and the console for the block: ONE ``FileHandler`` appending to ``log_file``, on ``logger``
+    (the attached ``training`` logger: its records) and on :data:`~training.ui.common.lines_log` (the dashboard
+    lines) alike, so ``train.log`` is written by a single handler in the order the lines were logged; and, when
+    ``stream`` is given, a ``StreamHandler`` on ``lines_log`` (the console fallback's lines). None leaves a
+    destination out. The handlers are removed and closed afterwards."""
+    added: list[tuple[logging.Logger, logging.Handler]] = []
+    if log_file is not None:
+        file_handler = line_handler(log_file)
+        added += [(logger, file_handler), (lines_log, file_handler)]
+    if stream is not None:
+        added.append((lines_log, line_handler(stream)))
+    for target, handler in added:
+        target.addHandler(handler)
+    try:
+        yield
+    finally:
+        for target, handler in added:
+            target.removeHandler(handler)
+        for handler in {id(handler): handler for _target, handler in added}.values():
+            handler.close()
 
 
 class TerminalCapture:

@@ -13,8 +13,9 @@ from pathlib import Path
 
 from rich.console import Console
 
-from training.ui.common import KEEP, log
-from training.ui.dashboard import training_dashboard
+from training.ui.board import TrainingDashboard
+from training.ui.common import KEEP, dashboard_enabled, log
+from training.ui.fallback import ConsoleFallbackDashboard
 
 DEMO_STAGES = ["pretrain", "instruct"]
 DEMO_STEPS = [30, 20]
@@ -33,18 +34,15 @@ def demo(
     library = logging.getLogger("demo_third_party_library")  # like transformers / datasets: a StreamHandler on stderr
     library_handler = logging.StreamHandler(sys.stderr)
     library.addHandler(library_handler)
+    board: TrainingDashboard | ConsoleFallbackDashboard
+    if enabled if enabled is not None else dashboard_enabled():
+        board = TrainingDashboard(
+            "demo-run", DEMO_STAGES, DEMO_STEPS, total_steps, details=details, log_step_interval=5, console=console
+        )
+    else:
+        board = ConsoleFallbackDashboard("demo-run", DEMO_STAGES, DEMO_STEPS, total_steps, details=details, log_step_interval=5)
     try:
-        with training_dashboard(
-            "demo-run",
-            DEMO_STAGES,
-            DEMO_STEPS,
-            total_steps,
-            details=details,
-            log_step_interval=5,
-            log_file=log_file,
-            enabled=enabled,
-            console=console,
-        ) as board:
+        with board.running(log_file=log_file):
             board.note_event("no checkpoint found, starting from scratch")
             board.set_status("training")
             log.info("Total training steps: %d (4 micro-batches each)", total_steps, extra=KEEP)

@@ -43,7 +43,7 @@ from training.test_step import reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import TRAIN_LOG_NAME
-from training.ui.fallback import NoOpDashboard
+from training.ui.fallback import ConsoleFallbackDashboard
 
 
 def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:
@@ -763,7 +763,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Without an injected dashboard `open` goes through `open_dashboard`: stdout is not a TTY under pytest, so the
-    `NoOpDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
+    `ConsoleFallbackDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
     details, the log interval, the resume step) with the `training` logger attached for the block and
     `run_directory / train.log` appended — the header records, the fallback's step lines and events all end up there
     and on stderr (where the CLI's log handlers write too, so a piped run's story stays in one stream);
@@ -777,7 +777,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     handlers_before = list(training_logger.handlers)
     with RunLogger.open(settings, tmp_path, resolved, tiny_model, stage_manager, progress, backend, clock=FakeClock()) as run_logger:
         board = run_logger.dashboard
-        assert isinstance(board, NoOpDashboard)
+        assert isinstance(board, ConsoleFallbackDashboard)
         assert board.stage_names == ["a", "b"] and board.steps_per_stage == [8, 4] and board.total_steps == 12
         assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"}
         assert board.log_step_interval == 2
@@ -802,12 +802,34 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
     settings = reference_settings(log_step_interval=3, eval_step_interval=99)  # eval must be a multiple of log
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
-        assert isinstance(board, NoOpDashboard)  # stdout is not a TTY under pytest
+        assert isinstance(board, ConsoleFallbackDashboard)  # stdout is not a TTY under pytest
         assert (board.run_name, board.stage_names, board.steps_per_stage, board.total_steps) == ("steps", ["a", "b"], [8, 4], 12)
         assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cuda:0", "precision": "32"}
         assert board.log_step_interval == 3
         board.update_step(6, 0, None, {"loss": 1.0})
     assert (tmp_path / TRAIN_LOG_NAME).exists() and "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
+
+
+def _display_is_up(board: TrainingDashboard) -> bool:
+    """Through a call: mypy would otherwise keep the narrowing of ``board._live`` across the ``with`` block."""
+    return board._live is not None
+
+
+def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the display enabled (`dashboard_enabled`: a terminal and `TRAINING_DASHBOARD` not `0`) `open_dashboard`
+    builds the live `TrainingDashboard` from the same run description, up for the block and closed after it, with
+    stderr as the stream a display that disables itself falls back to (where the CLI's log handlers write)."""
+    monkeypatch.setattr("training.logger.dashboard_enabled", lambda: True)
+    settings = reference_settings(log_step_interval=3, eval_step_interval=99)
+    stage_manager = two_stage_manager(settings)
+    with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cpu") as board:
+        assert isinstance(board, TrainingDashboard) and _display_is_up(board) and board.enabled
+        assert (board.run_name, board.stage_names, board.steps_per_stage, board.total_steps) == ("steps", ["a", "b"], [8, 4], 12)
+        assert board.details == {"model": "tiny", "dataset": "tiny", "device": "cpu", "precision": "32"}
+        assert board.log_step_interval == 3
+        board.update_step(6, 0, None, {"loss": 1.0})
+    assert not _display_is_up(board) and board._fallback_stream is sys.stderr
+    assert "step 6/12" in (tmp_path / TRAIN_LOG_NAME).read_text()
 
 
 class RaisingTracker(Logger):

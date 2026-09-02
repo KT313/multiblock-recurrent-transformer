@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the public API of the training dashboard: the factory and the scripted 30-step run the way ``train()``
-/ ``RunLogger`` will drive it, with everything that could print around the display firing."""
+"""Tests for the public API of the training dashboard: the scripted 30-step run the way ``train()`` / ``RunLogger``
+drive it, with everything that could print around the display firing, and the log file both dashboards write."""
 
 from __future__ import annotations
 
@@ -9,68 +9,46 @@ import logging
 import sys
 import time
 from collections import deque
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 import pytest
 
 from training.ui.board import TrainingDashboard
-from training.ui.dashboard import RunDashboard, training_dashboard
-from training.ui.fallback import NoOpDashboard
+from training.ui.fallback import ConsoleFallbackDashboard
 from training.ui.testing import (
     BOX_CHARACTERS,
-    LOGGER_NAME,
     STAGES,
     STEPS,
     TOTAL,
     FakeClock,
     console_output,
+    fallback_board,
+    live_board,
     metrics,
     screen_text,
     string_console,
 )
 
 
-def test_factory_picks_the_fallback_when_disabled(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
-    monkeypatch.setenv("TRAINING_DASHBOARD", "0")
-    logger = logging.getLogger(LOGGER_NAME + ".factory")
-    real_out = sys.stdout
-    with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logger, stream=io.StringIO(), clock=clock) as b:
-        assert isinstance(b, NoOpDashboard) and sys.stdout is real_out, "the fallback captures nothing"
-    monkeypatch.setenv("TRAINING_DASHBOARD", "1")
-    with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logger, stream=io.StringIO(), clock=clock) as b:
-        assert isinstance(b, NoOpDashboard), "stdout is not a TTY"
-    with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logger, enabled=True, console=string_console(), clock=clock) as b:
-        assert isinstance(b, TrainingDashboard) and b._live is not None
-    assert b._live is None
-
-
-def test_factory_gives_the_live_display_the_fallback_stream(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
+def test_a_disabled_live_display_writes_its_lines_to_the_fallback_stream(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
     """A display that disables itself after an internal error must write its plain lines where a run that never got
-    a display writes them (the CLI passes stderr) — it used to build its fallback on ``stream``, i.e. stdout, which
-    is exactly the failure path ``fallback_stream`` was added for."""
+    a display writes them (``open_dashboard`` passes stderr as ``fallback_stream``), not to the display's own
+    ``stream``."""
     stream, fallback = io.StringIO(), io.StringIO()
 
     def broken(step: int, stage_index: int) -> None:
         raise RuntimeError("renderer broke")
 
-    with training_dashboard(
-        "r", STAGES, STEPS, TOTAL, enabled=True,  # the default `training` logger: the fallback's own lines reach it
-        log_step_interval=1, console=string_console(), stream=stream, fallback_stream=fallback, clock=clock,
+    with live_board(  # the default `training` logger, as in a run
+        "r", STAGES, STEPS, TOTAL, log_step_interval=1, console=string_console(), stream=stream, fallback_stream=fallback, clock=clock
     ) as b:
-        assert isinstance(b, TrainingDashboard)
         monkeypatch.setattr(b, "_refresh_bars", broken)
         b.update_step(1, 0, None, metrics(1))  # disables the display
-        b.update_step(2, 0, None, metrics(2))  # from here the fallback logs the step lines
+        b.update_step(2, 0, None, metrics(2))  # from here the lines reach the console
         b.note_event("saved checkpoint x.pth")
     assert "step 2/30" in fallback.getvalue() and "event: saved checkpoint x.pth" in fallback.getvalue()
     assert "step 2/30" not in stream.getvalue()
-
-
-def test_factory_passes_final_frame_on(clock: FakeClock) -> None:
-    console = string_console()
-    with training_dashboard("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), enabled=True, final_frame=False, console=console, clock=clock) as b:
-        b.update_step(3, 0, None, metrics(3))
-    assert "overall" not in screen_text(console, 120)
 
 
 # --- the scripted run -----------------------------------------------------------------------------------------------------
@@ -103,7 +81,7 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
     console = string_console(120, height=height)
     frames: list[str] = []
     try:
-        with training_dashboard(
+        with live_board(
             "tiny",
             STAGES,
             STEPS,
@@ -112,11 +90,9 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
             log_step_interval=5,
             log_file=log_file,
             logger=logger,
-            enabled=True,
             console=console,
             clock=clock,
         ) as board:
-            assert isinstance(board, TrainingDashboard)
             board._log_lines, board._lines = log_lines, deque(board._lines, maxlen=log_lines)  # smaller panels than the defaults
             board._events = deque(board._events, maxlen=event_lines)
             board.note_event("no checkpoint found, starting from scratch")  # RunLogger.log_fresh_start
@@ -189,7 +165,7 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
 # --- the log file under both dashboards --------------------------------------------------------------------------------------
 
 
-def _drive_scripted_run(board: RunDashboard, clock: FakeClock, logger: logging.Logger) -> None:
+def _drive_scripted_run(board: TrainingDashboard | ConsoleFallbackDashboard, clock: FakeClock, logger: logging.Logger) -> None:
     """The same calls on either dashboard, the way ``RunLogger`` makes them: the transition progress at every step,
     the metric dict at log steps only, ``{}`` at the others, validations, events and two records of the attached
     logger."""
@@ -235,15 +211,14 @@ def test_live_dashboard_writes_the_fallback_lines_to_the_log_file_only(tmp_path:
     logger = logging.getLogger("training")  # as in a run: the fallback's lines are logged under `training`
     console = string_console(120, height=40)
     log_file = tmp_path / "train.log"
-    with training_dashboard("tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, enabled=True, console=console, clock=clock) as board:
-        assert isinstance(board, TrainingDashboard)
+    with live_board("tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, console=console, clock=clock) as board:
         _drive_scripted_run(board, clock, logger)
         panel = board.lines()
-    messages = [line.split(": ", 1)[1] for line in log_file.read_text().splitlines() if "training.ui.dashboard: status:" not in line]
+    messages = [line.split(": ", 1)[1] for line in log_file.read_text().splitlines() if "training.ui.lines: status:" not in line]
     assert len(messages) == len(_EXPECTED_LOG_MESSAGES), messages
     for message, expected in zip(messages, _EXPECTED_LOG_MESSAGES):
         assert message.startswith(expected), (message, expected)
-    assert all("INFO training.ui.dashboard: step 5/30" in line for line in log_file.read_text().splitlines() if "step 5/30" in line)
+    assert all("INFO training.ui.lines: step 5/30" in line for line in log_file.read_text().splitlines() if "step 5/30" in line)
     raw = console_output(console)
     for text in ("step 5/30", "step 30/30", "validation val_loss_4", "event: "):
         assert text not in raw and not any(text in line for line in panel), f"{text!r} reached the terminal or the panel"
@@ -253,14 +228,15 @@ def test_live_and_fallback_dashboards_write_identical_log_files(tmp_path: Path, 
     monkeypatch.setattr(time, "time", lambda: 1_756_000_000.0)  # `logging` stamps records with `time.time`: one asctime in both
     logger = logging.getLogger("training")
     files: dict[str, bytes] = {}
-    for name, enabled in (("live", True), ("fallback", False)):
+    for name in ("live", "fallback"):
         clock = FakeClock()
         log_file = tmp_path / f"{name}.log"
-        with training_dashboard(
-            "tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, enabled=enabled,
-            console=string_console(120, height=40), stream=io.StringIO(), clock=clock,
-        ) as board:
-            assert isinstance(board, TrainingDashboard if enabled else NoOpDashboard)
+        running: AbstractContextManager[TrainingDashboard | ConsoleFallbackDashboard] = (
+            live_board("tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, console=string_console(120, height=40), clock=clock)
+            if name == "live"
+            else fallback_board("tiny", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, logger=logger, stream=io.StringIO(), clock=clock)
+        )
+        with running as board:
             _drive_scripted_run(board, clock, logger)
         files[name] = log_file.read_bytes()
     assert files["live"] == files["fallback"]

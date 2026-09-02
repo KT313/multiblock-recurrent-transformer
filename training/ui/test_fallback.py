@@ -10,16 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from training.ui.fallback import NoOpDashboard
-from training.ui.testing import STAGES, STEPS, TOTAL, FakeClock, metrics
+from training.ui.fallback import ConsoleFallbackDashboard
+from training.ui.format import step_line
+from training.ui.testing import STAGES, STEPS, TOTAL, FakeClock, fallback_board, metrics
+from training.ui.throughput import Throughput
 
 
 def test_fallback_logs_one_line_per_interval_and_writes_the_log_file(tmp_path: Path, clock: FakeClock) -> None:
     stream = io.StringIO()
     log_file = tmp_path / "train.log"
     real_out = sys.stdout
-    # the fallback's lines are emitted on `training.ui.dashboard`: they reach the `training` logger `open()` attaches
-    with NoOpDashboard.open("r", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, stream=stream, clock=clock) as b:
+    with fallback_board("r", STAGES, STEPS, TOTAL, log_step_interval=5, log_file=log_file, stream=stream, clock=clock) as b:
         assert sys.stdout is real_out, "the fallback captures nothing"
         b.set_status("training")  # DEBUG: not printed
         b.note_event("no checkpoint found, starting from scratch")
@@ -29,8 +30,6 @@ def test_fallback_logs_one_line_per_interval_and_writes_the_log_file(tmp_path: P
         b.update_step(18, 0, 0.5, metrics(18))
         b.update_validation(10, {"val_loss_4": 3.25, "val_loss": 3.125})
         b.update_step(TOTAL, 1, None, metrics(TOTAL))  # the last step is always logged
-        with b.suspended():
-            pass
     lines = [line.split(": ", 1)[1] for line in stream.getvalue().splitlines()]
     assert lines[0] == "event: no checkpoint found, starting from scratch"
     step_lines = [line for line in lines if line.startswith("step ") and "/" in line.split(" | ")[0]]
@@ -41,12 +40,14 @@ def test_fallback_logs_one_line_per_interval_and_writes_the_log_file(tmp_path: P
     ]
     assert "step 10: validation val_loss_4 3.2500, val_loss 3.1250" in lines
     assert not any("status" in line for line in lines)
-    assert log_file.read_text().splitlines()[0].endswith(lines[0]) and "step 30/30" in log_file.read_text()
+    file_lines = log_file.read_text().splitlines()
+    assert file_lines[0].endswith(lines[0]) and "step 30/30" in log_file.read_text()
+    assert all("INFO training.ui.lines: " in line for line in file_lines if "step " in line), "the dashboard lines' logger"
 
 
 def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
     stream = io.StringIO()
-    with NoOpDashboard.open("r", STAGES, STEPS, TOTAL, stream=stream, clock=clock) as b:
+    with fallback_board("r", STAGES, STEPS, TOTAL, stream=stream, clock=clock) as b:
         clock.advance(18)
         b.update_step(18, 0, 0.5, {"loss": 2.0})
         b.update_step(TOTAL, 5, None, {})  # an unknown stage index renders as "?"
@@ -56,20 +57,24 @@ def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
     assert "step 30/30 | stage 5 ?" in output and "step 30: validation (no losses)" in output
 
 
-def test_step_line_is_none_off_the_interval_and_records_the_throughput(clock: FakeClock) -> None:
-    b = NoOpDashboard("r", STAGES, STEPS, TOTAL, log_step_interval=5, clock=clock)
+def test_step_line_is_none_off_the_interval_and_reads_the_recorded_throughput(clock: FakeClock) -> None:
+    throughput = Throughput(TOTAL, clock=clock)
     clock.advance(2)
-    assert b.step_line(1, 0, None, {}) is None and b.throughput.seconds_per_step == 2.0
+    throughput.record(1)
+    assert step_line(1, 0, None, {}, total_steps=TOTAL, stage_names=STAGES, log_step_interval=5, throughput=throughput) is None
+    assert throughput.seconds_per_step == 2.0
     clock.advance(8)
-    assert b.step_line(5, 0, None, {"loss": 2.0}) == "step 5/30 | stage 0 pretrain | loss 2.0000 | s/step 2.00s | elapsed 0:00:10 | ETA 0:00:50"
+    throughput.record(5)
+    text = step_line(5, 0, None, {"loss": 2.0}, total_steps=TOTAL, stage_names=STAGES, log_step_interval=5, throughput=throughput)
+    assert text == "step 5/30 | stage 0 pretrain | loss 2.0000 | s/step 2.00s | elapsed 0:00:10 | ETA 0:00:50"
 
 
 def test_fallback_rejects_mismatched_stage_lists() -> None:
     with pytest.raises(ValueError, match="2 stage names for 1 step counts"):
-        NoOpDashboard("r", STAGES, [5], 5)
+        ConsoleFallbackDashboard("r", STAGES, [5], 5)
 
 
 def test_fallback_write_is_a_plain_line() -> None:
     stream = io.StringIO()
-    NoOpDashboard("r", STAGES, STEPS, TOTAL, stream=stream).write("hello", keep=True)
+    ConsoleFallbackDashboard("r", STAGES, STEPS, TOTAL, stream=stream).write("hello", keep=True)
     assert stream.getvalue() == "hello\n"

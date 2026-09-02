@@ -4,9 +4,9 @@ helpers that were logged, and `RunLogger` — every console line, timer and coun
 terminal dashboard and ending in a `TrainingReport`.
 
 `RunLogger` never prints. What a run shows on the terminal goes through two channels, both owned by the dashboard of
-`training.ui` for the duration of the run (`RunLogger.open` enters it; the live `TrainingDashboard` on a TTY, the
-`NoOpDashboard` console fallback otherwise — one log line per `log_step_interval` steps — and `train.log` under the
-run directory in both cases):
+`training.ui` for the duration of the run (`open_dashboard`, entered by `RunLogger.open`: the live
+`TrainingDashboard` on a TTY, the `ConsoleFallbackDashboard` otherwise — one log line per `log_step_interval` steps
+— and `train.log` under the run directory in both cases):
 
 * *records* on the `training.logger` logger (the `training` hierarchy the CLI attaches a stream handler to and the
   dashboard takes over for the run): the header lines of `open` and the final line of `close`, marked
@@ -36,9 +36,10 @@ from torch.optim import Optimizer
 from training.backend.base import plain_model
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
+from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import KEEP, TRAIN_LOG_NAME
-from training.ui.dashboard import RunDashboard, training_dashboard
+from training.ui.common import KEEP, TRAIN_LOG_NAME, dashboard_enabled
+from training.ui.fallback import ConsoleFallbackDashboard
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -179,7 +180,7 @@ class TrainingReport:
 
 class Dashboard(Protocol):
     """The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
-    live display) and `NoOpDashboard` (the console fallback) satisfy it; tests pass a recording fake."""
+    live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake."""
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -192,30 +193,51 @@ class Dashboard(Protocol):
     def set_status(self, text: str) -> None: ...
 
 
+@contextmanager
 def open_dashboard(
     settings: Settings, run_directory: Path, stage_manager: StageManager, *, start_step: int, device: str
-) -> AbstractContextManager[RunDashboard]:
-    """The run's dashboard (`training.ui.training_dashboard`): the live display when stdout is a terminal and
-    `TRAINING_DASHBOARD` is not `0`, the one-line-per-`log_step_interval` console fallback otherwise; one bar per
+) -> Iterator[Dashboard]:
+    """The run's dashboard, in service for the block: the live `TrainingDashboard` when stdout is a terminal and
+    `TRAINING_DASHBOARD` is not `0` (`dashboard_enabled`), the one-line-per-`log_step_interval`
+    `ConsoleFallbackDashboard` otherwise — its lines on stderr, where the CLI's log handlers write too, so a piped
+    run's story stays in one stream (a live display that disables itself falls back to the same stream). One bar per
     stage (named after `stage_manager.stages`, sized by its boundary) plus the overall bar, the header naming the
-    run, the model and dataset config (file names without `.yaml`), the device and precision; every record appended
-    to `run_directory / train.log`. `start_step` (the resume step) keeps the ETA honest after a resume."""
-    return training_dashboard(
-        settings.run_name,
-        [stage.name for stage in stage_manager.stages],
-        [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries],
-        stage_manager.total_steps,
-        details={
-            "model": Path(settings.model_architecture_config).stem,
-            "dataset": Path(settings.dataset_config).stem,
-            "device": device,
-            "precision": settings.precision,
-        },
-        start_step=start_step,
-        log_step_interval=settings.log_step_interval,
-        log_file=run_directory / TRAIN_LOG_NAME,
-        fallback_stream=sys.stderr,  # piped runs: step lines join the log handlers' lines on stderr
-    )
+    run, the model and dataset config (file names without `.yaml`), the device and precision; the `training` logger
+    routed into the dashboard and every record and dashboard line appended to `run_directory / train.log`.
+    `start_step` (the resume step) keeps the ETA honest after a resume."""
+    stage_names = [stage.name for stage in stage_manager.stages]
+    steps_per_stage = [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries]
+    details = {
+        "model": Path(settings.model_architecture_config).stem,
+        "dataset": Path(settings.dataset_config).stem,
+        "device": device,
+        "precision": settings.precision,
+    }
+    board: TrainingDashboard | ConsoleFallbackDashboard
+    if dashboard_enabled():
+        board = TrainingDashboard(
+            settings.run_name,
+            stage_names,
+            steps_per_stage,
+            stage_manager.total_steps,
+            details=details,
+            start_step=start_step,
+            log_step_interval=settings.log_step_interval,
+            fallback_stream=sys.stderr,
+        )
+    else:
+        board = ConsoleFallbackDashboard(
+            settings.run_name,
+            stage_names,
+            steps_per_stage,
+            stage_manager.total_steps,
+            details=details,
+            start_step=start_step,
+            log_step_interval=settings.log_step_interval,
+            stream=sys.stderr,
+        )
+    with board.running(log_file=run_directory / TRAIN_LOG_NAME):
+        yield board
 
 
 class RunLogger:

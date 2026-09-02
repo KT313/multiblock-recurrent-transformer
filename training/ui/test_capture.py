@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the logging handler, attaching a logger, and the terminal capture around the live display."""
+"""Tests for the logging handler, the run's log-file handlers, and the terminal capture around the live display."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.ui.capture import LineSink
-from data_preparation.lib.ui.capture import DashboardLogHandler
+from data_preparation.lib.ui.capture import DashboardLogHandler, LineSink, attach_logger
 from training.ui.capture import (
     QUIET_ENV,
     STDERR_LOGGER,
@@ -21,9 +20,10 @@ from training.ui.capture import (
     WANDB_QUIET_SETTINGS,
     WARNINGS_LOGGER,
     TerminalCapture,
-    attach_logger,
     format_warning,
+    run_log_handlers,
 )
+from training.ui.common import lines_log
 from training.ui.testing import LOGGER_NAME
 
 
@@ -89,45 +89,36 @@ def test_handler_never_raises_on_a_broken_sink() -> None:
     handler.emit(_record("training.x", logging.INFO, "msg"))
 
 
-# --- attaching a logger -------------------------------------------------------------------------------------------------------
+# --- the run's log-file and console handlers ------------------------------------------------------------------------------------
 
 
-def test_attach_swaps_the_stream_handler_writes_the_log_file_and_restores(tmp_path: Path) -> None:
-    sink = RecordingSink()
-    logger = logging.getLogger(LOGGER_NAME + ".attach")
-    logger.propagate = False
-    logger.setLevel(logging.WARNING)
-    stream_handler = logging.StreamHandler(io.StringIO())
-    logger.addHandler(stream_handler)
+def test_run_log_handlers_share_one_file_handler_between_the_logger_and_the_lines(tmp_path: Path) -> None:
+    logger = logging.getLogger(LOGGER_NAME + ".handlers")
+    logger.setLevel(logging.INFO)
+    lines_log.setLevel(logging.INFO)  # in a run it inherits the attached `training` logger's level
+    before = list(lines_log.handlers)  # pytest puts its capture handlers on every non-propagating logger
+    stream = io.StringIO()
     log_file = tmp_path / "out" / "train.log"
     try:
-        with attach_logger(sink, logger, log_file) as file_handler:
-            assert stream_handler not in logger.handlers and len(logger.handlers) == 2
+        with run_log_handlers(logger, log_file, stream):
+            [file_handler] = logger.handlers
             assert isinstance(file_handler, logging.FileHandler) and file_handler.baseFilename == str(log_file)
-            assert logger.level == logging.INFO, "lowered to INFO for the block: the dashboard lives on INFO records"
-            logger.info("inside %d", 1)
-            assert sink.texts()[-1].endswith("inside 1")
-        assert logger.handlers == [stream_handler] and logger.level == logging.WARNING
-        assert "inside 1" in log_file.read_text()
-        assert stream_handler.stream.getvalue() == ""
+            added = [handler for handler in lines_log.handlers if handler not in before]
+            assert added[0] is file_handler and len(added) == 2, "the same handler instance, plus the stream handler"
+            logger.info("a record")
+            lines_log.info("a line")
+        assert logger.handlers == [] and lines_log.handlers == before
     finally:
-        logger.removeHandler(stream_handler)
-        logger.propagate = True
+        lines_log.setLevel(logging.NOTSET)
+    assert [line.split(": ", 1)[1] for line in log_file.read_text().splitlines()] == ["a record", "a line"], "one file, in logging order"
+    assert stream.getvalue().endswith("INFO training.ui.lines: a line\n") and "a record" not in stream.getvalue()
 
 
-def test_attach_restores_handlers_when_the_body_raises() -> None:
-    logger = logging.getLogger(LOGGER_NAME + ".raise")
-    logger.propagate = False
-    stream_handler = logging.StreamHandler(io.StringIO())
-    logger.addHandler(stream_handler)
-    try:
-        with pytest.raises(RuntimeError, match="boom"), attach_logger(RecordingSink(), logger, None) as file_handler:
-            assert stream_handler not in logger.handlers and file_handler is None
-            raise RuntimeError("boom")
-        assert logger.handlers == [stream_handler]
-    finally:
-        logger.removeHandler(stream_handler)
-        logger.propagate = True
+def test_run_log_handlers_without_a_file_or_a_stream_add_nothing() -> None:
+    logger = logging.getLogger(LOGGER_NAME + ".nothing")
+    before = list(lines_log.handlers)
+    with run_log_handlers(logger, None, None):
+        assert logger.handlers == [] and lines_log.handlers == before
 
 
 # --- the terminal capture -----------------------------------------------------------------------------------------------------
@@ -162,7 +153,7 @@ def test_root_handler_skips_what_an_attached_handler_covers() -> None:
     capture = TerminalCapture(sink, skip=lambda name: name.startswith(LOGGER_NAME))
     capture.start()
     try:
-        with attach_logger(sink, logger, None):
+        with attach_logger(sink, logger, None, ensure_info_level=True):
             logger.info("once")
             logging.getLogger("elsewhere").warning("root")
     finally:

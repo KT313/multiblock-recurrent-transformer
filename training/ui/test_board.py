@@ -23,6 +23,7 @@ from training.ui.testing import (
     TOTAL,
     FakeClock,
     console_output,
+    live_board,
     metrics,
     screen_text,
     string_console,
@@ -95,7 +96,7 @@ def test_last_stage_shows_no_transition_note(board: TrainingDashboard) -> None:
 
 
 def test_stage_names_with_markup_characters_render_literally(clock: FakeClock) -> None:
-    with TrainingDashboard.open("r", ["[bold]x[/bold]"], [1], 1, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock) as b:
+    with live_board("r", ["[bold]x[/bold]"], [1], 1, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock) as b:
         assert "[bold]x[/bold]" in b.render_text()
 
 
@@ -168,14 +169,14 @@ def test_bars_for_a_zero_length_stage_render(clock: FakeClock) -> None:
 
 def test_footer_names_the_log_file(tmp_path: Path, clock: FakeClock) -> None:
     log_file = tmp_path / "train.log"
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), log_file=log_file, console=string_console(), clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), log_file=log_file, console=string_console(), clock=clock) as b:
         assert b.render_text().rstrip().splitlines()[-1].startswith(f"log: {log_file}")
 
 
 def test_rows_never_wrap_so_the_frame_height_does_not_depend_on_the_width(clock: FakeClock) -> None:
     long_name = "a-very-long-stage-name-" * 4
     details = {"model": "crow-300m-final", "dataset": "crow_300m_final", "device": "cuda:0", "precision": "bf16-mixed"}
-    with TrainingDashboard.open(
+    with live_board(
         "run-" * 10, [long_name, "b"], STEPS, TOTAL, details=details, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock
     ) as b:
         b.update_step(18, 0, 0.5, metrics(18))
@@ -190,7 +191,7 @@ def test_rows_never_wrap_so_the_frame_height_does_not_depend_on_the_width(clock:
 
 def test_short_terminal_shrinks_the_log_panel_then_the_events_panel(clock: FakeClock) -> None:
     b = TrainingDashboard("r", STAGES, STEPS, TOTAL, log_lines=12, event_lines=6, console=string_console(), clock=clock)
-    with b, b.attach(logging.getLogger(LOGGER_NAME)):
+    with b.running(logging.getLogger(LOGGER_NAME)):
         for i in range(20):
             b.write(f"line {i}")
         for i in range(8):
@@ -237,7 +238,7 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during(clock
     console = string_console(100)
     logger = logging.getLogger(LOGGER_NAME + ".keep")
     table = "a  b  c" + " " * 200 + "end"
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logger, console=console, clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, logger=logger, console=console, clock=clock) as b:
         b._refresh_per_second = 50
         logger.info("quiet")
         logger.warning("loud")
@@ -258,7 +259,7 @@ def test_kept_records_are_printed_once_after_the_display_closed_not_during(clock
 
 def test_final_frame_can_be_turned_off(clock: FakeClock) -> None:
     console = string_console()
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), final_frame=False, console=console, clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger(LOGGER_NAME), final_frame=False, console=console, clock=clock) as b:
         b.update_step(3, 0, None, metrics(3))
         logging.getLogger(LOGGER_NAME).warning("only this")
     screen = screen_text(console, 120)
@@ -272,7 +273,7 @@ def test_attach_swaps_the_stream_handler_writes_the_log_file_and_restores(tmp_pa
     logger.addHandler(stream_handler)
     log_file = tmp_path / "out" / "train.log"
     try:
-        with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logger, log_file=log_file, console=string_console(), clock=clock) as b:
+        with live_board("r", STAGES, STEPS, TOTAL, logger=logger, log_file=log_file, console=string_console(), clock=clock) as b:
             assert stream_handler not in logger.handlers and len(logger.handlers) == 2
             logger.info("inside %d", 1)
             assert b.lines()[-1].endswith("inside 1")
@@ -307,7 +308,7 @@ def test_stdout_and_stderr_are_captured_while_the_display_is_up(tmp_path: Path, 
     real_out, real_err = sys.stdout, sys.stderr
     log_file = tmp_path / "train.log"
     # the `training` logger, as in a run: the sink loggers `training.stdout` / `training.stderr` sit under it
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
         streams: tuple[object, object] = (sys.stdout, sys.stderr)  # object: the stubs type them TextIO, the sink is not one
         assert all(isinstance(stream, LineSink) for stream in streams)
         print("stray print")
@@ -345,7 +346,7 @@ def test_an_exception_inside_the_block_leaves_a_clean_scrollback(clock: FakeCloc
     console = string_console(100)
     real_out, real_err = sys.stdout, sys.stderr
     logger = logging.getLogger(LOGGER_NAME + ".exception")
-    with pytest.raises(RuntimeError, match="loop broke"), TrainingDashboard.open("r", STAGES, STEPS, TOTAL, logger=logger, console=console, clock=clock) as b:
+    with pytest.raises(RuntimeError, match="loop broke"), live_board("r", STAGES, STEPS, TOTAL, logger=logger, console=console, clock=clock) as b:
         b.update_step(7, 0, None, metrics(7))
         logger.warning("last words")
         raise RuntimeError("loop broke")
@@ -373,7 +374,7 @@ def test_close_is_idempotent_and_a_console_on_stdout_is_pinned(clock: FakeClock)
 def test_a_failing_update_disables_the_display_once_and_falls_back(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
     stream = io.StringIO()
     real_out = sys.stdout
-    with TrainingDashboard.open(
+    with live_board(
         "r", STAGES, STEPS, TOTAL, log_step_interval=1, console=string_console(), stream=stream, clock=clock
     ) as b:
         logging.getLogger(LOGGER_NAME).warning("before the failure")
@@ -397,7 +398,7 @@ def test_a_failing_update_disables_the_display_once_and_falls_back(monkeypatch: 
 
 def test_a_failing_render_is_reported_and_disables_on_the_next_call(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
     stream = io.StringIO()
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, console=string_console(), stream=stream, clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, console=string_console(), stream=stream, clock=clock) as b:
         monkeypatch.setattr(b, "_render_metrics", _boom)
         text = b.render_text()  # what the Live thread does: never raises, shows the error instead
         assert "training dashboard render failed" in text and _is_enabled(b) is True
@@ -411,7 +412,7 @@ def test_a_failing_start_disables_before_the_block_runs(monkeypatch: pytest.Monk
     stream = io.StringIO()
     real_out = sys.stdout
     monkeypatch.setattr(TrainingDashboard, "_start_live", _boom)
-    with TrainingDashboard.open("r", STAGES, STEPS, TOTAL, console=string_console(), stream=stream, clock=clock) as b:
+    with live_board("r", STAGES, STEPS, TOTAL, console=string_console(), stream=stream, clock=clock) as b:
         assert _is_enabled(b) is False and sys.stdout is real_out
         b.write("plain", keep=True)
     assert "training dashboard disabled" in stream.getvalue() and "plain\n" in stream.getvalue()

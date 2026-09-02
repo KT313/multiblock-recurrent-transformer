@@ -25,9 +25,9 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-from training.ui.capture import TerminalCapture, attach_logger
-from training.ui.common import TRAINING_LOGGER_NAME, Clock, log
-from training.ui.fallback import NoOpDashboard
+from data_preparation.lib.ui.capture import attach_logger
+from training.ui.capture import TerminalCapture, line_handler, run_log_handlers
+from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
     METRIC_COLUMNS,
     event_line,
@@ -38,8 +38,10 @@ from training.ui.format import (
     known_metrics,
     line,
     status_line,
+    step_line,
     validation_line,
 )
+from training.ui.throughput import Throughput
 
 DEFAULT_LOG_LINES = 12
 DEFAULT_EVENT_LINES = 6
@@ -68,15 +70,15 @@ class TrainingDashboard:
 
     ``console`` is for tests (a ``rich.console.Console`` over a ``StringIO``); ``clock`` is injected by the ETA
     tests. ``enabled`` is True until the dashboard disables itself after an internal error; from then on the public
-    methods delegate to a :class:`NoOpDashboard` built from the same arguments (the console fallback) and
-    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. That
-    fallback writes to ``fallback_stream`` when one is given (the run's CLI passes stderr, so the lines of a
-    display that disabled itself mid-run land on the same stream as the log handlers' lines), else to ``stream``.
+    methods keep only what the console fallback does — the lines on :data:`~training.ui.common.lines_log` — and
+    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. Those
+    lines go to ``fallback_stream`` when one is given (the run's CLI passes stderr, so the lines of a display that
+    disabled itself mid-run land on the same stream as the log handlers' lines), else to ``stream``.
     ``final_frame`` prints the static summary once the display closed.
 
-    The log file :meth:`attach` is given receives the lines the fallback would log (one per ``log_step_interval``
-    steps, one per validation, one per event) through :meth:`_log_line` — the file handler alone, never the panel or
-    the terminal — so ``train.log`` reads the same whichever dashboard the run had.
+    The step / validation / event lines the fallback would log are logged here too, on ``lines_log`` — which only
+    the log file :meth:`attach` is given reads, never the panel or the terminal — so ``train.log`` reads the same
+    whichever dashboard the run had.
     """
 
     def __init__(
@@ -98,32 +100,23 @@ class TrainingDashboard:
         fallback_stream: TextIO | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
-        self._fallback = NoOpDashboard(
-            run_name,
-            stage_names,
-            steps_per_stage,
-            total_steps,
-            details=details,
-            start_step=start_step,
-            log_step_interval=log_step_interval,
-            stream=fallback_stream if fallback_stream is not None else stream,
-            clock=clock,
-        )
+        if len(stage_names) != len(steps_per_stage):
+            raise ValueError(f"{len(stage_names)} stage names for {len(steps_per_stage)} step counts")
         self.run_name = run_name
         self.stage_names = list(stage_names)
         self.steps_per_stage = list(steps_per_stage)
         self.total_steps = total_steps
         self.details = dict(details or {})
+        self.log_step_interval = max(int(log_step_interval), 1)
         self.enabled = True
         self._stream = stream if stream is not None else sys.stdout
-        # where the plain lines go once the display is gone (`write`, and the fallback's own lines through the
-        # handler `attach` installs): the run's fallback stream when it has one, else the display's own stream
+        # where the plain lines go once the display is gone (`write`, and the dashboard lines from then on): the
+        # run's fallback stream when it has one, else the display's own stream
         self._fallback_stream = fallback_stream if fallback_stream is not None else self._stream
         self._console = console if console is not None else Console(file=self._stream)
         self._refresh_per_second = refresh_per_second
         self._final_frame = final_frame
-        # one estimate for the bars' ETA and the fallback's lines; it also carries on if the display gets disabled
-        self._throughput = self._fallback.throughput
+        self._throughput = Throughput(total_steps, start_step=start_step, clock=clock)  # the bars' ETA and the lines
         self._lock = threading.RLock()  # every mutation (loop thread) and every render (Live thread)
         self._log_lines = log_lines
         self._lines: deque[str] = deque(maxlen=log_lines)
@@ -136,58 +129,27 @@ class TrainingDashboard:
         self._latest: dict[str, float] = {}
         self._validation: tuple[int, dict[str, float]] | None = None
         self._log_file: Path | None = None
-        self._file_handler: logging.Handler | None = None  # the log file's handler while attached: `_log_line` feeds it
+        self._attached_logger: str | None = None  # the logger `attach` routes into the panel, while attached
+        self._console_lines: logging.Handler | None = None  # the dashboard lines' way to the console once disabled
         self._render_error: BaseException | None = None  # set on the Live thread, handled on the caller's thread
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
         self._live: Live | None = None
         self._open = False
-        self._attached: list[str] = []
         self._capture = TerminalCapture(self, skip=self.is_attached)
         self._refresh_bars(start_step, 0)
 
-    @classmethod
-    @contextmanager
-    def open(
-        cls,
-        run_name: str,
-        stage_names: Sequence[str],
-        steps_per_stage: Sequence[int],
-        total_steps: int,
-        *,
-        details: Mapping[str, str] | None = None,
-        start_step: int = 0,
-        log_step_interval: int = 1,
-        log_file: Path | None = None,
-        logger: logging.Logger | None = None,
-        final_frame: bool = True,
-        console: Console | None = None,
-        stream: TextIO | None = None,
-        fallback_stream: TextIO | None = None,
-        clock: Clock = time.monotonic,
-    ) -> Iterator[TrainingDashboard]:
-        """A running dashboard with the ``training`` logger (or ``logger``) attached for the block; ``log_file``
-        appended (``run_directory / TRAIN_LOG_NAME`` by convention)."""
-        board = cls(
-            run_name,
-            stage_names,
-            steps_per_stage,
-            total_steps,
-            details=details,
-            start_step=start_step,
-            log_step_interval=log_step_interval,
-            final_frame=final_frame,
-            console=console,
-            stream=stream,
-            fallback_stream=fallback_stream,
-            clock=clock,
-        )
-        # the logger first: the dashboard's own warning (a failing start, an internal error) always has a handler
-        with board.attach(logger or logging.getLogger(TRAINING_LOGGER_NAME), log_file=log_file), board:
-            yield board
-
     # --- lifecycle --------------------------------------------------------------------------------------------------
+
+    @contextmanager
+    def running(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[TrainingDashboard]:
+        """The dashboard in service for the block: ``logger`` (default: the ``training`` logger) attached
+        (:meth:`attach`, first — so the dashboard's own warning of a failing start always has a handler) and the
+        display up (``__enter__`` / ``__exit__``); ``log_file`` appended (``run_directory / TRAIN_LOG_NAME`` by
+        convention)."""
+        with self.attach(logger, log_file=log_file), self:
+            yield self
 
     def __enter__(self) -> TrainingDashboard:
         if self.enabled and not self._open:
@@ -274,7 +236,8 @@ class TrainingDashboard:
         file.flush()
 
     def _disable(self, error: BaseException) -> None:
-        """Close the display after an internal error; the fallback takes over. Logs one warning (the first error)."""
+        """Close the display after an internal error; from now on this behaves like the console fallback (the
+        dashboard lines reach the fallback stream too). Logs one warning (the first error)."""
         if not self.enabled:
             return
         self.enabled = False
@@ -282,10 +245,18 @@ class TrainingDashboard:
             self._teardown()
         with suppress(Exception):
             self._print_kept()
+        self._console_lines = line_handler(self._fallback_stream)
+        lines_log.addHandler(self._console_lines)
         log.warning(
             "training dashboard disabled after an internal error (training continues with the console fallback): %r",
             error,
         )
+
+    def _drop_console_lines(self) -> None:
+        handler, self._console_lines = self._console_lines, None
+        if handler is not None:
+            lines_log.removeHandler(handler)
+            handler.close()
 
     def _check_render_error(self) -> None:
         """A failure of the render happened on the Live thread (which must not stop Live itself); handle it here."""
@@ -293,17 +264,15 @@ class TrainingDashboard:
         if error is not None:
             self._disable(error)
 
-    def _guarded(self, action: Callable[[], None]) -> bool:
-        """Run ``action``; on any exception disable the display and return False so the caller uses the fallback."""
+    def _guarded(self, action: Callable[[], None]) -> None:
+        """Run ``action`` on the display; on any exception disable the display (the lines still get logged)."""
         self._check_render_error()
         if not self.enabled:
-            return False
+            return
         try:
             action()
         except Exception as error:
             self._disable(error)
-            return False
-        return True
 
     # --- the API train() drives ------------------------------------------------------------------------------------
 
@@ -314,23 +283,36 @@ class TrainingDashboard:
         (0-1) of the running transition out of it or None; ``metrics`` is the step dict (only the
         :data:`METRIC_COLUMNS` keys are read, missing keys keep their last value). O(1): a few bar updates and a dict
         merge; the display redraws on its own timer."""
-        if not self._guarded(lambda: self._apply_step(step, stage_index, transition, metrics)):
-            self._fallback.update_step(step, stage_index, transition, metrics)
+        with self._lock:
+            self._throughput.record(step)
+        self._guarded(lambda: self._apply_step(step, stage_index, transition, metrics))
+        text = step_line(
+            step,
+            stage_index,
+            transition,
+            metrics,
+            total_steps=self.total_steps,
+            stage_names=self.stage_names,
+            log_step_interval=self.log_step_interval,
+            throughput=self._throughput,
+        )
+        if text is not None:
+            lines_log.info(text)
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """The validation losses measured after ``step`` (one entry per recurrence depth, e.g. ``val_loss_4``)."""
-        if not self._guarded(lambda: self._apply_validation(step, losses)):
-            self._fallback.update_validation(step, losses)
+        self._guarded(lambda: self._apply_validation(step, losses))
+        lines_log.info(validation_line(step, losses))
 
     def note_event(self, text: str) -> None:
         """Add a line to the events list (checkpoint written, resume point, stage transition, export)."""
-        if not self._guarded(lambda: self._apply_event(text)):
-            self._fallback.note_event(text)
+        self._guarded(lambda: self._apply_event(text))
+        lines_log.info(event_line(text))
 
     def set_status(self, text: str) -> None:
         """The status shown in the header (``training``, ``evaluating``, ``saving checkpoint`` ...)."""
-        if not self._guarded(lambda: self._apply_status(text)):
-            self._fallback.set_status(text)
+        self._guarded(lambda: self._apply_status(text))
+        lines_log.debug(status_line(text))
 
     def _apply_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -342,9 +324,6 @@ class TrainingDashboard:
             self._stage_index = stage_index
             self._latest.update(known)
             self._refresh_bars(step, stage_index)
-            file_line = self._fallback.step_line(step, stage_index, transition, metrics)  # also records the throughput
-        if file_line is not None:
-            self._log_line(logging.INFO, file_line)
 
     def _refresh_bars(self, step: int, stage_index: int) -> None:
         last = len(self._bars) - 1
@@ -364,27 +343,15 @@ class TrainingDashboard:
     def _apply_validation(self, step: int, losses: Mapping[str, object]) -> None:
         with self._lock:
             self._validation = (step, floats(losses))
-        self._log_line(logging.INFO, validation_line(step, losses))
 
     def _apply_event(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         with self._lock:
             self._events.append(f"{stamp}  step {self._step}: {text}")
-        self._log_line(logging.INFO, event_line(text))
 
     def _apply_status(self, text: str) -> None:
         with self._lock:
             self._status = text
-        self._log_line(logging.DEBUG, status_line(text))
-
-    def _log_line(self, level: int, message: str) -> None:
-        """The line the fallback would log, as a record of the ``training.ui.dashboard`` logger handed to the log
-        file's handler directly: it never passes a logger, so no other handler (the panel, the root capture) sees it.
-        Dropped when no log file is attached or the logger would not emit at ``level`` (the DEBUG status lines)."""
-        handler = self._file_handler
-        if handler is None or not log.isEnabledFor(level):
-            return
-        handler.handle(log.makeRecord(log.name, level, __file__, 0, message, (), None))
 
     # --- log lines ----------------------------------------------------------------------------------------------------
 
@@ -401,29 +368,31 @@ class TrainingDashboard:
                 self._kept.append(text)
 
     def is_attached(self, logger_name: str) -> bool:
-        """Whether records of ``logger_name`` reach the panel through a handler :meth:`attach` installed."""
+        """Whether records of ``logger_name`` reach the panel through the handler :meth:`attach` installed (the
+        root-logger handler of the capture skips those, or the panel would show them twice)."""
         with self._lock:
-            return any(logger_name == name or logger_name.startswith(name + ".") for name in self._attached)
+            attached = self._attached_logger
+        return attached is not None and (logger_name == attached or logger_name.startswith(attached + "."))
 
     @contextmanager
-    def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> Iterator[None]:
-        """Route ``logger`` into this dashboard (and ``log_file``, named in the footer) for the duration of the
-        block. ``logger`` must be the ``training`` logger or one of its ancestors for the dashboard's own warning /
-        fallback lines to reach it."""
+    def attach(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[None]:
+        """Route ``logger`` (default: the ``training`` logger) into the panel and ``log_file`` (named in the footer),
+        and this dashboard's own lines into ``log_file`` alone — one file handler shared by both loggers — for the
+        duration of the block. ``logger`` must be the ``training`` logger or one of its ancestors for the
+        dashboard's own warning to reach it; a logger above INFO is lowered to INFO for the block (a run started
+        without the CLI's logging setup keeps its lines)."""
+        target = logger if logger is not None else logging.getLogger(TRAINING_LOGGER_NAME)
         with self._lock:
-            self._attached.append(logger.name)
+            self._attached_logger = target.name
             if log_file is not None:
                 self._log_file = log_file
         try:
-            with attach_logger(self, logger, log_file) as file_handler:
-                if file_handler is not None:
-                    self._file_handler = file_handler
+            with attach_logger(self, target, None, ensure_info_level=True), run_log_handlers(target, log_file, None):
                 yield
         finally:
             with self._lock:
-                self._attached.remove(logger.name)
-                if log_file is not None:
-                    self._file_handler = None  # closed by `attach_logger`
+                self._attached_logger = None
+            self._drop_console_lines()
 
     # --- state for tests ------------------------------------------------------------------------------------------------
 
