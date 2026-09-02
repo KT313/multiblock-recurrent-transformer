@@ -1,35 +1,33 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Progress bars for the preparation stages (the only module that imports ``tqdm``).
+"""The progress-bar interface of the preparation stages and its no-op.
 
-``progress(...)`` returns a ``tqdm`` bar on stderr, or a no-op with the same interface when progress is disabled:
-``DATA_PREP_PROGRESS=0`` in the environment, or stderr is not a terminal. Log lines are written through
-:func:`write_line` (``tqdm.write``) so they do not garble an open bar.
+The stages report progress through :class:`Progress`; the live implementation is the dashboard's task row
+(``lib/ui/dashboard.py``), and :class:`NoProgress` stands in when no dashboard is active. :func:`progress_enabled`
+is the rule the dashboard opens under: ``DATA_PREP_PROGRESS`` not ``0`` and stderr a terminal.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Iterable, Iterator
 from types import TracebackType
-from typing import Any, Protocol, TextIO, TypeVar
-
-from tqdm import tqdm
+from typing import Any, Protocol, TextIO
 
 ENV_VAR = "DATA_PREP_PROGRESS"
 DISABLING_VALUES = ("0", "false", "no", "off")
 
-T = TypeVar("T")
-
 
 class Progress(Protocol):
-    """The subset of the ``tqdm`` interface the stages use."""
+    """What the stages do with a bar: count updates, show a postfix, and open it as a ``with`` block (``close`` is
+    what leaving the block does)."""
 
+    @property
+    def n(self) -> int: ...
+    @property
+    def total(self) -> int | None: ...
     def update(self, n: int = 1) -> Any: ...
     def set_postfix(self, ordered_dict: Any = None, refresh: bool = True, **kwargs: Any) -> Any: ...
-    def set_description(self, desc: str | None = None, refresh: bool = True) -> Any: ...
     def close(self) -> None: ...
-    def __iter__(self) -> Iterator[Any]: ...
     def __enter__(self) -> Progress: ...
     def __exit__(
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
@@ -37,11 +35,11 @@ class Progress(Protocol):
 
 
 class NoProgress:
-    """No-op stand-in for a ``tqdm`` bar (iteration passes the wrapped iterable through; ``n`` counts updates)."""
+    """The bar without a display: ``n`` still counts the updates."""
 
-    def __init__(self, iterable: Iterable[Any] | None = None) -> None:
-        self._iterable = iterable
+    def __init__(self, total: int | None = None) -> None:
         self.n = 0
+        self.total = total
 
     def update(self, n: int = 1) -> None:
         self.n += n
@@ -49,16 +47,8 @@ class NoProgress:
     def set_postfix(self, ordered_dict: Any = None, refresh: bool = True, **kwargs: Any) -> None:
         return None
 
-    def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
-        return None
-
     def close(self) -> None:
         return None
-
-    def __iter__(self) -> Iterator[Any]:
-        if self._iterable is None:
-            return iter(())
-        return iter(self._iterable)
 
     def __enter__(self) -> NoProgress:
         return self
@@ -66,7 +56,7 @@ class NoProgress:
     def __exit__(
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        self.close()
+        return None
 
 
 def progress_enabled(stream: TextIO | None = None) -> bool:
@@ -80,31 +70,3 @@ def progress_enabled(stream: TextIO | None = None) -> bool:
     if isatty is None:
         return False
     return bool(isatty())
-
-
-def progress(
-    iterable: Iterable[T] | None = None,
-    *,
-    total: int | None = None,
-    desc: str = "",
-    unit: str = "row",
-    leave: bool = True,
-) -> Progress:
-    """A ``tqdm`` bar over ``iterable`` (or a manual one with ``total``) on stderr, or :class:`NoProgress`."""
-    if not progress_enabled():
-        return NoProgress(iterable)
-    return tqdm(
-        iterable,
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=leave,
-        file=sys.stderr,
-        dynamic_ncols=True,
-        mininterval=0.5,
-    )
-
-
-def write_line(text: str, stream: TextIO) -> None:
-    """Write ``text`` (plus newline) to ``stream`` without garbling open progress bars."""
-    tqdm.write(text, file=stream)

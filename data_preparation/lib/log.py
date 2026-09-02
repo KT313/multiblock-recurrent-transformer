@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import sys
 
-from data_preparation.lib.progress import write_line
 
 ROOT_LOGGER_NAME = "data_preparation"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -26,14 +25,8 @@ def get_logger(name: str) -> logging.Logger:
 
 
 class ProgressStreamHandler(logging.StreamHandler):  # type: ignore[type-arg]  # stdlib generic only in stubs
-    """``StreamHandler`` whose records are written with ``tqdm.write`` (bars are cleared and redrawn around them)."""
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            write_line(self.format(record), self.stream)
-            self.flush()
-        except Exception:
-            self.handleError(record)
+    """The stderr handler :func:`configure_logging` attaches — its own class so a second call finds it again (and the
+    dashboard, which swaps it out for the duration of a run, can tell it from a library's handler)."""
 
 
 def _our_handler(root: logging.Logger) -> ProgressStreamHandler | None:

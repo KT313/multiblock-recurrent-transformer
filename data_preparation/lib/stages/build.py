@@ -137,7 +137,7 @@ def build_source(
     # shard before it writes anything, so its readers check between raw shards instead
     pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
-    with pipeline, progress(total=pending_rows, desc=name, unit="row", leave=False, panel="builds") as bar:
+    with pipeline, progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar:
         pipeline.bar = bar
         if all_at_once:
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)

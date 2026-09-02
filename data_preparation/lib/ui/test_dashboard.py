@@ -251,34 +251,13 @@ def test_indeterminate_task_without_total(dashboard: Dashboard) -> None:
     assert "counting" in text and "42 " in text and "42 rows" in text
 
 
-def test_iteration_updates_and_closes(dashboard: Dashboard) -> None:
-    bar = dashboard.task("iter", total=3, leave=False, iterable=[1, 2, 3])
-    assert list(bar) == [1, 2, 3]
-    assert isinstance(bar, Task) and bar.n == 3
-    assert tasks_of(dashboard) == []
-
-
-def test_iterable_gives_the_total(dashboard: Dashboard) -> None:
-    bar = dashboard.task("shards", iterable=[1, 2, 3])
-    assert isinstance(bar, Task) and bar.total == 3
-    assert list(bar) == [1, 2, 3] and bar.closed
-
-
-def test_set_description(dashboard: Dashboard) -> None:
-    bar = dashboard.task("before", total=1)
-    bar.set_description("after")
-    text = render_text(dashboard)
-    assert "after" in text and "before" not in text
-
-
 def test_updates_after_close_keep_counting_but_the_row_is_gone(dashboard: Dashboard) -> None:
-    bar = dashboard.task("gone", total=2, leave=False)
+    bar = dashboard.task("gone", total=2)
     assert isinstance(bar, Task)
     bar.close()
     bar.update(1)
     bar.set_postfix(a=1)
-    bar.set_description("late")
-    assert bar.n == 1 and tasks_of(dashboard) == [] and "late" not in render_text(dashboard)
+    assert bar.n == 1 and tasks_of(dashboard) == [] and "gone" not in render_text(dashboard)
 
 
 def test_updates_from_threads(dashboard: Dashboard) -> None:
@@ -412,30 +391,21 @@ def test_progress_uses_active_dashboard_else_fallback(monkeypatch: pytest.Monkey
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
     with Dashboard(enabled=True, console=console) as board:
         assert active_dashboard() is board
-        bar = progress(total=2, desc="inside", unit="step", leave=False, panel="builds")
+        bar = progress(total=2, desc="inside", unit="step", panel="builds")
         assert isinstance(bar, Task)
         assert "inside" in render_text(board)
     assert active_dashboard() is None
 
 
-def test_nested_with_reuses_active_dashboard() -> None:
-    console = Console(file=io.StringIO(), force_terminal=True, width=80)
-    outer = Dashboard(enabled=True, console=console)
-    with outer as a:
-        with Dashboard(enabled=True, console=console) as b, a as c:
-            assert a is b is c is outer
-            assert outer.is_active
-        assert outer.is_active
-    assert active_dashboard() is None
-
-
-def test_nested_delegated_block_keeps_the_outer_display_alive() -> None:
+def test_a_second_dashboard_inside_the_block_raises() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=80)
     outer = Dashboard(enabled=True, console=console)
     with outer:
-        with Dashboard(enabled=True, console=console):
+        with pytest.raises(RuntimeError, match="already active"), Dashboard(enabled=True, console=console):
             pass
-        assert outer.is_active and outer._live is not None, "the inner block must not stop the outer display"
+        with pytest.raises(RuntimeError, match="already active"), outer:
+            pass
+        assert outer.is_active and outer._live is not None, "the refused blocks leave the outer display alone"
     assert active_dashboard() is None and outer._live is None
 
 
@@ -612,7 +582,7 @@ def test_three_threads_drive_the_panels_and_the_scrollback_is_clean() -> None:
             summary.update(1)
 
         def build() -> None:
-            with progress(total=30, desc="peso", unit="row", panel="builds", leave=False) as bar:
+            with progress(total=30, desc="peso", unit="row", panel="builds") as bar:
                 for i in range(30):
                     bar.update(1)
                     bar.set_postfix({"shard": f"{i + 1}/30"})

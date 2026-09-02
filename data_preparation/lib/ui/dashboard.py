@@ -30,11 +30,9 @@ Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create
         with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads") as bar:
             bar.update(1); bar.set_postfix({"file": "x.parquet", "MB": 6})
 
-:class:`Task` implements the same interface as ``lib.progress.Progress`` (``update`` / ``set_postfix`` /
-``set_description`` / ``close`` / iteration / context manager / ``n``); :func:`progress` has the signature of
-``lib.progress.progress`` plus ``panel`` (which panel the row belongs to) and ``summary`` (the panel's one summary
-task, e.g. the jobs of a pool): it creates a task on the active dashboard, or falls back to the tqdm / no-op bar
-when none is active. :func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended`
+:class:`Task` implements ``lib.progress.Progress`` (``update`` / ``set_postfix`` / context manager / ``n`` /
+``total``); :func:`progress` creates a task in ``panel`` of the active dashboard (``summary`` makes it the panel's
+one summary task, e.g. the jobs of a pool) and returns the no-op ``NoProgress`` when none is active. :func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended`
 clears the display around a terminal prompt.
 
 Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal — the same rule as ``lib.progress``): no live display,
@@ -49,7 +47,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -64,7 +62,6 @@ from rich.table import Table
 from rich.text import Text
 
 from data_preparation.lib.progress import NoProgress, Progress, progress_enabled
-from data_preparation.lib.progress import progress as fallback_progress
 from data_preparation.lib.ui.capture import DashboardLogHandler, LoggingCapture, StreamCapture, attach_logger
 
 T = TypeVar("T")
@@ -101,11 +98,10 @@ def _megabytes(task: Task) -> float:
 class Task:
     """One row of a dashboard panel; the ``lib.progress.Progress`` interface.
 
-    ``n`` mirrors tqdm's counter (updates done). The row is shown while the task is open and disappears on
-    ``close``; its counts then live on in the panel's summary line until the next summary task (round) starts.
-    ``leave`` is accepted by :func:`progress` for interface compatibility and has no effect here. The bar may
-    overshoot its ``total`` like the download bar does (a loader finishing a remote row group); it renders full,
-    the count shows ``completed/total`` past 100 %.
+    ``n`` counts the updates. The row is shown while the task is open and disappears on ``close``; its counts then
+    live on in the panel's summary line until the next summary task (round) starts. The bar may overshoot its
+    ``total`` like the download bar does (a loader finishing a remote row group); it renders full, the count shows
+    ``completed/total`` past 100 %.
     """
 
     def __init__(
@@ -117,11 +113,9 @@ class Task:
         total: int | None,
         unit: str,
         summary: bool,
-        iterable: Iterable[Any] | None,
     ) -> None:
         self._dashboard = dashboard
         self._panel = panel
-        self._iterable = iterable
         self.description = description
         self.total = total
         self.unit = unit
@@ -149,10 +143,6 @@ class Task:
         with self._dashboard._lock:
             self.postfix = values
 
-    def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
-        with self._dashboard._lock:
-            self.description = desc or ""
-
     def close(self) -> None:
         with self._dashboard._lock:
             if self.finished is not None:
@@ -169,16 +159,6 @@ class Task:
         if self.completed <= 0 or elapsed <= 0:
             return None
         return self.completed / elapsed
-
-    def __iter__(self) -> Iterator[Any]:
-        if self._iterable is None:
-            return
-        try:
-            for item in self._iterable:
-                yield item
-                self.update(1)
-        finally:
-            self.close()
 
     def __enter__(self) -> Task:
         return self
@@ -287,12 +267,11 @@ class Dashboard:
     ``log_lines`` lines), footer.
 
     ``enabled`` defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); ``console`` is for tests
-    (a ``rich.console.Console`` over a ``StringIO``). Only one dashboard can be active at a time (``with`` block);
-    :func:`progress` and :func:`active_dashboard` find it. Nested ``with`` blocks reuse the active one.
+    (a ``rich.console.Console`` over a ``StringIO``). Exactly one dashboard is active at a time (``with`` block);
+    :func:`progress` and :func:`active_dashboard` find it, entering a second one raises.
     """
 
     _active: Dashboard | None = None
-    _active_lock = threading.RLock()  # re-entrant: a nested `with Dashboard()` delegates to the active one
 
     def __init__(
         self,
@@ -321,7 +300,6 @@ class Dashboard:
         self._log_file: Path | None = None
         self._started_at = time.monotonic()
         self._live: Live | None = None
-        self._depth = 0
         self._attached: list[str] = []
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
@@ -331,13 +309,9 @@ class Dashboard:
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
     def __enter__(self) -> Dashboard:
-        with Dashboard._active_lock:
-            if Dashboard._active is not None and Dashboard._active is not self:
-                return Dashboard._active.__enter__()  # increments the active dashboard's depth; its __exit__ undoes it
-            self._depth += 1
-            if self._depth > 1:
-                return self
-            Dashboard._active = self
+        if Dashboard._active is not None:
+            raise RuntimeError("a Dashboard is already active")
+        Dashboard._active = self
         if self.enabled:
             self._started_at = time.monotonic()
             self._silence_third_party_bars()
@@ -349,15 +323,7 @@ class Dashboard:
     def __exit__(
         self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        with Dashboard._active_lock:
-            active = Dashboard._active
-            if active is not None and active is not self:  # this block was delegated to the active dashboard
-                active.__exit__(exc_type, exc_value, traceback)
-                return
-            self._depth -= 1
-            if self._depth > 0:
-                return
-            Dashboard._active = None
+        Dashboard._active = None
         if not self.enabled:
             return
         try:
@@ -464,20 +430,16 @@ class Dashboard:
         *,
         total: int | None = None,
         unit: str = "row",
-        leave: bool = True,
-        iterable: Iterable[T] | None = None,
         panel: str | None = None,
         summary: bool = False,
     ) -> Progress:
         """A new row in ``panel`` (a no-op bar when the dashboard is disabled). ``summary`` makes it the panel's
         summary task (the pool's jobs) and starts a new round of the panel's counts."""
         if not self.enabled:
-            return NoProgress(iterable)
-        if total is None and iterable is not None and isinstance(iterable, Sized):
-            total = len(iterable)  # like tqdm
+            return NoProgress(total)
         with self._lock:
             state = self._panels.setdefault(panel or DEFAULT_PANEL, _PanelState(panel or DEFAULT_PANEL, self._max_rows))
-            task = Task(self, state, desc, total=total, unit=unit, summary=summary, iterable=iterable)
+            task = Task(self, state, desc, total=total, unit=unit, summary=summary)
             state.add(task)
         return task
 
@@ -545,22 +507,12 @@ def active_dashboard() -> Dashboard | None:
     return Dashboard._active
 
 
-def progress(
-    iterable: Iterable[T] | None = None,
-    *,
-    total: int | None = None,
-    desc: str = "",
-    unit: str = "row",
-    leave: bool = True,
-    panel: str | None = None,
-    summary: bool = False,
-) -> Progress:
-    """Drop-in for ``lib.progress.progress``: a task in ``panel`` of the active dashboard, else the tqdm / no-op
-    bar (which ignore ``panel`` / ``summary``)."""
+def progress(*, total: int | None = None, desc: str = "", unit: str = "row", panel: str | None = None, summary: bool = False) -> Progress:
+    """A task in ``panel`` of the active dashboard, else a :class:`NoProgress` (which counts, shows nothing)."""
     dashboard = active_dashboard()
     if dashboard is None:
-        return fallback_progress(iterable, total=total, desc=desc, unit=unit, leave=leave)
-    return dashboard.task(desc, total=total, unit=unit, leave=leave, iterable=iterable, panel=panel, summary=summary)
+        return NoProgress(total)
+    return dashboard.task(desc, total=total, unit=unit, panel=panel, summary=summary)
 
 
 def set_status(**fields: object) -> None:

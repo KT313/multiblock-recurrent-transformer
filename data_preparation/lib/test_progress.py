@@ -1,14 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.progress: the no-op path, the env switch and the tqdm path on a fake TTY."""
+"""Tests for data_preparation.lib.progress: the enabling rule and the no-op bar."""
 
 from __future__ import annotations
 
 import io
-import sys
 
 import pytest
 
-from data_preparation.lib.progress import ENV_VAR, NoProgress, progress, progress_enabled, write_line
+from data_preparation.lib.progress import ENV_VAR, NoProgress, progress_enabled
 
 
 class FakeTty(io.StringIO):
@@ -28,33 +27,9 @@ def test_env_switch_disables(monkeypatch: pytest.MonkeyPatch, value: str) -> Non
     assert progress_enabled(FakeTty()) is False
 
 
-def test_no_progress_interface(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ENV_VAR, "0")
-    bar = progress(total=10, desc="x")
-    assert isinstance(bar, NoProgress)
+def test_no_progress_counts_updates() -> None:
+    bar = NoProgress(total=10)
     with bar as b:
         b.update(3)
         b.set_postfix(tokens=1)
-        b.set_description("y")
-    assert bar.n == 3
-    assert list(progress([1, 2, 3], desc="it")) == [1, 2, 3]
-    assert list(progress(desc="empty")) == []
-
-
-def test_tqdm_path_on_tty(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(ENV_VAR, raising=False)
-    stream = FakeTty()
-    monkeypatch.setattr(sys, "stderr", stream)
-    bar = progress(total=2, desc="dl", unit="row", leave=False)
-    assert not isinstance(bar, NoProgress)
-    bar.update(2)
-    bar.set_postfix(file="a.parquet")
-    bar.close()
-    assert "dl" in stream.getvalue()
-    assert [x * 2 for x in progress([1, 2], desc="it")] == [2, 4]
-
-
-def test_write_line() -> None:
-    stream = io.StringIO()
-    write_line("hello", stream)
-    assert stream.getvalue() == "hello\n"
+    assert bar.n == 3 and bar.total == 10 and NoProgress().total is None
