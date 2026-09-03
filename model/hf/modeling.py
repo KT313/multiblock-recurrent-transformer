@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""HuggingFace `transformers` wrapper and export for `RecurrentGPT`.
+"""
+HuggingFace `transformers` wrapper and export for `RecurrentGPT`.
 
 `export_to_hf` writes safetensors + config.json and copies this package's modules flat next to them, so the folder
 loads with `AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)`. Flat because transformers' dynamic
@@ -50,7 +51,10 @@ _MODEL_FIELDS = (
 
 
 def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[StepsSpec] | None:
-    """Parse "12" into (12, 0) for all blocks, or "4,12,4" into one (n, 0) pair per block."""
+    """
+    Parse "12" into (12, 0) for all blocks, or "4,12,4" into one (n, 0) pair per block.
+    """
+
     steps_str = steps_str.strip()
     if not steps_str:
         return None
@@ -66,10 +70,13 @@ def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[
 
 
 def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_size: int) -> torch.Tensor:
-    """`logits` with the embedding table's padding columns (`vocab_size:`) set to -inf; unchanged when the table is
+    """
+    `logits` with the embedding table's padding columns (`vocab_size:`) set to -inf; unchanged when the table is
     not padded. Those columns are trained on no target, and `generate(do_sample=True)` could otherwise draw an id the
     tokenizer cannot decode. Only the HF wrapper masks: the training loss must see the model's own logits (the golden
-    tests check those numbers)."""
+    tests check those numbers).
+    """
+
     if padded_vocab_size <= vocab_size:
         return logits
     masked = logits.clone()  # a clone, not an in-place write: `logits` is part of the autograd graph
@@ -78,7 +85,9 @@ def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_s
 
 
 class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # transformers' __init_subclass__ is untyped
-    """`RecurrentConfig` fields as a `PretrainedConfig` (RoPE settings flattened to `rope_base`)."""
+    """
+    `RecurrentConfig` fields as a `PretrainedConfig` (RoPE settings flattened to `rope_base`).
+    """
 
     model_type = "recurrent_gpt"
 
@@ -125,7 +134,9 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
 
 
 class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore[no-untyped-call]  # see above
-    """Wraps `RecurrentGPT` for lm-eval / generation; no KV cache, the full sequence is recomputed per step."""
+    """
+    Wraps `RecurrentGPT` for lm-eval / generation; no KV cache, the full sequence is recomputed per step.
+    """
 
     config_class = RecurrentGPTConfig
     base_model_prefix = "model"
@@ -140,7 +151,9 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         self.post_init()  # type: ignore[no-untyped-call]  # untyped in transformers
 
     def _init_weights(self, module: torch.nn.Module) -> None:
-        """Weights are initialized by `RecurrentGPT` itself."""
+        """
+        Weights are initialized by `RecurrentGPT` itself.
+        """
 
     def forward(
         self,
@@ -152,7 +165,8 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         num_steps: NumSteps = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
-        """`num_steps` as in `RecurrentGPT.forward`. When None: in eval mode `EVAL_RECURRENCE_STEPS` ("12" or
+        """
+        `num_steps` as in `RecurrentGPT.forward`. When None: in eval mode `EVAL_RECURRENCE_STEPS` ("12" or
         "4,12,4") if set, else the config's `mean_recurrence` per block; in training mode always the sampler (the env
         var sets zero backprop iterations, which would silently train the recurrence without gradient).
 
@@ -162,7 +176,9 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         `labels` follow the HuggingFace contract and are shifted here: `model(x, labels=x).loss` is the next-token
         loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The inner `RecurrentGPT` expects pre-shifted
         labels, so it gets `labels=None`. `attention_mask` `(B, S)` (1 = keep) and `position_ids` (1-D or `(B, S)`)
-        are forwarded to the inner model."""
+        are forwarded to the inner model.
+        """
+
         if return_dict is None:
             return_dict = self.config.return_dict
 
@@ -200,12 +216,15 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         return (loss, logits)
 
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """The whole sequence every step (no KV cache), plus the padding mask and the positions.
+        """
+        The whole sequence every step (no KV cache), plus the padding mask and the positions.
 
         `generate` left-pads prompts of different lengths; without the mask the model would attend to the pads and
         count them as positions. With it every row's positions are `cumsum(mask) - 1`, clamped at 0, so the first real
         token of every row sits at position 0. Everything else `generate` passes (a cache, embeddings) is dropped.
-        `*args` / `**kwargs`: transformers' signature changes between versions and `generate` only passes keywords."""
+        `*args` / `**kwargs`: transformers' signature changes between versions and `generate` only passes keywords.
+        """
+
         attention_mask: torch.Tensor | None = kwargs.get("attention_mask")
         position_ids: torch.Tensor | None = kwargs.get("position_ids")
         model_inputs: dict[str, Any] = {"input_ids": input_ids}
@@ -243,16 +262,22 @@ _RELATIVE_IMPORT = re.compile(r"^(?P<indent>[ \t]*)from[ \t]+(?P<dots>\.+)(?P<na
 
 
 def flat_module_name(module: Path) -> str:
-    """Top-level name of a package module in the export folder: `layers/norms.py` -> `layers_norms`."""
+    """
+    Top-level name of a package module in the export folder: `layers/norms.py` -> `layers_norms`.
+    """
+
     return "_".join(module.with_suffix("").parts)
 
 
 def flatten_relative_imports(source: str, module: Path, package_dir: Path) -> str:
-    """Rewrite the package-relative imports of `module` (its path relative to `package_dir`) for the flat export.
+    """
+    Rewrite the package-relative imports of `module` (its path relative to `package_dir`) for the flat export.
 
     Only `from .x import` lines change: `from .layers.norms import X` -> `from .layers_norms import X`, `from ..config
     import Y` -> `from .config import Y`. An import that resolves to a package (`from .layers import X` or
-    `from . import x`) raises: `__init__.py` files are not exported, so imports must name the defining module."""
+    `from . import x`) raises: `__init__.py` files are not exported, so imports must name the defining module.
+    """
+
     # Directory of `module` inside the package, e.g. ("hf",) for hf/modeling.py or () for a top-level module.
     module_package = module.parent.parts
 
@@ -275,7 +300,10 @@ def flatten_relative_imports(source: str, module: Path, package_dir: Path) -> st
 
 
 def export_sources(package_dir: Path, out_dir: Path) -> list[Path]:
-    """Write every module of the package (no `__init__.py`, tests or `__pycache__`) flat into `out_dir`."""
+    """
+    Write every module of the package (no `__init__.py`, tests or `__pycache__`) flat into `out_dir`.
+    """
+
     written: list[Path] = []
     for source in sorted(package_dir.rglob("*.py")):
         module = source.relative_to(package_dir)
@@ -293,7 +321,10 @@ def export_sources(package_dir: Path, out_dir: Path) -> list[Path]:
 def export_to_hf(
     model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_dir: str | Path | None = None
 ) -> Path:
-    """Write `model` as a self-contained `trust_remote_code` folder (safetensors, config.json, model sources)."""
+    """
+    Write `model` as a self-contained `trust_remote_code` folder (safetensors, config.json, model sources).
+    """
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Fixtures of the dashboard tests: the hand-advanced clock and an open dashboard on a StringIO console."""
+"""
+Fixtures of the dashboard tests: the hand-advanced clock and an open dashboard on a StringIO console.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +22,10 @@ def clock() -> FakeClock:
 
 @pytest.fixture
 def board(clock: FakeClock) -> Iterator[TrainingDashboard]:
-    """An enabled dashboard rendering into a StringIO console (no real terminal needed)."""
+    """
+    An enabled dashboard rendering into a StringIO console (no real terminal needed).
+    """
+
     with live_board(
         "tiny-run",
         STAGES,

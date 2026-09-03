@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.benchmarks with a stubbed `datasets` module."""
+"""
+Tests for data_preparation.lib.stages.benchmarks with a stubbed `datasets` module.
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the scripted demo: on a StringIO console, and end to end in a pseudo-terminal (``python -m
-training.ui.dashboard``), where the screen afterwards must show only the kept lines and the final summary."""
+"""
+Tests for the scripted demo: on a StringIO console, and end to end in a pseudo-terminal (python -m
+training.ui.dashboard), where the screen afterwards must show only the kept lines and the final summary.
+"""
 
 from __future__ import annotations
 
@@ -60,8 +62,11 @@ def test_main_parses_the_seconds_and_returns_the_exit_code(capsys: pytest.Captur
 
 
 def _run_demo_in_pty(*, width: int, height: int, seconds: float, interrupt_after: float | None = None, timeout: float = 60.0) -> tuple[int, str]:
-    """Run ``python -m training.ui.dashboard <seconds>`` on a pseudo-terminal of the given size; the exit code and
-    everything it wrote. ``interrupt_after`` sends SIGINT that many seconds after the first dashboard frame."""
+    """
+    Run python -m training.ui.dashboard <seconds> on a pseudo-terminal of the given size; the exit code and
+    everything it wrote. interrupt_after sends SIGINT that many seconds after the first dashboard frame.
+    """
+
     pid, fd = pty.fork()
     if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -97,7 +102,10 @@ def _run_demo_in_pty(*, width: int, height: int, seconds: float, interrupt_after
 
 
 def _assert_clean_terminal(text: str, width: int) -> str:
-    """The screen after the run: no panel remnants, the bars once (the static summary), the cursor shown again."""
+    """
+    The screen after the run: no panel remnants, the bars once (the static summary), the cursor shown again.
+    """
+
     plain = strip_ansi(text)
     assert "╭─ log" in plain and "╭─ events" in plain and plain.count("overall") > 1, "the live dashboard did run"
     shown = screen_of(text, width)

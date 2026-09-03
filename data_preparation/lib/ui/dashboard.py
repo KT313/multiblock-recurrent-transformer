@@ -1,39 +1,40 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Terminal dashboard for the preparation stages: one live layout (header, a **downloads** panel, a **builds**
-panel, the **log** panel, a footer) and nothing else on the terminal while it is up.
+"""
+Terminal dashboard for the preparation stages: one live layout (header, a downloads panel, a builds
+panel, the log panel, a footer) and nothing else on the terminal while it is up.
 
-A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` with one ``rich.live.Live`` display on stderr. Every
-progress bar is a :class:`Task` rendered inside one of the panels: one row per running task (at most ``max_rows``,
+A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` with one rich.live.Live display on stderr. Every
+progress bar is a :class:`Task` rendered inside one of the panels: one row per running task (at most max_rows,
 then "… and k more"); finished rows disappear into the panel's summary line (jobs done, rows done / wanted, bytes
 fetched, elapsed). A download row also shows its bytes and current speed (a live byte counter, sampled per frame
 over the last :data:`DOWNLOAD_RATE_WINDOW` seconds). Updates from worker threads go through one lock; the display
 refreshes on its own timer.
 
-While the display is up nothing may print around it (a stray line shifts the frame), so ``__enter__`` also, through
-:mod:`ui.capture`, routes every ``logging`` record into the log panel (the plain ``StreamHandler``\\s of libraries
-such as ``huggingface_hub`` / ``datasets`` are detached for the duration), replaces ``sys.stdout`` / ``sys.stderr``
-with line sinks that log what is written to them, and silences the tqdm bars of ``huggingface_hub`` / ``datasets``.
+While the display is up nothing may print around it (a stray line shifts the frame), so __enter__ also, through
+:mod:`ui.capture`, routes every logging record into the log panel (the plain StreamHandler\\s of libraries
+such as huggingface_hub / datasets are detached for the duration), replaces sys.stdout / sys.stderr
+with line sinks that log what is written to them, and silences the tqdm bars of huggingface_hub / datasets.
 
-Records of WARNING and above, and records logged with ``extra={"keep": True}`` (the plan / status tables), are
+Records of WARNING and above, and records logged with extra={"keep": True} (the plan / status tables), are
 *kept*: shown in the panel and printed once, unwrapped, after the display closed. The scrollback of a run is the
 kept lines followed by the final table, never a frozen frame (the display is transient). Ctrl-C / an exception
 leave through the same path.
 
-Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create tasks)::
+Usage (prepare.py / auto-prepare wrap the build once; the stages only create tasks)::
 
     with DataDashboard(title="prepare tiny") as dashboard, dashboard.attach(logging.getLogger("data_preparation")):
         with progress(total=1000, desc="fineweb_edu", unit="row", panel="downloads", bytes_fetched=lambda: stats.bytes_fetched) as bar:
             bar.update(1); bar.set_postfix({"file": "x.parquet"})
 
-:class:`Task` implements ``lib.progress.Progress`` (``update`` / ``set_postfix`` / context manager / ``n`` /
-``total``); :func:`progress` creates a task in ``panel`` of the active dashboard (``summary`` makes it the panel's
-one summary task, e.g. the jobs of a pool) and returns the no-op ``NoProgress`` when none is active.
+:class:`Task` implements lib.progress.Progress (update / set_postfix / context manager / n /
+total); :func:`progress` creates a task in panel of the active dashboard (summary makes it the panel's
+one summary task, e.g. the jobs of a pool) and returns the no-op NoProgress when none is active.
 :func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended` clears the display around
 a terminal prompt.
 
-Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal, the rule of ``lib.progress``): no live display, no
+Disabled (DATA_PREP_PROGRESS=0 or stderr not a terminal, the rule of lib.progress): no live display, no
 capture, tasks are no-ops and the log handler writes plain lines to stderr. A terminal that dies mid-run closes the
-display and the run continues headless with ``build.log`` as its output (:mod:`ui.display`).
+display and the run continues headless with build.log as its output (:mod:`ui.display`).
 """
 
 from __future__ import annotations
@@ -76,7 +77,10 @@ FOOTER_HINT = "Ctrl-C stops at the next shard; everything published so far is ke
 
 
 def _format_postfix(values: dict[str, Any]) -> str:
-    """``key=value`` pairs joined by commas (tqdm's postfix style)."""
+    """
+    key=value pairs joined by commas (tqdm's postfix style).
+    """
+
     return ", ".join(f"{key}={value}" for key, value in values.items())
 
 
@@ -85,19 +89,28 @@ def _format_elapsed(seconds: float) -> str:
 
 
 def _format_bytes(count: int) -> str:
-    """``320 MB``, ``1.25 GB`` from a gibibyte on."""
+    """
+    320 MB, 1.25 GB from a gibibyte on.
+    """
+
     megabytes = count / 2**20
     return f"{megabytes / 1024:,.2f} GB" if megabytes >= 1024 else f"{megabytes:,.0f} MB"
 
 
 def _format_byte_rate(bytes_per_second: float) -> str:
-    """``3.2 MB/s``, ``87 kB/s`` below a tenth of a megabyte per second."""
+    """
+    3.2 MB/s, 87 kB/s below a tenth of a megabyte per second.
+    """
+
     megabytes = bytes_per_second / 2**20
     return f"{megabytes:,.1f} MB/s" if megabytes >= 0.1 else f"{bytes_per_second / 2**10:,.0f} kB/s"
 
 
 def _download_cell(task: Task) -> str:
-    """``3.2 MB/s · 320 MB`` for a task that fetched bytes (the speed once its samples span a second), else empty."""
+    """
+    3.2 MB/s · 320 MB for a task that fetched bytes (the speed once its samples span a second), else empty.
+    """
+
     fetched = task.bytes_fetched
     if fetched <= 0:
         return ""
@@ -107,13 +120,14 @@ def _download_cell(task: Task) -> str:
 
 
 class Task:
-    """One row of a dashboard panel; the ``lib.progress.Progress`` interface.
+    """
+    One row of a dashboard panel; the lib.progress.Progress interface.
 
-    ``n`` counts the updates. The row is shown while the task is open and disappears on ``close``; its counts then
+    n counts the updates. The row is shown while the task is open and disappears on close; its counts then
     live on in the panel's summary line until the next summary task (round) starts. The bar may overshoot its
-    ``total`` like the download bar does (a loader finishing a remote row group); it renders full, the count shows
-    ``completed/total`` past 100 %. ``bytes_fetched`` is a download task's live byte counter: the row shows its
-    value and the speed over the last frames, the summary line adds it up, ``close`` freezes it.
+    total like the download bar does (a loader finishing a remote row group); it renders full, the count shows
+    completed/total past 100 %. bytes_fetched is a download task's live byte counter: the row shows its
+    value and the speed over the last frames, the summary line adds it up, close freezes it.
     """
 
     def __init__(
@@ -169,20 +183,29 @@ class Task:
 
     @property
     def bytes_fetched(self) -> int:
-        """The bytes the task fetched so far (0 without a counter); frozen once closed."""
+        """
+        The bytes the task fetched so far (0 without a counter); frozen once closed.
+        """
+
         if self._bytes_fetched is None:
             return 0
         return self._bytes_at_close if self.closed else self._bytes_fetched()
 
     def sample_bytes(self, now: float) -> None:
-        """Record this frame's byte count; samples older than :data:`DOWNLOAD_RATE_WINDOW` drop out."""
+        """
+        Record this frame's byte count; samples older than :data:`DOWNLOAD_RATE_WINDOW` drop out.
+        """
+
         samples = self._byte_samples
         samples.append((now, self.bytes_fetched))
         while samples and now - samples[0][0] > DOWNLOAD_RATE_WINDOW:
             samples.popleft()
 
     def download_rate(self) -> float | None:
-        """Bytes per second over the sampled frames; None until they span at least a second."""
+        """
+        Bytes per second over the sampled frames; None until they span at least a second.
+        """
+
         if len(self._byte_samples) < 2:
             return None
         (first_time, first_bytes), (last_time, last_bytes) = self._byte_samples[0], self._byte_samples[-1]
@@ -194,7 +217,10 @@ class Task:
         return (self.finished if self.finished is not None else now) - self.started
 
     def speed(self, now: float) -> float | None:
-        """Units per second over the task's lifetime; None before the first update."""
+        """
+        Units per second over the task's lifetime; None before the first update.
+        """
+
         elapsed = self.elapsed(now)
         if self.completed <= 0 or elapsed <= 0:
             return None
@@ -210,7 +236,9 @@ class Task:
 
 
 class _PanelState:
-    """The tasks of one panel: the running rows, the finished ones of the current round, the round's summary task."""
+    """
+    The tasks of one panel: the running rows, the finished ones of the current round, the round's summary task.
+    """
 
     def __init__(self, name: str, max_rows: int) -> None:
         self.name = name
@@ -238,7 +266,10 @@ class _PanelState:
         return not self.active and not self.done and self.summary is None
 
     def height(self) -> int:
-        """Lines the panel occupies: borders, rows (bounded), the overflow line, the summary line."""
+        """
+        Lines the panel occupies: borders, rows (bounded), the overflow line, the summary line.
+        """
+
         rows = min(len(self.active), self.max_rows) or (0 if self.idle else 1)
         return 2 + rows + (1 if len(self.active) > self.max_rows else 0) + 1
 
@@ -280,8 +311,11 @@ class _PanelState:
         return table
 
     def _summary_line(self, now: float) -> Text:
-        """``5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03``: the round's jobs, every row of every task
-        of the round (running and finished), the bytes they fetched, the time since the round began."""
+        """
+        5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03: the round's jobs, every row of every task
+        of the round (running and finished), the bytes they fetched, the time since the round began.
+        """
+
         if self.idle:
             return Text("idle", style="dim")
         tasks = [*self.done, *self.active]
@@ -306,12 +340,13 @@ class _PanelState:
 
 
 class DataDashboard(LiveDisplay):
-    """Live terminal display: header, one panel per task group (``downloads``, ``builds``, …), the log panel (last
-    ``log_lines`` lines), footer.
+    """
+    Live terminal display: header, one panel per task group (downloads, builds, …), the log panel (last
+    log_lines lines), footer.
 
-    ``enabled`` defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); ``console`` is for tests
-    (a ``rich.console.Console`` over a ``StringIO``), ``clock`` too (elapsed times and download speeds). Exactly one
-    dashboard is active at a time (``with`` block); :func:`progress` and :func:`active_dashboard` find it, entering
+    enabled defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); console is for tests
+    (a rich.console.Console over a StringIO), clock too (elapsed times and download speeds). Exactly one
+    dashboard is active at a time (with block); :func:`progress` and :func:`active_dashboard` find it, entering
     a second one raises.
     """
 
@@ -385,10 +420,13 @@ class DataDashboard(LiveDisplay):
     _THIRD_PARTY_BAR_ENV = ("HF_HUB_DISABLE_PROGRESS_BARS", "HF_DATASETS_DISABLE_PROGRESS_BARS")
 
     def _silence_third_party_bars(self) -> None:
-        """Turn off the tqdm bars of ``huggingface_hub`` / ``datasets`` (file downloads, ``load_dataset``) while
+        """
+        Turn off the tqdm bars of huggingface_hub / datasets (file downloads, load_dataset) while
         the live display is up. The env vars cover the not-yet-imported libraries (which then stay silent for the
         rest of the process: they read the variable once, at import), the function calls the already-imported
-        ones; :meth:`_restore_third_party_bars` undoes both."""
+        ones; :meth:`_restore_third_party_bars` undoes both.
+        """
+
         self._saved_env = {name: os.environ.get(name) for name in self._THIRD_PARTY_BAR_ENV}
         for name in self._THIRD_PARTY_BAR_ENV:
             os.environ[name] = "1"
@@ -414,16 +452,22 @@ class DataDashboard(LiveDisplay):
             sys.modules["datasets"].utils.logging.enable_progress_bar()
 
     def _capture_logging(self) -> None:
-        """Every ``logging`` record into the panel: the dashboard's handler on the root logger, and every plain
-        console ``StreamHandler`` of every logger (``huggingface_hub`` and ``datasets`` install one on theirs at
-        import) detached until :meth:`_release_logging` (:class:`~ui.capture.LoggingCapture`)."""
+        """
+        Every logging record into the panel: the dashboard's handler on the root logger, and every plain
+        console StreamHandler of every logger (huggingface_hub and datasets install one on theirs at
+        import) detached until :meth:`_release_logging` (:class:`~ui.capture.LoggingCapture`).
+        """
+
         self._logging_capture.start()
 
     def _release_logging(self) -> None:
         self._logging_capture.stop()
 
     def _redirect_streams(self) -> None:
-        """``sys.stdout`` / ``sys.stderr`` become line sinks that log (INFO / WARNING) what is written to them."""
+        """
+        sys.stdout / sys.stderr become line sinks that log (INFO / WARNING) what is written to them.
+        """
+
         self._stream_capture.redirect()
 
     def _release_streams(self) -> None:
@@ -441,9 +485,12 @@ class DataDashboard(LiveDisplay):
         summary: bool = False,
         bytes_fetched: Callable[[], int] | None = None,
     ) -> Progress:
-        """A new row in ``panel`` (a no-op bar when the dashboard is disabled). ``summary`` makes it the panel's
-        summary task (the pool's jobs) and starts a new round of the panel's counts; ``bytes_fetched`` is a download
-        task's live byte counter (the row shows its bytes and current speed, the summary line adds it up)."""
+        """
+        A new row in panel (a no-op bar when the dashboard is disabled). summary makes it the panel's
+        summary task (the pool's jobs) and starts a new round of the panel's counts; bytes_fetched is a download
+        task's live byte counter (the row shows its bytes and current speed, the summary line adds it up).
+        """
+
         if not self.enabled:
             return NoProgress(total)
         with self._lock:
@@ -453,19 +500,28 @@ class DataDashboard(LiveDisplay):
         return task
 
     def set_status(self, **fields: object) -> None:
-        """Header fields (``round="1/5"``, ``step="download"``), shown as ``key value`` after the title."""
+        """
+        Header fields (round="1/5", step="download"), shown as key value after the title.
+        """
+
         with self._lock:
             self._status.update({key: str(value) for key, value in fields.items()})
 
     def log_handler(self, level: int = logging.NOTSET, keep_level: int = logging.WARNING) -> DashboardLogHandler:
-        """A logging handler for this dashboard (see :class:`DashboardLogHandler`); :meth:`attach` installs it."""
+        """
+        A logging handler for this dashboard (see :class:`DashboardLogHandler`); :meth:`attach` installs it.
+        """
+
         return DashboardLogHandler(self, level, keep_level)
 
     @contextmanager
     def attach(self, logger: logging.Logger, *, log_file: Path | None = None) -> Iterator[None]:
-        """Route ``logger`` into this dashboard for the duration of the block: the plain stream handlers that
-        ``lib.log.configure_logging`` installed are detached (their lines would print behind the live display) and
-        restored afterwards; with ``log_file`` every record is also appended to that file (named in the footer)."""
+        """
+        Route logger into this dashboard for the duration of the block: the plain stream handlers that
+        lib.log.configure_logging installed are detached (their lines would print behind the live display) and
+        restored afterwards; with log_file every record is also appended to that file (named in the footer).
+        """
+
         with attach_logger(self, logger, log_file):
             with self._lock:
                 self._attached_logger_names.append(logger.name)
@@ -494,7 +550,10 @@ class DataDashboard(LiveDisplay):
 
 
 def active_dashboard() -> DataDashboard | None:
-    """The dashboard of the enclosing ``with DataDashboard()`` block, if any."""
+    """
+    The dashboard of the enclosing with DataDashboard() block, if any.
+    """
+
     return DataDashboard._active
 
 
@@ -507,8 +566,11 @@ def progress(
     summary: bool = False,
     bytes_fetched: Callable[[], int] | None = None,
 ) -> Progress:
-    """A task in ``panel`` of the active dashboard (see :meth:`DataDashboard.task`), else a :class:`NoProgress`
-    (which counts, shows nothing)."""
+    """
+    A task in panel of the active dashboard (see :meth:`DataDashboard.task`), else a :class:`NoProgress`
+    (which counts, shows nothing).
+    """
+
     dashboard = active_dashboard()
     if dashboard is None:
         return NoProgress(total)
@@ -516,7 +578,10 @@ def progress(
 
 
 def set_status(**fields: object) -> None:
-    """Header fields of the active dashboard (no-op without one)."""
+    """
+    Header fields of the active dashboard (no-op without one).
+    """
+
     dashboard = active_dashboard()
     if dashboard is not None:
         dashboard.set_status(**fields)
@@ -524,7 +589,10 @@ def set_status(**fields: object) -> None:
 
 @contextmanager
 def suspended() -> Iterator[None]:
-    """The active dashboard's display cleared for the block (a terminal prompt); no-op without one."""
+    """
+    The active dashboard's display cleared for the block (a terminal prompt); no-op without one.
+    """
+
     dashboard = active_dashboard()
     if dashboard is None:
         yield

@@ -1,13 +1,14 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``prepare.py describe``: render a dataset config as a Markdown document (``docs/data_mixture.md`` is generated
-with it, so the documentation of the thesis mixture cannot drift from ``config/datasets/crow_300m_final.yaml``).
+"""
+prepare.py describe: render a dataset config as a Markdown document (docs/data_mixture.md is generated
+with it, so the documentation of the thesis mixture cannot drift from config/datasets/crow_300m_final.yaml).
 
 Pure function of the config file: tokenizer, sequence length and processing defaults, one table per stage (weights,
 derived token budgets and sequence counts), the validation split per source and the source registry. The leading
-comment block of the YAML file (the lines starting with ``#`` before the first key) is rendered as the "Notes"
+comment block of the YAML file (the lines starting with # before the first key) is rendered as the "Notes"
 section, so config-specific remarks live next to the config. Per-source budgets are the planner's arithmetic
-(``DatasetConfig.sequence_budget``: the integral of the weight schedule over the run); the per-stage tables show
-``stage.tokens × weight``; the rows-per-stage column is an estimate from ``describe_tokens_per_row`` (which
+(DatasetConfig.sequence_budget: the integral of the weight schedule over the run); the per-stage tables show
+stage.tokens × weight; the rows-per-stage column is an estimate from describe_tokens_per_row (which
 nothing else uses).
 """
 
@@ -22,8 +23,11 @@ GENERATED_WITH = "uv run python data_preparation/prepare.py describe --dataset_c
 
 
 def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") -> str:
-    """The Markdown document for ``config`` loaded from ``config_path``; ``notes`` is inserted verbatim after the
-    header (see :func:`leading_comment`)."""
+    """
+    The Markdown document for config loaded from config_path; notes is inserted verbatim after the
+    header (see :func:`leading_comment`).
+    """
+
     config_file = Path(config_path).as_posix()
     lines: list[str] = [
         f"# Dataset `{config.name}`",
@@ -51,7 +55,10 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
 
 
 def leading_comment(config_path: str | Path) -> str:
-    """The comment block at the top of a YAML file (``#`` lines before the first non-comment line), as prose."""
+    """
+    The comment block at the top of a YAML file (# lines before the first non-comment line), as prose.
+    """
+
     out: list[str] = []
     for raw in Path(config_path).read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -91,7 +98,10 @@ def _general(config: DatasetConfig) -> list[str]:
 
 
 def _tokenizer_label(tokenizer: TokenizerConfig) -> str:
-    """e.g. "`llama-32k` (hf, `hf-internal-testing/llama-tokenizer` @ `<sha>`)"."""
+    """
+    e.g. "`llama-32k` (hf, `hf-internal-testing/llama-tokenizer` @ `<sha>`)".
+    """
+
     label = f"`{tokenizer.name}` ({tokenizer.kind}"
     if tokenizer.hf_id:
         label += f", `{tokenizer.hf_id}`"
@@ -150,7 +160,10 @@ def _stages(config: DatasetConfig) -> list[str]:
 
 
 def _validation_split(config: DatasetConfig) -> list[str]:
-    """One line per source: how the training resolver splits its processed rows."""
+    """
+    One line per source: how the training resolver splits its processed rows.
+    """
+
     lines = [
         "## Validation split",
         "",
@@ -238,12 +251,18 @@ def _details(config: DatasetConfig, name: str) -> str:
 
 
 def _sequences(tokens: float, block_size: int) -> str:
-    """Sequences of ``block_size`` tokens, rounded up like the planner does: 1,611,329."""
+    """
+    Sequences of block_size tokens, rounded up like the planner does: 1,611,329.
+    """
+
     return f"{ceil(tokens / block_size):,}"
 
 
 def _tokens(n: int) -> str:
-    """Human-scale token count: 3.30B, 150.0M, 12.5K, 42."""
+    """
+    Human-scale token count: 3.30B, 150.0M, 12.5K, 42.
+    """
+
     if n >= 10**9:
         return f"{n / 1e9:.2f}B"
     if n >= 10**6:

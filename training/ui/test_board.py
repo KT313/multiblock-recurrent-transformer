@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the live training dashboard: rendering, the captured terminal, kept lines, the clean scrollback."""
+"""
+Tests for the live training dashboard: rendering, the captured terminal, kept lines, the clean scrollback.
+"""
 
 from __future__ import annotations
 
@@ -68,7 +70,10 @@ def test_stage_transition_moves_the_highlight(board: TrainingDashboard) -> None:
 
 
 def test_transition_note_follows_the_transition_argument(board: TrainingDashboard) -> None:
-    """The note shows the transition progress passed with every step (log step or not) and goes when None comes."""
+    """
+    The note shows the transition progress passed with every step (log step or not) and goes when None comes.
+    """
+
     board.update_step(18, 0, 0.5, metrics(18))
     board.update_step(19, 0, 0.5, {})  # a non-log step: an empty dict, the transition still on
     assert "transition → instruct 50%" in board.render_text()

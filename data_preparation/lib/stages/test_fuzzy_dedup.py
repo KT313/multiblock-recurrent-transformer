@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the streaming MinHash/LSH near-duplicate removal: rows kept are pinned to the pre-rewrite (serial,
-in-process) implementation on a synthetic corpus with planted near- and exact duplicates."""
+"""
+Tests for the streaming MinHash/LSH near-duplicate removal: rows kept are pinned to the pre-rewrite (serial,
+in-process) implementation on a synthetic corpus with planted near- and exact duplicates.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +43,10 @@ EXPECTED_KEPT: dict[float, list[int]] = {t: sorted(set(range(N_DOCS)) - removed)
 
 
 def make_corpus(seed: int = 0, n_base: int = 200) -> list[str]:
-    """200 random 30-120 word documents + 60 near-duplicates (1-3 words changed) + 40 exact duplicates, shuffled."""
+    """
+    200 random 30-120 word documents + 60 near-duplicates (1-3 words changed) + 40 exact duplicates, shuffled.
+    """
+
     rng = random.Random(seed)
     docs = [" ".join(rng.choice(VOCAB) for _ in range(rng.randint(30, 120))) for _ in range(n_base)]
     out = list(docs)

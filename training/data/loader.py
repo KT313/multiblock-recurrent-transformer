@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Dataloader construction (one train loader per SOURCE for the whole run and one validation loader per stage,
+"""
+Dataloader construction (one train loader per SOURCE for the whole run and one validation loader per stage,
 `build_run_dataloaders`) and the assembly of one world batch into padded micro-batches.
 
 The stage structure never touches the train loaders: `training.step.BatchStream` draws the source per sample with
@@ -31,9 +32,12 @@ SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (
 
 
 def entry_dataset(entry: DataEntry, shard: tuple[int, int] = (0, 1)) -> ParquetTextDataset:
-    """The `ParquetTextDataset` of one data entry: its folder, its row range ``[skip_rows, skip_rows + max_rows)``
-    (the validation split decided by the resolver) and its ``data_signature`` (None = the text column), dealt over
-    ``shard=(rank, world)`` (a no-op with ``world == 1``)."""
+    """
+    The `ParquetTextDataset` of one data entry: its folder, its row range [skip_rows, skip_rows + max_rows)
+    (the validation split decided by the resolver) and its data_signature (None = the text column), dealt over
+    shard=(rank, world) (a no-op with world == 1).
+    """
+
     return ParquetTextDataset(
         entry.data_dir,
         entry.prefix,
@@ -57,9 +61,12 @@ def build_dataloader(
     pin_memory: bool = False,
     padded: bool = True,
 ) -> DataLoader[Row]:
-    """Loader over ``entries``: a single per-source train entry, or a stage's ``val_data`` mixed by weight
+    """
+    Loader over entries: a single per-source train entry, or a stage's val_data mixed by weight
     (`training.data.dataset_resolver` resolves both); every entry becomes one `entry_dataset`, and the loader
-    itself is `dataloader_over` the single dataset or the `WeightedMixtureDataset` of several."""
+    itself is `dataloader_over` the single dataset or the `WeightedMixtureDataset` of several.
+    """
+
     if len({entry.prefix for entry in entries}) != len(entries):
         raise ValueError("Dataset prefixes within one loader must be unique.")
     datasets = [entry_dataset(entry, shard) for entry in entries]
@@ -91,12 +98,14 @@ def dataloader_over(
     pin_memory: bool = False,
     padded: bool = True,
 ) -> DataLoader[Row]:
-    """The `DataLoader` over one dataset with the run's collate function.
+    """
+    The `DataLoader` over one dataset with the run's collate function.
 
-    ``padded`` (validation, the default) yields ready ``(input_ids, labels, data_ids)`` batches; ``padded=False``
-    (training) yields a `WorkerBatch`, padded later per micro-batch in `world_batch_micro_batches`. ``pin_memory``
+    padded (validation, the default) yields ready (input_ids, labels, data_ids) batches; padded=False
+    (training) yields a `WorkerBatch`, padded later per micro-batch in `world_batch_micro_batches`. pin_memory
     is the backend's decision.
     """
+
     collate: Callable[[list[Row]], Any]
     if padded:
         collate = partial(
@@ -121,11 +130,12 @@ def dataloader_over(
 
 @dataclass
 class RunDataloaders:
-    """One train loader per SOURCE for the whole run and one validation loader per stage, with lazily created and
+    """
+    One train loader per SOURCE for the whole run and one validation loader per stage, with lazily created and
     cycled train iterators and the resume offsets they start at.
 
-    ``train_loaders`` maps source name to loader in dataset-config order (`train_sources`). ``datasets`` are the
-    parquet datasets behind the train loaders (a test fake passes ``{}``): the offset of `set_resume_offsets` is
+    train_loaders maps source name to loader in dataset-config order (`train_sources`). datasets are the
+    parquet datasets behind the train loaders (a test fake passes {}): the offset of `set_resume_offsets` is
     applied to a dataset right before its first iterator after a resume and reset to 0 for every later epoch.
     """
 
@@ -141,12 +151,18 @@ class RunDataloaders:
 
     @property
     def train_sources(self) -> list[str]:
-        """The source names in dataset-config order."""
+        """
+        The source names in dataset-config order.
+        """
+
         return list(self.train_loaders)
 
     def _start_train_iterator(self, source: str) -> Iterator[WorkerBatch]:
-        """A fresh iterator over ``source``'s loader, its dataset set to start at the pending resume offset (0 when
-        none is pending). Numerics: each `iter(DataLoader)` draws one base seed from the global torch RNG."""
+        """
+        A fresh iterator over source's loader, its dataset set to start at the pending resume offset (0 when
+        none is pending). Numerics: each `iter(DataLoader)` draws one base seed from the global torch RNG.
+        """
+
         offset = self.pending_offsets.pop(source, 0)
         dataset = self.datasets.get(source)
         if dataset is not None:
@@ -155,11 +171,13 @@ class RunDataloaders:
         return iterator
 
     def next_train_batch(self, source: str) -> WorkerBatch:
-        """Next worker batch of ``source``'s loader; restarts the loader when its epoch is over.
+        """
+        Next worker batch of source's loader; restarts the loader when its epoch is over.
 
         The restart never spins on an empty range: setup guarantees at least one training row per source
         (`check_entry_rows`). Numerics: the iterator is created lazily at the first pull and anew on every restart.
         """
+
         iterator = self._train_iterators[source]
         if iterator is None:
             iterator = self._start_train_iterator(source)
@@ -169,15 +187,21 @@ class RunDataloaders:
             return next(self._start_train_iterator(source))  # the epoch is over; the next one reads the whole range
 
     def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
-        """Start every train dataset named in `consumed_rows` that many rows into its range (modulo the range) at
-        its next epoch; names of removed sources are ignored."""
+        """
+        Start every train dataset named in `consumed_rows` that many rows into its range (modulo the range) at
+        its next epoch; names of removed sources are ignored.
+        """
+
         self.pending_offsets = {source: rows for source, rows in consumed_rows.items() if source in self.train_loaders}
 
     def close(self) -> None:
-        """Shut down the worker processes of every live train iterator (idempotent); `train()` calls it on every way
+        """
+        Shut down the worker processes of every live train iterator (idempotent); `train()` calls it on every way
         out. Without it a run that ends in an exception leaves its iterators in a reference cycle, and each worker's
         shutdown takes 5 s once the GC gets there. torch offers no public shutdown; `_shutdown_workers` is what the
-        iterator's own finalizer runs."""
+        iterator's own finalizer runs.
+        """
+
         for source, iterator in self._train_iterators.items():
             shutdown = getattr(iterator, "_shutdown_workers", None)
             if shutdown is not None:
@@ -186,9 +210,12 @@ class RunDataloaders:
 
 
 def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> RunDataloaders:
-    """One train loader per train source of `dataset` and one validation loader per stage (its entries mixed with
+    """
+    One train loader per train source of `dataset` and one validation loader per stage (its entries mixed with
     constant weights). One tokenizer shared by every loader. Train loaders run `TRAIN_LOADER_NUM_WORKERS` worker each
-    and yield unpadded samples; validation loaders read in-process and yield padded batches."""
+    and yield unpadded samples; validation loaders read in-process and yield padded batches.
+    """
+
     tokenizer = Tokenizer(dataset.tokenizer_dir)
     shard = (backend.rank, backend.world_size)
     train_datasets = {entry.prefix: entry_dataset(entry, shard) for entry in dataset.train_sources}
@@ -226,7 +253,10 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
 
 
 def sample_length(sample: Sample) -> int:
-    """Tokens of a sample before padding: what its micro-batch will have to be padded to."""
+    """
+    Tokens of a sample before padding: what its micro-batch will have to be padded to.
+    """
+
     return sample[0].shape[0]
 
 
@@ -239,12 +269,14 @@ def world_batch_micro_batches(
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
 ) -> list[Batch]:
-    """Split one world batch of samples into micro-batches of `micro_batch_size` and pad each of them once.
+    """
+    Split one world batch of samples into micro-batches of `micro_batch_size` and pad each of them once.
 
     With `sort_by_length` the samples are sorted by token count first (a stable sort), so a micro-batch groups rows
     of similar length and pads less. Without it the arrival order is kept. The width comes from the full sample
     length either way, never from the supervised part.
     """
+
     if sort_by_length:
         samples = sorted(samples, key=sample_length)
     return [

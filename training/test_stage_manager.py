@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the stage manager: hand-computed boundaries, world-size independence, validation, stage info inside
-transitions, the stage the run is entering, the interpolated per-step data weights and stage-end checkpoint steps."""
+"""
+Tests for the stage manager: hand-computed boundaries, world-size independence, validation, stage info inside
+transitions, the stage the run is entering, the interpolated per-step data weights and stage-end checkpoint steps.
+"""
 
 import pytest
 
@@ -63,8 +65,11 @@ def test_transition_pct_truncates_tokens_then_steps(pct: float, expected_transit
 
 
 def test_zero_length_transition_has_no_transition_steps_but_a_stage_end_checkpoint() -> None:
-    """A transition shorter than one step (tokens * pct < tokens_per_step) collapses to nothing: no step is in a
-    transition, the data/LR switch hard at the boundary and the stage-end checkpoint lands at end - 1."""
+    """
+    A transition shorter than one step (tokens * pct < tokens_per_step) collapses to nothing: no step is in a
+    transition, the data/LR switch hard at the boundary and the stage-end checkpoint lands at end - 1.
+    """
+
     stages = [resolved_stage("a", 8192, 1e-3, transition_pct=0.05), resolved_stage("b", 8192, 1e-4)]
     sm = StageManager(stages, world_batch_size=4, block_size=256)
     assert _bounds(sm) == [(0, 8, 8), (8, 16, 16)]
@@ -102,7 +107,10 @@ def test_warmup_or_cooldown_too_long_raises(warmup: int, cooldown: int) -> None:
 
 
 def test_warmup_and_cooldown_that_fit_are_accepted() -> None:
-    """Stage 0 has 8 steps of which the last 2 are its transition: the warmup must end before step 6."""
+    """
+    Stage 0 has 8 steps of which the last 2 are its transition: the warmup must end before step 6.
+    """
+
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256, warmup_steps=5, cooldown_steps=3)
     assert sm.total_steps == 20
     sm._validate_lr_schedule()  # idempotent re-check
@@ -148,16 +156,22 @@ def test_get_stage_info_inside_and_outside_transitions() -> None:
 
 
 def test_entering_stage_at_names_the_incoming_stage_inside_a_transition() -> None:
-    """The stage the validation loader and a checkpoint's `stage` follow: the stage containing the step, except
-    inside a transition window, where it is the stage being entered (tiny: windows [6, 8) and [14, 16))."""
+    """
+    The stage the validation loader and a checkpoint's `stage` follow: the stage containing the step, except
+    inside a transition window, where it is the stage being entered (tiny: windows [6, 8) and [14, 16)).
+    """
+
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     assert [sm.entering_stage_at(step) for step in range(26)] == [0] * 6 + [1] * 8 + [2] * 12
     assert [sm.get_stage_info(step).stage_index for step in range(26)] == [0] * 8 + [1] * 8 + [2] * 10
 
 
 def weighted_stages() -> list[ResolvedStage]:
-    """The tiny boundaries ((0,8,6), (8,16,14), (16,20)) with a source `a` leaving, `b` shared and `c` entering
-    across the first transition."""
+    """
+    The tiny boundaries ((0,8,6), (8,16,14), (16,20)) with a source `a` leaving, `b` shared and `c` entering
+    across the first transition.
+    """
+
     return [
         resolved_stage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 0.7, "b": 0.3}),
         resolved_stage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 0.5, "c": 0.5}),
@@ -202,8 +216,11 @@ def test_get_stage_info_past_the_end_reports_last_stage_complete() -> None:
 
 
 def test_stage_ending_at_exact_steps() -> None:
-    """The stage index only at the last step before each transition (5 -> 0, 13 -> 1), None everywhere else,
-    including the last stage, which has no transition after it."""
+    """
+    The stage index only at the last step before each transition (5 -> 0, 13 -> 1), None everywhere else,
+    including the last stage, which has no transition after it.
+    """
+
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     expected = {5: 0, 13: 1}
     for step in range(25):

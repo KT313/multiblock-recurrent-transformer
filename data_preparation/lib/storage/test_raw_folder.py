@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `RawFolder`: the token cap and its fallback, the read-only queries over a raw manifest, the append
+"""
+Tests for `RawFolder`: the token cap and its fallback, the read-only queries over a raw manifest, the append
 bookkeeping (offset and reject counters per shard), exhaustion (also by a `check_limit` that later grows) and the
-truncation to a good prefix, which restores every counter from the last kept shard."""
+truncation to a good prefix, which restores every counter from the last kept shard.
+"""
 
 from __future__ import annotations
 
@@ -64,7 +66,10 @@ def test_mark_exhausted_records_the_limit_and_saves(tmp_path: Path) -> None:
 
 
 def _exhausted(folder: RawFolder) -> bool:
-    """`folder.exhausted` through a call: mypy would narrow the attribute across the reopen calls in one test."""
+    """
+    `folder.exhausted` through a call: mypy would narrow the attribute across the reopen calls in one test.
+    """
+
     return folder.exhausted
 
 
@@ -91,8 +96,11 @@ def test_reopen_if_check_limit_grew(tmp_path: Path, caplog: pytest.LogCaptureFix
 
 
 def test_appending_records_offset_and_reject_counters_per_shard(tmp_path: Path) -> None:
-    """Every published shard carries the loader offset and the reject totals as of its last stored row, on top of
-    what the folder already held (`_before`), and the manifest is saved after each one."""
+    """
+    Every published shard carries the loader offset and the reject totals as of its last stored row, on top of
+    what the folder already held (`_before`), and the manifest is saved after each one.
+    """
+
     folder = RawFolder(tmp_path, _manifest(rows_fetched=100, skipped_malformed=5, dropped_too_long=1))
     with ShardWriter(tmp_path, 2, start_shard=0, on_shard=folder.record_shard) as writer:
         for consumed, skipped, dropped in ((3, 1, 0), (6, 1, 2), (9, 4, 2), (11, 4, 3)):

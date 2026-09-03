@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Shared base of the two live dashboards (`DataDashboard`, `TrainingDashboard`): a transient `rich.live.Live`
+"""
+Shared base of the two live dashboards (`DataDashboard`, `TrainingDashboard`): a transient `rich.live.Live`
 display, a log panel with the last `log_lines` logged lines, *kept* lines printed after the display closes,
 `suspended()` around a terminal prompt, and the frame as plain text.
 
@@ -45,13 +46,18 @@ def _fileno(stream: TextIO) -> int | None:
 
 
 def line(text: str, style: str = "") -> Text:
-    """One terminal row: never wraps, cropped with an ellipsis; markup in ``text`` is not interpreted."""
+    """
+    One terminal row: never wraps, cropped with an ellipsis; markup in text is not interpreted.
+    """
+
     return Text(text, style=style, no_wrap=True, overflow="ellipsis")
 
 
 class ResizeAwareLive(Live):
-    """A ``rich.live.Live`` that clears the screen before a frame drawn for a new terminal size and reports a
-    dead terminal through ``on_terminal_lost(reason)`` instead of crashing the refresh thread."""
+    """
+    A rich.live.Live that clears the screen before a frame drawn for a new terminal size and reports a
+    dead terminal through on_terminal_lost(reason) instead of crashing the refresh thread.
+    """
 
     def __init__(self, *args: Any, on_terminal_lost: Callable[[str], None] | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -82,11 +88,12 @@ class ResizeAwareLive(Live):
 
 
 class LiveDisplay:
-    """The live display, log panel and kept lines of a dashboard.
+    """
+    The live display, log panel and kept lines of a dashboard.
 
-    ``stream`` is the terminal to draw on (stderr for data preparation, stdout for training); ``console`` replaces
-    the console built on it (tests pass one over a ``StringIO``). While ``enabled`` is False, :meth:`write` prints
-    plain lines to ``_plain_stream`` instead of the panel.
+    stream is the terminal to draw on (stderr for data preparation, stdout for training); console replaces
+    the console built on it (tests pass one over a StringIO). While enabled is False, :meth:`write` prints
+    plain lines to _plain_stream instead of the panel.
     """
 
     def __init__(self, *, stream: TextIO, console: Console | None, refresh_per_second: float, log_lines: int) -> None:
@@ -134,7 +141,10 @@ class LiveDisplay:
 
     @contextmanager
     def suspended(self) -> Iterator[None]:
-        """Close the display and hand the terminal back for a prompt; reopen it afterwards."""
+        """
+        Close the display and hand the terminal back for a prompt; reopen it afterwards.
+        """
+
         if self._live is None:
             yield
             return
@@ -147,22 +157,34 @@ class LiveDisplay:
             self._start_live()
 
     def _release_streams(self) -> None:
-        """Restore the real ``sys.stdout`` / ``sys.stderr`` (subclass capture)."""
+        """
+        Restore the real sys.stdout / sys.stderr (subclass capture).
+        """
+
         raise NotImplementedError
 
     def _redirect_streams(self) -> None:
-        """Capture ``sys.stdout`` / ``sys.stderr`` again (subclass capture)."""
+        """
+        Capture sys.stdout / sys.stderr again (subclass capture).
+        """
+
         raise NotImplementedError
 
     # --- a dead terminal ----------------------------------------------------------------------------------------------
 
     @property
     def headless(self) -> bool:
-        """Whether the terminal went away and the display closed itself."""
+        """
+        Whether the terminal went away and the display closed itself.
+        """
+
         return self._headless
 
     def _terminal_lost(self, reason: str) -> None:
-        """The terminal is gone: silence it, close the display, warn in the log. Idempotent; safe on any thread."""
+        """
+        The terminal is gone: silence it, close the display, warn in the log. Idempotent; safe on any thread.
+        """
+
         with self._lock:
             if self._headless:
                 return
@@ -174,8 +196,11 @@ class LiveDisplay:
         self.logger.warning("terminal gone (%s): the display is closed, the run continues headless%s", reason, log_hint)
 
     def _silence_terminal(self) -> None:
-        """Point the console and the plain stream at ``/dev/null``; when the display drew on the process's own
-        stdout / stderr, those file descriptors too. Lock-free, a signal handler calls it."""
+        """
+        Point the console and the plain stream at /dev/null; when the display drew on the process's own
+        stdout / stderr, those file descriptors too. Lock-free, a signal handler calls it.
+        """
+
         if self._null_file is None:
             self._null_file = open(os.devnull, "w")  # noqa: SIM115  # stays open for the rest of the process
             if self._console.file is self._stream and _fileno(self._stream) in (1, 2):
@@ -185,8 +210,11 @@ class LiveDisplay:
         self._plain_stream = self._null_file
 
     def _install_sighup_handler(self) -> None:
-        """SIGHUP leaves a note for the refresh thread instead of ending the process. Main thread only, as Python
-        requires for signal handlers."""
+        """
+        SIGHUP leaves a note for the refresh thread instead of ending the process. Main thread only, as Python
+        requires for signal handlers.
+        """
+
         if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGHUP"):
             return
         live = self._live
@@ -207,8 +235,11 @@ class LiveDisplay:
     # --- log lines and kept records -----------------------------------------------------------------------------------
 
     def write(self, text: str, *, keep: bool = False) -> None:
-        """Append ``text`` to the log panel, one entry per line; to the plain stream when disabled. With ``keep`` it
-        is also printed once the display closed."""
+        """
+        Append text to the log panel, one entry per line; to the plain stream when disabled. With keep it
+        is also printed once the display closed.
+        """
+
         if not self.enabled:
             self._plain_stream.write(text + "\n")
             self._plain_stream.flush()
@@ -219,7 +250,10 @@ class LiveDisplay:
                 self._kept.append(text)
 
     def _print_kept(self) -> None:
-        """Print the kept records once, plainly, on the console's file."""
+        """
+        Print the kept records once, plainly, on the console's file.
+        """
+
         with self._lock:
             kept, self._kept = self._kept, []
         file = self._console.file
@@ -228,40 +262,61 @@ class LiveDisplay:
         file.flush()
 
     def is_attached(self, logger_name: str) -> bool:
-        """Whether ``logger_name`` already reaches the panel through a handler ``attach`` installed (the root handler
-        skips those to avoid duplicates)."""
+        """
+        Whether logger_name already reaches the panel through a handler attach installed (the root handler
+        skips those to avoid duplicates).
+        """
+
         with self._lock:
             return any(logger_name == name or logger_name.startswith(name + ".") for name in self._attached_logger_names)
 
     def lines(self) -> list[str]:
-        """The log lines currently shown (newest last)."""
+        """
+        The log lines currently shown (newest last).
+        """
+
         with self._lock:
             return list(self._panel_lines)
 
     def kept(self) -> list[str]:
-        """The kept records not yet printed (they are printed when the display closes)."""
+        """
+        The kept records not yet printed (they are printed when the display closes).
+        """
+
         with self._lock:
             return list(self._kept)
 
     # --- rendering ------------------------------------------------------------------------------------------------------
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        """The frame (a subclass's layout), rendered by the Live thread under ``_lock``."""
+        """
+        The frame (a subclass's layout), rendered by the Live thread under _lock.
+        """
+
         raise NotImplementedError
 
     def _render_log(self, height: int) -> Panel:
-        """The log panel: the newest ``height`` lines, one row each."""
+        """
+        The log panel: the newest height lines, one row each.
+        """
+
         lines = list(self._panel_lines)[-height:]
         body = line("\n".join(lines) or "(no log output yet)")
         return Panel(body, title="log", title_align="left", border_style="dim", padding=(0, 1))
 
     def _footer(self, *parts: str) -> Text:
-        """The dim last row: ``log: <file>`` (once ``attach`` named one) and ``parts``, dot-separated."""
+        """
+        The dim last row: log: <file> (once attach named one) and parts, dot-separated.
+        """
+
         log_name = [f"log: {self._log_file}"] if self._log_file is not None else []
         return line(" · ".join([*log_name, *parts]), style="dim")
 
     def render_text(self, width: int = 120, height: int = 50) -> str:
-        """The current frame as plain text (tests, or a snapshot for a log file)."""
+        """
+        The current frame as plain text (tests, or a snapshot for a log file).
+        """
+
         console = Console(width=width, height=height, force_terminal=False, color_system=None)
         with console.capture() as capture:
             console.print(self)

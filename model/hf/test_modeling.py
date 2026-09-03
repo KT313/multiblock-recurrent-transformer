@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.hf.modeling`: recurrence-step parsing, config conversion and the trust_remote_code export round trip."""
+"""
+Tests for `model.hf.modeling`: recurrence-step parsing, config conversion and the trust_remote_code export round trip.
+"""
 
 import json
 import os
@@ -56,7 +58,10 @@ def test_parse_recurrence_steps_length_mismatch() -> None:
 
 
 def fake_package(root: Path) -> Path:
-    """`a.py`, `pkg/{__init__,b,c}.py`, `pkg/sub/d.py`, a test file and a `__pycache__` entry."""
+    """
+    `a.py`, `pkg/{__init__,b,c}.py`, `pkg/sub/d.py`, a test file and a `__pycache__` entry.
+    """
+
     pkg = root / "package"
     for rel, text in {
         "__init__.py": "from .a import A\n",
@@ -147,7 +152,10 @@ def test_config_round_trip() -> None:
 
 
 def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
-    """Keys missing from a config.json fall back to `RecurrentConfig()` (the export has no access to config/)."""
+    """
+    Keys missing from a config.json fall back to `RecurrentConfig()` (the export has no access to config/).
+    """
+
     hf_cfg = RecurrentGPTConfig()
     defaults = RecurrentConfig()
     assert hf_cfg.n_layers_in_recurrent_block == defaults.n_layers_in_recurrent_block == [4]
@@ -185,8 +193,11 @@ def test_wrapper_forward_matches_inner_model_in_eval() -> None:
 
 
 def test_wrapper_loss_is_the_next_token_loss_shifted_internally() -> None:
-    """The HF contract: `model(x, labels=x).loss` predicts token t+1 from token t. The INNER model takes
-    pre-shifted labels (the trainer's collate shifts), so its own loss on the same call is a different number."""
+    """
+    The HF contract: `model(x, labels=x).loss` predicts token t+1 from token t. The INNER model takes
+    pre-shifted labels (the trainer's collate shifts), so its own loss on the same call is a different number.
+    """
+
     hf_model = tiny_hf_model().train(False)
     x = ids(2, 8)
     torch.manual_seed(1)
@@ -241,8 +252,11 @@ def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The env var fixes the eval depths with zero backprop iterations: honouring it in training mode would train
-    the recurrence without any gradient reaching it."""
+    """
+    The env var fixes the eval depths with zero backprop iterations: honouring it in training mode would train
+    the recurrence without any gradient reaching it.
+    """
+
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,1")
     hf_model = tiny_hf_model().train(True)
     hf_model.model.step = 3
@@ -261,8 +275,11 @@ def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.Mo
 
 
 def test_hf_config_broadcasts_the_per_block_int_shorthand() -> None:
-    """`mean_recurrence: 12` for every block is the documented shorthand `RecurrentConfig` broadcasts; the wrapper's
-    config used to raise a TypeError on it (it zipped over an int)."""
+    """
+    `mean_recurrence: 12` for every block is the documented shorthand `RecurrentConfig` broadcasts; the wrapper's
+    config used to raise a TypeError on it (it zipped over an int).
+    """
+
     hf_cfg = RecurrentGPTConfig(n_layers_in_recurrent_block=[2, 2, 2], mean_recurrence=3, mean_backprop_depth=2)
     assert hf_cfg.mean_recurrence == [3, 3, 3] and hf_cfg.mean_backprop_depth == [2, 2, 2]
     assert hf_cfg.num_hidden_layers == hf_cfg.to_recurrent_config().effective_expected_depth
@@ -281,8 +298,11 @@ def test_mask_padded_vocabulary_helper() -> None:
 
 
 def test_padded_vocabulary_columns_are_masked_and_never_generated() -> None:
-    """The embedding table is padded to `padding_multiple` and those columns are trained on no target, so the
-    wrapper hides them: `generate(do_sample=True)` can only draw ids the tokenizer knows."""
+    """
+    The embedding table is padded to `padding_multiple` and those columns are trained on no target, so the
+    wrapper hides them: `generate(do_sample=True)` can only draw ids the tokenizer knows.
+    """
+
     cfg = tiny_config(vocab_size=500, padding_multiple=512)
     assert (cfg.vocab_size, cfg.padded_vocab_size) == (500, 512)
     torch.manual_seed(0)
@@ -302,8 +322,11 @@ def test_padded_vocabulary_columns_are_masked_and_never_generated() -> None:
 
 @pytest.fixture
 def zero_latent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Zero the random latent state: with it, an eval-mode forward at a fixed recurrence depth is deterministic and
-    two differently shaped batches of the same tokens can be compared."""
+    """
+    Zero the random latent state: with it, an eval-mode forward at a fixed recurrence depth is deterministic and
+    two differently shaped batches of the same tokens can be compared.
+    """
+
     monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
 
 
@@ -312,8 +335,11 @@ PADDING_MASK = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
 
 
 def test_left_padded_batch_gives_the_logits_of_the_single_prompts(zero_latent: None) -> None:
-    """The wrapper's own path (`prepare_inputs_for_generation` -> `forward`): a left-padded batch must attend to no
-    pad and count no pad as a position, so every row's real positions have the logits of that prompt run alone."""
+    """
+    The wrapper's own path (`prepare_inputs_for_generation` -> `forward`): a left-padded batch must attend to no
+    pad and count no pad as a position, so every row's real positions have the logits of that prompt run alone.
+    """
+
     hf_model = tiny_hf_model().train(False)
     prepared = hf_model.prepare_inputs_for_generation(PADDED, attention_mask=PADDING_MASK)
     batched = hf_model(**prepared).logits
@@ -352,7 +378,10 @@ def test_generate_batches_left_padded_prompts_like_single_prompts(zero_latent: N
 
 
 def load_exported(out_dir: Path) -> RecurrentGPTForCausalLM:
-    """The dynamically loaded class is a copy of `RecurrentGPTForCausalLM` with an identical interface."""
+    """
+    The dynamically loaded class is a copy of `RecurrentGPTForCausalLM` with an identical interface.
+    """
+
     loaded = cast(RecurrentGPTForCausalLM, AutoModelForCausalLM.from_pretrained(out_dir, trust_remote_code=True))
     loaded.train(False)
     return loaded
@@ -448,8 +477,11 @@ def test_generate_runs(tmp_path: Path) -> None:
 
 
 def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> None:
-    """The copied sources must work without `model` importable: load in a subprocess whose cwd is the temp dir and
-    whose only `sys.path` entries are the interpreter's own, then compare logits with the un-exported model."""
+    """
+    The copied sources must work without `model` importable: load in a subprocess whose cwd is the temp dir and
+    whose only `sys.path` entries are the interpreter's own, then compare logits with the un-exported model.
+    """
+
     torch.manual_seed(0)
     model = build_model(TINY_ARCHITECTURE)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")

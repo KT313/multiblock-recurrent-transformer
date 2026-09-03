@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The smoothed steps-per-second estimate behind the ETA of the bars, the metrics table and the fallback lines."""
+"""
+The smoothed steps-per-second estimate behind the ETA of the bars, the metrics table and the fallback lines.
+"""
 
 from __future__ import annotations
 
@@ -11,11 +13,12 @@ RATE_SMOOTHING = 0.1  # weight of the newest seconds/step sample in the exponent
 
 
 class Throughput:
-    """Smoothed seconds per optimizer step from the times :meth:`record` is called with, and the ETA derived from it.
+    """
+    Smoothed seconds per optimizer step from the times :meth:`record` is called with, and the ETA derived from it.
 
-    The first interval sets the estimate, the second replaces it (the first interval holds ``torch.compile`` and the
+    The first interval sets the estimate, the second replaces it (the first interval holds torch.compile and the
     loader start-up, an outlier), later ones move it by :data:`RATE_SMOOTHING` (an exponential moving average, so
-    one slow step does not swing the ETA). ``start_step`` is the step the run (re)starts at, so a resumed run does
+    one slow step does not swing the ETA). start_step is the step the run (re)starts at, so a resumed run does
     not count the checkpointed steps as done in zero seconds.
     """
 
@@ -29,7 +32,10 @@ class Throughput:
         self._samples = 0
 
     def record(self, step: int) -> None:
-        """Note that ``step`` optimizer steps are done now (a step not beyond the last recorded one is ignored)."""
+        """
+        Note that step optimizer steps are done now (a step not beyond the last recorded one is ignored).
+        """
+
         now = self._clock()
         advanced = step - self._last_step
         if advanced <= 0:
@@ -55,7 +61,10 @@ class Throughput:
         return 1.0 / self.seconds_per_step
 
     def remaining(self, step: int) -> float | None:
-        """Estimated seconds until ``total_steps`` (None before the first interval)."""
+        """
+        Estimated seconds until total_steps (None before the first interval).
+        """
+
         if self.seconds_per_step is None:
             return None
         return self.seconds_per_step * max(self._total_steps - step, 0)

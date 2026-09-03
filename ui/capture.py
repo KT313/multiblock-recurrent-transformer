@@ -1,25 +1,26 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""How both live dashboards keep the terminal to themselves.
+"""
+How both live dashboards keep the terminal to themselves.
 
-A dashboard is a :class:`LogSink`: something with ``write(text, *, keep=False)``. While its display is up:
+A dashboard is a :class:`LogSink`: something with write(text, *, keep=False). While its display is up:
 
 * :class:`LoggingCapture` puts a :class:`DashboardLogHandler` on the root logger and detaches every plain console
-  ``StreamHandler`` (the ones ``huggingface_hub`` / ``datasets`` / ``transformers`` install at import), which would
+  StreamHandler (the ones huggingface_hub / datasets / transformers install at import), which would
   write behind the display,
-* :class:`StreamCapture` replaces ``sys.stdout`` / ``sys.stderr`` with :class:`LineSink`\\ s that turn writes into
+* :class:`StreamCapture` replaces sys.stdout / sys.stderr with :class:`LineSink`\\ s that turn writes into
   log records,
-* :func:`attach_logger` routes one logger (``data_preparation`` / ``training``) into the sink directly and appends
+* :func:`attach_logger` routes one logger (data_preparation / training) into the sink directly and appends
   its records to a log file.
 
 Three pitfalls handled here once:
 
-* **Recursion.** A handler that fails while emitting reports to ``sys.stderr``, which is the line sink, which logs
+* Recursion. A handler that fails while emitting reports to sys.stderr, which is the line sink, which logs
   again. :class:`LineSink` keeps a thread-local re-entrancy flag and sends such writes to the saved real stream;
-  :meth:`DashboardLogHandler.handleError` writes to the real stderr, never through ``logging``.
-* **``sys.stdout.fileno()``.** A bare ``io.TextIOBase`` has none; :meth:`LineSink.fileno` answers with the real
+  :meth:`DashboardLogHandler.handleError` writes to the real stderr, never through logging.
+* sys.stdout.fileno(). A bare io.TextIOBase has none; :meth:`LineSink.fileno` answers with the real
   stream's.
-* **Loggers created during iteration.** wandb's threads create loggers while a run is up; :func:`existing_loggers`
-  snapshots ``loggerDict`` under the ``logging`` lock.
+* Loggers created during iteration. wandb's threads create loggers while a run is up; :func:`existing_loggers`
+  snapshots loggerDict under the logging lock.
 """
 
 from __future__ import annotations
@@ -39,21 +40,29 @@ from data_preparation.lib.log import LOG_FORMAT
 
 
 class LogSink(Protocol):
-    """What :class:`DashboardLogHandler` writes to: a dashboard's log panel (or, disabled, its stream)."""
+    """
+    What :class:`DashboardLogHandler` writes to: a dashboard's log panel (or, disabled, its stream).
+    """
 
     def write(self, text: str, *, keep: bool = False) -> None: ...
 
 
 def is_console_handler(handler: logging.Handler) -> TypeGuard[logging.StreamHandler[Any]]:
-    """A plain ``StreamHandler`` (a terminal writer) rather than a file / dashboard / library handler."""
+    """
+    A plain StreamHandler (a terminal writer) rather than a file / dashboard / library handler.
+    """
+
     return isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
 
 
 def existing_loggers() -> list[logging.Logger]:
-    """Every logger that exists right now, plus the root logger.
+    """
+    Every logger that exists right now, plus the root logger.
 
-    The dict is copied under the ``logging`` module's own lock: wandb's background threads create loggers while a
-    run is up, and iterating it directly can raise "dictionary changed size during iteration"."""
+    The dict is copied under the logging module's own lock: wandb's background threads create loggers while a
+    run is up, and iterating it directly can raise "dictionary changed size during iteration".
+    """
+
     acquire: Callable[[], None] | None = getattr(logging, "_acquireLock", None)
     release: Callable[[], None] | None = getattr(logging, "_releaseLock", None)
     if acquire is None or release is None:  # pragma: no cover - the private lock helpers exist in every CPython 3.x
@@ -70,12 +79,14 @@ def existing_loggers() -> list[logging.Logger]:
 
 
 class LineSink(io.TextIOBase):
-    """A ``sys.stdout`` / ``sys.stderr`` replacement: complete lines go to ``emit``, a carriage return discards the
+    """
+    A sys.stdout / sys.stderr replacement: complete lines go to emit, a carriage return discards the
     line so far (a tqdm bar delivers only its final state), the rest is emitted on :meth:`close_flush`.
 
-    ``real_stream`` is the stream this one replaced (``sys.__stderr__`` when not given): where :meth:`fileno` points
-    and where a re-entrant write goes, one arriving while this thread is already inside ``emit`` (see the module
-    docstring)."""
+    real_stream is the stream this one replaced (sys.__stderr__ when not given): where :meth:`fileno` points
+    and where a re-entrant write goes, one arriving while this thread is already inside emit (see the module
+    docstring).
+    """
 
     def __init__(self, emit: Callable[[str], None], *, real_stream: TextIO | None = None) -> None:
         super().__init__()
@@ -87,7 +98,10 @@ class LineSink(io.TextIOBase):
 
     @property
     def real_stream(self) -> TextIO | None:
-        """The stream this sink replaced: the target of re-entrant writes and of :meth:`fileno`."""
+        """
+        The stream this sink replaced: the target of re-entrant writes and of :meth:`fileno`.
+        """
+
         return self._real_stream if self._real_stream is not None else sys.__stderr__
 
     def writable(self) -> bool:
@@ -120,7 +134,10 @@ class LineSink(io.TextIOBase):
         return False
 
     def fileno(self) -> int:
-        """The descriptor of the replaced stream, so a library asking ``sys.stdout`` for one gets the terminal'text."""
+        """
+        The descriptor of the replaced stream, so a library asking sys.stdout for one gets the terminal'text.
+        """
+
         stream = self.real_stream
         if stream is None:
             raise io.UnsupportedOperation("fileno")
@@ -138,11 +155,13 @@ class LineSink(io.TextIOBase):
 
 
 class DashboardLogHandler(logging.Handler):
-    """``logging.Handler`` whose records land in ``sink``, a dashboard's log panel (or its stream when disabled).
+    """
+    logging.Handler whose records land in sink, a dashboard's log panel (or its stream when disabled).
 
-    Records at ``keep_level`` and above (default WARNING) and records logged with ``extra={"keep": True}`` are
+    Records at keep_level and above (default WARNING) and records logged with extra={"keep": True} are
     *kept*: the dashboards print them once after the display closed, so they survive in the terminal's history.
-    ``already_attached`` names loggers that reach the sink through another handler already, so a record is not written twice."""
+    already_attached names loggers that reach the sink through another handler already, so a record is not written twice.
+    """
 
     def __init__(
         self,
@@ -171,8 +190,11 @@ class DashboardLogHandler(logging.Handler):
             self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """Report a failing :meth:`emit` on the saved real stderr, never through ``logging`` or ``sys.stderr`` (a
-        :class:`LineSink` while a display is up, which would recurse)."""
+        """
+        Report a failing :meth:`emit` on the saved real stderr, never through logging or sys.stderr (a
+        :class:`LineSink` while a display is up, which would recurse).
+        """
+
         if not logging.raiseExceptions:
             return
         stream = self._error_stream if self._error_stream is not None else sys.__stderr__
@@ -191,12 +213,15 @@ class DashboardLogHandler(logging.Handler):
 def attach_logger(
     sink: LogSink, logger: logging.Logger, log_file: Path | None, *, ensure_info_level: bool = False
 ) -> Iterator[logging.FileHandler | None]:
-    """Route ``logger`` into ``sink`` for the block (the body of both dashboards' ``attach``).
+    """
+    Route logger into sink for the block (the body of both dashboards' attach).
 
     The logger's plain stream handlers are detached for the block (their lines would garble the display) and
-    restored afterwards. With ``log_file`` every record is also appended to that file. With ``ensure_info_level`` a
-    logger above INFO is lowered to INFO for the block. Yields the file handler (None without ``log_file``); the
-    training dashboard writes its step / validation / event lines to it directly."""
+    restored afterwards. With log_file every record is also appended to that file. With ensure_info_level a
+    logger above INFO is lowered to INFO for the block. Yields the file handler (None without log_file); the
+    training dashboard writes its step / validation / event lines to it directly.
+    """
+
     detached_handlers: list[logging.Handler] = [handler for handler in logger.handlers if is_console_handler(handler)]
     added_handlers: list[logging.Handler] = [DashboardLogHandler(sink)]
     file_handler: logging.FileHandler | None = None
@@ -224,9 +249,11 @@ def attach_logger(
 
 
 class LoggingCapture:
-    """Every ``logging`` record into ``sink`` between :meth:`start` and :meth:`stop`: a :class:`DashboardLogHandler`
-    on the root logger (``already_attached`` names loggers an attached handler already covers) while every plain console
-    ``StreamHandler`` of every logger is detached. Both methods are idempotent."""
+    """
+    Every logging record into sink between :meth:`start` and :meth:`stop`: a :class:`DashboardLogHandler`
+    on the root logger (already_attached names loggers an attached handler already covers) while every plain console
+    StreamHandler of every logger is detached. Both methods are idempotent.
+    """
 
     def __init__(self, sink: LogSink, *, already_attached: Callable[[str], bool] | None = None) -> None:
         self._sink = sink
@@ -262,9 +289,11 @@ class LoggingCapture:
 
 
 class StreamCapture:
-    """``sys.stdout`` / ``sys.stderr`` replaced by :class:`LineSink`\\ s that log what is written (INFO / WARNING) on
+    """
+    sys.stdout / sys.stderr replaced by :class:`LineSink`\\ s that log what is written (INFO / WARNING) on
     the two given loggers, so stray prints and tqdm's final line reach the log panel. :meth:`redirect` and
-    :meth:`release` are idempotent; :meth:`release` logs what a sink still holds without a newline."""
+    :meth:`release` are idempotent; :meth:`release` logs what a sink still holds without a newline.
+    """
 
     def __init__(self, stdout_logger_name: str, stderr_logger_name: str) -> None:
         self._stdout_logger_name = stdout_logger_name

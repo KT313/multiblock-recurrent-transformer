@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.blocks.recurrence`: step canonicalisation and broadcasting, the latent state init, the
-poisson-lognormal-filling depth sampler and the (no-grad, backprop) iteration loop."""
+"""
+Tests for `model.blocks.recurrence`: step canonicalisation and broadcasting, the latent state init, the
+poisson-lognormal-filling depth sampler and the (no-grad, backprop) iteration loop.
+"""
 
 from typing import Any
 
@@ -88,8 +90,11 @@ def test_sampler_respects_backprop_bound_and_is_positive() -> None:
 
 
 def test_sampler_total_depth_mean_is_mean_recurrence_plus_one() -> None:
-    """n + k == p == Poisson(LogNormal(log(t+s) - sigma^2/2, sigma)) + 1, whose mean is mean_recurrence + 1
-    (the +1 is inherited from upstream and kept for identity). Also: k == min(s, p), n == p - k."""
+    """
+    n + k == p == Poisson(LogNormal(log(t+s) - sigma^2/2, sigma)) + 1, whose mean is mean_recurrence + 1
+    (the +1 is inherited from upstream and kept for identity). Also: k == min(s, p), n == p - k.
+    """
+
     for mean, s in ((12, 8), (4, 3)):
         totals = []
         for step in range(2000):
@@ -112,7 +117,10 @@ def test_sampler_deterministic_in_step_independent_of_global_rng() -> None:
 
 
 def test_sampler_advances_global_rng() -> None:
-    """The (meta-check) `torch.rand` draw advances the global RNG; pinned for bit-identity with the thesis code."""
+    """
+    The (meta-check) `torch.rand` draw advances the global RNG; pinned for bit-identity with the thesis code.
+    """
+
     for training in (True, False):
         torch.manual_seed(0)
         sample_recurrence_steps(2, 2, step=0, training=training)
@@ -171,7 +179,10 @@ def test_iterate_core_block_matches_manual_loop(tiny_model: RecurrentGPT) -> Non
 def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
     tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, n: int, k: int
 ) -> None:
-    """(n, k) is not symmetric: exactly the first n core-block applications happen under no_grad."""
+    """
+    (n, k) is not symmetric: exactly the first n core-block applications happen under no_grad.
+    """
+
     grad_modes: list[bool] = []
     orig = recurrence.core_block_forward
 

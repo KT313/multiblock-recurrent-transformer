@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the Bloom-filter exact-dedup set (tiny 1 MB budgets)."""
+"""
+Tests for the Bloom-filter exact-dedup set (tiny 1 MB budgets).
+"""
 
 from __future__ import annotations
 
@@ -37,7 +39,10 @@ INT64_MAX = (1 << 63) - 1
     ],
 )
 def test_text_hash64_pins_the_stored_keys(text: str, normalized: int, raw: int) -> None:
-    """The `hash` column of every processed shard on disk holds these values: the function must never change them."""
+    """
+    The `hash` column of every processed shard on disk holds these values: the function must never change them.
+    """
+
     assert text_hash64(text) == normalized and text_hash64(text, normalize=False) == raw
 
 
@@ -50,7 +55,10 @@ def test_text_hash64_normalizes_case_and_whitespace() -> None:
 
 
 def _random_hashes(count: int, seed: int) -> list[int]:
-    """``count`` distinct signed 64-bit integers, the range :func:`text_hash64` produces."""
+    """
+    count distinct signed 64-bit integers, the range :func:`text_hash64` produces.
+    """
+
     rng = random.Random(seed)
     values: set[int] = set()
     while len(values) < count:

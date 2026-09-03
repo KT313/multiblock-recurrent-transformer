@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.model.RecurrentGPT`: gradient flow through every layer, step handling, the recurrence
-sampler, loss masking, gradient checkpointing and the seeded golden forward (numerics regression guard)."""
+"""
+Tests for `model.model.RecurrentGPT`: gradient flow through every layer, step handling, the recurrence
+sampler, loss masking, gradient checkpointing and the seeded golden forward (numerics regression guard).
+"""
 
 from pathlib import Path
 from typing import Any, cast
@@ -33,7 +35,10 @@ def core_block(model: RecurrentGPT, idx: int) -> torch.nn.ModuleList:
 
 
 def per_block(values: int | list[int]) -> list[int]:
-    """`RecurrentConfig` normalizes per-block fields to lists; narrow the declared union for the type checkers."""
+    """
+    `RecurrentConfig` normalizes per-block fields to lists; narrow the declared union for the type checkers.
+    """
+
     assert isinstance(values, list)
     return values
 
@@ -61,8 +66,11 @@ def test_structure_follows_config(tiny_model: RecurrentGPT) -> None:
 
 
 def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
-    """Module and parameter names of the tiny model (checkpoint / HF export compatibility): recorded from the thesis
-    code, any change here breaks every saved checkpoint."""
+    """
+    Module and parameter names of the tiny model (checkpoint / HF export compatibility): recorded from the thesis
+    code, any change here breaks every saved checkpoint.
+    """
+
     expected = [
         "freqs_cis",
         "transformer.wte.weight",
@@ -220,7 +228,10 @@ def test_train_forward_backward_every_layer_gets_gradient(tiny_model: RecurrentG
 
 
 def test_prelude_layers_chain(tiny_model: RecurrentGPT) -> None:
-    """Each prelude layer feeds the next: zeroing layer 0's contribution changes what layer 1 sees."""
+    """
+    Each prelude layer feeds the next: zeroing layer 0's contribution changes what layer 1 sees.
+    """
+
     x = ids()
     seen_in: list[Tensor] = []
     seen_out: list[Tensor] = []
@@ -240,9 +251,12 @@ def test_prelude_layers_chain(tiny_model: RecurrentGPT) -> None:
 
 
 def test_forward_matches_hand_composed_pipeline(tiny_model: RecurrentGPT) -> None:
-    """Spell out the architecture (CLAUDE.md "RecurrentGPT forward") with explicit steps and check the logits: scaled
+    """
+    Spell out the architecture (CLAUDE.md "RecurrentGPT forward") with explicit steps and check the logits: scaled
     embedding -> chained prelude -> per block: iterate (norm, random latent, n + k iterations) then residual onto the
-    block input, which becomes the next block's input -> coda -> ln_final -> tied head -> fp32 logits."""
+    block input, which becomes the next block's input -> coda -> ln_final -> tied head -> fp32 logits.
+    """
+
     steps = [(2, 1), (1, 2)]
     x = ids(1, 10)
     torch.manual_seed(9)
@@ -297,8 +311,11 @@ def test_eval_sampler_returns_mean_recurrence_and_zero_grad_steps(tiny_model: Re
 def test_eval_forward_is_deterministic_under_a_seed_and_equals_explicit_mean_steps(
     tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Eval mode draws no recurrence depth, but the latent init still consumes the global RNG, so determinism holds
-    under a fixed seed (not across two un-seeded calls)."""
+    """
+    Eval mode draws no recurrence depth, but the latent init still consumes the global RNG, so determinism holds
+    under a fixed seed (not across two un-seeded calls).
+    """
+
     tiny_model.eval()
     x = ids()
     torch.manual_seed(5)
@@ -366,7 +383,10 @@ def test_per_block_depths_actually_differ(tiny_model: RecurrentGPT) -> None:
 def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
     tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, n: int, k: int
 ) -> None:
-    """(n, k) is not symmetric: exactly the first n core-block applications happen under no_grad."""
+    """
+    (n, k) is not symmetric: exactly the first n core-block applications happen under no_grad.
+    """
+
     grad_modes: list[bool] = []
     orig = recurrence.core_block_forward
 
@@ -390,8 +410,11 @@ def test_no_grad_steps_cut_gradient_when_k_is_zero(tiny_model: RecurrentGPT) -> 
 
 
 def test_position_ids_select_rope_rows(tiny_model: RecurrentGPT) -> None:
-    """`position_ids` index the RoPE table along the sequence axis: a shifted contiguous range gives the same logits
-    (relative positions unchanged), a permuted one does not. S=6 differs from every other table axis (1, 256, 8, 2)."""
+    """
+    `position_ids` index the RoPE table along the sequence axis: a shifted contiguous range gives the same logits
+    (relative positions unchanged), a permuted one does not. S=6 differs from every other table axis (1, 256, 8, 2).
+    """
+
     tiny_model.eval()
     x = ids(1, 6)
     torch.manual_seed(1)
@@ -415,7 +438,10 @@ def freqs_table(sequence_length: int = 8, head_size: int = 4) -> Tensor:
 
 
 def test_prepare_attention_inputs_without_arguments_is_the_plain_causal_path() -> None:
-    """The training path: the first S rows and no mask at all, so `attention_sdpa` keeps `is_causal=True`."""
+    """
+    The training path: the first S rows and no mask at all, so `attention_sdpa` keeps `is_causal=True`.
+    """
+
     table = freqs_table()
     x = ids(2, 6)
     rotary, mask = model_module.prepare_attention_inputs(table, x)
@@ -447,8 +473,11 @@ def test_prepare_attention_inputs_rejects_shapes_it_cannot_use() -> None:
 
 
 def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
-    """The mask carries the causal triangle itself (sdpa's math kernel rejects a mask next to `is_causal=True`),
-    and no query row is ever fully masked: an all-masked row would make softmax NaN and the NaN would spread."""
+    """
+    The mask carries the causal triangle itself (sdpa's math kernel rejects a mask next to `is_causal=True`),
+    and no query row is ever fully masked: an all-masked row would make softmax NaN and the NaN would spread.
+    """
+
     table = freqs_table()
     x = ids(2, 4)
     ints = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
@@ -470,8 +499,11 @@ def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
 def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
     tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End to end through the model: with the mask, the real positions of a left-padded row give the same logits as
-    the row on its own. The latent state is the only randomness left in eval mode; it is zeroed so both runs match."""
+    """
+    End to end through the model: with the mask, the real positions of a left-padded row give the same logits as
+    the row on its own. The latent state is the only randomness left in eval mode; it is zeroed so both runs match.
+    """
+
     monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
     tiny_model.eval()
     real = torch.tensor([[5, 7, 11]])
@@ -587,8 +619,11 @@ def test_custom_ignore_index() -> None:
 
 
 def golden_forward() -> dict[str, torch.Tensor]:
-    """`tiny` built with seed 0, input ids from generator seed 1, global seed 123 before a train-mode forward at
-    step 0 (sampled recurrence depths + random latent init)."""
+    """
+    `tiny` built with seed 0, input ids from generator seed 1, global seed 123 before a train-mode forward at
+    step 0 (sampled recurrence depths + random latent init).
+    """
+
     model = seeded_tiny(0)
     x = ids(2, 32, seed=1)
     torch.manual_seed(123)
@@ -597,18 +632,23 @@ def golden_forward() -> dict[str, torch.Tensor]:
 
 
 def record_golden() -> Path:
-    """Re-record `golden_tiny_forward.pt`. ONLY do this in a commit whose purpose is a numerics change:
-    `uv run python -c "from model.test_model import record_golden; record_golden()"`."""
+    """
+    Re-record `golden_tiny_forward.pt`. ONLY do this in a commit whose purpose is a numerics change:
+    `uv run python -c "from model.test_model import record_golden; record_golden()"`.
+    """
+
     torch.save(golden_forward(), GOLDEN_PATH)
     return GOLDEN_PATH
 
 
 def test_golden_tiny_forward() -> None:
-    """Numerics regression guard: seeded `tiny` forward must reproduce the committed logits/loss (atol 1e-5).
+    """
+    Numerics regression guard: seeded `tiny` forward must reproduce the committed logits/loss (atol 1e-5).
 
     The golden file `model/golden_tiny_forward.pt` may only be re-recorded (via `record_golden()`) in a commit whose
     explicit purpose is a numerics change; any other failure here is a regression in the model code.
     """
+
     assert GOLDEN_PATH.exists(), "golden file missing; record it with record_golden() in a numerics commit"
     golden = torch.load(GOLDEN_PATH, weights_only=True)
     got = golden_forward()

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the logging handler, the run's log-file handlers, and the terminal capture around the live display."""
+"""
+Tests for the logging handler, the run's log-file handlers, and the terminal capture around the live display.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +30,9 @@ from training.ui.testing import LOGGER_NAME
 
 
 class RecordingSink:
-    """A ``LogSink`` remembering what it was given."""
+    """
+    A LogSink remembering what it was given.
+    """
 
     def __init__(self) -> None:
         self.written: list[tuple[str, bool]] = []
@@ -41,12 +45,18 @@ class RecordingSink:
 
 
 def _streams() -> tuple[object, object]:
-    """``(sys.stdout, sys.stderr)`` through a call: mypy would otherwise keep the narrowing of an earlier assertion."""
+    """
+    (sys.stdout, sys.stderr) through a call: mypy would otherwise keep the narrowing of an earlier assertion.
+    """
+
     return sys.stdout, sys.stderr
 
 
 def _redirected(capture: TerminalCapture) -> bool:
-    """``capture.streams_redirected`` through a call, for the same reason (mypy narrows attribute expressions)."""
+    """
+    capture.streams_redirected through a call, for the same reason (mypy narrows attribute expressions).
+    """
+
     return capture.streams_redirected
 
 

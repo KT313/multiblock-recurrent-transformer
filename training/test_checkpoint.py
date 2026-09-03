@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the checkpoint schema (`CheckpointMetadata`), naming/search, the save decision, save→load→forward
-bit-identity and optimizer state."""
+"""
+Tests for the checkpoint schema (`CheckpointMetadata`), naming/search, the save decision, save→load→forward
+bit-identity and optimizer state.
+"""
 
 from dataclasses import asdict, fields
 from pathlib import Path
@@ -80,7 +82,10 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
 
 
 def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
-    """No tolerance for older layouts (clean break): a missing key names itself instead of becoming a default."""
+    """
+    No tolerance for older layouts (clean break): a missing key names itself instead of becoming a default.
+    """
+
     state = _metadata(backend, tiny_model).to_state()
     del state["validation_rows"]
     state["config"] = state.pop("settings")  # the pre-restructure key name
@@ -167,9 +172,12 @@ def test_find_latest_checkpoint_ignores_runs_with_a_longer_name(tmp_path: Path, 
 
 
 def test_is_checkpoint_step_table() -> None:
-    """Three rules: every `save_step_interval` steps, the last step (`total_steps`) if `save_last_step`, and the
+    """
+    Three rules: every `save_step_interval` steps, the last step (`total_steps`) if `save_last_step`, and the
     step after the last plain step of a stage (`stage_ending_at`). Two stages of 12 + 8 optimizer steps (4 × 256
-    tokens each, no transition): stage 0 ends with step 12, the run with step 20."""
+    tokens each, no transition): stage 0 ends with step 12, the run with step 20.
+    """
+
     stages = [
         resolved_stage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
         resolved_stage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
@@ -216,8 +224,11 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
 
 
 def test_every_settings_field_is_classified() -> None:
-    """Every Settings field is either exempted or compared on resume (with a differing value in the table above),
-    and every exempted name is a real field; a typo in the exemption tuple would silently compare nothing."""
+    """
+    Every Settings field is either exempted or compared on resume (with a differing value in the table above),
+    and every exempted name is a real field; a typo in the exemption tuple would silently compare nothing.
+    """
+
     field_names = {f.name for f in fields(Settings)}
     exempt = set(SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME)
     assert exempt <= field_names
@@ -228,10 +239,13 @@ def test_every_settings_field_is_classified() -> None:
 def test_check_settings_unchanged_catches_every_compared_setting(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
-    """Each compared field fails a resume on its own, the eval knobs included: every forward draws from the global
+    """
+    Each compared field fails a resume on its own, the eval knobs included: every forward draws from the global
     torch RNG, so how often and how widely validation runs changes the training stream itself. The weight-decay
     grouping flag is refused even under `allow_settings_change`: the restored optimizer keeps the checkpoint's
-    parameter groups, so the new value could never take effect."""
+    parameter groups, so the new value could never take effect.
+    """
+
     metadata = _metadata(backend, tiny_model)
     config = tiny_model.config.to_dict()
     check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), config, False)  # nothing changed
@@ -250,7 +264,10 @@ def test_check_settings_unchanged_catches_every_compared_setting(
 def test_check_settings_unchanged_ignores_the_exempt_settings(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
-    """Paths, run bookkeeping, logging and the resume features themselves may differ from the checkpoint."""
+    """
+    Paths, run bookkeeping, logging and the resume features themselves may differ from the checkpoint.
+    """
+
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
@@ -265,8 +282,11 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
 def test_check_settings_unchanged_treats_a_missing_stored_key_as_changed(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
-    """A checkpoint from an older code version that did not store a (newer) compared field fails the resume naming
-    it (fail fast, `allow_settings_change` overrides); a stored key that is no longer a Settings field is ignored."""
+    """
+    A checkpoint from an older code version that did not store a (newer) compared field fails the resume naming
+    it (fail fast, `allow_settings_change` overrides); a stored key that is no longer a Settings field is ignored.
+    """
+
     metadata = _metadata(backend, tiny_model)
     del metadata.settings["grad_clip"]
     metadata.settings["a_removed_setting"] = 123  # not a field any more: ignored
@@ -371,7 +391,9 @@ def test_load_of_an_older_layout_fails_before_touching_the_model(
 def test_compiled_wrapper_is_unwrapped_for_state_dict(
     tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
-    """State-dict keys must not carry an `_orig_mod.` prefix when the model is a torch.compile wrapper."""
+    """
+    State-dict keys must not carry an `_orig_mod.` prefix when the model is a torch.compile wrapper.
+    """
 
     class Wrapper(torch.nn.Module):
         def __init__(self, inner: torch.nn.Module) -> None:

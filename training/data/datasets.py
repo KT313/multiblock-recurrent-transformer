@@ -1,6 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Streaming parquet datasets. Rows are yielded as dicts; tokenization happens in the collate function."""
+"""
+Streaming parquet datasets. Rows are yielded as dicts; tokenization happens in the collate function.
+"""
 
 import logging
 import random
@@ -21,12 +23,13 @@ PARQUET_READ_BATCH_ROWS = 1024
 
 
 class ParquetTextDataset(IterableDataset[Row]):
-    """One directory of parquet files, streamed in sorted file order without shuffling.
+    """
+    One directory of parquet files, streamed in sorted file order without shuffling.
 
-    Each row is a dict with the ``data_signature["keys"]`` columns plus ``data_signature`` and ``data_id``.
-    ``skip_rows`` / ``max_rows`` restrict the dataset to the row range ``[skip_rows, skip_rows + max_rows)``, clipped
-    to the rows that exist. One ``__iter__`` is one epoch over the range, dealt round-robin over
-    ``world * num_workers`` shards. ``set_resume_offset`` starts the next epoch that many rows into the range;
+    Each row is a dict with the data_signature["keys"] columns plus data_signature and data_id.
+    skip_rows / max_rows restrict the dataset to the row range [skip_rows, skip_rows + max_rows), clipped
+    to the rows that exist. One __iter__ is one epoch over the range, dealt round-robin over
+    world * num_workers shards. set_resume_offset starts the next epoch that many rows into the range;
     `RunDataloaders` sets it before the first epoch after a resume and back to 0 before every later one.
     """
 
@@ -64,26 +67,38 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.resume_offset = 0  # rows of the range the next epoch skips; see `set_resume_offset`
 
     def __len__(self) -> int:
-        """Rows in the range over all shards (one epoch)."""
+        """
+        Rows in the range over all shards (one epoch).
+        """
+
         return self.num_rows
 
     def set_resume_offset(self, rows: int) -> None:
-        """Skip the first `rows` rows of the range in every following epoch (taken modulo the range, so more
-        consumed rows than the range holds wrap around to where the last epoch stood)."""
+        """
+        Skip the first `rows` rows of the range in every following epoch (taken modulo the range, so more
+        consumed rows than the range holds wrap around to where the last epoch stood).
+        """
+
         if rows < 0:
             raise ValueError(f"{self.prefix}: resume offset must be non-negative, got {rows}")
         self.resume_offset = rows % self.num_rows if self.num_rows else 0
 
     def _shard(self) -> tuple[int, int]:
-        """(shard_id, num_shards) for the calling process/worker; the single place sharding is decided."""
+        """
+        (shard_id, num_shards) for the calling process/worker; the single place sharding is decided.
+        """
+
         worker = get_worker_info()
         num_workers = worker.num_workers if worker is not None else 1
         worker_id = worker.id if worker is not None else 0
         return self.rank * num_workers + worker_id, self.world_size * num_workers
 
     def _range_batches(self, keys: list[str]) -> Iterator[tuple[int, pa.RecordBatch]]:
-        """``(range_idx, batch)`` pairs covering exactly rows ``[start, stop)``; ``range_idx`` is the position of
-        the batch's first row within the range. Files and row groups outside the range are never opened/read."""
+        """
+        (range_idx, batch) pairs covering exactly rows [start, stop); range_idx is the position of
+        the batch's first row within the range. Files and row groups outside the range are never opened/read.
+        """
+
         file_start = 0
         for file, rows_in_file in zip(self.files, self.file_rows):
             file_stop = file_start + rows_in_file
@@ -135,9 +150,11 @@ class ParquetTextDataset(IterableDataset[Row]):
 
 
 class WeightedMixtureDataset(IterableDataset[T], Generic[T]):
-    """Draws each row from one of several datasets with fixed probabilities (a seeded draw per row) until every
+    """
+    Draws each row from one of several datasets with fixed probabilities (a seeded draw per row) until every
     member is read once; an exhausted member leaves the draw and the others renormalise. The validation loaders of
-    a stage with several validation sources read this."""
+    a stage with several validation sources read this.
+    """
 
     def __init__(self, datasets: Sequence[Iterable[T]], weights: Sequence[float], seed: int) -> None:
         if len(datasets) != len(weights) or not datasets:

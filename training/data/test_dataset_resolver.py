@@ -1,8 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the dataset resolver: golden comparison against the pre-dataset-config run config of the thesis run
+"""
+Tests for the dataset resolver: golden comparison against the pre-dataset-config run config of the thesis run
 (now with the validation-split row ranges), the split arithmetic and its disjointness on the tiny dataset, the
 manifest/footer cross-check and the direct filesystem check, auto-prepare, the hard error without it, cross-checks
-between run and dataset config, resume checks of the hash and of the stored split."""
+between run and dataset config, resume checks of the hash and of the stored split.
+"""
 
 import json
 import logging
@@ -158,7 +160,10 @@ def _ranges(entries: list[DataEntry]) -> list[Entry]:
 
 
 def _rows_in(directory: Path) -> int:
-    """Rows of the `data-*.parquet` shards of a processed folder (parquet footers only)."""
+    """
+    Rows of the `data-*.parquet` shards of a processed folder (parquet footers only).
+    """
+
     return sum(pq.read_metadata(path).num_rows for path in sorted(directory.glob("data-*.parquet")))
 
 
@@ -175,8 +180,11 @@ def _settings(dataset_config: Path, dataset_dir: Path, **overrides: Any) -> Sett
 
 
 def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
-    """A config with a train-only source `a`, a source `both` used in train and val (with `source_overrides`) and a
-    validation-only source `held` (`rows` given); framework for the split-arithmetic tests."""
+    """
+    A config with a train-only source `a`, a source `both` used in train and val (with `source_overrides`) and a
+    validation-only source `held` (`rows` given); framework for the split-arithmetic tests.
+    """
+
     return DatasetConfig(
         name="t",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
@@ -216,9 +224,12 @@ def test_crow_entries_match_the_previous_run_config(crow_cfg: DatasetConfig) -> 
 
 
 def test_crow_train_sources_are_one_run_wide_reader_per_source(crow_cfg: DatasetConfig) -> None:
-    """The train side of the thesis mixture as the continuous-stream design reads it: one entry per source used in
+    """
+    The train side of the thesis mixture as the continuous-stream design reads it: one entry per source used in
     training, in config order, prefix = the plain source name, range = validation holdout -> end (so stages sharing
-    a source never re-read rows)."""
+    a source never re-read rows).
+    """
+
     layout = DatasetLayout(Path("dataset"))
     validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
     sources = resolve_train_sources(crow_cfg, layout, validation_rows)
@@ -245,8 +256,11 @@ FRAMEWORK_NEUTRAL_MODULES = (
 
 
 def test_framework_neutral_modules_do_not_load_torch() -> None:
-    """The JAX/TPU-port readiness claim, enforced: importing any of these modules must not pull in torch, also
-    not through `training/data/__init__.py`, which therefore re-exports nothing."""
+    """
+    The JAX/TPU-port readiness claim, enforced: importing any of these modules must not pull in torch, also
+    not through `training/data/__init__.py`, which therefore re-exports nothing.
+    """
+
     lines = ["import importlib, sys"]
     for module in FRAMEWORK_NEUTRAL_MODULES:
         lines.append(f"importlib.import_module({module!r}); assert 'torch' not in sys.modules, {module!r}")
@@ -254,9 +268,12 @@ def test_framework_neutral_modules_do_not_load_torch() -> None:
 
 
 def test_same_source_same_split_in_every_stage(crow_cfg: DatasetConfig) -> None:
-    """fineweb_edu is validated on in both pretrain stages and trained on through one run-wide reader: every
+    """
+    fineweb_edu is validated on in both pretrain stages and trained on through one run-wide reader: every
     stage's validation entry reads the same held-out rows `[0, GOLDEN_VAL_ROWS)` and the single train source
-    starts right after them."""
+    starts right after them.
+    """
+
     layout = DatasetLayout(Path("dataset"))
     validation_rows = {name: validation_rows_of(crow_cfg, name, GOLDEN_ROWS) for name in crow_cfg.sources}
     for stage in crow_cfg.stages[:2]:
@@ -335,8 +352,11 @@ def test_resolve_splits_on_the_tiny_dataset(tiny_dataset_config: DatasetConfig, 
 def test_split_ranges_are_disjoint_and_complete(
     name: str, tiny_dataset_config: DatasetConfig, tiny_layout: DatasetLayout, tiny_dataset_dir: Path
 ) -> None:
-    """Reading the validation and the training range through `ParquetTextDataset` yields every row of the folder
-    exactly once: no row in both, counts add up."""
+    """
+    Reading the validation and the training range through `ParquetTextDataset` yields every row of the folder
+    exactly once: no row in both, counts add up.
+    """
+
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
     directory = tiny_layout.processed_dir(name)
     total = _rows_in(directory)
@@ -399,8 +419,11 @@ def _stage(val: list[DataEntry]) -> ResolvedStage:
 
 
 def test_check_entries_names_the_entry_with_an_empty_range(tiny_pretrain_dir: Path) -> None:
-    """The row counts come from `processed_row_counts` (which already refused a missing or shard-less folder), so
-    the check is pure arithmetic over the mapping: every entry's range must hold a row."""
+    """
+    The row counts come from `processed_row_counts` (which already refused a missing or shard-less folder), so
+    the check is pure arithmetic over the mapping: every entry's range must hold a row.
+    """
+
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
@@ -418,7 +441,10 @@ def test_check_entries_names_the_entry_with_an_empty_range(tiny_pretrain_dir: Pa
 
 
 def test_loader_shards_counts_workers_and_ranks() -> None:
-    """`num_workers=0` loads in the calling process: one shard per rank, not zero."""
+    """
+    `num_workers=0` loads in the calling process: one shard per rank, not zero.
+    """
+
     assert loader_shards(0, 1) == 1
     assert loader_shards(0, 4) == 4
     assert loader_shards(1, 1) == 1
@@ -437,10 +463,13 @@ def test_entry_rows_in_range_clips_to_the_rows_on_disk(tiny_pretrain_dir: Path) 
 
 
 def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_pretrain_dir: Path) -> None:
-    """An entry with fewer rows than its loader has shards leaves a shard empty; the restart of an exhausted
+    """
+    An entry with fewer rows than its loader has shards leaves a shard empty; the restart of an exhausted
     loader (or mixture member) then gets a second `StopIteration` and the run dies mid-training, so it is a setup
     error naming the entry, its rows and the shard count. Train loaders run one worker per source and validation
-    loaders in-process, so with one device everything is a single shard and only a larger world can starve one."""
+    loaders in-process, so with one device everything is a single shard and only a larger world can starve one.
+    """
+
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
@@ -473,9 +502,12 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
 
 
 def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pretrain_dir: Path) -> None:
-    """A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
+    """
+    A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
     batches, the rows of every entry dealt over `world_size` shards); several entries are read once each through
-    `WeightedMixtureDataset`."""
+    `WeightedMixtureDataset`.
+    """
+
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
@@ -493,9 +525,12 @@ def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pret
 def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     tiny_pretrain_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Too little validation data is caught at setup, not at the first evaluation step: no batch at all is a hard
+    """
+    Too little validation data is caught at setup, not at the first evaluation step: no batch at all is a hard
     error naming the stage, the entries and both numbers; fewer batches than `eval_iters` is a warning (`evaluate`
-    averages the batches it gets), and enough data passes silently."""
+    averages the batches it gets), and enough data passes silently.
+    """
+
     good = str(tiny_pretrain_dir)
     rows = {good: _rows_in(tiny_pretrain_dir)}
     stage = _stage([DataEntry("s-a", good, max_rows=4)])
@@ -522,8 +557,11 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
 def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
     tiny_dataset_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The tiny dataset's finetune validation split is a couple of rows: enough for one micro-batch (the run is
-    fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so."""
+    """
+    The tiny dataset's finetune validation split is a couple of rows: enough for one micro-batch (the run is
+    fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so.
+    """
+
     settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         resolved = resolve_dataset(settings)
@@ -533,7 +571,10 @@ def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
 
 
 def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A planner that claims completeness does not save a run whose processed folder is missing."""
+    """
+    A planner that claims completeness does not save a run whose processed folder is missing.
+    """
+
     import training.data.dataset_resolver as resolver_module
 
     monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir: DatasetReport(tokenizer_complete=True))
@@ -544,9 +585,12 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
 
 def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """A shard the manifest does not list used to be a dead end: status said complete, training refused, repair saw
+    """
+    A shard the manifest does not list used to be a dead end: status said complete, training refused, repair saw
     nothing. Now the repair step owns it: without auto_prepare the run fails saying the dataset needs repair, with
-    auto_prepare the derived folder is rebuilt and the run proceeds."""
+    auto_prepare the derived folder is rebuilt and the run proceeds.
+    """
+
     root = tmp_path / "ds"
     shutil.copytree(tiny_dataset_dir, root)
     folder = DatasetLayout(root).processed_dir("synthetic_instruct")
@@ -589,8 +633,11 @@ def test_data_entry_defaults() -> None:
 
 
 def test_resolved_stages_carry_the_schedule_of_every_stage(tiny_dataset_dir: Path) -> None:
-    """`ResolvedDataset.stages` is what the stage manager takes: budget, LR, transition and sampling weights per
-    stage next to the validation entries."""
+    """
+    `ResolvedDataset.stages` is what the stage manager takes: budget, LR, transition and sampling weights per
+    stage next to the validation entries.
+    """
+
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
     stages = resolved.stages
     assert len(stages) == 3 and all(isinstance(s, ResolvedStage) for s in stages)
@@ -632,8 +679,11 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
 
 
 def test_auto_prepare_forwards_the_stop_request_to_the_build(tmp_path: Path) -> None:
-    """`should_stop` (the CLI's Ctrl-C) reaches `prepare`: a request that already says stop ends the in-process build
-    at its first shard with `BuildAborted`; the dataset stays incomplete, nothing is deleted."""
+    """
+    `should_stop` (the CLI's Ctrl-C) reaches `prepare`: a request that already says stop ends the in-process build
+    at its first shard with `BuildAborted`; the dataset stays incomplete, nothing is deleted.
+    """
+
     empty = tmp_path / "empty"
     with pytest.raises(BuildAborted):
         resolve_dataset(_settings(TINY_DATASET_YAML, empty), should_stop=lambda: True)
@@ -671,8 +721,11 @@ def test_still_incomplete_after_prepare_raises(tmp_path: Path, monkeypatch: pyte
 
 
 def test_auto_prepare_never_deletes_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The training run hands `prepare` `assume_yes=False` and a `confirm` that declines: a stale raw folder is a
-    hard error naming the folder, never a silent re-download."""
+    """
+    The training run hands `prepare` `assume_yes=False` and a `confirm` that declines: a stale raw folder is a
+    hard error naming the folder, never a silent re-download.
+    """
+
     import training.data.dataset_resolver as resolver_module
 
     seen: dict[str, Any] = {}

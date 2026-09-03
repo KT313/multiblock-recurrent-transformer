@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.sources.hf_cache."""
+"""
+Tests for data_preparation.lib.sources.hf_cache.
+"""
 
 import os
 from pathlib import Path

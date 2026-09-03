@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.attention`: shapes, causality, RoPE relative-position invariance and the q/k bias."""
+"""
+Tests for `model.attention`: shapes, causality, RoPE relative-position invariance and the q/k bias.
+"""
 
 import math
 from typing import Any
@@ -35,7 +37,10 @@ def test_freqs_cis_shape_and_dtype() -> None:
 
 
 def test_freqs_cis_matches_hand_formula() -> None:
-    """Entry (m, j) is (cos(m * theta_j), sin(m * theta_j)) with theta_j = base ** (-2j / dim)."""
+    """
+    Entry (m, j) is (cos(m * theta_j), sin(m * theta_j)) with theta_j = base ** (-2j / dim).
+    """
+
     dim, end, base = 8, 5, 100.0
     freqs = precompute_freqs_cis(dim, end, base)
     for m in range(end):
@@ -46,7 +51,10 @@ def test_freqs_cis_matches_hand_formula() -> None:
 
 
 def test_rope_matches_hand_written_complex_rotation() -> None:
-    """Adjacent pairs (x[2j], x[2j+1]) are rotated by m * theta_j (interleaved pairing, positive angle for q and k)."""
+    """
+    Adjacent pairs (x[2j], x[2j+1]) are rotated by m * theta_j (interleaved pairing, positive angle for q and k).
+    """
+
     torch.manual_seed(0)
     hd, S, base = 8, 6, 100.0
     freqs = precompute_freqs_cis(hd, S, base)
@@ -103,7 +111,10 @@ def test_attention_sdpa_matches_hand_computed_causal_softmax() -> None:
 
 
 def test_rope_relative_position_invariance_of_qk_dot_product() -> None:
-    """q at position i dotted with k at position j depends only on i - j after rotation."""
+    """
+    q at position i dotted with k at position j depends only on i - j after rotation.
+    """
+
     torch.manual_seed(0)
     hd, S = 16, 40
     freqs = precompute_freqs_cis(hd, S, 50_000)
@@ -141,7 +152,10 @@ def test_rope_keeps_input_dtype() -> None:
 
 
 def test_position_ids_select_freqs() -> None:
-    """Using rows 4.. of the table for a sequence must equal computing at those positions directly."""
+    """
+    Using rows 4.. of the table for a sequence must equal computing at those positions directly.
+    """
+
     attn, cfg, freqs = make_attn()
     x = torch.randn(1, 6, cfg.n_embd)
     y_shifted = attn(x, freqs[:, 4:10])

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.storage.manifest."""
+"""
+Tests for data_preparation.lib.storage.manifest.
+"""
 
 import json
 from pathlib import Path
@@ -20,7 +22,10 @@ from data_preparation.lib.storage.manifest import (
 
 
 def verify_shards(directory: Path, manifest: Manifest) -> list[str]:
-    """The `shard_problem` of every shard of `manifest` that has one."""
+    """
+    The `shard_problem` of every shard of `manifest` that has one.
+    """
+
     return [problem for shard in manifest.shards if (problem := shard_problem(directory, shard)) is not None]
 
 
@@ -33,7 +38,10 @@ def _manifest() -> Manifest:
 
 
 def test_manifests_written_with_the_keys_under_extra_load_into_the_typed_fields(tmp_path: Path) -> None:
-    """The on-disk layout keeps the stage's bookkeeping under `extra`; the fields are typed in memory only."""
+    """
+    The on-disk layout keeps the stage's bookkeeping under `extra`; the fields are typed in memory only.
+    """
+
     processed = {
         "source": "s", "source_hash": "h", "stage": "processed", "rows_fetched": 0, "shards": [{"name": "data-00000.parquet", "rows": 4, "tokens": 40}],
         "extra": {"input_shards": [["data-00000.parquet", 6]], "columns": ["text", "tokens"], "shuffled": True, "seed": 3, "stats": {"input_rows": 6}},

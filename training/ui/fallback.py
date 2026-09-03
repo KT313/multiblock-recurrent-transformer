@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The console fallback of the training dashboard: the same four calls, one log line per interval, no display."""
+"""
+The console fallback of the training dashboard: the same four calls, one log line per interval, no display.
+"""
 
 from __future__ import annotations
 
@@ -19,12 +21,13 @@ from training.ui.throughput import Throughput
 
 
 class ConsoleFallbackDashboard:
-    """The console fallback: the four calls of :class:`~training.ui.board.TrainingDashboard` without a live display.
+    """
+    The console fallback: the four calls of :class:`~training.ui.board.TrainingDashboard` without a live display.
 
-    ``update_step`` logs one line every ``log_step_interval`` steps (and at the last step), ``update_validation`` and
-    ``note_event`` one line each, ``set_status`` a DEBUG line, all on :data:`~training.ui.common.lines_log`, whose
-    handlers :meth:`attach` installs for the block: the run's ``train.log`` and this dashboard's stream. It captures
-    nothing. The live dashboard writes the same lines to the log file, so ``train.log`` reads the same under both.
+    update_step logs one line every log_step_interval steps (and at the last step), update_validation and
+    note_event one line each, set_status a DEBUG line, all on :data:`~training.ui.common.lines_log`, whose
+    handlers :meth:`attach` installs for the block: the run's train.log and this dashboard's stream. It captures
+    nothing. The live dashboard writes the same lines to the log file, so train.log reads the same under both.
     """
 
     def __init__(
@@ -53,21 +56,30 @@ class ConsoleFallbackDashboard:
 
     @contextmanager
     def attach(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[None]:
-        """Route ``logger`` (default: the ``training`` logger) and this dashboard's own lines to the stream and
-        ``log_file`` (one shared file handler) for the block. A logger above INFO is lowered to INFO for the block."""
+        """
+        Route logger (default: the training logger) and this dashboard's own lines to the stream and
+        log_file (one shared file handler) for the block. A logger above INFO is lowered to INFO for the block.
+        """
+
         target = logger if logger is not None else logging.getLogger(TRAINING_LOGGER_NAME)
         with attach_logger(self, target, None, ensure_info_level=True), run_log_handlers(target, log_file, self._stream):
             yield
 
     @contextmanager
     def running(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[ConsoleFallbackDashboard]:
-        """The dashboard in service for the block (:meth:`attach`); the interface of the live dashboard's
-        ``running``."""
+        """
+        The dashboard in service for the block (:meth:`attach`); the interface of the live dashboard's
+        running.
+        """
+
         with self.attach(logger, log_file=log_file):
             yield self
 
     def write(self, text: str, *, keep: bool = False) -> None:
-        """A record of the attached logger: one plain line on the stream."""
+        """
+        A record of the attached logger: one plain line on the stream.
+        """
+
         self._stream.write(text + "\n")
         self._stream.flush()
 

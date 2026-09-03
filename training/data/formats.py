@@ -1,9 +1,10 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Row -> (input_ids, labels) formatting functions, selected by ``data_signature["format_fn"]``.
+"""
+Row -> (input_ids, labels) formatting functions, selected by data_signature["format_fn"].
 
-Every function returns two equal-length ``torch.long`` tensors. Positions that must not be supervised are set to
-``tokenizer.pad_id`` in ``labels``; the collate function turns those into the ignore index. Two formats exist:
-``pass_text`` (pretrain sources) and ``concatenate_instruction_input_output`` (instruct sources,
+Every function returns two equal-length torch.long tensors. Positions that must not be supervised are set to
+tokenizer.pad_id in labels; the collate function turns those into the ignore index. Two formats exist:
+pass_text (pretrain sources) and concatenate_instruction_input_output (instruct sources,
 `INSTRUCT_DATA_SIGNATURE` of the dataset resolver).
 """
 
@@ -18,7 +19,10 @@ FormatFn = Callable[[Row, Tokenizer, bool, bool], tuple[torch.Tensor, torch.Tens
 
 
 def pass_text(row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain language modelling on the ``text`` column; every token is supervised."""
+    """
+    Plain language modelling on the text column; every token is supervised.
+    """
+
     text = row.get("text")
     if text is None:
         raise ValueError(f"Dataset row has no 'text' field. Row keys: {list(row.keys())}")
@@ -29,7 +33,10 @@ def pass_text(row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool) -> t
 def concatenate_instruction_input_output(
     row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``instruction`` [+ ``input``] form the prompt (masked); only ``output`` is supervised."""
+    """
+    instruction [+ input] form the prompt (masked); only output is supervised.
+    """
+
     instruction = row.get("instruction")
     output = row.get("output")
     if instruction is None or output is None:
@@ -54,5 +61,8 @@ FORMAT_FNS: dict[str, FormatFn] = {
 
 
 def apply_formatting(row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch a dataset row to the format function named in its ``data_signature``."""
+    """
+    Dispatch a dataset row to the format function named in its data_signature.
+    """
+
     return FORMAT_FNS[row["data_signature"]["format_fn"]](row, tokenizer, add_bos, add_eos)

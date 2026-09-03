@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the golden-run helpers (`training.testing.golden`): the tiny-yaml writer, the comparison and the
-single-thread / deterministic block. The golden run itself is `test_run.py::test_golden_tiny_run`."""
+"""
+Tests for the golden-run helpers (`training.testing.golden`): the tiny-yaml writer, the comparison and the
+single-thread / deterministic block. The golden run itself is `test_run.py::test_golden_tiny_run`.
+"""
 
 import json
 from pathlib import Path
@@ -21,8 +23,11 @@ from training.settings import parse_settings
 
 
 def test_write_tiny_yaml_rewrites_paths_and_overrides(tmp_path: Path) -> None:
-    """`out_dir` / `dataset_dir` are rewritten, an existing key is replaced in place (a string value that looks like
-    a number stays a string), a new key is appended, and the result parses as settings."""
+    """
+    `out_dir` / `dataset_dir` are rewritten, an existing key is replaced in place (a string value that looks like
+    a number stays a string), a new key is appended, and the result parses as settings.
+    """
+
     path = write_tiny_yaml(tmp_path, tmp_path / "data", tmp_path / "out", precision="32", resume_warmup_steps=2)
     assert path == tmp_path / "tiny.yaml"
     text = path.read_text()

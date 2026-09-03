@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.norms.RMSNorm`."""
+"""
+Tests for `model.norms.RMSNorm`.
+"""
 
 import pytest
 import torch
@@ -32,8 +34,11 @@ def test_scale_invariance() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_input_uses_fp32_statistics(dtype: torch.dtype) -> None:
-    """Statistics are computed in float32; the output dtype follows the usual promotion with the weight (float32 weight
-    -> float32 output, half weight -> half output)."""
+    """
+    Statistics are computed in float32; the output dtype follows the usual promotion with the weight (float32 weight
+    -> float32 output, half weight -> half output).
+    """
+
     norm = RMSNorm(64)
     x = (torch.randn(4, 64) * 1e-3).to(dtype)  # squares underflow in half precision but not in float32
     y = norm(x)

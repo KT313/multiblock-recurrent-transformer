@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the shared live display: the log panel and kept lines, the plain stream while disabled, the prompt
-suspension, and the one-row text."""
+"""
+Tests for the shared live display: the log panel and kept lines, the plain stream while disabled, the prompt
+suspension, and the one-row text.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +23,9 @@ from ui.testing import DyingFile, console_output, screen_text, string_console
 
 
 class MinimalDisplay(LiveDisplay):
-    """A display with a one-line header, the log panel and the footer; the stream hooks only count."""
+    """
+    A display with a one-line header, the log panel and the footer; the stream hooks only count.
+    """
 
     def __init__(self, console: Console, stream: io.StringIO | None = None) -> None:
         super().__init__(stream=stream or io.StringIO(), console=console, refresh_per_second=50, log_lines=3)

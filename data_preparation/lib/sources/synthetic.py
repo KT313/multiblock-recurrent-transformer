@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Synthetic data for the tiny run and the tests: a hand-written WordLevel tokenizer (<pad>, <bos>, <eos>,
-tok_0..tok_255) and deterministic random-word rows (`synthetic_row(kind, seed, index)`), reproducible per row."""
+"""
+Synthetic data for the tiny run and the tests: a hand-written WordLevel tokenizer (<pad>, <bos>, <eos>,
+tok_0..tok_255) and deterministic random-word rows (`synthetic_row(kind, seed, index)`), reproducible per row.
+"""
 
 from __future__ import annotations
 
@@ -22,13 +24,19 @@ SYNTHETIC_OUTPUT_WORDS = (8, 64)
 
 
 def _synthetic_words(rng: random.Random, low: int, high: int) -> str:
-    """Between ``low`` and ``high`` (inclusive) random ``tok_<i>`` words, space separated."""
+    """
+    Between low and high (inclusive) random tok_<i> words, space separated.
+    """
+
     n_words = rng.randint(low, high)
     return " ".join(f"tok_{rng.randrange(N_WORD_TOKENS)}" for _ in range(n_words))
 
 
 def synthetic_row(kind: str, seed: int, index: int) -> Row:
-    """Row `index` of a synthetic source; depends only on `(seed, index)` so any offset yields the same rows."""
+    """
+    Row `index` of a synthetic source; depends only on `(seed, index)` so any offset yields the same rows.
+    """
+
     rng = random.Random(f"{seed}:{index}")
     if kind == "instruct":
         # Order matters: the instruction is drawn before the output from the same RNG.
@@ -39,7 +47,10 @@ def synthetic_row(kind: str, seed: int, index: int) -> Row:
 
 
 def _synthetic_vocab() -> dict[str, int]:
-    """token -> id: the specials first (0, 1, 2), then tok_0..tok_255 (3..258)."""
+    """
+    token -> id: the specials first (0, 1, 2), then tok_0..tok_255 (3..258).
+    """
+
     vocab = {token: token_id for token_id, token in enumerate(SPECIALS)}
     for i in range(N_WORD_TOKENS):
         vocab[f"tok_{i}"] = len(vocab)
@@ -47,7 +58,10 @@ def _synthetic_vocab() -> dict[str, int]:
 
 
 def write_synthetic_tokenizer(path: Path) -> None:
-    """A WordLevel tokenizer.json (<pad>=0, <bos>=1, <eos>=2, tok_i=3+i) written by hand so there is no magic."""
+    """
+    A WordLevel tokenizer.json (<pad>=0, <bos>=1, <eos>=2, tok_i=3+i) written by hand so there is no magic.
+    """
+
     vocab = _synthetic_vocab()
     added_tokens = [
         {

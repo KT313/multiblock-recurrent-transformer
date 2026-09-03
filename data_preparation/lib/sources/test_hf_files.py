@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the ``hf_files`` / ``github_code`` loaders (``sources/hub_files.py``): Hub access is stubbed with local
+"""
+Tests for the hf_files / github_code loaders (sources/hub_files.py): Hub access is stubbed with local
 temp files and a download counter; offset/count/order across file boundaries, file skipping via the persisted index,
-every supported file format, shared files between two language sources, and the error paths. Offline, fast."""
+every supported file format, shared files between two language sources, and the error paths. Offline, fast.
+"""
 
 from __future__ import annotations
 
@@ -146,7 +148,10 @@ def test_plain_json_must_be_array(tmp_path: Path) -> None:
 
 
 def _padded_rows(prefix: str, n: int, pad: int = 16 * 1024) -> list[Row]:
-    """Rows of ~`pad` bytes each (ijson pulls 64 KB chunks, so a file of 50 rows is ~800 KB: 7 rows are one chunk)."""
+    """
+    Rows of ~`pad` bytes each (ijson pulls 64 KB chunks, so a file of 50 rows is ~800 KB: 7 rows are one chunk).
+    """
+
     return [{"id": f"{prefix}{i}", "text": "x" * pad, "score": i + 0.5} for i in range(n)]
 
 
@@ -155,8 +160,11 @@ def _bytes_read(handle: RecordingFile) -> int:
 
 
 def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path) -> None:
-    """A `.json` array above the cache threshold is read remotely through ijson: `count` rows cost a prefix of the
-    file, the row count is recorded only after a full read, and a top-up re-streams the file from its start."""
+    """
+    A `.json` array above the cache threshold is read remotely through ijson: `count` rows cost a prefix of the
+    file, the row count is recorded only after a full read, and a top-up re-streams the file from its start.
+    """
+
     hub.add("big/a.json", _padded_rows("a", 50))
     size = hub.files["big/a.json"].stat().st_size
     assert size > 50 * 16 * 1024
@@ -259,8 +267,11 @@ def test_github_code_offsets_count_language_rows_and_share_files(hub: FakeHub, t
 
 
 def test_keyed_offset_carries_across_files_with_unknown_counts(hub: FakeHub, tmp_path: Path) -> None:
-    """A file with fewer matching rows than the remaining skip only shrinks the skip (nothing is known about the
-    files yet, so none can be skipped without reading)."""
+    """
+    A file with fewer matching rows than the remaining skip only shrinks the skip (nothing is known about the
+    files yet, so none can be skipped without reading).
+    """
+
     hub.add("data/a.parquet", _rows("a", 6, _language))  # Python: a0 a3
     hub.add("data/b.parquet", _rows("b", 6, _language))  # Python: b0 b3
     hub.add("data/c.parquet", _rows("c", 6, _language))  # Python: c0 c3
@@ -305,13 +316,19 @@ REMOTE = {"max_cached_file_mb": 0}  # every (non-empty) file counts as "large"
 
 
 def _big_rows(prefix: str, n: int) -> list[Row]:
-    """Rows of ~8 KB incompressible text, so row groups are large compared to pyarrow's 64 KB footer read."""
+    """
+    Rows of ~8 KB incompressible text, so row groups are large compared to pyarrow's 64 KB footer read.
+    """
+
     rng = random.Random(0)
     return [{"id": f"{prefix}{i}", "text": f"{prefix}{i} " + rng.randbytes(4000).hex()} for i in range(n)]
 
 
 def _group_spans(path: Path) -> list[tuple[int, int]]:
-    """Byte span [start, end) of every row group's column chunks."""
+    """
+    Byte span [start, end) of every row group's column chunks.
+    """
+
     metadata = pq.ParquetFile(path).metadata
     spans: list[tuple[int, int]] = []
     for g in range(metadata.num_row_groups):
@@ -327,7 +344,10 @@ def _group_spans(path: Path) -> list[tuple[int, int]]:
 
 
 def _touched_groups(ranges: list[tuple[int, int]], spans: list[tuple[int, int]], size: int) -> set[int]:
-    """Row groups intersected by the recorded reads, ignoring the footer read (pyarrow reads the file's tail once)."""
+    """
+    Row groups intersected by the recorded reads, ignoring the footer read (pyarrow reads the file's tail once).
+    """
+
     data_reads = [(a, b) for a, b in ranges if b != size]
     assert all(b - a < size // 2 for a, b in ranges)  # nothing ever reads the file whole
     return {g for g, (s, e) in enumerate(spans) if any(a < e and b > s for a, b in data_reads)}
@@ -466,7 +486,10 @@ def test_index_without_sizes_is_upgraded(hub: FakeHub, tmp_path: Path) -> None:
 
 
 def _forget_open_indexes() -> None:
-    """Simulate a fresh process: the next `FileIndex.open` loads from disk instead of the process-wide cache."""
+    """
+    Simulate a fresh process: the next `FileIndex.open` loads from disk instead of the process-wide cache.
+    """
+
     hub_files._OPEN_INDEXES.clear()
 
 
@@ -524,7 +547,9 @@ def test_legacy_index_without_revision_upgrades_once_then_guards(hub: FakeHub, t
 
 
 class _ManualClock:
-    """Hand-advanced stand-in for ``time.monotonic`` (injected as ``FileIndex.clock``)."""
+    """
+    Hand-advanced stand-in for time.monotonic (injected as FileIndex.clock).
+    """
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -534,7 +559,10 @@ class _ManualClock:
 
 
 def _index_on_manual_clock(hub: FakeHub, index_dir: Path, files: str) -> tuple[FileIndex, _ManualClock]:
-    """An open index whose save throttle runs on a hand-advanced clock starting at 0.0."""
+    """
+    An open index whose save throttle runs on a hand-advanced clock starting at 0.0.
+    """
+
     clock = _ManualClock()
     for name in files:
         hub.add(f"f/{name}.jsonl", _rows(name, 2))
@@ -545,7 +573,10 @@ def _index_on_manual_clock(hub: FakeHub, index_dir: Path, files: str) -> tuple[F
 
 
 def _spy_writes(monkeypatch: pytest.MonkeyPatch, clock: _ManualClock) -> list[float]:
-    """The clock reading of every index write from here on."""
+    """
+    The clock reading of every index write from here on.
+    """
+
     writes: list[float] = []
     original = FileIndex._write
 
@@ -581,15 +612,21 @@ def test_index_saves_between_files_once_the_save_interval_passed(hub: FakeHub, t
 
 
 def test_every_supported_format_has_a_reader() -> None:
-    """The dispatch table and the recognised suffixes must agree: a format added to one without the other either
-    fails here or raises loudly (``file_format`` / the dispatch), so no format can bypass the contract."""
+    """
+    The dispatch table and the recognised suffixes must agree: a format added to one without the other either
+    fails here or raises loudly (file_format / the dispatch), so no format can bypass the contract.
+    """
+
     assert set(hub_files.FORMAT_READERS) == set(hub_files.FORMATS)
 
 
 @pytest.mark.parametrize("suffix", hub_files.FORMATS)
 def test_reading_contract_bounds_and_projects_every_format(hub: FakeHub, suffix: str) -> None:
-    """Every supported format through the shared dispatch: batches of at most ``batch_size`` rows, every row
-    projected to ``columns``, order preserved across ``skip``, ``columns=None`` keeps every column."""
+    """
+    Every supported format through the shared dispatch: batches of at most batch_size rows, every row
+    projected to columns, order preserved across skip, columns=None keeps every column.
+    """
+
     rows = [{"id": f"r{i}", "text": f"doc {i}", "extra": i} for i in range(7)]
     hub.add(f"rows{suffix}", rows)
     path = hub.files[f"rows{suffix}"]
@@ -602,7 +639,10 @@ def test_reading_contract_bounds_and_projects_every_format(hub: FakeHub, suffix:
 
 
 def test_dispatch_enforces_the_contract_centrally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A format reader only decodes: the dispatch itself projects (a reader cannot forget it)."""
+    """
+    A format reader only decodes: the dispatch itself projects (a reader cannot forget it).
+    """
+
     path = tmp_path / "x.jsonl"
     rows = [{"id": f"r{i}", "extra": i} for i in range(5)]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
@@ -628,8 +668,11 @@ def test_parquet_iter_stops_before_later_groups(tmp_path: Path, monkeypatch: pyt
 
 
 def test_parquet_row_groups_are_decoded_in_bounded_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A row group is handed out in ``ROW_BATCH`` slices instead of one python list; the rows and their order are
-    exactly those of a full read, and the projection still applies."""
+    """
+    A row group is handed out in ROW_BATCH slices instead of one python list; the rows and their order are
+    exactly those of a full read, and the projection still applies.
+    """
+
     path = tmp_path / "big.parquet"
     rows = _rows("r", 25)
     pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=10)  # 3 row groups: 10, 10, 5
@@ -656,7 +699,10 @@ def test_parquet_row_groups_are_decoded_in_bounded_batches(tmp_path: Path, monke
 
 
 def _spy_read_row_group(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, list[str] | None]]:
-    """Record every ``(row group, columns)`` pulled through ``ParquetFile.iter_batches``."""
+    """
+    Record every (row group, columns) pulled through ParquetFile.iter_batches.
+    """
+
     calls: list[tuple[int, list[str] | None]] = []
     original = pq.ParquetFile.iter_batches
 
@@ -712,7 +758,10 @@ def test_columns_are_projected_for_parquet(hub: FakeHub, monkeypatch: pytest.Mon
 
 @pytest.mark.parametrize("suffix", [".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".json"])
 def test_columns_are_projected_for_the_json_formats(hub: FakeHub, suffix: str) -> None:
-    """The json family parses whole rows and drops the surplus columns afterwards, cached and streamed alike."""
+    """
+    The json family parses whole rows and drops the surplus columns afterwards, cached and streamed alike.
+    """
+
     hub.add(f"f/a{suffix}", _rows("a", 4))
     for load_kwargs in ({"data_files": f"f/*{suffix}"}, {"data_files": f"f/*{suffix}", **REMOTE}):
         src = _src(load_kwargs=load_kwargs)
@@ -724,8 +773,11 @@ def test_columns_are_projected_for_the_json_formats(hub: FakeHub, suffix: str) -
 
 
 def test_projection_keeps_a_mixed_type_surplus_column_out_of_the_shard_writer(hub: FakeHub, tmp_path: Path) -> None:
-    """Why the json path must project: a surplus column whose type varies from row to row (a string here, a list
-    there) makes the shard writer fail on every retry, so the source could never complete."""
+    """
+    Why the json path must project: a surplus column whose type varies from row to row (a string here, a list
+    there) makes the shard writer fail on every retry, so the source could never complete.
+    """
+
     hub.add("f/a.jsonl", [
         {"id": "a0", "text": "a doc 0", "meta": "a string"},
         {"id": "a1", "text": "a doc 1", "meta": ["a", "list"]},

@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Helpers of the dashboard tests, shared by ``data_preparation/lib/ui`` and ``training/ui``: a hand-advanced clock,
+"""
+Helpers of the dashboard tests, shared by data_preparation/lib/ui and training/ui: a hand-advanced clock,
 a StringIO console that behaves like a terminal, its output with and without control codes, and :class:`Screen`, the VT emulator that
-shows what those control codes leave on a real terminal."""
+shows what those control codes leave on a real terminal.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +17,9 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 class FakeClock:
-    """A clock the tests advance by hand (injected as ``clock=``)."""
+    """
+    A clock the tests advance by hand (injected as clock=).
+    """
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -28,7 +32,9 @@ class FakeClock:
 
 
 class DyingFile(io.StringIO):
-    """A terminal that goes away: after :meth:`die` every write raises ``EIO``, as a closed pty does."""
+    """
+    A terminal that goes away: after :meth:`die` every write raises EIO, as a closed pty does.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -46,7 +52,10 @@ class DyingFile(io.StringIO):
 
 
 def string_console(width: int = 120, height: int | None = None) -> Console:
-    """A terminal-like console writing into a StringIO (colours and cursor codes included)."""
+    """
+    A terminal-like console writing into a StringIO (colours and cursor codes included).
+    """
+
     return Console(file=io.StringIO(), force_terminal=True, width=width, height=height)
 
 
@@ -57,13 +66,18 @@ def console_output(console: Console) -> str:
 
 
 def strip_ansi(text: str) -> str:
-    """Terminal output without its control sequences (colours split the box titles: ``╭─`` + reset + `` log ``)."""
+    """
+    Terminal output without its control sequences (colours split the box titles: ╭─ + reset +  log ).
+    """
+
     return _ANSI.sub("", text)
 
 
 class Screen:
-    """A minimal terminal emulator (CR, LF, cursor up/down, home, erase line / screen, SGR ignored) with unbounded
-    scrollback: what the dashboard's control codes leave on the screen, as a real terminal would show it."""
+    """
+    A minimal terminal emulator (CR, LF, cursor up/down, home, erase line / screen, SGR ignored) with unbounded
+    scrollback: what the dashboard's control codes leave on the screen, as a real terminal would show it.
+    """
 
     _CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
 
@@ -140,12 +154,18 @@ class Screen:
 
 
 def screen_text(console: Console, width: int) -> str:
-    """What a terminal of ``width`` columns shows after everything the console wrote (its unbounded scrollback)."""
+    """
+    What a terminal of width columns shows after everything the console wrote (its unbounded scrollback).
+    """
+
     return screen_of(console_output(console), width)
 
 
 def screen_of(raw: str, width: int) -> str:
-    """:func:`screen_text` for raw terminal output (a pty transcript)."""
+    """
+    :func:`screen_text` for raw terminal output (a pty transcript).
+    """
+
     screen = Screen(width)
     screen.feed(raw)
     return screen.text()

@@ -75,7 +75,10 @@ def test_padding_becomes_ignore_index_and_eos(tokenizer: Tokenizer) -> None:
 
 
 def test_ignore_index_is_the_default_and_matches_the_model(tokenizer: Tokenizer) -> None:
-    """`IGNORE_INDEX` is defined once here; `collate_fn` defaults to it and it equals the model's own default."""
+    """
+    `IGNORE_INDEX` is defined once here; `collate_fn` defaults to it and it equals the model's own default.
+    """
+
     assert IGNORE_INDEX == -100 == inspect.signature(RecurrentGPT.__init__).parameters["ignore_index"].default
     _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, block_size=128)
     assert (labels == IGNORE_INDEX).sum() == 4
@@ -101,7 +104,10 @@ def test_prompt_mask_survives_collation(tokenizer: Tokenizer) -> None:
 
 
 def test_out_of_vocab_labels_become_ignore_index(tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Labels >= vocab_size (or negative) are masked; the model's padded vocab must not train on them."""
+    """
+    Labels >= vocab_size (or negative) are masked; the model's padded vocab must not train on them.
+    """
+
     monkeypatch.setattr(type(tokenizer), "vocab_size", property(lambda self: 10))
     input_ids, labels, _ = collate_fn([_row("tok_1 tok_2 tok_100 tok_3")], tokenizer, block_size=128)
     # tokens: bos(1) 4 5 103 6 eos(2); labels: 4 5 103 6 2 -> 103 masked
@@ -153,13 +159,19 @@ def test_all_padding_row_is_dropped(tokenizer: Tokenizer) -> None:
 
 
 def test_single_token_row_is_dropped(tokenizer: Tokenizer) -> None:
-    """One token leaves nothing after the shift, so the row cannot be trained on."""
+    """
+    One token leaves nothing after the shift, so the row cannot be trained on.
+    """
+
     assert collate_samples([_row("")], tokenizer, block_size=128, add_bos=False, add_eos=True) == []
 
 
 def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tokenizer) -> None:
-    """Regression: the unusable row used to raise `StopIteration` out of the collate function, which torch reads as
-    'this worker is finished'. It now costs exactly that one row."""
+    """
+    Regression: the unusable row used to raise `StopIteration` out of the collate function, which torch reads as
+    'this worker is finished'. It now costs exactly that one row.
+    """
+
     batch = [_row("zzz yyy", "bad"), _row(_words(5), "good")]
     assert [s[2] for s in collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)] == ["good"]
     _, _, data_ids = collate_fn(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
@@ -167,8 +179,11 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
 
 
 def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Tokenizer) -> None:
-    """`rows_read` counts every row that went in, the dropped ones too, while `samples` holds only
-    the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips."""
+    """
+    `rows_read` counts every row that went in, the dropped ones too, while `samples` holds only
+    the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips.
+    """
+
     batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
     samples, rows_read = collate_worker_batch(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
     assert rows_read == 4
@@ -179,7 +194,10 @@ def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Toke
 
 
 def test_collate_worker_batch_counts_a_fully_dropped_batch(tokenizer: Tokenizer) -> None:
-    """A worker batch whose every row was dropped still reports its rows as read (no samples, no missing rows)."""
+    """
+    A worker batch whose every row was dropped still reports its rows as read (no samples, no missing rows).
+    """
+
     samples, rows_read = collate_worker_batch(
         [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, block_size=128, add_bos=False, add_eos=False
     )
@@ -192,7 +210,10 @@ def test_batch_of_only_dropped_rows_is_an_error(tokenizer: Tokenizer) -> None:
 
 
 def test_prompt_only_window_is_dropped(tokenizer: Tokenizer) -> None:
-    """An instruction row whose prompt alone fills block_size+1 has no supervised label left after truncation."""
+    """
+    An instruction row whose prompt alone fills block_size+1 has no supervised label left after truncation.
+    """
+
     row = {"instruction": _words(30), "input": "", "output": "tok_1", "data_signature": INSTR_SIG, "data_id": "ft"}
     assert collate_samples([row], tokenizer, block_size=16) == []
     # one more token of room and the first output token is supervised from the last prompt position
@@ -226,7 +247,10 @@ def test_collate_fn_is_collate_samples_then_pad_and_shift(tokenizer: Tokenizer) 
 
 
 def test_pad_and_shift_width_is_this_micro_batch_only(tokenizer: Tokenizer) -> None:
-    """The width comes from the samples handed in, never from how a loader grouped them earlier."""
+    """
+    The width comes from the samples handed in, never from how a loader grouped them earlier.
+    """
+
     short = collate_samples([_row(_words(5))], tokenizer, block_size=128)
     long = collate_samples([_row(_words(60))], tokenizer, block_size=128)
     assert pad_and_shift(short, tokenizer, block_size=128, padding_multiple=16)[0].shape == (1, 15)

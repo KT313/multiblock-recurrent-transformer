@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.download: tokenizer step, token counter, incremental download (truncation at
-the token cap, dropped long instruct rows, resumable counters), raw manifest states."""
+"""
+Tests for data_preparation.lib.stages.download: tokenizer step, token counter, incremental download (truncation at
+the token cap, dropped long instruct rows, resumable counters), raw manifest states.
+"""
 
 from __future__ import annotations
 
@@ -176,7 +178,10 @@ def test_download_synthetic_appends_incrementally(
 def test_download_passes_index_dir_and_on_file_to_the_loader(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hub-file loaders get `index_dir=<dataset>/hub_index` and an `on_file` callback from the download stage."""
+    """
+    Hub-file loaders get `index_dir=<dataset>/hub_index` and an `on_file` callback from the download stage.
+    """
+
     from data_preparation.lib.sources import loaders as loaders_mod
 
     seen: list[SharedLoaderParameters] = []
@@ -197,7 +202,10 @@ def test_download_passes_index_dir_and_on_file_to_the_loader(
 def test_the_download_row_reports_the_bytes_the_loader_fetched(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dashboard row of a download reads the loader's `FetchStats` live and keeps the final count once closed."""
+    """
+    The dashboard row of a download reads the loader's `FetchStats` live and keeps the final count once closed.
+    """
+
     from data_preparation.lib.sources import loaders as loaders_mod
 
     def fake_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
@@ -232,8 +240,11 @@ def test_download_local_applies_converter_and_flags_exhaustion(
 def test_download_projects_to_the_text_field_and_requires_it(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:
-    """A pretrain source read as-is stores only its `text_field` (plus `tokens`): the projection applies to every
-    file format, local `.jsonl` included, so the surplus `lang` column never reaches the raw shards."""
+    """
+    A pretrain source read as-is stores only its `text_field` (plus `tokens`): the projection applies to every
+    file format, local `.jsonl` included, so the surplus `lang` column never reaches the raw shards.
+    """
+
     src_dir = layout.root.parent / "code"
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
@@ -248,7 +259,10 @@ def test_download_projects_to_the_text_field_and_requires_it(
 
 
 def test_a_written_shard_holds_only_the_row_columns(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """The fetch progress travels next to the row, never in it: no bookkeeping column reaches the shard."""
+    """
+    The fetch progress travels next to the row, never in it: no bookkeeping column reaches the shard.
+    """
+
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
     download(cfg, "p", layout, rows_needed=3, shard_size=5)
     (shard,) = sorted(layout.raw_dir("p").glob("data-*.parquet"))
@@ -291,8 +305,11 @@ def test_download_refuses_to_restart_over_shards_without_a_manifest(
 def test_download_keeps_every_row_a_loader_yields_beyond_rows_needed(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
 ) -> None:
-    """A remote parquet loader finishes its row group: all rows land on disk, `rows_fetched` is the boundary and a
-    later call below that boundary never touches the loader."""
+    """
+    A remote parquet loader finishes its row group: all rows land on disk, `rows_fetched` is the boundary and a
+    later call below that boundary never touches the loader.
+    """
+
     from data_preparation.lib.sources import loaders as loaders_mod
 
     calls: list[tuple[int, int, list[str] | None, bool]] = []
@@ -471,8 +488,11 @@ def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> di
 def test_download_github_code_group_equals_separate_downloads(
     hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader
 ) -> None:
-    """Golden: one group pass leaves exactly the raw shards / offsets / exhausted flags of three separate downloads,
-    while opening every repo file once."""
+    """
+    Golden: one group pass leaves exactly the raw shards / offsets / exhausted flags of three separate downloads,
+    while opening every repo file once.
+    """
+
     hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
     hub.add("data/b.parquet", _code_rows("b", 8))
     sources = {"py": _github("Python"), "java": _github("Java"), "rust": _github("Rust")}
@@ -517,7 +537,10 @@ def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactor
 
 
 def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Rust tokenizer threads plus a later fork is the known `tokenizers` deadlock; loading must set the guard."""
+    """
+    Rust tokenizer threads plus a later fork is the known `tokenizers` deadlock; loading must set the guard.
+    """
+
     monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
     _auto_tokenizer()
     assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
@@ -530,8 +553,11 @@ def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pyte
 def test_download_truncates_pretrain_text_at_the_token_cap(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
-    """Stored text is a prefix of the source text that re-tokenizes to <= the cap; `tokens` is the stored text's own
-    count; rows under the cap are stored unchanged; the manifest records the cap."""
+    """
+    Stored text is a prefix of the source text that re-tokenizes to <= the cap; `tokens` is the stored text's own
+    count; rows under the cap are stored unchanged; the manifest records the cap.
+    """
+
     cap = 100
     cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=cap))
     m = download(cfg, "p", layout, rows_needed=40, shard_size=10)
@@ -555,8 +581,11 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
 def test_download_appends_at_the_folder_cap_when_the_config_cap_is_lower(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
-    """Lowering `max_seq_length` is free, so an append under the lower cap must not shorten the folder's rows: the
-    manifest keeps promising `truncated_at_tokens`, and raising the cap back must still be `current`, not a lie."""
+    """
+    Lowering `max_seq_length` is free, so an append under the lower cap must not shorten the folder's rows: the
+    manifest keeps promising `truncated_at_tokens`, and raising the cap back must still be `current`, not a lie.
+    """
+
     high = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=100))
     download(high, "p", layout, rows_needed=20, shard_size=10)
     low = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=40))
@@ -586,7 +615,10 @@ def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
 def test_download_github_code_group_truncates_like_separate_downloads(
     hub: FakeHub, cfg_factory: CfgFactory, tmp_path: Path, read_rows: Reader
 ) -> None:
-    """The group path (`_fetch_group`) runs the same token step as `download`: identical truncated texts and counts."""
+    """
+    The group path (`_fetch_group`) runs the same token step as `download`: identical truncated texts and counts.
+    """
+
     long_rows = [
         {"id": f"r{i}", "text": " ".join(f"tok_{(i + j) % 256}" for j in range(20)), "language": ("Python", "Java")[i % 2]} for i in range(6)
     ]
@@ -609,7 +641,10 @@ def test_download_github_code_group_truncates_like_separate_downloads(
 
 
 def _instruct_rows_with_long_and_malformed(n: int) -> list[Row]:
-    """Index i: malformed (no output) when i % 3 == 0, too long (10 words) when i % 3 == 1, kept (2 words) otherwise."""
+    """
+    Index i: malformed (no output) when i % 3 == 0, too long (10 words) when i % 3 == 1, kept (2 words) otherwise.
+    """
+
     rows: list[Row] = []
     for i in range(n):
         if i % 3 == 0:
@@ -630,9 +665,12 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     tmp_path: Path,
     token_batch: int,
 ) -> None:
-    """Rows over `max_seq_length` are not stored, never truncated; `dropped_too_long` / `skipped_malformed` are
+    """
+    Rows over `max_seq_length` are not stored, never truncated; `dropped_too_long` / `skipped_malformed` are
     recorded per shard up to its last stored row, so a stop after the first shard and a resume count every rejected
-    row exactly once (round-2 bug: the totals were saved from the running counters)."""
+    row exactly once (round-2 bug: the totals were saved from the running counters).
+    """
+
     monkeypatch.setattr(download_module, "TOKEN_BATCH", token_batch)
     src_dir = layout.root.parent / "drop"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
@@ -715,8 +753,11 @@ def test_download_github_code_group_raises_for_an_outdated_member(
 
 
 def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total: int = 40) -> list[int]:
-    """Stub the synthetic loader with one that yields ``total`` rows from ``offset`` and raises after the
-    ``fail_at``-th row of the whole source (None: never); returns the list of offsets it was called with."""
+    """
+    Stub the synthetic loader with one that yields total rows from offset and raises after the
+    fail_at-th row of the whole source (None: never); returns the list of offsets it was called with.
+    """
+
     from data_preparation.lib.sources import loaders as loaders_mod
 
     offsets: list[int] = []
@@ -763,8 +804,11 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
 def test_download_instruct_shard_offsets_count_consumed_source_rows(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer
 ) -> None:
-    """Instruct rows are filtered while downloading: a shard's offset is the number of *source* rows consumed up to
-    its last kept row (what a resume must skip), not the number of rows kept."""
+    """
+    Instruct rows are filtered while downloading: a shard's offset is the number of *source* rows consumed up to
+    its last kept row (what a resume must skip), not the number of rows kept.
+    """
+
     src_dir = layout.root.parent / "ins"
     rows = [{"instruction": f"i{i}", "output": f"o{i}"} if i % 2 else {"instruction": f"i{i}"} for i in range(12)]  # even: malformed
     write_local(src_dir, rows, "jsonl")
@@ -824,9 +868,12 @@ def test_truncate_raw_to_good_prefix(
 def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resume(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader
 ) -> None:
-    """A repair that drops a broken shard restores **every** counter from the last kept shard, so the resume behind
+    """
+    A repair that drops a broken shard restores every counter from the last kept shard, so the resume behind
     it counts each rejected source row exactly once (round-2 finding D-M4: only `rows_fetched` and the exhaustion
-    flag were reset, so the malformed / too-long rows of the dropped shards were counted twice)."""
+    flag were reset, so the malformed / too-long rows of the dropped shards were counted twice).
+    """
+
     src_dir = layout.root.parent / "retruncate"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
     cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, max_seq_length=5))
@@ -851,8 +898,11 @@ def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resum
 def test_truncating_a_manifest_without_shard_counters_resets_them(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A raw folder written before the per-shard counters existed still loads and truncates: the counters restart at
-    0 with a log line instead of crashing or making the folder stale."""
+    """
+    A raw folder written before the per-shard counters existed still loads and truncates: the counters restart at
+    0 with a log line instead of crashing or making the folder stale.
+    """
+
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     _failing_loader(monkeypatch, fail_at=None)
     download(cfg, "p", layout, rows_needed=40, shard_size=10)
@@ -877,8 +927,11 @@ def test_truncating_a_manifest_without_shard_counters_resets_them(
 def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A filtered instruct download must not re-open the source per iteration (a remote JSON file would be
-    re-streamed from byte 0 every time): one loader call, closed as soon as enough rows are kept."""
+    """
+    A filtered instruct download must not re-open the source per iteration (a remote JSON file would be
+    re-streamed from byte 0 every time): one loader call, closed as soon as enough rows are kept.
+    """
+
     from data_preparation.lib.sources import loaders as loaders_mod
 
     calls: list[tuple[int, int]] = []

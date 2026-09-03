@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Logging of a training run: the wandb wrapper (`Logger`, offline by default), the gradient / parameter metric
+"""
+Logging of a training run: the wandb wrapper (`Logger`, offline by default), the gradient / parameter metric
 helpers, and `RunLogger`: every console line, timer and counter of a run, driving the terminal dashboard and
 ending in a `TrainingReport`.
 
@@ -48,7 +49,8 @@ console = logging.getLogger(CONSOLE_LOGGER_NAME)
 
 
 class Logger:
-    """wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported).
+    """
+    wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported).
 
     The run is created quiet (`WANDB_QUIET_SETTINGS`): wandb's default console wrapping and banner lines would fight
     the dashboard's stream capture.
@@ -100,7 +102,10 @@ def _to_scalar(value: Any) -> Any:
 
 
 def num_parameters(model: Module, only_trainable: bool = False) -> int:
-    """Total number of parameters (tied weights counted once, as `parameters()` deduplicates them)."""
+    """
+    Total number of parameters (tied weights counted once, as `parameters()` deduplicates them).
+    """
+
     parameters = list(model.parameters())
     if only_trainable:
         parameters = [parameter for parameter in parameters if parameter.requires_grad]
@@ -108,9 +113,12 @@ def num_parameters(model: Module, only_trainable: bool = False) -> int:
 
 
 def describe_parameters(model: Module) -> str:
-    """The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
+    """
+    The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
     blocks and the count of the unrolled model at the mean recurrence (`total - recurrent + recurrent * mean of
-    mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped)."""
+    mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped).
+    """
+
     unwrapped = plain_model(model)
     total_parameters = num_parameters(unwrapped)
     core_blocks = cast(Iterable[Module], unwrapped.transformer.core_blocks)
@@ -129,8 +137,10 @@ def describe_parameters(model: Module) -> str:
 
 @dataclass
 class TrainingReport:
-    """What `train()` returns: the counts, times, last losses and files of one run (built by `RunLogger.close`,
-    re-exported by `training/run.py`)."""
+    """
+    What `train()` returns: the counts, times, last losses and files of one run (built by `RunLogger.close`,
+    re-exported by `training/run.py`).
+    """
 
     run_directory: Path
     steps_this_process: int  # optimizer steps run by this process (a resumed run counts from its resume step)
@@ -146,7 +156,10 @@ class TrainingReport:
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step, only with `keep_history`
 
     def summary(self) -> str:
-        """The lines the CLI prints after `train()` returned."""
+        """
+        The lines the CLI prints after `train()` returned.
+        """
+
         origin = f"resumed from {self.resumed_from}" if self.resumed_from is not None else "fresh start"
         lines = [
             f"Training run in {self.run_directory}: {self.steps_this_process} optimizer steps completed "
@@ -172,8 +185,10 @@ class TrainingReport:
 
 
 class Dashboard(Protocol):
-    """The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
-    live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake."""
+    """
+    The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake.
+    """
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -190,11 +205,14 @@ class Dashboard(Protocol):
 def open_dashboard(
     settings: Settings, run_directory: Path, stage_manager: StageManager, *, start_step: int, device: str
 ) -> Iterator[Dashboard]:
-    """The run's dashboard, in service for the block: the live `TrainingDashboard` when stdout is a terminal and
+    """
+    The run's dashboard, in service for the block: the live `TrainingDashboard` when stdout is a terminal and
     `TRAINING_DASHBOARD` is not `0`, else the `ConsoleFallbackDashboard` with its lines on stderr (where the CLI's
     log handlers write too). One bar per stage plus the overall bar, a header naming run, model, dataset, device and
     precision, the `training` logger routed in and everything appended to `run_directory / train.log`. `start_step`
-    (the resume step) keeps the ETA honest."""
+    (the resume step) keeps the ETA honest.
+    """
+
     stage_names = [stage.name for stage in stage_manager.stages]
     steps_per_stage = [boundary.end_step - boundary.start_step for boundary in stage_manager.boundaries]
     details = {
@@ -231,7 +249,8 @@ def open_dashboard(
 
 
 class RunLogger:
-    """Console records, the terminal dashboard, wandb metrics, timers, the data-composition counter and the metric
+    """
+    Console records, the terminal dashboard, wandb metrics, timers, the data-composition counter and the metric
     history of one run.
 
     Create it with `open()` once the setup is done and use it as a context manager, so a failing loop still releases
@@ -301,10 +320,13 @@ class RunLogger:
         setup_started: float | None = None,
         keep_history: bool = False,
     ) -> RunLogger:
-        """Open the run's logging once the setup is done: the wandb run (hyperparameters, `num_parameters`), the
+        """
+        Open the run's logging once the setup is done: the wandb run (hyperparameters, `num_parameters`), the
         dashboard (unless `dashboard` is given), then the console header lines. The setup timer ends and the train
         timer starts here. `progress.step` is the resume step; `setup_started` the clock reading at the start of the
-        run; `clock` and `keep_history` are test knobs."""
+        run; `clock` and `keep_history` are test knobs.
+        """
+
         wandb = Logger(
             settings.logger_project,
             settings.run_name,
@@ -345,8 +367,11 @@ class RunLogger:
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        """Release wandb and the dashboard, so the terminal is restored on an exception and on Ctrl-C too; idempotent.
-        Every resource is released even when an earlier release raises; the first failure is the one re-raised."""
+        """
+        Release wandb and the dashboard, so the terminal is restored on an exception and on Ctrl-C too; idempotent.
+        Every resource is released even when an earlier release raises; the first failure is the one re-raised.
+        """
+
         failures: list[BaseException] = []
         for release in (self.wandb.finish, self._exit_stack.close):
             try:
@@ -359,14 +384,20 @@ class RunLogger:
     # --- status and events -----------------------------------------------------------------------------------------
 
     def status(self, text: str) -> None:
-        """The dashboard's header status: what the run is doing right now (`training`, `stopping after this step,
-        saving a checkpoint`, `exporting`; `finished` / `stopped on request` set by `close`)."""
+        """
+        The dashboard's header status: what the run is doing right now (`training`, `stopping after this step,
+        saving a checkpoint`, `exporting`; `finished` / `stopped on request` set by `close`).
+        """
+
         self._status = text
         self.dashboard.set_status(text)
 
     @contextmanager
     def _status_during(self, text: str) -> Iterator[None]:
-        """Show `text` as the status for the block, then the status from before it."""
+        """
+        Show `text` as the status for the block, then the status from before it.
+        """
+
         previous = self._status
         self.status(text)
         try:
@@ -376,8 +407,11 @@ class RunLogger:
 
     @contextmanager
     def evaluating(self) -> Iterator[None]:
-        """Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
-        next to the validation metrics of that step in `log_step`."""
+        """
+        Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
+        next to the validation metrics of that step in `log_step`.
+        """
+
         started = self._clock()
         with self._status_during("evaluating"):
             try:
@@ -386,31 +420,47 @@ class RunLogger:
                 self._evaluation_seconds = self._clock() - started
 
     def saving_checkpoint(self) -> AbstractContextManager[None]:
-        """Around one checkpoint write: the status reads `saving checkpoint`."""
+        """
+        Around one checkpoint write: the status reads `saving checkpoint`.
+        """
+
         return self._status_during("saving checkpoint")
 
     def log_resume(self, path: Path, step: int) -> None:
-        """The run continues from checkpoint `path` at optimizer step `step` (the report's `resumed_from`)."""
+        """
+        The run continues from checkpoint `path` at optimizer step `step` (the report's `resumed_from`).
+        """
+
         self.resumed_from = path
         self.dashboard.note_event(f"resumed from {path} at step {step}")
 
     def log_fresh_start(self) -> None:
-        """No checkpoint was loaded; the run starts at step 0."""
+        """
+        No checkpoint was loaded; the run starts at step 0.
+        """
+
         self.dashboard.note_event("no checkpoint found, starting from scratch")
 
     def log_checkpoint(self, path: Path) -> None:
-        """A checkpoint was written to `path` (the report's `checkpoints_written`)."""
+        """
+        A checkpoint was written to `path` (the report's `checkpoints_written`).
+        """
+
         self.checkpoints_written.append(path)
         self.dashboard.note_event(f"saved checkpoint {path}")
 
     def log_export(self, path: Path) -> None:
-        """The HuggingFace export was written to `path`."""
+        """
+        The HuggingFace export was written to `path`.
+        """
+
         self.dashboard.note_event(f"exported HuggingFace model to {path}")
 
     # --- steps -------------------------------------------------------------------------------------------------------
 
     def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
-        """Account one completed optimizer step (`progress.step`, after `progress.advance()`).
+        """
+        Account one completed optimizer step (`progress.step`, after `progress.advance()`).
 
         Every step: the data ids join the composition counter, a transition starting or ending becomes an event, a
         set `result.validation` becomes the dashboard's validation row, the bars move (with an empty metric dict, so
@@ -425,6 +475,7 @@ class RunLogger:
         * `data_composition/<data id>`: the fraction of world-batch samples per data id since the last log step;
         * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`, `val_time`).
         """
+
         self._sample_counter.update(result.data_ids)
         stage_at_done = self.stage_manager.get_stage_info(progress.step)
         self._note_transition(result.stage, stage_at_done)
@@ -441,9 +492,12 @@ class RunLogger:
         self.dashboard.update_step(progress.step, stage_at_done.stage_index, transition, metrics)
 
     def _note_transition(self, before: StageInfo, after: StageInfo) -> None:
-        """The two transition events: "starting transition" after the last plain step of a stage, "transition
+        """
+        The two transition events: "starting transition" after the last plain step of a stage, "transition
         complete" after the last transition step. `before` is the stage info at the step that trained, `after` the
-        one at the completed step."""
+        one at the completed step.
+        """
+
         stages = self.stage_manager.stages
         if after.transition_to is not None and before.transition_to is None:
             leaving, entering = stages[after.stage_index], stages[after.transition_to]
@@ -457,8 +511,11 @@ class RunLogger:
             )
 
     def _log_validation(self, result: StepResult, progress: TrainingProgress) -> dict[str, float] | None:
-        """The validation metrics of this step as floats plus `val_time`, the `val_loss*` entries shown on the
-        dashboard; None if the step did not evaluate."""
+        """
+        The validation metrics of this step as floats plus `val_time`, the `val_loss*` entries shown on the
+        dashboard; None if the step did not evaluate.
+        """
+
         if result.validation is None:
             return None
         validation = {name: float(_to_scalar(value)) for name, value in result.validation.items()}
@@ -472,8 +529,11 @@ class RunLogger:
     def _step_metrics(
         self, result: StepResult, progress: TrainingProgress, validation: dict[str, float] | None
     ) -> dict[str, Any]:
-        """The metric dict of a log step (documented in `log_step`); resets the interval timer and the composition
-        counter."""
+        """
+        The metric dict of a log step (documented in `log_step`); resets the interval timer and the composition
+        counter.
+        """
+
         now = self._clock()
         steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
         seconds_per_step = (now - self._interval_started) / steps_in_interval
@@ -503,8 +563,11 @@ class RunLogger:
         return metrics
 
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
-        """End the run's logging: `train_time` into the wandb summary, the final console line and status, the
-        dashboard closed; returns the report. `stopped` says the run ended on request before its last step."""
+        """
+        End the run's logging: `train_time` into the wandb summary, the final console line and status, the
+        dashboard closed; returns the report. `stopped` says the run ended on request before its last step.
+        """
+
         train_seconds = self._clock() - self._train_started
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
@@ -534,7 +597,10 @@ class RunLogger:
 def _reverse_engineer_adam_effective_lr(
     param: torch.Tensor, param_state: dict[str, torch.Tensor], group: dict[str, Any]
 ) -> torch.Tensor:
-    """Recompute Adam's per-element effective LR (ignoring bias correction and the scheduled LR)."""
+    """
+    Recompute Adam's per-element effective LR (ignoring bias correction and the scheduled LR).
+    """
+
     grad = param.grad
     assert grad is not None, "effective LR needs a gradient"
     exp_avg = param_state["exp_avg"].float()
@@ -547,7 +613,10 @@ def _reverse_engineer_adam_effective_lr(
 
 
 def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
-    """(n_embd, query width, key/value width) for slicing fused qkv gradients; None for non-transformer models."""
+    """
+    (n_embd, query width, key/value width) for slicing fused qkv gradients; None for non-transformer models.
+    """
+
     config = getattr(model, "config", None)
     if config is None or not all(hasattr(config, name) for name in ("n_embd", "head_size", "num_attention_heads")):
         return None
@@ -556,13 +625,15 @@ def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
 
 @torch.no_grad()
 def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, torch.Tensor]:
-    """Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
+    """
+    Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
     and before `zero_grad()`.
 
     One pass over the parameters in optimizer-group order: `query_grad_<i>` / `ffn2_grad_<i>` number the fused-qkv
     and MLP-projection weights with a gradient (NaN when non-finite), `*_effective_lr_<i>` those with a finite
     gradient and Adam state.
     """
+
     metrics: dict[str, torch.Tensor] = {}
     dims = _qkv_dims(model)
     transformer = getattr(model, "transformer", None)

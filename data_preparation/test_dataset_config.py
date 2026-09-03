@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.dataset_config: loading the shipped configs, every validation rule, source usage,
-budgets and the raw / processed hash invariants."""
+"""
+Tests for data_preparation.dataset_config: loading the shipped configs, every validation rule, source usage,
+budgets and the raw / processed hash invariants.
+"""
 
 from __future__ import annotations
 
@@ -43,8 +45,11 @@ def _sources_of_kind(cfg: DatasetConfig, kind: str) -> list[str]:
 
 
 def _minimal() -> dict[str, Any]:
-    """A small valid config as a plain dict (mutated by the validation tests): `pre` is trained and validated on
-    (split), `hold` is validation-only (needs `rows`), `ins` is an instruct source trained and validated on."""
+    """
+    A small valid config as a plain dict (mutated by the validation tests): `pre` is trained and validated on
+    (split), `hold` is validation-only (needs `rows`), `ins` is an instruct source trained and validated on.
+    """
+
     return {
         "name": "t",
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
@@ -105,7 +110,10 @@ def test_shipped_configs_load(path: Path) -> None:
 
 
 def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
-    """The real-source smoke config differs from the thesis config only in name and budgets."""
+    """
+    The real-source smoke config differs from the thesis config only in name and budgets.
+    """
+
     final, mini = load_dataset_config(CROW), load_dataset_config(MINI)
     assert mini.name == "crow-300m-mini"
     assert [s.tokens for s in mini.stages] == [300_000, 150_000, 60_000]
@@ -169,8 +177,11 @@ def test_load_from_written_yaml(tmp_path: Path) -> None:
     ],
 )
 def test_unknown_keys_fail_loading_with_a_clear_error(tmp_path: Path, mutate: Mutation, match: str) -> None:
-    """Unknown keys must not be silently ignored: loading raises a ValueError naming the file and the key, never
-    jsonargparse's usage dump + `sys.exit(2)`."""
+    """
+    Unknown keys must not be silently ignored: loading raises a ValueError naming the file and the key, never
+    jsonargparse's usage dump + `sys.exit(2)`.
+    """
+
     d = _minimal()
     mutate(d)
     with pytest.raises(ValueError, match=match):
@@ -238,8 +249,11 @@ def test_validation_rejects(mutate: Mutation, match: str) -> None:
 
 
 def test_field_scopes_cover_every_source_field() -> None:
-    """A new `SourceConfig` field must state where it applies. Without an entry it applies nowhere, so this test
-    (and every config that sets it) fails instead of the field being silently accepted for every kind and loader."""
+    """
+    A new `SourceConfig` field must state where it applies. Without an entry it applies nowhere, so this test
+    (and every config that sets it) fails instead of the field being silently accepted for every kind and loader.
+    """
+
     assert {f.name for f in fields(SourceConfig)} == set(dc.SOURCE_FIELD_SCOPES)
     for name, scope in dc.SOURCE_FIELD_SCOPES.items():
         assert scope.kinds <= dc.ALL_KINDS and scope.loaders <= dc.ALL_LOADERS, name
@@ -272,8 +286,11 @@ def test_a_field_set_outside_its_scope_names_the_field_and_the_rule(kwargs: dict
 
 
 def test_a_field_at_its_default_is_never_out_of_scope() -> None:
-    """Only a value a config actually chose is checked, so an instruct source is not rejected for the `text_field`
-    default it never mentioned."""
+    """
+    Only a value a config actually chose is checked, so an instruct source is not rejected for the `text_field`
+    default it never mentioned.
+    """
+
     source = SourceConfig(kind="instruct", loader="synthetic")
     assert (source.text_field, source.split, source.input_inversions) == ("text", "train", 0.0)
 
@@ -343,8 +360,11 @@ def test_validation_fraction_of() -> None:
 
 
 def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -> None:
-    """One continuous stream per source: the budgets of stages sharing a source ADD UP (they used to be maximised
-    when every stage re-read the source from the top)."""
+    """
+    One continuous stream per source: the budgets of stages sharing a source ADD UP (they used to be maximised
+    when every stage re-read the source from the top).
+    """
+
     d = _minimal()
     d["sources"]["pre2"] = {"kind": "pretrain", "loader": "synthetic"}
     d["stages"][0]["train"] = {"pre": 0.6, "pre2": 0.4}
@@ -360,8 +380,11 @@ def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -
 
 
 def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
-    """Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
-    ``transition tokens × (weight + next stage's weight) / 2``: a source leaving ramps out, one entering ramps in."""
+    """
+    Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
+    transition tokens × (weight + next stage's weight) / 2: a source leaving ramps out, one entering ramps in.
+    """
+
     d = _minimal()
     d["stages"][0]["transition_pct"] = 0.2  # transition window: 1000 × 0.2 = 200 tokens at the end of s1
     cfg = _build(d)
@@ -390,14 +413,20 @@ def test_rows_needed_counts_the_margin_and_the_split() -> None:
 
 
 def _over_the_cap_tokens() -> int:
-    """A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (block_size 64, split 0.05):
-    ceil(80e6 / 64) = 1,250,000 sequences; × 1.2 ÷ 0.95 = 1,578,948 rows."""
+    """
+    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (block_size 64, split 0.05):
+    ceil(80e6 / 64) = 1,250,000 sequences; × 1.2 ÷ 0.95 = 1,578,948 rows.
+    """
+
     return 80_000_000
 
 
 def test_a_shuffled_source_over_the_build_cap_is_refused_at_load(tmp_path: Path) -> None:
-    """`shuffle: true` builds all-at-once in memory (`lib/stages/build.py`); a config asking that of a huge source
-    would OOM hours in, so it fails at `load_dataset_config`, before `prepare` or auto-prepare do any work (D4)."""
+    """
+    `shuffle: true` builds all-at-once in memory (`lib/stages/build.py`); a config asking that of a huge source
+    would OOM hours in, so it fails at `load_dataset_config`, before `prepare` or auto-prepare do any work (D4).
+    """
+
     d = _minimal()
     d["sources"]["pre"]["shuffle"] = True
     d["stages"][0]["tokens"] = _over_the_cap_tokens()
@@ -563,8 +592,11 @@ def test_source_hash_stable_across_key_order_and_reloads() -> None:
 
 
 def test_every_schema_field_carries_a_hash_annotation() -> None:
-    """A new field must say which hash it belongs to; without the annotation every hash of it raises rather than
-    silently landing in (or missing from) one, the drift this replaces."""
+    """
+    A new field must say which hash it belongs to; without the annotation every hash of it raises rather than
+    silently landing in (or missing from) one, the drift this replaces.
+    """
+
     samples: list[Any] = [
         TokenizerConfig(name="t", kind="synthetic"),
         DedupConfig(),
@@ -584,13 +616,18 @@ def test_every_schema_field_carries_a_hash_annotation() -> None:
 
 @dataclasses.dataclass
 class _UnannotatedField:
-    """What a field added to the schema without a `hash` annotation looks like: hashing it must raise."""
+    """
+    What a field added to the schema without a `hash` annotation looks like: hashing it must raise.
+    """
 
     value: int = 0
 
 
 def test_hash_payload_hashes_every_counted_value_recursively() -> None:
-    """A field enters with its value, default or not; nested blocks are walked with the same selector."""
+    """
+    A field enters with its value, default or not; nested blocks are walked with the same selector.
+    """
+
     assert dc.hash_payload(DedupConfig(), "processed") == {"mode": "exact", "normalize": True}
     assert dc.hash_payload(DedupConfig(mode="minhash", threshold=0.5), "processed") == {
         "mode": "minhash", "normalize": True, "threshold": 0.5, "num_perm": 256, "ngram": 5,
@@ -610,7 +647,10 @@ def test_hash_payload_hashes_every_counted_value_recursively() -> None:
 
 
 def test_changing_a_default_changes_the_processed_hash(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Data built under an old default must not pass as current: the resolved value is hashed, not "was it set"."""
+    """
+    Data built under an old default must not pass as current: the resolved value is hashed, not "was it set".
+    """
+
     base = _build(_minimal())
     monkeypatch.setattr(dc, "DEFAULT_BENCHMARKS", ["gsm8k"])  # `DecontaminationConfig.benchmarks` defaults to a copy of it
     changed = _build(_minimal())
@@ -620,8 +660,11 @@ def test_changing_a_default_changes_the_processed_hash(monkeypatch: pytest.Monke
 
 
 def test_hash_payload_selects_by_annotation() -> None:
-    """Each name takes exactly its own fields (`processed_hash` folds the raw hash in as one value, `config_hash`
-    the processed hashes); nothing annotated `none` enters anywhere."""
+    """
+    Each name takes exactly its own fields (`processed_hash` folds the raw hash in as one value, `config_hash`
+    the processed hashes); nothing annotated `none` enters anywhere.
+    """
+
     src = SourceConfig(kind="instruct", loader="hf_stream", hf_id="x/y", fields={"instruction": "a", "output": "b"},
                        check_limit=5, rows=None, seed=7, input_inversions=0.5, describe_tokens_per_row=9)  # fmt: skip
     assert set(dc.hash_payload(src, "raw")) == {
@@ -636,7 +679,10 @@ def test_hash_payload_selects_by_annotation() -> None:
 
 
 def test_the_seed_is_raw_identity_only_for_the_synthetic_loader() -> None:
-    """An instruct source's seed drives inversions and shuffle (build-time): a new seed rebuilds processed, never raw."""
+    """
+    An instruct source's seed drives inversions and shuffle (build-time): a new seed rebuilds processed, never raw.
+    """
+
     d = _minimal()
     base = _build(d)
     d["sources"]["ins"]["seed"] = 7
@@ -656,8 +702,11 @@ def test_config_hash_ignores_the_bloom_budget_like_processed_hash_does() -> None
 
 
 def test_minhash_is_rejected_for_instruct_sources_and_allowed_per_pretrain_source(tmp_path: Path) -> None:
-    """The near-duplicate pass runs only in the pretrain branch of the build, so an instruct source configured with
-    `minhash` would silently be deduplicated exactly: the config is refused when it is loaded, naming the source."""
+    """
+    The near-duplicate pass runs only in the pretrain branch of the build, so an instruct source configured with
+    `minhash` would silently be deduplicated exactly: the config is refused when it is loaded, naming the source.
+    """
+
     d = _minimal()
     d["processing"] = {"dedup": {"mode": "minhash"}}  # the dataset-level block is what reaches the instruct source
     with pytest.raises(ValueError, match="source 'ins': dedup.mode=minhash is not implemented for instruct sources"):
@@ -700,8 +749,11 @@ def test_the_processing_payload_keeps_only_the_active_dedup_mode() -> None:
 
 
 def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
-    """The raw shards are the bandwidth-expensive part: nothing but a real change of the source, or of how its
-    stored token counts are made, may invalidate them."""
+    """
+    The raw shards are the bandwidth-expensive part: nothing but a real change of the source, or of how its
+    stored token counts are made, may invalidate them.
+    """
+
     base = _build(_minimal())
     h = base.raw_hash("pre")
 
@@ -803,8 +855,11 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
 
 
 def test_hash_payload_golden_defaults() -> None:
-    """Every default is hashed as a value, so changing one re-labels every folder built under the old default.
-    Changing any of these defaults must be a conscious, hash-breaking commit: update this golden dict with it."""
+    """
+    Every default is hashed as a value, so changing one re-labels every folder built under the old default.
+    Changing any of these defaults must be a conscious, hash-breaking commit: update this golden dict with it.
+    """
+
     assert asdict(ProcessingConfig()) == {
         "min_chars": 50,
         "dedup": {"mode": "exact", "normalize": True, "bloom_memory_mb": 1024, "threshold": 0.95, "num_perm": 256, "ngram": 5},

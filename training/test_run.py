@@ -1,8 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `training.run`: the setup helpers (fast) and end-to-end runs of `train()` on the tiny 3-stage config with
+"""
+Tests for `training.run`: the setup helpers (fast) and end-to-end runs of `train()` on the tiny 3-stage config with
 synthetic data (marked slow): checkpoints, schedule, evaluation, export, determinism, resume, the stop request and
 the golden 20-step run. One optimizer step is tested in `test_step.py`, evaluation in `test_evaluation.py`, the
-CLI in `test_train.py`."""
+CLI in `test_train.py`.
+"""
 
 import json
 import shutil
@@ -55,7 +57,10 @@ History = dict[int, dict[str, float]]
 
 
 def _run(yaml_path: Path, backend: SingleDeviceBackend | None = None) -> TrainingReport:
-    """Run training on the yaml (the backend of the settings unless one is given) and return its report."""
+    """
+    Run training on the yaml (the backend of the settings unless one is given) and return its report.
+    """
+
     return train(parse_settings(["--config", str(yaml_path)]), backend=backend, keep_history=True)
 
 
@@ -79,7 +84,10 @@ def cpu_backend() -> SingleDeviceBackend:
 
 
 def test_create_backend_follows_the_settings(tiny_settings: Settings) -> None:
-    """`settings.backend` at `settings.precision`; the device is the backend's default (`cuda:0` or the CPU)."""
+    """
+    `settings.backend` at `settings.precision`; the device is the backend's default (`cuda:0` or the CPU).
+    """
+
     tiny_settings.precision = "32"
     backend = create_backend(tiny_settings)
     assert isinstance(backend, SingleDeviceBackend) and backend.precision == "32"
@@ -96,8 +104,11 @@ def test_stop_requested() -> None:
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
-    """`build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
-    block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings."""
+    """
+    `build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
+    block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings.
+    """
+
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
     assert sm.stages is tiny_resolved.stages
@@ -121,9 +132,12 @@ def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_rec
 def test_train_refuses_a_run_directory_another_run_holds(
     tiny_settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """`train()` takes the run-directory lock right after creating the directory and holds it for the whole run: a
+    """
+    `train()` takes the run-directory lock right after creating the directory and holds it for the whole run: a
     second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
-    `train.log` and `run_config.json` with the first one."""
+    `train.log` and `run_config.json` with the first one.
+    """
+
     with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
     assert list(checkpoint_dir(Path(tiny_settings.out_dir)).glob("*.pth")) == [], "nothing ran"
@@ -142,8 +156,11 @@ def test_check_block_sizes_agree_message(tiny_settings: Settings) -> None:
 
 
 def test_build_run_model_on_tiny(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
-    """The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
-    settings, `model_config.json` next to the checkpoints, the model on the backend's device."""
+    """
+    The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
+    settings, `model_config.json` next to the checkpoints, the model on the backend's device.
+    """
+
     tiny_settings.model_overwrite = {"n_embd": 32}
     run_directory = prepare_run_directory(tiny_settings)
     model = build_run_model(tiny_settings, cpu_backend, run_directory)
@@ -160,8 +177,11 @@ def test_build_run_model_on_tiny(tiny_settings: Settings, cpu_backend: SingleDev
 
 
 def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
-    """The parameter init consumes the global torch RNG (why `build_run_model` runs after the loaders): the same seed
-    gives the same weights, and the init advances the RNG."""
+    """
+    The parameter init consumes the global torch RNG (why `build_run_model` runs after the loaders): the same seed
+    gives the same weights, and the init advances the RNG.
+    """
+
     run_directory = prepare_run_directory(tiny_settings)
     torch.manual_seed(3)
     first = build_run_model(tiny_settings, cpu_backend, run_directory)
@@ -175,8 +195,11 @@ def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cp
 
 
 def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend) -> None:
-    """Three parameter groups (matrices, embeddings, norms + biases); the third has no weight
-    decay under `no_weight_decay_for_bias_and_norm_params`; the constructor LR is `optim_config.lr`."""
+    """
+    Three parameter groups (matrices, embeddings, norms + biases); the third has no weight
+    decay under `no_weight_decay_for_bias_and_norm_params`; the constructor LR is `optim_config.lr`.
+    """
+
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
     assert isinstance(optimizer, torch.optim.AdamW)  # tiny.yaml
     assert len(optimizer.param_groups) == 3
@@ -188,8 +211,11 @@ def test_build_run_optimizer_groups(tiny_settings: Settings, tiny_model: Recurre
 def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
     tiny_settings: Settings, tiny_resolved: ResolvedDataset, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """`resume: false`, and `resume: true` with no checkpoint of the run in the directory: no resume point, the
-    progress stays at step 0."""
+    """
+    `resume: false`, and `resume: true` with no checkpoint of the run in the directory: no resume point, the
+    progress stays at step 0.
+    """
+
     run_directory = prepare_run_directory(tiny_settings)
     optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
     stage_manager = build_stage_manager(tiny_settings, tiny_resolved, cpu_backend.world_size)
@@ -250,7 +276,10 @@ def test_non_finite_grad_norm_terminates(
 
 @pytest.fixture(scope="module")
 def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -> dict[str, Any]:
-    """One uninterrupted tiny run shared by the assertions below (module-scoped: a few seconds on CPU)."""
+    """
+    One uninterrupted tiny run shared by the assertions below (module-scoped: a few seconds on CPU).
+    """
+
     tmp = tmp_path_factory.mktemp("full_run")
     out_dir = tmp / "out"
     yaml_path = write_tiny_yaml(tmp, tiny_dataset_dir, out_dir, export_to_hf=True)
@@ -310,7 +339,10 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
 
 @pytest.mark.slow
 def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
-    """Every field of the report of a fresh, uninterrupted, exporting run, and its summary."""
+    """
+    Every field of the report of a fresh, uninterrupted, exporting run, and its summary.
+    """
+
     report: TrainingReport = full_run["report"]
     history: History = full_run["history"]
     assert report.run_directory == full_run["out_dir"]
@@ -333,9 +365,12 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
 
 @pytest.mark.slow
 def test_train_log_of_a_full_run(full_run: dict[str, Any]) -> None:
-    """Under pytest stdout is not a TTY, so `RunLogger` opened the console fallback of the dashboard: the run left
+    """
+    Under pytest stdout is not a TTY, so `RunLogger` opened the console fallback of the dashboard: the run left
     `out_dir / train.log` with the header lines, one line per optimizer step (`log_step_interval: 1`), the
-    validation lines, the events (checkpoints, transitions, export) and the final line."""
+    validation lines, the events (checkpoints, transitions, export) and the final line.
+    """
+
     log_text = (full_run["out_dir"] / TRAIN_LOG_NAME).read_text()
     assert "Total training steps: 20 (2 micro-batches each)" in log_text
     assert "event: no checkpoint found, starting from scratch" in log_text
@@ -351,7 +386,10 @@ def test_train_log_of_a_full_run(full_run: dict[str, Any]) -> None:
 
 
 def test_train_and_logger_never_print() -> None:
-    """Only the CLI (`train.py`) prints; `run.py` and `logger.py` log and drive the dashboard."""
+    """
+    Only the CLI (`train.py`) prints; `run.py` and `logger.py` log and drive the dashboard.
+    """
+
     for module in (run_module, logger_module):
         source = Path(cast(str, module.__file__)).read_text()
         assert "print(" not in source, module.__name__
@@ -387,8 +425,11 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
 
 @pytest.mark.slow
 def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
-    """Data ids are plain SOURCE names (the run-wide readers): all pretrain until the transition into finetune, all
-    instruct after it, a per-sample mix inside the window."""
+    """
+    Data ids are plain SOURCE names (the run-wide readers): all pretrain until the transition into finetune, all
+    instruct after it, a per-sample mix inside the window.
+    """
+
     history: History = full_run["history"]
     assert history[3]["data_composition/synthetic_pretrain"] == pytest.approx(1.0)
     assert history[18]["data_composition/synthetic_instruct"] == pytest.approx(1.0)
@@ -428,8 +469,11 @@ def test_same_seed_is_deterministic(full_run: dict[str, Any], tmp_path: Path, ti
 def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
-    """A resume that silently mixes two configurations is a chimera: numerics-relevant settings are compared
-    against the checkpoint; `allow_settings_change: true` overrides."""
+    """
+    A resume that silently mixes two configurations is a chimera: numerics-relevant settings are compared
+    against the checkpoint; `allow_settings_change: true` overrides.
+    """
+
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()  # leave steps to run after the resume
@@ -443,7 +487,10 @@ def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
 
 
 def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """`run_config.json` is the historical record of what the run was started with; a resume must not overwrite it."""
+    """
+    `run_config.json` is the historical record of what the run was started with; a resume must not overwrite it.
+    """
+
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
@@ -459,11 +506,14 @@ def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp
 def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
-    """`resume: true` continues from the latest checkpoint of the run (here the stage-1_end one at step 14).
+    """
+    `resume: true` continues from the latest checkpoint of the run (here the stage-1_end one at step 14).
 
     Losses cannot be compared exactly here: the resumed run rebuilds the loaders, whose fresh iterators draw base
     seeds from the global torch RNG at points the uninterrupted run does not (see
-    `test_stage_boundary_resume_continues_schedule_and_stream` for what a resume does promise)."""
+    `test_stage_boundary_resume_continues_schedule_and_stream` for what a resume does promise).
+    """
+
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
@@ -492,8 +542,11 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
 
 
 def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
-    """tiny.yaml without transitions; fp32 because bf16 autocast is very slow on the CPU and precision is
-    irrelevant for the bit-exactness claim."""
+    """
+    tiny.yaml without transitions; fp32 because bf16 autocast is very slow on the CPU and precision is
+    irrelevant for the bit-exactness claim.
+    """
+
     tmp_path.mkdir(parents=True, exist_ok=True)
     dataset_yaml = tmp_path / "tiny_dataset.yaml"
     dataset_yaml.write_text(TINY_DATASET_YAML.read_text().replace("transition_pct: 0.25", "transition_pct: 0.0"))
@@ -504,14 +557,17 @@ def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, *
 
 @pytest.mark.slow
 def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """Resuming from the stage-0_end checkpoint continues the run: the same remaining steps, the exact LR schedule,
+    """
+    Resuming from the stage-0_end checkpoint continues the run: the same remaining steps, the exact LR schedule,
     the evaluation cadence, and the data stream picks up where the checkpoint stood. The resumed run ends with
     exactly the uninterrupted run's per-source consumed-row counters, having repeated no row.
 
     It is deliberately NOT bit-exact any more: the run-wide readers live across stage boundaries, so a resumed
     run's freshly created loader iterators draw base seeds from the global torch RNG at points the uninterrupted
     run does not, and the losses diverge (the old per-stage loaders happened to make a stage-boundary resume
-    bit-exact because the next stage's loader had not been created yet)."""
+    bit-exact because the next stage's loader had not been created yet).
+    """
+
     full_dir = tmp_path / "full" / "out"
     history_full = _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir)).history
     names = sorted(p.name for p in checkpoint_dir(full_dir).glob("*.pth"))
@@ -544,9 +600,11 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
 
 @pytest.mark.slow
 def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
-    """A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-source row
+    """
+    A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-source row
     counters continue instead of restarting at row 0, so the resumed run trains on rows the interrupted run had not
-    reached (`BatchStream.load_state_dict` says exactly what that does and does not promise)."""
+    reached (`BatchStream.load_state_dict` says exactly what that does and does not promise).
+    """
 
     def consumed(directory: Path, name: str) -> dict[str, int]:
         state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
@@ -597,7 +655,10 @@ def test_resume_from_explicit_checkpoint_path_with_resume_warmup(
 def test_resume_with_changed_dataset_config_raises_unless_allowed(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
-    """A dataset config whose hash differs from the checkpoint's (here: transition_pct changed, data unchanged)."""
+    """
+    A dataset config whose hash differs from the checkpoint's (here: transition_pct changed, data unchanged).
+    """
+
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
@@ -616,8 +677,11 @@ def test_resume_with_changed_dataset_config_raises_unless_allowed(
 def test_resume_with_changed_validation_split_raises_unless_allowed(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
-    """A checkpoint whose stored validation split differs from the freshly resolved one (as if the data had grown
-    since): the error names the source and both numbers; `allow_dataset_change` resumes anyway."""
+    """
+    A checkpoint whose stored validation split differs from the freshly resolved one (as if the data had grown
+    since): the error names the source and both numbers; `allow_dataset_change` resumes anyway.
+    """
+
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
     (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
@@ -642,8 +706,10 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
 
 
 class StopAfterPolls:
-    """A `StopCheck` that says stop from its n-th poll on; `train()` polls once per completed optimizer step, so
-    `StopAfterPolls(5)` stops the run after step 5."""
+    """
+    A `StopCheck` that says stop from its n-th poll on; `train()` polls once per completed optimizer step, so
+    `StopAfterPolls(5)` stops the run after step 5.
+    """
 
     def __init__(self, polls: int) -> None:
         self.polls = polls
@@ -658,8 +724,11 @@ class StopAfterPolls:
 def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """A stop request after step 5 (inside stage 0): the loop saves `step-00000005-tiny.pth`, skips the export and
-    returns a stopped report of 5 steps; `resume: true` then continues from that checkpoint to the end and exports."""
+    """
+    A stop request after step 5 (inside stage 0): the loop saves `step-00000005-tiny.pth`, skips the export and
+    returns a stopped report of 5 steps; `resume: true` then continues from that checkpoint to the end and exports.
+    """
+
     out_dir = tmp_path / "out"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=True)
     should_stop = StopAfterPolls(5)
@@ -693,8 +762,11 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
 def test_stop_request_at_a_checkpoint_step_saves_once(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """A stop request after step 6, the last plain step of stage 0: the stage-end checkpoint is the one written,
-    not a second file."""
+    """
+    A stop request after step 6, the last plain step of stage 0: the stage-end checkpoint is the one written,
+    not a second file.
+    """
+
     out_dir = tmp_path / "out"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32")
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(6))
@@ -709,7 +781,8 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
 
 @pytest.mark.slow
 def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
-    """Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
+    """
+    Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
 
     The golden is a refactor guard, not a promise about CPU training: it was recorded in fp32 on the CPU with one
     thread and deterministic algorithms (torch 2.13.0+cu130, see `training.testing.golden.record_golden_run`), so it catches
@@ -720,6 +793,7 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
     commit whose purpose is a numerics change or a change of the tiny dataset. If it fails on another machine for
     float-order reasons only, loosen the tolerance rather than chase it.
     """
+
     assert GOLDEN_RUN_PATH.exists(), "golden run missing; record it with record_golden_run() in a numerics commit"
     expected = json.loads(GOLDEN_RUN_PATH.read_text())
     actual = golden_run_metrics(tiny_dataset_dir)

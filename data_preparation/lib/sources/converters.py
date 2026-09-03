@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Row converters and filters: `get_converter(source)` maps a raw row to the standard shape (pretrain `{"text"}`,
-instruct `{"instruction", "input", "output"}`), `get_filter(name)` a row predicate (`sharegpt_quality`)."""
+"""
+Row converters and filters: `get_converter(source)` maps a raw row to the standard shape (pretrain `{"text"}`,
+instruct `{"instruction", "input", "output"}`), `get_filter(name)` a row predicate (`sharegpt_quality`).
+"""
 
 from __future__ import annotations
 
@@ -17,14 +19,20 @@ INSTRUCT_FIELDS = ("instruction", "input", "output")
 
 
 def _require(row: Row, *keys: str) -> None:
-    """Raise ``ValueError`` naming the missing columns if ``row`` lacks any of ``keys``."""
+    """
+    Raise ValueError naming the missing columns if row lacks any of keys.
+    """
+
     missing = [key for key in keys if key not in row]
     if missing:
         raise ValueError(f"row is missing column(s) {missing}; available columns: {sorted(row)}")
 
 
 def text_or_empty(value: Any) -> str:
-    """``str(value)``, with ``None`` becoming the empty string."""
+    """
+    str(value), with None becoming the empty string.
+    """
+
     return "" if value is None else str(value)
 
 
@@ -32,13 +40,19 @@ def text_or_empty(value: Any) -> str:
 
 
 def gsm8k_question_answer(row: Row) -> Row:
-    """GSM8K `question` + `answer` -> one pretraining document."""
+    """
+    GSM8K `question` + `answer` -> one pretraining document.
+    """
+
     _require(row, "question", "answer")
     return {"text": f"Question: {text_or_empty(row['question'])}\n\nAnswer: {text_or_empty(row['answer'])}"}
 
 
 def _conversations(row: Row) -> list[Any]:
-    """The `conversations` list of a row (an error if the column is missing or not a list)."""
+    """
+    The `conversations` list of a row (an error if the column is missing or not a list).
+    """
+
     _require(row, "conversations")
     conversations = row["conversations"]
     if not isinstance(conversations, list):
@@ -47,10 +61,12 @@ def _conversations(row: Row) -> list[Any]:
 
 
 def sharegpt_conversations(row: Row) -> Row:
-    """SlimOrca / ShareGPT `conversations` with `from`/`value` turns: system->input, human->instruction, gpt->output.
+    """
+    SlimOrca / ShareGPT `conversations` with `from`/`value` turns: system->input, human->instruction, gpt->output.
 
     Later turns of the same role overwrite earlier ones (as in the thesis pipeline: only one exchange is kept).
     """
+
     by_role = {"system": "", "human": "", "gpt": ""}
     for turn in _conversations(row):
         if not isinstance(turn, dict) or "from" not in turn:
@@ -62,7 +78,10 @@ def sharegpt_conversations(row: Row) -> Row:
 
 
 def first_two_turns(row: Row) -> Row:
-    """`conversations` without role tags (WizardLM): first `value` = instruction, second = output."""
+    """
+    `conversations` without role tags (WizardLM): first `value` = instruction, second = output.
+    """
+
     conversations = _conversations(row)
     if len(conversations) < 2:
         raise ValueError(f"first_two_turns: need at least two turns, got {len(conversations)}; columns: {sorted(row)}")
@@ -73,7 +92,10 @@ def first_two_turns(row: Row) -> Row:
 
 
 def fields_converter(fields: dict[str, str]) -> Converter:
-    """Converter mapping `{instruction: <col>, input: <col>?, output: <col>}` to the standard instruct row."""
+    """
+    Converter mapping `{instruction: <col>, input: <col>?, output: <col>}` to the standard instruct row.
+    """
+
     if not {"instruction", "output"} <= set(fields):
         raise ValueError(f"fields must map at least instruction and output, got {sorted(fields)}")
     unknown = set(fields) - set(INSTRUCT_FIELDS)
@@ -99,7 +121,10 @@ _IDENTITY_FIELDS_CONVERTER = fields_converter({name: name for name in INSTRUCT_F
 
 
 def instruction_input_output(row: Row) -> Row:
-    """Rows that already carry `instruction`/`output` (and optionally `input`); missing input -> ""."""
+    """
+    Rows that already carry `instruction`/`output` (and optionally `input`); missing input -> "".
+    """
+
     return _IDENTITY_FIELDS_CONVERTER(row)
 
 
@@ -112,7 +137,10 @@ CONVERTERS: dict[str, Converter] = {
 
 
 def get_converter(source: SourceConfig) -> Converter | None:
-    """`fields` mapping first, then the named `converter`, else None (row used as is; `text_field` applied later)."""
+    """
+    `fields` mapping first, then the named `converter`, else None (row used as is; `text_field` applied later).
+    """
+
     if source.fields is not None:
         return fields_converter(source.fields)
     if source.converter is None:
@@ -130,7 +158,10 @@ SHAREGPT_CODE_BLOCK_MARKERS = ("```python", "```java", "```cpp", "```javascript"
 
 
 def sharegpt_quality(row: Row) -> bool:
-    """ShareGPT quality filter: human->gpt opening, 50-2000 chars per side, no code blocks in the answer."""
+    """
+    ShareGPT quality filter: human->gpt opening, 50-2000 chars per side, no code blocks in the answer.
+    """
+
     conversations = row.get("conversations")
     if not isinstance(conversations, list) or len(conversations) < 2:
         return False
@@ -153,7 +184,10 @@ FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality}
 
 
 def get_filter(name: str) -> Filter:
-    """The registered filter called ``name`` (``ValueError`` for an unknown name)."""
+    """
+    The registered filter called name (ValueError for an unknown name).
+    """
+
     if name not in FILTERS:
         raise ValueError(f"unknown filter {name!r}; known filters: {sorted(FILTERS)}")
     return FILTERS[name]

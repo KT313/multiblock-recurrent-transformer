@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""One optimizer step of the training loop: the micro-batch stream, the scheduled learning rate and
+"""
+One optimizer step of the training loop: the micro-batch stream, the scheduled learning rate and
 `run_one_optimizer_step`, the only place with autocast / backward / clipping.
 
 Everything here is numerics, bit-identical to the thesis loop; the golden tests in `test_step.py` and `test_run.py`
@@ -33,7 +34,8 @@ from training.stage_manager import StageInfo, StageManager
 
 @dataclass
 class TrainingProgress:
-    """The mutable step counter of a run, shared by the loop and the micro-batch stream.
+    """
+    The mutable step counter of a run, shared by the loop and the micro-batch stream.
 
     `step` is the next optimizer step to run; `train()` calls `advance()` once right after `run_one_optimizer_step`.
     """
@@ -42,14 +44,19 @@ class TrainingProgress:
     resume_step: int = -1  # step the run was resumed at, -1 for a fresh run
 
     def advance(self) -> None:
-        """One optimizer step completed: after this `step` is the number of completed steps (evaluation, logging and
-        checkpoint intervals count these) and the index of the next step to run."""
+        """
+        One optimizer step completed: after this `step` is the number of completed steps (evaluation, logging and
+        checkpoint intervals count these) and the index of the next step to run.
+        """
+
         self.step += 1
 
 
 @dataclass
 class StepResult:
-    """What one optimizer step produced."""
+    """
+    What one optimizer step produced.
+    """
 
     step: int  # the optimizer step that was run
     learning_rate: float  # scheduled LR of that step
@@ -63,7 +70,8 @@ class StepResult:
 
 
 class BatchStream:
-    """Endless stream of micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
+    """
+    Endless stream of micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
 
     One reader per source for the whole run; stages only change the draw weights, so a source shared by two stages
     is never re-read. Each sample of a world batch comes from a source drawn with the current step's weights; the
@@ -98,12 +106,16 @@ class BatchStream:
         return next(self._micro_batches)
 
     def state_dict(self) -> dict[str, Any]:
-        """What a checkpoint stores: the rows read per source (dropped rows included) and the draw RNG state. Old
-        checkpoint schemas have no loader (repo policy)."""
+        """
+        What a checkpoint stores: the rows read per source (dropped rows included) and the draw RNG state. Old
+        checkpoint schemas have no loader (repo policy).
+        """
+
         return {"consumed_rows": dict(self.consumed_rows), "draw_rng": self.rng.getstate()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it and
+        """
+        Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it and
         the draw RNG picks its state back up.
 
         "No repeated rows", not bit-exact: samples that sat in a buffer at checkpoint time were counted as read and
@@ -111,13 +123,17 @@ class BatchStream:
         reproducing the interrupted run's losses. Counters are rows READ (dropped rows included), the unit the
         offsets skip.
         """
+
         self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
         self.rng.setstate(state["draw_rng"])
         self.loaders.set_resume_offsets(self.consumed_rows)
 
     def _next_sample(self, source: str) -> Sample:
-        """The next buffered sample of `source`, pulling worker batches until one is there; rows read (dropped rows
-        included) are counted against the source at pull time."""
+        """
+        The next buffered sample of `source`, pulling worker batches until one is there; rows read (dropped rows
+        included) are counted against the source at pull time.
+        """
+
         buffer = self._buffers[source]
         while not buffer:
             batch = self.loaders.next_train_batch(source)
@@ -146,8 +162,11 @@ class BatchStream:
 
 
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:
-    """The LR of optimizer step `progress.step`: trapezoid warmup / cooldown over the whole run, the per-stage base
-    LR in between (linearly interpolated inside a transition), the resume warmup after `progress.resume_step`."""
+    """
+    The LR of optimizer step `progress.step`: trapezoid warmup / cooldown over the whole run, the per-stage base
+    LR in between (linearly interpolated inside a transition), the resume warmup after `progress.resume_step`.
+    """
+
     return get_lr_multistage(
         progress.step,
         stage_manager.total_steps,
@@ -170,13 +189,15 @@ def run_one_optimizer_step(
     batches: Iterator[Batch],
     progress: TrainingProgress,
 ) -> StepResult:
-    """Run optimizer step `progress.step`: one world batch of `gradient_accumulation_steps` micro-batches from
+    """
+    Run optimizer step `progress.step`: one world batch of `gradient_accumulation_steps` micro-batches from
     `batches`, one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
 
     Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
     loss is all-reduced every step (a no-op on one device).
     """
+
     step = progress.step
     accumulation_steps = settings.gradient_accumulation_steps
     plain_model(model).step = step

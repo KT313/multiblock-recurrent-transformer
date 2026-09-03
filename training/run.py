@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""`train()`: one training run as a readable entry function, plus the setup helpers it is made of.
+"""
+`train()`: one training run as a readable entry function, plus the setup helpers it is made of.
 
     create_backend                    device, precision, torch flags; then `seed_everything`
     prepare_run_directory             out_dir/checkpoints, run_config.json
@@ -64,8 +65,10 @@ from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
 
 @dataclass(frozen=True)
 class RunState:
-    """The run once it is set up, handed to `restore_checkpoint_if_resuming`, `save_run_checkpoint` and
-    `export_if_requested` as one argument. Every member keeps its identity for the whole run; only `progress` moves."""
+    """
+    The run once it is set up, handed to `restore_checkpoint_if_resuming`, `save_run_checkpoint` and
+    `export_if_requested` as one argument. Every member keeps its identity for the whole run; only `progress` moves.
+    """
 
     settings: Settings
     run_directory: Path
@@ -79,8 +82,10 @@ class RunState:
 
 @dataclass(frozen=True)
 class ResumePoint:
-    """Where a resumed run continues from: the checkpoint it was restored from and the data-stream state stored in
-    it (None in a checkpoint written before the stream existed), for `BatchStream.load_state_dict`."""
+    """
+    Where a resumed run continues from: the checkpoint it was restored from and the data-stream state stored in
+    it (None in a checkpoint written before the stream existed), for `BatchStream.load_state_dict`.
+    """
 
     checkpoint: Path
     data_stream: dict[str, Any] | None
@@ -94,7 +99,8 @@ def train(
     started_at: float | None = None,
     keep_history: bool = False,
 ) -> TrainingReport:
-    """Run the training run described by `settings` and return its report.
+    """
+    Run the training run described by `settings` and return its report.
 
     `backend`: created from the settings unless given (tests inject the CPU backend); seeded here either way.
     `should_stop`: the run's stop request (the CLI's Ctrl-C), polled between build shards and after every optimizer
@@ -106,6 +112,7 @@ def train(
     Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint, so the
     stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
     """
+
     backend = backend or create_backend(settings)
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
@@ -167,27 +174,39 @@ def train(
 
 
 def create_backend(settings: Settings) -> Backend:
-    """The run's backend (`settings.backend` at `settings.precision`); its constructor picks the device and sets the
-    torch flags. `train()` seeds it right after."""
+    """
+    The run's backend (`settings.backend` at `settings.precision`); its constructor picks the device and sets the
+    torch flags. `train()` seeds it right after.
+    """
+
     return get_backend(settings.backend, precision=settings.precision)
 
 
 def prepare_run_directory(settings: Settings) -> Path:
-    """Create the run directory (`settings.out_dir`) with its `checkpoints/` folder. Returns the run directory."""
+    """
+    Create the run directory (`settings.out_dir`) with its `checkpoints/` folder. Returns the run directory.
+    """
+
     run_directory = Path(settings.out_dir)
     checkpoint_dir(run_directory).mkdir(parents=True, exist_ok=True)
     return run_directory
 
 
 def record_run_config(settings: Settings, run_directory: Path) -> None:
-    """Write `run_config.json` (the settings as parsed) for a FRESH run only; a resume keeps the file the run was
-    started with."""
+    """
+    Write `run_config.json` (the settings as parsed) for a FRESH run only; a resume keeps the file the run was
+    started with.
+    """
+
     with open(run_directory / "run_config.json", "w") as file:
         json.dump(asdict(settings), file, indent=4)
 
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
-    """The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries."""
+    """
+    The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries.
+    """
+
     return StageManager(
         dataset.stages,
         world_batch_size=settings.world_batch_size,
@@ -200,8 +219,11 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
 
 
 def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -> None:
-    """The run config's `block_size` must equal the architecture's (the RoPE table is sized by it). The dataset-side
-    check (`block_size` of the dataset config) is the resolver's."""
+    """
+    The run config's `block_size` must equal the architecture's (the RoPE table is sized by it). The dataset-side
+    check (`block_size` of the dataset config) is the resolver's.
+    """
+
     if model_config.block_size != settings.block_size:
         raise ValueError(
             f"block_size {settings.block_size} of the run config does not match block_size {model_config.block_size} "
@@ -210,12 +232,14 @@ def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -
 
 
 def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -> Module:
-    """The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
+    """
+    The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
     then `backend.setup_model` (device, optional compile).
 
     Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`; nothing that
     draws may run before it.
     """
+
     model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
     check_block_sizes_agree(settings, model_config)
     model = RecurrentGPT(
@@ -226,8 +250,11 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
 
 
 def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> Optimizer:
-    """The run's optimizer: the three parameter groups of `get_param_groups`, `settings.optimizer` with
-    `settings.optim_config`, wrapped by `backend.setup_optimizer`."""
+    """
+    The run's optimizer: the three parameter groups of `get_param_groups`, `settings.optimizer` with
+    `settings.optim_config`, wrapped by `backend.setup_optimizer`.
+    """
+
     param_groups = get_param_groups(
         model, settings.optim_config.weight_decay, settings.no_weight_decay_for_bias_and_norm_params
     )
@@ -235,13 +262,15 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
 
 
 def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
-    """Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
+    """
+    Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
 
     With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` in the run
     directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and settings
     against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step = checkpoint step`.
     The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
     """
+
     settings = state.settings
     if not settings.resume:
         return None
@@ -264,17 +293,22 @@ def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
 
 
 def stop_requested(should_stop: StopCheck | None) -> bool:
-    """Whether the caller asked the run to stop (None: never)."""
+    """
+    Whether the caller asked the run to stop (None: never).
+    """
+
     return should_stop is not None and should_stop()
 
 
 def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> None:
-    """Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
+    """
+    Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
     Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
     the stage the run is heading for (`StageManager.entering_stage_at`). Numerics: called after evaluation and
     logging, so the stored RNG state includes the evaluation draws.
     """
+
     settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
     stage_end = stage_manager.stage_ending_at(progress.step - 1)
     path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end)
@@ -297,8 +331,11 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
 
 
 def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
-    """With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`), tell
-    the logger and return the folder; None otherwise."""
+    """
+    With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`), tell
+    the logger and return the folder; None otherwise.
+    """
+
     settings = state.settings
     if not settings.export_to_hf:
         return None

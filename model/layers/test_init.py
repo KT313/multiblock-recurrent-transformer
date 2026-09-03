@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.init`: the takase std table, orthogonality of `trunc_orthogonal_`, zero biases."""
+"""
+Tests for `model.init`: the takase std table, orthogonality of `trunc_orthogonal_`, zero biases.
+"""
 
 from math import sqrt
 

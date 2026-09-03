@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Evaluation between optimizer steps: the validation loss at every `partial_depth_eval` depth and at the model's
+"""
+Evaluation between optimizer steps: the validation loss at every `partial_depth_eval` depth and at the model's
 mean recurrence, and the rule that says when it runs.
 
 Numerics: every forward consumes the global torch RNG, so the number and order of validation forwards is part of
@@ -24,11 +25,13 @@ from training.stage_manager import StageManager
 
 @torch.no_grad()
 def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: Iterable[Batch]) -> dict[str, Tensor]:
-    """Validation loss at every depth in `partial_depth_eval` and at the model's mean recurrence.
+    """
+    Validation loss at every depth in `partial_depth_eval` and at the model's mean recurrence.
 
     Returns `val_loss` / `val_ppl` (mean recurrence) plus `val_loss_<depth>` / `val_ppl_<depth>` per depth. The mean
     is over the batches actually seen (at most `eval_iters`), all-reduced; a loader that yields no batch is an error.
     """
+
     model.eval()
     config = plain_model(model).config
     mean_recurrence = cast(list[int], config.mean_recurrence)  # broadcast to a list in RecurrentConfig.__post_init__
@@ -63,6 +66,9 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
 
 
 def is_evaluation_step(settings: Settings, completed_steps: int, stage_manager: StageManager) -> bool:
-    """Whether to evaluate after `completed_steps` completed optimizer steps: every `eval_step_interval` steps and after the
-    last step."""
+    """
+    Whether to evaluate after `completed_steps` completed optimizer steps: every `eval_step_interval` steps and after the
+    last step.
+    """
+
     return completed_steps % settings.eval_step_interval == 0 or completed_steps >= stage_manager.total_steps

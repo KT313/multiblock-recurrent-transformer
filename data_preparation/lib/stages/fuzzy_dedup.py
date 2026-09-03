@@ -1,17 +1,18 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Streaming MinHash + LSH near-duplicate removal (``dedup.mode: minhash``), first occurrence wins.
+"""
+Streaming MinHash + LSH near-duplicate removal (dedup.mode: minhash), first occurrence wins.
 
-Signatures are computed in a **spawn**-context ``multiprocessing.Pool`` of ``pass_workers`` (``pass_workers > 1``;
+Signatures are computed in a spawn-context multiprocessing.Pool of pass_workers (pass_workers > 1;
 spawn because the pool is created from a build worker thread, where a fork could inherit another thread's lock
-mid-hold) in chunks of ``chunk_size`` rows; workers return only the ``uint64[num_perm]`` hash values of each
-document (nothing but numpy arrays is pickled), the main process rebuilds the ``MinHash`` from that array and
-queries/inserts the single ``MinHashLSH`` in input order. Rows stream in and out; at most ``2 * pass_workers``
+mid-hold) in chunks of chunk_size rows; workers return only the uint64[num_perm] hash values of each
+document (nothing but numpy arrays is pickled), the main process rebuilds the MinHash from that array and
+queries/inserts the single MinHashLSH in input order. Rows stream in and out; at most 2 * pass_workers
 chunks are in flight at any time.
 
 Memory: the LSH index holds the signature of every *kept* row, i.e. O(kept rows). Per kept row this is the
-``num_perm`` uint64 hash values (8 * num_perm bytes, 2 KB at num_perm=256) plus ``b`` band keys and the ``doc_<i>``
+num_perm uint64 hash values (8 * num_perm bytes, 2 KB at num_perm=256) plus b band keys and the doc_<i>
 key strings in Python dicts/sets: in practice roughly 3-5 KB per kept row at num_perm=256, so ~4 GB per million
-kept rows. Signatures use datasketch's default ``seed=1`` and are therefore reproducible across runs and workers.
+kept rows. Signatures use datasketch's default seed=1 and are therefore reproducible across runs and workers.
 """
 
 from __future__ import annotations
@@ -37,14 +38,17 @@ CHUNK_SIZE = 1024
 MINHASH_SEED = 1  # datasketch default; pinned so signatures are stable
 
 # Signature parameters of *this* process: the n-gram size and the MinHash constructor arguments. Set once per process
-# by ``_init_worker`` before ``_signature`` is used: the spawn-pool initializer (spawn children start with fresh
+# by _init_worker before _signature is used: the spawn-pool initializer (spawn children start with fresh
 # module globals; its arguments are two plain ints), or called directly when pass_workers <= 1.
 _NGRAM: int = 0
 _MINHASH_KWARGS: dict[str, Any] = {}
 
 
 def _import_datasketch() -> tuple[Any, Any]:
-    """``(MinHash, MinHashLSH)``, imported lazily because datasketch is an optional extra."""
+    """
+    (MinHash, MinHashLSH), imported lazily because datasketch is an optional extra.
+    """
+
     try:
         from datasketch import MinHash, MinHashLSH
     except ImportError as exc:
@@ -55,8 +59,11 @@ def _import_datasketch() -> tuple[Any, Any]:
 
 
 def _minhash_kwargs(num_perm: int) -> dict[str, Any]:
-    """Constructor arguments that make every ``MinHash`` here comparable: pinned seed and, on datasketch >= 2.0,
-    the default hashing ``scheme`` (required explicitly when rebuilding from ``hashvalues``)."""
+    """
+    Constructor arguments that make every MinHash here comparable: pinned seed and, on datasketch >= 2.0,
+    the default hashing scheme (required explicitly when rebuilding from hashvalues).
+    """
+
     MinHash, _ = _import_datasketch()
     kwargs: dict[str, Any] = {"num_perm": num_perm, "seed": MINHASH_SEED}
     scheme = getattr(MinHash(num_perm=1, seed=MINHASH_SEED), "scheme", None)
@@ -66,7 +73,10 @@ def _minhash_kwargs(num_perm: int) -> dict[str, Any]:
 
 
 def _init_worker(num_perm: int, ngram: int) -> None:
-    """Set the per-process signature parameters (pool initializer)."""
+    """
+    Set the per-process signature parameters (pool initializer).
+    """
+
     global _NGRAM
     _NGRAM = ngram
     _MINHASH_KWARGS.clear()
@@ -74,9 +84,12 @@ def _init_worker(num_perm: int, ngram: int) -> None:
 
 
 def _signature(text: str) -> Signature:
-    """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle); an empty array for
-    a text with fewer than ``ngram`` words: such texts have no n-grams, and the empty-set signature would make every
-    one of them a near-duplicate of the first."""
+    """
+    MinHash hash values of the word n-grams of text (plain numpy array, cheap to pickle); an empty array for
+    a text with fewer than ngram words: such texts have no n-grams, and the empty-set signature would make every
+    one of them a near-duplicate of the first.
+    """
+
     MinHash, _ = _import_datasketch()
     ngrams = get_ngrams(text, n=_NGRAM)
     if not ngrams:
@@ -88,12 +101,18 @@ def _signature(text: str) -> Signature:
 
 
 def _signatures(texts: list[str]) -> list[Signature]:
-    """Worker task: the signatures of one chunk of texts."""
+    """
+    Worker task: the signatures of one chunk of texts.
+    """
+
     return [_signature(text) for text in texts]
 
 
 def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[tuple[Row, Signature]]:
-    """``(row, signature)`` pairs computed in this process."""
+    """
+    (row, signature) pairs computed in this process.
+    """
+
     _init_worker(dedup.num_perm, dedup.ngram)
     for row in rows:
         yield row, _signature(row["text"])
@@ -102,11 +121,13 @@ def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[
 def _signatures_in_pool(
     rows: Iterator[Row], dedup: DedupConfig, pass_workers: int, chunk_size: int
 ) -> Iterator[tuple[Row, Signature]]:
-    """``(row, signature)`` pairs in input order, signatures computed by a spawn worker pool chunk by chunk.
-
-    Bounded in-order pipeline: at most ``2 * pass_workers`` chunks are read ahead of the consumer, so the input keeps
-    streaming however slow the LSH side is (``pool.imap`` would read the whole input into its task queue).
     """
+    (row, signature) pairs in input order, signatures computed by a spawn worker pool chunk by chunk.
+
+    Bounded in-order pipeline: at most 2 * pass_workers chunks are read ahead of the consumer, so the input keeps
+    streaming however slow the LSH side is (pool.imap would read the whole input into its task queue).
+    """
+
     max_inflight = 2 * pass_workers
     inflight: deque[tuple[list[Row], AsyncResult[list[Signature]]]] = deque()
 
@@ -127,10 +148,13 @@ def _signatures_in_pool(
 def fuzzy_dedup(
     rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], pass_workers: int = 1, chunk_size: int = CHUNK_SIZE
 ) -> Iterator[Row]:
-    """Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= ``dedup.threshold``) among the rows
-    yielded before; rows too short for a single n-gram pass through untouched (``stats["too_short_passed"]``, they
-    are only deduplicated exactly). ``stats`` gets ``threshold``, ``num_perm``, ``near_duplicates_removed``,
-    ``near_duplicate_rate`` and ``seconds``. See the module docstring for the memory footprint."""
+    """
+    Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= dedup.threshold) among the rows
+    yielded before; rows too short for a single n-gram pass through untouched (stats["too_short_passed"], they
+    are only deduplicated exactly). stats gets threshold, num_perm, near_duplicates_removed,
+    near_duplicate_rate and seconds. See the module docstring for the memory footprint.
+    """
+
     MinHash, MinHashLSH = _import_datasketch()
     stats.update({"threshold": dedup.threshold, "num_perm": dedup.num_perm, "near_duplicates_removed": 0, "too_short_passed": 0})
     lsh = MinHashLSH(threshold=dedup.threshold, num_perm=dedup.num_perm)

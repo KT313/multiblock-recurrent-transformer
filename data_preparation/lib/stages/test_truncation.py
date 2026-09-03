@@ -1,9 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.truncation: token-boundary text truncation in tokenizer and estimate mode.
+"""
+Tests for data_preparation.lib.stages.truncation: token-boundary text truncation in tokenizer and estimate mode.
 
 Two offline tokenizers: the synthetic WordLevel one of the tiny config (whitespace words, what the rest of the suite
 uses) and a small BPE with a Metaspace pre-tokenizer trained here in milliseconds (llama-style "▁" tokens whose
-offsets overlap the first word, the boundary subtlety the module handles)."""
+offsets overlap the first word, the boundary subtlety the module handles).
+"""
 
 from __future__ import annotations
 
@@ -25,7 +27,10 @@ from data_preparation.lib.stages.truncation import (
 
 
 def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> tuple[str, int]:
-    """`truncate_many` for one text."""
+    """
+    `truncate_many` for one text.
+    """
+
     return truncate_many([text], max_tokens, tokenizer)[0]
 
 CORPUS = [
@@ -40,7 +45,10 @@ UNICODE = "日本語 😀 naïve café … über 😀😀 tok_1 tok_2 "
 
 
 def _count(tokenizer: PreTrainedTokenizerFast, text: str) -> int:
-    """The count definition of ``TokenCounter``: no special tokens."""
+    """
+    The count definition of TokenCounter: no special tokens.
+    """
+
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
@@ -139,8 +147,11 @@ def test_negative_cap_is_rejected(wordlevel: PreTrainedTokenizerFast) -> None:
 
 
 def test_metaspace_prefix_token_overlapping_the_first_word(metaspace_bpe: PreTrainedTokenizerFast) -> None:
-    """'aaaa…' tokenizes to ['▁' (0, 1), 'aaaa…' (0, 32), …]: token 1 starts at offset 0, so a cap of 1 keeps
-    nothing (a single 'a' would already be two tokens) and the recount (0) is what is returned."""
+    """
+    'aaaa…' tokenizes to ['▁' (0, 1), 'aaaa…' (0, 32), …]: token 1 starts at offset 0, so a cap of 1 keeps
+    nothing (a single 'a' would already be two tokens) and the recount (0) is what is returned.
+    """
+
     text = "a" * 60
     assert _count(metaspace_bpe, text) > 2
     assert truncate_to_token_cap(text, 1, metaspace_bpe) == ("", 0)
@@ -161,9 +172,11 @@ def test_random_texts_satisfy_the_invariants(tokenizer: PreTrainedTokenizerFast)
 
 
 class _ViterbiLikeStub:
-    """One token per character, except that "xy" is one token when something follows it (an end-of-word dependent
+    """
+    One token per character, except that "xy" is one token when something follows it (an end-of-word dependent
     segmentation, as a Unigram model can produce): cutting "xyz" after token 0 ("xy") gives "xy", which alone is two
-    tokens, more than the cap of 1, so the module must cut again."""
+    tokens, more than the cap of 1, so the module must cut again.
+    """
 
     calls: list[list[str]]
 

@@ -1,30 +1,31 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""File-by-file reading of a Hub dataset repo (the ``hf_files`` / ``github_code`` loaders).
+"""
+File-by-file reading of a Hub dataset repo (the hf_files / github_code loaders).
 
-Row order = the repo's files matching a glob (``load_kwargs.data_files``, relative to the repo root) sorted by path,
+Row order = the repo's files matching a glob (load_kwargs.data_files, relative to the repo root) sorted by path,
 rows in file order. How a file is fetched depends on its size (known from the index):
 
-* **≤ ``max_cached_file_mb``** (default :data:`DEFAULT_MAX_CACHED_FILE_MB`; ``load_kwargs.max_cached_file_mb``
-  overrides it per source): ``hf_hub_download`` into the Hub cache (never fetched twice), then read locally.
-* **larger parquet files** are opened remotely (``HfFileSystem``, HTTP range requests) and only the row groups
+* ≤ max_cached_file_mb (default :data:`DEFAULT_MAX_CACHED_FILE_MB`; load_kwargs.max_cached_file_mb
+  overrides it per source): hf_hub_download into the Hub cache (never fetched twice), then read locally.
+* larger parquet files are opened remotely (HfFileSystem, HTTP range requests) and only the row groups
   covering the requested rows are read, each decoded in :data:`ROW_BATCH` slices. A fetched row group is kept
-  whole (``count`` is a minimum, ``align_to_row_group=True``), so the same bytes are never downloaded twice; a
+  whole (count is a minimum, align_to_row_group=True), so the same bytes are never downloaded twice; a
   top-up at a larger offset seeks straight to the right row group.
-* **larger ``.jsonl`` / ``.jsonl.zst`` / ``.jsonl.gz`` / ``.json.gz`` / ``.json`` files** are streamed from the
-  start (a ``.json`` array incrementally with ``ijson``, :func:`iter_json_array`) and dropped after exactly
-  ``count`` rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
+* larger .jsonl / .jsonl.zst / .jsonl.gz / .json.gz / .json files are streamed from the
+  start (a .json array incrementally with ijson, :func:`iter_json_array`) and dropped after exactly
+  count rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
   file re-streams that file's prefix.
 
-A :class:`FileIndex` per ``(repo, revision, glob)`` remembers the file list and sizes (one batched
-``HfApi.get_paths_info`` call), the row count of every file read so far and the row-group row counts of every
-parquet footer seen, so a fetch at ``offset`` skips whole files without opening them. It records the commit the
+A :class:`FileIndex` per (repo, revision, glob) remembers the file list and sizes (one batched
+HfApi.get_paths_info call), the row count of every file read so far and the row-group row counts of every
+parquet footer seen, so a fetch at offset skips whole files without opening them. It records the commit the
 file list was taken at; an index loaded from disk is only valid while the repo still resolves to that commit (a
 moved repo is a hard error: offsets counted against the old listing would skip or duplicate rows). It is
-persisted as JSON under ``<index_dir>/<repo>@<revision>/<glob hash>.json`` when an ``index_dir`` is given, else
-kept in memory. Per-key counters (``keyed_counts[key][file]``, ``group_counts[key][file]``, e.g. rows of one language
-for ``github_code``) share the index.
+persisted as JSON under <index_dir>/<repo>@<revision>/<glob hash>.json when an index_dir is given, else
+kept in memory. Per-key counters (keyed_counts[key][file], group_counts[key][file], e.g. rows of one language
+for github_code) share the index.
 
-Files read from the Hub cache (and local files) use exact ``count`` semantics: over-reading them costs nothing.
+Files read from the Hub cache (and local files) use exact count semantics: over-reading them costs nothing.
 
 Hub access goes through :func:`repo_listing`, :func:`resolve_revision`, :func:`paths_info`, :func:`hub_download`
 and :func:`open_remote` (stubbed by the tests) or the callables of a :class:`HubFetcher`, which also holds the
@@ -79,19 +80,25 @@ HUB_REQUEST_TIMEOUT = 30.0  # seconds to connect, and between two reads, of any 
 
 @functools.cache
 def configure_hub_http() -> None:
-    """Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
+    """
+    Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
     The library passes its own, shorter timeouts to range reads and cache downloads; the repo listing and the size
-    lookup (``HfApi.dataset_info`` / ``get_paths_info``) rely on the client's, which is unset by default."""
+    lookup (HfApi.dataset_info / get_paths_info) rely on the client's, which is unset by default.
+    """
+
     from huggingface_hub import get_session
 
     get_session().timeout = HUB_REQUEST_TIMEOUT
 
 
 def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
-    """All file paths of a dataset repo at ``revision`` plus the commit hash that revision resolved to.
+    """
+    All file paths of a dataset repo at revision plus the commit hash that revision resolved to.
 
-    One ``HfApi.dataset_info`` call gives both (the sibling list is the file list, ``sha`` the resolved commit), so
-    recording the commit alongside the listing costs no extra request."""
+    One HfApi.dataset_info call gives both (the sibling list is the file list, sha the resolved commit), so
+    recording the commit alongside the listing costs no extra request.
+    """
+
     from huggingface_hub import HfApi
 
     configure_hub_http()
@@ -102,12 +109,18 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
 
 
 def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> str:
-    """The commit hash ``revision`` currently resolves to (the default branch's head when unset)."""
+    """
+    The commit hash revision currently resolves to (the default branch's head when unset).
+    """
+
     return repo_listing(repo_id, revision, token)[1]
 
 
 def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
-    """Sizes in bytes of the given repo files (batched ``HfApi.get_paths_info``)."""
+    """
+    Sizes in bytes of the given repo files (batched HfApi.get_paths_info).
+    """
+
     from huggingface_hub import HfApi
     from huggingface_hub.hf_api import RepoFile
 
@@ -127,7 +140,10 @@ def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str 
 
 
 def hub_download(repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
-    """Download one repo file into the Hub cache (no-op if cached) and return its local path."""
+    """
+    Download one repo file into the Hub cache (no-op if cached) and return its local path.
+    """
+
     from huggingface_hub import hf_hub_download
 
     configure_hub_http()
@@ -135,7 +151,10 @@ def hub_download(repo_id: str, filename: str, revision: str | None, token: str |
 
 
 def open_remote(repo_id: str, filename: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
-    """Open one repo file for random-access reading over HTTP (``HfFileSystem``; nothing is cached on disk)."""
+    """
+    Open one repo file for random-access reading over HTTP (HfFileSystem; nothing is cached on disk).
+    """
+
     from huggingface_hub import HfFileSystem
 
     configure_hub_http()
@@ -149,7 +168,10 @@ def open_remote(repo_id: str, filename: str, revision: str | None, token: str | 
 
 
 def index_path(index_dir: Path, repo_id: str, revision: str | None, pattern: str) -> Path:
-    """``<index_dir>/<repo with / replaced>@<revision>/<sha256(pattern)[:16]>.json``."""
+    """
+    <index_dir>/<repo with / replaced>@<revision>/<sha256(pattern)[:16]>.json.
+    """
+
     repo = repo_id.replace("/", "--")
     pattern_hash = hashlib.sha256(pattern.encode()).hexdigest()[:16]
     return index_dir / f"{repo}@{revision or 'main'}" / f"{pattern_hash}.json"
@@ -181,11 +203,14 @@ class FileIndex:
     def open(
         cls, repo_id: str, revision: str | None, pattern: str, index_dir: Path | None, token: str | None
     ) -> FileIndex:
-        """Load the persisted index or create it (listing the repo once); file list and sizes are cached in it.
+        """
+        Load the persisted index or create it (listing the repo once); file list and sizes are cached in it.
         A persisted index is one process-wide instance per path, so concurrent readers of the same repo files
-        (the build runs items in threads) share it; its mutations and saves are serialised by ``_lock``. An index
+        (the build runs items in threads) share it; its mutations and saves are serialised by _lock. An index
         loaded from disk is checked against the repo's current revision resolution (a moved repo is an error, see
-        :meth:`_check_revision`); the process-cached instance was checked when it was first opened."""
+        :meth:`_check_revision`); the process-cached instance was checked when it was first opened.
+        """
+
         path = None if index_dir is None else index_path(index_dir, repo_id, revision, pattern)
         if path is None:
             index = cls._from_repo_listing(repo_id, revision, pattern, None, token)
@@ -207,7 +232,10 @@ class FileIndex:
 
     @classmethod
     def _load(cls, repo_id: str, revision: str | None, pattern: str, path: Path) -> FileIndex:
-        """The index persisted at ``path`` (older files may lack the optional sections; they default to empty)."""
+        """
+        The index persisted at path (older files may lack the optional sections; they default to empty).
+        """
+
         data = json.loads(path.read_text(encoding="utf-8"))
         return cls(
             repo_id=repo_id,
@@ -224,13 +252,16 @@ class FileIndex:
         )
 
     def _check_revision(self, token: str | None) -> None:
-        """Fail if the repo no longer resolves to the commit the file list was taken at.
+        """
+        Fail if the repo no longer resolves to the commit the file list was taken at.
 
         The file order and every per-file row count are only valid for that exact listing (raw-folder offsets
         were counted against it), so silently re-listing a moved repo would skip or duplicate rows. This is the
         one place a loaded index costs a network call. An index written before the commit was recorded stores
         none: it adopts the current resolution once without erroring (failing would break every existing
-        ``dataset/hub_index/`` tree) and is guarded from then on."""
+        dataset/hub_index/ tree) and is guarded from then on.
+        """
+
         current = resolve_revision(self.repo_id, self.revision, token)
         if self.resolved_revision is None:
             self.resolved_revision = current  # one-time upgrade of a pre-recording index; persisted by open()'s save
@@ -247,8 +278,11 @@ class FileIndex:
     def _from_repo_listing(
         cls, repo_id: str, revision: str | None, pattern: str, path: Path | None, token: str | None
     ) -> FileIndex:
-        """A fresh index: list the repo once and keep the files matching ``pattern``, sorted by path, together
-        with the commit the listing resolved to (the same call yields both)."""
+        """
+        A fresh index: list the repo once and keep the files matching pattern, sorted by path, together
+        with the commit the listing resolved to (the same call yields both).
+        """
+
         all_files, resolved = repo_listing(repo_id, revision, token)
         matcher = glob_regex(pattern)
         files = sorted(path for path in all_files if matcher.fullmatch(path))
@@ -257,7 +291,10 @@ class FileIndex:
         return cls(repo_id, revision, pattern, files, resolved_revision=resolved, path=path)
 
     def ensure_sizes(self, token: str | None) -> None:
-        """Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed)."""
+        """
+        Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed).
+        """
+
         missing = [file for file in self.files if file not in self.sizes]
         if missing:
             sizes = paths_info(self.repo_id, missing, self.revision, token)
@@ -265,18 +302,24 @@ class FileIndex:
                 self.sizes.update(sizes)
 
     def save(self) -> None:
-        """Write the index to ``path`` atomically (no-op for an in-memory index); serialised per instance.
+        """
+        Write the index to path atomically (no-op for an in-memory index); serialised per instance.
 
         This is the unconditional backstop of the throttled :meth:`_write_if_due`: `open()` calls it, and so does
-        the ``finally`` of :func:`read_rows_multi`, which also runs when a download completes or the stop flag
-        makes the consumer close the row generator early."""
+        the finally of :func:`read_rows_multi`, which also runs when a download completes or the stop flag
+        makes the consumer close the row generator early.
+        """
+
         if self.path is None:
             return
         with self._lock:
             self._write()
 
     def _write(self) -> None:
-        """Write the JSON (caller holds ``_lock``; no-op for an in-memory index)."""
+        """
+        Write the JSON (caller holds _lock; no-op for an in-memory index).
+        """
+
         if self.path is None:
             return
         payload = {
@@ -296,25 +339,34 @@ class FileIndex:
         self._last_write = self.clock()
 
     def _write_if_due(self) -> None:
-        """Write only when :data:`INDEX_SAVE_INTERVAL_SECONDS` have passed since the last write (caller holds
-        ``_lock``).
+        """
+        Write only when :data:`INDEX_SAVE_INTERVAL_SECONDS` have passed since the last write (caller holds
+        _lock).
 
         The index is a cache of learned row counts (several MB of JSON for a repo of ~12,000 files) and writing
         it after every finished file rewrote the whole file once per file. Batching on a clock loses at most the
         last interval's counts in a crash, and a lost count is only re-learned by re-reading that file: never
-        wrong data, just a bounded re-read. :meth:`save` is the unconditional backstop at the end of every read."""
+        wrong data, just a bounded re-read. :meth:`save` is the unconditional backstop at the end of every read.
+        """
+
         if self.clock() - self._last_write >= INDEX_SAVE_INTERVAL_SECONDS:
             self._write()
 
     def count(self, key: str | None, file: str) -> int | None:
-        """Known row count of ``file`` (``key=None``: all rows; else the ``keyed_counts[key]`` counter), or None."""
+        """
+        Known row count of file (key=None: all rows; else the keyed_counts[key] counter), or None.
+        """
+
         if key is None:
             return self.row_counts.get(file)
         return self.keyed_counts.get(key, {}).get(file)
 
     def record_count(self, key: str | None, file: str, value: int) -> None:
-        """Store the row count of ``file`` (``key=None``: all rows; else the ``keyed_counts[key]`` counter) and save on
-        the clock (:meth:`_write_if_due`; the end of the read saves unconditionally)."""
+        """
+        Store the row count of file (key=None: all rows; else the keyed_counts[key] counter) and save on
+        the clock (:meth:`_write_if_due`; the end of the read saves unconditionally).
+        """
+
         with self._lock:
             if key is None:
                 self.row_counts[file] = value
@@ -323,31 +375,43 @@ class FileIndex:
             self._write_if_due()
 
     def record_row_groups(self, file: str, groups: list[int]) -> None:
-        """Store a parquet file's row-group row counts (and thereby its total row count); save on the clock."""
+        """
+        Store a parquet file's row-group row counts (and thereby its total row count); save on the clock.
+        """
+
         with self._lock:
             self.row_groups[file] = groups
             self.row_counts[file] = sum(groups)
             self._write_if_due()
 
     def known_group_counts(self, key: str | None, file: str) -> list[int]:
-        """Rows per row group of ``file`` that count towards ``key`` (``key=None``: the footer's row counts; else the
-        matching rows of the row groups already read under ``key``, a prefix of the file's groups)."""
+        """
+        Rows per row group of file that count towards key (key=None: the footer's row counts; else the
+        matching rows of the row groups already read under key, a prefix of the file's groups).
+        """
+
         if key is None:
             return self.row_groups.get(file, [])
         return self.group_counts.get(key, {}).get(file, [])
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
-        """Store (a copy of) the matching rows per row group read so far under ``key`` (a prefix of the file's
-        groups) in memory; the index is written on the save clock (``record`` / :meth:`_write_if_due`) and when a
-        read ends (``save``), not once per row group: for a repo of hundreds of files and thousands of row groups
-        that would rewrite the whole JSON thousands of times."""
+        """
+        Store (a copy of) the matching rows per row group read so far under key (a prefix of the file's
+        groups) in memory; the index is written on the save clock (record / :meth:`_write_if_due`) and when a
+        read ends (save), not once per row group: for a repo of hundreds of files and thousands of row groups
+        that would rewrite the whole JSON thousands of times.
+        """
+
         with self._lock:
             self.group_counts.setdefault(key, {})[file] = list(groups)
 
 
 def glob_regex(pattern: str) -> re.Pattern[str]:
-    """``data_files`` glob as an anchored regex with Hub semantics: ``*`` and ``?`` do not cross ``/``, ``**`` does
-    (``data/*.parquet`` matches ``data/x.parquet`` but not ``data/sub/x.parquet``; ``fnmatch`` would match both)."""
+    """
+    data_files glob as an anchored regex with Hub semantics: * and ? do not cross /, ** does
+    (data/*.parquet matches data/x.parquet but not data/sub/x.parquet; fnmatch would match both).
+    """
+
     parts: list[str] = []
     i = 0
     while i < len(pattern):
@@ -381,7 +445,9 @@ def glob_regex(pattern: str) -> re.Pattern[str]:
 
 @dataclass
 class FetchStats:
-    """The download counters of one fetcher (the dashboard's download row reads ``bytes_fetched`` live)."""
+    """
+    The download counters of one fetcher (the dashboard's download row reads bytes_fetched live).
+    """
 
     bytes_fetched: int = 0  # remote reads (read-ahead excluded) + whole files this fetcher downloaded to the cache
     files_downloaded: int = 0  # files fetched whole into the Hub cache (or already there)
@@ -389,7 +455,9 @@ class FetchStats:
 
 
 class _CountingRaw(io.RawIOBase, BinaryIO):
-    """Raw file over a binary file object that adds every byte read to ``stats.bytes_fetched``."""
+    """
+    Raw file over a binary file object that adds every byte read to stats.bytes_fetched.
+    """
 
     def __init__(self, inner: BinaryIO, stats: FetchStats) -> None:
         super().__init__()
@@ -427,8 +495,10 @@ OpenRemote = Callable[[str, str, str | None, str | None, int], BinaryIO]
 
 @dataclass
 class HubFetcher:
-    """Decides per file between the Hub cache and remote reading and opens it; ``download`` / ``remote`` default to
-    the module-level :func:`hub_download` / :func:`open_remote` (resolved at call time so tests can stub either)."""
+    """
+    Decides per file between the Hub cache and remote reading and opens it; download / remote default to
+    the module-level :func:`hub_download` / :func:`open_remote` (resolved at call time so tests can stub either).
+    """
 
     token: str | None = None
     max_cached_file_mb: float = DEFAULT_MAX_CACHED_FILE_MB
@@ -438,12 +508,18 @@ class HubFetcher:
     created: float = field(default_factory=time.time)  # a cache file younger than this was downloaded by this fetcher
 
     def uses_cache(self, size: int) -> bool:
-        """Whether a file of ``size`` bytes is fetched whole into the Hub cache (else it is read remotely)."""
+        """
+        Whether a file of size bytes is fetched whole into the Hub cache (else it is read remotely).
+        """
+
         return size <= self.max_cached_file_mb * 1024 * 1024
 
     @contextmanager
     def open(self, index: FileIndex, file: str, fmt: str) -> Iterator[BinaryIO]:
-        """A binary, seekable file object for ``file``: the cached local copy or the remote file."""
+        """
+        A binary, seekable file object for file: the cached local copy or the remote file.
+        """
+
         if self.uses_cache(index.sizes[file]):
             with self._open_cached(index, file) as handle:
                 yield handle
@@ -490,7 +566,10 @@ class HubFetcher:
 
 
 def file_format(name: str) -> str:
-    """The recognised suffix of ``name`` (longest match of :data:`FORMATS`) or a clear error."""
+    """
+    The recognised suffix of name (longest match of :data:`FORMATS`) or a clear error.
+    """
+
     lower = name.lower()
     for suffix in FORMATS:
         if lower.endswith(suffix):
@@ -499,12 +578,18 @@ def file_format(name: str) -> str:
 
 
 def parquet_row_groups(parquet: pq.ParquetFile) -> list[int]:
-    """Rows per row group from the footer (no data read)."""
+    """
+    Rows per row group from the footer (no data read).
+    """
+
     return [int(parquet.metadata.row_group(group).num_rows) for group in range(parquet.num_row_groups)]
 
 
 def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | None = None) -> Generator[Row, None, None]:
-    """Rows of :func:`parquet_batches` one at a time (kept for consumers that want rows, not batches)."""
+    """
+    Rows of :func:`parquet_batches` one at a time (kept for consumers that want rows, not batches).
+    """
+
     for batch in parquet_batches(parquet, skip, columns, ROW_BATCH):
         yield from batch
 
@@ -512,9 +597,12 @@ def iter_parquet(parquet: pq.ParquetFile, skip: int = 0, columns: list[str] | No
 def parquet_batches(
     parquet: pq.ParquetFile, skip: int, columns: list[str] | None, batch_size: int
 ) -> Iterator[RowBatch]:
-    """Row batches of an open parquet file in order, skipping the first ``skip`` rows; row groups are read one at a
+    """
+    Row batches of an open parquet file in order, skipping the first skip rows; row groups are read one at a
     time and only from the first one that holds a wanted row on (a consumer that stops early never touches later
-    groups), each decoded in ``batch_size`` slices. ``columns`` prunes the read (None: every column)."""
+    groups), each decoded in batch_size slices. columns prunes the read (None: every column).
+    """
+
     for group, group_rows in enumerate(parquet_row_groups(parquet)):
         if skip >= group_rows:  # every row of this group is skipped: do not read it
             skip -= group_rows
@@ -529,28 +617,37 @@ def parquet_batches(
 
 
 def read_row_group(parquet: pq.ParquetFile, group: int, columns: list[str] | None) -> Iterator[Row]:
-    """Rows of :func:`row_group_batches` one at a time, in :data:`ROW_BATCH` slices."""
+    """
+    Rows of :func:`row_group_batches` one at a time, in :data:`ROW_BATCH` slices.
+    """
+
     for batch in row_group_batches(parquet, group, columns, ROW_BATCH):
         yield from batch
 
 
 def row_group_batches(parquet: pq.ParquetFile, group: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
-    """Row batches of one row group as dicts (the single place that pulls row-group bytes), ``batch_size`` rows each.
+    """
+    Row batches of one row group as dicts (the single place that pulls row-group bytes), batch_size rows each.
 
     A whole row group as a python list is what a book-like source cannot afford (gutenberg row groups hold ~300 MB
     per 1,000 rows and several downloads run at once), so the group is decoded batch by batch
-    (``ParquetFile.iter_batches(row_groups=[group])``) and only one batch of dicts is alive at a time. Rows and
-    their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded."""
+    (ParquetFile.iter_batches(row_groups=[group])) and only one batch of dicts is alive at a time. Rows and
+    their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded.
+    """
+
     for batch in parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group]):
         yield batch.to_pylist()
 
 
 def project_row(row: Row, columns: list[str] | None) -> Row:
-    """``row`` reduced to ``columns`` (``None``: the row unchanged).
+    """
+    row reduced to columns (None: the row unchanged).
 
-    A column the row does not have stays absent instead of becoming ``None``, so a caller checking for its own
-    column (``download.py``'s ``text_row``) still sees the row as the file had it; parquet raises for an unknown
-    column at read time, so neither path invents data."""
+    A column the row does not have stays absent instead of becoming None, so a caller checking for its own
+    column (download.py's text_row) still sees the row as the file had it; parquet raises for an unknown
+    column at read time, so neither path invents data.
+    """
+
     if columns is None:
         return row
     return {column: row[column] for column in columns if column in row}
@@ -560,22 +657,31 @@ FormatReader = Callable[[BinaryIO, str, int, list[str] | None, int], Iterator[Ro
 
 
 def _parquet_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
-    """:data:`FORMAT_READERS` entry for parquet: :func:`parquet_batches` over the opened file. ``columns`` is
+    """
+    :data:`FORMAT_READERS` entry for parquet: :func:`parquet_batches` over the opened file. columns is
     passed down so pyarrow prunes the read to those columns (and errors on an unknown one); the projection
-    guarantee itself lives in :func:`iter_row_batches`."""
+    guarantee itself lives in :func:`iter_row_batches`.
+    """
+
     yield from parquet_batches(pq.ParquetFile(handle), skip, columns, batch_size)
 
 
 def _json_array_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
-    """:data:`FORMAT_READERS` entry for ``.json`` arrays: one row per batch (the parse is sequential, so a
-    single-row batch keeps an early stop as cheap as before); the dispatch projects."""
+    """
+    :data:`FORMAT_READERS` entry for .json arrays: one row per batch (the parse is sequential, so a
+    single-row batch keeps an early stop as cheap as before); the dispatch projects.
+    """
+
     for row in iter_json_array(handle, name, skip):
         yield [row]
 
 
 def _json_lines_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
-    """:data:`FORMAT_READERS` entry for the json-lines family: one row per batch (a remote stream is dropped the
-    moment the consumer has enough rows, so nothing may be decoded ahead); the dispatch projects."""
+    """
+    :data:`FORMAT_READERS` entry for the json-lines family: one row per batch (a remote stream is dropped the
+    moment the consumer has enough rows, so nothing may be decoded ahead); the dispatch projects.
+    """
+
     for row in _iter_json_lines(handle, file_format(name), skip):
         yield [row]
 
@@ -593,16 +699,19 @@ FORMAT_READERS: dict[str, FormatReader] = {
 def iter_row_batches(
     handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None, batch_size: int | None = None
 ) -> Iterator[RowBatch]:
-    """**The reading contract**, the single dispatch every consumer reads files through: batches of about
-    ``batch_size`` (default :data:`ROW_BATCH`) rows of the open binary file in order, skipping the first ``skip``
-    rows (parquet skips whole row groups), every row projected to ``columns`` (None: every column).
+    """
+    The reading contract, the single dispatch every consumer reads files through: batches of about
+    batch_size (default :data:`ROW_BATCH`) rows of the open binary file in order, skipping the first skip
+    rows (parquet skips whole row groups), every row projected to columns (None: every column).
 
     The per-format reader (:data:`FORMAT_READERS` by :func:`file_format`) only decodes; this function applies the
     projection itself (:func:`project_row`: a requested column a row lacks stays absent, so a caller checking for
-    its own column still sees the row as the file had it). Parquet additionally prunes the read to ``columns`` and
+    its own column still sees the row as the file had it). Parquet additionally prunes the read to columns and
     raises for an unknown one at read time, so neither path invents data, and either way every surplus column
     stays out of what the caller stores, including one whose type varies from row to row and would make the shard
-    writer fail."""
+    writer fail.
+    """
+
     fmt = file_format(name)
     reader = FORMAT_READERS.get(fmt)
     if reader is None:
@@ -612,23 +721,32 @@ def iter_row_batches(
 
 
 def iter_stream(handle: BinaryIO, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
-    """Rows of :func:`iter_row_batches` one at a time (same contract: ordered, ``skip`` applied, projected)."""
+    """
+    Rows of :func:`iter_row_batches` one at a time (same contract: ordered, skip applied, projected).
+    """
+
     for batch in iter_row_batches(handle, name, skip, columns):
         yield from batch
 
 
 def iter_file(path: Path, name: str, skip: int = 0, columns: list[str] | None = None) -> Iterator[Row]:
-    """:func:`iter_stream` over a local file."""
+    """
+    :func:`iter_stream` over a local file.
+    """
+
     with path.open("rb") as handle:
         yield from iter_stream(handle, name, skip, columns)
 
 
 def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]:
-    """Elements of a top-level JSON array parsed incrementally with ``ijson`` (the C ``yajl2_c`` backend when it is
-    installed, else ijson's pure-Python one), skipping the first ``skip``. Only the bytes up to the last element
-    consumed are read, so a consumer that stops early never pulls the rest of the file; this is the single ``.json``
+    """
+    Elements of a top-level JSON array parsed incrementally with ijson (the C yajl2_c backend when it is
+    installed, else ijson's pure-Python one), skipping the first skip. Only the bytes up to the last element
+    consumed are read, so a consumer that stops early never pulls the rest of the file; this is the single .json
     code path for cached and remote files alike (a cached file is read from disk in 64 KB chunks the same way).
-    A file whose top-level value is not an array (e.g. an object) is a clear error."""
+    A file whose top-level value is not an array (e.g. an object) is a clear error.
+    """
+
     import ijson  # in the `data` extra; ijson ships no type information (mypy override in pyproject.toml)
 
     events = ijson.parse(handle, use_float=True)  # reads 64 KB chunks: the granularity of an early stop
@@ -650,7 +768,10 @@ def iter_json_array(handle: BinaryIO, name: str, skip: int = 0) -> Iterator[Row]
 
 
 def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:
-    """Rows of a (possibly compressed) json-lines file, skipping the first ``skip`` non-empty lines."""
+    """
+    Rows of a (possibly compressed) json-lines file, skipping the first skip non-empty lines.
+    """
+
     if fmt == ".jsonl.zst":
         import zstandard
 
@@ -668,7 +789,10 @@ def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:
 
 
 def _parse_json_lines(lines: Any, skip: int) -> Iterator[Row]:
-    """One JSON object per non-empty line, skipping the first ``skip`` of them."""
+    """
+    One JSON object per non-empty line, skipping the first skip of them.
+    """
+
     skipped = 0
     for line in lines:
         if not line.strip():
@@ -684,10 +808,12 @@ def _parse_json_lines(lines: Any, skip: int) -> Iterator[Row]:
 
 @dataclass
 class ReadRequest:
-    """One consumer of :func:`read_rows_multi`: at least ``count`` rows passing ``match`` (all rows without it), the
-    first ``offset`` such rows skipped. ``key`` is where the index records the per-file / per-row-group counts of
-    matching rows (``keyed_counts[key]`` / ``group_counts[key]``); a request with ``match`` but no ``key`` records nothing
-    and cannot skip files. ``name`` tags the rows it receives."""
+    """
+    One consumer of :func:`read_rows_multi`: at least count rows passing match (all rows without it), the
+    first offset such rows skipped. key is where the index records the per-file / per-row-group counts of
+    matching rows (keyed_counts[key] / group_counts[key]); a request with match but no key records nothing
+    and cannot skip files. name tags the rows it receives.
+    """
 
     name: str
     offset: int
@@ -698,9 +824,10 @@ class ReadRequest:
 
 @dataclass
 class _Cursor:
-    """Mutable position of one :class:`ReadRequest` while :func:`read_rows_multi` runs.
+    """
+    Mutable position of one :class:`ReadRequest` while :func:`read_rows_multi` runs.
 
-    ``remaining_skip`` counts rows still to skip before the first yielded row (plain rows without ``match``,
+    remaining_skip counts rows still to skip before the first yielded row (plain rows without match,
     matching rows with it); it carries across files (a file with fewer matching rows than the skip only shrinks it).
     """
 
@@ -718,8 +845,11 @@ class _Cursor:
 
     @property
     def record_key(self) -> str | None:
-        """Where matching-row counts are recorded: ``key`` for filtered reads, nothing otherwise (plain row counts
-        come from footers and full reads regardless of the request)."""
+        """
+        Where matching-row counts are recorded: key for filtered reads, nothing otherwise (plain row counts
+        come from footers and full reads regardless of the request).
+        """
+
         return self.request.key if self.request.match is not None else None
 
     @property
@@ -730,15 +860,21 @@ class _Cursor:
         return self.match is None or self.match(row)
 
     def skip_whole(self, rows: int) -> bool:
-        """Skip a unit (file / row group) of ``rows`` (matching) rows if the skip position lies at or beyond its
-        end; return whether it was skipped."""
+        """
+        Skip a unit (file / row group) of rows (matching) rows if the skip position lies at or beyond its
+        end; return whether it was skipped.
+        """
+
         if self.remaining_skip < rows:
             return False
         self.remaining_skip -= rows
         return True
 
     def known_count(self, index: FileIndex, file: str) -> int | None:
-        """The known number of rows of ``file`` that count for this request, or None."""
+        """
+        The known number of rows of file that count for this request, or None.
+        """
+
         if self.match is None:
             return index.count(None, file)
         if self.request.key is None:
@@ -746,8 +882,11 @@ class _Cursor:
         return index.count(self.request.key, file)
 
     def known_group_counts(self, index: FileIndex, file: str) -> list[int]:
-        """Rows per row group of ``file`` that count for this request, for the prefix of groups whose count is
-        known (every group from the footer for a plain read)."""
+        """
+        Rows per row group of file that count for this request, for the prefix of groups whose count is
+        known (every group from the footer for a plain read).
+        """
+
         if self.match is None:
             return index.known_group_counts(None, file)
         if self.request.key is None:
@@ -768,22 +907,24 @@ def read_rows(
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
 ) -> Iterator[Row]:
-    """Rows from ``offset`` on (counting rows that pass ``match``) across the index's files: at least ``count``
+    """
+    Rows from offset on (counting rows that pass match) across the index's files: at least count
     of them when the source has that many. :func:`read_rows_multi` with a single request.
 
-    ``count`` is exact for files read from the Hub cache and for remote streams. For a parquet file read remotely
-    with ``align_to_row_group`` (the default) the reader finishes the row group in which it reached ``count``: the
+    count is exact for files read from the Hub cache and for remote streams. For a parquet file read remotely
+    with align_to_row_group (the default) the reader finishes the row group in which it reached count: the
     bytes were already fetched, so keeping the rows means a later fetch at the resulting offset never downloads
-    them again; ``align_to_row_group=False`` stops at exactly ``count`` rows. ``columns`` projects every yielded
+    them again; align_to_row_group=False stops at exactly count rows. columns projects every yielded
     row (None: every column): parquet reads only those columns, the json formats drop the rest after parsing.
 
-    Files whose known row count (``index.count(key, file)``) lies entirely before ``offset`` are skipped without
-    being opened; every file read through to its end records its count (``key`` for the matching rows, and the
+    Files whose known row count (index.count(key, file)) lies entirely before offset are skipped without
+    being opened; every file read through to its end records its count (key for the matching rows, and the
     total row count) so the next call can skip it. Parquet files record their row-group layout as soon as their
-    footer was read, so a file that lies entirely before ``offset`` is skipped even if it was never read, and
-    with ``key`` the matching rows of every row group read so far, so a keyed fetch seeks to the right row group
-    too. ``fetcher`` (default: a :class:`HubFetcher` with ``token``) chooses cache vs. remote reading per file.
+    footer was read, so a file that lies entirely before offset is skipped even if it was never read, and
+    with key the matching rows of every row group read so far, so a keyed fetch seeks to the right row group
+    too. fetcher (default: a :class:`HubFetcher` with token) chooses cache vs. remote reading per file.
     """
+
     request = ReadRequest(name="", offset=offset, count=count, key=key, match=match)
     for _, row in read_rows_multi(
         index, [request], token=token, on_file=on_file, fetcher=fetcher, columns=columns,
@@ -802,14 +943,16 @@ def read_rows_multi(
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
 ) -> Iterator[tuple[str, Row]]:
-    """Serve several :class:`ReadRequest` in **one pass** over the index's files: every file and every parquet row
-    group is opened / read at most once and each row is handed to every request that wants it, as
-    ``(request.name, row)`` pairs. A file or row group is skipped when no request that still needs rows has to look
-    at it (each request seeks by its own known counts, see :func:`read_rows`); a request that reached its
-    ``count`` stops taking rows (at the end of the current remote row group with ``align_to_row_group``) while the
-    others read on, and the pass ends when every request is satisfied or the files are exhausted. Everything else
-    (``count`` semantics, what gets recorded in the index, ``columns``) is as for :func:`read_rows`, per request.
     """
+    Serve several :class:`ReadRequest` in one pass over the index's files: every file and every parquet row
+    group is opened / read at most once and each row is handed to every request that wants it, as
+    (request.name, row) pairs. A file or row group is skipped when no request that still needs rows has to look
+    at it (each request seeks by its own known counts, see :func:`read_rows`); a request that reached its
+    count stops taking rows (at the end of the current remote row group with align_to_row_group) while the
+    others read on, and the pass ends when every request is satisfied or the files are exhausted. Everything else
+    (count semantics, what gets recorded in the index, columns) is as for :func:`read_rows`, per request.
+    """
+
     if fetcher is None:
         fetcher = HubFetcher(token=token)
     cursors = [_Cursor(request=request, remaining_skip=request.offset) for request in requests if request.count > 0]
@@ -846,8 +989,11 @@ def read_rows_multi(
 
 
 def _skip_file_if_count_known(index: FileIndex, cursor: _Cursor, file: str) -> bool:
-    """Skip ``file`` for ``cursor`` without opening it when its (matching) row count is known and lies entirely
-    before the cursor's skip position; return whether it was skipped."""
+    """
+    Skip file for cursor without opening it when its (matching) row count is known and lies entirely
+    before the cursor's skip position; return whether it was skipped.
+    """
+
     known = cursor.known_count(index, file)
     if known is None:
         return False
@@ -856,7 +1002,9 @@ def _skip_file_if_count_known(index: FileIndex, cursor: _Cursor, file: str) -> b
 
 @dataclass
 class _ParquetReader:
-    """One request's progress through one parquet file (see :func:`_parquet_rows`)."""
+    """
+    One request's progress through one parquet file (see :func:`_parquet_rows`).
+    """
 
     cursor: _Cursor
     known_group_counts: list[int]  # (matching) rows per row group, the prefix known so far
@@ -865,7 +1013,10 @@ class _ParquetReader:
     reading: bool = True  # False once the request stopped taking rows from this file
 
     def finished_group(self, index: FileIndex, file: str, group: int) -> None:
-        """Record the matching rows of a row group read completely (extends the known prefix by one group)."""
+        """
+        Record the matching rows of a row group read completely (extends the known prefix by one group).
+        """
+
         record_key = self.cursor.record_key
         if record_key is not None and group == len(self.known_group_counts):
             self.known_group_counts.append(self.matched_in_group)
@@ -880,10 +1031,13 @@ def _parquet_rows(
     columns: list[str] | None,
     finish_group: bool,
 ) -> Iterator[tuple[str, Row]]:
-    """Rows of one parquet file for several requests: a row group is read (once) when at least one request needs
-    it, row groups that every request skips by its known counts are never read. With ``finish_group`` a request
-    that reaches ``count`` still takes the rest of the row group. Keyed requests record the matching rows of every
-    row group they read completely; a request that reads the file to its end records the file's count."""
+    """
+    Rows of one parquet file for several requests: a row group is read (once) when at least one request needs
+    it, row groups that every request skips by its known counts are never read. With finish_group a request
+    that reaches count still takes the rest of the row group. Keyed requests record the matching rows of every
+    row group they read completely; a request that reads the file to its end records the file's count.
+    """
+
     groups = index.row_groups[file]  # rows per row group, from the footer
     readers: list[_ParquetReader] = []
     for cursor in cursors:
@@ -941,10 +1095,13 @@ def _parquet_rows(
 def _stream_rows(
     handle: BinaryIO, index: FileIndex, file: str, cursors: list[_Cursor], columns: list[str] | None = None
 ) -> Iterator[tuple[str, Row]]:
-    """Rows of one non-parquet file for several requests, each exactly up to its ``count`` and projected to
-    ``columns``; the stream is dropped as soon as every request is satisfied. The file is decoded from its first row
+    """
+    Rows of one non-parquet file for several requests, each exactly up to its count and projected to
+    columns; the stream is dropped as soon as every request is satisfied. The file is decoded from its first row
     (a stream has no cheap way to skip, and only a full read tells how many rows it holds), so a file read to its end
-    records its row count and, for every keyed request that read it through, its matching rows."""
+    records its row count and, for every keyed request that read it through, its matching rows.
+    """
+
     reading = list(cursors)
     matched = {cursor.name: 0 for cursor in cursors}
     rows_seen = 0

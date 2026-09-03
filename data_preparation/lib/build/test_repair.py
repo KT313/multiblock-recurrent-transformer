@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.build.repair: every raw / processed branch on a scratch layout, the single
-confirmation for all queued raw deletions, the non-interactive and declined aborts, and the read-only dry run."""
+"""
+Tests for data_preparation.lib.build.repair: every raw / processed branch on a scratch layout, the single
+confirmation for all queued raw deletions, the non-interactive and declined aborts, and the read-only dry run.
+"""
 
 from __future__ import annotations
 
@@ -31,17 +33,26 @@ from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest
 
 
 def raw_deleted(report: RepairReport) -> list[RepairAction]:
-    """Raw folders the report deleted (performed, not planned)."""
+    """
+    Raw folders the report deleted (performed, not planned).
+    """
+
     return [action for action in report.actions if report.performed and action.kind == "raw" and action.action == "delete"]
 
 
 def processed_deleted(report: RepairReport) -> list[RepairAction]:
-    """Processed folders the report deleted (performed, not planned)."""
+    """
+    Processed folders the report deleted (performed, not planned).
+    """
+
     return [action for action in report.actions if report.performed and action.kind == "processed" and action.action == "delete"]
 
 
 def raw_deletions_planned(report: RepairReport) -> list[RepairAction]:
-    """Raw folders queued for deletion (before they are confirmed, or in a dry run)."""
+    """
+    Raw folders queued for deletion (before they are confirmed, or in a dry run).
+    """
+
     return [action for action in report.actions if action.kind == "raw" and action.action == "delete"]
 
 CfgFactory = Callable[..., DatasetConfig]
@@ -54,7 +65,10 @@ def _synthetic(seed: int = 0) -> SourceConfig:
 
 
 def _prepared(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, names: tuple[str, ...] = ("a",), rows: int = 8) -> DatasetConfig:
-    """A config over synthetic sources ``names``, each downloaded (``rows`` rows in shards of 4) and built."""
+    """
+    A config over synthetic sources names, each downloaded (rows rows in shards of 4) and built.
+    """
+
     cfg = with_tokenizer(cfg_factory({name: _synthetic(seed=index) for index, name in enumerate(names)}))
     for name in names:
         download(cfg, name, layout, rows_needed=rows, shard_size=4)
@@ -71,7 +85,10 @@ def _edit_manifest(folder: Path, **changes: Any) -> None:
 
 
 def _snapshot(root: Path) -> Snapshot:
-    """``{relative path: mtime_ns}`` of every file under ``root`` (proves a run touched nothing)."""
+    """
+    {relative path: mtime_ns} of every file under root (proves a run touched nothing).
+    """
+
     return {str(path.relative_to(root)): path.stat().st_mtime_ns for path in sorted(root.rglob("*")) if path.is_file()}
 
 
@@ -85,7 +102,9 @@ class _Terminal(io.StringIO):
 
 
 def _recording_confirm(prompts: list[str], answer: bool) -> Callable[[str], bool]:
-    """A ``confirm`` callable that records every message it is asked and answers ``answer``."""
+    """
+    A confirm callable that records every message it is asked and answers answer.
+    """
 
     def confirm(message: str) -> bool:
         prompts.append(message)
@@ -155,8 +174,11 @@ def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFac
 def test_broken_raw_shard_mid_folder_truncates_after_the_one_confirmation(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Truncating to the good prefix before a mid-folder broken shard drops the healthy shards after it too. That
-    loss of downloaded rows joins the one confirmation instead of happening silently."""
+    """
+    Truncating to the good prefix before a mid-folder broken shard drops the healthy shards after it too. That
+    loss of downloaded rows joins the one confirmation instead of happening silently.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards
     raw = layout.raw_dir("a")
     (raw / "data-00001.parquet").write_bytes(b"corrupt")
@@ -313,8 +335,11 @@ def test_processed_shards_without_a_manifest_are_deleted(cfg_factory: CfgFactory
 
 
 def test_an_unlisted_processed_shard_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """A shard on disk that the manifest does not list (a crash between publishing and saving) used to be invisible
-    here while the training resolver refused the folder; the repair step must be the one that heals it."""
+    """
+    A shard on disk that the manifest does not list (a crash between publishing and saving) used to be invisible
+    here while the training resolver refused the folder; the repair step must be the one that heals it.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     folder = layout.processed_dir("a")
     existing = sorted(folder.glob("data-*.parquet"))[0]
@@ -329,9 +354,12 @@ def test_an_unlisted_processed_shard_deletes_the_folder(cfg_factory: CfgFactory,
 def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
 ) -> None:
-    """The M1 regression: a build that crashes between publishing a shard and saving the manifest leaves one
+    """
+    The M1 regression: a build that crashes between publishing a shard and saving the manifest leaves one
     unlisted file: exactly the next shard the resumed build writes. The repair step leaves it alone (deleting the
-    folder would redo the whole build for one file), the resumed build overwrites it and completes the folder."""
+    folder would redo the whole build for one file), the resumed build overwrites it and completes the folder.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards, fully built
     processed = layout.processed_dir("a")
     complete_rows = read_rows(processed)
@@ -356,8 +384,11 @@ def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
 
 
 def test_the_same_stray_on_a_complete_folder_is_still_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """The next-shard name is only harmless while raw shards are uncovered; on a folder that covers every raw shard
-    no build would overwrite it, so the folder is rebuilt as before."""
+    """
+    The next-shard name is only harmless while raw shards are uncovered; on a folder that covers every raw shard
+    no build would overwrite it, so the folder is rebuilt as before.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)  # 2 raw shards, fully built
     folder = layout.processed_dir("a")
     (folder / "data-00002.parquet").write_bytes(b"stray")
@@ -368,8 +399,11 @@ def test_the_same_stray_on_a_complete_folder_is_still_deleted(cfg_factory: CfgFa
 
 
 def test_an_unreadable_processed_manifest_is_deleted_only_after_confirmation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """A corrupt processed MANIFEST.json is corruption worth a look: its deletion joins the one confirmation instead
-    of going through as ordinary derived data."""
+    """
+    A corrupt processed MANIFEST.json is corruption worth a look: its deletion joins the one confirmation instead
+    of going through as ordinary derived data.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     folder = layout.processed_dir("a")
     (folder / "MANIFEST.json").write_text("{ not json")
@@ -420,9 +454,12 @@ def test_leftover_temporary_folder_is_removed(cfg_factory: CfgFactory, with_toke
 def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
 ) -> None:
-    """A crash between the two renames of the all-at-once swap leaves the replaced folder aside as ``.old`` and the
-    complete ``.tmp`` as the only copy of the data: the repair step renames the ``.tmp`` into place and removes the
-    ``.old`` instead of discarding the completed build."""
+    """
+    A crash between the two renames of the all-at-once swap leaves the replaced folder aside as .old and the
+    complete .tmp as the only copy of the data: the repair step renames the .tmp into place and removes the
+    .old instead of discarding the completed build.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     processed = layout.processed_dir("a")
     rows_before = read_rows(processed)
@@ -449,8 +486,11 @@ def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
 
 
 def test_incomplete_tmp_next_to_missing_processed_is_still_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """Only a ``.tmp`` whose own manifest says the build finished (current hash, every shard verifies) is swapped
-    into place; one without a manifest is the leftover of an interrupted build as before."""
+    """
+    Only a .tmp whose own manifest says the build finished (current hash, every shard verifies) is swapped
+    into place; one without a manifest is the leftover of an interrupted build as before.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     processed = layout.processed_dir("a")
     temporary = processed.with_name("a.tmp")
@@ -463,8 +503,11 @@ def test_incomplete_tmp_next_to_missing_processed_is_still_deleted(cfg_factory: 
 
 
 def test_complete_tmp_next_to_an_existing_processed_folder_is_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """A crash after the ``.tmp`` was completed but before the swap began: the old folder is still in place, so the
-    ``.tmp`` is removed as a leftover (the next build rebuilds it) instead of replacing a folder that exists."""
+    """
+    A crash after the .tmp was completed but before the swap began: the old folder is still in place, so the
+    .tmp is removed as a leftover (the next build rebuilds it) instead of replacing a folder that exists.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     processed = layout.processed_dir("a")
     temporary = processed.with_name("a.tmp")
@@ -477,8 +520,11 @@ def test_complete_tmp_next_to_an_existing_processed_folder_is_deleted(cfg_factor
 
 
 def test_leftover_old_folder_is_removed_without_confirmation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """A crash after the new folder was renamed into place leaves the replaced ``.old`` behind: derived data that
-    was already replaced, deleted without asking."""
+    """
+    A crash after the new folder was renamed into place leaves the replaced .old behind: derived data that
+    was already replaced, deleted without asking.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     processed = layout.processed_dir("a")
     old = processed.with_name("a.old")

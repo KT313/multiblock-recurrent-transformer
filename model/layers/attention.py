@@ -1,9 +1,11 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Causal self-attention (fused qkv projection, optional q/k bias, RoPE) on top of `scaled_dot_product_attention`.
+"""
+Causal self-attention (fused qkv projection, optional q/k bias, RoPE) on top of `scaled_dot_product_attention`.
 
 Tensor shape names used throughout: B = batch, S = sequence length, E = n_embd, nh = number of heads,
-hd = head dimension (E == nh * hd)."""
+hd = head dimension (E == nh * hd).
+"""
 
 from __future__ import annotations
 
@@ -19,9 +21,12 @@ if TYPE_CHECKING:
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> Tensor:
-    """RoPE table for head dimension `dim` and positions `0 .. end-1`: entry `[0, m, 0, j]` is
+    """
+    RoPE table for head dimension `dim` and positions `0 .. end-1`: entry `[0, m, 0, j]` is
     `(cos(m * theta_j), sin(m * theta_j))` with `theta_j = theta ** (-2j / dim)`. Shape (1, end, 1, dim // 2, 2),
-    always float32; the singleton axes broadcast against (B, S, nh, hd // 2, 2)."""
+    always float32; the singleton axes broadcast against (B, S, nh, hd // 2, 2).
+    """
+
     with torch.autocast("cuda", enabled=False):
         inv_freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))  # (dim // 2,)
         positions = torch.arange(end, dtype=torch.float32, device=inv_freqs.device)  # (end,)
@@ -32,10 +37,13 @@ def precompute_freqs_cis(dim: int, end: int, theta: float) -> Tensor:
 
 
 def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    """Rotate q and k (B, S, nh, hd) by RoPE in float32 and cast back to the input dtype.
+    """
+    Rotate q and k (B, S, nh, hd) by RoPE in float32 and cast back to the input dtype.
 
     Adjacent feature pairs `(x[2j], x[2j+1])` are treated as complex numbers and multiplied by `e^(i * m * theta_j)`
-    (https://github.com/t-vi/lit-llama/blob/9e5eb8b1b376d8ae24e79278008b7190961062e3/lit_llama/model.py)."""
+    (https://github.com/t-vi/lit-llama/blob/9e5eb8b1b376d8ae24e79278008b7190961062e3/lit_llama/model.py).
+    """
+
     with torch.autocast("cuda", enabled=False):
         # q and k are rotated in one go: concatenated along the head axis, features split into pairs.
         qk_pairs = torch.cat([q, k], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()  # type: ignore[no-untyped-call]  # torch stub gap
@@ -48,11 +56,14 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tu
 
 
 def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
-    """Causal attention; inputs and output are (B, S, nh, hd).
+    """
+    Causal attention; inputs and output are (B, S, nh, hd).
 
     Without `mask`, sdpa's own `is_causal=True` applies the causal triangle (the training path). A `mask` must be a
     broadcastable bool mask that already contains the causal triangle (`prepare_attention_inputs` builds one); it is
-    passed with `is_causal=False` because some sdpa backends reject an explicit mask together with `is_causal=True`."""
+    passed with `is_causal=False` because some sdpa backends reject an explicit mask together with `is_causal=True`.
+    """
+
     # scaled_dot_product_attention wants the head axis before the sequence axis: (B, nh, S, hd).
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -64,7 +75,9 @@ def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) 
 
 
 class CausalSelfAttention(torch.nn.Module):
-    """Multi-head causal self-attention: fused qkv projection, optional q/k bias, RoPE, sdpa, output projection."""
+    """
+    Multi-head causal self-attention: fused qkv projection, optional q/k bias, RoPE, sdpa, output projection.
+    """
 
     __constants__ = ("n_head", "head_dim")
 

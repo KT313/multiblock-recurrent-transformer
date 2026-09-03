@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the planner: `rows_needed` by hand (sequences, the split, validation-only sources), the download plan
+"""
+Tests for the planner: `rows_needed` by hand (sequences, the split, validation-only sources), the download plan
 (clamped, zero when exhausted, stale raw rejected, topped up when the build drops more than the margin), the
-`SourceLedger` satisfaction cases and the status table."""
+`SourceLedger` satisfaction cases and the status table.
+"""
 
 from __future__ import annotations
 
@@ -46,8 +48,11 @@ Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 
 def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, block_size: int = 64, min_chars: int = 1) -> DatasetConfig:
-    """`a` trained in both stages (weight 0.5 then 1.0) and validated on in the first (split), `b` only trained on
-    in the first, `h` used only for validation (`rows`), instruct source `i` in a finetune stage (split)."""
+    """
+    `a` trained in both stages (weight 0.5 then 1.0) and validated on in the first (split), `b` only trained on
+    in the first, `h` used only for validation (`rows`), instruct source `i` in a finetune stage (split).
+    """
+
     return DatasetConfig(
         name="two",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
@@ -95,8 +100,11 @@ def test_rows_needed_sums_the_stages_and_scales_with_block_size() -> None:
 
 
 def test_rows_needed_is_the_schema_formula() -> None:
-    """The planner delegates to `DatasetConfig.rows_needed`, the number the shuffled-build cap checks at config
-    load, so the two views of the requirement cannot drift."""
+    """
+    The planner delegates to `DatasetConfig.rows_needed`, the number the shuffled-build cap checks at config
+    load, so the two views of the requirement cannot drift.
+    """
+
     cfg = two_stage_cfg()
     assert [cfg.rows_needed(name) for name in cfg.sources] == [cfg.rows_needed(name) for name in cfg.sources]
 
@@ -175,7 +183,10 @@ def test_raw_is_exhausted_honours_a_grown_check_limit() -> None:
 
 
 def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """The repair step (or a dry run's report) owns such a folder: the plan names the state and fetches nothing."""
+    """
+    The repair step (or a dry run's report) owns such a folder: the plan names the state and fetches nothing.
+    """
+
     cfg = two_stage_cfg()
     prepare(config_file(cfg), layout.root, assume_yes=False)
     cfg.token_count = "estimate"  # part of the raw hash: every raw folder is stale
@@ -194,7 +205,10 @@ def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layou
 
 
 def _ledger(**overrides: Any) -> SourceLedger:
-    """A ledger of a trained source with 100 raw rows fully built into 90 processed ones (budget 100 / 84)."""
+    """
+    A ledger of a trained source with 100 raw rows fully built into 90 processed ones (budget 100 / 84).
+    """
+
     defaults: dict[str, Any] = dict(
         name="s", kind="pretrain", rows_needed=100, rows_sufficient=84, sequence_budget=70, raw_state="current",
         raw_reason="current", raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_problem="none", processed_reason="ok",
@@ -204,7 +218,10 @@ def _ledger(**overrides: Any) -> SourceLedger:
 
 
 def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`plan_downloads`, the satisfaction check and the status table are three views of the same object."""
+    """
+    `plan_downloads`, the satisfaction check and the status table are three views of the same object.
+    """
+
     cfg = two_stage_cfg()
     prepare(config_file(cfg), layout.root, assume_yes=False)
     ledger = source_ledger(cfg, "a", layout)
@@ -235,8 +252,11 @@ def test_the_satisfaction_cases() -> None:
 
 
 def test_an_exhausted_source_whose_rows_all_go_to_the_holdout_is_failed() -> None:
-    """The training resolver holds `ceil(validation_fraction × rows)` out; an exhausted source must keep at least
-    one training row after that split, or training would fail at startup with an empty range (decision D3)."""
+    """
+    The training resolver holds `ceil(validation_fraction × rows)` out; an exhausted source must keep at least
+    one training row after that split, or training would fail at startup with an empty range (decision D3).
+    """
+
     all_validation = _ledger(processed_rows=2, training_rows=0, exhausted=True)
     assert all_validation.satisfaction() == (
         False,
@@ -254,8 +274,11 @@ def test_an_exhausted_source_whose_rows_all_go_to_the_holdout_is_failed() -> Non
 
 
 def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
-    """Raw is long enough but only 60 of 100 rows survived the build: the shortfall (84 − 60) is divided by the
-    observed yield (0.6) and multiplied by the same 1.2 safety margin the first download uses."""
+    """
+    Raw is long enough but only 60 of 100 rows survived the build: the shortfall (84 − 60) is divided by the
+    observed yield (0.6) and multiplied by the same 1.2 safety margin the first download uses.
+    """
+
     short = _ledger(processed_rows=60, training_rows=60)
     assert short.rows_to_fetch[0] == 48 == ceil((84 - 60) * Fraction("1.2") / Fraction(60, 100))
     assert short.rows_target == 100 + 48, "the download takes a target, not an increment"
@@ -269,8 +292,11 @@ def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
 
 
 def test_the_top_up_is_capped_at_the_full_requirement(caplog: pytest.LogCaptureFixture) -> None:
-    """A pathological yield (1 of 1,200 rows) extrapolates to a download nobody wants: the round asks for at most
-    `rows_needed`, with a warning, and the next round measures the yield again on more data."""
+    """
+    A pathological yield (1 of 1,200 rows) extrapolates to a download nobody wants: the round asks for at most
+    `rows_needed`, with a warning, and the next round measures the yield again on more data.
+    """
+
     pathological = _ledger(raw_rows=1200, processed_rows=1, training_rows=1)
     assert ceil((84 - 1) * Fraction("1.2") * 1200) == 119_520  # what the yield extrapolates to
     with caplog.at_level("WARNING", logger="data_preparation"):
@@ -323,8 +349,11 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
 
 def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`Manifest.load` raises next to shards: right for raw, wrong for a processed folder the repair step deletes
-    (after confirmation): `status` (and `prepare --dry_run`, and training's auto-prepare) must report it."""
+    """
+    `Manifest.load` raises next to shards: right for raw, wrong for a processed folder the repair step deletes
+    (after confirmation): `status` (and `prepare --dry_run`, and training's auto-prepare) must report it.
+    """
+
     cfg = two_stage_cfg()
     path = config_file(cfg)
     prepare(path, layout.root, assume_yes=False)
@@ -366,9 +395,12 @@ def test_exhausted_and_built_source_is_satisfied(layout: DatasetLayout, cfg_fact
 
 
 def test_prepare_fails_an_exhausted_source_the_validation_holdout_would_empty(layout: DatasetLayout, cfg_factory: CfgFactory, config_file: ConfigFile, write_local: Writer) -> None:
-    """End to end: a trained-and-validated source that runs dry with its every processed row going to the
+    """
+    End to end: a trained-and-validated source that runs dry with its every processed row going to the
     training-time holdout is reported FAILED by `prepare`; training would otherwise crash at startup. A val-only
-    source holds nothing out, so any row still serves it (`test_exhausted_and_built_source_is_satisfied`)."""
+    source holds nothing out, so any row still serves it (`test_exhausted_and_built_source_is_satisfied`).
+    """
+
     src_dir = layout.root.parent / "one_row"
     write_local(src_dir, [{"text": "tok_1 tok_2 tok_3"}], "parquet")
     cfg = cfg_factory({"w": SourceConfig(kind="pretrain", loader="local", path=str(src_dir), validation_fraction=0.5)})

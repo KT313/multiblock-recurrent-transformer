@@ -1,11 +1,13 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Multi-block recurrent transformer: prelude -> N recurrent core blocks (each with its own adapter, input norm and
+"""
+Multi-block recurrent transformer: prelude -> N recurrent core blocks (each with its own adapter, input norm and
 recurrence depth, residual around each block) -> coda -> final norm -> tied LM head.
 
 The parts live in the topic packages: `layers/` (norms, attention, MLP, init), `blocks/sandwich.py` (the transformer
 block) and `blocks/recurrence.py` (depth sampler, latent state, one recurrence iteration, the iteration loop). This
-module assembles them into `RecurrentGPT` and binds the recurrence to the model's `step`, mode, config and modules."""
+module assembles them into `RecurrentGPT` and binds the recurrence to the model's `step`, mode, config and modules.
+"""
 
 from typing import cast
 
@@ -32,7 +34,8 @@ def prepare_attention_inputs(
     attention_mask: Tensor | None = None,
     position_ids: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None]:
-    """The two per-batch inputs every attention layer needs, as `(rotary, mask)`: the RoPE rows and the sdpa mask.
+    """
+    The two per-batch inputs every attention layer needs, as `(rotary, mask)`: the RoPE rows and the sdpa mask.
 
     `rotary`: the rows of `freqs_cis` for this batch's positions. Without `position_ids` the first S rows, shape
     `(1, S, 1, hd // 2, 2)` (the training path, an exact no-op); with 1-D positions those rows in that order; with the
@@ -42,7 +45,9 @@ def prepare_attention_inputs(
     padding mask (1 = keep) becomes a `(B, 1, S, S)` bool mask that already contains the causal triangle, because
     some sdpa backends reject an explicit mask together with `is_causal=True`. True means attend. Every query keeps
     its own position (the diagonal): a row allowed to attend to nothing, a pad token at the start of a left-padded
-    sequence, would give a NaN softmax row that spreads through the next layer's value matmul."""
+    sequence, would give a NaN softmax row that spreads through the next layer's value matmul.
+    """
+
     sequence_length = input_ids.shape[1]
     if position_ids is None:
         rotary = freqs_cis[:, :sequence_length]
@@ -68,7 +73,9 @@ def prepare_attention_inputs(
 
 
 class TransformerModules(torch.nn.ModuleDict):
-    """`ModuleDict` of the model parts; the annotations only give `model.transformer.<name>` a precise static type."""
+    """
+    `ModuleDict` of the model parts; the annotations only give `model.transformer.<name>` a precise static type.
+    """
 
     wte: torch.nn.Embedding  # token embedding
     prelude: torch.nn.ModuleList  # SandwichBlocks run once before the recurrence
@@ -80,7 +87,9 @@ class TransformerModules(torch.nn.ModuleDict):
 
 
 class RecurrentGPT(torch.nn.Module):
-    """Prelude, recurrent core blocks, coda, final norm and tied LM head; `step` seeds the recurrence sampler."""
+    """
+    Prelude, recurrent core blocks, coda, final norm and tied LM head; `step` seeds the recurrence sampler.
+    """
 
     freqs_cis: Tensor  # registered buffer (declared here for the type checkers only)
 
@@ -146,11 +155,17 @@ class RecurrentGPT(torch.nn.Module):
         self.reset_parameters()
 
     def _precompute_freqs_cis(self) -> Tensor:
-        """The RoPE table for every position up to `block_size`."""
+        """
+        The RoPE table for every position up to `block_size`.
+        """
+
         return precompute_freqs_cis(self.config.head_size, self.config.block_size, self.config.rope_settings.rope_base)
 
     def reset_parameters(self) -> None:
-        """Re-initialize the modules that are not `Linear` (those init themselves): embedding and LayerNorms."""
+        """
+        Re-initialize the modules that are not `Linear` (those init themselves): embedding and LayerNorms.
+        """
+
         self.config.init.apply(self.transformer.wte, "embedding")
         for ln_f in self.transformer.ln_fs:
             self.config.init.apply(ln_f, "normalization")
@@ -165,13 +180,16 @@ class RecurrentGPT(torch.nn.Module):
         return_logits: bool = False,
         num_steps: NumSteps = None,
     ) -> dict[str, Tensor | None]:
-        """`num_steps`: None (sample per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair
+        """
+        `num_steps`: None (sample per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair
         per core block.
 
         `labels` must be pre-shifted (the trainer's collate shifts): the loss is `CE(logits[t], labels[t])`. The
         HuggingFace wrapper shifts internally instead. `attention_mask` is a `(B, S)` padding mask (1 = keep),
         `position_ids` 1-D or `(B, S)`; `prepare_attention_inputs` turns both into what the attention layers need.
-        Both are None on the training path."""
+        Both are None on the training path.
+        """
+
         freqs_cis, mask = prepare_attention_inputs(self.freqs_cis, input_ids, attention_mask, position_ids)
 
         x = self.transformer.wte(input_ids)  # (B, S, E)
@@ -201,7 +219,10 @@ class RecurrentGPT(torch.nn.Module):
         return {"loss": loss, "logits": returned_logits, "log_ppl": loss.clone().detach()}
 
     def loss(self, logits: Tensor, labels: Tensor) -> Tensor:
-        """Cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`."""
+        """
+        Cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`.
+        """
+
         n_classes = logits.shape[-1]
         labels = labels.to(torch.long)
         invalid = (labels < 0) | (labels >= n_classes)
@@ -214,8 +235,11 @@ class RecurrentGPT(torch.nn.Module):
     def run_core_block(
         self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None, num_steps: StepsPair | None, block_idx: int
     ) -> Tensor:
-        """Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, then iterate
-        the block n times without and k times with gradient (`num_steps`, or the sampler's draw when None)."""
+        """
+        Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, then iterate
+        the block n times without and k times with gradient (`num_steps`, or the sampler's draw when None).
+        """
+
         transformer = self.transformer
         x_base = transformer.ln_fs[block_idx](x)
         x_latent = initialize_state(x)  # consumes the global RNG first, then (if sampling) the sampler's draw
@@ -245,12 +269,15 @@ class RecurrentGPT(torch.nn.Module):
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
     def sample_block_depths(self, block_idx: int = 0) -> tuple[Tensor, Tensor]:
-        """(n no-grad, k backprop) iterations for core block `block_idx`: the poisson-lognormal-filling draw seeded by
+        """
+        (n no-grad, k backprop) iterations for core block `block_idx`: the poisson-lognormal-filling draw seeded by
         `self.step` in training, (`mean_recurrence`, 0) in eval mode.
 
         The seed is `self.step` alone, as in the reference implementation (the golden test in `test_model.py` fails on
         any change): `block_idx` only selects the block's means, so blocks with equal `(mean_recurrence,
-        mean_backprop_depth)` draw the same `(n, k)` every step."""
+        mean_backprop_depth)` draw the same `(n, k)` every step.
+        """
+
         assert isinstance(self.config.mean_recurrence, list)  # normalized by RecurrentConfig.__post_init__
         assert isinstance(self.config.mean_backprop_depth, list)
         # `sample_recurrence_steps` is dynamo-disabled, which makes it untyped for mypy; hence the explicit annotation.

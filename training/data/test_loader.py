@@ -77,7 +77,10 @@ def _loader(
 
 
 def _rows_in(directory: Path) -> int:
-    """Rows of the `data-*.parquet` shards of a processed folder (parquet footers only)."""
+    """
+    Rows of the `data-*.parquet` shards of a processed folder (parquet footers only).
+    """
+
     return sum(pq.read_metadata(path).num_rows for path in sorted(directory.glob("data-*.parquet")))
 
 
@@ -95,8 +98,11 @@ def test_entry_defaults_read_the_whole_text_column(tokenizer: Tokenizer, tiny_pr
 
 
 def test_row_range_reaches_the_dataset(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
-    """`skip_rows` / `max_rows` of an entry restrict its dataset (the resolver's validation split): the validation
-    range and the training range of one folder are disjoint and together are the folder, in order."""
+    """
+    `skip_rows` / `max_rows` of an entry restrict its dataset (the resolver's validation split): the validation
+    range and the training range of one folder are disjoint and together are the folder, in order.
+    """
+
     directory = str(tiny_pretrain_dir)
     total, k = _rows_in(tiny_pretrain_dir), 3
 
@@ -144,7 +150,10 @@ MIXTURE_BLOCK_SIZE = 128
 def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
     tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path, tiny_instruct_dir: Path
 ) -> None:
-    """The draws follow the weights while every member has rows; the loader ends once each member was read once."""
+    """
+    The draws follow the weights while every member has rows; the loader ends once each member was read once.
+    """
+
     loader = _loader(entries, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
     batches = list(loader)
     pre_rows, ft_rows = _rows_in(tiny_pretrain_dir), _rows_in(tiny_instruct_dir)
@@ -158,8 +167,11 @@ def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
 def test_validation_mixture_is_finite_and_matches_the_batch_count(
     tokenizer: Tokenizer, tiny_pretrain_dir: Path, tiny_instruct_dir: Path
 ) -> None:
-    """A two-entry validation stage: the loader is finite, its batch count is what `validation_batches_available`
-    promised at setup, and the smaller member's rows appear exactly once."""
+    """
+    A two-entry validation stage: the loader is finite, its batch count is what `validation_batches_available`
+    promised at setup, and the smaller member's rows appear exactly once.
+    """
+
     stage_entries = [
         DataEntry("s-pre", str(tiny_pretrain_dir), weight=0.7, max_rows=10),
         DataEntry("s-ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE, max_rows=3),
@@ -181,8 +193,11 @@ def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[Dat
 
 
 def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
-    """Rows are dealt round-robin to workers and DataLoader collects worker batches round-robin, so with
-    micro_batch_size=1 the two loaders yield the very same sequence."""
+    """
+    Rows are dealt round-robin to workers and DataLoader collects worker batches round-robin, so with
+    micro_batch_size=1 the two loaders yield the very same sequence.
+    """
+
     a = list(_loader(entries[:1], tokenizer, 1, num_workers=0))
     b = list(_loader(entries[:1], tokenizer, 1, num_workers=2))
     assert len(a) == len(b) == _rows_in(tiny_pretrain_dir)
@@ -190,8 +205,11 @@ def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenize
 
 
 def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
-    """With micro_batch_size>1 each worker batches *its* rows (0,2,4.. / 1,3,5..), so batches differ from
-    num_workers=0 in composition but cover exactly the same rows over an epoch."""
+    """
+    With micro_batch_size>1 each worker batches *its* rows (0,2,4.. / 1,3,5..), so batches differ from
+    num_workers=0 in composition but cover exactly the same rows over an epoch.
+    """
+
     a = list(_loader(entries[:1], tokenizer, 2, num_workers=0))
     b = list(_loader(entries[:1], tokenizer, 2, num_workers=2))
     assert len(a) == len(b) == math.ceil(_rows_in(tiny_pretrain_dir) / 2)
@@ -211,9 +229,12 @@ def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: lis
 
 
 def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
-    """Regression (T-M4): a row with no supervised label used to raise `StopIteration` out of the collate function,
+    """
+    Regression (T-M4): a row with no supervised label used to raise `StopIteration` out of the collate function,
     which torch's worker loop reads as 'this worker is done' and the single-process loop as 'restart at row 0'. At
-    `block_size` 16 most instruct prompts alone fill the window; the loader still walks its whole epoch."""
+    `block_size` 16 most instruct prompts alone fill the window; the loader still walks its whole epoch.
+    """
+
     rows = list(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)))
     kept = len(collate_samples(rows, tokenizer, block_size=16))
     assert 0 < kept < len(rows), "the fixture must drop some rows and keep others"
@@ -242,9 +263,12 @@ def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
 
 
 def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
-    """One train loader per SOURCE (the whole-run readers, one worker each) and one validation loader per stage of
+    """
+    One train loader per SOURCE (the whole-run readers, one worker each) and one validation loader per stage of
     the tiny dataset, tokenizer loaded from the resolved directory, train loaders unpadded, validation loaders
-    padded and restricted to the held-out rows of the split."""
+    padded and restricted to the held-out rows of the split.
+    """
+
     dataset: ResolvedDataset = resolve_dataset(tiny_settings)
     loaders = build_run_dataloaders(tiny_settings, dataset, SingleDeviceBackend(device="cpu", precision="32"))
     assert isinstance(loaders, RunDataloaders)
@@ -283,18 +307,27 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
 
 
 def _tagged(tag: str, n: int) -> list[WorkerBatch]:
-    """A finite 'loader' yielding n one-sample worker batches tagged with `tag`."""
+    """
+    A finite 'loader' yielding n one-sample worker batches tagged with `tag`.
+    """
+
     return [WorkerBatch([(torch.full((2,), i), torch.full((2,), i), tag)], 1) for i in range(n)]
 
 
 def _first(batch: WorkerBatch) -> int:
-    """The counter value of a `_tagged` worker batch."""
+    """
+    The counter value of a `_tagged` worker batch.
+    """
+
     return int(batch.samples[0][0][0])
 
 
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
-    """A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
-    `check_entry_rows` guarantees at least one training row per source)."""
+    """
+    A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
+    `check_entry_rows` guarantees at least one training row per source).
+    """
+
     rd = RunDataloaders({"a": _tagged("a", 3), "b": _tagged("b", 2)}, [], tokenizer, {})
     assert [_first(rd.next_train_batch("a")) for _ in range(7)] == [0, 1, 2, 0, 1, 2, 0]
     assert [s[2] for s in rd.next_train_batch("b").samples] == ["b"]
@@ -318,8 +351,11 @@ def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
 
 
 def test_set_resume_offsets_are_applied_when_the_iterator_starts(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    """The offsets wait in `pending_offsets` and land on a source's dataset right before its first iterator is
-    created; a source without a pending offset starts at 0."""
+    """
+    The offsets wait in `pending_offsets` and land on a source's dataset right before its first iterator is
+    created; a source without a pending offset starts at 0.
+    """
+
     pre, ft = entry_dataset(entries[0]), entry_dataset(entries[1])
     loaders: dict[str, Iterable[WorkerBatch]] = {
         "pre": dataloader_over(pre, tokenizer, 64, 2, padded=False),
@@ -335,7 +371,10 @@ def test_set_resume_offsets_are_applied_when_the_iterator_starts(tokenizer: Toke
 
 
 def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
-    """The first epoch after a resume starts at the offset; once it ends, the loader reads its whole range again."""
+    """
+    The first epoch after a resume starts at the offset; once it ends, the loader reads its whole range again.
+    """
+
     parquet = entry_dataset(DataEntry("pre", str(tiny_pretrain_dir)))
     total = _rows_in(tiny_pretrain_dir)
     rd = RunDataloaders({"pre": dataloader_over(parquet, tokenizer, 64, 1, padded=False)}, [], tokenizer, {"pre": parquet})
@@ -347,8 +386,11 @@ def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer,
 
 
 def test_close_shuts_down_the_worker_iterators(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
-    """`close()` stops the worker processes of every live train iterator right away and forgets the iterators;
-    a fake without workers and a second call are no-ops."""
+    """
+    `close()` stops the worker processes of every live train iterator right away and forgets the iterators;
+    a fake without workers and a second call are no-ops.
+    """
+
     parquet = entry_dataset(DataEntry("pre", str(tiny_pretrain_dir)))
     loader = dataloader_over(parquet, tokenizer, 64, 1, num_workers=1, padded=False)
     rd = RunDataloaders({"pre": loader, "fake": _tagged("fake", 2)}, [], tokenizer, {"pre": parquet})
@@ -369,7 +411,10 @@ BLOCK = 64  # cap of the fake-sample tests: block_size + 1 = 65 tokens
 
 
 def _sample(length: int, tag: str) -> Sample:
-    """An unpadded sample of `length` valid (non-pad, in-vocab) tokens; every position is supervised."""
+    """
+    An unpadded sample of `length` valid (non-pad, in-vocab) tokens; every position is supervised.
+    """
+
     ids = torch.full((length,), 3, dtype=torch.long)
     return ids, ids.clone(), tag
 
@@ -428,8 +473,11 @@ def test_world_batch_uneven_split_yields_a_partial_micro_batch(tokenizer: Tokeni
 
 
 def test_world_batch_width_does_not_depend_on_the_loader_grouping(tokenizer: Tokenizer) -> None:
-    """The point of assembling before padding: a micro-batch of short rows is no longer widened because some other
-    micro-batch of the same world batch happened to contain a long row."""
+    """
+    The point of assembling before padding: a micro-batch of short rows is no longer widened because some other
+    micro-batch of the same world batch happened to contain a long row.
+    """
+
     short = [_sample(5, "a"), _sample(6, "b")]
     long = [_sample(60, "c"), _sample(61, "d")]
     alone = _split(tokenizer, short, micro_batch_size=2, sort=True, multiple=8)
@@ -457,7 +505,10 @@ def test_world_batch_on_real_loader_preserves_every_sample(tokenizer: Tokenizer,
 
 
 def _prompt_masked_sample(prompt: int, answer: int, tag: str, pad_id: int) -> Sample:
-    """An instruct-shaped sample: `prompt` masked positions (pad id in the labels), then `answer` supervised ones."""
+    """
+    An instruct-shaped sample: `prompt` masked positions (pad id in the labels), then `answer` supervised ones.
+    """
+
     ids = torch.full((prompt + answer,), 3, dtype=torch.long)
     labels = ids.clone()
     labels[:prompt] = pad_id
@@ -465,8 +516,11 @@ def _prompt_masked_sample(prompt: int, answer: int, tag: str, pad_id: int) -> Sa
 
 
 def test_world_batch_keeps_every_supervised_label_of_prompt_masked_rows(tokenizer: Tokenizer) -> None:
-    """An instruct row's labels sit at the END of the row, so the width must come from the full length; a width
-    derived from the count of supervised labels would cut the answers off long-prompt rows."""
+    """
+    An instruct row's labels sit at the END of the row, so the width must come from the full length; a width
+    derived from the count of supervised labels would cut the answers off long-prompt rows.
+    """
+
     pad = tokenizer.pad_id
     samples = [_prompt_masked_sample(200, 12, "a", pad), _prompt_masked_sample(150, 30, "b", pad)]
     out = world_batch_micro_batches(samples, 2, tokenizer, 255, sort_by_length=True, padding_multiple=128)
@@ -485,8 +539,11 @@ def test_world_batch_keeps_the_labels_of_real_instruct_rows(tokenizer: Tokenizer
 
 
 def test_the_data_package_re_exports_nothing() -> None:
-    """`training.data` must stay import-light: a re-export of the torch modules would load torch for everyone
-    importing `dataset_resolver` (the framework-neutral module living in this package)."""
+    """
+    `training.data` must stay import-light: a re-export of the torch modules would load torch for everyone
+    importing `dataset_resolver` (the framework-neutral module living in this package).
+    """
+
     import training.data as pkg
 
     assert not hasattr(pkg, "__all__") and not hasattr(pkg, "collate_fn")

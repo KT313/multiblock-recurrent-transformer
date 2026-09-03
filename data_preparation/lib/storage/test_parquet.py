@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.storage.parquet: shard naming and the shard writer."""
+"""
+Tests for data_preparation.lib.storage.parquet: shard naming and the shard writer.
+"""
 
 from collections.abc import Iterable
 from pathlib import Path
@@ -39,7 +41,10 @@ def test_shard_index() -> None:
 
 
 def _write_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, *, start_shard: int = 0) -> list[str]:
-    """Write dict rows as shards through `ShardWriter`; the names of the published shards, in order."""
+    """
+    Write dict rows as shards through `ShardWriter`; the names of the published shards, in order.
+    """
+
     published: list[Path] = []
     with ShardWriter(out_dir, shard_size, start_shard=start_shard, on_shard=published.append) as writer:
         for row in rows:

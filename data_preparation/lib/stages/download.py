@@ -1,20 +1,21 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The download step (``sources/<source>/raw/``) and the tokenizer step, plus the token counter and manifest helpers
-that ``stages/build.py`` shares.
+"""
+The download step (sources/<source>/raw/) and the tokenizer step, plus the token counter and manifest helpers
+that stages/build.py shares.
 
-Every step is a function ``(config, name, layout, *options) -> Manifest`` that is idempotent via the manifest (a
+Every step is a function (config, name, layout, *options) -> Manifest that is idempotent via the manifest (a
 second call with nothing new returns the stored manifest without touching the shards) and incremental where the
 data allow it. Raw folders are append-only and precious (bandwidth): :func:`download` appends to a *current* raw
 manifest, starts a fresh folder when there is none, and never deletes one. A folder whose manifest is *stale*
-(``DatasetConfig.raw_hash``: loader identity, ``token_count`` or tokenizer changed) or *outdated* (stored with a
-smaller ``max_seq_length`` than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
-the repair step (``lib/build/repair.py``) deletes such folders after the user confirmed, nothing else does.
+(DatasetConfig.raw_hash: loader identity, token_count or tokenizer changed) or *outdated* (stored with a
+smaller max_seq_length than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
+the repair step (lib/build/repair.py) deletes such folders after the user confirmed, nothing else does.
 
-What a raw row is: pretrain rows carry ``text_field`` truncated at the token boundary ``max_seq_length`` (the
-stored ``tokens`` is the true count of the stored text, see ``truncation.py``); instruct rows carry ``instruction /
-input / output`` with ``tokens`` = the count of their concatenation, uncapped. An instruct row longer than
-``max_seq_length`` is not stored at all (``dropped_too_long``; cutting an answer would be worse than losing the
-row). The raw manifest records ``truncated_at_tokens`` (the cap used, both kinds), ``token_count`` and the
+What a raw row is: pretrain rows carry text_field truncated at the token boundary max_seq_length (the
+stored tokens is the true count of the stored text, see truncation.py); instruct rows carry instruction /
+input / output with tokens = the count of their concatenation, uncapped. An instruct row longer than
+max_seq_length is not stored at all (dropped_too_long; cutting an answer would be worse than losing the
+row). The raw manifest records truncated_at_tokens (the cap used, both kinds), token_count and the
 tokenizer name.
 """
 
@@ -61,9 +62,11 @@ DEFAULT_SHARD_SIZE = 10_000
 
 
 class TokenCounter:
-    """Token counts with the config's tokenizer (``token_count: tokenizer``, ``add_special_tokens=False``) or
-    ``len(text) // 4`` (``estimate``). Counts are never capped here: the download truncates pretrain *text* at the
-    cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count."""
+    """
+    Token counts with the config's tokenizer (token_count: tokenizer, add_special_tokens=False) or
+    len(text) // 4 (estimate). Counts are never capped here: the download truncates pretrain *text* at the
+    cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
+    """
 
     def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
         self.mode = config.token_count
@@ -86,13 +89,19 @@ class TokenCounter:
         return [len(ids) for ids in encoded]
 
     def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
-        """``(prefix, count)`` per text with ``count <= max_tokens``: ``truncation.truncate_many`` with this
-        counter's token definition (the cut text re-counts to exactly ``count``)."""
+        """
+        (prefix, count) per text with count <= max_tokens: truncation.truncate_many with this
+        counter's token definition (the cut text re-counts to exactly count).
+        """
+
         return truncate_many(texts, max_tokens, self._tokenizer)
 
 
 def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
-    """The saved HF tokenizer in ``tokenizer_dir``; fails if the tokenizer stage has not run yet."""
+    """
+    The saved HF tokenizer in tokenizer_dir; fails if the tokenizer stage has not run yet.
+    """
+
     has_tokenizer_files = (tokenizer_dir / "tokenizer.json").is_file() or (tokenizer_dir / "tokenizer_config.json").is_file()
     if not has_tokenizer_files:
         raise FileNotFoundError(f"tokenizer {name!r} not found at {tokenizer_dir}; run the tokenizer stage first")
@@ -103,9 +112,12 @@ _IMPORT_LOCK = threading.Lock()
 
 
 def _auto_tokenizer() -> Any:
-    """``transformers.AutoTokenizer``, imported lazily (the HF cache env must be configurable before the import)
-    and under a lock: ``transformers`` initialises its lazy modules on first import, which is not thread-safe and
-    the build runs items in threads."""
+    """
+    transformers.AutoTokenizer, imported lazily (the HF cache env must be configurable before the import)
+    and under a lock: transformers initialises its lazy modules on first import, which is not thread-safe and
+    the build runs items in threads.
+    """
+
     with _IMPORT_LOCK:
         # the tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination /
         # minhash pools are spawn and immune) is the well-known tokenizers deadlock; the library's own
@@ -120,9 +132,12 @@ def _auto_tokenizer() -> Any:
 
 
 def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest | None:
-    """The stored manifest if it matches ``source_hash`` and ``stage``; None (with a warning) if stale or absent.
-    For derived folders (``processed/``, tokenizers) that the caller rebuilds; raw folders go through
-    :func:`inspect_raw`, which never treats a stale folder as absent."""
+    """
+    The stored manifest if it matches source_hash and stage; None (with a warning) if stale or absent.
+    For derived folders (processed/, tokenizers) that the caller rebuilds; raw folders go through
+    :func:`inspect_raw`, which never treats a stale folder as absent.
+    """
+
     manifest = Manifest.load(directory)
     if manifest is None:
         return None
@@ -138,8 +153,11 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
 def new_manifest(
     config: DatasetConfig, source: str, source_hash: str, stage: str, *, tokens: bool = False, truncated_at_tokens: int | None = None
 ) -> Manifest:
-    """An empty manifest for ``stage``; with ``tokens`` it records how token counts are measured, raw manifests
-    record ``truncated_at_tokens`` (the ``max_seq_length`` their rows were cut / dropped at)."""
+    """
+    An empty manifest for stage; with tokens it records how token counts are measured, raw manifests
+    record truncated_at_tokens (the max_seq_length their rows were cut / dropped at).
+    """
+
     return Manifest(
         source=source,
         source_hash=source_hash,
@@ -152,7 +170,10 @@ def new_manifest(
 
 
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
-    """Apply a pretrain source's converter (if any) and check that ``text_field`` is present."""
+    """
+    Apply a pretrain source's converter (if any) and check that text_field is present.
+    """
+
     converter = get_converter(source)
     if converter is not None:
         row = converter(row)
@@ -167,8 +188,10 @@ RawManifestState = Literal["missing", "current", "stale", "outdated"]
 
 
 class RawInspection(NamedTuple):
-    """The state of ``sources/<name>/raw`` against the config, its manifest (None when missing) and the reason line
-    the download's refusal, the repair step's plan and the status table all phrase from."""
+    """
+    The state of sources/<name>/raw against the config, its manifest (None when missing) and the reason line
+    the download's refusal, the repair step's plan and the status table all phrase from.
+    """
 
     state: RawManifestState
     manifest: Manifest | None
@@ -176,15 +199,21 @@ class RawInspection(NamedTuple):
 
     @property
     def current_manifest(self) -> Manifest | None:
-        """The manifest when the folder is current (the download appends to it, the build reads it), else None."""
+        """
+        The manifest when the folder is current (the download appends to it, the build reads it), else None.
+        """
+
         return self.manifest if self.state == "current" else None
 
 
 def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawInspection:
-    """``missing`` (no manifest; the folder may still hold shards, which :func:`download` refuses to start over),
-    ``stale`` (the manifest's hash differs from ``config.raw_hash(name)``: loader identity, ``token_count`` or
-    tokenizer changed, or it is another stage's manifest), ``outdated`` (``config.max_seq_length`` was raised above
-    the cap the rows were truncated / dropped at) or ``current``."""
+    """
+    missing (no manifest; the folder may still hold shards, which :func:`download` refuses to start over),
+    stale (the manifest's hash differs from config.raw_hash(name): loader identity, token_count or
+    tokenizer changed, or it is another stage's manifest), outdated (config.max_seq_length was raised above
+    the cap the rows were truncated / dropped at) or current.
+    """
+
     manifest = Manifest.load(layout.raw_dir(name))
     if manifest is None:
         return RawInspection("missing", None, "missing")
@@ -196,9 +225,11 @@ def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawI
 
 
 class RawFolderError(RuntimeError):
-    """A raw folder that :func:`download` may not append to (stale or outdated; ``problem`` is the
+    """
+    A raw folder that :func:`download` may not append to (stale or outdated; problem is the
     :func:`inspect_raw` reason). The download never deletes raw data; the repair step does, after the user
-    confirmed (``lib/build/repair.py``)."""
+    confirmed (lib/build/repair.py).
+    """
 
     def __init__(self, name: str, directory: Path, problem: str) -> None:
         super().__init__(
@@ -213,7 +244,10 @@ class RawFolderError(RuntimeError):
 
 
 def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Manifest:
-    """Save the config's tokenizer to ``layout.tokenizer_dir(name)`` (Hub download or the synthetic WordLevel one)."""
+    """
+    Save the config's tokenizer to layout.tokenizer_dir(name) (Hub download or the synthetic WordLevel one).
+    """
+
     tokenizer = config.tokenizer
     tokenizer_dir = layout.tokenizer_dir(tokenizer.name)
     source_hash = config.tokenizer_hash()
@@ -237,8 +271,11 @@ def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Manifest:
 
 
 def fetch_source(config: DatasetConfig, source: SourceConfig) -> SourceConfig:
-    """The source as handed to its loader: with ``config.always_range_requests`` every Hub file is read remotely by
-    piece (``max_cached_file_mb`` forced to 0), otherwise the source's own threshold applies."""
+    """
+    The source as handed to its loader: with config.always_range_requests every Hub file is read remotely by
+    piece (max_cached_file_mb forced to 0), otherwise the source's own threshold applies.
+    """
+
     if config.always_range_requests and source.loader in ("hf_files", "github_code"):
         return replace(source, load_kwargs={**source.load_kwargs, MAX_CACHED_FILE_KEY: 0})
     return source
@@ -246,13 +283,15 @@ def fetch_source(config: DatasetConfig, source: SourceConfig) -> SourceConfig:
 
 @dataclass
 class _IncrementCounters:
-    """What one download increment did so far (updated while :func:`_fetch` runs, read back at the end)."""
+    """
+    What one download increment did so far (updated while :func:`_fetch` runs, read back at the end).
+    """
 
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
     kept: int = 0  # rows written to disk
     skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
     dropped_too_long: int = 0  # instruct rows with more than `max_seq_length` tokens
-    exhausted: bool = False  # the loader ran dry, or ``check_limit`` was reached
+    exhausted: bool = False  # the loader ran dry, or check_limit was reached
 
 
 def download(
@@ -265,28 +304,30 @@ def download(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
 ) -> Manifest:
-    """Append raw shards until ``rows_needed`` rows are on disk (no-op if they already are).
+    """
+    Append raw shards until rows_needed rows are on disk (no-op if they already are).
 
     The folder's manifest must be current (:func:`inspect_raw`): a stale or outdated one raises
     :class:`RawFolderError` (nothing is deleted here), a missing one starts the folder from shard 0 (refused when
-    shards without a manifest are present). ``manifest.rows_fetched`` is the loader offset reached (source rows
-    consumed). Pretrain sources keep every row (converter applied, ``text_field`` guaranteed, the text truncated to
-    ``max_seq_length`` tokens with its true count in ``tokens``). Instruct sources run the converter and filter at
-    download time and store only standardized ``{instruction, input, output}`` rows of at most ``max_seq_length``
-    tokens; malformed rows (converter raises ``ValueError``) are counted in ``skipped_malformed``, longer rows in
-    ``dropped_too_long``. ``check_limit`` bounds the source rows inspected in total. A loader that yields fewer rows
-    than requested sets ``exhausted`` (the training sampler cycles a source smaller than its budget).
+    shards without a manifest are present). manifest.rows_fetched is the loader offset reached (source rows
+    consumed). Pretrain sources keep every row (converter applied, text_field guaranteed, the text truncated to
+    max_seq_length tokens with its true count in tokens). Instruct sources run the converter and filter at
+    download time and store only standardized {instruction, input, output} rows of at most max_seq_length
+    tokens; malformed rows (converter raises ValueError) are counted in skipped_malformed, longer rows in
+    dropped_too_long. check_limit bounds the source rows inspected in total. A loader that yields fewer rows
+    than requested sets exhausted (the training sampler cycles a source smaller than its budget).
 
-    ``rows_needed`` is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
-    (see ``sources/loaders.py``), every row it yields is written and ``rows_fetched`` advances to that row-group
+    rows_needed is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
+    (see sources/loaders.py), every row it yields is written and rows_fetched advances to that row-group
     boundary, so the same bytes are never downloaded twice. Sources without a converter are read with only
-    ``text_field`` projected (``columns``); converters and ``fields`` mappings get every column.
+    text_field projected (columns); converters and fields mappings get every column.
 
     Every shard is published and recorded in the manifest (with the loader offset after its last row and the
     skipped / dropped totals up to that row, :class:`RawFolder`) as soon as it is written, so a failure or a stop
     request (checked after every shard) keeps everything fetched so far and the next call resumes from the last
     complete shard without counting anything twice.
     """
+
     folder, increment = _plan_increment(config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout), should_stop=should_stop)
     if increment is None:
         return folder.manifest
@@ -308,8 +349,11 @@ def download(
 
 
 def _finish_increment(folder: RawFolder, source: SourceConfig, counters: _IncrementCounters) -> None:
-    """Hand the increment's totals to the folder; a source stopped by its own ``check_limit`` records that limit
-    (so a later, larger one reopens it) instead of counting as a loader that ran dry."""
+    """
+    Hand the increment's totals to the folder; a source stopped by its own check_limit records that limit
+    (so a later, larger one reopens it) instead of counting as a loader that ran dry.
+    """
+
     limit = source.check_limit
     by_limit = limit if limit is not None and folder.start_offset + counters.consumed >= limit else None
     progress_now = RowProgress(counters.consumed, counters.skipped_malformed, counters.dropped_too_long)
@@ -324,10 +368,13 @@ def _log_increment(name: str, counters: _IncrementCounters, manifest: Manifest) 
 
 
 def _raw_folder_to_append_to(config: DatasetConfig, name: str, layout: DatasetLayout, *, should_stop: StopCheck | None = None) -> RawFolder:
-    """The raw folder of ``name`` around its current manifest, or a fresh one (``truncated_at_tokens =
-    max_seq_length``) when the directory has none. Refused when the folder is stale or outdated
+    """
+    The raw folder of name around its current manifest, or a fresh one (truncated_at_tokens =
+    max_seq_length) when the directory has none. Refused when the folder is stale or outdated
     (:class:`RawFolderError`; deleting it is the repair step's decision) or holds shards without any manifest:
-    nothing would say where those rows came from, and starting over would delete them."""
+    nothing would say where those rows came from, and starting over would delete them.
+    """
+
     raw_dir = layout.raw_dir(name)
     inspection = inspect_raw(config, name, layout)
     if inspection.manifest is not None and inspection.state != "current":
@@ -347,13 +394,14 @@ TOKEN_BATCH = 256  # rows tokenized per tokenizer call while downloading
 
 
 class _TokenStep:
-    """The token step of a download, fed row by row and batching :data:`TOKEN_BATCH` rows per tokenizer call:
-    ``add(row, progress)`` returns the rows ready to store once a batch is full (else ``[]``), ``flush()`` the rest;
+    """
+    The token step of a download, fed row by row and batching :data:`TOKEN_BATCH` rows per tokenizer call:
+    add(row, progress) returns the rows ready to store once a batch is full (else []), flush() the rest;
     every returned row comes with the :class:`RowProgress` right after it.
 
-    Pretrain rows: ``text_field`` is truncated at token ``max_tokens`` (``truncation.py``) and ``tokens`` is the
-    true count of the stored text. Instruct rows: ``tokens`` counts instruction + input + output uncapped; a row over
-    ``max_tokens`` is dropped (``counters.dropped_too_long``), never cut, and every stored row's progress carries the
+    Pretrain rows: text_field is truncated at token max_tokens (truncation.py) and tokens is the
+    true count of the stored text. Instruct rows: tokens counts instruction + input + output uncapped; a row over
+    max_tokens is dropped (counters.dropped_too_long), never cut, and every stored row's progress carries the
     drop count of the rows before it (exact per row, so a resume never double counts).
     """
 
@@ -367,11 +415,17 @@ class _TokenStep:
 
     @property
     def pending(self) -> int:
-        """Rows buffered for the next tokenizer call."""
+        """
+        Rows buffered for the next tokenizer call.
+        """
+
         return len(self._batch)
 
     def add(self, row: Row, progress: RowProgress) -> list[StoredRow]:
-        """Buffer ``row``; a full batch (:data:`TOKEN_BATCH` rows) is released."""
+        """
+        Buffer row; a full batch (:data:`TOKEN_BATCH` rows) is released.
+        """
+
         self._batch.append((row, progress))
         return self.flush() if len(self._batch) >= TOKEN_BATCH else []
 
@@ -402,8 +456,10 @@ class _TokenStep:
 
 @dataclass
 class _Increment:
-    """One source's part of a download pass: what it still wants, how a source row becomes a stored row, and what
-    the pass did for it so far (:attr:`counters`)."""
+    """
+    One source's part of a download pass: what it still wants, how a source row becomes a stored row, and what
+    the pass did for it so far (:attr:`counters`).
+    """
 
     name: str
     source: SourceConfig
@@ -421,24 +477,33 @@ class _Increment:
 
     @property
     def loader_count(self) -> int:
-        """What the loader is asked for. Pretrain rows are all kept: ``rows_to_keep`` (or the consume budget when that is
+        """
+        What the loader is asked for. Pretrain rows are all kept: rows_to_keep (or the consume budget when that is
         smaller); a remote loader may still finish its row group beyond it. Instruct rows may be dropped by the
-        filter, the converter or the token step: everything within the budget, or without bound."""
+        filter, the converter or the token step: everything within the budget, or without bound.
+        """
+
         if self.is_instruct:
             return UNBOUNDED_COUNT if self.max_consume is None else self.max_consume
         return self.rows_to_keep if self.max_consume is None else min(self.rows_to_keep, self.max_consume)
 
     @property
     def done(self) -> bool:
-        """No more source rows are taken: the consume budget is spent (``check_limit`` bounds the source rows
-        consumed, whatever the loader yields beyond its count), or an instruct source kept its ``rows_to_keep`` rows."""
+        """
+        No more source rows are taken: the consume budget is spent (check_limit bounds the source rows
+        consumed, whatever the loader yields beyond its count), or an instruct source kept its rows_to_keep rows.
+        """
+
         if self.max_consume is not None and self.counters.consumed >= self.max_consume:
             return True
         return self.is_instruct and self.counters.kept >= self.rows_to_keep
 
     def convert(self, name: str, raw: Row) -> Row | None:
-        """The row to store for source row ``raw``, or None when the filter rejects it or the converter finds it
-        malformed (``ValueError``, counted in ``skipped_malformed``)."""
+        """
+        The row to store for source row raw, or None when the filter rejects it or the converter finds it
+        malformed (ValueError, counted in skipped_malformed).
+        """
+
         if not self.is_instruct:
             return text_row(self.source, raw, name)
         if self.row_filter is not None and not self.row_filter(raw):
@@ -460,8 +525,11 @@ def _plan_increment(
     token_counter: Callable[[], TokenCounter],
     should_stop: StopCheck | None,
 ) -> tuple[RawFolder, _Increment | None]:
-    """Open the raw folder of ``name`` and decide what this pass fetches for it: None when there is nothing to do
-    (the source is exhausted, the rows are on disk, or its ``check_limit`` is spent, recorded as the exhaustion)."""
+    """
+    Open the raw folder of name and decide what this pass fetches for it: None when there is nothing to do
+    (the source is exhausted, the rows are on disk, or its check_limit is spent, recorded as the exhaustion).
+    """
+
     source = fetch_source(config, config.sources[name])
     folder = _raw_folder_to_append_to(config, name, layout, should_stop=should_stop)
     folder.reopen_if_check_limit_grew(source.check_limit)
@@ -485,7 +553,10 @@ def _plan_increment(
 
 
 def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
-    """``rows`` as ``(name, row)`` pairs; closing this generator closes the loader's."""
+    """
+    rows as (name, row) pairs; closing this generator closes the loader's.
+    """
+
     try:
         for raw in rows:
             yield name, raw
@@ -496,13 +567,16 @@ def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
 
 
 def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: Progress, postfix: _DownloadPostfix, shard_size: int) -> None:
-    """One download pass: every ``(name, row)`` of ``rows`` goes to its increment (counted as consumed, converted,
+    """
+    One download pass: every (name, row) of rows goes to its increment (counted as consumed, converted,
     tokenized in batches and appended shard by shard to its raw directory, one shard writer per increment) until
     every increment is :attr:`~_Increment.done` or the stream ends (the stream is closed either way); the token
     batches are flushed and an increment that kept fewer rows than it wanted is exhausted. An instruct increment's
     token step is flushed early when its buffered rows would meet the target, so it stops exactly there (a second
-    pass would re-stream the file prefix). ``bar`` tracks kept rows (postfix: source rows consumed, current repo
-    file; the bytes fetched are the counter the bar was created with)."""
+    pass would re-stream the file prefix). bar tracks kept rows (postfix: source rows consumed, current repo
+    file; the bytes fetched are the counter the bar was created with).
+    """
+
     increments_by_name = {increment.name: increment for increment in increments}
     consumed_total = 0
     with ExitStack() as stack:
@@ -544,7 +618,10 @@ def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: P
 
 
 def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], bar: Progress) -> None:
-    """The rows the token step released, appended and counted as kept."""
+    """
+    The rows the token step released, appended and counted as kept.
+    """
+
     for row, row_progress in stored:
         increment.folder.add(writer, row, row_progress)
         increment.counters.kept += 1
@@ -561,14 +638,16 @@ def download_github_code_group(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
 ) -> dict[str, Manifest]:
-    """:func:`download` for several `github_code` sources of one repo in a **single pass** over its files: every
-    row group is fetched once and its rows are dispatched to the language source that wants them (a source that
-    has its ``rows_needed[name]`` or spent its ``check_limit`` stops taking rows, the others read on). The raw
-    shards (texts truncated by the same token step), ``rows_fetched`` and ``exhausted`` of every source are exactly
-    what separate ``download`` calls would produce: the same :func:`_fetch` pass over the repo reader instead of
-    one loader. A stale or outdated member raises :class:`RawFolderError` before anything is fetched. Returns the
-    raw manifest of every source in ``names``.
     """
+    :func:`download` for several `github_code` sources of one repo in a single pass over its files: every
+    row group is fetched once and its rows are dispatched to the language source that wants them (a source that
+    has its rows_needed[name] or spent its check_limit stops taking rows, the others read on). The raw
+    shards (texts truncated by the same token step), rows_fetched and exhausted of every source are exactly
+    what separate download calls would produce: the same :func:`_fetch` pass over the repo reader instead of
+    one loader. A stale or outdated member raises :class:`RawFolderError` before anything is fetched. Returns the
+    raw manifest of every source in names.
+    """
+
     for name in names:
         source = config.sources[name]
         if source.loader != "github_code":
@@ -614,7 +693,10 @@ def download_github_code_group(
 
 
 def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
-    """The column projection covering every member's (None as soon as one member needs every column)."""
+    """
+    The column projection covering every member's (None as soon as one member needs every column).
+    """
+
     union: list[str] = []
     for columns in projections:
         if columns is None:
@@ -624,28 +706,38 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
 
 
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
-    """The standardized ``{instruction, input, output}`` row for ``raw``.
-
-    A ``ValueError`` raised by the converter (malformed row) propagates to the caller, which skips the row.
     """
+    The standardized {instruction, input, output} row for raw.
+
+    A ValueError raised by the converter (malformed row) propagates to the caller, which skips the row.
+    """
+
     row = converter(raw) if converter is not None else dict(raw)
     return {"instruction": row["instruction"], "input": row.get("input", ""), "output": row["output"]}
 
 
 class _DownloadPostfix:
-    """The download bar's postfix: source rows consumed, current repo file (refreshed sparsely)."""
+    """
+    The download bar's postfix: source rows consumed, current repo file (refreshed sparsely).
+    """
 
     def __init__(self, bar: Progress) -> None:
         self._bar = bar
         self._values: dict[str, Any] = {"consumed": 0}
 
     def on_file(self, file: str) -> None:
-        """Loader callback: a new repo file is being read."""
+        """
+        Loader callback: a new repo file is being read.
+        """
+
         self._values["file"] = file.rsplit("/", 1)[-1]
         self._refresh()
 
     def consumed(self, total: int) -> None:
-        """Record the running count of consumed source rows; the bar is refreshed every 100 rows."""
+        """
+        Record the running count of consumed source rows; the bar is refreshed every 100 rows.
+        """
+
         self._values["consumed"] = total
         if total % 100 == 0:
             self._refresh()
@@ -655,9 +747,12 @@ class _DownloadPostfix:
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
-    """Column projection for a source's loader (applied whatever the file format): ``[text_field]`` for pretrain
-    sources read as-is, None (every column) when a converter or ``fields`` mapping may need others or the rows are
-    instruct rows."""
+    """
+    Column projection for a source's loader (applied whatever the file format): [text_field] for pretrain
+    sources read as-is, None (every column) when a converter or fields mapping may need others or the rows are
+    instruct rows.
+    """
+
     if source.kind == "instruct" or get_converter(source) is not None:
         return None
     return [source.text_field]

@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values, continuity at every stage
-transition and the resume warmup ramp."""
+"""
+Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values, continuity at every stage
+transition and the resume warmup ramp.
+"""
 
 from typing import Any
 
@@ -80,7 +82,10 @@ def test_no_warmup_and_no_cooldown_is_a_flat_plateau() -> None:
 
 
 def test_warmup_ramps_monotonically_to_the_first_stage_lr_up_to_the_transition() -> None:
-    """The longest allowed warmup (5 of stage a's 6 plain steps) never targets the next stage's LR: no dip."""
+    """
+    The longest allowed warmup (5 of stage a's 6 plain steps) never targets the next stage's LR: no dip.
+    """
+
     sm = _tiny_manager(warmup=5)
     lrs = [_lr(sm, step) for step in range(8)]
     assert lrs[:6] == pytest.approx([3e-4 * step / 5 for step in range(6)])
@@ -89,14 +94,20 @@ def test_warmup_ramps_monotonically_to_the_first_stage_lr_up_to_the_transition()
 
 
 def test_warmup_starts_at_zero_even_with_min_lr() -> None:
-    """The global warmup ramps from 0 (not from `min_lr`); only plateau/transition/cooldown are floored, as upstream."""
+    """
+    The global warmup ramps from 0 (not from `min_lr`); only plateau/transition/cooldown are floored, as upstream.
+    """
+
     sm = _tiny_manager()
     assert _lr(sm, 0, min_lr=1e-5) == 0.0
     assert _lr(sm, 1, min_lr=1e-5) == pytest.approx(1.5e-4)
 
 
 def test_warmup_and_cooldown_boundaries_are_continuous_with_the_plateau() -> None:
-    """`step == warmup_steps` is the first plateau step; `step == max_steps - cooldown_steps` the last one."""
+    """
+    `step == warmup_steps` is the first plateau step; `step == max_steps - cooldown_steps` the last one.
+    """
+
     sm = _tiny_manager(warmup=4, cooldown=3)  # 20 steps
     assert [_lr(sm, s) for s in range(5)] == pytest.approx([0.0, 0.75e-4, 1.5e-4, 2.25e-4, 3e-4])
     assert [_lr(sm, s) for s in range(16, 21)] == pytest.approx([5e-5, 5e-5, 5e-5 * 2 / 3, 5e-5 / 3, 0.0])
@@ -158,8 +169,11 @@ def test_resume_warmup_helper() -> None:
 
 
 def test_resume_warmup_applies_only_inside_the_ramp() -> None:
-    """`get_lr_multistage` ramps for `resume_warmup_steps` steps after `resume_step` and is the plain schedule before
-    the resume, after the ramp, without a resume (`resume_step=-1`) and with the ramp disabled."""
+    """
+    `get_lr_multistage` ramps for `resume_warmup_steps` steps after `resume_step` and is the plain schedule before
+    the resume, after the ramp, without a resume (`resume_step=-1`) and with the ramp disabled.
+    """
+
     sm = _tiny_manager()
     plateau = _lr(sm, 5)
     kw = dict(resume_step=10, resume_warmup_steps=4)

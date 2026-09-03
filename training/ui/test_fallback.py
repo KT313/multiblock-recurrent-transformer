@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the console fallback of the training dashboard."""
+"""
+Tests for the console fallback of the training dashboard.
+"""
 
 from __future__ import annotations
 

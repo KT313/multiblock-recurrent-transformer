@@ -1,8 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the training CLI (`training/train.py`): argv parsing, the exit codes 0 / 1 / 130 with a monkeypatched
+"""
+Tests for the training CLI (`training/train.py`): argv parsing, the exit codes 0 / 1 / 130 with a monkeypatched
 `train`, the stop request set by the first Ctrl-C / SIGTERM (the second aborting), console logging, and the tiny run
 end to end in a pseudo-terminal with the live dashboard (marked slow): a full run and one interrupted by SIGINT, both
-leaving a clean screen. The run itself is tested in `test_run.py`."""
+leaving a clean screen. The run itself is tested in `test_run.py`.
+"""
 
 import fcntl
 import logging
@@ -56,10 +58,13 @@ def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
 
 @pytest.fixture(autouse=True)
 def detached_training_handlers() -> Iterator[logging.Logger]:
-    """The `training` logger (yielded) and the `data_preparation` logger without the handlers
+    """
+    The `training` logger (yielded) and the `data_preparation` logger without the handlers
     `configure_console_logging` adds to either of them, removed again afterwards, so a handler bound to a captured
     stderr never outlives its test (later tests of other modules would log into a closed stream). Autouse: every
-    `main()` call configures both hierarchies."""
+    `main()` call configures both hierarchies.
+    """
+
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     data_logger = logging.getLogger("data_preparation")
     before = {logger: (list(logger.handlers), logger.level) for logger in (training_logger, data_logger)}
@@ -78,7 +83,9 @@ def yaml_path(tmp_path: Path, tiny_dataset_dir: Path) -> Path:
 
 
 class FakeTrain:
-    """Stands in for `training.run.train` in the CLI: records its arguments, returns `report` or raises `error`."""
+    """
+    Stands in for `training.run.train` in the CLI: records its arguments, returns `report` or raises `error`.
+    """
 
     def __init__(self, report: TrainingReport | None = None, error: BaseException | None = None) -> None:
         self.report = report
@@ -103,8 +110,11 @@ class FakeTrain:
 def test_main_parses_argv_trains_and_prints_the_report(
     monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], detached_training_handlers: logging.Logger
 ) -> None:
-    """`--config` plus overrides reach `train()` as settings, together with the stop request and the start time; the
-    report's summary is printed to stdout; exit code 0; the CLI configured the `training` console handler."""
+    """
+    `--config` plus overrides reach `train()` as settings, together with the stop request and the start time; the
+    report's summary is printed to stdout; exit code 0; the CLI configured the `training` console handler.
+    """
+
     report = _report(tmp_path / "out")
     fake_train = FakeTrain(report)
     monkeypatch.setattr(train_module, "train", fake_train)
@@ -141,8 +151,11 @@ def test_main_returns_130_for_a_stopped_run(monkeypatch: pytest.MonkeyPatch, yam
 def test_main_returns_130_when_interrupted(
     monkeypatch: pytest.MonkeyPatch, yaml_path: Path, error: BaseException, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A `BuildAborted` of the in-process dataset build and a `KeyboardInterrupt` (the second Ctrl-C) both end the
-    CLI with 130 and one warning; nothing is printed."""
+    """
+    A `BuildAborted` of the in-process dataset build and a `KeyboardInterrupt` (the second Ctrl-C) both end the
+    CLI with 130 and one warning; nothing is printed.
+    """
+
     monkeypatch.setattr(train_module, "train", FakeTrain(error=error))
     with caplog.at_level(logging.WARNING, logger="training"):
         assert main(["--config", str(yaml_path)]) == 130
@@ -161,7 +174,10 @@ def test_main_returns_1_and_logs_the_traceback_on_failure(
 
 
 def test_main_without_a_config_exits_through_the_parser(capsys: pytest.CaptureFixture[str]) -> None:
-    """Settings errors are the parser's (`SystemExit` 2, usage on stderr), not exit code 1."""
+    """
+    Settings errors are the parser's (`SystemExit` 2, usage on stderr), not exit code 1.
+    """
+
     with pytest.raises(SystemExit) as excinfo:
         main([])
     assert excinfo.value.code == 2
@@ -181,8 +197,11 @@ def test_stop_request_is_a_stop_check() -> None:
 
 
 def test_first_interrupt_sets_the_stop_request_and_is_logged(caplog: pytest.LogCaptureFixture) -> None:
-    """SIGINT (Ctrl-C) once inside `stop_on_interrupt`: the request is set, a `keep` warning names the signal, the
-    default handlers are back (a second SIGINT raises `KeyboardInterrupt`); on exit the previous handlers return."""
+    """
+    SIGINT (Ctrl-C) once inside `stop_on_interrupt`: the request is set, a `keep` warning names the signal, the
+    default handlers are back (a second SIGINT raises `KeyboardInterrupt`); on exit the previous handlers return.
+    """
+
     previous_int, previous_term = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
     with caplog.at_level(logging.WARNING, logger="training"), stop_on_interrupt() as should_stop:
         assert should_stop() is False
@@ -208,7 +227,10 @@ def test_sigterm_sets_the_stop_request_too() -> None:
 
 
 def test_stop_on_interrupt_outside_the_main_thread_yields_an_unarmed_request() -> None:
-    """Signal handlers can only be installed from the main thread; elsewhere the request exists but no signal sets it."""
+    """
+    Signal handlers can only be installed from the main thread; elsewhere the request exists but no signal sets it.
+    """
+
     previous_int = signal.getsignal(signal.SIGINT)
     seen: list[bool] = []
 
@@ -224,8 +246,11 @@ def test_stop_on_interrupt_outside_the_main_thread_yields_an_unarmed_request() -
 
 
 def test_main_maps_a_stop_during_training_to_130(monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """The whole path: Ctrl-C while `train()` runs sets the request the CLI passed in; `train()` returns a stopped
-    report; the CLI prints it and exits 130; the signal handlers are restored afterwards."""
+    """
+    The whole path: Ctrl-C while `train()` runs sets the request the CLI passed in; `train()` returns a stopped
+    report; the CLI prints it and exits 130; the signal handlers are restored afterwards.
+    """
+
     previous_int = signal.getsignal(signal.SIGINT)
 
     def train_until_interrupted(settings: Settings, *, should_stop: StopRequest, started_at: float, **_: Any) -> TrainingReport:
@@ -244,8 +269,11 @@ def test_main_maps_a_stop_during_training_to_130(monkeypatch: pytest.MonkeyPatch
 
 @pytest.fixture
 def detached_data_preparation_handlers() -> Iterator[logging.Logger]:
-    """The `data_preparation` logger with no handler for the test (an earlier `configure_logging` of the session may
-    have left one bound to a since-closed capture stream); its handlers and level are put back afterwards."""
+    """
+    The `data_preparation` logger with no handler for the test (an earlier `configure_logging` of the session may
+    have left one bound to a since-closed capture stream); its handlers and level are put back afterwards.
+    """
+
     data_logger = logging.getLogger("data_preparation")
     before = list(data_logger.handlers)
     level = data_logger.level
@@ -265,9 +293,12 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
     detached_training_handlers: logging.Logger,
     detached_data_preparation_handlers: logging.Logger,
 ) -> None:
-    """One stderr handler each on the `training` and the `data_preparation` logger (idempotent) at INFO, so
+    """
+    One stderr handler each on the `training` and the `data_preparation` logger (idempotent) at INFO, so
     `RunLogger`'s `training.logger` records and the dataset resolver's `data_preparation.*` records both reach the
-    terminal in the line format of the data-prep CLI (the resolver itself configures nothing)."""
+    terminal in the line format of the data-prep CLI (the resolver itself configures nothing).
+    """
+
     training_logger = train_module.configure_console_logging()
     train_module.configure_console_logging()
     assert training_logger is detached_training_handlers and training_logger.level == logging.INFO
@@ -287,9 +318,12 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
 def _run_cli_in_pty(
     arguments: list[str], *, width: int, height: int, interrupt_after: float | None = None, timeout: float = 240.0
 ) -> tuple[int, str]:
-    """Run `python training/train.py <arguments>` on the CPU on a pseudo-terminal of the given size; the exit code
+    """
+    Run `python training/train.py <arguments>` on the CPU on a pseudo-terminal of the given size; the exit code
     and everything it wrote. `interrupt_after` sends SIGINT that many seconds after the first dashboard frame. (The
-    pty runner of `training/ui/test_demo.py`, with the command line and the CPU pin of a training run.)"""
+    pty runner of `training/ui/test_demo.py`, with the command line and the CPU pin of a training run.)
+    """
+
     pid, fd = pty.fork()
     if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -326,13 +360,19 @@ def _run_cli_in_pty(
 
 
 def _tiny_cli_arguments(tiny_dataset_dir: Path, out_dir: Path, *overrides: str) -> list[str]:
-    """`config/tiny.yaml` on the prepared tiny dataset, fp32 (bf16 autocast is slow on the CPU), no wandb."""
+    """
+    `config/tiny.yaml` on the prepared tiny dataset, fp32 (bf16 autocast is slow on the CPU), no wandb.
+    """
+
     return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir), "--precision", "32", *overrides]
 
 
 def _assert_clean_terminal(text: str, width: int) -> str:
-    """The screen after the run: the live dashboard did run, no panel remnants, the bars once (the dashboard's static
-    summary), the cursor shown again; returns the screen text."""
+    """
+    The screen after the run: the live dashboard did run, no panel remnants, the bars once (the dashboard's static
+    summary), the cursor shown again; returns the screen text.
+    """
+
     plain = strip_ansi(text)
     assert "╭─ log" in plain and "╭─ events" in plain and plain.count("overall") > 1, "the live dashboard did run"
     shown = screen_of(text, width)
@@ -344,10 +384,13 @@ def _assert_clean_terminal(text: str, width: int) -> str:
 
 @pytest.mark.slow
 def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(tiny_dataset_dir: Path, short_tmp_path: Path) -> None:
-    """The whole CLI with the live dashboard: exit 0, the checkpoints and `train.log` written; the screen afterwards
+    """
+    The whole CLI with the live dashboard: exit 0, the checkpoints and `train.log` written; the screen afterwards
     shows the kept header lines and the final line once, the dashboard's static summary once (every stage ticked)
     and then the report's summary, and nothing of the live frame. (`short_tmp_path`: the 140-column screen must show
-    the checkpoint path unabridged in the events panel and the summary line.)"""
+    the checkpoint path unabridged in the events panel and the summary line.)
+    """
+
     out_dir = short_tmp_path / "out"
     code, text = _run_cli_in_pty(_tiny_cli_arguments(tiny_dataset_dir, out_dir), width=140, height=45)
     assert code == 0, text[-3000:]
@@ -370,9 +413,12 @@ def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(t
 
 @pytest.mark.slow
 def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_screen(tiny_dataset_dir: Path, tmp_path: Path) -> None:
-    """Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
+    """
+    Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
     finishes its step, saves a checkpoint, exits 130; the screen shows the signal's kept warning, the "stopped on
-    request" line, the static summary and the report once, no frame remnants."""
+    request" line, the static summary and the report once, no frame remnants.
+    """
+
     out_dir = tmp_path / "out"
     arguments = _tiny_cli_arguments(tiny_dataset_dir, out_dir, "--world_batch_size", "1", "--micro_batch_size", "1")
     code, text = _run_cli_in_pty(arguments, width=140, height=45, interrupt_after=0.5)

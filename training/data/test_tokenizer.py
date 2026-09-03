@@ -71,7 +71,10 @@ def _without_pad(tiny_tokenizer_dir: Path, tmp_path: Path) -> Path:
 
 
 def test_missing_pad_token_falls_back(tiny_tokenizer_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    """The synthetic tokenizer exposes no unk at the HF level, so without a pad token it falls back to EOS."""
+    """
+    The synthetic tokenizer exposes no unk at the HF level, so without a pad token it falls back to EOS.
+    """
+
     with caplog.at_level("WARNING"):
         tokenizer = Tokenizer(_without_pad(tiny_tokenizer_dir, tmp_path))
     assert tokenizer.processor.pad_token_id is None
@@ -80,7 +83,10 @@ def test_missing_pad_token_falls_back(tiny_tokenizer_dir: Path, tmp_path: Path, 
 
 
 def test_resolve_pad_id_order() -> None:
-    """Thesis behaviour for the Llama tokenizer: no pad token -> `<unk>` (id 0); then EOS; then an error."""
+    """
+    Thesis behaviour for the Llama tokenizer: no pad token -> `<unk>` (id 0); then EOS; then an error.
+    """
+
     from types import SimpleNamespace
 
     from training.data.tokenizer import resolve_pad_id

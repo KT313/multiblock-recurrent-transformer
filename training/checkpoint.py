@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Checkpoint schema, naming, search, and save/load through the backend. Steps in file names are OPTIMIZER steps.
+"""
+Checkpoint schema, naming, search, and save/load through the backend. Steps in file names are OPTIMIZER steps.
 
 A checkpoint is one `torch.save` dict: the `"model"` and `"optimizer"` state dicts plus the `CheckpointMetadata`
 fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key.
@@ -24,7 +25,9 @@ CHECKPOINT_SUFFIX = ".pth"
 
 @dataclass
 class CheckpointMetadata:
-    """Everything in a checkpoint besides the two state dicts."""
+    """
+    Everything in a checkpoint besides the two state dicts.
+    """
 
     step: int  # optimizer steps completed when the checkpoint was written
     stage: int  # stage the run is in at `step` (the one it enters next when written before a transition)
@@ -36,12 +39,18 @@ class CheckpointMetadata:
     data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read per source + the draw RNG
 
     def to_state(self) -> dict[str, Any]:
-        """The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied)."""
+        """
+        The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied).
+        """
+
         return {field.name: getattr(self, field.name) for field in fields(self)}
 
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "CheckpointMetadata":
-        """Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored."""
+        """
+        Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored.
+        """
+
         missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(
@@ -56,7 +65,10 @@ def checkpoint_dir(out_dir: str | Path) -> Path:
 
 
 def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None) -> str:
-    """`step-{step:08d}-{run_name}` plus `-stage-{i}_end` for the checkpoint written before a stage transition."""
+    """
+    `step-{step:08d}-{run_name}` plus `-stage-{i}_end` for the checkpoint written before a stage transition.
+    """
+
     name = f"step-{step:08d}-{run_name}"
     if stage_end is not None:
         name += f"-stage-{stage_end}_end"
@@ -64,7 +76,10 @@ def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None) -
 
 
 def checkpoint_path(run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None) -> Path:
-    """`run_directory/checkpoints/<checkpoint_name>`; `stage_end` is `StageManager.stage_ending_at(step - 1)`."""
+    """
+    `run_directory/checkpoints/<checkpoint_name>`; `stage_end` is `StageManager.stage_ending_at(step - 1)`.
+    """
+
     return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end)
 
 
@@ -73,7 +88,10 @@ def _step_from_name(path: Path) -> int:
 
 
 def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]:
-    """Highest-step checkpoint of `run_name` under `out_dir/checkpoints`, or None."""
+    """
+    Highest-step checkpoint of `run_name` under `out_dir/checkpoints`, or None.
+    """
+
     directory = checkpoint_dir(out_dir)
     pattern = re.compile(rf"^step-\d{{8}}-{re.escape(run_name)}(-stage-\d+_end)?{re.escape(CHECKPOINT_SUFFIX)}$")
     candidates = [path for path in directory.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(path.name)]
@@ -132,12 +150,14 @@ PARAM_GROUPING_SETTING = "no_weight_decay_for_bias_and_norm_params"
 def check_settings_unchanged(
     metadata: CheckpointMetadata, settings: "Settings", model_config: dict[str, Any], allow_settings_change: bool
 ) -> None:
-    """Fail a resume whose settings or model config differ from the checkpoint's, unless `allow_settings_change`.
+    """
+    Fail a resume whose settings or model config differ from the checkpoint's, unless `allow_settings_change`.
 
     Fields in `SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME` are skipped; a field the checkpoint did not store counts as
     changed. `model_config` is compared whole. A changed `PARAM_GROUPING_SETTING` is refused even with
     `allow_settings_change`: the restored optimizer keeps the checkpoint's groups.
     """
+
     current = asdict(settings)
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
@@ -173,12 +193,14 @@ def check_settings_unchanged(
 
 
 def is_checkpoint_step(settings: Settings, completed_steps: int, stage_manager: StageManager) -> bool:
-    """Whether to write a checkpoint after `completed_steps` completed optimizer steps.
+    """
+    Whether to write a checkpoint after `completed_steps` completed optimizer steps.
 
     Three rules: every `save_step_interval` steps (0 disables), at the last step (`stage_manager.total_steps`) if
     `save_last_step`, and before every stage transition (`completed_steps` follows the last plain step of a stage,
     `StageManager.stage_ending_at(completed_steps - 1)`).
     """
+
     save_at_interval = settings.save_step_interval > 0 and completed_steps % settings.save_step_interval == 0
     save_at_last_step = settings.save_last_step and completed_steps >= stage_manager.total_steps
     save_at_stage_end = stage_manager.stage_ending_at(completed_steps - 1) is not None
@@ -188,7 +210,10 @@ def is_checkpoint_step(settings: Settings, completed_steps: int, stage_manager: 
 def save_training_checkpoint(
     backend: Backend, path: str | Path, model: Module, optimizer: Optimizer, metadata: CheckpointMetadata
 ) -> None:
-    """Write the model + optimizer state dicts and `metadata` to `path`."""
+    """
+    Write the model + optimizer state dicts and `metadata` to `path`.
+    """
+
     state: dict[str, Any] = {
         "model": unwrap_compiled(model).state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -200,10 +225,12 @@ def save_training_checkpoint(
 def load_training_checkpoint(
     backend: Backend, path: str | Path, model: Module, optimizer: Optimizer
 ) -> CheckpointMetadata:
-    """Load the model and optimizer state in place and return the checkpoint's metadata.
+    """
+    Load the model and optimizer state in place and return the checkpoint's metadata.
 
     The metadata is read first, so a checkpoint of an older layout fails before anything is modified.
     """
+
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
     unwrap_compiled(model).load_state_dict(state["model"])

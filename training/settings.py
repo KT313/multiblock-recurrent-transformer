@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Training run settings: the YAML/CLI schema consumed by `training/train.py`.
+"""
+Training run settings: the YAML/CLI schema consumed by `training/train.py`.
 
 Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e. world
 batches of `world_batch_size × block_size` tokens. Defaults make a run on one local GPU work out of the box.
@@ -37,7 +38,8 @@ NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
 
 @dataclass
 class OptimizerConfig:
-    """The `optim_config:` mapping of a run config: the optimizer's constructor options, typed.
+    """
+    The `optim_config:` mapping of a run config: the optimizer's constructor options, typed.
 
     A dataclass so jsonargparse merges per-field CLI overrides (`--optim_config.lr 3e-4`) and rejects unknown names.
     `lr` is NOT the schedule's LR (`stage_base_lrs` is); ELLISAdam keeps it as `init_lr`, the weight-decay reference.
@@ -164,13 +166,19 @@ class Settings:
 
     @property
     def gradient_accumulation_steps(self) -> int:
-        """Micro-batches per optimizer step on one device (divide by world_size once distributed training exists)."""
+        """
+        Micro-batches per optimizer step on one device (divide by world_size once distributed training exists).
+        """
+
         return self.world_batch_size // self.micro_batch_size
 
 
 
 def parse_settings(args: Optional[list[str]] = None) -> Settings:
-    """`--config file.yaml` plus `--key value` overrides for any field (nested keys with dots)."""
+    """
+    `--config file.yaml` plus `--key value` overrides for any field (nested keys with dots).
+    """
+
     parser = ArgumentParser(description="Train a multi-block recurrent transformer.")
     parser.add_argument("--config", action=ActionConfigFile, help="YAML settings file")
     parser.add_class_arguments(Settings, nested_key=None)

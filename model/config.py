@@ -1,6 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Architecture configuration of the multi-block recurrent transformer (the `crow-300m-final` code path only)."""
+"""
+Architecture configuration of the multi-block recurrent transformer (the `crow-300m-final` code path only).
+"""
 
 import json
 from dataclasses import asdict, dataclass, field, fields
@@ -13,7 +15,10 @@ from .layers.init import Init
 
 
 def find_multiple(value: int, multiple: int) -> int:
-    """Smallest multiple of `multiple` that is >= `value`."""
+    """
+    Smallest multiple of `multiple` that is >= `value`.
+    """
+
     if value % multiple == 0:
         return value
     return value + multiple - (value % multiple)
@@ -38,9 +43,12 @@ _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
 
 
 def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> list[int]:
-    """A per-block field as one entry per core block: an int (or a one-element list) is repeated for every block, a
+    """
+    A per-block field as one entry per core block: an int (or a one-element list) is repeated for every block, a
     longer list must already have one entry per block. `RecurrentConfig.__post_init__` and the HuggingFace config
-    (`model/hf/modeling.py`) both use this, so the int shorthand means the same in both."""
+    (`model/hf/modeling.py`) both use this, so the int shorthand means the same in both.
+    """
+
     if isinstance(value, int):
         values = [value]
     else:
@@ -54,7 +62,9 @@ def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> l
 
 @dataclass
 class RecurrentConfig:
-    """Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block."""
+    """
+    Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block.
+    """
 
     name: str = ""
     # Core
@@ -135,10 +145,13 @@ class RecurrentConfig:
         self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
 
     def _validate_recurrence(self) -> None:
-        """Reject values the sampler and the model would accept silently: a block without layers, a block that never
+        """
+        Reject values the sampler and the model would accept silently: a block without layers, a block that never
         gets gradient (`mean_backprop_depth` 0), a mean recurrence <= 0 (`log(0)` at the first forward), or a backprop
         depth above the mean recurrence (training would target `mean_backprop_depth` while eval and the init scaling
-        use `mean_recurrence`)."""
+        use `mean_recurrence`).
+        """
+
         if self.n_layers_in_prelude < 0 or self.n_layers_in_coda < 0:
             raise ValueError("n_layers_in_prelude and n_layers_in_coda must be >= 0")
         assert isinstance(self.n_layers_in_recurrent_block, list)
@@ -157,8 +170,11 @@ class RecurrentConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
-        """A config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
-        dataclass fields, nested settings as nested mappings) with keyword overrides applied on top."""
+        """
+        A config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
+        dataclass fields, nested settings as nested mappings) with keyword overrides applied on top.
+        """
+
         with open(path, encoding="utf-8") as yaml_file:
             loaded = yaml.safe_load(yaml_file)
         if not isinstance(loaded, dict):
@@ -186,7 +202,10 @@ class RecurrentConfig:
         return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
-        """Dataclass fields only (derived attributes and the `Init` object are recomputed on load)."""
+        """
+        Dataclass fields only (derived attributes and the `Init` object are recomputed on load).
+        """
+
         return asdict(self)
 
     def to_json(self, path: str | Path) -> None:

@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Batch collation in two halves: `collate_samples` tokenizes rows into unpadded samples (in the dataloader workers)
+"""
+Batch collation in two halves: `collate_samples` tokenizes rows into unpadded samples (in the dataloader workers)
 and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (in the main process).
 
 `collate_fn` composes the two for a padded loader (validation). The split lets `world_batch_micro_batches` group a
@@ -20,7 +21,8 @@ Batch = tuple[torch.Tensor, torch.Tensor, list[str]]  # a padded, shifted micro-
 
 
 class WorkerBatch(NamedTuple):
-    """What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus how
+    """
+    What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus how
     many rows were READ to produce them, dropped rows included.
 
     The count travels with the batch from the worker, so `BatchStream` counts consumed rows in the unit a resume
@@ -33,18 +35,23 @@ class WorkerBatch(NamedTuple):
 
 
 def find_multiple(value: int, multiple: int) -> int:
-    """Smallest multiple of ``multiple`` that is >= ``value``."""
+    """
+    Smallest multiple of multiple that is >= value.
+    """
+
     return value if value % multiple == 0 else value + multiple - (value % multiple)
 
 
 def shift_inputs_and_labels(
     inputs: torch.Tensor, labels: torch.Tensor, tokenizer: Tokenizer
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Next-token shift: inputs drop the last position, labels drop the first.
+    """
+    Next-token shift: inputs drop the last position, labels drop the first.
 
     Trailing pad ids in the inputs are replaced by EOS so they are valid embedding indices; the labels keep their
     pad ids so the caller can turn them into the ignore index.
     """
+
     seq_len = inputs.shape[1]
     input_ids = inputs[:, : seq_len - 1].contiguous().long()
     label_ids = labels[:, 1:seq_len].contiguous().long()
@@ -54,12 +61,14 @@ def shift_inputs_and_labels(
 
 
 def has_supervised_label(labels: torch.Tensor, tokenizer: Tokenizer) -> bool:
-    """Whether the shift of this unpadded ``labels`` row leaves a single position with a loss.
-
-    The shift drops ``labels[0]`` and the collation masks pad ids and out-of-vocab ids, so the row is trainable iff
-    some ``labels[1:]`` is a valid, non-pad id. False for a row that is one token long, for a row of pure padding
-    (unknown tokens) and for an instruct row whose masked prompt alone fills ``block_size + 1``.
     """
+    Whether the shift of this unpadded labels row leaves a single position with a loss.
+
+    The shift drops labels[0] and the collation masks pad ids and out-of-vocab ids, so the row is trainable iff
+    some labels[1:] is a valid, non-pad id. False for a row that is one token long, for a row of pure padding
+    (unknown tokens) and for an instruct row whose masked prompt alone fills block_size + 1.
+    """
+
     tail = labels[1:]
     if tail.numel() == 0:
         return False
@@ -74,12 +83,14 @@ def collate_samples(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> list[Sample]:
-    """Format and tokenize dataset rows into unpadded ``(input_ids, labels, data_id)`` samples.
+    """
+    Format and tokenize dataset rows into unpadded (input_ids, labels, data_id) samples.
 
-    Rows are truncated to ``block_size + 1`` tokens (the shift turns that into ``block_size`` positions); rows without
+    Rows are truncated to block_size + 1 tokens (the shift turns that into block_size positions); rows without
     a supervised label are DROPPED, never raised on: a `StopIteration` out of a collate function ends the worker or
     the epoch, so an unusable row must cost one row, not a loader.
     """
+
     max_tokens = block_size + 1
     samples: list[Sample] = []
     for row in batch:
@@ -97,8 +108,11 @@ def collate_worker_batch(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> WorkerBatch:
-    """`collate_samples` plus the count of rows that went in: the collate function of the training loaders.
-    ``rows_read`` advances by rows read from disk, dropped rows included, the unit a resume skips."""
+    """
+    `collate_samples` plus the count of rows that went in: the collate function of the training loaders.
+    rows_read advances by rows read from disk, dropped rows included, the unit a resume skips.
+    """
+
     return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), len(batch))
 
 
@@ -109,12 +123,14 @@ def pad_and_shift(
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
 ) -> Batch:
-    """Pad `samples` to one width and shift them into a ``(input_ids, labels, data_ids)`` micro-batch.
-
-    The width is the longest sample of THIS micro-batch, rounded up to ``padding_multiple`` and capped at
-    ``block_size + 1``; the shift then drops one position from it. Pad positions become EOS in the inputs and
-    ``ignore_index`` in the labels, as do labels outside the tokenizer's vocabulary.
     """
+    Pad `samples` to one width and shift them into a (input_ids, labels, data_ids) micro-batch.
+
+    The width is the longest sample of THIS micro-batch, rounded up to padding_multiple and capped at
+    block_size + 1; the shift then drops one position from it. Pad positions become EOS in the inputs and
+    ignore_index in the labels, as do labels outside the tokenizer's vocabulary.
+    """
+
     if not samples:
         raise ValueError("pad_and_shift needs at least one sample; empty micro-batches are never assembled")
     max_tokens = block_size + 1
@@ -143,8 +159,11 @@ def collate_fn(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> Batch:
-    """`collate_samples` followed by `pad_and_shift`: the collate function of the validation loaders. A batch in which
-    every row was dropped is an error (`block_size` too small for a validation batch is a configuration mistake)."""
+    """
+    `collate_samples` followed by `pad_and_shift`: the collate function of the validation loaders. A batch in which
+    every row was dropped is an error (`block_size` too small for a validation batch is a configuration mistake).
+    """
+
     samples = collate_samples(batch, tokenizer, block_size, add_bos, add_eos)
     if not samples:
         raise ValueError(

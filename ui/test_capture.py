@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the console capture both live dashboards install: the line sink (splitting, the re-entrancy guard that
+"""
+Tests for the console capture both live dashboards install: the line sink (splitting, the re-entrancy guard that
 breaks the logging recursion, `fileno`), the dashboard log handler (formatting, keeping, `handleError`), attaching a
-logger, the logger walk and the stream / logging captures."""
+logger, the logger walk and the stream / logging captures.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +33,9 @@ STDERR_LOGGER = f"{LOGGER_NAME}.stderr"
 
 
 class RecordingSink:
-    """A ``LogSink`` remembering what it was given."""
+    """
+    A LogSink remembering what it was given.
+    """
 
     def __init__(self) -> None:
         self.written: list[tuple[str, bool]] = []
@@ -44,14 +48,19 @@ class RecordingSink:
 
 
 class FailingStream(io.StringIO):
-    """A log file whose device is full: every write raises, as a ``FileHandler`` stream on ENOSPC would."""
+    """
+    A log file whose device is full: every write raises, as a FileHandler stream on ENOSPC would.
+    """
 
     def write(self, s: str, /) -> int:
         raise OSError(28, "No space left on device")
 
 
 def _redirected(capture: StreamCapture) -> bool:
-    """``capture.redirected`` through a call: mypy would otherwise keep the narrowing of an earlier assertion."""
+    """
+    capture.redirected through a call: mypy would otherwise keep the narrowing of an earlier assertion.
+    """
+
     return capture.redirected
 
 
@@ -64,10 +73,13 @@ def _record(name: str, level: int, message: str, **extra: object) -> logging.Log
 
 @pytest.fixture
 def isolated_logger() -> Iterator[logging.Logger]:
-    """A logger of its own, with the handlers a test added to it removed again afterwards.
+    """
+    A logger of its own, with the handlers a test added to it removed again afterwards.
 
-    ``propagate`` is left alone: pytest's own capture handler attaches itself to every *non*-propagating logger at
-    the start of every phase, which would show up in the handler lists these tests assert on."""
+    propagate is left alone: pytest's own capture handler attaches itself to every *non*-propagating logger at
+    the start of every phase, which would show up in the handler lists these tests assert on.
+    """
+
     logger = logging.getLogger(LOGGER_NAME)
     before, level = list(logger.handlers), logger.level
     logger.setLevel(logging.INFO)
@@ -95,7 +107,10 @@ def test_line_sink_splits_lines_and_flushes_the_rest() -> None:
 
 
 def test_line_sink_fileno_is_the_replaced_stream_s(tmp_path: Path) -> None:
-    """T-M11: a bare ``io.TextIOBase`` has no ``fileno()``, so ``sys.stdout.fileno()`` used to raise for a whole run."""
+    """
+    T-M11: a bare io.TextIOBase has no fileno(), so sys.stdout.fileno() used to raise for a whole run.
+    """
+
     with (tmp_path / "real").open("w", encoding="utf-8") as real:
         sink = LineSink(lambda _line: None, real_stream=real)
         assert sink.fileno() == real.fileno()
@@ -112,7 +127,10 @@ def test_line_sink_without_a_real_stream_reports_no_fileno(monkeypatch: pytest.M
 
 
 def test_line_sink_sends_a_re_entrant_write_to_the_real_stream() -> None:
-    """H9: a write caused by the sink's own emit must not be fed back in; that is the recursion bomb."""
+    """
+    H9: a write caused by the sink's own emit must not be fed back in; that is the recursion bomb.
+    """
+
     real = io.StringIO()
     lines: list[str] = []
 
@@ -132,7 +150,10 @@ def test_line_sink_sends_a_re_entrant_write_to_the_real_stream() -> None:
 
 
 def test_line_sink_guard_is_thread_local() -> None:
-    """The guard must not silence another thread's lines while one thread is inside its emit."""
+    """
+    The guard must not silence another thread's lines while one thread is inside its emit.
+    """
+
     real = io.StringIO()
     lines: list[str] = []
     inside = threading.Event()
@@ -157,10 +178,13 @@ def test_line_sink_guard_is_thread_local() -> None:
 
 
 def test_a_failing_log_handler_does_not_recurse_into_the_sink(isolated_logger: logging.Logger, tmp_path: Path) -> None:
-    """H9 end to end: the train.log handler on a full disk must not end the run with a ``RecursionError``.
+    """
+    H9 end to end: the train.log handler on a full disk must not end the run with a RecursionError.
 
-    ``logging.Handler.handleError`` writes its report to ``sys.stderr``, the sink, which logs it, which reaches
-    the same failing handler. The thread-local guard sends that second write to the real stream instead."""
+    logging.Handler.handleError writes its report to sys.stderr, the sink, which logs it, which reaches
+    the same failing handler. The thread-local guard sends that second write to the real stream instead.
+    """
+
     real_err = io.StringIO()
     file_handler = logging.StreamHandler(FailingStream())  # a `FileHandler` whose device filled up behaves like this
     isolated_logger.addHandler(file_handler)
@@ -199,7 +223,9 @@ def test_handler_skips_the_loggers_it_is_told_to() -> None:
 
 
 def test_handler_reports_a_broken_sink_on_the_saved_stderr_and_never_through_logging() -> None:
-    """The other end of H9: ``handleError`` must not write to ``sys.stderr`` (a sink while a display is up)."""
+    """
+    The other end of H9: handleError must not write to sys.stderr (a sink while a display is up).
+    """
 
     class BrokenSink:
         def write(self, text: str, *, keep: bool = False) -> None:
@@ -260,7 +286,10 @@ def test_existing_loggers_lists_the_root_logger_and_every_named_one() -> None:
 
 
 def test_existing_loggers_copies_the_dict_while_holding_the_logging_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """T-M16: wandb's background threads create loggers, so an unguarded walk can raise "dictionary changed size"."""
+    """
+    T-M16: wandb's background threads create loggers, so an unguarded walk can raise "dictionary changed size".
+    """
+
     locked = [False]
     held: list[bool] = []
     # the module lock helpers are private, so typeshed does not declare them; `existing_loggers` looks them up the same way

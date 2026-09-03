@@ -28,7 +28,10 @@ def pretrain_dir(tiny_pretrain_dir: Path) -> Path:
 
 @pytest.fixture
 def small_dir(tmp_path: Path) -> Path:
-    """Three parquet files with numbered rows, written in non-sorted order to check sorted-file iteration."""
+    """
+    Three parquet files with numbered rows, written in non-sorted order to check sorted-file iteration.
+    """
+
     d = tmp_path / "small"
     d.mkdir()
     for name, rows in [("b.parquet", range(10, 20)), ("a.parquet", range(10)), ("c.parquet", range(20, 23))]:
@@ -83,7 +86,10 @@ def test_shard_without_worker_info(small_dir: Path) -> None:
 
 
 def test_shard_combines_rank_and_worker(small_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """shard_id = rank * num_workers + worker_id over world * num_workers shards."""
+    """
+    shard_id = rank * num_workers + worker_id over world * num_workers shards.
+    """
+
     monkeypatch.setattr(datasets_module, "get_worker_info", lambda: SimpleNamespace(id=1, num_workers=2))
     assert ParquetTextDataset(small_dir, "p", shard=(1, 2))._shard() == (3, 4)
     monkeypatch.setattr(datasets_module, "get_worker_info", lambda: SimpleNamespace(id=0, num_workers=3))
@@ -100,7 +106,10 @@ def test_iter_respects_worker_shard(small_dir: Path, monkeypatch: pytest.MonkeyP
 def test_sharding_grid_world_and_workers(
     small_dir: Path, monkeypatch: pytest.MonkeyPatch, world: int, num_workers: int
 ) -> None:
-    """Every (rank, worker) shard gets exactly rows[shard_id::num_shards]; the shards tile all rows."""
+    """
+    Every (rank, worker) shard gets exactly rows[shard_id::num_shards]; the shards tile all rows.
+    """
+
     expected = _expected_rows(small_dir)
     seen: list[str] = []
     for rank in range(world):
@@ -117,7 +126,10 @@ def test_sharding_grid_world_and_workers(
 
 
 def test_sharding_counts_across_read_batches_and_files(small_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The global row index must not reset at parquet read-batch or file boundaries."""
+    """
+    The global row index must not reset at parquet read-batch or file boundaries.
+    """
+
     monkeypatch.setattr(datasets_module, "PARQUET_READ_BATCH_ROWS", 4)
     expected = _expected_rows(small_dir)
     for rank in range(3):
@@ -137,7 +149,10 @@ TOTAL = sum(SHARD_SIZES)
 
 @pytest.fixture
 def ranged_dir(tmp_path: Path) -> Path:
-    """Three unequal shards in the build's naming scheme; rows carry their directory index as unique text."""
+    """
+    Three unequal shards in the build's naming scheme; rows carry their directory index as unique text.
+    """
+
     d = tmp_path / "ranged"
     d.mkdir()
     first = 0
@@ -210,8 +225,11 @@ def test_negative_range_raises(ranged_dir: Path) -> None:
 def test_split_at_k_is_disjoint_and_complete(
     ranged_dir: Path, monkeypatch: pytest.MonkeyPatch, k: int, read_batch: int
 ) -> None:
-    """[0, k) as validation and [k, end) as training tile the directory, for k inside shards and on boundaries,
-    with read batches larger than the whole directory and smaller than a row group."""
+    """
+    [0, k) as validation and [k, end) as training tile the directory, for k inside shards and on boundaries,
+    with read batches larger than the whole directory and smaller than a row group.
+    """
+
     monkeypatch.setattr(datasets_module, "PARQUET_READ_BATCH_ROWS", read_batch)
     val = ParquetTextDataset(ranged_dir, "val", max_rows=k)
     train = ParquetTextDataset(ranged_dir, "train", skip_rows=k)
@@ -224,7 +242,10 @@ def test_split_at_k_is_disjoint_and_complete(
 def test_shards_partition_the_range_only(
     ranged_dir: Path, monkeypatch: pytest.MonkeyPatch, world: int, num_workers: int
 ) -> None:
-    """Shard `shard_id` takes range_rows[shard_id::num_shards]; shards tile the range and never leave it."""
+    """
+    Shard `shard_id` takes range_rows[shard_id::num_shards]; shards tile the range and never leave it.
+    """
+
     skip, max_rows = 5, 13
     expected = _docs(skip, skip + max_rows)
     seen: list[str] = []
@@ -263,8 +284,11 @@ def test_files_and_row_groups_outside_range_are_not_read(ranged_dir: Path, monke
 
 
 def test_range_length_is_the_epoch_and_a_mixture_reads_it_once(ranged_dir: Path) -> None:
-    """The class does not cycle itself: one __iter__ is one epoch over the range, and a WeightedMixtureDataset over
-    it ends with that epoch."""
+    """
+    The class does not cycle itself: one __iter__ is one epoch over the range, and a WeightedMixtureDataset over
+    it ends with that epoch.
+    """
+
     ds = ParquetTextDataset(ranged_dir, "p", skip_rows=6, max_rows=4)
     assert _texts(ds) == _texts(ds) == _docs(6, 10)
     mixture = WeightedMixtureDataset([ds], [1.0], seed=0)
@@ -276,7 +300,9 @@ def test_range_length_is_the_epoch_and_a_mixture_reads_it_once(ranged_dir: Path)
 
 
 class _Counting:
-    """Finite iterable of tagged items, counts how many times it was (re)started."""
+    """
+    Finite iterable of tagged items, counts how many times it was (re)started.
+    """
 
     def __init__(self, prefix: str, n: int) -> None:
         self.prefix, self.n, self.starts = prefix, n, 0
@@ -309,8 +335,11 @@ def test_mixture_frequencies_match_weights() -> None:
 
 
 def test_mixture_drops_exhausted_members_and_ends_with_the_last() -> None:
-    """An exhausted member leaves the draw (never restarted), the others carry on with renormalised weights, and
-    the mixture ends once every member is read: every item of every member exactly once, in the member's order."""
+    """
+    An exhausted member leaves the draw (never restarted), the others carry on with renormalised weights, and
+    the mixture ends once every member is read: every item of every member exactly once, in the member's order.
+    """
+
     a, b = _Counting("a", 4), _Counting("b", 1000)
     ds = WeightedMixtureDataset([a, b], [0.5, 0.5], seed=3)
     items = list(iter(ds))
@@ -378,8 +407,11 @@ def test_resume_offset_starts_the_next_epoch_inside_the_range(small_dir: Path) -
 
 
 def test_resume_offset_holds_until_it_is_set_back(small_dir: Path) -> None:
-    """The dataset keeps the offset for every epoch until it is set back to 0 (`RunDataloaders` does that before
-    the second epoch after a resume: a permanent offset would hide the rows before it)."""
+    """
+    The dataset keeps the offset for every epoch until it is set back to 0 (`RunDataloaders` does that before
+    the second epoch after a resume: a permanent offset would hide the rows before it).
+    """
+
     ds = ParquetTextDataset(small_dir, "small")
     ds.set_resume_offset(20)
     assert len(list(ds)) == 3 and ds.resume_offset == 20
@@ -395,14 +427,20 @@ def test_resume_offset_wraps_around_the_range(small_dir: Path) -> None:
 
 
 def test_resume_offset_applies_on_top_of_the_validation_split(small_dir: Path) -> None:
-    """`skip_rows` is the split, the resume offset is counted inside the resulting range."""
+    """
+    `skip_rows` is the split, the resume offset is counted inside the resulting range.
+    """
+
     ds = ParquetTextDataset(small_dir, "small", skip_rows=5, max_rows=10)
     ds.set_resume_offset(3)
     assert [r["text"] for r in ds] == [f"row {i}" for i in range(8, 15)]
 
 
 def test_resume_offset_is_shared_by_the_shards(small_dir: Path) -> None:
-    """The offset counts rows of the range, not of a shard, so the shards together still yield each row once."""
+    """
+    The offset counts rows of the range, not of a shard, so the shards together still yield each row once.
+    """
+
     rows: list[str] = []
     for rank in (0, 1):
         ds = ParquetTextDataset(small_dir, "small", shard=(rank, 2))

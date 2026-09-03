@@ -1,8 +1,10 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""How a core block is iterated: the `(n no-grad, k backprop)` depth sampler, the random latent state, one recurrence
+"""
+How a core block is iterated: the `(n no-grad, k backprop)` depth sampler, the random latent state, one recurrence
 iteration (adapter over `[latent, input]`, then the block's layers) and the iteration loop with optional activation
-checkpointing. `RecurrentGPT` (`model/model.py`) binds these to a model's `step`, mode, config and modules."""
+checkpointing. `RecurrentGPT` (`model/model.py`) binds these to a model's `step`, mode, config and modules.
+"""
 
 import math
 from functools import partial
@@ -24,7 +26,10 @@ _checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False,
 
 
 def canon_steps(steps: StepsSpec) -> StepsPair:
-    """Turn one `StepsSpec` into an (n, k) pair of plain ints; a missing k means 0."""
+    """
+    Turn one `StepsSpec` into an (n, k) pair of plain ints; a missing k means 0.
+    """
+
     if isinstance(steps, torch.Tensor):
         values = steps.detach().reshape(-1)
         num_steps_no_grad = int(values[0].item())
@@ -40,8 +45,11 @@ def canon_steps(steps: StepsSpec) -> StepsPair:
 
 
 def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair | None]:
-    """One entry per core block: None (sample per block), one (n_no_grad, k_with_grad) pair broadcast to all blocks,
-    or a list of pairs with one entry per block."""
+    """
+    One entry per core block: None (sample per block), one (n_no_grad, k_with_grad) pair broadcast to all blocks,
+    or a list of pairs with one entry per block.
+    """
+
     if num_steps is None:
         return [None] * num_blocks
     if isinstance(num_steps, list):
@@ -55,7 +63,10 @@ def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair 
 
 
 def initialize_state(x: Tensor) -> Tensor:
-    """`state_init=normal`: a standard-normal latent state of `x`'s shape, drawn from the global RNG."""
+    """
+    `state_init=normal`: a standard-normal latent state of `x`'s shape, drawn from the global RNG.
+    """
+
     return torch.randn_like(x)
 
 
@@ -63,10 +74,13 @@ def initialize_state(x: Tensor) -> Tensor:
 def sample_recurrence_steps(
     mean_recurrence: int, mean_backprop_depth: int, *, step: int, training: bool
 ) -> tuple[Tensor, Tensor]:
-    """Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by `step`; in eval
+    """
+    Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by `step`; in eval
     mode return (`mean_recurrence`, 0).
 
-    Outputs are long tensors so that they can be passed through compiled functions."""
+    Outputs are long tensors so that they can be passed through compiled functions.
+    """
+
     # One draw, two jobs: it detects meta-tensor tracing (flop counting) and advances the global RNG by one number.
     # The reference forward pass depends on that RNG consumption (right after `initialize_state`); never skip it.
     if torch.rand((1,)).is_meta:
@@ -104,7 +118,10 @@ def core_block_forward(
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
 ) -> Tensor:
-    """One recurrence iteration: inject the (normalised) block input into the latent state, then run the layers."""
+    """
+    One recurrence iteration: inject the (normalised) block input into the latent state, then run the layers.
+    """
+
     x_latent = adapter(torch.cat([x_latent, x_base], dim=-1))  # (B, S, 2 * E) -> (B, S, E)
     for layer in layers:
         x_latent = layer(x_latent, freqs_cis, mask)
@@ -124,8 +141,11 @@ def iterate_core_block(
     layers: torch.nn.ModuleList,
     gradient_checkpointing: bool,
 ) -> Tensor:
-    """Iterate `core_block_forward` first `num_steps_no_grad` times under `torch.no_grad`, then `num_steps_with_grad`
-    times with gradient (each of those activation-checkpointed when `gradient_checkpointing`)."""
+    """
+    Iterate `core_block_forward` first `num_steps_no_grad` times under `torch.no_grad`, then `num_steps_with_grad`
+    times with gradient (each of those activation-checkpointed when `gradient_checkpointing`).
+    """
+
     with torch.no_grad():
         for _ in range(num_steps_no_grad):
             x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers)

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The HuggingFace cache location, set from the CLI before any HF library is imported."""
+"""
+The HuggingFace cache location, set from the CLI before any HF library is imported.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +14,10 @@ log = get_logger(__name__)
 
 
 def configure_hf_cache(cache_dir: Path | None) -> None:
-    """Point every HuggingFace cache at ``cache_dir``; must run before ``datasets``/``transformers`` are imported."""
+    """
+    Point every HuggingFace cache at cache_dir; must run before datasets/transformers are imported.
+    """
+
     if cache_dir is None:
         return
     cache_dir = cache_dir.expanduser().resolve()

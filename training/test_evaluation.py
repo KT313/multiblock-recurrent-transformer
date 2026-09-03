@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `training.evaluation`: the per-depth validation loss (batch-major, averaged over the batches actually
-delivered), the empty-loader error and the evaluation-step rule."""
+"""
+Tests for `training.evaluation`: the per-depth validation loss (batch-major, averaged over the batches actually
+delivered), the empty-loader error and the evaluation-step rule.
+"""
 
 from typing import Any
 
@@ -36,7 +38,10 @@ def settings() -> Settings:
 
 
 def _batches(count: int) -> list[Batch]:
-    """`count` fixed validation micro-batches of two rows each."""
+    """
+    `count` fixed validation micro-batches of two rows each.
+    """
+
     return [(torch.randint(1, 512, (2, 16)), torch.randint(1, 512, (2, 16)), ["v", "v"]) for _ in range(count)]
 
 
@@ -84,9 +89,12 @@ def test_evaluate_reports_every_depth(
 def test_evaluate_averages_the_batches_actually_delivered(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """A validation loader shorter than `eval_iters` (the tiny config's finetune split is one micro-batch) is
+    """
+    A validation loader shorter than `eval_iters` (the tiny config's finetune split is one micro-batch) is
     averaged over the batches it delivered, not over the planned `eval_iters`; the bug this replaces divided by
-    `eval_iters` and reported a loss scaled down by the missing rows."""
+    `eval_iters` and reported a loss scaled down by the missing rows.
+    """
+
     settings.partial_depth_eval = [1]
     settings.eval_iters = 4
     torch.manual_seed(0)
@@ -110,7 +118,10 @@ def test_evaluate_averages_the_batches_actually_delivered(
 def test_evaluate_on_an_empty_loader_raises(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """No batch at all is an error naming the situation, never a NaN or a silent zero."""
+    """
+    No batch at all is an error naming the situation, never a NaN or a silent zero.
+    """
+
     settings.partial_depth_eval = [1]
     settings.eval_iters = 2
     with pytest.raises(RuntimeError, match="validation loader yielded no batch"):
@@ -121,8 +132,11 @@ def test_evaluate_on_an_empty_loader_raises(
 def test_evaluate_scores_every_depth_on_the_same_batches(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The paired comparison: the depths are compared on exactly the same batches, and every batch is taken from
-    the loader once (the recording loader hands out distinguishable batches)."""
+    """
+    The paired comparison: the depths are compared on exactly the same batches, and every batch is taken from
+    the loader once (the recording loader hands out distinguishable batches).
+    """
+
     settings.partial_depth_eval = [1, 3]
     settings.eval_iters = 3
     torch.manual_seed(0)
@@ -153,9 +167,12 @@ def test_evaluate_scores_every_depth_on_the_same_batches(
 def test_evaluate_iterates_the_loader_once(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """CHANGED (was one `iter()` per depth): the batch-major loop creates exactly ONE iterator per evaluation.
+    """
+    CHANGED (was one `iter()` per depth): the batch-major loop creates exactly ONE iterator per evaluation.
     Numerics: each `iter()` of a DataLoader draws a base seed from the global torch RNG, so the number of
-    iterations is part of the RNG stream (`training/golden_tiny_run.json` was re-recorded for it)."""
+    iterations is part of the RNG stream (`training/golden_tiny_run.json` was re-recorded for it).
+    """
+
     settings.partial_depth_eval = [1]
     settings.eval_iters = 1
     iterations = 0
@@ -173,7 +190,10 @@ def test_evaluate_iterates_the_loader_once(
 
 
 def test_is_evaluation_step_table(settings: Settings) -> None:
-    """Every `eval_step_interval` completed steps and after the last step (here a 20-step run, interval 8)."""
+    """
+    Every `eval_step_interval` completed steps and after the last step (here a 20-step run, interval 8).
+    """
+
     stage = resolved_stage("only", tokens=20 * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
     stage_manager = StageManager([stage], settings.world_batch_size, settings.block_size)
     assert stage_manager.total_steps == 20

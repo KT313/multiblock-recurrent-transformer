@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.row_pipeline: length filter batches, quality heuristics, contamination n-grams,
-instruct inversions and field checks."""
+"""
+Tests for data_preparation.lib.stages.row_pipeline: length filter batches, quality heuristics, contamination n-grams,
+instruct inversions and field checks.
+"""
 
 from typing import Any
 
@@ -67,7 +69,10 @@ def test_preprocess_batch_missing_text_field_raises() -> None:
 
 
 def _repetitive_trigrams() -> str:
-    """>20 words; bigram uniqueness 28/39 >= 0.7 but trigram uniqueness 28/38 < 0.8."""
+    """
+    >20 words; bigram uniqueness 28/39 >= 0.7 but trigram uniqueness 28/38 < 0.8.
+    """
+
     block = [f"b{i}" for i in range(12)]
     unique = [f"u{i}" for i in range(16)]
     words = block + block + unique

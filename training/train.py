@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Command line of a training run, the mirror of `data_preparation/prepare.py`.
+"""
+Command line of a training run, the mirror of `data_preparation/prepare.py`.
 
     python training/train.py --config config/crow_300m_final.yaml [--key value ...]
 
@@ -45,8 +46,10 @@ log = logging.getLogger(f"{TRAINING_LOGGER_NAME}.train")
 
 
 class StopRequest:
-    """The one stop request of a run (a `StopCheck`: calling it answers "stop?"). `train()` polls it after every
-    optimizer step, the in-process dataset build between shards."""
+    """
+    The one stop request of a run (a `StopCheck`: calling it answers "stop?"). `train()` polls it after every
+    optimizer step, the in-process dataset build between shards.
+    """
 
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -60,13 +63,15 @@ class StopRequest:
 
 @contextmanager
 def stop_on_interrupt() -> Iterator[StopRequest]:
-    """Install the Ctrl-C / SIGTERM handling of a run and yield its stop request; the previous handlers are put back
+    """
+    Install the Ctrl-C / SIGTERM handling of a run and yield its stop request; the previous handlers are put back
     on exit.
 
     The first signal sets the request, logs it and hands both signals back to their default handlers, so a second
     Ctrl-C raises `KeyboardInterrupt` as usual (and a second SIGTERM kills). Signal handlers can only be installed
     from the main thread; elsewhere the request is yielded unarmed.
     """
+
     request = StopRequest()
     if threading.current_thread() is not threading.main_thread():
         yield request
@@ -91,8 +96,11 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
 
 
 def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
-    """Attach one stderr handler each to the `training` and `data_preparation` logger hierarchies (same handler type
-    and line format); idempotent. Returns the `training` logger. The CLI's job: library code configures no logging."""
+    """
+    Attach one stderr handler each to the `training` and `data_preparation` logger hierarchies (same handler type
+    and line format); idempotent. Returns the `training` logger. The CLI's job: library code configures no logging.
+    """
+
     configure_logging(level)  # the `data_preparation` hierarchy: the resolver's status table, split and build lines
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     training_logger.setLevel(level)
@@ -108,7 +116,10 @@ def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse `argv` (default: the command line), run, print the report; returns the exit code (module docstring)."""
+    """
+    Parse `argv` (default: the command line), run, print the report; returns the exit code (module docstring).
+    """
+
     started_at = time.time()
     configure_console_logging()
     settings = parse_settings(argv)

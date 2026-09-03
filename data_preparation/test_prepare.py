@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.prepare: command registration and flags, exit codes (`status`, interrupt, unconfirmed
-raw deletion, failures), `describe` output, `prepare` options, tiny end to end."""
+"""
+Tests for data_preparation.prepare: command registration and flags, exit codes (`status`, interrupt, unconfirmed
+raw deletion, failures), `describe` output, `prepare` options, tiny end to end.
+"""
 
 from __future__ import annotations
 
@@ -28,10 +30,13 @@ TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 @pytest.fixture(autouse=True)
 def detached_data_preparation_handlers() -> Iterator[logging.Logger]:
-    """The `data_preparation` logger (yielded) without the handler `configure_logging` adds to it, removed again
+    """
+    The `data_preparation` logger (yielded) without the handler `configure_logging` adds to it, removed again
     afterwards, so a handler bound to a captured stderr never outlives its test (the dashboard tests would then log
     into a closed stream, and a failing handler used to take the whole run down with it). Autouse: every `main()`
-    call configures the hierarchy. The sibling of `training/test_train.py`'s fixture."""
+    call configures the hierarchy. The sibling of `training/test_train.py`'s fixture.
+    """
+
     logger = logging.getLogger("data_preparation")
     handlers_before, level = list(logger.handlers), logger.level
     yield logger

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the helpers of the dashboard tests."""
+"""
+Tests for the helpers of the dashboard tests.
+"""
 
 from __future__ import annotations
 

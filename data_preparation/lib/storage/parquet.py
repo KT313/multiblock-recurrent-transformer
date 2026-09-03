@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Parquet shard files: the ``data-NNNNN.parquet`` naming, listing, atomic publishing and the incremental writer."""
+"""
+Parquet shard files: the data-NNNNN.parquet naming, listing, atomic publishing and the incremental writer.
+"""
 
 from __future__ import annotations
 
@@ -20,27 +22,37 @@ SHARD_COMPRESSION: Literal["zstd"] = "zstd"  # every shard written from now on; 
 
 
 def list_parquet_files(directory: Path) -> list[Path]:
-    """Sorted ``*.parquet`` files inside ``directory`` (empty if the directory does not exist)."""
+    """
+    Sorted *.parquet files inside directory (empty if the directory does not exist).
+    """
+
     if not directory.is_dir():
         return []
     return sorted(directory.glob("*.parquet"))
 
 
 def shard_index(path: Path) -> int | None:
-    """Index ``n`` of a ``data-{n:05d}.parquet`` shard name, or None for other files."""
+    """
+    Index n of a data-{n:05d}.parquet shard name, or None for other files.
+    """
+
     match = SHARD_PATTERN.match(path.name)
     return int(match.group(1)) if match else None
 
 
 def shard_name(index: int) -> str:
-    """File name of shard ``index``: ``data-{index:05d}.parquet``."""
+    """
+    File name of shard index: data-{index:05d}.parquet.
+    """
+
     return f"data-{index:05d}.parquet"
 
 
 class ShardWriter:
-    """Writes dict rows as ``out_dir/data-NNNNN.parquet`` shards of ``shard_size`` rows. ``add(row)`` buffers rows and
-    publishes every full shard as soon as it is written (atomically, then ``on_shard(path)`` so the caller records it
-    in a manifest). Numbering starts at ``start_shard`` (append mode); stale shards ``>= start_shard`` in ``out_dir``
+    """
+    Writes dict rows as out_dir/data-NNNNN.parquet shards of shard_size rows. add(row) buffers rows and
+    publishes every full shard as soon as it is written (atomically, then on_shard(path) so the caller records it
+    in a manifest). Numbering starts at start_shard (append mode); stale shards >= start_shard in out_dir
     are removed on enter. An exception leaves the published shards in place and discards only the buffered partial
     shard: raw downloads are append-only, and losing a whole increment to a network error would throw away hours of
     transfer. Several writers (one per output directory) can be fed from one input stream.
@@ -80,7 +92,10 @@ class ShardWriter:
             self._buffer = []
 
     def write_shard(self, table: pa.Table) -> None:
-        """Publish ``table`` as the next shard (the caller sizes it), then the ``on_shard`` callback."""
+        """
+        Publish table as the next shard (the caller sizes it), then the on_shard callback.
+        """
+
         path = publish_shard(table, self.out_dir / shard_name(self.start_shard + self.shards_written))
         self.shards_written += 1
         self._on_shard(path)
@@ -94,7 +109,10 @@ class ShardWriter:
 
 
 def publish_shard(table: pa.Table, path: Path) -> Path:
-    """Write ``table`` to ``path`` atomically (:func:`write_atomically`) and return ``path``."""
+    """
+    Write table to path atomically (:func:`write_atomically`) and return path.
+    """
+
     with write_atomically(path) as tmp:
         pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
     return path

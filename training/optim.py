@@ -1,5 +1,6 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""The optimizer of the thesis runs, ELLISAdam (a port of the upstream implementation with its four options:
+"""
+The optimizer of the thesis runs, ELLISAdam (a port of the upstream implementation with its four options:
 `update_clipping`, `atan_adam`, `running_init`, `decouple_wd`), plus the parameter-group split.
 """
 
@@ -17,10 +18,12 @@ from training.settings import OptimizerConfig
 def get_param_groups(
     model: Module, weight_decay: float, no_wd_for_bias_and_norm: bool = True
 ) -> list[dict[str, Any]]:
-    """Split parameters into weights / embeddings / scale-and-norm groups, as upstream did.
+    """
+    Split parameters into weights / embeddings / scale-and-norm groups, as upstream did.
 
     Group order matters for checkpoints: 0 = matrices, 1 = embeddings (+ tied lm_head), 2 = norms and biases.
     """
+
     weights_group: list[Tensor] = []
     embedding_group: list[Tensor] = []
     scale_and_norm_group: list[Tensor] = []
@@ -51,11 +54,13 @@ ELLIS_ONLY_OPTIONS = ("update_clipping", "atan_adam", "running_init", "decouple_
 
 
 def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig) -> Optimizer:
-    """Construct "AdamW" (torch) or "ELLISAdam" from the run's `optim_config`.
+    """
+    Construct "AdamW" (torch) or "ELLISAdam" from the run's `optim_config`.
 
     `eps: None` is left out of the constructor call so each optimizer keeps its own default (ELLISAdam 1e-6,
     torch AdamW 1e-8), exactly as a config that never mentioned `eps` did.
     """
+
     common: dict[str, Any] = {"lr": config.lr, "betas": config.betas, "weight_decay": config.weight_decay}
     if config.eps is not None:
         common["eps"] = config.eps
@@ -78,14 +83,18 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:
-    """Apply the scheduled learning rate to every group, as a tensor (ELLISAdam stores its LR as a float32 tensor and
-    clones it in its step; torch AdamW accepts a tensor LR on CUDA too)."""
+    """
+    Apply the scheduled learning rate to every group, as a tensor (ELLISAdam stores its LR as a float32 tensor and
+    clones it in its step; torch AdamW accepts a tensor LR on CUDA too).
+    """
+
     for group in optimizer.param_groups:
         group["lr"] = torch.as_tensor(lr)
 
 
 class ELLISAdam(Optimizer):
-    """AdamW variant with optional RMS update clipping, atan2 update, running init and decoupled weight decay.
+    """
+    AdamW variant with optional RMS update clipping, atan2 update, running init and decoupled weight decay.
 
     `lr` is stored as a float32 tensor; `init_lr` (the constructor LR) is the reference for decoupled weight decay,
     i.e. the decay applied per step is `lr / init_lr * weight_decay`.
@@ -157,7 +166,10 @@ class ELLISAdam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
-        """Perform a single optimization step."""
+        """
+        Perform a single optimization step.
+        """
+
         loss: float | None = None
         if closure is not None:
             with torch.enable_grad():

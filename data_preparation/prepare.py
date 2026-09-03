@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Entry point for dataset preparation.
+"""
+Entry point for dataset preparation.
 
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--yes] [--dry_run]
@@ -9,17 +10,17 @@
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 
-``prepare`` materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
-(``lib/build/runner.py``). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
-manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; ``--yes`` answers it,
-and without a terminal the command prints the list and exits 2 with nothing changed. ``status`` prints what the
-repair step would do plus the status table and exits 0 iff the dataset is complete. ``describe`` renders the config
-as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir`` relocates the HuggingFace caches.
+prepare materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
+(lib/build/runner.py). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
+manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
+and without a terminal the command prints the list and exits 2 with nothing changed. status prints what the
+repair step would do plus the status table and exits 0 iff the dataset is complete. describe renders the config
+as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
-repair, 3 another data preparation is still running (``lib/build/lock.py``; the message names its pid and start
+repair, 3 another data preparation is still running (lib/build/lock.py; the message names its pid and start
 time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
-kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
+kept). On a terminal the run shows the live dashboard of lib/ui/dashboard.py; the log lines it kept (warnings,
 the tables) and the final status table are printed once it closed.
 """
 
@@ -93,7 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path | None) -> None:
-    """``--dataset_config`` (required unless ``config_default`` is given), ``--dataset_dir``, ``--cache_dir``."""
+    """
+    --dataset_config (required unless config_default is given), --dataset_dir, --cache_dir.
+    """
+
     sub.add_argument("--dataset_config", type=Path, default=config_default, required=config_default is None, help="dataset config YAML")
     sub.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR, help="root of all prepared data")
     sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
@@ -117,6 +121,7 @@ def run_prepare(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
+
     with DataDashboard(title=f"prepare {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
         log.info("preparing dataset config %s under %s", args.dataset_config, layout.root)
         report = prepare(
@@ -131,6 +136,7 @@ def run_prepare(args: argparse.Namespace) -> None:
             sources=args.sources,
             hf_token=args.hf_token,
         )
+
         partial = args.dry_run or args.sources is not None or args.steps is not None
         if partial:
             return  # the dataset is not expected to be complete after a partial run
@@ -154,12 +160,18 @@ def run_describe(args: argparse.Namespace) -> None:
 
 
 def _interrupt_on_sigterm(signum: int, frame: FrameType | None) -> None:
-    """``kill`` / a byte-capped run (``tools/capped_download.sh``) end like Ctrl-C: stop at the next shard, exit 130."""
+    """
+    kill / a byte-capped run (tools/capped_download.sh) end like Ctrl-C: stop at the next shard, exit 130.
+    """
+
     raise KeyboardInterrupt
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse ``argv`` (default ``sys.argv``), dispatch, and map failures to exit codes (module docstring)."""
+    """
+    Parse argv (default sys.argv), dispatch, and map failures to exit codes (module docstring).
+    """
+
     configure_logging()
     args = build_parser().parse_args(argv)
     if threading.current_thread() is threading.main_thread():

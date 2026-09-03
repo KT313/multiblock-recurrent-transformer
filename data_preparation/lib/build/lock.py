@@ -1,11 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""One run per program at a time: an advisory ``flock`` on a lock file held for the whole run.
+"""
+One run per program at a time: an advisory flock on a lock file held for the whole run.
 
-``<dataset_dir>/.build.lock`` guards a build (a second build, or a training run's auto-prepare, would otherwise
-interleave directory removals, shard writes and manifest saves); ``<out_dir>/.train.lock`` guards a training run.
+<dataset_dir>/.build.lock guards a build (a second build, or a training run's auto-prepare, would otherwise
+interleave directory removals, shard writes and manifest saves); <out_dir>/.train.lock guards a training run.
 The file records who holds it (program, pid, host, since) for the error message. The OS releases the lock when the
 holder dies, so a lock file is never stale; a run that lost its terminal and continues headless holds it until it
-finishes. ``status`` and ``--dry_run`` do not take it."""
+finishes. status and --dry_run do not take it.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +31,9 @@ TRAIN_LOCK_NAME = ".train.lock"
 
 @dataclass(frozen=True)
 class Holder:
-    """Who holds a lock, as recorded in the lock file."""
+    """
+    Who holds a lock, as recorded in the lock file.
+    """
 
     program: str
     pid: int
@@ -37,12 +41,17 @@ class Holder:
     since: str  # ISO 8601, UTC
 
     def started(self) -> str:
-        """``since`` in the local time zone (``2026-09-03 07:45:22 JST``)."""
+        """
+        since in the local time zone (2026-09-03 07:45:22 JST).
+        """
+
         return datetime.fromisoformat(self.since).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 class RunLocked(RuntimeError):
-    """Another process holds the lock: a run of the same program, or of the build a training run needs, is going."""
+    """
+    Another process holds the lock: a run of the same program, or of the build a training run needs, is going.
+    """
 
     def __init__(self, path: Path, program: str, holder: Holder | None) -> None:
         self.path = path
@@ -60,7 +69,10 @@ class RunLocked(RuntimeError):
 
 @contextmanager
 def run_lock(path: Path, program: str) -> Iterator[None]:
-    """Hold ``path`` exclusively for the block as ``program``; :class:`RunLocked` (naming the holder) if it is taken."""
+    """
+    Hold path exclusively for the block as program; :class:`RunLocked` (naming the holder) if it is taken.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -81,7 +93,10 @@ def run_lock(path: Path, program: str) -> Iterator[None]:
 
 
 def build_lock(root: Path) -> AbstractContextManager[None]:
-    """The build lock of the dataset directory ``root`` (``root/.build.lock``)."""
+    """
+    The build lock of the dataset directory root (root/.build.lock).
+    """
+
     return run_lock(root / BUILD_LOCK_NAME, "data preparation")
 
 

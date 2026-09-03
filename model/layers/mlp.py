@@ -1,6 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Gated (SwiGLU) MLP with a fused gate/up projection."""
+"""
+Gated (SwiGLU) MLP with a fused gate/up projection.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +18,9 @@ if TYPE_CHECKING:
 
 
 class GatedMLP(torch.nn.Module):
-    """`proj(silu(gate(x)) * up(x))`; `fc` computes gate and up in one matmul (gate = first half of its rows)."""
+    """
+    `proj(silu(gate(x)) * up(x))`; `fc` computes gate and up in one matmul (gate = first half of its rows).
+    """
 
     def __init__(self, config: RecurrentConfig) -> None:
         super().__init__()

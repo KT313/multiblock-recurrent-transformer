@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""How layers form a transformer block (`sandwich`) and how a core block is iterated (`recurrence`)."""
+"""
+How layers form a transformer block (`sandwich`) and how a core block is iterated (`recurrence`).
+"""
 
 from .recurrence import (
     NumSteps,

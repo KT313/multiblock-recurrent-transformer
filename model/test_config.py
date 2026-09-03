@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.config`: per-block broadcasting, derived sizes, the shipped architecture YAMLs and the JSON
-round trip. `tiny_config` / `TINY_ARCHITECTURE` are the shared helpers of the other `model/test_*.py` files."""
+"""
+Tests for `model.config`: per-block broadcasting, derived sizes, the shipped architecture YAMLs and the JSON
+round trip. `tiny_config` / `TINY_ARCHITECTURE` are the shared helpers of the other `model/test_*.py` files.
+"""
 
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,10 @@ CROW_ARCHITECTURE = ARCHITECTURE_DIR / "crow_300m_final.yaml"
 
 
 def tiny_config(**overrides: Any) -> RecurrentConfig:
-    """`config/model_architecture/tiny.yaml` with overrides applied (the test-suite model)."""
+    """
+    `config/model_architecture/tiny.yaml` with overrides applied (the test-suite model).
+    """
+
     return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **overrides)
 
 
@@ -140,7 +145,10 @@ def test_tiny_architecture_yaml() -> None:
 
 
 def test_architecture_yamls_list_every_tunable_field() -> None:
-    """Both files list the same keys: every dataclass field except the fixed single-value ones."""
+    """
+    Both files list the same keys: every dataclass field except the fixed single-value ones.
+    """
+
     import yaml
 
     fixed = {
@@ -263,7 +271,10 @@ def test_invalid_single_value_fields_rejected(field: str, value: object) -> None
     ],
 )
 def test_degenerate_recurrence_values_are_rejected_at_config_time(overrides: dict[str, object], match: str) -> None:
-    """These used to pass validation and fail (or silently train without gradient) at the first forward."""
+    """
+    These used to pass validation and fail (or silently train without gradient) at the first forward.
+    """
+
     with pytest.raises(ValueError, match=match):
         tiny(**overrides)
 

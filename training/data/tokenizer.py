@@ -1,6 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Thin wrapper around a HuggingFace fast tokenizer directory (``tokenizer.json`` + ``tokenizer_config.json``)."""
+"""
+Thin wrapper around a HuggingFace fast tokenizer directory (tokenizer.json + tokenizer_config.json).
+"""
 
 import logging
 from pathlib import Path
@@ -13,12 +15,14 @@ _PAD_ID_FALLBACKS = ("pad_token_id", "unk_token_id", "eos_token_id")
 
 
 def resolve_pad_id(processor: object, path: Path) -> int:
-    """The id used for padding and for masking labels.
+    """
+    The id used for padding and for masking labels.
 
     Tokenizers without a pad token (the Llama tokenizer) fall back to the unk token (Llama's `<unk>`, id 0), then to
     EOS. Pad positions in the inputs are replaced by EOS in the collate function anyway; in the labels they become
     the ignore index.
     """
+
     for attribute in _PAD_ID_FALLBACKS:
         token_id = cast(int | None, getattr(processor, attribute, None))
         if token_id is None:
@@ -32,7 +36,8 @@ def resolve_pad_id(processor: object, path: Path) -> int:
 
 
 class Tokenizer:
-    """Loads a HF tokenizer directory and encodes text without automatic special tokens.
+    """
+    Loads a HF tokenizer directory and encodes text without automatic special tokens.
 
     BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them.
     """
@@ -50,18 +55,27 @@ class Tokenizer:
 
     @property
     def vocab_size(self) -> int:
-        """Size of the base vocabulary (without added tokens), used to mask out-of-range labels."""
+        """
+        Size of the base vocabulary (without added tokens), used to mask out-of-range labels.
+        """
+
         return self.processor.vocab_size
 
     def __len__(self) -> int:
         return len(self.processor)
 
     def __reduce__(self) -> tuple[type["Tokenizer"], tuple[Path]]:
-        """Pickle as (class, (path,)) so worker processes reload the tokenizer from disk instead of copying it."""
+        """
+        Pickle as (class, (path,)) so worker processes reload the tokenizer from disk instead of copying it.
+        """
+
         return (self.__class__, (self.path,))
 
     def encode(self, text: str, bos: bool = False, eos: bool = False) -> list[int]:
-        """Tokenize ``text``; prepend BOS / append EOS when requested and the tokenizer defines them."""
+        """
+        Tokenize text; prepend BOS / append EOS when requested and the tokenizer defines them.
+        """
+
         tokens: list[int] = self.processor.encode(text)
         if bos and self.bos_id is not None:
             tokens = [self.bos_id] + tokens

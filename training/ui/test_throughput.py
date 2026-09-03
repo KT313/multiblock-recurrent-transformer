@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the smoothed steps-per-second estimate and the ETA."""
+"""
+Tests for the smoothed steps-per-second estimate and the ETA.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +33,10 @@ def test_throughput_eta_arithmetic(clock: FakeClock) -> None:
 
 
 def test_throughput_forgets_the_first_interval(clock: FakeClock) -> None:
-    """The first interval holds the compile and the loader start-up; the ETA must not carry it for dozens of steps."""
+    """
+    The first interval holds the compile and the loader start-up; the ETA must not carry it for dozens of steps.
+    """
+
     throughput = Throughput(1000, clock=clock)
     clock.advance(60)
     throughput.record(1)  # 60 s: the compile step

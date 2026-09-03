@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the single-device backend: device pick, autocast, clipping, checkpoint round trip, no-op collectives,
-RNG state round trip, device transfer and pin_memory."""
+"""
+Tests for the single-device backend: device pick, autocast, clipping, checkpoint round trip, no-op collectives,
+RNG state round trip, device transfer and pin_memory.
+"""
 
 import random
 import warnings
@@ -98,7 +100,10 @@ def test_setup_model_moves_and_returns_module() -> None:
 
 
 def test_setup_model_compile_wraps_the_module(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`compile_model=True` goes through `torch.compile(model, dynamic=True)`; stubbed so the test stays fast."""
+    """
+    `compile_model=True` goes through `torch.compile(model, dynamic=True)`; stubbed so the test stays fast.
+    """
+
     calls: list[tuple[torch.nn.Module, bool]] = []
 
     def fake_compile(model: torch.nn.Module, dynamic: bool = False) -> torch.nn.Module:
@@ -183,7 +188,10 @@ def test_rng_state_round_trip(tmp_path: Path) -> None:
 
 
 def test_set_rng_state_without_cuda_entry() -> None:
-    """A state written on a CPU-only machine (no "cuda" key) restores the python and torch generators."""
+    """
+    A state written on a CPU-only machine (no "cuda" key) restores the python and torch generators.
+    """
+
     backend = SingleDeviceBackend(device="cpu", precision="32")
     torch.manual_seed(1)
     random.seed(1)
@@ -194,7 +202,10 @@ def test_set_rng_state_without_cuda_entry() -> None:
 
 
 def test_rng_state_of_a_cpu_backend_never_touches_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A CPU backend neither stores CUDA generator state nor consults a "cuda" entry it is handed."""
+    """
+    A CPU backend neither stores CUDA generator state nor consults a "cuda" entry it is handed.
+    """
+
     backend = SingleDeviceBackend(device="cpu", precision="32")
     monkeypatch.setattr(torch.cuda, "get_rng_state", lambda *_: pytest.fail("CUDA generator read by a CPU backend"))
     monkeypatch.setattr(torch.cuda, "set_rng_state", lambda *_: pytest.fail("CUDA generator set by a CPU backend"))
@@ -209,9 +220,12 @@ def test_rng_state_of_a_cpu_backend_never_touches_cuda(monkeypatch: pytest.Monke
 
 @pytest.mark.gpu
 def test_rng_state_of_a_cuda_backend_holds_its_own_device_only() -> None:
-    """The **restore** is what is measured: capture, draw, let the generator move on, restore, draw again. With no
+    """
+    The restore is what is measured: capture, draw, let the generator move on, restore, draw again. With no
     reseeding in between, only `set_rng_state` can make the second draw repeat the first (the old version reseeded
-    before each draw and passed with the restore stubbed out)."""
+    before each draw and passed with the restore stubbed out).
+    """
+
     backend = SingleDeviceBackend(device="cuda:0", precision="32")
     torch.cuda.manual_seed(9)
     state = backend.rng_state()
@@ -223,7 +237,10 @@ def test_rng_state_of_a_cuda_backend_holds_its_own_device_only() -> None:
 
 
 def test_save_checkpoint_is_atomic_and_leaves_no_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The final name appears only after a complete write; a failing save leaves neither a partial file nor a .tmp."""
+    """
+    The final name appears only after a complete write; a failing save leaves neither a partial file nor a .tmp.
+    """
+
     backend = SingleDeviceBackend(device="cpu", precision="32")
     path = tmp_path / "ckpt" / "step.pth"
     backend.save_checkpoint(path, {"a": torch.ones(2)})

@@ -1,8 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `prepare` / `status`: tiny end to end and idempotent, the download + build rounds, step and source
+"""
+Tests for `prepare` / `status`: tiny end to end and idempotent, the download + build rounds, step and source
 filters, builds overlapping the downloads (a source built as soon as its own download finished, never before),
 failure and interrupt handling across both pools, the lock, dry runs, the raw-deletion confirmation, parallel ==
-sequential, `github_code` groups, repair of broken folders."""
+sequential, `github_code` groups, repair of broken folders.
+"""
 
 from __future__ import annotations
 
@@ -43,7 +45,10 @@ TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 
 def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
-    """`{file: mtime_ns}` of every file under `root` (the lock file is rewritten by every `prepare`)."""
+    """
+    `{file: mtime_ns}` of every file under `root` (the lock file is rewritten by every `prepare`).
+    """
+
     return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file() and (include_lock or p.name != ".build.lock")}
 
 
@@ -97,8 +102,11 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
 def test_a_download_that_falls_short_gets_a_second_round(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A loader that returns fewer rows than asked (without being exhausted) leaves the source short after round 1;
-    round 2 plans the difference and tops it up."""
+    """
+    A loader that returns fewer rows than asked (without being exhausted) leaves the source short after round 1;
+    round 2 plans the difference and tops it up.
+    """
+
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     calls: list[int] = []
 
@@ -142,12 +150,15 @@ def test_a_source_still_short_after_max_rounds_is_reported(
 def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The 20 % safety margin does not always cover what the build drops: here four of every five rows are exact
+    """
+    The 20 % safety margin does not always cover what the build drops: here four of every five rows are exact
     duplicates. Round 1 downloads `rows_needed` raw rows and lands far short of `rows_sufficient` processed ones;
     the next rounds see that raw is long enough but *processed* is not and top the source up from the yield it
     showed. No round asks for more than the full requirement (`_top_up_rows` caps it, so one bad yield
     measurement cannot ask the loader for billions of rows). Before the ledger the plan only looked at raw rows: it
-    planned nothing, the round loop gave up, and `prepare` failed with no way to make progress (open finding H5)."""
+    planned nothing, the round loop gave up, and `prepare` failed with no way to make progress (open finding H5).
+    """
+
     src_dir = layout.root.parent / "dupes"
     rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
     write_local(src_dir, rows, "parquet")
@@ -169,10 +180,13 @@ def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
 def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
+    """
+    A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
     with an empty processed folder. That used to count as satisfied: `prepare` and `status` said "dataset complete",
     exit 0, and the training run failed much later (open finding H2). A failed source is a failed build, so it
-    is now unsatisfied with a reason that names the likely mistake."""
+    is now unsatisfied with a reason that names the likely mistake.
+    """
+
     src_dir = layout.root.parent / "wrong_fields"
     write_local(src_dir, [{"question": f"q{i}", "answer": f"a{i}"} for i in range(20)], "jsonl")
     source = SourceConfig(kind="instruct", loader="local", path=str(src_dir), fields={"instruction": "prompt", "output": "completion"})
@@ -238,8 +252,11 @@ def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_f
 
 
 def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`--sources a a` would otherwise inspect `a` twice: the repair step would list it twice and delete the same
-    folder twice (the second `rmtree` on a directory that is gone). The selection is in config order."""
+    """
+    `--sources a a` would otherwise inspect `a` twice: the repair step would list it twice and delete the same
+    folder twice (the second `rmtree` on a directory that is gone). The selection is in config order.
+    """
+
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
     cfg = cfg_factory(sources, tokens=500)
     assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["a", "b"] and runner.checked_sources(cfg, None) is None
@@ -256,7 +273,10 @@ def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: Dat
 def test_failing_download_stops_the_other_downloads_within_a_shard_and_is_reraised(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The other downloads stop at their next shard; a download that stopped is never followed by its build."""
+    """
+    The other downloads stop at their next shard; a download that stopped is never followed by its build.
+    """
+
     ticks: dict[str, int] = {}
 
     def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
@@ -300,8 +320,10 @@ def test_jobs_not_started_yet_are_cancelled_after_a_failure(
 def test_the_original_error_wins_over_jobs_that_merely_stopped(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Jobs that stop because of the failure may finish before the failing one; the failure itself is raised,
-    never `BuildAborted`."""
+    """
+    Jobs that stop because of the failure may finish before the failing one; the failure itself is raised,
+    never `BuildAborted`.
+    """
 
     def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
         if name == "s0":
@@ -327,8 +349,11 @@ def test_the_original_error_wins_over_jobs_that_merely_stopped(
 def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_shards(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Ctrl-C while `wait_for_jobs` waits: the flag reaches the running download through `should_stop`, it stops at
-    its next shard (published), `prepare` raises `BuildAborted` and the next run resumes."""
+    """
+    Ctrl-C while `wait_for_jobs` waits: the flag reaches the running download through `should_stop`, it stops at
+    its next shard (published), `prepare` raises `BuildAborted` and the next run resumes.
+    """
+
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     shards_done: list[int] = []
 
@@ -367,8 +392,11 @@ def test_an_outer_should_stop_is_honoured(cfg_factory: CfgFactory, layout: Datas
 
 
 def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() -> None:
-    """H6: an exception in the main-thread `on_success` follow-up must stop the pools like a job failure would;
-    otherwise the pool exits block on downloads polling a flag nobody raised."""
+    """
+    H6: an exception in the main-thread `on_success` follow-up must stop the pools like a job failure would;
+    otherwise the pool exits block on downloads polling a flag nobody raised.
+    """
+
     flag = runner.StopFlag()
     ran: list[str] = []
 
@@ -400,7 +428,9 @@ def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: 
 
 
 class _Events:
-    """A thread-safe ordered log of `(what, name)` events from the stubs of a test."""
+    """
+    A thread-safe ordered log of `(what, name)` events from the stubs of a test.
+    """
 
     def __init__(self) -> None:
         self.items: list[tuple[str, str]] = []
@@ -415,7 +445,10 @@ class _Events:
 
 
 def _wait_for(event: threading.Event, should_stop: Any, what: str, timeout: float = 10.0) -> None:
-    """Block a stub until `event` is set, honouring the stop request; a `TimeoutError` instead of a hanging test."""
+    """
+    Block a stub until `event` is set, honouring the stop request; a `TimeoutError` instead of a hanging test.
+    """
+
     deadline = time.monotonic() + timeout
     while not event.wait(0.02):
         check_stop(should_stop)
@@ -426,7 +459,10 @@ def _wait_for(event: threading.Event, should_stop: Any, what: str, timeout: floa
 def test_a_source_is_built_while_other_downloads_still_run(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """s1's download does not return before s0 has been built: the build pool works while the download pool runs."""
+    """
+    s1's download does not return before s0 has been built: the build pool works while the download pool runs.
+    """
+
     events = _Events()
     s0_built = threading.Event()
 
@@ -502,7 +538,10 @@ def test_github_code_group_members_are_built_after_the_group_pass(
 def test_a_failing_build_stops_the_running_downloads(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The mirror image of the failing-download test: one stop flag for both pools."""
+    """
+    The mirror image of the failing-download test: one stop flag for both pools.
+    """
+
     ticks: dict[str, int] = {}
     lock = threading.Lock()
 
@@ -531,7 +570,10 @@ def test_a_failing_build_stops_the_running_downloads(
 def test_no_build_is_submitted_after_a_failure(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A download that completes after another job failed (it did not poll the flag) is not followed by its build."""
+    """
+    A download that completes after another job failed (it did not poll the flag) is not followed by its build.
+    """
+
     started: list[str] = []
 
     def download_stub(config: DatasetConfig, name: str, *args: Any, should_stop: Any = None, **kwargs: Any) -> Manifest:
@@ -556,8 +598,11 @@ def test_no_build_is_submitted_after_a_failure(
 def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resumes(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Ctrl-C while a build (s0) and a download (s1) run side by side: both stop at their next shard, everything
-    published is kept, `prepare` raises `BuildAborted`; the next run resumes both."""
+    """
+    Ctrl-C while a build (s0) and a download (s1) run side by side: both stop at their next shard, everything
+    published is kept, `prepare` raises `BuildAborted`; the next run resumes both.
+    """
+
     cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500)
     build_started = threading.Event()
     ticks: dict[str, int] = {}
@@ -696,8 +741,11 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
 def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Neither entry point changes the tree here, so they must not judge it differently: both end with the same
-    assessment, counting the repairs the run left undone (all of them in a dry run) as incomplete."""
+    """
+    Neither entry point changes the tree here, so they must not judge it differently: both end with the same
+    assessment, counting the repairs the run left undone (all of them in a dry run) as incomplete.
+    """
+
     path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
     assert prepare(path, layout.root, assume_yes=False).complete
     next(layout.processed_dir("p").glob("data-*.parquet")).unlink()  # broken: the repair step would delete the folder
@@ -730,7 +778,10 @@ def test_status_is_read_only_and_reports_would_repair(cfg_factory: CfgFactory, l
 
 
 def test_parallel_prepare_equals_sequential_prepare(cfg_factory: CfgFactory, config_file: ConfigFile, tmp_path: Path) -> None:
-    """The rows a source ends up with depend only on its own loader order, not on the interleaving."""
+    """
+    The rows a source ends up with depend only on its own loader order, not on the interleaving.
+    """
+
     path = config_file(_three_sources(cfg_factory))
     sequential, parallel = tmp_path / "sequential", tmp_path / "parallel"
     assert prepare(path, sequential, assume_yes=False, num_workers=1, max_parallel_downloads=1).complete
@@ -807,7 +858,10 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
 
 
 def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them."""
+    """
+    The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them.
+    """
+
     cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw_dir, processed_dir = layout.raw_dir("p"), layout.processed_dir("p")
@@ -872,9 +926,12 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
 def test_prepare_logs_the_stop_reason_of_a_slow_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failing build stops the other running builds at their next shard (the build pool has the download pool's
+    """
+    A failing build stops the other running builds at their next shard (the build pool has the download pool's
     stop semantics). s1 explodes only once s0 and s2 are building: builds start as their downloads finish, so
-    without the gate s2 might still be downloading and be stopped there instead."""
+    without the gate s2 might still be downloading and be stopped there instead.
+    """
+
     ticks: dict[str, int] = {}
     lock = threading.Lock()
     others_building = threading.Event()

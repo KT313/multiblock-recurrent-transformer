@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.sources: loaders honour offset/count/order against stubbed `datasets`, local
+"""
+Tests for data_preparation.lib.sources: loaders honour offset/count/order against stubbed `datasets`, local
 files, synthetic determinism, every converter/filter on hand-written rows, and that every name used by the shipped
-dataset configs is registered. Offline, CPU, fast."""
+dataset configs is registered. Offline, CPU, fast.
+"""
 
 from __future__ import annotations
 
@@ -40,7 +42,9 @@ CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config
 
 
 class FakeStream:
-    """Minimal stand-in for an IterableDataset: iteration + `.skip()`; records how far it was consumed."""
+    """
+    Minimal stand-in for an IterableDataset: iteration + `.skip()`; records how far it was consumed.
+    """
 
     def __init__(self, rows: list[Row]) -> None:
         self.rows = rows
@@ -57,7 +61,9 @@ class FakeStream:
 
 
 class FakeDatasets:
-    """Fake `datasets.load_dataset`: serves `rows` in order, applies `split` slicing, records the call kwargs."""
+    """
+    Fake `datasets.load_dataset`: serves `rows` in order, applies `split` slicing, records the call kwargs.
+    """
 
     def __init__(self, rows: list[Row]) -> None:
         self.rows = rows
@@ -166,8 +172,11 @@ def test_local_reads_parquet_and_jsonl_in_sorted_order(tmp_path: Path) -> None:
 
 
 def test_local_projects_jsonl_and_parquet_to_the_requested_columns(tmp_path: Path) -> None:
-    """`local` goes through the shared reading contract: `columns` projects both formats (a `.jsonl` row's surplus
-    column is dropped, a requested column a row lacks stays absent), None keeps every column."""
+    """
+    `local` goes through the shared reading contract: `columns` projects both formats (a `.jsonl` row's surplus
+    column is dropped, a requested column a row lacks stays absent), None keeps every column.
+    """
+
     pq.write_table(pa.table({"text": ["b0"], "extra": [1]}), tmp_path / "b.parquet")
     (tmp_path / "a.jsonl").write_text(json.dumps({"text": "a0", "extra": 0}) + "\n")
     source = _src(loader="local", path=str(tmp_path), hf_id=None, revision=None)
@@ -322,7 +331,10 @@ def _sharegpt(human: str, gpt: str, first: str = "human", second: str = "gpt") -
 
 
 def test_converters_turn_null_values_into_empty_fields_not_the_string_none() -> None:
-    """A null turn / column must become an empty field (dropped at build), never the text "None" trained on."""
+    """
+    A null turn / column must become an empty field (dropped at build), never the text "None" trained on.
+    """
+
     conversation = {"conversations": [{"from": "human", "value": None}, {"from": "gpt", "value": "x"}]}
     assert sharegpt_conversations(conversation) == {"instruction": "", "input": "", "output": "x"}
     assert first_two_turns({"conversations": [{"value": None}, {"value": "y"}]}) == {"instruction": "", "input": "", "output": "y"}

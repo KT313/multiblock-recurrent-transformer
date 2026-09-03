@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Area fixtures for data_preparation: keep the `datasets` cache out of the user's home and offline; builders for
-small dataset configs over `synthetic` / `local` sources used by the stage and planner tests."""
+"""
+Area fixtures for data_preparation: keep the `datasets` cache out of the user's home and offline; builders for
+small dataset configs over `synthetic` / `local` sources used by the stage and planner tests.
+"""
 
 from __future__ import annotations
 
@@ -51,7 +53,9 @@ REV = "abc"
 
 
 class RecordingFile(io.FileIO):
-    """A local file that records the byte range of every read (stand-in for the remote fsspec file object)."""
+    """
+    A local file that records the byte range of every read (stand-in for the remote fsspec file object).
+    """
 
     def __init__(self, path: Path) -> None:
         super().__init__(path, "rb")
@@ -71,8 +75,10 @@ class RecordingFile(io.FileIO):
 
 
 class FakeHub:
-    """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings. `sha` is the
-    commit hash `REV` currently resolves to; a test moves the repo by assigning a new value."""
+    """
+    Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings. `sha` is the
+    commit hash `REV` currently resolves to; a test moves the repo by assigning a new value.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -145,7 +151,10 @@ def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHub:
 
 @pytest.fixture
 def hf_datasets() -> Iterator[ModuleType]:
-    """The `datasets` module with caching disabled (map/filter results stay in temp files)."""
+    """
+    The `datasets` module with caching disabled (map/filter results stay in temp files).
+    """
+
     datasets = pytest.importorskip("datasets")
     datasets.disable_caching()
     datasets.utils.logging.set_verbosity_error()
@@ -164,7 +173,8 @@ TEST_BLOOM_MEMORY_MB = 1  # the dedup filter of every test config (the default 1
 
 @pytest.fixture
 def cfg_factory() -> CfgFactory:
-    """`make(sources, processing=..., token_count=..., max_seq_length=..., block_size=..., tokens=...)` -> DatasetConfig.
+    """
+    `make(sources, processing=..., token_count=..., max_seq_length=..., block_size=..., tokens=...)` -> DatasetConfig.
 
     A `pretrain` stage trains on every pretrain source without `rows` (equal weights) and a `finetune` stage on
     every instruct source without `rows`; a source with `rows` is used only for validation (in the stage of its
@@ -225,7 +235,9 @@ def cfg_factory() -> CfgFactory:
 
 @pytest.fixture
 def write_local() -> Callable[[Path, list[Row], str], Path]:
-    """`write_local(directory, rows, fmt)` writes one parquet (or jsonl) file of dict rows for the `local` loader."""
+    """
+    `write_local(directory, rows, fmt)` writes one parquet (or jsonl) file of dict rows for the `local` loader.
+    """
 
     def write(directory: Path, rows: list[Row], fmt: str = "parquet") -> Path:
         directory.mkdir(parents=True, exist_ok=True)
@@ -245,7 +257,9 @@ def write_local() -> Callable[[Path, list[Row], str], Path]:
 
 @pytest.fixture
 def mtimes() -> Callable[[Path], dict[str, int]]:
-    """`{file name: mtime_ns}` of every parquet shard in a directory (to prove a stage did not rewrite them)."""
+    """
+    `{file name: mtime_ns}` of every parquet shard in a directory (to prove a stage did not rewrite them).
+    """
 
     def collect(directory: Path) -> dict[str, int]:
         return {p.name: p.stat().st_mtime_ns for p in sorted(directory.glob("*.parquet"))}
@@ -255,7 +269,9 @@ def mtimes() -> Callable[[Path], dict[str, int]]:
 
 @pytest.fixture
 def read_rows() -> Callable[[Path], list[Row]]:
-    """All rows of the `data-*.parquet` shards of a directory, in shard order."""
+    """
+    All rows of the `data-*.parquet` shards of a directory, in shard order.
+    """
 
     def read(directory: Path) -> list[Row]:
         rows: list[Row] = []
@@ -267,8 +283,11 @@ def read_rows() -> Callable[[Path], list[Row]]:
 
 
 def truncate_to_good_prefix(folder: RawFolder) -> bool:
-    """The repair step's truncation as one call: True when the folder verifies (nothing dropped) or was truncated
-    to its good prefix, False when no prefix can be kept (the first shard is bad, or the kept shard has no offset)."""
+    """
+    The repair step's truncation as one call: True when the folder verifies (nothing dropped) or was truncated
+    to its good prefix, False when no prefix can be kept (the first shard is bad, or the kept shard has no offset).
+    """
+
     good, problem = good_prefix_length(folder.directory, folder.manifest)
     if problem is None:
         return True
@@ -280,7 +299,9 @@ def truncate_to_good_prefix(folder: RawFolder) -> bool:
 
 @pytest.fixture
 def with_tokenizer(layout: DatasetLayout) -> Callable[[DatasetConfig], DatasetConfig]:
-    """Run the tokenizer stage for a config (needed before any token counting) and hand the config back."""
+    """
+    Run the tokenizer stage for a config (needed before any token counting) and hand the config back.
+    """
 
     def prepare(cfg: DatasetConfig) -> DatasetConfig:
         prepare_tokenizer(cfg, layout)
@@ -291,8 +312,10 @@ def with_tokenizer(layout: DatasetLayout) -> Callable[[DatasetConfig], DatasetCo
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Callable[[DatasetConfig], Path]:
-    """`config_file(cfg)` writes the config as YAML (what `prepare` / `status` take) and returns the path
-    (`<tmp_path>/<cfg.name>.yaml`; a second call with the same name overwrites it)."""
+    """
+    `config_file(cfg)` writes the config as YAML (what `prepare` / `status` take) and returns the path
+    (`<tmp_path>/<cfg.name>.yaml`; a second call with the same name overwrites it).
+    """
 
     def write(cfg: DatasetConfig) -> Path:
         path = tmp_path / f"{cfg.name}.yaml"

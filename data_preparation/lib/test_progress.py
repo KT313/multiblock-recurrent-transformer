@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.progress: the enabling rule and the no-op bar."""
+"""
+Tests for data_preparation.lib.progress: the enabling rule and the no-op bar.
+"""
 
 from __future__ import annotations
 

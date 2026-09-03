@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the settings schema: YAML loading (`config/tiny.yaml`, the complete `config/crow_300m_final.yaml`), CLI
-overrides, validation, derived values."""
+"""
+Tests for the settings schema: YAML loading (`config/tiny.yaml`, the complete `config/crow_300m_final.yaml`), CLI
+overrides, validation, derived values.
+"""
 
 from dataclasses import MISSING, asdict, fields
 from pathlib import Path
@@ -122,7 +124,10 @@ def test_parse_crow_yaml() -> None:
 
 
 def test_crow_yaml_lists_every_settings_field() -> None:
-    """The thesis run config is the template: exactly the set of `Settings` fields, nothing stale, nothing missing."""
+    """
+    The thesis run config is the template: exactly the set of `Settings` fields, nothing stale, nothing missing.
+    """
+
     with open(CROW_YAML, encoding="utf-8") as fp:
         loaded = yaml.safe_load(fp)
     assert set(loaded) == {f.name for f in fields(Settings)}
@@ -130,7 +135,10 @@ def test_crow_yaml_lists_every_settings_field() -> None:
 
 
 def test_crow_yaml_effective_values_are_unchanged() -> None:
-    """Listing every key must not change the run: explicit values as before, every other key at its default."""
+    """
+    Listing every key must not change the run: explicit values as before, every other key at its default.
+    """
+
     cfg = parse_settings(["--config", str(CROW_YAML)])
     expected = _field_defaults() | CROW_EXPLICIT
     assert set(expected) == {f.name for f in fields(Settings)}
@@ -216,8 +224,11 @@ def test_unknown_cli_key_is_rejected() -> None:
 
 
 def test_optim_config_field_override_merges_with_yaml() -> None:
-    """`--optim_config.lr` changes one field and keeps every other YAML value; a dict-typed setting would be
-    replaced whole, silently dropping the weight decay and the ELLISAdam flags (finding H10)."""
+    """
+    `--optim_config.lr` changes one field and keeps every other YAML value; a dict-typed setting would be
+    replaced whole, silently dropping the weight decay and the ELLISAdam flags (finding H10).
+    """
+
     cfg = parse_settings(["--config", str(CROW_YAML), "--optim_config.lr", "3e-4"])
     assert cfg.optim_config == OptimizerConfig(
         lr=3e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
@@ -240,7 +251,10 @@ def test_optim_config_unknown_yaml_field_is_rejected(tmp_path: Path) -> None:
 
 
 def test_settings_rejects_a_plain_dict_optim_config() -> None:
-    """The old shape of the setting (a free-form dict) fails with a message naming it, not far away in the optimizer."""
+    """
+    The old shape of the setting (a free-form dict) fails with a message naming it, not far away in the optimizer.
+    """
+
     with pytest.raises(ValueError, match="optim_config must be an OptimizerConfig"):
         _settings(optim_config={"lr": 1e-4})
 
@@ -279,9 +293,12 @@ def test_validation_batch_divisibility() -> None:
 
 
 def test_validation_of_nonsensical_batch_sizes() -> None:
-    """A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
+    """
+    A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
     loop of a step run zero times: the run "trained" and reported loss 0.0. Both fail at settings time now, and so
-    does a world batch smaller than one micro-batch."""
+    does a world batch smaller than one micro-batch.
+    """
+
     for bad in (0, -4):
         with pytest.raises(ValueError, match="micro_batch_size must be positive"):
             _settings(micro_batch_size=bad, world_batch_size=8)
@@ -293,8 +310,11 @@ def test_validation_of_nonsensical_batch_sizes() -> None:
 
 
 def test_validation_misaligned_eval_and_log_intervals() -> None:
-    """Validation runs every eval_step_interval steps but the logger only emits at log steps, so an evaluation at a
-    non-log step would be computed and silently thrown away; refused at settings time instead."""
+    """
+    Validation runs every eval_step_interval steps but the logger only emits at log steps, so an evaluation at a
+    non-log step would be computed and silently thrown away; refused at settings time instead.
+    """
+
     with pytest.raises(ValueError, match=r"eval_step_interval \(10\) must be a multiple of log_step_interval \(4\)"):
         _settings(log_step_interval=4, eval_step_interval=10)
 
@@ -306,7 +326,10 @@ def test_validation_aligned_eval_and_log_intervals(log: int, eval_: int) -> None
 
 
 def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
-    """`parse_settings` goes through `Settings.__post_init__`, so a bad YAML value is rejected the same way."""
+    """
+    `parse_settings` goes through `Settings.__post_init__`, so a bad YAML value is rejected the same way.
+    """
+
     yaml = tmp_path / "bad.yaml"
     yaml.write_text(TINY_YAML.read_text().replace("micro_batch_size: 2", "micro_batch_size: 3"))
     with pytest.raises(ValueError, match="multiple of micro_batch_size"):
@@ -314,7 +337,10 @@ def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
 
 
 def test_settings_do_not_touch_the_filesystem(tmp_path: Path) -> None:
-    """Existence of the dataset config / data is checked by the resolver, not by the schema."""
+    """
+    Existence of the dataset config / data is checked by the resolver, not by the schema.
+    """
+
     cfg = _settings(dataset_config=str(tmp_path / "missing.yaml"), dataset_dir=str(tmp_path / "nowhere"))
     assert cfg.dataset_config.endswith("missing.yaml")
 
@@ -328,7 +354,10 @@ def test_gradient_accumulation_steps(micro: int, world: int, expected: int) -> N
 
 
 def test_value_rule_tables_name_real_fields_and_do_not_overlap() -> None:
-    """The three tables `Settings.__post_init__` loops over hold field names, each field in at most one of them."""
+    """
+    The three tables `Settings.__post_init__` loops over hold field names, each field in at most one of them.
+    """
+
     names = {f.name for f in fields(Settings)}
     tables = [set(REQUIRED_SETTINGS), set(POSITIVE_SETTINGS), set(NON_NEGATIVE_SETTINGS)]
     for table in tables:

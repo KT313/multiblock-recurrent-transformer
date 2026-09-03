@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the rich dashboard: one live layout (downloads / builds / log panels), nothing printed around it."""
+"""
+Tests for the rich dashboard: one live layout (downloads / builds / log panels), nothing printed around it.
+"""
 
 from __future__ import annotations
 
@@ -42,7 +44,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def tasks_of(board: DataDashboard) -> list[Task]:
-    """The open tasks of every panel (summary tasks included)."""
+    """
+    The open tasks of every panel (summary tasks included).
+    """
+
     with board._lock:
         tasks: list[Task] = []
         for state in board._panels.values():
@@ -58,20 +63,29 @@ def panel_names_of(board: DataDashboard) -> list[str]:
 
 
 def render_text(board: DataDashboard, width: int = 120, height: int = 50) -> str:
-    """The dashboard's current display as plain text."""
+    """
+    The dashboard's current display as plain text.
+    """
+
     return board.render_text(width, height)
 
 
 @pytest.fixture
 def dashboard() -> Iterator[DataDashboard]:
-    """An enabled dashboard rendering into a StringIO console (no real terminal needed)."""
+    """
+    An enabled dashboard rendering into a StringIO console (no real terminal needed).
+    """
+
     console = Console(file=io.StringIO(), force_terminal=True, width=120)
     with DataDashboard(enabled=True, console=console, log_lines=3, max_rows=4, refresh_per_second=50) as board:
         yield board
 
 
 def _outside_frames(screen_text: str) -> str:
-    """The screen without the panel lines (frame content starts with a box character)."""
+    """
+    The screen without the panel lines (frame content starts with a box character).
+    """
+
     return "\n".join(line for line in screen_text.splitlines() if not line.startswith(("│", "╭", "╰")))
 
 
@@ -185,7 +199,10 @@ def test_updates_from_threads(dashboard: DataDashboard) -> None:
 
 
 def test_header_shows_title_status_and_footer_the_log_file(short_tmp_path: Path) -> None:
-    """(`short_tmp_path`: the footer shows the log file's path unabridged at width 120.)"""
+    """
+    (`short_tmp_path`: the footer shows the log file's path unabridged at width 120.)
+    """
+
     console = Console(file=io.StringIO(), force_terminal=True, width=120)
     logger = logging.getLogger("data_preparation.test_dashboard_header")
     log_file = short_tmp_path / "build.log"
@@ -531,7 +548,10 @@ def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen() -> No
 
 
 def _check_frame(frame: str, log_lines: int) -> None:
-    """One rendered frame: the summary row once, every bar inside a panel, the log panel bounded."""
+    """
+    One rendered frame: the summary row once, every bar inside a panel, the log panel bounded.
+    """
+
     assert frame.count("jobs done") == 1, frame
     for line in frame.splitlines():
         if "row/s" in line or "jobs done" in line or "rows" in line:
@@ -614,9 +634,12 @@ prepare.main(["prepare", "--dataset_config", "config/datasets/tiny.yaml", "--dat
 def _run_in_pty(
     script: str, *, width: int, height: int, timeout: float = 120.0, terminate_after: float | None = None, close_after: float | None = None
 ) -> tuple[int, bytes]:
-    """Run ``python -c script`` on a pseudo-terminal of the given size; the exit code and everything it wrote.
-    ``terminate_after`` sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run);
-    ``close_after`` closes the terminal instead (the window closed: SIGHUP and EIO for the child)."""
+    """
+    Run python -c script on a pseudo-terminal of the given size; the exit code and everything it wrote.
+    terminate_after sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run);
+    close_after closes the terminal instead (the window closed: SIGHUP and EIO for the child).
+    """
+
     pid, fd = pty.fork()
     if pid == 0:  # child: the pty is its controlling terminal (stdin/stdout/stderr)
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -666,7 +689,10 @@ def _run_in_pty(
 
 @pytest.mark.slow
 def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_table(short_tmp_path: Path) -> None:
-    """(`short_tmp_path`: the final `done: <dataset dir>` line must fit one 140-column screen line.)"""
+    """
+    (`short_tmp_path`: the final `done: <dataset dir>` line must fit one 140-column screen line.)
+    """
+
     dataset_dir = short_tmp_path / "dataset"
     code, raw = _run_in_pty(_PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.03), width=140, height=45)
     text = raw.decode("utf-8", "replace")

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.mlp.GatedMLP`."""
+"""
+Tests for `model.mlp.GatedMLP`.
+"""
 
 from typing import Any
 
@@ -48,7 +50,10 @@ def test_position_wise() -> None:
 
 
 def test_silu_is_applied_to_the_first_half_only() -> None:
-    """SiLU is not symmetric in its two factors: applying it to the second half instead must give a different result."""
+    """
+    SiLU is not symmetric in its two factors: applying it to the second half instead must give a different result.
+    """
+
     mlp, cfg = make_mlp()
     x = torch.randn(3, cfg.n_embd)
     w1, w2 = mlp.fc.weight.chunk(2, dim=0)

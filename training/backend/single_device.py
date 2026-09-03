@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Single-device backend: one CUDA GPU (CPU fallback), bf16 autocast, plain `torch.save`/`torch.load`."""
+"""
+Single-device backend: one CUDA GPU (CPU fallback), bf16 autocast, plain `torch.save`/`torch.load`.
+"""
 
 import random
 import warnings
@@ -19,7 +21,10 @@ PRECISIONS = ("bf16-mixed", "32")
 
 
 def _set_torch_flags() -> None:
-    """Global matmul/cuDNN settings the training runs used (TF32 accumulation, benchmark mode)."""
+    """
+    Global matmul/cuDNN settings the training runs used (TF32 accumulation, benchmark mode).
+    """
+
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.allow_tf32 = True
@@ -28,7 +33,9 @@ def _set_torch_flags() -> None:
 
 
 class SingleDeviceBackend:
-    """Runs everything on `cuda:0` if available, otherwise on the CPU (with a warning)."""
+    """
+    Runs everything on `cuda:0` if available, otherwise on the CPU (with a warning).
+    """
 
     world_size: int = 1
     rank: int = 0

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the formatting helpers, the step-dict readers and the panel-height fit."""
+"""
+Tests for the formatting helpers, the step-dict readers and the panel-height fit.
+"""
 
 from __future__ import annotations
 

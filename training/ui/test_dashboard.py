@@ -1,6 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the public API of the training dashboard: the scripted 30-step run the way ``train()`` / ``RunLogger``
-drive it, with everything that could print around the display firing, and the log file both dashboards write."""
+"""
+Tests for the public API of the training dashboard: the scripted 30-step run the way train() / RunLogger
+drive it, with everything that could print around the display firing, and the log file both dashboards write.
+"""
 
 from __future__ import annotations
 
@@ -21,9 +23,12 @@ from ui.testing import FakeClock, console_output, screen_text, string_console
 
 
 def test_a_disabled_live_display_writes_its_lines_to_the_fallback_stream(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
-    """A display that disables itself after an internal error must write its plain lines where a run that never got
-    a display writes them (``open_dashboard`` passes stderr as ``fallback_stream``), not to the display's own
-    ``stream``."""
+    """
+    A display that disables itself after an internal error must write its plain lines where a run that never got
+    a display writes them (open_dashboard passes stderr as fallback_stream), not to the display's own
+    stream.
+    """
+
     stream, fallback = io.StringIO(), io.StringIO()
 
     def broken(step: int, stage_index: int) -> None:
@@ -44,7 +49,10 @@ def test_a_disabled_live_display_writes_its_lines_to_the_fallback_stream(monkeyp
 
 
 def _check_frame(frame: str, height: int, log_lines: int, event_lines: int) -> None:
-    """One rendered frame: the header, the bars and the metrics table once, the panels bounded, the frame fits."""
+    """
+    One rendered frame: the header, the bars and the metrics table once, the panels bounded, the frame fits.
+    """
+
     lines = frame.splitlines()
     assert len(lines) <= height, frame
     assert frame.count("overall") == 1 and frame.count("grad norm") == 1 and frame.count("▶") <= 1, frame
@@ -59,8 +67,11 @@ def _check_frame(frame: str, height: int, log_lines: int, event_lines: int) -> N
 
 
 def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: FakeClock) -> None:
-    """The way ``train()`` / ``RunLogger`` drive the dashboard, while log records, stray prints, a bare stderr write
-    and a third-party logger with its own stderr handler fire."""
+    """
+    The way train() / RunLogger drive the dashboard, while log records, stray prints, a bare stderr write
+    and a third-party logger with its own stderr handler fire.
+    """
+
     logger = logging.getLogger("training")  # as in a run: `RunLogger` logs under `training`, the sinks too
     library = logging.getLogger("fake_datasets_library")
     library_handler = logging.StreamHandler(sys.stderr)
@@ -155,9 +166,12 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
 
 
 def _drive_scripted_run(board: TrainingDashboard | ConsoleFallbackDashboard, clock: FakeClock, logger: logging.Logger) -> None:
-    """The same calls on either dashboard, the way ``RunLogger`` makes them: the transition progress at every step,
-    the metric dict at log steps only, ``{}`` at the others, validations, events and two records of the attached
-    logger."""
+    """
+    The same calls on either dashboard, the way RunLogger makes them: the transition progress at every step,
+    the metric dict at log steps only, {} at the others, validations, events and two records of the attached
+    logger.
+    """
+
     board.note_event("no checkpoint found, starting from scratch")
     logger.info("Total training steps: %d", TOTAL, extra={"keep": True})
     board.set_status("training")

@@ -1,5 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Shared pytest fixtures: the tiny dataset config built into a session temp dir, its tokenizer, the tiny model.
+"""
+Shared pytest fixtures: the tiny dataset config built into a session temp dir, its tokenizer, the tiny model.
 
 Under pytest-xdist every worker process imports torch; the intra-op thread count is capped to the machine's
 share per worker so the four workers do not oversubscribe the cores. GPU tests share one worker (`xdist_group`).
@@ -28,7 +29,10 @@ TINY_MODEL_ARCHITECTURE = REPO_ROOT / "config" / "model_architecture" / "tiny.ya
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """GPU tests share one xdist worker (one 8 GB device) and are skipped without a CUDA device."""
+    """
+    GPU tests share one xdist worker (one 8 GB device) and are skipped without a CUDA device.
+    """
+
     cuda = torch.cuda.is_available()
     for item in items:
         if "gpu" in item.keywords:
@@ -39,9 +43,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture
 def short_tmp_path() -> Iterator[Path]:
-    """A short per-test directory (`/tmp/pytest-short-*`) for tests that show a path on a fixed-width screen: pytest's
+    """
+    A short per-test directory (`/tmp/pytest-short-*`) for tests that show a path on a fixed-width screen: pytest's
     `tmp_path` grows under xdist (`popen-gwN/`) and with the session counter (`pytest-NNN`), and pushes such lines past
-    the width they are asserted at."""
+    the width they are asserted at.
+    """
+
     path = Path(tempfile.mkdtemp(prefix="pytest-short-"))
     try:
         yield path
@@ -56,8 +63,11 @@ def tiny_dataset_config() -> DatasetConfig:
 
 @pytest.fixture(scope="session")
 def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_config: DatasetConfig) -> Path:
-    """`config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, processed/,
-    tokenizers/) that `config/tiny.yaml` expects under `dataset/`."""
+    """
+    `config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, processed/,
+    tokenizers/) that `config/tiny.yaml` expects under `dataset/`.
+    """
+
     root: Path = tmp_path_factory.mktemp("tiny_dataset")
     prepare(TINY_DATASET_CONFIG, root, assume_yes=False)
     return root
@@ -70,13 +80,19 @@ def tiny_layout(tiny_dataset_dir: Path) -> DatasetLayout:
 
 @pytest.fixture(scope="session")
 def tiny_pretrain_dir(tiny_layout: DatasetLayout) -> Path:
-    """`processed/synthetic_pretrain`: text rows."""
+    """
+    `processed/synthetic_pretrain`: text rows.
+    """
+
     return tiny_layout.processed_dir("synthetic_pretrain")
 
 
 @pytest.fixture(scope="session")
 def tiny_instruct_dir(tiny_layout: DatasetLayout) -> Path:
-    """`processed/synthetic_instruct`: instruction / input / output rows."""
+    """
+    `processed/synthetic_instruct`: instruction / input / output rows.
+    """
+
     return tiny_layout.processed_dir("synthetic_instruct")
 
 
@@ -87,7 +103,10 @@ def tiny_tokenizer_dir(tiny_layout: DatasetLayout) -> Path:
 
 @pytest.fixture
 def tiny_model() -> RecurrentGPT:
-    """Fresh, seeded `tiny` model (config/model_architecture/tiny.yaml) on the CPU (~256K parameters)."""
+    """
+    Fresh, seeded `tiny` model (config/model_architecture/tiny.yaml) on the CPU (~256K parameters).
+    """
+
     from model import build_model
 
     torch.manual_seed(0)

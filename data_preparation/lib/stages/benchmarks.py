@@ -1,8 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Benchmark test sets used for decontamination and their n-gram sets.
+"""
+Benchmark test sets used for decontamination and their n-gram sets.
 
-``BENCHMARKS`` maps the names used in ``decontamination.benchmarks`` to ``(hf_id, config, split)``.
-A benchmark that cannot be loaded is an **error** (a build must never silently decontaminate against less).
+BENCHMARKS maps the names used in decontamination.benchmarks to (hf_id, config, split).
+A benchmark that cannot be loaded is an error (a build must never silently decontaminate against less).
 """
 
 from __future__ import annotations
@@ -28,7 +29,10 @@ BENCHMARKS: dict[str, tuple[str, str | None, str]] = {
 
 
 def example_text(example: dict[str, Any]) -> str:
-    """All string fields (and strings inside list fields) of a benchmark example, joined."""
+    """
+    All string fields (and strings inside list fields) of a benchmark example, joined.
+    """
+
     parts: list[str] = []
     for value in example.values():
         if isinstance(value, str):
@@ -39,7 +43,10 @@ def example_text(example: dict[str, Any]) -> str:
 
 
 def _benchmark_ngrams(name: str, n: int, cache_dir: str | None) -> set[str]:
-    """Download one benchmark test set and collect the normalized ``n``-grams of all its examples."""
+    """
+    Download one benchmark test set and collect the normalized n-grams of all its examples.
+    """
+
     from datasets import load_dataset
 
     hf_id, config, split = BENCHMARKS[name]
@@ -52,10 +59,12 @@ def _benchmark_ngrams(name: str, n: int, cache_dir: str | None) -> set[str]:
 
 
 def load_benchmark_ngrams(names: list[str], n: int = 13, cache_dir: str | None = None) -> dict[str, set[str]]:
-    """Download every named benchmark test set and collect its normalized n-grams.
-
-    Raises ``KeyError`` for an unknown name and re-raises whatever ``datasets.load_dataset`` raises.
     """
+    Download every named benchmark test set and collect its normalized n-grams.
+
+    Raises KeyError for an unknown name and re-raises whatever datasets.load_dataset raises.
+    """
+
     unknown = [name for name in names if name not in BENCHMARKS]
     if unknown:
         raise KeyError(f"unknown benchmark(s) {unknown}; known: {sorted(BENCHMARKS)}")

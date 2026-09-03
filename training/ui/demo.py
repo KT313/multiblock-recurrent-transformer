@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""A scripted fake run for a look at the dashboard: ``uv run python -m training.ui.dashboard [seconds]``."""
+"""
+A scripted fake run for a look at the dashboard: uv run python -m training.ui.dashboard [seconds].
+"""
 
 from __future__ import annotations
 
@@ -24,9 +26,12 @@ DEMO_STEPS = [30, 20]
 def demo(
     seconds: float = 5.0, *, enabled: bool | None = None, log_file: Path | None = None, console: Console | None = None
 ) -> None:
-    """A fake two-stage run (30 + 20 optimizer steps over ``seconds``) driving the whole API while the things a real
-    run writes around it fire: a stray ``print``, a bare ``sys.stderr.write``, a ``warnings.warn``, a third-party
-    logger with its own stderr handler. Piped (or ``TRAINING_DASHBOARD=0``) it shows the fallback."""
+    """
+    A fake two-stage run (30 + 20 optimizer steps over seconds) driving the whole API while the things a real
+    run writes around it fire: a stray print, a bare sys.stderr.write, a warnings.warn, a third-party
+    logger with its own stderr handler. Piped (or TRAINING_DASHBOARD=0) it shows the fallback.
+    """
+
     total_steps = sum(DEMO_STEPS)
     pause = seconds / total_steps
     rng = random.Random(0)
@@ -94,7 +99,10 @@ def demo(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m training.ui.dashboard [seconds]``: the demo; Ctrl-C leaves through the dashboard and exits 130."""
+    """
+    python -m training.ui.dashboard [seconds]: the demo; Ctrl-C leaves through the dashboard and exits 130.
+    """
+
     arguments = sys.argv[1:] if argv is None else argv
     try:
         demo(float(arguments[0]) if arguments else 5.0)

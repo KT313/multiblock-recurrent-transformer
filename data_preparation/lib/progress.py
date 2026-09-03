@@ -1,9 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The progress-bar interface of the preparation stages and its no-op.
+"""
+The progress-bar interface of the preparation stages and its no-op.
 
 The stages report progress through :class:`Progress`; the live implementation is the dashboard's task row
-(``lib/ui/dashboard.py``), and :class:`NoProgress` stands in when no dashboard is active. :func:`progress_enabled`
-is the rule the dashboard opens under: ``DATA_PREP_PROGRESS`` not ``0`` and stderr a terminal (``ui.enabled``).
+(lib/ui/dashboard.py), and :class:`NoProgress` stands in when no dashboard is active. :func:`progress_enabled`
+is the rule the dashboard opens under: DATA_PREP_PROGRESS not 0 and stderr a terminal (ui.enabled).
 """
 
 from __future__ import annotations
@@ -18,8 +19,10 @@ ENV_VAR = "DATA_PREP_PROGRESS"
 
 
 class Progress(Protocol):
-    """What the stages do with a bar: count updates, show a postfix, and open it as a ``with`` block (``close`` is
-    what leaving the block does)."""
+    """
+    What the stages do with a bar: count updates, show a postfix, and open it as a with block (close is
+    what leaving the block does).
+    """
 
     @property
     def n(self) -> int: ...
@@ -35,7 +38,9 @@ class Progress(Protocol):
 
 
 class NoProgress:
-    """The bar without a display: ``n`` still counts the updates."""
+    """
+    The bar without a display: n still counts the updates.
+    """
 
     def __init__(self, total: int | None = None) -> None:
         self.n = 0
@@ -60,5 +65,8 @@ class NoProgress:
 
 
 def progress_enabled(stream: TextIO | None = None) -> bool:
-    """False when ``DATA_PREP_PROGRESS=0`` (or ``false``/``no``/``off``) or when ``stream`` (stderr) is not a TTY."""
+    """
+    False when DATA_PREP_PROGRESS=0 (or false/no/off) or when stream (stderr) is not a TTY.
+    """
+
     return display_enabled(ENV_VAR, sys.stderr if stream is None else stream)

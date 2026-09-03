@@ -1,23 +1,24 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The ``build`` step for both source kinds: ``sources/<name>/raw`` -> ``processed/<name>``.
+"""
+The build step for both source kinds: sources/<name>/raw -> processed/<name>.
 
-``pretrain`` rows go through the length filter (``min_chars``; the upper bound is the token truncation at download)
--> quality filter -> decontamination -> exact dedup (``hash`` column, first occurrence wins); ``instruct`` rows
+pretrain rows go through the length filter (min_chars; the upper bound is the token truncation at download)
+-> quality filter -> decontamination -> exact dedup (hash column, first occurrence wins); instruct rows
 (converter and filter already applied at download) get their input inversions -> empty-field and over-cap removal
--> exact dedup over ``instruction\\ninput\\noutput``. Both kinds publish ``layout.processed_columns(kind)``; the
-``tokens`` of a pretrain row is the stored raw count clamped to the current ``max_seq_length``.
+-> exact dedup over instruction\\ninput\\noutput. Both kinds publish layout.processed_columns(kind); the
+tokens of a pretrain row is the stored raw count clamped to the current max_seq_length.
 
 Two write modes:
 
-* **per raw shard, resumable** (pretrain sources without ``shuffle``): the survivors of one raw shard are published
-  before the next raw shard is read and the manifest records the raw shard as covered (``input_shards``), so a
+* per raw shard, resumable (pretrain sources without shuffle): the survivors of one raw shard are published
+  before the next raw shard is read and the manifest records the raw shard as covered (input_shards), so a
   failure or a stop request (checked between raw shards) loses at most one raw shard of work and the next call
   resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
-  ``dedup.bloom_memory_mb``) is refilled from the ``hash`` column of the processed shards at the start of every
+  dedup.bloom_memory_mb) is refilled from the hash column of the processed shards at the start of every
   build, so the rows kept are exactly those of one full pass.
-* **all at once** (``config.shuffle_of(name)``, the default for instruct sources, and ``dedup.mode: minhash``): every
-  raw shard is read, the survivors are shuffled with ``random.Random(source.seed)`` (or, for minhash, run through
-  the LSH index), written into ``processed/<name>.tmp`` and swapped into place rename-aside
+* all at once (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash): every
+  raw shard is read, the survivors are shuffled with random.Random(source.seed) (or, for minhash, run through
+  the LSH index), written into processed/<name>.tmp and swapped into place rename-aside
   (:func:`_swap_into_place`; the repair step finishes an interrupted swap). Why shuffle: the training loader reads
   a source's shards in order and only mixes between sources; instruct repositories are sorted by task, so without
   a shuffle the model would see one task for thousands of steps. Instruct sources are small, so rebuilding them
@@ -89,10 +90,13 @@ def build_source(
     shard_size: int = DEFAULT_SHARD_SIZE,
     should_stop: StopCheck | None = None,
 ) -> Manifest:
-    """Turn the raw shards of source ``name`` into ``processed/<name>`` (see the module docstring) and return the
-    processed manifest. ``pass_workers`` sizes the spawn process pool of the optional cleaning passes
-    (decontamination / minhash; 1 = in-process). Raises ``FileNotFoundError`` without a current raw manifest (run
-    the download first)."""
+    """
+    Turn the raw shards of source name into processed/<name> (see the module docstring) and return the
+    processed manifest. pass_workers sizes the spawn process pool of the optional cleaning passes
+    (decontamination / minhash; 1 = in-process). Raises FileNotFoundError without a current raw manifest (run
+    the download first).
+    """
+
     source = config.sources[name]
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
@@ -148,8 +152,11 @@ def _build_per_raw_shard(
     shard_size: int,
     should_stop: StopCheck | None,
 ) -> None:
-    """One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
-    raw shard as covered) before the next raw shard starts; the stop request is checked in between."""
+    """
+    One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
+    raw shard as covered) before the next raw shard starts; the stop request is checked in between.
+    """
+
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
     for index, shard in enumerate(pending, start=1):
         if pipeline.bar is not None:
@@ -171,9 +178,12 @@ def _build_all_at_once(
     shard_size: int,
     should_stop: StopCheck | None,
 ) -> None:
-    """Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
-    it, written into ``output.directory`` (the ``.tmp`` sibling) and swapped over ``processed_dir`` rename-aside
-    (:func:`_swap_into_place`)."""
+    """
+    Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
+    it, written into output.directory (the .tmp sibling) and swapped over processed_dir rename-aside
+    (:func:`_swap_into_place`).
+    """
+
     pipeline.stats["input_rows"] += raw.rows()
     rows = pipeline.run(raw_dir, list(raw.shards), first_row_index=0)
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
@@ -194,11 +204,14 @@ def _build_all_at_once(
 
 
 def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
-    """Replace ``processed_dir`` by the complete ``temporary`` folder without a moment where neither exists: the
-    old folder steps aside (``processed/<name>.old``), the new one is renamed into place, and only then is anything
-    deleted. A crash between the renames leaves the ``.old`` next to the complete ``.tmp`` (the repair step
-    finishes the swap), one after them leaves the new folder in place next to a stale ``.old`` (the repair step
-    removes it)."""
+    """
+    Replace processed_dir by the complete temporary folder without a moment where neither exists: the
+    old folder steps aside (processed/<name>.old), the new one is renamed into place, and only then is anything
+    deleted. A crash between the renames leaves the .old next to the complete .tmp (the repair step
+    finishes the swap), one after them leaves the new folder in place next to a stale .old (the repair step
+    removes it).
+    """
+
     old = _old_dir(processed_dir)
     if old.exists():
         shutil.rmtree(old)  # leftover of an earlier crashed swap; the folder that replaced it is in place or in `temporary`
@@ -210,13 +223,19 @@ def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
 
 
 def _temporary_dir(processed_dir: Path) -> Path:
-    """``processed/<name>.tmp``: where an all-at-once build writes before the swap into place."""
+    """
+    processed/<name>.tmp: where an all-at-once build writes before the swap into place.
+    """
+
     return processed_dir.with_name(processed_dir.name + ".tmp")
 
 
 def _old_dir(processed_dir: Path) -> Path:
-    """``processed/<name>.old``: where :func:`_swap_into_place` parks the folder it replaces until the new one is
-    in place."""
+    """
+    processed/<name>.old: where :func:`_swap_into_place` parks the folder it replaces until the new one is
+    in place.
+    """
+
     return processed_dir.with_name(processed_dir.name + ".old")
 
 
@@ -225,9 +244,11 @@ def _old_dir(processed_dir: Path) -> Path:
 
 @dataclass
 class ProcessedOutput:
-    """The processed folder of one build: its manifest, the directory shards are published into (the final folder,
-    or the ``.tmp`` sibling of an all-at-once build) and whether the manifest was created by this call (a new
-    manifest is saved even when nothing is appended, so an empty source still counts as built)."""
+    """
+    The processed folder of one build: its manifest, the directory shards are published into (the final folder,
+    or the .tmp sibling of an all-at-once build) and whether the manifest was created by this call (a new
+    manifest is saved even when nothing is appended, so an empty source still counts as built).
+    """
 
     manifest: Manifest
     directory: Path
@@ -235,10 +256,13 @@ class ProcessedOutput:
 
     @classmethod
     def resume(cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, assessment: ProcessedAssessment) -> ProcessedOutput:
-        """The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
+        """
+        The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
         raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
         the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
-        parsed is never deleted here: the repair step does that, after the user confirmed."""
+        parsed is never deleted here: the repair step does that, after the user confirmed.
+        """
+
         if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
             return cls(assessment.manifest, processed_dir, is_new=False)
         if assessment.problem == "unreadable_manifest":
@@ -254,15 +278,24 @@ class ProcessedOutput:
         return cls(_fresh_manifest(config, name, source_hash), processed_dir, is_new=True)
 
     def covered(self) -> int:
-        """Raw shards the manifest already covers."""
+        """
+        Raw shards the manifest already covers.
+        """
+
         return len(self.manifest.input_shards)
 
     def stored_hashes(self) -> Iterator[int]:
-        """The exact-dedup keys of every processed row on disk, in manifest order (refills the dedup filter)."""
+        """
+        The exact-dedup keys of every processed row on disk, in manifest order (refills the dedup filter).
+        """
+
         return stored_hashes(self.directory / shard.name for shard in self.manifest.shards)
 
     def publish(self, rows: list[Row], shard_size: int) -> None:
-        """Append ``rows`` as shard(s) of at most ``shard_size`` rows, each recorded in the manifest."""
+        """
+        Append rows as shard(s) of at most shard_size rows, each recorded in the manifest.
+        """
+
         for start in range(0, len(rows), shard_size):
             chunk = rows[start : start + shard_size]
             path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))
@@ -303,11 +336,13 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
 
 
 class RowPipeline:
-    """The row pipeline of one build call, reusable per raw shard: the dedup filter, the statistics, the token
-    counter (instruct inversions) and the decontamination worker pool (a ``with`` resource) persist across ``run``
+    """
+    The row pipeline of one build call, reusable per raw shard: the dedup filter, the statistics, the token
+    counter (instruct inversions) and the decontamination worker pool (a with resource) persist across run
     calls. Pretrain: length filter -> quality filter -> decontamination -> hash -> exact dedup; instruct: input
     inversions -> empty / over-cap removal -> hash -> exact dedup. The filters run before the dedup, so the hashes on
-    disk are exactly the dedup's "seen" set and an incremental build keeps the same rows as a full pass."""
+    disk are exactly the dedup's "seen" set and an incremental build keeps the same rows as a full pass.
+    """
 
     def __init__(
         self,
@@ -346,8 +381,11 @@ class RowPipeline:
         self.decontaminator.__exit__(exc_type, exc, tb)
 
     def run(self, raw_dir: Path, shards: list[ShardInfo], *, first_row_index: int) -> Iterator[Row]:
-        """The processed rows of ``shards`` (lazy). ``first_row_index`` is the global raw row index of the first row
-        of ``shards[0]`` (instruct inversions are keyed by it)."""
+        """
+        The processed rows of shards (lazy). first_row_index is the global raw row index of the first row
+        of shards[0] (instruct inversions are keyed by it).
+        """
+
         if self.kind == "pretrain":
             rows = self._pretrain_rows(raw_dir, shards)
         else:
@@ -378,9 +416,12 @@ class RowPipeline:
             }
 
     def _length_filtered_rows(self, raw_dir: Path, shards: list[ShardInfo]) -> Iterator[Row]:
-        """``{text, tokens}`` rows of the raw shards through the length filter (``preprocess_batch`` per Arrow batch:
-        null / shorter than ``min_chars`` dropped); statistics summed into ``stats["length_filter"]``, the bar
-        advanced per raw row."""
+        """
+        {text, tokens} rows of the raw shards through the length filter (preprocess_batch per Arrow batch:
+        null / shorter than min_chars dropped); statistics summed into stats["length_filter"], the bar
+        advanced per raw row.
+        """
+
         text_field = self.source.text_field
         stats: dict[str, int] = self.stats["length_filter"]
         for shard in shards:
@@ -396,10 +437,13 @@ class RowPipeline:
     # --- instruct --------------------------------------------------------------------------------------------------
 
     def _instruct_rows(self, raw_dir: Path, shards: list[ShardInfo], first_row_index: int) -> Iterator[Row]:
-        """``{instruction, input, output, tokens, hash}`` rows of the raw shards: inversions decided per row by
-        ``random.Random(f"{seed}:{global row index}")`` (deterministic, independent of shard boundaries and of a
-        resume), then rows without instruction / output and rows over ``max_seq_length`` tokens dropped (an inversion
-        prepends a fixed instruction, so it can push a row over the cap that fitted before)."""
+        """
+        {instruction, input, output, tokens, hash} rows of the raw shards: inversions decided per row by
+        random.Random(f"{seed}:{global row index}") (deterministic, independent of shard boundaries and of a
+        resume), then rows without instruction / output and rows over max_seq_length tokens dropped (an inversion
+        prepends a fixed instruction, so it can push a row over the cap that fitted before).
+        """
+
         share = self.source.input_inversions
         normalize = self.processing.dedup.normalize
         row_index = first_row_index
@@ -430,8 +474,11 @@ class RowPipeline:
                     }
 
     def _invert_sample(self, rows: list[Row], first_row_index: int, share: float) -> None:
-        """Replace the seeded sample of ``rows`` (in place) by their input inversion and recount their tokens; rows
-        the inversion leaves unchanged (empty instruction or output) are not counted."""
+        """
+        Replace the seeded sample of rows (in place) by their input inversion and recount their tokens; rows
+        the inversion leaves unchanged (empty instruction or output) are not counted.
+        """
+
         seed = self.source.seed
         chosen: list[int] = []
         for offset, row in enumerate(rows):
@@ -460,8 +507,11 @@ class RowPipeline:
 
 
 def _exact_dedup(rows: Iterator[Row], seen: SeenDocuments, stats: dict[str, Any]) -> Iterator[Row]:
-    """First occurrence wins: drop rows whose ``hash`` the filter has seen (the keys of every processed row on disk
-    plus the rows kept earlier in this pass). A Bloom false positive drops a unique row, never keeps a duplicate."""
+    """
+    First occurrence wins: drop rows whose hash the filter has seen (the keys of every processed row on disk
+    plus the rows kept earlier in this pass). A Bloom false positive drops a unique row, never keeps a duplicate.
+    """
+
     for row in rows:
         if not seen.add_if_new(row["hash"]):
             stats["duplicates_removed"] += 1
@@ -470,7 +520,10 @@ def _exact_dedup(rows: Iterator[Row], seen: SeenDocuments, stats: dict[str, Any]
 
 
 def _quality_filter(rows: Iterator[Row], stats: dict[str, Any]) -> Iterator[Row]:
-    """Drop rows failing ``check_quality``; counts the rejections per reason in ``stats``."""
+    """
+    Drop rows failing check_quality; counts the rejections per reason in stats.
+    """
+
     for row in rows:
         passes, reason = check_quality(row["text"])
         if not passes:
@@ -500,16 +553,21 @@ def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float)
 
 
 def _contaminated_by(text: str) -> list[str]:
-    """Benchmarks ``text`` is contaminated by, using the process-global n-grams of ``_init_decontamination``."""
+    """
+    Benchmarks text is contaminated by, using the process-global n-grams of _init_decontamination.
+    """
+
     return check_contamination(text, _BENCHMARK_NGRAMS, _DECONTAM["n"], _DECONTAM["threshold"])[1]
 
 
 class Decontaminator:
-    """Drops rows contaminated by a benchmark (counts hits per benchmark in ``stats``); the benchmark n-grams are
-    loaded once, in this process, and checked in-process (``pass_workers <= 1``) or in a pool of ``pass_workers``
-    **spawn** processes that lives for the whole ``with`` block. Spawn, not fork: the pool is created from a build
+    """
+    Drops rows contaminated by a benchmark (counts hits per benchmark in stats); the benchmark n-grams are
+    loaded once, in this process, and checked in-process (pass_workers <= 1) or in a pool of pass_workers
+    spawn processes that lives for the whole with block. Spawn, not fork: the pool is created from a build
     worker thread (`lib/build/runner.py` runs one build per thread), and a fork of a multi-threaded process can
-    inherit a lock another thread holds mid-operation; spawn children start clean."""
+    inherit a lock another thread holds mid-operation; spawn children start clean.
+    """
 
     def __init__(self, config: DecontaminationConfig, pass_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
         self.config = config
@@ -545,7 +603,10 @@ class Decontaminator:
             yield row
 
     def _checks(self, rows: Iterator[Row]) -> Iterator[tuple[Row, list[str]]]:
-        """``(row, contaminating benchmarks)`` for every row."""
+        """
+        (row, contaminating benchmarks) for every row.
+        """
+
         if self._pool is None:
             for row in rows:
                 yield row, _contaminated_by(row["text"])

@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `describe`: deterministic Markdown, every section and source present, budgets match the planner."""
+"""
+Tests for `describe`: deterministic Markdown, every section and source present, budgets match the planner.
+"""
 
 from __future__ import annotations
 

@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.build.assessment: every verdict of `assess_processed_folder` on a scratch
+"""
+Tests for data_preparation.lib.build.assessment: every verdict of `assess_processed_folder` on a scratch
 layout, the crash-leftover (M1) case that is resumable instead of broken, and the manifest-only mode the planner
-uses (`check_files=False`)."""
+uses (`check_files=False`).
+"""
 
 from __future__ import annotations
 
@@ -29,7 +31,10 @@ Prep = Callable[[DatasetConfig], DatasetConfig]
 
 
 def _built(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, rows: int = 8) -> DatasetConfig:
-    """A config with one synthetic source `a`, downloaded (`rows` rows in shards of 4) and built."""
+    """
+    A config with one synthetic source `a`, downloaded (`rows` rows in shards of 4) and built.
+    """
+
     cfg = with_tokenizer(cfg_factory({"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}))
     download(cfg, "a", layout, rows_needed=rows, shard_size=4)
     build_source(cfg, "a", layout, shard_size=4)
@@ -108,8 +113,11 @@ def test_missing_listed_shard_is_broken_only_when_files_are_checked(cfg_factory:
 
 
 def test_crash_leftover_next_shard_is_resumable(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """The M1 state: one unlisted file with exactly the name the resumed build publishes next, while raw shards
-    are still uncovered. The build overwrites it, so the cheapest repair is to do nothing."""
+    """
+    The M1 state: one unlisted file with exactly the name the resumed build publishes next, while raw shards
+    are still uncovered. The build overwrites it, so the cheapest repair is to do nothing.
+    """
+
     cfg = _built(cfg_factory, with_tokenizer, layout)
     manifest = Manifest.load(layout.processed_dir("a"))
     assert manifest is not None and next_shard_to_write(manifest) == "data-00002.parquet"
@@ -121,8 +129,11 @@ def test_crash_leftover_next_shard_is_resumable(cfg_factory: CfgFactory, with_to
 
 
 def test_the_same_stray_on_a_complete_folder_is_broken(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """A folder that already covers every raw shard gets no further publish: nothing would overwrite the stray, the
-    training resolver would refuse the folder, so it stays a rebuild."""
+    """
+    A folder that already covers every raw shard gets no further publish: nothing would overwrite the stray, the
+    training resolver would refuse the folder, so it stays a rebuild.
+    """
+
     cfg = _built(cfg_factory, with_tokenizer, layout)
     (layout.processed_dir("a") / "data-00002.parquet").write_bytes(b"stray")
     assessment = _assess(cfg, layout, _raw_shards(layout))
@@ -155,9 +166,12 @@ def test_covered_shards_must_be_a_prefix_of_the_raw_shards(cfg_factory: CfgFacto
 
 
 def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    """One tree, one folder state per source: the repair step deletes exactly the folders whose cheapest repair is a
+    """
+    One tree, one folder state per source: the repair step deletes exactly the folders whose cheapest repair is a
     rebuild, and the planner's manifest-only state matches the verdict's manifest-level knowledge (file-level
-    problems are invisible to it by design; the repair dry report flags them in ``status``)."""
+    problems are invisible to it by design; the repair dry report flags them in status).
+    """
+
     names = ("a", "b", "c", "d", "e", "f", "g")
     cfg = with_tokenizer(cfg_factory({name: SourceConfig(kind="pretrain", loader="synthetic", seed=seed) for seed, name in enumerate(names)}))
     for name in names:
@@ -191,8 +205,11 @@ def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_facto
 def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, config_file: Callable[[DatasetConfig], Path]
 ) -> None:
-    """The M1 state through the entry points: ``status`` and ``prepare --dry_run`` report a pending build and no
-    repair, ``prepare`` resumes the build over the leftover and ends complete, all three from the same verdict."""
+    """
+    The M1 state through the entry points: status and prepare --dry_run report a pending build and no
+    repair, prepare resumes the build over the leftover and ends complete, all three from the same verdict.
+    """
+
     cfg = with_tokenizer(cfg_factory({"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=6))
     path = config_file(cfg)
     download(cfg, "a", layout, rows_needed=8, shard_size=4)  # 2 raw shards; rows_needed(cfg) is 8 too
@@ -219,8 +236,11 @@ def _make_stale(folder: Path) -> None:
 
 
 def _make_crash_leftover(folder: Path) -> None:
-    """Reconstruct the crash between publishing a shard and saving the manifest: the last processed shard file
-    stays on disk, the manifest no longer lists it nor covers the raw shard it came from."""
+    """
+    Reconstruct the crash between publishing a shard and saving the manifest: the last processed shard file
+    stays on disk, the manifest no longer lists it nor covers the raw shard it came from.
+    """
+
     manifest = Manifest.load(folder)
     assert manifest is not None and len(manifest.shards) >= 2
     manifest.shards = manifest.shards[:-1]
@@ -229,7 +249,10 @@ def _make_crash_leftover(folder: Path) -> None:
 
 
 def test_every_problem_has_a_verdict_and_a_repair() -> None:
-    """The verdict and the repair derive from the problem, so a consumer can never see them disagree."""
+    """
+    The verdict and the repair derive from the problem, so a consumer can never see them disagree.
+    """
+
     problems: tuple[ProcessedProblem, ...] = (
         "none", "absent", "crash_leftover", "unreadable_manifest", "no_manifest",
         "raw_deleted", "stale", "broken_shard", "stray_shards", "raw_changed",

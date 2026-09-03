@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.log."""
+"""
+Tests for data_preparation.lib.log.
+"""
 
 import logging
 from collections.abc import Iterator

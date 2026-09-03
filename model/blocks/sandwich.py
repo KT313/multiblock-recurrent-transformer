@@ -1,6 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
-"""Transformer layer used in prelude, core blocks and coda."""
+"""
+Transformer layer used in prelude, core blocks and coda.
+"""
 
 import torch
 from torch import Tensor
@@ -12,7 +14,8 @@ from ..layers.norms import RMSNorm
 
 
 class SandwichBlock(torch.nn.Module):
-    """Attention and MLP sub-layer, each "sandwiched" between a pre-norm and a post-norm:
+    """
+    Attention and MLP sub-layer, each "sandwiched" between a pre-norm and a post-norm:
 
         x = norm_2(attn(norm_1(x)) + x)
         x = norm_4(mlp(norm_3(x)) + x)

@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.stages.build: the per-shard resumable build of pretrain sources (length filter,
+"""
+Tests for data_preparation.lib.stages.build: the per-shard resumable build of pretrain sources (length filter,
 dedup, quality, decontamination, token clamp, fuzzy dedup), the all-at-once shuffled build of instruct sources
-(inversions, dedup, empty / over-cap removal) and the dedup-filter refill across a restart, on local sources."""
+(inversions, dedup, empty / over-cap removal) and the dedup-filter refill across a restart, on local sources.
+"""
 
 from __future__ import annotations
 
@@ -100,8 +102,11 @@ def test_build_writes_a_manifest_even_when_every_row_is_dropped(
 def test_build_of_an_exhausted_raw_dir_with_zero_shards_writes_an_empty_manifest(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep
 ) -> None:
-    """A source whose loader yields nothing (or nothing the converter accepts) is exhausted with zero raw shards; the
-    build still records a processed manifest with zero shards, so the planner counts the source as complete."""
+    """
+    A source whose loader yields nothing (or nothing the converter accepts) is exhausted with zero raw shards; the
+    build still records a processed manifest with zero shards, so the planner counts the source as complete.
+    """
+
     write_local(local_dir, [{"question": "q"}], "parquet")  # the converter rejects the row: nothing is stored
     src = SourceConfig(kind="instruct", loader="local", path=str(local_dir), converter="instruction_input_output")
     cfg = with_tokenizer(cfg_factory({"i": src}))
@@ -143,8 +148,11 @@ def test_build_exact_dedup_tokens_and_idempotence(
 def test_build_clamps_stored_counts_to_a_lowered_cap(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
-    """Lowering `max_seq_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
-    counts to the new cap instead."""
+    """
+    Lowering `max_seq_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
+    counts to the new cap instead.
+    """
+
     cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, max_seq_length=64)
     assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [30, 3]
     lowered = replace(cfg, max_seq_length=8)
@@ -168,9 +176,12 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:  # fmt: skip
-    """A top-up processes only the raw shards not yet covered, leaves the old processed shards untouched, removes
+    """
+    A top-up processes only the raw shards not yet covered, leaves the old processed shards untouched, removes
     duplicates across old and new shards (the fresh Bloom filter of the second call is refilled from the `hash`
-    column on disk) and ends with exactly the rows of a fresh full pass."""
+    column on disk) and ends with exactly the rows of a fresh full pass.
+    """
+
     first = [_words(6, i) for i in range(6)] + [_words(6, 0)]  # one duplicate inside
     cfg = _prepare(cfg_factory, layout, local_dir, first, with_tokenizer, write=write_local, shard_size=3)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
@@ -219,8 +230,11 @@ def test_incremental_build_with_quality_filter_equals_a_full_pass(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, tmp_path: Path,
 ) -> None:  # fmt: skip
-    """A row the quality filter drops must not claim its dedup hash: a later (differently cased) duplicate that
-    passes the filter is kept, in the incremental and in the full pass alike."""
+    """
+    A row the quality filter drops must not claim its dedup hash: a later (differently cased) duplicate that
+    passes the filter is kept, in the incremental and in the full pass alike.
+    """
+
     bad_caps = GOOD.upper()  # dropped: too many ALL-CAPS words; same normalized hash as GOOD
     proc = ProcessingConfig(min_chars=5, quality_filter=True)
     cfg = _prepare(cfg_factory, layout, local_dir, [bad_caps, "Another good text. It has sentences. Three of them here."],
@@ -274,7 +288,10 @@ def test_build_rebuilds_when_shards_predate_the_columns_or_raw_changed(
 def test_build_refuses_a_processed_manifest_it_cannot_parse(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
-    """The build never deletes a folder whose manifest is corrupt: the repair step does, after confirmation."""
+    """
+    The build never deletes a folder whose manifest is corrupt: the repair step does, after confirmation.
+    """
+
     cfg = _prepare(cfg_factory, layout, local_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local)
     build_source(cfg, "s", layout)
     processed = layout.processed_dir("s")
@@ -288,8 +305,11 @@ def test_build_refuses_a_processed_manifest_it_cannot_parse(
 def test_stale_rebuild_removes_the_shards_of_the_previous_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
-    """A rebuild from a fresh manifest (stale hash) publishes fewer shards than before: none of the old ones may
-    survive unlisted next to the new manifest (round-2 finding)."""
+    """
+    A rebuild from a fresh manifest (stale hash) publishes fewer shards than before: none of the old ones may
+    survive unlisted next to the new manifest (round-2 finding).
+    """
+
     texts = [_words(6, i) for i in range(6)]
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, processing=ProcessingConfig(min_chars=5), shard_size=6)
     processed = layout.processed_dir("s")
@@ -334,8 +354,11 @@ def test_build_decontamination_only_when_enabled(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, monkeypatch: pytest.MonkeyPatch, pass_workers: int,
 ) -> None:  # fmt: skip
-    """`pass_workers=2` runs the real spawn pool end to end: the n-grams are loaded once in the parent (where the
-    patched loader lives; a spawn child would not see the monkeypatch) and reach the workers as pickled init args."""
+    """
+    `pass_workers=2` runs the real spawn pool end to end: the n-grams are loaded once in the parent (where the
+    patched loader lives; a spawn child would not see the monkeypatch) and reach the workers as pickled init args.
+    """
+
     planted = " ".join(f"w{i}" for i in range(20))
     calls: list[tuple[list[str], int, str]] = []
 
@@ -524,9 +547,12 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
 def test_instruct_inversions_are_seeded_per_row_and_survive_a_resume(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader, tmp_path: Path
 ) -> None:
-    """`shuffle: false` puts an instruct source on the per-shard resumable path; the inversion of a row depends only
+    """
+    `shuffle: false` puts an instruct source on the per-shard resumable path; the inversion of a row depends only
     on (seed, global raw row index), so a build stopped after two raw shards and resumed equals one uninterrupted
-    build, and a shuffled build of the same source inverts the same rows."""
+    build, and a shuffled build of the same source inverts the same rows.
+    """
+
     src_dir = layout.root.parent / "inv"
     rows = [_instruct_row(i) for i in range(40)]
     write_local(src_dir, rows, "jsonl")
@@ -600,7 +626,10 @@ def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(
 
 
 def test_swap_into_place_is_rename_aside(tmp_path: Path) -> None:
-    """Old aside, new in place, only then a deletion; without an old folder the aside step is skipped."""
+    """
+    Old aside, new in place, only then a deletion; without an old folder the aside step is skipped.
+    """
+
     processed = tmp_path / "i"
     processed.mkdir()
     (processed / "data-00000.parquet").write_bytes(b"old")
@@ -630,8 +659,11 @@ def test_swap_into_place_is_rename_aside(tmp_path: Path) -> None:
 def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rename-aside window: a crash on the final delete leaves the new folder in place and the replaced one as
-    ``.old``: never a moment without the data (the repair step removes the ``.old``)."""
+    """
+    The rename-aside window: a crash on the final delete leaves the new folder in place and the replaced one as
+    .old: never a moment without the data (the repair step removes the .old).
+    """
+
     src_dir = layout.root.parent / "swap"
     write_local(src_dir, [_instruct_row(i) for i in range(4)], "jsonl")
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir)

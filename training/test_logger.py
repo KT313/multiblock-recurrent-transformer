@@ -1,8 +1,10 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the disabled logger (no-ops), the stubbed wandb path (quiet settings included), the gradient/parameter
+"""
+Tests for the disabled logger (no-ops), the stubbed wandb path (quiet settings included), the gradient/parameter
 metric helpers and `RunLogger` (the header records via `caplog` on `training.logger`, the dashboard calls on a
 recording fake and on a real `TrainingDashboard` over a StringIO console, the fallback picked under pytest and its
-`train.log`, wandb dict, timers on a fake clock, data composition, history, `TrainingReport`)."""
+`train.log`, wandb dict, timers on a fake clock, data composition, history, `TrainingReport`).
+"""
 
 import io
 import logging
@@ -57,7 +59,10 @@ def test_disabled_logger_is_a_no_op(tmp_path: Path) -> None:
 
 
 def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The wandb calls are exercised against a stub run so no wandb import/network happens."""
+    """
+    The wandb calls are exercised against a stub run so no wandb import/network happens.
+    """
+
     calls: list[tuple[Any, ...]] = []
 
     class _Config:
@@ -76,7 +81,9 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
             calls.append(("finish",))
 
     class _Settings:
-        """Stands in for `wandb.Settings`: records what `Logger` asks for."""
+        """
+        Stands in for `wandb.Settings`: records what `Logger` asks for.
+        """
 
         def __init__(self, **values: Any) -> None:
             self.values = values
@@ -120,8 +127,11 @@ def test_to_scalar() -> None:
 
 
 def test_describe_parameters_counts_total_recurrent_and_unrolled(tiny_model: RecurrentGPT) -> None:
-    """The line names the total, the parameters of the core blocks and the unrolled count at the mean recurrence
-    (tiny: mean_recurrence [2, 2], so unrolled = total + recurrent)."""
+    """
+    The line names the total, the parameters of the core blocks and the unrolled count at the mean recurrence
+    (tiny: mean_recurrence [2, 2], so unrolled = total + recurrent).
+    """
+
     total = num_parameters(tiny_model)
     recurrent = sum(p.numel() for block in tiny_model.transformer.core_blocks for p in block.parameters())
     assert 0 < recurrent < total
@@ -258,7 +268,9 @@ def test_non_finite_gradient_is_reported_as_nan(tiny_model: RecurrentGPT) -> Non
 
 
 class FakeClock:
-    """A clock that only moves when a test says so (`clock=` of `RunLogger.open`)."""
+    """
+    A clock that only moves when a test says so (`clock=` of `RunLogger.open`).
+    """
 
     def __init__(self, now: float = 1000.0) -> None:
         self.now = now
@@ -279,7 +291,10 @@ STEP_KEYS = {
 
 
 def two_stage_manager(settings: Settings) -> StageManager:
-    """Two stages with a transition between them (stage a: 8 steps, the last 25 % transitioning; stage b: 4 steps)."""
+    """
+    Two stages with a transition between them (stage a: 8 steps, the last 25 % transitioning; stage b: 4 steps).
+    """
+
     stages = [
         resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
         resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
@@ -296,7 +311,10 @@ def fake_result(
     metrics: dict[str, torch.Tensor] | None = None,
     validation: dict[str, torch.Tensor] | None = None,
 ) -> StepResult:
-    """A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors."""
+    """
+    A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors.
+    """
+
     return StepResult(
         step=step,
         learning_rate=1e-4 * step,
@@ -312,7 +330,10 @@ def fake_result(
 
 @pytest.fixture
 def resolved(tiny_dataset_config: DatasetConfig) -> ResolvedDataset:
-    """Only `config_hash` is read by `RunLogger.open` (the wandb hyperparameters)."""
+    """
+    Only `config_hash` is read by `RunLogger.open` (the wandb hyperparameters).
+    """
+
     return ResolvedDataset(
         config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}, rows_on_disk={}
     )
@@ -325,7 +346,9 @@ def console_records(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixtur
 
 
 class RecordingDashboard:
-    """A `Dashboard` that records every call (`RunLogger`'s side of the dashboard API, without a display)."""
+    """
+    A `Dashboard` that records every call (`RunLogger`'s side of the dashboard API, without a display).
+    """
 
     def __init__(self) -> None:
         # (step, stage index, transition progress or None, the step dict as passed)
@@ -350,7 +373,10 @@ class RecordingDashboard:
 
 
 def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
-    """A real `TrainingDashboard` rendering into a StringIO (never entered: no live display, no terminal capture)."""
+    """
+    A real `TrainingDashboard` rendering into a StringIO (never entered: no live display, no terminal capture).
+    """
+
     return TrainingDashboard(
         "steps",
         [s.name for s in stage_manager.stages],
@@ -374,9 +400,12 @@ def open_run_logger(
     setup_started: float | None = None,
     dashboard: Dashboard | None = None,
 ) -> RunLogger:
-    """`RunLogger.open` on the CPU backend; `dashboard` defaults to a fresh `RecordingDashboard` (available as
+    """
+    `RunLogger.open` on the CPU backend; `dashboard` defaults to a fresh `RecordingDashboard` (available as
     `run_logger.dashboard`), so no test opens the real factory unless it asks for it (`dashboard=None` explicitly is
-    not possible here; call `RunLogger.open` directly for that)."""
+    not possible here; call `RunLogger.open` directly for that).
+    """
+
     progress = TrainingProgress(step=start_step, resume_step=start_step if start_step else -1)
     backend = SingleDeviceBackend(device="cpu", precision="32")
     return RunLogger.open(
@@ -395,7 +424,10 @@ def open_run_logger(
 
 
 def recording(run_logger: RunLogger) -> RecordingDashboard:
-    """The `RecordingDashboard` behind a logger opened by `open_run_logger` without a dashboard of its own."""
+    """
+    The `RecordingDashboard` behind a logger opened by `open_run_logger` without a dashboard of its own.
+    """
+
     assert isinstance(run_logger.dashboard, RecordingDashboard)
     return run_logger.dashboard
 
@@ -403,7 +435,10 @@ def recording(run_logger: RunLogger) -> RecordingDashboard:
 def run_fake_steps(
     run_logger: RunLogger, stage_manager: StageManager, progress: TrainingProgress, clock: FakeClock, steps: int, seconds_per_step: float
 ) -> None:
-    """`steps` fake optimizer steps, each taking `seconds_per_step`, logged as `train()` logs them."""
+    """
+    `steps` fake optimizer steps, each taking `seconds_per_step`, logged as `train()` logs them.
+    """
+
     for _ in range(steps):
         result = fake_result(stage_manager, progress.step)
         progress.advance()
@@ -424,8 +459,11 @@ def _record_wandb_logs(monkeypatch: pytest.MonkeyPatch) -> dict[int, dict[str, A
 def test_open_logs_the_run_header_and_ends_the_setup_timer(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """The stage summary, the total-steps line, the parameter line and the setup line are INFO records on
-    `training.logger` marked `keep`; the setup timer is measured from `setup_started` to `open`."""
+    """
+    The stage summary, the total-steps line, the parameter line and the setup line are INFO records on
+    `training.logger` marked `keep`; the setup timer is measured from `setup_started` to `open`.
+    """
+
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock(1000.0)
@@ -448,9 +486,12 @@ def test_log_step_history_wandb_dict_and_throughput(
     console_records: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every log step: the same metric dict (already scalars) to wandb, as floats to `history[done]` and to the
+    """
+    Every log step: the same metric dict (already scalars) to wandb, as floats to `history[done]` and to the
     dashboard's `update_step` (no tensor in it); the throughput arithmetic on a fake clock ticking 2 s per step; no
-    per-step console record (the fallback dashboard's line is the one console line of a step)."""
+    per-step console record (the fallback dashboard's line is the one console line of a step).
+    """
+
     recorded = _record_wandb_logs(monkeypatch)
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
@@ -485,8 +526,11 @@ def test_log_step_history_wandb_dict_and_throughput(
 
 
 def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without `keep_history` (the CLI's default) `history` stays empty while wandb and the dashboard still get every
-    log step's metric dict: a long run does not hold its metrics in memory."""
+    """
+    Without `keep_history` (the CLI's default) `history` stays empty while wandb and the dashboard still get every
+    log step's metric dict: a long run does not hold its metrics in memory.
+    """
+
     recorded = _record_wandb_logs(monkeypatch)
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
@@ -505,9 +549,12 @@ def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.Mon
 def test_log_interval_composition_fractions_sum_to_one_and_reset(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
+    """
+    `log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
     dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
-    counts every world batch since the last log step and starts over afterwards."""
+    counts every world batch since the last log step and starts over afterwards.
+    """
+
     recorded = _record_wandb_logs(monkeypatch)
     settings = reference_settings(log_step_interval=2)
     stage_manager = reference_stage_manager(settings)
@@ -536,11 +583,14 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
 def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_at_done(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
+    """
+    Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
     done and one "transition complete" event after step 8 is done (worded as the thesis loop printed them, with the
     stage names); no console record for them. The bars get the stage containing `done` (a until 8 steps are done, b
     from then on) and the transition keys of `done`, while `history` keeps the `stage/*` metrics of the step trained
-    on, one step behind: `stage/current_stage` is the stage containing that step, also inside its transition."""
+    on, one step behind: `stage/current_stage` is the stage containing that step, also inside its transition.
+    """
+
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
@@ -564,10 +614,13 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
 def test_evaluating_times_the_validation_and_log_step_reports_it(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """The `evaluating()` block shows `evaluating` as the status (the previous status afterwards) and its duration
+    """
+    The `evaluating()` block shows `evaluating` as the status (the previous status afterwards) and its duration
     becomes `val_time` of that step's validation metrics (floats in the metric dict, `history` and the report); the
     dashboard gets the `val_loss*` entries as floats; a validation without a timed block reports 0 s (the timer is
-    consumed, never stale)."""
+    consumed, never stale).
+    """
+
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()
@@ -604,9 +657,12 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
 def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """A run resumed at step 4 that ran 3 steps, wrote 2 checkpoints and exported: every report field, the summary
+    """
+    A run resumed at step 4 that ran 3 steps, wrote 2 checkpoints and exported: every report field, the summary
     text, the events of resume / checkpoint / export, the `keep` line and the status of the finish, and `close()` +
-    `__exit__` releasing the resources exactly once."""
+    `__exit__` releasing the resources exactly once.
+    """
+
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock(500.0)
@@ -682,8 +738,11 @@ def test_fresh_start_report_summary_without_steps(
 def test_run_logger_never_prints(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Every console line is a logging record or a dashboard call; with a recording dashboard nothing reaches stdout /
-    stderr (there is no handler on `training`), and the module has no `print` at all."""
+    """
+    Every console line is a logging record or a dashboard call; with a recording dashboard nothing reaches stdout /
+    stderr (there is no handler on `training`), and the module has no `print` at all.
+    """
+
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     clock = FakeClock()
@@ -703,8 +762,11 @@ def test_run_logger_never_prints(
 def test_status_and_saving_checkpoint_forward_to_the_dashboard(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
 ) -> None:
-    """`status(text)` sets the header status; `saving_checkpoint()` shows `saving checkpoint` for the block and puts
-    the status from before it back (also after an exception in the block)."""
+    """
+    `status(text)` sets the header status; `saving_checkpoint()` shows `saving checkpoint` for the block and puts
+    the status from before it back (also after an exception in the block).
+    """
+
     settings = reference_settings()
     run_logger = open_run_logger(settings, reference_stage_manager(settings), tiny_model, resolved, tmp_path, FakeClock())
     run_logger.status("training")
@@ -726,9 +788,12 @@ def test_status_and_saving_checkpoint_forward_to_the_dashboard(
 def test_run_logger_drives_a_real_training_dashboard(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
 ) -> None:
-    """The same calls on a `TrainingDashboard` over a StringIO console (not entered: rendering only): after a log
+    """
+    The same calls on a `TrainingDashboard` over a StringIO console (not entered: rendering only): after a log
     step the frame shows the loss and the bar counts, `log_checkpoint` shows up in the events, `evaluating()` in the
-    status, the validation losses in their table."""
+    status, the validation losses in their table.
+    """
+
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
     board = string_console_dashboard(stage_manager)
@@ -762,12 +827,15 @@ def test_run_logger_drives_a_real_training_dashboard(
 def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Without an injected dashboard `open` goes through `open_dashboard`: stdout is not a TTY under pytest, so the
+    """
+    Without an injected dashboard `open` goes through `open_dashboard`: stdout is not a TTY under pytest, so the
     `ConsoleFallbackDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
     details, the log interval, the resume step) with the `training` logger attached for the block and
     `run_directory / train.log` appended: the header records, the fallback's step lines and events all end up there
     and on stderr (where the CLI's log handlers write too, so a piped run's story stays in one stream);
-    `close()` detaches it again."""
+    `close()` detaches it again.
+    """
+
     monkeypatch.setenv("TRAINING_DASHBOARD", "1")
     settings = reference_settings(log_step_interval=2)
     stage_manager = two_stage_manager(settings)
@@ -797,8 +865,11 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
 
 
 def test_open_dashboard_arguments(tmp_path: Path) -> None:
-    """`open_dashboard` passes the run to the factory: one bar per stage, the config file names as the header
-    details, the log interval and the resume step; the fallback is chosen when the display is disabled."""
+    """
+    `open_dashboard` passes the run to the factory: one bar per stage, the config file names as the header
+    details, the log interval and the resume step; the fallback is chosen when the display is disabled.
+    """
+
     settings = reference_settings(log_step_interval=3, eval_step_interval=99)  # eval must be a multiple of log
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
@@ -811,14 +882,20 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
 
 
 def _display_is_up(board: TrainingDashboard) -> bool:
-    """Through a call: mypy would otherwise keep the narrowing of ``board._live`` across the ``with`` block."""
+    """
+    Through a call: mypy would otherwise keep the narrowing of board._live across the with block.
+    """
+
     return board._live is not None
 
 
 def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """With the display enabled (`dashboard_enabled`: a terminal and `TRAINING_DASHBOARD` not `0`) `open_dashboard`
+    """
+    With the display enabled (`dashboard_enabled`: a terminal and `TRAINING_DASHBOARD` not `0`) `open_dashboard`
     builds the live `TrainingDashboard` from the same run description, up for the block and closed after it, with
-    stderr as the stream a display that disables itself falls back to (where the CLI's log handlers write)."""
+    stderr as the stream a display that disables itself falls back to (where the CLI's log handlers write).
+    """
+
     monkeypatch.setattr("training.logger.dashboard_enabled", lambda: True)
     settings = reference_settings(log_step_interval=3, eval_step_interval=99)
     stage_manager = two_stage_manager(settings)
@@ -833,7 +910,9 @@ def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, mon
 
 
 class RaisingTracker(Logger):
-    """A `Logger` whose `finish()` fails, as a broken `wandb.finish()` would (disabled: wandb is never imported)."""
+    """
+    A `Logger` whose `finish()` fails, as a broken `wandb.finish()` would (disabled: wandb is never imported).
+    """
 
     def __init__(self, out_dir: Path) -> None:
         super().__init__("proj", "run", out_dir, enabled=False)
@@ -852,8 +931,11 @@ def _logger_with(tracker: Logger, stage_manager: StageManager, settings: Setting
 
 
 def test_exit_releases_every_resource_even_when_the_tracker_raises(tmp_path: Path) -> None:
-    """A failing `wandb.finish()` used to leave the terminal with the dashboard's redirected streams and a hidden
-    cursor: the resources are released whatever the tracker does."""
+    """
+    A failing `wandb.finish()` used to leave the terminal with the dashboard's redirected streams and a hidden
+    cursor: the resources are released whatever the tracker does.
+    """
+
     settings = reference_settings()
     tracker = RaisingTracker(tmp_path)
     run_logger = _logger_with(tracker, reference_stage_manager(settings), settings, tmp_path)
@@ -865,7 +947,10 @@ def test_exit_releases_every_resource_even_when_the_tracker_raises(tmp_path: Pat
 
 
 def test_exit_raises_the_first_failure_and_still_releases_the_rest(tmp_path: Path) -> None:
-    """Both teardowns fail: everything is released and the first failure is the one raised, not the last."""
+    """
+    Both teardowns fail: everything is released and the first failure is the one raised, not the last.
+    """
+
     settings = reference_settings()
     tracker = RaisingTracker(tmp_path)
     run_logger = _logger_with(tracker, reference_stage_manager(settings), settings, tmp_path)
@@ -884,8 +969,11 @@ def test_exit_raises_the_first_failure_and_still_releases_the_rest(tmp_path: Pat
 def test_close_of_a_stopped_run(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """`close(..., stopped=True)` (the stop request of `train()`): the report says so, its summary tells how to
-    continue, the final `keep` line and the final dashboard status read "stopped on request"."""
+    """
+    `close(..., stopped=True)` (the stop request of `train()`): the report says so, its summary tells how to
+    continue, the final `keep` line and the final dashboard status read "stopped on request".
+    """
+
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()

@@ -1,13 +1,14 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``MANIFEST.json`` beside a shard directory: what the directory contains and which config built it.
+"""
+MANIFEST.json beside a shard directory: what the directory contains and which config built it.
 
-Every stage directory (``dataset/sources/<source>/raw/``, ``dataset/processed/<source>/``, tokenizers) carries one
-manifest. ``source_hash`` is the stage's key from the config that produced it: :meth:`DatasetConfig.raw_hash` for
-``raw/`` (loader identity plus token settings, so processing changes never invalidate downloads),
-:meth:`DatasetConfig.processed_hash` for ``processed/``, ``tokenizer_hash`` for tokenizers. A manifest whose hash
+Every stage directory (dataset/sources/<source>/raw/, dataset/processed/<source>/, tokenizers) carries one
+manifest. source_hash is the stage's key from the config that produced it: :meth:`DatasetConfig.raw_hash` for
+raw/ (loader identity plus token settings, so processing changes never invalidate downloads),
+:meth:`DatasetConfig.processed_hash` for processed/, tokenizer_hash for tokenizers. A manifest whose hash
 differs from the current config is stale: a processed folder is rebuilt, a raw folder is an error until the repair
 step deletes it after confirmation (raw is never re-downloaded silently). A raw manifest also records
-``truncated_at_tokens`` (the ``max_seq_length`` its texts were cut at): raising the cap above it makes the folder
+truncated_at_tokens (the max_seq_length its texts were cut at): raising the cap above it makes the folder
 *outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification reads parquet metadata only.
 """
 
@@ -92,7 +93,10 @@ class Manifest:
         return sum(shard.rows for shard in self.shards)
 
     def tokens(self) -> int | None:
-        """Total measured tokens, or None if any shard has no token count."""
+        """
+        Total measured tokens, or None if any shard has no token count.
+        """
+
         total = 0
         for shard in self.shards:
             if shard.tokens is None:
@@ -104,12 +108,15 @@ class Manifest:
         return self.source_hash == source_hash
 
     def is_outdated(self, max_seq_length: int) -> bool:
-        """Whether a raw folder was stored with a smaller cap than the config asks for now.
+        """
+        Whether a raw folder was stored with a smaller cap than the config asks for now.
 
-        Cap rule: rows are at most ``truncated_at_tokens`` long, so raising ``max_seq_length`` above it outdates the
+        Cap rule: rows are at most truncated_at_tokens long, so raising max_seq_length above it outdates the
         folder (its texts are missing tokens the config now wants; it is re-downloaded after confirmation), while
-        lowering it never does (the build clamps stored counts, training truncates at ``block_size`` anyway). A
-        manifest without ``truncated_at_tokens`` is never outdated by this rule."""
+        lowering it never does (the build clamps stored counts, training truncates at block_size anyway). A
+        manifest without truncated_at_tokens is never outdated by this rule.
+        """
+
         return self.truncated_at_tokens is not None and max_seq_length > self.truncated_at_tokens
 
     def add_shard(
@@ -121,7 +128,10 @@ class Manifest:
         skipped_malformed: int | None = None,
         dropped_too_long: int | None = None,
     ) -> None:
-        """Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name."""
+        """
+        Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name.
+        """
+
         self.shards = [shard for shard in self.shards if shard.name != name]
         self.shards.append(
             ShardInfo(
@@ -134,8 +144,11 @@ class Manifest:
     # --- (de)serialisation -------------------------------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        """The JSON layout: the stage's typed fields live under ``extra`` (a processed manifest's ``seed`` is
-        ``shuffle_seed``, a raw manifest's ``check_limit`` is ``check_limit_reached``, written only when set)."""
+        """
+        The JSON layout: the stage's typed fields live under extra (a processed manifest's seed is
+        shuffle_seed, a raw manifest's check_limit is check_limit_reached, written only when set).
+        """
+
         payload = asdict(self)
         extra: dict[str, Any] = payload.pop("extra")
         typed = {name: payload.pop(name) for name in _PROCESSED_FIELDS + _RAW_FIELDS}
@@ -152,7 +165,10 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Manifest:
-        """Build from a JSON dict (the layout of :meth:`to_dict`); unknown keys (from newer versions) are ignored."""
+        """
+        Build from a JSON dict (the layout of :meth:`to_dict`); unknown keys (from newer versions) are ignored.
+        """
+
         kwargs = _known_fields_only(payload, cls)
         raw_shards: list[dict[str, Any]] = kwargs.get("shards", [])
         kwargs["shards"] = [ShardInfo(**_known_fields_only(shard, ShardInfo)) for shard in raw_shards]
@@ -169,7 +185,10 @@ class Manifest:
         return cls(**kwargs)
 
     def save(self, directory: Path) -> Path:
-        """Write ``directory/MANIFEST.json`` atomically (:func:`write_atomically`) and return its path."""
+        """
+        Write directory/MANIFEST.json atomically (:func:`write_atomically`) and return its path.
+        """
+
         path = directory / MANIFEST_NAME
         with write_atomically(path) as tmp:
             tmp.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
@@ -178,9 +197,12 @@ class Manifest:
 
     @classmethod
     def load(cls, directory: Path) -> Manifest | None:
-        """The manifest in ``directory``, or None if absent. An unparsable manifest is only ignored (with a warning)
+        """
+        The manifest in directory, or None if absent. An unparsable manifest is only ignored (with a warning)
         when the directory holds no shards; next to shards it is an error: treating it as absent would make the
-        next build start from shard 0 and delete data that may have been expensive to download."""
+        next build start from shard 0 and delete data that may have been expensive to download.
+        """
+
         path = directory / MANIFEST_NAME
         if not path.is_file():
             return None
@@ -206,17 +228,26 @@ _RAW_FIELDS = tuple(_RAW_KEYS.values())
 
 
 def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:
-    """``[[name, rows], ...]`` of ``shards``, the shape a processed manifest's ``input_shards`` records."""
+    """
+    [[name, rows], ...] of shards, the shape a processed manifest's input_shards records.
+    """
+
     return [[shard.name, shard.rows] for shard in shards]
 
 
 def has_shards(directory: Path) -> bool:
-    """Whether ``directory`` holds any ``data-*.parquet`` shard."""
+    """
+    Whether directory holds any data-*.parquet shard.
+    """
+
     return any(directory.glob("data-*.parquet"))
 
 
 def _known_fields_only(payload: dict[str, Any], dataclass_type: type) -> dict[str, Any]:
-    """``payload`` restricted to the field names of ``dataclass_type``."""
+    """
+    payload restricted to the field names of dataclass_type.
+    """
+
     known = {dataclass_field.name for dataclass_field in fields(dataclass_type)}
     return {key: value for key, value in payload.items() if key in known}
 
@@ -225,19 +256,28 @@ def _known_fields_only(payload: dict[str, Any], dataclass_type: type) -> dict[st
 
 
 def shard_rows(path: Path) -> int:
-    """Row count of a parquet file from its footer metadata (no data read)."""
+    """
+    Row count of a parquet file from its footer metadata (no data read).
+    """
+
     return pq.read_metadata(path).num_rows
 
 
 def shard_tokens(path: Path) -> int:
-    """Sum of a shard's ``tokens`` column (one column read)."""
+    """
+    Sum of a shard's tokens column (one column read).
+    """
+
     column = pq.read_table(path, columns=["tokens"]).column("tokens")
     total = pc.sum(column).as_py()
     return 0 if total is None else int(total)
 
 
 def shard_problem(directory: Path, shard: ShardInfo) -> str | None:
-    """Why ``shard`` does not match its file in ``directory`` (missing, unreadable, row count), or None."""
+    """
+    Why shard does not match its file in directory (missing, unreadable, row count), or None.
+    """
+
     path = directory / shard.name
     if not path.is_file():
         return f"missing shard {shard.name}"
@@ -251,7 +291,10 @@ def shard_problem(directory: Path, shard: ShardInfo) -> str | None:
 
 
 def library_versions() -> dict[str, str]:
-    """Python, pyarrow, datasets/transformers (if installed) and the repo git sha (if available)."""
+    """
+    Python, pyarrow, datasets/transformers (if installed) and the repo git sha (if available).
+    """
+
     versions = {"python": platform.python_version(), "pyarrow": pa.__version__}
     for package in ("datasets", "transformers"):
         with contextlib.suppress(importlib_metadata.PackageNotFoundError):
@@ -263,7 +306,10 @@ def library_versions() -> dict[str, str]:
 
 
 def _git_sha() -> str | None:
-    """HEAD commit of this repo, or None when git is unavailable or the tree is not a checkout."""
+    """
+    HEAD commit of this repo, or None when git is unavailable or the tree is not a checkout.
+    """
+
     repo_root = Path(__file__).resolve().parents[3]
     try:
         result = subprocess.run(

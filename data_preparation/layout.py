@@ -1,7 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
+"""
+Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
-The tree shows the download/build boundary: ``sources/`` holds only downloaded data, ``processed/`` only derived data.
+The tree shows the download/build boundary: sources/ holds only downloaded data, processed/ only derived data.
 
     <root>/sources/<source>/raw/                         downloaded rows (text truncated to `max_seq_length` tokens,
                                                          + `tokens` column); append-only, shared by every dataset config;
@@ -29,7 +30,10 @@ PROCESSED_COLUMNS: tuple[str, ...] = PRETRAIN_PROCESSED_COLUMNS
 
 
 def processed_columns(kind: str) -> tuple[str, ...]:
-    """Columns of a processed shard of a source of ``kind`` (``pretrain`` or ``instruct``)."""
+    """
+    Columns of a processed shard of a source of kind (pretrain or instruct).
+    """
+
     if kind == "pretrain":
         return PRETRAIN_PROCESSED_COLUMNS
     if kind == "instruct":
@@ -39,16 +43,24 @@ def processed_columns(kind: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class DatasetLayout:
-    """Directory scheme under `root` (default `dataset/`); every method returns a path, none touches the disk."""
+    """
+    Directory scheme under `root` (default `dataset/`); every method returns a path, none touches the disk.
+    """
 
     root: Path = Path("dataset")
 
     def raw_dir(self, name: str) -> Path:
-        """Downloaded rows of source ``name`` (the only tree the download step writes)."""
+        """
+        Downloaded rows of source name (the only tree the download step writes).
+        """
+
         return self.root / "sources" / name / "raw"
 
     def processed_dir(self, name: str) -> Path:
-        """Cleaned rows of source ``name`` (the only tree the build step writes)."""
+        """
+        Cleaned rows of source name (the only tree the build step writes).
+        """
+
         return self.root / "processed" / name
 
     def tokenizer_dir(self, name: str) -> Path:

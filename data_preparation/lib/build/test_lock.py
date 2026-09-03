@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for data_preparation.lib.build.lock."""
+"""
+Tests for data_preparation.lib.build.lock.
+"""
 
 from __future__ import annotations
 
@@ -76,7 +78,10 @@ def test_a_lock_is_released_on_an_exception(tmp_path: Path) -> None:
 
 
 def test_a_lock_file_left_by_a_dead_holder_is_simply_taken(tmp_path: Path) -> None:
-    """The OS dropped the `flock` with the process: the next run takes the file and overwrites the dead holder's record."""
+    """
+    The OS dropped the `flock` with the process: the next run takes the file and overwrites the dead holder's record.
+    """
+
     path = tmp_path / TRAIN_LOCK_NAME
     path.write_text(json.dumps({"program": "training", "pid": 999999, "host": "dead-host", "since": "2020-01-01T00:00:00+00:00"}))
     with run_lock(path, "training"):

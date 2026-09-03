@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Names shared by the dashboard modules: the env var, the logger hierarchy, the log file, the enabling rule."""
+"""
+Names shared by the dashboard modules: the env var, the logger hierarchy, the log file, the enabling rule.
+"""
 
 from __future__ import annotations
 
@@ -30,5 +32,8 @@ lines_log.propagate = False
 
 
 def dashboard_enabled(stream: TextIO | None = None) -> bool:
-    """False when ``TRAINING_DASHBOARD=0`` (or ``false``/``no``/``off``) or when ``stream`` (stdout) is not a TTY."""
+    """
+    False when TRAINING_DASHBOARD=0 (or false/no/off) or when stream (stdout) is not a TTY.
+    """
+
     return display_enabled(ENV_VAR, sys.stdout if stream is None else stream)

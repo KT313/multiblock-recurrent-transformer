@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for the parameter-group split, `build_optimizer`/`set_lr` and hand-checked ELLISAdam steps."""
+"""
+Tests for the parameter-group split, `build_optimizer`/`set_lr` and hand-checked ELLISAdam steps.
+"""
 
 import copy
 import math
@@ -79,13 +81,19 @@ def test_build_optimizer(name: str, cls: type[torch.optim.Optimizer]) -> None:
 
 
 def _group_options(opt: torch.optim.Optimizer) -> list[dict[str, Any]]:
-    """Every per-group option except the parameter list, tensors compared by value."""
+    """
+    Every per-group option except the parameter list, tensors compared by value.
+    """
+
     return [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
 
 
 def test_build_optimizer_matches_the_old_dict_path() -> None:
-    """The dataclass path hands the optimizer exactly the keyword arguments the free-form dict did: the shipped
-    ELLISAdam options give the same defaults, and an unset `eps` keeps each optimizer's own default."""
+    """
+    The dataclass path hands the optimizer exactly the keyword arguments the free-form dict did: the shipped
+    ELLISAdam options give the same defaults, and an unset `eps` keeps each optimizer's own default.
+    """
+
     p = torch.nn.Parameter(torch.zeros(2))
     config = OptimizerConfig(
         lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
@@ -137,7 +145,10 @@ def _reference_ellis_adam_step(
     update_clipping: bool,
     atan_adam: bool,
 ) -> float:
-    """Plain-python re-implementation of `_single_tensor_modded_adamw` for a scalar at `init_lr == lr`."""
+    """
+    Plain-python re-implementation of `_single_tensor_modded_adamw` for a scalar at `init_lr == lr`.
+    """
+
     m = beta1 * m + (1 - beta1) * g
     v = beta2 * v + (1 - beta2) * g * g
     step_size = lr
@@ -206,11 +217,14 @@ def test_ellis_adam_two_steps_match_reference() -> None:
 
 
 def test_ellis_adam_final_config_one_step_hand_value() -> None:
-    """All four switches of `config/crow_300m_final.yaml` at once (update_clipping, atan_adam, running_init,
+    """
+    All four switches of `config/crow_300m_final.yaml` at once (update_clipping, atan_adam, running_init,
     decouple_wd). Hand calculation for p=1, g=0.5, lr=0.1, betas=(0.9, 0.95), wd=0.01:
     running_init -> m = v = g, g^2 after the (idempotent) first moment update -> m=0.5, v=0.25;
     rms = sqrt(g^2 / v) = 1 -> no clipping; step_size = 0.1 / bc1(0.1) = 1.0;
-    denom = sqrt(v) / sqrt(1 - 0.95) = 0.5 / sqrt(0.05); decay 1 - 0.01; update = atan2(0.5, denom)."""
+    denom = sqrt(v) / sqrt(1 - 0.95) = 0.5 / sqrt(0.05); decay 1 - 0.01; update = atan2(0.5, denom).
+    """
+
     p = torch.nn.Parameter(torch.tensor([1.0]))
     p.grad = torch.tensor([0.5])
     opt = ELLISAdam(
@@ -242,8 +256,11 @@ def test_ellis_adam_final_config_one_step_hand_value() -> None:
 
 
 def test_update_clipping_eps_floor_is_applied_in_place() -> None:
-    """When `exp_avg_sq < eps^2` the RMS uses the floor `eps^2` -- and, as upstream, the `clamp_` is in place, so
-    the stored second moment is raised to `eps^2` as a side effect. Pinned so a rewrite notices the change."""
+    """
+    When `exp_avg_sq < eps^2` the RMS uses the floor `eps^2` -- and, as upstream, the `clamp_` is in place, so
+    the stored second moment is raised to `eps^2` as a side effect. Pinned so a rewrite notices the change.
+    """
+
     p = torch.nn.Parameter(torch.tensor([1.0]))
     p.grad = torch.tensor([1e-9])
     opt = ELLISAdam([p], lr=0.1, betas=(0.9, 0.99), eps=1e-6, weight_decay=0.0, update_clipping=True)
@@ -264,7 +281,10 @@ def test_decoupled_weight_decay_scales_with_scheduled_lr() -> None:
 
 
 def test_coupled_weight_decay_multiplies_by_lr() -> None:
-    """`decouple_wd=False`: decay per step is `lr * weight_decay` (called directly on the kernel)."""
+    """
+    `decouple_wd=False`: decay per step is `lr * weight_decay` (called directly on the kernel).
+    """
+
     p = torch.tensor([1.0])
     _single_tensor_modded_adamw(
         [p],
@@ -333,8 +353,11 @@ def test_ellis_adam_state_dict_round_trip() -> None:
 
 
 def test_ellis_adam_on_tiny_model_reduces_loss(tiny_model: RecurrentGPT) -> None:
-    """`weight_decay` is a per-step fraction under `decouple_wd` (the final run used 4e-5); with 0.1 the parameters
-    shrink 10 % every step and the loss rises, so use the real setting here."""
+    """
+    `weight_decay` is a per-step fraction under `decouple_wd` (the final run used 4e-5); with 0.1 the parameters
+    shrink 10 % every step and the loss rises, so use the real setting here.
+    """
+
     torch.manual_seed(0)
     x = torch.randint(0, 512, (2, 32))
     groups = get_param_groups(tiny_model, weight_decay=4e-5)

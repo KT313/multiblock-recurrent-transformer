@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The live training dashboard: one transient ``rich.live.Live`` layout (header, stage bars, metrics, validation,
+"""
+The live training dashboard: one transient rich.live.Live layout (header, stage bars, metrics, validation,
 events, log panel, footer) with the terminal captured around it (:mod:`training.ui.capture`). The module docstring
-of :mod:`training.ui.dashboard` describes the whole picture."""
+of :mod:`training.ui.dashboard` describes the whole picture.
+"""
 
 from __future__ import annotations
 
@@ -48,8 +50,10 @@ DEFAULT_REFRESH_PER_SECOND = 4  # bounded: the live display redraws on its own t
 
 @dataclass
 class StageBar:
-    """One bar row: a stage (or the overall run) with its optimizer-step count. ``marker`` / ``style`` tell the
-    stage's state (``▶`` current, ``✓`` done, blank pending); ``note`` is the dimmed text after the percentage."""
+    """
+    One bar row: a stage (or the overall run) with its optimizer-step count. marker / style tell the
+    stage's state (▶ current, ✓ done, blank pending); note is the dimmed text after the percentage.
+    """
 
     name: str
     total: int
@@ -64,16 +68,17 @@ class StageBar:
 
 
 class TrainingDashboard(LiveDisplay):
-    """Live terminal display of one training run (layout and capture: see :mod:`training.ui.dashboard`).
+    """
+    Live terminal display of one training run (layout and capture: see :mod:`training.ui.dashboard`).
 
-    ``console`` is for tests; ``clock`` is injected by the ETA tests. ``enabled`` is True until the dashboard disables
+    console is for tests; clock is injected by the ETA tests. enabled is True until the dashboard disables
     itself after an internal error or a dead terminal (:mod:`ui.display`); from then on the public methods only log
-    the lines the console fallback logs and :meth:`write` prints plain lines to ``fallback_stream`` (the CLI passes
-    stderr) or ``stream``, so a broken display costs one warning, never the run. ``final_frame`` prints the static
+    the lines the console fallback logs and :meth:`write` prints plain lines to fallback_stream (the CLI passes
+    stderr) or stream, so a broken display costs one warning, never the run. final_frame prints the static
     summary once the display closed.
 
     The step / validation / event lines go to :data:`~training.ui.common.lines_log` too, which only the log file
-    reads, so ``train.log`` reads the same whichever dashboard the run had.
+    reads, so train.log reads the same whichever dashboard the run had.
     """
 
     def __init__(
@@ -133,8 +138,11 @@ class TrainingDashboard(LiveDisplay):
 
     @contextmanager
     def running(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[TrainingDashboard]:
-        """The dashboard in service for the block: ``logger`` (default: the ``training`` logger) attached first, so
-        the dashboard's own warnings always have a handler, then the display up; ``log_file`` appended."""
+        """
+        The dashboard in service for the block: logger (default: the training logger) attached first, so
+        the dashboard's own warnings always have a handler, then the display up; log_file appended.
+        """
+
         with self.attach(logger, log_file=log_file), self:
             yield self
 
@@ -156,8 +164,11 @@ class TrainingDashboard(LiveDisplay):
         self.close()
 
     def close(self) -> None:
-        """End the display (idempotent): erase the frame, restore streams / handlers / environment, print the kept
-        lines and, with ``final_frame``, the static summary. ``__exit__`` calls it on every way out."""
+        """
+        End the display (idempotent): erase the frame, restore streams / handlers / environment, print the kept
+        lines and, with final_frame, the static summary. __exit__ calls it on every way out.
+        """
+
         if not self._open:
             return
         self._open = False
@@ -172,15 +183,21 @@ class TrainingDashboard(LiveDisplay):
             self._console.print(self.render_summary())
 
     def _teardown(self) -> None:
-        """Undo ``__enter__``. Never called with the lock held: ``Live.stop`` joins its refresh thread, which may be
-        waiting for the lock."""
+        """
+        Undo __enter__. Never called with the lock held: Live.stop joins its refresh thread, which may be
+        waiting for the lock.
+        """
+
         try:
             self._stop_live()
         finally:
             self._capture.stop()
 
     def _pin_console_file(self) -> None:
-        """A console created without a file follows ``sys.stdout`` dynamically and would render into the sink."""
+        """
+        A console created without a file follows sys.stdout dynamically and would render into the sink.
+        """
+
         if self._console.file is sys.stdout or self._console.file is sys.stderr:
             self._console.file = self._console.file
 
@@ -191,8 +208,11 @@ class TrainingDashboard(LiveDisplay):
         self._capture.redirect_streams()
 
     def _disable(self, error: BaseException) -> None:
-        """Close the display after an internal error and behave like the console fallback from now on. Logs one
-        warning."""
+        """
+        Close the display after an internal error and behave like the console fallback from now on. Logs one
+        warning.
+        """
+
         if not self.enabled:
             return
         self.enabled = False
@@ -215,13 +235,19 @@ class TrainingDashboard(LiveDisplay):
             handler.close()
 
     def _check_render_error(self) -> None:
-        """A failure of the render happened on the Live thread (which must not stop Live itself); handle it here."""
+        """
+        A failure of the render happened on the Live thread (which must not stop Live itself); handle it here.
+        """
+
         error, self._render_error = self._render_error, None
         if error is not None:
             self._disable(error)
 
     def _guarded(self, action: Callable[[], None]) -> None:
-        """Run ``action`` on the display; on any exception disable the display (the lines still get logged)."""
+        """
+        Run action on the display; on any exception disable the display (the lines still get logged).
+        """
+
         self._check_render_error()
         if not self.enabled:
             return
@@ -235,9 +261,12 @@ class TrainingDashboard(LiveDisplay):
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
     ) -> None:
-        """``step`` optimizer steps are done in stage ``stage_index``; ``transition`` is the progress (0-1) of the
-        running transition or None; only the :data:`METRIC_COLUMNS` keys of ``metrics`` are read. O(1); the display
-        redraws on its own timer."""
+        """
+        step optimizer steps are done in stage stage_index; transition is the progress (0-1) of the
+        running transition or None; only the :data:`METRIC_COLUMNS` keys of metrics are read. O(1); the display
+        redraws on its own timer.
+        """
+
         with self._lock:
             self._throughput.record(step)
         self._guarded(lambda: self._apply_step(step, stage_index, transition, metrics))
@@ -255,17 +284,26 @@ class TrainingDashboard(LiveDisplay):
             lines_log.info(text)
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
-        """The validation losses measured after ``step`` (one entry per recurrence depth, e.g. ``val_loss_4``)."""
+        """
+        The validation losses measured after step (one entry per recurrence depth, e.g. val_loss_4).
+        """
+
         self._guarded(lambda: self._apply_validation(step, losses))
         lines_log.info(validation_line(step, losses))
 
     def note_event(self, text: str) -> None:
-        """Add a line to the events list (checkpoint written, resume point, stage transition, export)."""
+        """
+        Add a line to the events list (checkpoint written, resume point, stage transition, export).
+        """
+
         self._guarded(lambda: self._apply_event(text))
         lines_log.info(event_line(text))
 
     def set_status(self, text: str) -> None:
-        """The status shown in the header (``training``, ``evaluating``, ``saving checkpoint`` ...)."""
+        """
+        The status shown in the header (training, evaluating, saving checkpoint ...).
+        """
+
         self._guarded(lambda: self._apply_status(text))
         lines_log.debug(status_line(text))
 
@@ -312,9 +350,12 @@ class TrainingDashboard(LiveDisplay):
 
     @contextmanager
     def attach(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[None]:
-        """Route ``logger`` (default: the ``training`` logger) into the panel and ``log_file`` (named in the footer),
-        and this dashboard's own lines into ``log_file`` alone (one shared file handler) for the block. A logger
-        above INFO is lowered to INFO for the block."""
+        """
+        Route logger (default: the training logger) into the panel and log_file (named in the footer),
+        and this dashboard's own lines into log_file alone (one shared file handler) for the block. A logger
+        above INFO is lowered to INFO for the block.
+        """
+
         target = logger if logger is not None else logging.getLogger(TRAINING_LOGGER_NAME)
         with self._lock:
             self._attached_logger_names.append(target.name)
@@ -331,7 +372,10 @@ class TrainingDashboard(LiveDisplay):
     # --- state for tests ------------------------------------------------------------------------------------------------
 
     def events(self) -> list[str]:
-        """The event lines currently shown (newest last)."""
+        """
+        The event lines currently shown (newest last).
+        """
+
         with self._lock:
             return list(self._events)
 
@@ -342,7 +386,10 @@ class TrainingDashboard(LiveDisplay):
 
     @property
     def tasks(self) -> list[StageBar]:
-        """The bars: one per stage, then the overall bar."""
+        """
+        The bars: one per stage, then the overall bar.
+        """
+
         with self._lock:
             return [*self._bars, self._overall]
 
@@ -364,13 +411,19 @@ class TrainingDashboard(LiveDisplay):
             yield Text(f"training dashboard render failed: {error!r}", style="bold red")
 
     def render_summary(self) -> RenderableType:
-        """The static summary printed after the display closed: header, bars, metrics, validation, events."""
+        """
+        The static summary printed after the display closed: header, bars, metrics, validation, events.
+        """
+
         with self._lock:
             events = [line(event) for event in self._events] or [line("(no events)", style="dim")]
             return Group(self._render_fixed(), line("events", style="bold"), *events)
 
     def _render_fixed(self) -> Group:
-        """Header, bars, metrics and validation: the part of the frame whose height only the run decides."""
+        """
+        Header, bars, metrics and validation: the part of the frame whose height only the run decides.
+        """
+
         parts: list[RenderableType] = [self._render_header(), self._render_bars(), self._render_metrics()]
         validation = self._render_validation()
         if validation is not None:

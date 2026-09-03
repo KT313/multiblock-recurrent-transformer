@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `model.blocks.sandwich.SandwichBlock`."""
+"""
+Tests for `model.blocks.sandwich.SandwichBlock`.
+"""
 
 from typing import Any
 
@@ -67,8 +69,11 @@ def test_all_parameters_receive_gradient() -> None:
 
 
 def test_mask_argument_is_forwarded_to_attention(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The block passes its `mask` argument through to attention (a sentinel object is used so a dropped argument
-    cannot be confused with the default None)."""
+    """
+    The block passes its `mask` argument through to attention (a sentinel object is used so a dropped argument
+    cannot be confused with the default None).
+    """
+
     block, cfg, freqs = make_block()
     seen: list[Tensor | None] = []
     orig = block.attn.forward

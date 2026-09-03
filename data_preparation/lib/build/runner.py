@@ -1,7 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""``prepare`` / ``status``: the top-level data pipeline, readable top to bottom.
+"""
+prepare / status: the top-level data pipeline, readable top to bottom.
 
-``prepare`` runs tokenizer, repair, (download + build) rounds, report, under the dataset directory's build lock::
+prepare runs tokenizer, repair, (download + build) rounds, report, under the dataset directory's build lock::
 
     prepare_tokenizer                                  tokenizers/<name>/ (downloads count tokens with it)
     repair_broken_and_stale_folders                    truncate broken raw, delete stale processed, confirm before any raw
@@ -16,18 +17,18 @@
     assess_dataset_state                               the status table and its verdict, counting the repairs this
                                                        run left undone (a dry run leaves all of them) as incomplete
 
-:func:`download_and_build_missing` is the only place with thread-pool code: a pool of ``max_parallel_downloads``
-download jobs (the ``github_code`` sources of one repo form one job) and a pool of ``num_workers`` build jobs run
+:func:`download_and_build_missing` is the only place with thread-pool code: a pool of max_parallel_downloads
+download jobs (the github_code sources of one repo form one job) and a pool of num_workers build jobs run
 side by side (:class:`JobPool`). A source is built the moment its download job finished, sources with nothing to
 download are built right away, and a source is never built while its own download runs. Each build job may hold a
-spawn process pool of ``pass_workers`` for its optional cleaning passes (decontamination / minhash), so the worst
-case is ``num_workers × pass_workers`` worker processes next to the threads. A failing job stops every running job
+spawn process pool of pass_workers for its optional cleaning passes (decontamination / minhash), so the worst
+case is num_workers × pass_workers worker processes next to the threads. A failing job stops every running job
 of both pools at its next shard (:class:`StopFlag`) and is re-raised after they stopped: a failed source is a
-failed build. Ctrl-C while waiting does the same and raises :class:`BuildAborted` (``prepare.py`` exits 130);
+failed build. Ctrl-C while waiting does the same and raises :class:`BuildAborted` (prepare.py exits 130);
 everything published so far is kept and the next run resumes at shard granularity.
 
-``status`` is read-only: the repair step's dry report ("would repair: …") plus the same
-:func:`assess_dataset_state` ending, so it and ``prepare --dry_run`` cannot call the same tree differently.
+status is read-only: the repair step's dry report ("would repair: …") plus the same
+:func:`assess_dataset_state` ending, so it and prepare --dry_run cannot call the same tree differently.
 """
 
 from __future__ import annotations
@@ -89,16 +90,18 @@ def prepare(
     should_stop: StopCheck | None = None,
     confirm: Confirm | None = None,
 ) -> DatasetReport:
-    """Materialise the dataset config at ``config_path`` under ``dataset_dir`` (see the module docstring) and return
+    """
+    Materialise the dataset config at config_path under dataset_dir (see the module docstring) and return
     its status.
 
-    ``assume_yes`` answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
-    cannot be parsed) without asking; otherwise ``confirm`` (or the terminal) is asked once and a refusal raises
-    :class:`ConfirmationRequired` before anything is changed. ``dry_run`` reports what the repair and the first
+    assume_yes answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
+    cannot be parsed) without asking; otherwise confirm (or the terminal) is asked once and a refusal raises
+    :class:`ConfirmationRequired` before anything is changed. dry_run reports what the repair and the first
     round would do and writes nothing (not even the lock file); its report is the one :func:`status` gives for the
-    same tree. ``steps`` (a subset of :data:`STEPS`) and ``sources`` restrict the work, and the satisfaction check,
+    same tree. steps (a subset of :data:`STEPS`) and sources restrict the work, and the satisfaction check,
     to the named steps / sources; the returned report always covers the whole config.
     """
+
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
@@ -132,8 +135,11 @@ def prepare(
 
 
 def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
-    """Read-only: what the repair step would do ("would repair: …"; such sources count as incomplete) and the
-    status table, logged and returned."""
+    """
+    Read-only: what the repair step would do ("would repair: …"; such sources count as incomplete) and the
+    status table, logged and returned.
+    """
+
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
@@ -158,13 +164,16 @@ def download_and_build_missing(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
 ) -> None:
-    """One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
-    not all processed yet, at the same time. A pool of ``max_parallel_downloads`` download jobs (the ``github_code``
-    sources of one repo are one job, :func:`download_github_code_group`) and a pool of ``num_workers`` build jobs
+    """
+    One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
+    not all processed yet, at the same time. A pool of max_parallel_downloads download jobs (the github_code
+    sources of one repo are one job, :func:`download_github_code_group`) and a pool of num_workers build jobs
     (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`; each build hands
-    ``pass_workers`` to its optional cleaning passes. Sources with nothing to download are built right away; every
+    pass_workers to its optional cleaning passes. Sources with nothing to download are built right away; every
     other source is built as soon as its download job finished, so a source is never built while its own download
-    runs. ``steps`` restricts the round to its download / build part, ``sources`` to the named sources."""
+    runs. steps restricts the round to its download / build part, sources to the named sources.
+    """
+
     downloads = download_jobs(download_plan, config, layout, hf_token) if "download" in steps else []
     downloading = {name for job in downloads for name in job.sources}
     pending = sources_with_pending_raw_shards(config, layout, sources) if "build" in steps else []
@@ -174,7 +183,10 @@ def download_and_build_missing(
     build_pool = JobPool("builds", max_workers=num_workers, flag=flag, total=len(builds) + len(downloading))
 
     def build_when_downloaded(job: Job) -> None:
-        """The follow-up of a finished download job (called in the main thread): build what it fetched."""
+        """
+        The follow-up of a finished download job (called in the main thread): build what it fetched.
+        """
+
         for name in job.sources:
             if "build" in steps and build_is_pending(config, name, layout):
                 build_pool.submit(build_source_job(config, name, layout, pass_workers))
@@ -196,7 +208,9 @@ def download_and_build_missing(
 
 @dataclass(frozen=True)
 class Job:
-    """One unit of work of a parallel helper; ``action`` takes the stop check the steps poll between shards."""
+    """
+    One unit of work of a parallel helper; action takes the stop check the steps poll between shards.
+    """
 
     what: str  # "source" | "github_code group" (for the log line on failure)
     name: str
@@ -205,9 +219,12 @@ class Job:
 
 
 def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None) -> list[Job]:
-    """One job per source with rows to fetch; the ``github_code`` sources of one repo are grouped into one. The
-    download takes a target (``rows_needed=``), so every job is asked for :attr:`SourceLedger.rows_target`: the
-    rows already on disk plus the ones the plan wants added (more than the budget in a top-up round)."""
+    """
+    One job per source with rows to fetch; the github_code sources of one repo are grouped into one. The
+    download takes a target (rows_needed=), so every job is asked for :attr:`SourceLedger.rows_target`: the
+    rows already on disk plus the ones the plan wants added (more than the budget in a top-up round).
+    """
+
     to_fetch = download_plan.to_fetch()
     rows_needed = {source.name: source.rows_target for source in to_fetch}
     jobs: list[Job] = []
@@ -222,9 +239,12 @@ def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: Da
 
 
 def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str]]:
-    """The ``github_code`` sources among ``names`` that share a repo (:func:`github_code_repo_key`), two or more
+    """
+    The github_code sources among names that share a repo (:func:`github_code_repo_key`), two or more
     per group, in config order; a single source of a repo goes through the ordinary per-source download (the same
-    pass over its own loader)."""
+    pass over its own loader).
+    """
+
     groups: dict[tuple[str | None, str | None, str], list[str]] = {}
     for name in names:
         source = config.sources[name]
@@ -258,9 +278,11 @@ def build_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, pa
 
 
 class StopFlag:
-    """The shared stop request of one pool of jobs: ``stop(reason)`` makes every job stop at its next shard (the
-    steps poll :meth:`should_stop`); the first reason wins. An outer ``should_stop`` (Ctrl-C handling of the caller,
-    a training run shutting down) is polled too."""
+    """
+    The shared stop request of one pool of jobs: stop(reason) makes every job stop at its next shard (the
+    steps poll :meth:`should_stop`); the first reason wins. An outer should_stop (Ctrl-C handling of the caller,
+    a training run shutting down) is polled too.
+    """
 
     def __init__(self, outer: StopCheck | None = None) -> None:
         self._event = threading.Event()
@@ -277,12 +299,14 @@ class StopFlag:
 
 
 class JobPool:
-    """A thread pool of ``max_workers`` running :class:`Job` objects under a shared :class:`StopFlag`, with the summary
-    bar of the dashboard panel named ``description`` (the jobs' own bars are its rows; ``total`` = the jobs expected).
+    """
+    A thread pool of max_workers running :class:`Job` objects under a shared :class:`StopFlag`, with the summary
+    bar of the dashboard panel named description (the jobs' own bars are its rows; total = the jobs expected).
     Jobs may be submitted while the pool runs (:meth:`submit`); :func:`wait_for_jobs` waits on :attr:`futures` and
-    calls ``on_success`` (main thread) for every job that finished without an error; that is where the download
-    pool submits the build of what it fetched. Leaving the ``with`` block waits for the running jobs (they stop at
-    their next shard once the flag is raised), then closes the bar."""
+    calls on_success (main thread) for every job that finished without an error; that is where the download
+    pool submits the build of what it fetched. Leaving the with block waits for the running jobs (they stop at
+    their next shard once the flag is raised), then closes the bar.
+    """
 
     def __init__(
         self, description: str, *, max_workers: int, flag: StopFlag, total: int, on_success: Callable[[Job], None] | None = None
@@ -306,7 +330,10 @@ class JobPool:
         self.futures[self._executor.submit(run_job, job, self.flag, self._running, self.bar)] = job
 
     def cancel_queued(self) -> None:
-        """Cancel the jobs not started yet (the running ones stop at their next shard through the flag)."""
+        """
+        Cancel the jobs not started yet (the running ones stop at their next shard through the flag).
+        """
+
         for future in self.futures:
             future.cancel()
 
@@ -323,7 +350,9 @@ class JobPool:
 
 
 class RunningJobs:
-    """The names of the jobs running right now (the pool bar's postfix)."""
+    """
+    The names of the jobs running right now (the pool bar's postfix).
+    """
 
     def __init__(self) -> None:
         self._names: list[str] = []
@@ -341,8 +370,11 @@ class RunningJobs:
 
 
 def run_job(job: Job, flag: StopFlag, running: RunningJobs, bar: Progress) -> None:
-    """Run one job in a pool thread; a failure raises the flag (the other jobs stop at their next shard, queued
-    jobs never start), is logged with its traceback and propagates to :func:`wait_for_jobs`."""
+    """
+    Run one job in a pool thread; a failure raises the flag (the other jobs stop at their next shard, queued
+    jobs never start), is logged with its traceback and propagates to :func:`wait_for_jobs`.
+    """
+
     bar.set_postfix({"running": running.add(job.name)}, refresh=False)
     try:
         check_stop(flag.should_stop)  # a job dequeued after a failure or an interrupt does not start
@@ -359,10 +391,13 @@ def run_job(job: Job, flag: StopFlag, running: RunningJobs, bar: Progress) -> No
 
 
 def wait_for_jobs(pools: list[JobPool], flag: StopFlag) -> list[BaseException]:
-    """Wait until every job of every pool finished, including the jobs an ``on_success`` follow-up submits while
-    waiting. Returns the failures (a ``KeyboardInterrupt`` becomes a :class:`BuildAborted`). The first failure or
+    """
+    Wait until every job of every pool finished, including the jobs an on_success follow-up submits while
+    waiting. Returns the failures (a KeyboardInterrupt becomes a :class:`BuildAborted`). The first failure or
     interrupt raises the flag (the running jobs of every pool stop at their next shard), cancels the jobs not started
-    yet and ends the follow-ups; the jobs that merely stopped are not collected (their ``BuildAborted`` is implied)."""
+    yet and ends the follow-ups; the jobs that merely stopped are not collected (their BuildAborted is implied).
+    """
+
     failures: list[BaseException] = []
     handled: set[Future[None]] = set()
     try:
@@ -404,8 +439,11 @@ def cancel_all(pools: list[JobPool]) -> None:
 
 
 def raise_first_failure(failures: list[BaseException]) -> None:
-    """Re-raise the failure that caused the stop: jobs that merely stopped because of it raised
-    :class:`BuildAborted`, which is only raised when nothing else went wrong."""
+    """
+    Re-raise the failure that caused the stop: jobs that merely stopped because of it raised
+    :class:`BuildAborted`, which is only raised when nothing else went wrong.
+    """
+
     for error in failures:
         if not isinstance(error, BuildAborted):
             raise error
@@ -425,9 +463,12 @@ def checked_steps(steps: Iterable[str]) -> set[str]:
 
 
 def checked_sources(config: DatasetConfig, sources: Iterable[str] | None) -> list[str] | None:
-    """``sources`` in config order, each once (None for every source); unknown names are an error. A name listed
-    twice (``prepare.py --sources a a``) would otherwise be inspected twice by the repair step, appear twice in its
-    confirmation list and make the second deletion of the same folder fail on a directory that is no longer there."""
+    """
+    sources in config order, each once (None for every source); unknown names are an error. A name listed
+    twice (prepare.py --sources a a) would otherwise be inspected twice by the repair step, appear twice in its
+    confirmation list and make the second deletion of the same folder fail on a directory that is no longer there.
+    """
+
     return None if sources is None else selected_sources(config, sources)
 
 
@@ -440,11 +481,14 @@ def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_work
 
 
 def another_round_can_fetch_more(config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None) -> bool:
-    """Whether a further round would download anything: the download step is active and the plan (the same
+    """
+    Whether a further round would download anything: the download step is active and the plan (the same
     :class:`~data_preparation.lib.build.planner.SourceLedger` objects the satisfaction check reads) still has rows
     to fetch for some selected source. That is a loader that returned fewer rows than asked without being exhausted,
     or a source whose build dropped more than the safety margin covers: the next round tops it up by the shortfall
-    scaled with the yield it showed, instead of planning nothing and leaving the run stuck."""
+    scaled with the yield it showed, instead of planning nothing and leaving the run stuck.
+    """
+
     if "download" not in active_steps:
         return False
     return plan_downloads(config, layout, sources=selected).total_rows_to_fetch() > 0
@@ -456,13 +500,19 @@ def warn_about_overlaps(config: DatasetConfig) -> None:
 
 
 def outstanding_repairs(report: RepairReport) -> list[RepairAction]:
-    """The actions of a repair pass that were planned but not carried out: everything of a dry run, nothing of a
-    pass that performed them. They are what still stands between the tree and a complete dataset."""
+    """
+    The actions of a repair pass that were planned but not carried out: everything of a dry run, nothing of a
+    pass that performed them. They are what still stands between the tree and a complete dataset.
+    """
+
     return [] if report.performed else list(report.actions)
 
 
 def log_repair(report: RepairReport) -> None:
-    """One line per action of a repair pass: what it did, or what it would do (a dry run)."""
+    """
+    One line per action of a repair pass: what it did, or what it would do (a dry run).
+    """
+
     if not report.actions:
         return
     if outstanding_repairs(report):
@@ -472,17 +522,23 @@ def log_repair(report: RepairReport) -> None:
 
 
 def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_report: RepairReport) -> DatasetReport:
-    """The verdict :func:`prepare` and :func:`status` both end with, so the two can never disagree about one tree:
-    the status table, with the sources of the repairs ``repair_report`` left undone counted as incomplete. A
-    ``status`` run and a ``prepare --dry_run`` change nothing, so their planned repairs are still outstanding; a real
-    ``prepare`` performed them before it downloaded anything and leaves none."""
+    """
+    The verdict :func:`prepare` and :func:`status` both end with, so the two can never disagree about one tree:
+    the status table, with the sources of the repairs repair_report left undone counted as incomplete. A
+    status run and a prepare --dry_run change nothing, so their planned repairs are still outstanding; a real
+    prepare performed them before it downloaded anything and leaves none.
+    """
+
     report = summarize_dataset_state(config, layout, needs_repair=[action.source for action in outstanding_repairs(repair_report)])
     log_report(report)
     return report
 
 
 def log_report(report: DatasetReport) -> None:
-    """The status table (kept in the scrollback) plus one warning per exhausted or unsatisfied source."""
+    """
+    The status table (kept in the scrollback) plus one warning per exhausted or unsatisfied source.
+    """
+
     for source in report.sources:
         satisfied, reason = source.satisfaction()
         if satisfied and source.exhausted:

@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Helpers of the training dashboard tests: a step dict, the box characters that must not
+"""
+Helpers of the training dashboard tests: a step dict, the box characters that must not
 survive a run, and the two dashboards opened in one call (constructor arguments plus `logger` / `log_file` of
-`running`). The hand-advanced clock, the StringIO console and the VT emulator are the shared ones of ``ui.testing``."""
+`running`). The hand-advanced clock, the StringIO console and the VT emulator are the shared ones of ui.testing.
+"""
 
 from __future__ import annotations
 
@@ -24,20 +26,29 @@ LOGGER_NAME = "training.test_dashboard"
 def live_board(
     *args: Any, logger: logging.Logger | None = None, log_file: Path | None = None, **kwargs: Any
 ) -> AbstractContextManager[TrainingDashboard]:
-    """A `TrainingDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended, the
-    display up."""
+    """
+    A `TrainingDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended, the
+    display up.
+    """
+
     return TrainingDashboard(*args, **kwargs).running(logger, log_file=log_file)
 
 
 def fallback_board(
     *args: Any, logger: logging.Logger | None = None, log_file: Path | None = None, **kwargs: Any
 ) -> AbstractContextManager[ConsoleFallbackDashboard]:
-    """A `ConsoleFallbackDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended."""
+    """
+    A `ConsoleFallbackDashboard(*args, **kwargs)` running for the block: `logger` attached, `log_file` appended.
+    """
+
     return ConsoleFallbackDashboard(*args, **kwargs).running(logger, log_file=log_file)
 
 
 def metrics(step: int, loss: float = 3.0, **extra: float) -> dict[str, float]:
-    """A step dict like ``RunLogger.log_step`` passes on."""
+    """
+    A step dict like RunLogger.log_step passes on.
+    """
+
     return {
         "loss": loss,
         "ppl": math.exp(loss),

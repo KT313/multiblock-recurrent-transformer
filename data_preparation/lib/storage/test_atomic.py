@@ -1,5 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Tests for `write_atomically`: the rename on success, the cleanup on failure, files and directories."""
+"""
+Tests for `write_atomically`: the rename on success, the cleanup on failure, files and directories.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +38,10 @@ def test_an_existing_file_is_replaced_and_kept_when_the_block_raises(tmp_path: P
 
 
 def test_a_keyboard_interrupt_also_cleans_up(tmp_path: Path) -> None:
-    """The second Ctrl-C of a run lands here: `BaseException`, not `Exception`."""
+    """
+    The second Ctrl-C of a run lands here: `BaseException`, not `Exception`.
+    """
+
     target = tmp_path / "checkpoint.pth"
     with pytest.raises(KeyboardInterrupt), write_atomically(target) as temporary:
         temporary.write_text("half", encoding="utf-8")
@@ -56,7 +61,10 @@ def test_a_leftover_temporary_of_a_crashed_write_is_removed_first(tmp_path: Path
 
 
 def test_a_directory_can_be_published_the_same_way(tmp_path: Path) -> None:
-    """The shape the instruct all-at-once build needs: a whole directory renamed into place."""
+    """
+    The shape the instruct all-at-once build needs: a whole directory renamed into place.
+    """
+
     target = tmp_path / "processed"
     with write_atomically(target) as temporary:
         temporary.mkdir()
