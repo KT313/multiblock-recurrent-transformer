@@ -4,7 +4,6 @@ This repository contains the code for my thesis "Efficient Large Language Models
 
 > **Built on [seal-rg/recurrent-pretraining](https://github.com/seal-rg/recurrent-pretraining)** (Geiping et al., 2025, Apache-2.0), base commit `3055b7f`. This repo is a multi-block extension of their depth-recurrent transformer; see `git diff upstream-base..HEAD` for exactly what was changed.
 
-
 ## Work
 
 The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
@@ -18,44 +17,50 @@ The code was restructured and trimmed after the thesis: only the code path of th
 
 ## Usage
 
-```bash
-uv sync --all-extras                                        # environment (uv only)
-uv run pytest                                               # tests, CPU, < 1 min
-uv run python training/train.py --config config/tiny.yaml   # 20-step smoke run on synthetic data (built on the fly)
-uv run python training/train.py --config config/crow_300m_final.yaml   # the thesis run on one GPU
-TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml   # plain one-line-per-interval console (also under a pipe); <out_dir>/train.log either way
-```
-
-A run config (`config/<run>.yaml`) holds optimizer, LR and batch settings and points to a model architecture config
-(`config/model_architecture/<name>.yaml`: every `RecurrentConfig` field with its value, overridable per key with
-`model_overwrite`) and a dataset config (`config/datasets/<name>.yaml`) that defines sources, per-stage token
-budgets/weights and the tokenizer (mixing and the train/val split happen in the training dataloader). Training
-verifies the prepared data under `dataset/` and builds what is missing (`auto_prepare: true`); to prepare up front
-or inspect the plan:
+### Setup
 
 ```bash
-uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml   # export HF_TOKEN for gated sources
-uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
-uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml    # same sources, a few MB: real-source smoke build
+make setup                # prepare uv venv
+uv run hf auth login      # log into huggingface for gated datasets
+
+make test                 # tests
+make typecheck            # mypy, basedpyright
+make lint                 # ruff
 ```
 
-`crow_300m_mini.yaml` is the thesis config with tiny budgets: it touches every real source (minutes, a few MB) and
-is the quickest way to check that the data path works end to end (it is a dataset config only; there is no
-`config/crow_300m_mini.yaml` run config, point a run at it with `--dataset_config` if you want to train on it).
+### Configs
 
-See `data_preparation/README.md` for the dataset config, `docs/data_mixture.md` for the thesis mixture (generated
-from the config) and `docs/multistage_training.md` for the stage mechanism.
-
-```
-model/             architecture (RecurrentGPT, config, HF export)
-training/          train.py (CLI), run.py (train()), step.py (one optimizer step), evaluation.py, checkpoint.py, logger.py (RunLogger, TrainingReport), ui/ (terminal dashboard, train.log), testing/golden.py (the golden run), settings, backend/, data/ (streaming, collation, dataset resolver), optimizer, schedule
-data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
-config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
-dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers
-docs/              thesis documentation and figures
-```
+- `config/<run>.yaml`: Optimizer, LR, batch settings, reference to model architecture and dataset configs (`model_overwrite` overrides single architecture keys)
+- `config/model_architecture/<name>.yaml`: model architecture settings
+- `config/datasets/<name>.yaml`: dataset composition
 
 Final model configs in the original repo were named "raven", so I named my model configs "crow" in the same spirit.
+
+### Data Preparation
+
+Optional: training builds whatever is missing itself by default (`auto_prepare: true`). Gated sources need the huggingface login from Setup.
+
+```bash
+# mini smoke run (real sources, a few MB)
+uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml
+
+# download thesis data sources
+uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml
+
+# check which sources are missing locally without starting download
+uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
+```
+
+### Training
+
+```bash
+# mini smoke run with synthetic data
+uv run python training/train.py --config config/tiny.yaml
+TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml # TUI disabled
+
+# thesis run on single gpu
+uv run python training/train.py --config config/crow_300m_final.yaml
+```
 
 ## Architecture
 
@@ -83,7 +88,7 @@ Compared to world batch size 64, world batch size 1024 strongly increases the lo
 
 ## Note
 
-During all training runs for my thesis, one of the two prelude blocks in my models never received a gradient during training. This was caused by the prelude blocks not chaining correctly in a for-loop. The issue has since been fixed in the code (commit "Fix prelude layers not chaining in model_dynamic forward").
+During all training runs for my thesis, one of the two prelude blocks in my models never received a gradient during training. This was caused by the prelude blocks not chaining correctly in a for-loop. The issue has since been fixed in the code (commit "Fix prelude layers not chaining in model_dynamic forward"). The code used in the thesis is available under `Releases` as `v1.0` (thesis version).
 
 ## Training Info
 
