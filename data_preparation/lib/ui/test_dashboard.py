@@ -636,7 +636,7 @@ def _run_in_pty(
 ) -> tuple[int, bytes]:
     """
     Run python -c script on a pseudo-terminal of the given size; the exit code and everything it wrote.
-    terminate_after sends SIGTERM that many seconds after the first dashboard frame (a byte-capped run);
+    terminate_after sends SIGTERM that many seconds after the first dashboard frame (what a job scheduler sends);
     close_after closes the terminal instead (the window closed: SIGHUP and EIO for the child).
     """
 

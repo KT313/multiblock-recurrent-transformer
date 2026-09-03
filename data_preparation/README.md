@@ -57,10 +57,8 @@ download, and the planner counts sequences.
 
 The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
 generated from it), `config/datasets/crow_300m_mini.yaml` (the same sources with tiny budgets: a real-source smoke
-build of a few MB that exercises every loader; needs `HF_TOKEN` for `mini-peS2o`; `tools/capped_download.sh 500 uv
-run python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_mini.yaml` runs it under a
-hard download cap) and `config/datasets/tiny.yaml` (synthetic, builds in seconds, used by the tests and
-`config/tiny.yaml`).
+build of a few MB that exercises every loader; needs `HF_TOKEN` for `mini-peS2o`) and `config/datasets/tiny.yaml`
+(synthetic, builds in seconds, used by the tests and `config/tiny.yaml`).
 
 ## On-disk layout: two trees
 
@@ -358,7 +356,7 @@ the frame from a cleared screen (both dashboards; `ui/display.py`). Nothing else
 terminal while the display is up: every `logging` record (the HuggingFace libraries' included), `warnings` and
 stray prints land in the log panel, the libraries' own bars are silenced. Warnings and the tables (plan, repair,
 status) are *kept* and printed once, unwrapped, after the display closed; the scrollback of a run is those lines
-and the final table, no frame. Ctrl-C and SIGTERM (`tools/capped_download.sh`) leave the same way. When stderr is
+and the final table, no frame. Ctrl-C and SIGTERM leave the same way. When stderr is
 not a terminal (`nohup`, redirects) or `DATA_PREP_PROGRESS=0` is set, there is no dashboard and plain timestamped
 log lines are written instead. A terminal that dies mid-run (closed window, dropped SSH session) does not end the
 run: the display closes itself and the run continues headless. `tail -f dataset/build.log` shows it; start long

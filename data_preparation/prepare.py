@@ -161,7 +161,7 @@ def run_describe(args: argparse.Namespace) -> None:
 
 def _interrupt_on_sigterm(signum: int, frame: FrameType | None) -> None:
     """
-    kill / a byte-capped run (tools/capped_download.sh) end like Ctrl-C: stop at the next shard, exit 130.
+    kill ends like Ctrl-C: stop at the next shard, exit 130.
     """
 
     raise KeyboardInterrupt

@@ -41,8 +41,7 @@ uv run python data_preparation/prepare.py prepare  --dataset_config config/datas
 
 `crow_300m_mini.yaml` is the thesis config with tiny budgets: it touches every real source (minutes, a few MB) and
 is the quickest way to check that the data path works end to end (it is a dataset config only; there is no
-`config/crow_300m_mini.yaml` run config, point a run at it with `--dataset_config` if you want to train on it); `tools/capped_download.sh 500 <command>` runs any
-command under a hard download cap (see `tools/README.md`).
+`config/crow_300m_mini.yaml` run config, point a run at it with `--dataset_config` if you want to train on it).
 
 See `data_preparation/README.md` for the dataset config, `docs/data_mixture.md` for the thesis mixture (generated
 from the config) and `docs/multistage_training.md` for the stage mechanism.
@@ -54,7 +53,6 @@ data_preparation/  prepare.py (prepare / status / describe / tiny) + lib/
 config/            run configs; config/model_architecture/ architecture configs; config/datasets/ dataset configs
 dataset/           gitignored; sources/<s>/raw (downloaded), processed/<s> (what training reads), tokenizers
 docs/              thesis documentation and figures
-tools/             dev tooling (download-capped command runner)
 ```
 
 Final model configs in the original repo were named "raven", so I named my model configs "crow" in the same spirit.
