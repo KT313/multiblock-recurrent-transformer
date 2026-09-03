@@ -1,5 +1,5 @@
 # Development entry points. Everything runs through uv (no manual venvs).
-.PHONY: setup test typecheck lint
+.PHONY: setup test typecheck lint download status training
 
 setup:  ## create/update the uv environment (incl. data-prep extras and dev tools)
 	uv sync --all-extras
@@ -14,3 +14,25 @@ typecheck:  ## static typing: mypy and basedpyright over all python files
 
 lint:  ## ruff
 	uv run ruff check .
+
+# Run targets take the config as a positional argument: `make download config/datasets/<name>.yaml`.
+CONFIG = $(filter %.yaml %.yml,$(MAKECMDGOALS))
+require_config = $(if $(CONFIG),,$(error usage: make $@ <path to a .yaml config>))
+
+download:  ## download and build a dataset: make download config/datasets/<name>.yaml
+	$(require_config)
+	uv run python data_preparation/prepare.py prepare --dataset_config $(CONFIG)
+
+status:  ## show which dataset sources are missing: make status config/datasets/<name>.yaml
+	$(require_config)
+	uv run python data_preparation/prepare.py status --dataset_config $(CONFIG)
+
+training:  ## train: make training config/<run>.yaml
+	$(require_config)
+	uv run python training/train.py --config $(CONFIG)
+
+ifneq ($(CONFIG),)
+.PHONY: $(CONFIG)
+$(CONFIG):  # the config path is a goal too; nothing to do for it
+	@:
+endif

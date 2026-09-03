@@ -49,6 +49,10 @@ uv run python data_preparation/prepare.py prepare  --dataset_config config/datas
 
 # check which sources are missing locally without starting download
 uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
+
+# make shortcuts for the same: download / status
+make download config/datasets/crow_300m_final.yaml
+make status config/datasets/crow_300m_final.yaml
 ```
 
 ### Training
@@ -60,6 +64,9 @@ TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml #
 
 # thesis run on single gpu
 uv run python training/train.py --config config/crow_300m_final.yaml
+
+# make shortcut for the same
+make training config/crow_300m_final.yaml
 ```
 
 ## Architecture
