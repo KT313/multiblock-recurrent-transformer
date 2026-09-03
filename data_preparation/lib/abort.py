@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Cooperative cancellation of a build: stages take a ``should_stop`` callable and call :func:`check_stop` between
-shards (never inside one), so a stop request — another item failed, or Ctrl-C — ends the stage within one shard
-with everything already published on disk and its manifest saved."""
+shards, never inside one. A stop request (another item failed, or Ctrl-C) ends the stage within one shard with
+everything already published on disk and its manifest saved."""
 
 from __future__ import annotations
 

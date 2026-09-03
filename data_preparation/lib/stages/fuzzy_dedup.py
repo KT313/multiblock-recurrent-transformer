@@ -10,7 +10,7 @@ chunks are in flight at any time.
 
 Memory: the LSH index holds the signature of every *kept* row, i.e. O(kept rows). Per kept row this is the
 ``num_perm`` uint64 hash values (8 * num_perm bytes, 2 KB at num_perm=256) plus ``b`` band keys and the ``doc_<i>``
-key strings in Python dicts/sets -- in practice roughly 3-5 KB per kept row at num_perm=256, so ~4 GB per million
+key strings in Python dicts/sets: in practice roughly 3-5 KB per kept row at num_perm=256, so ~4 GB per million
 kept rows. Signatures use datasketch's default ``seed=1`` and are therefore reproducible across runs and workers.
 """
 
@@ -37,14 +37,14 @@ CHUNK_SIZE = 1024
 MINHASH_SEED = 1  # datasketch default; pinned so signatures are stable
 
 # Signature parameters of *this* process: the n-gram size and the MinHash constructor arguments. Set once per process
-# by ``_init_worker`` (the spawn-pool initializer — spawn children start with fresh module globals and its arguments
-# are two plain ints — or called directly when pass_workers <= 1) before ``_signature`` is used.
+# by ``_init_worker`` before ``_signature`` is used: the spawn-pool initializer (spawn children start with fresh
+# module globals; its arguments are two plain ints), or called directly when pass_workers <= 1.
 _NGRAM: int = 0
 _MINHASH_KWARGS: dict[str, Any] = {}
 
 
 def _import_datasketch() -> tuple[Any, Any]:
-    """``(MinHash, MinHashLSH)`` -- imported lazily because datasketch is an optional extra."""
+    """``(MinHash, MinHashLSH)``, imported lazily because datasketch is an optional extra."""
     try:
         from datasketch import MinHash, MinHashLSH
     except ImportError as exc:
@@ -74,9 +74,9 @@ def _init_worker(num_perm: int, ngram: int) -> None:
 
 
 def _signature(text: str) -> Signature:
-    """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle); an **empty** array
-    for a text with fewer than ``ngram`` words — such texts have no n-grams, and the empty-set signature would make
-    every one of them a near-duplicate of the first."""
+    """MinHash hash values of the word n-grams of ``text`` (plain numpy array, cheap to pickle); an empty array for
+    a text with fewer than ``ngram`` words: such texts have no n-grams, and the empty-set signature would make every
+    one of them a near-duplicate of the first."""
     MinHash, _ = _import_datasketch()
     ngrams = get_ngrams(text, n=_NGRAM)
     if not ngrams:

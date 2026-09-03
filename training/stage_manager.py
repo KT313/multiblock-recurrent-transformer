@@ -15,11 +15,11 @@ from training.data.dataset_resolver import ResolvedStage
 
 @dataclass
 class StageInfo:
-    """Where a step stands: the stage whose boundary contains it (half-open: the first step of a stage belongs to
-    it, its `end_step` to the next), the progress through that stage, and — inside the transition window at the
-    end of the stage — the stage being entered and the progress through the window."""
+    """Where a step stands: the stage whose boundary contains it (half-open: a stage's `end_step` belongs to the next),
+    the progress through that stage and, inside the transition window at its end, the stage being entered and the
+    progress through the window."""
 
-    stage_idx: int  # index of the stage whose boundary contains the step
+    stage_index: int  # index of the stage whose boundary contains the step
     stage_progress: float  # progress through that stage (0-1)
     transition_to: Optional[int]  # index of the next stage while inside the transition window, else None
     transition_progress: float  # progress through the transition window (0-1), 0 outside it
@@ -98,11 +98,11 @@ class StageManager:
         """Convert token budgets into optimizer-step boundaries including transition periods."""
         boundaries = []
         current_step = 0
-        for idx, stage in enumerate(self.stages):
+        for index, stage in enumerate(self.stages):
             stage_steps = stage.tokens // self.tokens_per_step
 
-            # Transition OUT of this stage, as a percentage of this stage's tokens; none after the last stage
-            if idx < len(self.stages) - 1:
+            # transition OUT of this stage, as a percentage of its tokens; none after the last stage
+            if index < len(self.stages) - 1:
                 transition_tokens = int(stage.tokens * stage.transition_pct)
                 transition_steps = transition_tokens // self.tokens_per_step
             else:
@@ -150,46 +150,39 @@ class StageManager:
     def get_stage_info(self, step: int) -> StageInfo:
         """Stage/transition state at `step`: the stage whose boundary contains it and, inside that stage's transition
         window, the stage being entered. Past the last stage: the last stage, complete."""
-        for idx, boundary in enumerate(self.boundaries):
+        for index, boundary in enumerate(self.boundaries):
             if boundary.is_in_stage(step):
                 in_transition = boundary.is_in_transition(step)  # never true for the last stage (no window)
                 return StageInfo(
-                    stage_idx=idx,
+                    stage_index=index,
                     stage_progress=boundary.get_stage_progress(step),
-                    transition_to=idx + 1 if in_transition else None,
+                    transition_to=index + 1 if in_transition else None,
                     transition_progress=boundary.get_transition_progress(step),
                 )
         return StageInfo(
-            stage_idx=len(self.boundaries) - 1, stage_progress=1.0, transition_to=None, transition_progress=0.0
+            stage_index=len(self.boundaries) - 1, stage_progress=1.0, transition_to=None, transition_progress=0.0
         )
 
     def entering_stage_at(self, step: int) -> int:
         """Index of the stage whose data the run is heading for at `step`: the stage being entered inside a transition
-        window, otherwise the stage containing the step.
-
-        The validation loader of an evaluation after `step` completed steps and the `stage` a checkpoint of that
-        step records follow it, so a stage-end checkpoint (written as the transition starts) names the stage it
-        enters and a transition step is validated on the incoming stage's split.
-        """
-        info = self.get_stage_info(step)
-        return info.stage_idx if info.transition_to is None else info.transition_to
+        window, otherwise the stage containing the step. The validation loader after `step` and the `stage` of a
+        checkpoint written at `step` follow it."""
+        stage_info = self.get_stage_info(step)
+        return stage_info.stage_index if stage_info.transition_to is None else stage_info.transition_to
 
     def data_weights(self, step: int) -> dict[str, float]:
         """Sampling weight per train source at optimizer step `step` (from `ResolvedStage.train_weights`).
 
-        Outside a transition: the current stage's constants. Inside one: the linear interpolation
-        ``(1 − p) × current stage's weight + p × entering stage's weight`` with ``p = transition_progress``, over the
-        union of both stages' sources — a source leaving the mixture ramps to 0, one entering ramps from 0, and a
-        source in neither stage is absent (weight 0, never drawn). Each stage's weights sum to 1, so the
-        interpolated weights do too. This is the stage structure's ONLY effect on the training data: the per-source
-        readers run through the whole run, only their draw probabilities change.
+        Outside a transition: the current stage's weights. Inside one: ``(1 - p) * current + p * entering`` with
+        ``p = transition_progress``, over the union of both stages' sources (a source in neither is absent). This is
+        the stage structure's ONLY effect on the training data; the per-source readers run through the whole run.
         """
-        info = self.get_stage_info(step)
-        current = self.stages[info.stage_idx].train_weights
-        if info.transition_to is None:
+        stage_info = self.get_stage_info(step)
+        current = self.stages[stage_info.stage_index].train_weights
+        if stage_info.transition_to is None:
             return dict(current)
-        entering = self.stages[info.transition_to].train_weights
-        progress = info.transition_progress
+        entering = self.stages[stage_info.transition_to].train_weights
+        progress = stage_info.transition_progress
         return {
             name: (1.0 - progress) * current.get(name, 0.0) + progress * entering.get(name, 0.0)
             for name in {**current, **entering}
@@ -200,9 +193,9 @@ class StageManager:
 
         The training loop writes the `-stage-{i}_end` checkpoint after that step.
         """
-        for idx, boundary in enumerate(self.boundaries[:-1]):  # the last stage has no transition after it
+        for index, boundary in enumerate(self.boundaries[:-1]):  # the last stage has no transition after it
             if step == boundary.transition_start_step - 1:
-                return idx
+                return index
         return None
 
     def get_stage_summary(self) -> str:
@@ -214,16 +207,16 @@ class StageManager:
         lines.append(f"  World size: {self.world_size}")
         lines.append("")
 
-        for idx, (stage, boundary) in enumerate(zip(self.stages, self.boundaries)):
+        for index, (stage, boundary) in enumerate(zip(self.stages, self.boundaries)):
             stage_steps = boundary.end_step - boundary.start_step
             transition_steps = boundary.end_step - boundary.transition_start_step
             main_steps = stage_steps - transition_steps
 
-            lines.append(f"Stage {idx}: {stage.name}")
+            lines.append(f"Stage {index}: {stage.name}")
             lines.append(f"  Token budget: {stage.tokens:,}")
             lines.append(f"  Optimizer steps: {stage_steps:,} (steps {boundary.start_step:,} - {boundary.end_step:,})")
             lines.append(f"    - Main training: {main_steps:,} steps")
-            if idx < len(self.stages) - 1:
+            if index < len(self.stages) - 1:
                 transition_pct = stage.transition_pct * 100
                 lines.append(f"    - Transition OUT: {transition_steps:,} steps ({transition_pct:.1f}% of current stage)")
             lines.append(f"  Base LR: {stage.base_lr:.2e}")

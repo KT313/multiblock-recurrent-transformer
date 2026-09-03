@@ -2,13 +2,13 @@
 """``MANIFEST.json`` beside a shard directory: what the directory contains and which config built it.
 
 Every stage directory (``dataset/sources/<source>/raw/``, ``dataset/processed/<source>/``, tokenizers) carries one
-manifest. ``source_hash`` is the stage's key from the config that produced it (:meth:`DatasetConfig.raw_hash` for
-``raw/`` — loader identity plus token settings, so processing changes never invalidate downloads —,
-:meth:`DatasetConfig.processed_hash` for ``processed/``, ``tokenizer_hash`` for tokenizers); a manifest whose hash
+manifest. ``source_hash`` is the stage's key from the config that produced it: :meth:`DatasetConfig.raw_hash` for
+``raw/`` (loader identity plus token settings, so processing changes never invalidate downloads),
+:meth:`DatasetConfig.processed_hash` for ``processed/``, ``tokenizer_hash`` for tokenizers. A manifest whose hash
 differs from the current config is stale: a processed folder is rebuilt, a raw folder is an error until the repair
 step deletes it after confirmation (raw is never re-downloaded silently). A raw manifest also records
 ``truncated_at_tokens`` (the ``max_seq_length`` its texts were cut at): raising the cap above it makes the folder
-*outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification is cheap (parquet metadata only).
+*outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification reads parquet metadata only.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ class Manifest:
     source: str
     source_hash: str
     stage: str
-    rows_fetched: int = 0
+    rows_fetched: int = 0  # loader offset reached (source rows consumed), not rows kept
     shards: list[ShardInfo] = field(default_factory=list)
     token_count: str | None = None
     tokenizer: str | None = None
@@ -69,7 +69,7 @@ class Manifest:
     truncated_at_tokens: int | None = None
     versions: dict[str, str] = field(default_factory=dict)
     created: str = field(default_factory=_utc_now_iso)
-    extra: dict[str, Any] = field(default_factory=dict)  # what no field below types: a tokenizer manifest's kind / hf_id / revision
+    extra: dict[str, Any] = field(default_factory=dict)  # untyped remainder: a tokenizer manifest's kind / hf_id / revision
     # Processed manifests (on disk under `extra`, see `to_dict`): what the folder was built from and how.
     input_shards: list[list[Any]] = field(default_factory=list)  # [[raw shard name, rows], ...] built so far, in raw order
     columns: list[str] = field(default_factory=list)  # the processed column set the shards were written with
@@ -179,7 +179,7 @@ class Manifest:
     @classmethod
     def load(cls, directory: Path) -> Manifest | None:
         """The manifest in ``directory``, or None if absent. An unparsable manifest is only ignored (with a warning)
-        when the directory holds no shards; next to shards it is an error — treating it as absent would make the
+        when the directory holds no shards; next to shards it is an error: treating it as absent would make the
         next build start from shard 0 and delete data that may have been expensive to download."""
         path = directory / MANIFEST_NAME
         if not path.is_file():
@@ -206,7 +206,7 @@ _RAW_FIELDS = tuple(_RAW_KEYS.values())
 
 
 def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:
-    """``[[name, rows], ...]`` of ``shards`` — the shape a processed manifest's ``input_shards`` records."""
+    """``[[name, rows], ...]`` of ``shards``, the shape a processed manifest's ``input_shards`` records."""
     return [[shard.name, shard.rows] for shard in shards]
 
 
@@ -217,7 +217,7 @@ def has_shards(directory: Path) -> bool:
 
 def _known_fields_only(payload: dict[str, Any], dataclass_type: type) -> dict[str, Any]:
     """``payload`` restricted to the field names of ``dataclass_type``."""
-    known = {f.name for f in fields(dataclass_type)}
+    known = {dataclass_field.name for dataclass_field in fields(dataclass_type)}
     return {key: value for key, value in payload.items() if key in known}
 
 

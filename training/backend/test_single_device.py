@@ -98,7 +98,7 @@ def test_setup_model_moves_and_returns_module() -> None:
 
 
 def test_setup_model_compile_wraps_the_module(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`compile=True` goes through `torch.compile(model, dynamic=True)`; stubbed so the test stays fast."""
+    """`compile_model=True` goes through `torch.compile(model, dynamic=True)`; stubbed so the test stays fast."""
     calls: list[tuple[torch.nn.Module, bool]] = []
 
     def fake_compile(model: torch.nn.Module, dynamic: bool = False) -> torch.nn.Module:
@@ -108,7 +108,7 @@ def test_setup_model_compile_wraps_the_module(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(torch, "compile", fake_compile)
     backend = SingleDeviceBackend(device="cpu", precision="32")
     model = torch.nn.Linear(3, 2)
-    assert backend.setup_model(model, compile=True) is model
+    assert backend.setup_model(model, compile_model=True) is model
     assert calls == [(model, True)]
 
 

@@ -9,7 +9,7 @@ SCHEDULES = ("trapezoid",)
 
 
 def _scheduled_lr(
-    step: int, max_steps: int, stage_manager: StageManager, *, min_lr: float, warmup_steps: int, cooldown_steps: int
+    step: int, total_steps: int, stage_manager: StageManager, *, min_lr: float, warmup_steps: int, cooldown_steps: int
 ) -> float:
     """The schedule without the resume warmup: global warmup at the start, global cooldown at the end, the per-stage
     base LR in between and a linear interpolation between the adjacent base LRs inside a stage transition."""
@@ -19,14 +19,14 @@ def _scheduled_lr(
     if step < warmup_steps:
         return stages[0].base_lr * step / warmup_steps
 
-    if step > max_steps:
+    if step > total_steps:
         return min_lr
     # Global cooldown (end of last stage)
-    if step > (max_steps - cooldown_steps):
-        return max(stages[-1].base_lr * (max_steps - step) / cooldown_steps, min_lr)
+    if step > (total_steps - cooldown_steps):
+        return max(stages[-1].base_lr * (total_steps - step) / cooldown_steps, min_lr)
 
     stage_info = stage_manager.get_stage_info(step)
-    base_lr = stages[stage_info.stage_idx].base_lr
+    base_lr = stages[stage_info.stage_index].base_lr
     # During transition: interpolate from the current stage's base LR to the entering stage's
     if stage_info.transition_to is not None:
         entering_lr = stages[stage_info.transition_to].base_lr
@@ -45,7 +45,7 @@ def _resume_warmup(steps_since_resume: int, resume_warmup_steps: int, min_lr: fl
 
 def get_lr_multistage(
     step: int,
-    max_steps: int,
+    total_steps: int,
     stage_manager: StageManager,
     *,
     min_lr: float,
@@ -62,7 +62,7 @@ def get_lr_multistage(
         raise ValueError(f"Unsupported lr_schedule: {schedule}")
 
     target_lr = _scheduled_lr(
-        step, max_steps, stage_manager, min_lr=min_lr, warmup_steps=warmup_steps, cooldown_steps=cooldown_steps
+        step, total_steps, stage_manager, min_lr=min_lr, warmup_steps=warmup_steps, cooldown_steps=cooldown_steps
     )
     steps_since_resume = step - resume_step
     if resume_step >= 0 and 0 <= steps_since_resume < resume_warmup_steps:

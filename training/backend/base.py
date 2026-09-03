@@ -39,7 +39,7 @@ class Backend(Protocol):
     is_main: bool
     pin_memory: bool  # whether dataloaders should pin host memory (true on CUDA)
 
-    def setup_model(self, model: Module, compile: bool = False) -> Module:
+    def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         """Move the model to the device, optionally compile it, and wrap it (DDP/FSDP later)."""
         ...
 

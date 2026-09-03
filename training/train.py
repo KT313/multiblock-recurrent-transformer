@@ -1,24 +1,20 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Command line of a training run — the mirror of `data_preparation/prepare.py`.
+"""Command line of a training run, the mirror of `data_preparation/prepare.py`.
 
     python training/train.py --config config/crow_300m_final.yaml [--key value ...]
 
-Parses the settings (`--config` YAML plus `--key value` overrides), installs the run's stop request, calls
+Parses the settings (`--config` YAML plus `--key value` overrides), installs the stop request, calls
 `training.run.train` and prints its report. Ctrl-C (or SIGTERM) once: the run finishes the current optimizer step,
-saves a checkpoint and exits 130 — during the in-process dataset build (`auto_prepare`) it stops at the next shard
-instead, everything published kept (`BuildAborted`, also 130); a second Ctrl-C aborts right away as usual.
-`resume: true` continues a stopped run from its last checkpoint.
+saves a checkpoint and exits 130; during the in-process dataset build it stops at the next shard instead
+(`BuildAborted`, also 130). A second Ctrl-C aborts right away. `resume: true` continues a stopped run.
 
-The console: this module attaches one stderr handler to the `training` and `data_preparation` logger hierarchies
-(`configure_console_logging`). For the run itself `RunLogger` opens the terminal dashboard of `training/ui/` — the
-live display on a TTY, the one-line-per-`log_step_interval` fallback when piped or with `TRAINING_DASHBOARD=0`,
-`<out_dir>/train.log` in both cases — which swaps that `training` handler out for the duration and puts it back, so
-nothing prints twice; a first Ctrl-C / SIGTERM and an exception both leave through the dashboard's `__exit__`
-(frame erased, kept lines and the static summary printed), and the report's summary is printed after that.
+Console: one stderr handler on the `training` and `data_preparation` logger hierarchies (`configure_console_logging`).
+`RunLogger` opens the terminal dashboard of `training/ui/` for the run (the live display on a TTY, the one-line
+fallback when piped or with `TRAINING_DASHBOARD=0`, `<out_dir>/train.log` in both cases); it swaps the `training`
+handler out for the duration, so nothing prints twice.
 
-Exit codes: 0 finished, 1 failed (logged with its traceback), 3 another training run on the same `out_dir` (or the
-data preparation this one needs) is still running — one run at a time, `data_preparation/lib/build/lock.py`; the
-message names its pid and start time —, 130 interrupted.
+Exit codes: 0 finished, 1 failed (traceback logged), 3 another run holds the lock (the message names its pid and
+start time; `data_preparation/lib/build/lock.py`), 130 interrupted.
 """
 
 from __future__ import annotations
@@ -67,7 +63,7 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
     """Install the Ctrl-C / SIGTERM handling of a run and yield its stop request; the previous handlers are put back
     on exit.
 
-    The first signal sets the request, logs it and hands both signals back to their default handlers — so a second
+    The first signal sets the request, logs it and hands both signals back to their default handlers, so a second
     Ctrl-C raises `KeyboardInterrupt` as usual (and a second SIGTERM kills). Signal handlers can only be installed
     from the main thread; elsewhere the request is yielded unarmed.
     """
@@ -95,17 +91,14 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
 
 
 def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
-    """Attach one stderr stream handler each to the `training` and the `data_preparation` logger hierarchies, so
-    `RunLogger`'s lines and the dataset resolver's (which logs under `data_preparation`) reach the terminal; idempotent.
-
-    The CLI's job — library code does not configure logging. Both hierarchies get the same handler type and line
-    format (`data_preparation.lib.log.configure_logging` for the data-prep one). The dashboard `RunLogger` opens
-    swaps the `training` stream handler out for the run and restores it afterwards. Returns the `training` logger.
-    """
+    """Attach one stderr handler each to the `training` and `data_preparation` logger hierarchies (same handler type
+    and line format); idempotent. Returns the `training` logger. The CLI's job: library code configures no logging."""
     configure_logging(level)  # the `data_preparation` hierarchy: the resolver's status table, split and build lines
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     training_logger.setLevel(level)
-    handler = next((h for h in training_logger.handlers if isinstance(h, ProgressStreamHandler)), None)
+    handler = next(
+        (existing for existing in training_logger.handlers if isinstance(existing, ProgressStreamHandler)), None
+    )
     if handler is None:
         handler = ProgressStreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter(LOG_FORMAT))

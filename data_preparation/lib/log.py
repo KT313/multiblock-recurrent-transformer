@@ -24,8 +24,8 @@ def get_logger(name: str) -> logging.Logger:
 
 
 class ProgressStreamHandler(logging.StreamHandler):  # type: ignore[type-arg]  # stdlib generic only in stubs
-    """The stderr handler :func:`configure_logging` attaches — its own class so a second call finds it again (and the
-    dashboard, which swaps it out for the duration of a run, can tell it from a library's handler)."""
+    """The stderr handler :func:`configure_logging` attaches. Its own class so a second call finds it again and the
+    dashboard, which swaps it out during a run, can tell it from a library's handler."""
 
 
 def _our_handler(root: logging.Logger) -> ProgressStreamHandler | None:

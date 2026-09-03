@@ -11,9 +11,8 @@ from typing import Any, Optional
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
 
-# The value rules of `Settings`, as three tables read by one loop each in `Settings.__post_init__` (the same idea as
-# `SOURCE_FIELD_SCOPES` in `data_preparation/dataset_config.py`, one size smaller): a field that must be set, one
-# that must be > 0, one that must be >= 0. Rules relating two fields stay explicit below the loops.
+# The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
+# relating two fields stay explicit below the loops.
 REQUIRED_SETTINGS: dict[str, str] = {
     "dataset_config": "path to config/datasets/<name>.yaml",
     "model_architecture_config": "path to config/model_architecture/<name>.yaml",
@@ -40,11 +39,9 @@ NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
 class OptimizerConfig:
     """The `optim_config:` mapping of a run config: the optimizer's constructor options, typed.
 
-    A typed dataclass (not a free-form dict) so jsonargparse merges per-field CLI overrides
-    (`--optim_config.lr 3e-4`) into the YAML values instead of replacing the whole mapping, and rejects unknown
-    field names at parse time. `lr` is NOT the schedule's LR (`stage_base_lrs` is): ELLISAdam keeps it as
-    `init_lr`, the reference of the decoupled weight decay. The last four flags exist only on ELLISAdam;
-    `training/optim.py:build_optimizer` rejects non-default values of them for any other optimizer.
+    A dataclass so jsonargparse merges per-field CLI overrides (`--optim_config.lr 3e-4`) and rejects unknown names.
+    `lr` is NOT the schedule's LR (`stage_base_lrs` is); ELLISAdam keeps it as `init_lr`, the weight-decay reference.
+    The last four flags exist only on ELLISAdam; `build_optimizer` rejects non-default values for other optimizers.
     """
 
     lr: float = 1e-4  # constructor LR; for ELLISAdam the weight-decay reference (decay = lr / init_lr × weight_decay)
@@ -70,13 +67,11 @@ class Settings:
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
     auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
     prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers)
-    prepare_pass_workers: int = 4  # worker processes of EACH build's optional cleaning passes (decontamination /
-    # minhash; = prepare.py --pass_workers), so up to prepare_num_workers × prepare_pass_workers with those passes on
+    prepare_pass_workers: int = 4  # worker processes of each cleaning pass of the in-process build (--pass_workers)
     prepare_max_parallel_downloads: int = 2  # sources downloading at a time during the in-process build
     stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional
     allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config
-    allow_settings_change: bool = False  # resume although settings / model config differ from the checkpoint (every
-    # field is compared except the exemptions in training/checkpoint.py; the weight-decay grouping can never differ)
+    allow_settings_change: bool = False  # resume although settings / model config differ (see training/checkpoint.py)
 
     # Run
     run_name: str = "crow-300m"
@@ -87,9 +82,7 @@ class Settings:
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
-    # config, e.g. `--model_overwrite '{"n_embd": 512}'` for a CLI sweep; {} = the file as is
-    block_size: int = 2048  # sequence length; must equal the block_size of the architecture config and of the
-    # dataset config (the planner sized the data in sequences of it; <= max_seq_length follows from the schema)
+    block_size: int = 2048  # sequence length; must equal the architecture config's and the dataset config's
 
     # Data loading (train loaders always run one worker per source; there is no worker-count knob)
     sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
@@ -107,8 +100,7 @@ class Settings:
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
-    optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)  # typed constructor options; CLI overrides
-    # merge per field (`--optim_config.lr 3e-4` keeps the YAML's other values), unknown names fail at parse time
+    optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)  # typed; CLI overrides merge per field
     no_weight_decay_for_bias_and_norm_params: bool = True
     grad_clip: float = 1.0
     lr_schedule: str = "trapezoid"
@@ -134,8 +126,8 @@ class Settings:
     export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
 
     def __post_init__(self) -> None:
-        if not isinstance(self.optim_config, OptimizerConfig):  # dataclasses don't check types at runtime, and the
-            # old shape of this setting was a free-form dict: fail with a name, not far away in the optimizer
+        # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name
+        if not isinstance(self.optim_config, OptimizerConfig):
             raise ValueError(
                 f"optim_config must be an OptimizerConfig, got {type(self.optim_config).__name__} "
                 f"({self.optim_config!r}); construct OptimizerConfig(**mapping) instead of passing the mapping"
@@ -182,6 +174,6 @@ def parse_settings(args: Optional[list[str]] = None) -> Settings:
     parser = ArgumentParser(description="Train a multi-block recurrent transformer.")
     parser.add_argument("--config", action=ActionConfigFile, help="YAML settings file")
     parser.add_class_arguments(Settings, nested_key=None)
-    ns = parser.parse_args(args)
-    ns.pop("config", None)
-    return Settings(**parser.instantiate(ns).as_dict())
+    namespace = parser.parse_args(args)
+    namespace.pop("config", None)
+    return Settings(**parser.instantiate(namespace).as_dict())

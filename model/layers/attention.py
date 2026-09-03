@@ -50,11 +50,9 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tu
 def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
     """Causal attention; inputs and output are (B, S, nh, hd).
 
-    Without a mask, causality is left to sdpa's own ``is_causal=True`` (the training path). A ``mask`` must be a
-    broadcastable bool mask that *already contains the causal triangle* — that is what
-    `model.model.prepare_attention_inputs` builds — and is passed with ``is_causal=False``: sdpa rejects an explicit
-    mask together with ``is_causal=True`` on some of its backends (its math kernel raises "Explicit attn_mask should
-    not be set when is_causal=True", flash attention takes no mask at all)."""
+    Without `mask`, sdpa's own `is_causal=True` applies the causal triangle (the training path). A `mask` must be a
+    broadcastable bool mask that already contains the causal triangle (`prepare_attention_inputs` builds one); it is
+    passed with `is_causal=False` because some sdpa backends reject an explicit mask together with `is_causal=True`."""
     # scaled_dot_product_attention wants the head axis before the sequence axis: (B, nh, S, hd).
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -66,6 +64,8 @@ def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) 
 
 
 class CausalSelfAttention(torch.nn.Module):
+    """Multi-head causal self-attention: fused qkv projection, optional q/k bias, RoPE, sdpa, output projection."""
+
     __constants__ = ("n_head", "head_dim")
 
     def __init__(self, config: RecurrentConfig) -> None:

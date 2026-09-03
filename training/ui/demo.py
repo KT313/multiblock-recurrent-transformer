@@ -25,7 +25,7 @@ def demo(
     seconds: float = 5.0, *, enabled: bool | None = None, log_file: Path | None = None, console: Console | None = None
 ) -> None:
     """A fake two-stage run (30 + 20 optimizer steps over ``seconds``) driving the whole API while the things a real
-    run writes around it fire — a stray ``print``, a bare ``sys.stderr.write``, a ``warnings.warn``, a third-party
+    run writes around it fire: a stray ``print``, a bare ``sys.stderr.write``, a ``warnings.warn``, a third-party
     logger with its own stderr handler. Piped (or ``TRAINING_DASHBOARD=0``) it shows the fallback."""
     total_steps = sum(DEMO_STEPS)
     pause = seconds / total_steps

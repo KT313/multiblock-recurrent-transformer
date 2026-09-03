@@ -143,7 +143,7 @@ def test_config_round_trip() -> None:
     expected = cfg.to_dict()
     expected["name"] = ""  # the architecture label is not an HF field
     assert back.to_dict() == expected
-    assert back.head_size == cfg.head_size and back.n_layer == cfg.n_layer
+    assert back.head_size == cfg.head_size and back.mean_backprop_layers == cfg.mean_backprop_layers
 
 
 def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
@@ -177,7 +177,7 @@ def test_wrapper_forward_matches_inner_model_in_eval() -> None:
     torch.manual_seed(1)
     out = hf_model(x, labels=x)
     torch.manual_seed(1)
-    ref = hf_model.model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])
+    ref = hf_model.model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])
     assert torch.equal(out.logits, ref["logits"])
     torch.manual_seed(1)
     tup = hf_model(x, return_dict=False)
@@ -217,12 +217,12 @@ def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None
     out = hf_model(x, labels=x, return_dict=False)
     assert isinstance(out, tuple) and len(out) == 2
     torch.manual_seed(1)
-    ref = hf_model.model(x, return_logits=True)  # num_steps_pair=None -> sampled at step 3
+    ref = hf_model.model(x, return_logits=True)  # num_steps=None -> sampled at step 3
     assert torch.equal(out[1], ref["logits"])
     assert torch.equal(out[0], hf_model.model.loss(out[1][:, :-1].contiguous(), x[:, 1:].contiguous()))
     # ... which is not the eval path
     torch.manual_seed(1)
-    eval_ref = hf_model.model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    eval_ref = hf_model.model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
     assert not torch.equal(out[1], eval_ref)
 
 
@@ -233,7 +233,7 @@ def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(1)
     out = hf_model(x).logits
     torch.manual_seed(1)
-    ref = hf_model.model(x, return_logits=True, num_steps_pair=[(1, 0), (4, 0)])["logits"]
+    ref = hf_model.model(x, return_logits=True, num_steps=[(1, 0), (4, 0)])["logits"]
     assert torch.equal(out, ref)
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,2,3")
     with pytest.raises(ValueError, match="recurrence values"):
@@ -250,10 +250,10 @@ def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.Mo
     torch.manual_seed(1)
     out = hf_model(x).logits
     torch.manual_seed(1)
-    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps_pair=None -> sampled at step 3
+    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps=None -> sampled at step 3
     assert torch.equal(out, sampled)
     torch.manual_seed(1)
-    fixed = hf_model.model(x, return_logits=True, num_steps_pair=[(1, 0), (1, 0)])["logits"]
+    fixed = hf_model.model(x, return_logits=True, num_steps=[(1, 0), (1, 0)])["logits"]
     assert not torch.equal(out, fixed), "the env var is an eval knob"
     hf_model.train(False)  # and it is honoured again in eval mode
     torch.manual_seed(1)
@@ -420,7 +420,7 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     model.eval()
     x = ids()
     torch.manual_seed(1)
-    ref = model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    ref = model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
     torch.manual_seed(1)
     got = loaded(x).logits
     torch.testing.assert_close(got, ref, atol=1e-5, rtol=0)
@@ -456,7 +456,7 @@ def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> No
     model.eval()
     x = ids()
     torch.manual_seed(1)
-    ref = model(x, return_logits=True, num_steps_pair=[(2, 0), (2, 0)])["logits"]
+    ref = model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
     torch.save({"x": x, "ref": ref}, tmp_path / "ref.pt")
     script = f"""
 import importlib.util, sys

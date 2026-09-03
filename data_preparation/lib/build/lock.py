@@ -1,11 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""One run per program at a time: an advisory ``flock`` on a lock file held for the duration of the run —
-``<dataset_dir>/.build.lock`` for a build (``prepare.py prepare`` and ``train.py``'s auto-prepare, or two training runs
-sharing ``dataset_dir``, would otherwise interleave directory removals, shard writes and manifest saves) and
-``<out_dir>/.train.lock`` for a training run. The lock file records who holds it (program, pid, host, since) so the
-error message can say so; the OS releases the lock when the holder dies, so a lock file is never stale and never has
-to be removed by hand — a run that lost its terminal and continues headless holds it until it finishes. ``status`` /
-``--dry_run`` do not take it."""
+"""One run per program at a time: an advisory ``flock`` on a lock file held for the whole run.
+
+``<dataset_dir>/.build.lock`` guards a build (a second build, or a training run's auto-prepare, would otherwise
+interleave directory removals, shard writes and manifest saves); ``<out_dir>/.train.lock`` guards a training run.
+The file records who holds it (program, pid, host, since) for the error message. The OS releases the lock when the
+holder dies, so a lock file is never stale; a run that lost its terminal and continues headless holds it until it
+finishes. ``status`` and ``--dry_run`` do not take it."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class Holder:
 
 
 class RunLocked(RuntimeError):
-    """Another process holds the lock: a run of the same program (or of the build a training run needs) is going."""
+    """Another process holds the lock: a run of the same program, or of the build a training run needs, is going."""
 
     def __init__(self, path: Path, program: str, holder: Holder | None) -> None:
         self.path = path

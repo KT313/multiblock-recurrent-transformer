@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The live training dashboard: one transient ``rich.live.Live`` layout — header, stage bars, metrics, validation,
-events, log panel, footer — with the terminal captured around it (:mod:`training.ui.capture`). The module docstring
+"""The live training dashboard: one transient ``rich.live.Live`` layout (header, stage bars, metrics, validation,
+events, log panel, footer) with the terminal captured around it (:mod:`training.ui.capture`). The module docstring
 of :mod:`training.ui.dashboard` describes the whole picture."""
 
 from __future__ import annotations
@@ -66,18 +66,14 @@ class StageBar:
 class TrainingDashboard(LiveDisplay):
     """Live terminal display of one training run (layout and capture: see :mod:`training.ui.dashboard`).
 
-    ``console`` is for tests (a ``rich.console.Console`` over a ``StringIO``); ``clock`` is injected by the ETA
-    tests. ``enabled`` is True until the dashboard disables itself after an internal error; from then on the public
-    methods keep only what the console fallback does — the lines on :data:`~training.ui.common.lines_log` — and
-    :meth:`write` prints plain lines to the stream, so a broken display costs one warning, never the run. A terminal
-    that dies mid-run closes the display the same way and the run continues headless (:mod:`ui.display`). Those
-    lines go to ``fallback_stream`` when one is given (the run's CLI passes stderr, so the lines of a display that
-    disabled itself mid-run land on the same stream as the log handlers' lines), else to ``stream``.
-    ``final_frame`` prints the static summary once the display closed.
+    ``console`` is for tests; ``clock`` is injected by the ETA tests. ``enabled`` is True until the dashboard disables
+    itself after an internal error or a dead terminal (:mod:`ui.display`); from then on the public methods only log
+    the lines the console fallback logs and :meth:`write` prints plain lines to ``fallback_stream`` (the CLI passes
+    stderr) or ``stream``, so a broken display costs one warning, never the run. ``final_frame`` prints the static
+    summary once the display closed.
 
-    The step / validation / event lines the fallback would log are logged here too, on ``lines_log`` — which only
-    the log file :meth:`attach` is given reads, never the panel or the terminal — so ``train.log`` reads the same
-    whichever dashboard the run had.
+    The step / validation / event lines go to :data:`~training.ui.common.lines_log` too, which only the log file
+    reads, so ``train.log`` reads the same whichever dashboard the run had.
     """
 
     def __init__(
@@ -110,8 +106,7 @@ class TrainingDashboard(LiveDisplay):
         super().__init__(
             stream=stream if stream is not None else sys.stdout, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
         )
-        # where the plain lines go once the display is gone (`write`, and the dashboard lines from then on): the
-        # run's fallback stream when it has one, else the display's own stream
+        # plain lines once the display is gone: the run's fallback stream when it has one, else the display's own stream
         if fallback_stream is not None:
             self._plain_stream = fallback_stream
         self._final_frame = final_frame
@@ -131,17 +126,15 @@ class TrainingDashboard(LiveDisplay):
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
         self._open = False
         self.logger = log
-        self._capture = TerminalCapture(self, skip=self.is_attached)
+        self._capture = TerminalCapture(self, already_attached=self.is_attached)
         self._refresh_bars(start_step, 0)
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
     @contextmanager
     def running(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[TrainingDashboard]:
-        """The dashboard in service for the block: ``logger`` (default: the ``training`` logger) attached
-        (:meth:`attach`, first — so the dashboard's own warning of a failing start always has a handler) and the
-        display up (``__enter__`` / ``__exit__``); ``log_file`` appended (``run_directory / TRAIN_LOG_NAME`` by
-        convention)."""
+        """The dashboard in service for the block: ``logger`` (default: the ``training`` logger) attached first, so
+        the dashboard's own warnings always have a handler, then the display up; ``log_file`` appended."""
         with self.attach(logger, log_file=log_file), self:
             yield self
 
@@ -163,8 +156,8 @@ class TrainingDashboard(LiveDisplay):
         self.close()
 
     def close(self) -> None:
-        """End the display (idempotent): erase the frame, restore streams / handlers / environment, then print the
-        kept lines and — with ``final_frame`` — the static summary. ``__exit__`` calls it on every way out."""
+        """End the display (idempotent): erase the frame, restore streams / handlers / environment, print the kept
+        lines and, with ``final_frame``, the static summary. ``__exit__`` calls it on every way out."""
         if not self._open:
             return
         self._open = False
@@ -179,15 +172,15 @@ class TrainingDashboard(LiveDisplay):
             self._console.print(self.render_summary())
 
     def _teardown(self) -> None:
-        """Undo ``__enter__``; never called with the lock held — ``Live.stop`` joins its refresh thread, which may
-        be waiting for the lock."""
+        """Undo ``__enter__``. Never called with the lock held: ``Live.stop`` joins its refresh thread, which may be
+        waiting for the lock."""
         try:
             self._stop_live()
         finally:
             self._capture.stop()
 
     def _pin_console_file(self) -> None:
-        """A console created without a file follows ``sys.stdout`` dynamically — it would render into the sink."""
+        """A console created without a file follows ``sys.stdout`` dynamically and would render into the sink."""
         if self._console.file is sys.stdout or self._console.file is sys.stderr:
             self._console.file = self._console.file
 
@@ -198,8 +191,8 @@ class TrainingDashboard(LiveDisplay):
         self._capture.redirect_streams()
 
     def _disable(self, error: BaseException) -> None:
-        """Close the display after an internal error; from now on this behaves like the console fallback (the
-        dashboard lines reach the fallback stream too). Logs one warning (the first error)."""
+        """Close the display after an internal error and behave like the console fallback from now on. Logs one
+        warning."""
         if not self.enabled:
             return
         self.enabled = False
@@ -242,10 +235,9 @@ class TrainingDashboard(LiveDisplay):
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
     ) -> None:
-        """``step`` optimizer steps are done, the run is in stage ``stage_index``, ``transition`` is the progress
-        (0-1) of the running transition out of it or None; ``metrics`` is the step dict (only the
-        :data:`METRIC_COLUMNS` keys are read, missing keys keep their last value). O(1): a few bar updates and a dict
-        merge; the display redraws on its own timer."""
+        """``step`` optimizer steps are done in stage ``stage_index``; ``transition`` is the progress (0-1) of the
+        running transition or None; only the :data:`METRIC_COLUMNS` keys of ``metrics`` are read. O(1); the display
+        redraws on its own timer."""
         with self._lock:
             self._throughput.record(step)
         self._guarded(lambda: self._apply_step(step, stage_index, transition, metrics))
@@ -289,7 +281,7 @@ class TrainingDashboard(LiveDisplay):
             self._refresh_bars(step, stage_index)
 
     def _refresh_bars(self, step: int, stage_index: int) -> None:
-        last = len(self._bars) - 1
+        last_index = len(self._bars) - 1
         for index, (bar, start) in enumerate(zip(self._bars, self._stage_starts)):
             bar.completed = min(max(step - start, 0), bar.total)
             if bar.completed >= bar.total:  # done wins over current: the final summary shows every stage ticked
@@ -299,7 +291,7 @@ class TrainingDashboard(LiveDisplay):
             else:
                 bar.marker, bar.style = "  ", "dim"
             bar.note = ""
-            if index == stage_index and self._transition is not None and index < last:
+            if index == stage_index and self._transition is not None and index < last_index:
                 bar.note = f"transition → {self.stage_names[index + 1]} {self._transition:.0%}"
         self._overall.completed = min(step, self.total_steps)
 
@@ -321,13 +313,11 @@ class TrainingDashboard(LiveDisplay):
     @contextmanager
     def attach(self, logger: logging.Logger | None = None, *, log_file: Path | None = None) -> Iterator[None]:
         """Route ``logger`` (default: the ``training`` logger) into the panel and ``log_file`` (named in the footer),
-        and this dashboard's own lines into ``log_file`` alone — one file handler shared by both loggers — for the
-        duration of the block. ``logger`` must be the ``training`` logger or one of its ancestors for the
-        dashboard's own warning to reach it; a logger above INFO is lowered to INFO for the block (a run started
-        without the CLI's logging setup keeps its lines)."""
+        and this dashboard's own lines into ``log_file`` alone (one shared file handler) for the block. A logger
+        above INFO is lowered to INFO for the block."""
         target = logger if logger is not None else logging.getLogger(TRAINING_LOGGER_NAME)
         with self._lock:
-            self._attached.append(target.name)
+            self._attached_logger_names.append(target.name)
             if log_file is not None:
                 self._log_file = log_file
         try:
@@ -335,7 +325,7 @@ class TrainingDashboard(LiveDisplay):
                 yield
         finally:
             with self._lock:
-                self._attached.remove(target.name)
+                self._attached_logger_names.remove(target.name)
             self._drop_console_lines()
 
     # --- state for tests ------------------------------------------------------------------------------------------------
@@ -364,7 +354,7 @@ class TrainingDashboard(LiveDisplay):
                 fixed = self._render_fixed()
                 fixed_height = len(console.render_lines(fixed, options, pad=False))
                 events_wanted = len(self._events) or 1
-                events_shown, log_shown = fit_panel_heights(options.max_height - fixed_height - 1, events_wanted, self._log_lines)
+                events_shown, log_shown = fit_panel_heights(options.max_height - fixed_height - 1, events_wanted, self._panel_height)
                 events = self._render_events(events_shown)
                 log_panel = self._render_log(log_shown)
                 footer = self._footer()

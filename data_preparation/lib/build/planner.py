@@ -1,33 +1,23 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Planner: what a dataset config needs on disk versus what the manifests say is there, counted in **sequences**.
+"""Planner: what a dataset config needs on disk versus what the manifests say is there, counted in sequences.
 
-The trainer draws *rows* from one continuous stream per source with the stage weight (linearly interpolated across
-a transition window) and pads or truncates every row to ``block_size``, so the run consumes the integral of the
-source's weight schedule over the stage token budgets, ÷ ``block_size`` — its :meth:`DatasetConfig.sequence_budget`
-(each stage adds ``(tokens − transition tokens) × weight`` plus the trapezoid ``transition tokens × (weight +
-next stage's weight) / 2``; the 1.2 safety margin comes on top).
-That is the planner's unit: :meth:`DatasetConfig.rows_needed` turns it into a download target and
-:meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it. There is no tokens-per-row estimate anywhere in this arithmetic: a source whose rows
-are shorter than ``block_size`` is not over-downloaded, and the realised **token** mix of a stage is
-``weight × mean_tokens_per_row ÷ block_size``-weighted (the README says so; ``describe.py`` prints an estimate from
-``describe_tokens_per_row`` for the token table only).
+The trainer draws rows from one continuous stream per source with the stage weight and pads or truncates every row
+to ``block_size``, so the run consumes the integral of the source's weight schedule over the stage token budgets
+divided by ``block_size``: its :meth:`DatasetConfig.sequence_budget` (the 1.2 safety margin comes on top). That is
+the planner's unit: :meth:`DatasetConfig.rows_needed` turns it into a download target,
+:meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it. No tokens-per-row estimate enters this
+arithmetic (``describe.py`` prints one for its token table only).
 
-One :class:`SourceLedger` per source answers **both** questions the pipeline asks — "what is still to download?"
-(:attr:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`) — from one read
-of the config and the manifests. :func:`plan_downloads`, :func:`every_source_satisfies_its_budget`,
-``runner.another_round_can_fetch_more`` and :func:`summarize_dataset_state` all read that object, so they cannot
-disagree: a plan that looked only at raw rows next to a satisfaction check that looked only at processed rows would
-leave a source whose dedup or length filter dropped more than the safety margin short forever with nothing planned.
-The ledger sizes a **top-up** from the observed yield (processed ÷ raw), and an exhausted source with no rows is a
-failure, as "a failed source is a failed build" says it must be — and so is an exhausted source whose few rows all
-go to the training-time validation holdout (:func:`training_rows_after_split`): training would only fail at startup
-with a confusing empty-range error, so preparation's "satisfied" mirrors the split training will make.
+One :class:`SourceLedger` per source answers both questions the pipeline asks, "what is still to download?"
+(:attr:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`), from one read
+of the config and the manifests, so the plan and the satisfaction check cannot disagree. The ledger sizes a top-up
+from the observed yield (processed / raw). An exhausted source with no rows, or whose few rows all go to the
+training-time validation holdout (:func:`training_rows_after_split`), is a failure: a failed source is a failed
+build, never a silently smaller dataset.
 
 Everything here reads manifests only (no parquet footers): a processed folder's health is the shared verdict of
-``lib/build/assessment.py`` in its manifest-only mode (``check_files=False``), so broken or stray shard files are
-the repair step's business (``lib/build/repair.py``, the same verdict with the files checked) and the training
-resolver checks the folders on disk independently. Pure functions of ``(config, layout)``;
-``lib/build/runner.py`` executes them.
+``lib/build/assessment.py`` with ``check_files=False``; broken or stray shard files are the repair step's business.
+Pure functions of ``(config, layout)``; ``lib/build/runner.py`` executes them.
 """
 
 from __future__ import annotations
@@ -71,7 +61,7 @@ def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
 
 
 def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
-    """Whether the loader of ``name`` has nothing more to give: the raw manifest says exhausted — unless it was
+    """Whether the loader of ``name`` has nothing more to give: the raw manifest says exhausted, unless it was
     exhausted by a ``check_limit`` that has since grown or been removed (``download`` reads on then)."""
     if not raw.exhausted:
         return False
@@ -90,7 +80,7 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
     """Whether ``name`` has raw shards its processed folder does not cover yet (or no healthy processed folder);
-    False without a current raw manifest — there is nothing to build from."""
+    False without a current raw manifest: there is nothing to build from."""
     raw = inspect_raw(config, name, layout).current_manifest
     return raw is not None and assess_processed(config, name, layout, raw).problem != "none"
 
@@ -128,7 +118,10 @@ class DownloadPlan:
     def describe(self) -> str:
         """A fixed-width table: source, rows present, rows needed, rows to fetch, reason."""
         header = ("source", "present", "needed", "fetch", "reason")
-        rows = [(s.name, f"{s.raw_rows:,}", f"{s.rows_needed:,}", f"{s.rows_to_fetch[0]:,}", s.rows_to_fetch[1]) for s in self.sources]
+        rows = [
+            (source.name, f"{source.raw_rows:,}", f"{source.rows_needed:,}", f"{source.rows_to_fetch[0]:,}", source.rows_to_fetch[1])
+            for source in self.sources
+        ]
         return format_table(header, rows)
 
 
@@ -137,7 +130,7 @@ def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Ite
 
     A raw folder that is stale or outdated is planned as "nothing to fetch" with the state as its reason: the
     repair step deletes it (after confirmation) before any download runs, and a dry run shows the state instead of
-    failing — the download never appends to a folder whose rows the current config would not have produced.
+    failing. The download never appends to a folder whose rows the current config would not have produced.
     """
     return DownloadPlan(read_ledgers(config, layout, sources=sources))
 
@@ -173,11 +166,12 @@ class DatasetReport:
         """A fixed-width table: source, kind, rows needed, raw rows, processed rows, epochs, state, reason."""
         header = ("source", "kind", "needed", "raw", "processed", "epochs", "state", "reason")
         rows = []
-        for s in self.sources:
-            epochs = s.epochs()
+        for source in self.sources:
+            epochs = source.epochs()
+            state = "needs repair" if source.name in self.needs_repair else source.state()
             rows.append((
-                s.name, s.kind, f"{s.rows_needed:,}", f"{s.raw_rows:,}", f"{s.processed_rows:,}",
-                "-" if epochs is None else f"{epochs:.2f}", "needs repair" if s.name in self.needs_repair else s.state(), s.satisfaction()[1],
+                source.name, source.kind, f"{source.rows_needed:,}", f"{source.raw_rows:,}", f"{source.processed_rows:,}",
+                "-" if epochs is None else f"{epochs:.2f}", state, source.satisfaction()[1],
             ))  # fmt: skip
         rows.append(("tokenizer", "tokenizer", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
         return format_table(header, rows)
@@ -191,9 +185,9 @@ class DatasetReport:
 class SourceLedger:
     """One source as ``prepare`` sees it: the budget from the config, everything else from the manifests, read once.
 
-    The two questions the pipeline asks are answered from this one object — :attr:`rows_to_fetch` ("what is still to
-    download?") and :meth:`satisfaction` ("is this source done?") — so they cannot contradict each other (see the
-    module docstring).
+    The two questions the pipeline asks, :attr:`rows_to_fetch` ("what is still to download?") and
+    :meth:`satisfaction` ("is this source done?"), are answered from this one object, so they cannot contradict
+    each other (see the module docstring).
     """
 
     name: str
@@ -221,15 +215,15 @@ class SourceLedger:
 
     @property
     def rows_target(self) -> int:
-        """What :func:`~data_preparation.lib.stages.download.download` is asked for — a **target**, not an increment:
-        the rows already on disk plus the ones missing. Equal to :attr:`rows_needed` on a first pass, larger for a
+        """What :func:`~data_preparation.lib.stages.download.download` is asked for: a target, not an increment.
+        The rows already on disk plus the ones missing; equal to :attr:`rows_needed` on a first pass, larger for a
         top-up round that scales the shortfall by the observed yield."""
         return self.raw_rows + self.rows_to_fetch[0]
 
     @cached_property
     def rows_to_fetch(self) -> tuple[int, str]:
-        """``(rows, reason)``: raw rows to add — the difference to :attr:`rows_needed` while raw is short; **a top-up
-        sized by the observed yield** once raw is long enough but the build dropped more than the safety margin
+        """``(rows, reason)``: raw rows to add. The difference to :attr:`rows_needed` while raw is short; a top-up
+        sized by the observed yield once raw is long enough but the build dropped more than the safety margin
         covers; 0 when the loader is dry, the raw folder is the repair step's business, or the budget is served.
         Computed once per ledger (the pathological-yield warning is logged once)."""
         if self.raw_state not in ("missing", "current"):
@@ -249,14 +243,11 @@ class SourceLedger:
 
     def _top_up_rows(self) -> int:
         """Raw rows to add when the build dropped more than the ``SAFETY_MARGIN`` covers: the shortfall in processed
-        rows divided by the yield this source actually showed (``processed ÷ raw``) and multiplied by the same margin
-        the first download uses — the yield is one measurement, and overshooting costs a few rows while
-        undershooting costs another round. 0 when there is no yield to extrapolate from.
+        rows divided by the yield this source showed (processed / raw), times the same margin the first download
+        uses. 0 when there is no yield to extrapolate from.
 
-        **Capped at** :attr:`rows_needed`, the full requirement of the budget: a pathological yield (0.08 % of the
-        rows surviving, say) extrapolates to billions of rows and would ask the loader for a download nobody wants.
-        This is a runtime measurement going wrong mid-download, not a config mistake, so the round is capped with a
-        warning and the next round measures the yield again on more data.
+        Capped at :attr:`rows_needed`: a pathological yield (0.08 % surviving, say) extrapolates to billions of
+        rows. The round is capped with a warning and the next round measures the yield again on more data.
         """
         if self.raw_rows <= 0 or self.processed_rows <= 0:
             return 0
@@ -274,15 +265,13 @@ class SourceLedger:
     # --- is it done ------------------------------------------------------------------------------------------------
 
     def satisfaction(self) -> tuple[bool, str]:
-        """``(satisfied, reason)``. Satisfied = the processed folder is current, covers every raw shard and holds at
-        least :attr:`rows_sufficient` rows (so the training part after the split reaches the sequence budget) — or
-        the loader is dry with at least one row left for training after the validation holdout
-        (:attr:`training_rows`; a source used only in validation holds nothing out, so any row serves it): the sampler
-        cycles what is there. A source that ran dry with nothing is not satisfied — its rows were all rejected, which
-        is a wrong ``fields`` / ``converter`` / ``filter`` / ``language`` — nor is one whose few rows all go to the
-        validation holdout (training would fail at startup with an empty range): a failed source is a failed build,
-        never a silently smaller dataset. A stale / outdated raw folder is reported (the repair step deletes it after
-        confirmation), never counted. The reason is the status table's last column: ``"ok"``, or what is missing."""
+        """``(satisfied, reason)``. Satisfied: the processed folder is current, covers every raw shard and holds at
+        least :attr:`rows_sufficient` rows, or the loader is dry with at least one row left for training after the
+        validation holdout (:attr:`training_rows`; the sampler cycles what is there). A source that ran dry with
+        nothing is not satisfied (its rows were all rejected: a wrong ``fields`` / ``converter`` / ``filter`` /
+        ``language``), nor is one whose few rows all go to the validation holdout: a failed source is a failed
+        build, never a silently smaller dataset. A stale / outdated raw folder is reported, never counted. The
+        reason is the status table's last column: ``"ok"``, or what is missing."""
         if self.raw_state not in ("missing", "current"):
             return False, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
         if self.raw_state == "missing":

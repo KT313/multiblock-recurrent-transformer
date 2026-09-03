@@ -13,11 +13,10 @@ RATE_SMOOTHING = 0.1  # weight of the newest seconds/step sample in the exponent
 class Throughput:
     """Smoothed seconds per optimizer step from the times :meth:`record` is called with, and the ETA derived from it.
 
-    The first interval sets the estimate, the second one replaces it (the first interval of a run holds the
-    ``torch.compile`` and the loader start-up, an outlier that would otherwise dominate the ETA for dozens of steps),
-    later ones move it by :data:`RATE_SMOOTHING` (an exponential moving average — a stall or one slow evaluation step
-    does not swing the ETA). ``start_step`` is the step the run (re)starts at, so a resumed run does not count the
-    checkpointed steps as done in zero seconds.
+    The first interval sets the estimate, the second replaces it (the first interval holds ``torch.compile`` and the
+    loader start-up, an outlier), later ones move it by :data:`RATE_SMOOTHING` (an exponential moving average, so
+    one slow step does not swing the ETA). ``start_step`` is the step the run (re)starts at, so a resumed run does
+    not count the checkpointed steps as done in zero seconds.
     """
 
     def __init__(self, total_steps: int, *, start_step: int = 0, clock: Clock = time.monotonic) -> None:

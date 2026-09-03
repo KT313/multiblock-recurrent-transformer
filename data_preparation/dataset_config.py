@@ -45,7 +45,7 @@ DEFAULT_BENCHMARKS = [
     "mmlu_test",
     "winogrande_test",
 ]
-SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (covers what the length filter / dedup drop); a Fraction so 50 × 1.2 is exactly 60
+SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (covers filter / dedup losses); a Fraction so 50 × 1.2 is exactly 60
 
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
 # derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
@@ -63,7 +63,7 @@ SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in
 #   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder, nothing is downloaded.
 #   config    everything else that defines the training data; only `config_hash` (recorded in checkpoints so a resume
 #             against different data is detected) counts it.
-#   none      not hashed at all: how rows are fetched or described, resource knobs — nothing that changes the data.
+#   none      not hashed at all: how rows are fetched or described, resource knobs; nothing that changes the data.
 #
 # Each name selects exactly the fields annotated with it; the hashes nest instead of re-walking fields:
 # `processed_hash` folds the raw hash in as one value and `config_hash` is composed of every source's processed hash,
@@ -80,7 +80,7 @@ _LOAD_KWARGS: dict[str, Any] = {**_RAW, "hash_drop": ("max_cached_file_mb",)}
 
 
 def _seed_hash(source: SourceConfig) -> str:
-    """`seed` is loader identity — it generates the rows themselves — only for `loader: synthetic`; for every other
+    """`seed` is loader identity (it generates the rows themselves) only for `loader: synthetic`; for every other
     loader it drives the build-time input inversions and the shuffle order, so it belongs to the processed hash."""
     return "raw" if source.loader == "synthetic" else "processed"
 
@@ -114,14 +114,14 @@ class TokenizerConfig:
 class DedupConfig:
     """Deduplication of a source's rows (both kinds; instruct rows are hashed as instruction + input + output).
 
-    `none` and `exact` apply to both kinds, `minhash` only to pretrain sources — an instruct source configured with
+    `none` and `exact` apply to both kinds, `minhash` only to pretrain sources; an instruct source configured with
     it is rejected by `DatasetConfig._check_dedup_modes` instead of quietly getting exact dedup."""
 
-    mode: DedupMode = field(default="exact", metadata=_PROCESSED)  # minhash (pretrain sources only) = exact dedup first, then MinHash/LSH near-duplicate removal (not for scale)
+    mode: DedupMode = field(default="exact", metadata=_PROCESSED)  # minhash: exact dedup first, then MinHash/LSH near-duplicate removal (pretrain only, not for scale)
     normalize: bool = field(default=True, metadata={"hash": _normalize_hash})  # exact mode: hash lowercased, whitespace-collapsed text
     # A larger filter only lowers an already negligible false-positive rate: a resource knob, never a reason to
     # rebuild a processed folder, so it is in no hash.
-    bloom_memory_mb: int = field(default=1024, metadata=_UNHASHED)  # exact mode: memory budget of the Bloom filter holding the seen hashes (per source)
+    bloom_memory_mb: int = field(default=1024, metadata=_UNHASHED)  # exact mode: memory budget (MB) of the Bloom filter of seen hashes, per source
     threshold: float = field(default=0.95, metadata={"hash": _minhash_only})  # minhash mode: Jaccard threshold
     num_perm: int = field(default=256, metadata={"hash": _minhash_only})  # minhash mode: permutations
     ngram: int = field(default=5, metadata={"hash": _minhash_only})  # minhash mode: word n-gram size
@@ -140,7 +140,7 @@ class DecontaminationConfig:
     """Drop documents overlapping benchmark test sets (off by default; the thesis run skipped it)."""
 
     enabled: bool = field(default=False, metadata=_PROCESSED)  # off: documents are kept regardless of benchmark overlap
-    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS), metadata=_PROCESSED)  # benchmark test sets to check against (lib/stages/benchmarks.py)
+    benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS), metadata=_PROCESSED)  # test sets to check (lib/stages/benchmarks.py)
     ngram: int = field(default=13, metadata=_PROCESSED)  # word n-gram size compared between a document and the benchmarks
     threshold: float = field(default=0.1, metadata=_PROCESSED)  # share of a document's n-grams found in one benchmark
 
@@ -208,12 +208,12 @@ SOURCE_FIELD_SCOPES: dict[str, FieldScope] = {
 _NO_DEFAULT = object()  # a field without a default is always "set"
 
 
-def _field_default(f: Field[Any]) -> Any:
+def _field_default(dataclass_field: Field[Any]) -> Any:
     """The value a field has when a config does not mention it."""
-    if f.default is not MISSING:
-        return f.default
-    if f.default_factory is not MISSING:
-        return f.default_factory()
+    if dataclass_field.default is not MISSING:
+        return dataclass_field.default
+    if dataclass_field.default_factory is not MISSING:
+        return dataclass_field.default_factory()
     return _NO_DEFAULT
 
 
@@ -245,8 +245,8 @@ class SourceConfig:
     converter: Optional[str] = field(default=None, metadata=_RAW)  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
     fields: Optional[dict[str, str]] = field(default=None, metadata=_RAW)  # instruct: {instruction: <col>, input: <col>, output: <col>}
     filter: Optional[str] = field(default=None, metadata=_RAW)  # instruct: named row filter applied at download, e.g. sharegpt_quality
-    check_limit: Optional[int] = field(default=None, metadata=_CONFIG)  # stop after inspecting this many source rows even if short of target (> 0; both kinds)
-    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # rows to download for a source used only in validation (required there, forbidden for train sources)
+    check_limit: Optional[int] = field(default=None, metadata=_CONFIG)  # stop after inspecting this many source rows even if short of target (> 0)
+    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # rows to download for a validation-only source (required there, forbidden for train sources)
     seed: int = field(default=42, metadata={"hash": _seed_hash})  # synthetic generator seed; instruct: input-inversion and shuffle seed
     # hashed through the source's *effective* processing block (`source_processing`), not as a field of its own
     processing: Optional[ProcessingConfig] = field(default=None, metadata=_PROCESSED)  # pretrain: override of the dataset-level processing block
@@ -262,15 +262,15 @@ class SourceConfig:
     def _check_field_scopes(self) -> None:
         """The one loop over `SOURCE_FIELD_SCOPES`: a field set outside the kind/loader it belongs to is an error
         naming the field and where it does apply, and a required field missing inside its scope is one too."""
-        for f in fields(self):
-            scope = SOURCE_FIELD_SCOPES.get(f.name, _NOWHERE)
-            value = getattr(self, f.name)
+        for source_field in fields(self):
+            scope = SOURCE_FIELD_SCOPES.get(source_field.name, _NOWHERE)
+            value = getattr(self, source_field.name)
             if self.kind in scope.kinds and self.loader in scope.loaders:
                 if scope.required and not value:
                     where = f"loader {self.loader}" if scope.loaders != ALL_LOADERS else f"kind {self.kind}"
-                    raise ValueError(f"{where} requires {f.name}")
-            elif value != _field_default(f):
-                raise ValueError(f"{f.name} only applies to {_scope_text(scope)}")
+                    raise ValueError(f"{where} requires {source_field.name}")
+            elif value != _field_default(source_field):
+                raise ValueError(f"{source_field.name} only applies to {_scope_text(scope)}")
 
     def _check_values(self) -> None:
         """The rules about a field's value, which the scope table cannot express."""
@@ -369,7 +369,7 @@ class DatasetConfig:
             raise ValueError("validation_fraction must be in [0, 1)")
         if not self.stages:
             raise ValueError("stages must contain at least one stage")
-        if len({s.name for s in self.stages}) != len(self.stages):
+        if len({stage.name for stage in self.stages}) != len(self.stages):
             raise ValueError("stage names must be unique")
         for stage in self.stages:
             for key in (*stage.train, *stage.val):
@@ -403,7 +403,7 @@ class DatasetConfig:
         """`dedup.mode: minhash` never reaches an instruct source: the near-duplicate pass runs only in the pretrain
         branch of the build (`lib/stages/build.py`), so such a source would silently be deduplicated exactly and the
         config would promise something it does not do. `processing` is a pretrain-only per-source field, so it is the
-        dataset-level block that reaches an instruct source — a config that wants minhash for its pretrain sources
+        dataset-level block that reaches an instruct source; a config that wants minhash for its pretrain sources
         gives each of them its own `processing`."""
         for name, source in self.sources.items():
             if source.kind == "instruct" and self.source_processing(name).dedup.mode == "minhash":
@@ -417,7 +417,7 @@ class DatasetConfig:
         """A shuffled source is built all-at-once: every processed row is held in memory, shuffled, then written
         (`lib/stages/build.py`). A config can legally ask that of a huge source and OOM hours into the build, so a
         shuffled source whose planned row requirement (:meth:`rows_needed`, the planner's number) exceeds
-        `SHUFFLED_BUILD_MAX_ROWS` is refused here — both `prepare.py` and training's auto-prepare load the config
+        `SHUFFLED_BUILD_MAX_ROWS` is refused here; both `prepare.py` and training's auto-prepare load the config
         before any work."""
         for name in self.sources:
             if not self.shuffle_of(name):
@@ -468,8 +468,8 @@ class DatasetConfig:
         """Sequences (rows padded / truncated to ``block_size``) the whole run draws from the source: the integral
         of its sampling-weight schedule over the stage token budgets, rounded up.
 
-        The trainer reads every source as ONE continuous stream for the whole run — a stage does not restart the
-        source, it only changes the sampling weight — so stages sharing a source add up instead of overlapping.
+        The trainer reads every source as ONE continuous stream for the whole run (a stage does not restart the
+        source, it only changes the sampling weight), so stages sharing a source add up instead of overlapping.
         Each stage contributes its plain part ``(tokens − transition tokens) × weight`` plus, for the transition
         window at its end (``transition tokens = tokens × transition_pct``; none after the last stage), the
         trapezoid ``transition tokens × (weight + next stage's weight) / 2`` of the linear weight interpolation.
@@ -488,12 +488,11 @@ class DatasetConfig:
         return ceil(total / self.block_size)
 
     def rows_needed(self, source_name: str) -> int:
-        """Raw rows to download for the source — THE definition of the planner's row requirement
-        (`_check_shuffled_build_sizes` reads the same number). A source used for training (and maybe validation): ``ceil(sequence_budget ×
-        SAFETY_MARGIN ÷ (1 − validation_fraction_of(name)))`` — the margin covers what the length filter and the
-        dedup drop, the division keeps the *training* part at the sequence budget after the training resolver holds
-        ``validation_fraction`` of the processed rows out. A source used only for validation: its ``rows``. Exact
-        `Fraction` arithmetic: 50 × 1.2 is 60, not 60.000000000000007."""
+        """Raw rows to download for the source, the planner's row requirement (`_check_shuffled_build_sizes` reads
+        the same number). A source used for training: ``ceil(sequence_budget × SAFETY_MARGIN ÷ (1 −
+        validation_fraction_of(name)))``; the margin covers what the length filter and the dedup drop, the division
+        keeps the *training* part at the sequence budget after the validation holdout. A source used only for
+        validation: its ``rows``. Exact `Fraction` arithmetic: 50 × 1.2 is 60, not 60.000000000000007."""
         source = self.sources[source_name]
         if not self.used_in_train(source_name):
             return int(source.rows or 0)
@@ -508,7 +507,7 @@ class DatasetConfig:
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
     def raw_hash(self, source_name: str) -> str:
-        """Hash of a source's ``raw/`` folder: every field annotated ``raw`` — the loader identity (kind, loader,
+        """Hash of a source's ``raw/`` folder: every field annotated ``raw``, i.e. the loader identity (kind, loader,
         repo, revision, files, split, text field, language, path, converter/fields/filter; ``seed`` only for
         ``loader: synthetic``, where it generates the rows) plus ``token_count`` and the tokenizer, on which the
         stored ``tokens`` column and the token-boundary truncation depend.
@@ -529,7 +528,7 @@ class DatasetConfig:
 
     def processed_hash(self, source_name: str) -> str:
         """Hash of a source's ``processed/`` folder: the raw hash, plus the ``processed`` fields as the build
-        resolves them — ``max_seq_length`` (stored counts are clamped to it), the *effective* processing block (only
+        resolves them: ``max_seq_length`` (stored counts are clamped to it), the *effective* processing block (only
         the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
         ``input_inversions``, the resolved ``shuffle`` and the ``seed`` behind both. These four are written out
         rather than taken from :func:`hash_payload`, because the build uses their resolved values (``shuffle_of``,
@@ -566,7 +565,7 @@ class DatasetConfig:
 
     def overlap_warnings(self) -> list[str]:
         """Sources used only for validation that read the same Hub repo as a training source with the same or a
-        nested ``data_files`` glob prefix — such a held-out set is likely not disjoint from the training data
+        nested ``data_files`` glob prefix: such a held-out set is likely not disjoint from the training data
         (prefer listing the training source in ``val`` too: its ``validation_fraction`` split never overlaps)."""
         warnings: list[str] = []
         val_only = [name for name in self.sources if self.used_in_val(name) and not self.used_in_train(name)]
@@ -579,8 +578,9 @@ class DatasetConfig:
                 train = self.sources[train_name]
                 if train.hf_id != val.hf_id:
                     continue
-                a, b = _glob_prefix(val.load_kwargs.get("data_files")), _glob_prefix(train.load_kwargs.get("data_files"))
-                if a.startswith(b) or b.startswith(a):
+                val_prefix = _glob_prefix(val.load_kwargs.get("data_files"))
+                train_prefix = _glob_prefix(train.load_kwargs.get("data_files"))
+                if val_prefix.startswith(train_prefix) or train_prefix.startswith(val_prefix):
                     warnings.append(
                         f"validation-only source {val_name!r} reads {val.hf_id} like training source {train_name!r} "
                         f"(data_files {val.load_kwargs.get('data_files')!r} vs {train.load_kwargs.get('data_files')!r}): "
@@ -604,7 +604,7 @@ def _check_weights(what: str, weights: dict[str, float]) -> None:
     """Non-empty, every weight > 0 (a zero weight would list a source a stage never draws from), sum 1."""
     if not weights:
         raise ValueError(f"{what}: must not be empty")
-    if any(w <= 0 for w in weights.values()):
+    if any(weight <= 0 for weight in weights.values()):
         raise ValueError(f"{what}: weights must be > 0 (drop the key instead of a zero weight)")
     total = sum(weights.values())
     if abs(total - 1.0) > 1e-6:
@@ -614,9 +614,9 @@ def _check_weights(what: str, weights: dict[str, float]) -> None:
 def _glob_prefix(pattern: Any) -> str:
     """The literal directory prefix of a ``data_files`` glob (``data/CC-MAIN-2013-20/*.parquet`` -> ``data/CC-MAIN-2013-20/``)."""
     text = "" if pattern is None else str(pattern)
-    for i, char in enumerate(text):
+    for position, char in enumerate(text):
         if char in "*?[":
-            return text[:i]
+            return text[:position]
     return text
 
 
@@ -636,12 +636,13 @@ def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
 
     An unannotated field raises: a new schema field has to say which hash it belongs to.
     """
-    out: dict[str, Any] = {}
-    for f in fields(obj):
-        if field_hash_annotation(f, obj) != hash_name:
+    payload: dict[str, Any] = {}
+    for dataclass_field in fields(obj):
+        if field_hash_annotation(dataclass_field, obj) != hash_name:
             continue
-        out[f.name] = _drop_keys(_hashable(getattr(obj, f.name), hash_name), f.metadata.get("hash_drop", ()))
-    return out
+        value = _hashable(getattr(obj, dataclass_field.name), hash_name)
+        payload[dataclass_field.name] = _drop_keys(value, dataclass_field.metadata.get("hash_drop", ()))
+    return payload
 
 
 def field_hash_annotation(f: Field[Any], obj: Any) -> str:
@@ -667,7 +668,7 @@ def _drop_keys(value: Any, keys: Any) -> Any:
     """``value`` without the dict keys ``keys`` (``metadata["hash_drop"]``); the emptied dict itself stays."""
     if not keys or not isinstance(value, dict):
         return value
-    return {k: v for k, v in value.items() if k not in keys}
+    return {key: item for key, item in value.items() if key not in keys}
 
 
 def _hashable(value: Any, hash_name: HashName) -> Any:
@@ -675,9 +676,9 @@ def _hashable(value: Any, hash_name: HashName) -> Any:
     if _is_dataclass_instance(value):
         return hash_payload(value, hash_name)
     if isinstance(value, dict):
-        return {k: _hashable(v, hash_name) for k, v in value.items()}
+        return {key: _hashable(item, hash_name) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_hashable(v, hash_name) for v in value]
+        return [_hashable(item, hash_name) for item in value]
     return value
 
 

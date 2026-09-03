@@ -2,16 +2,13 @@
 """The exact-dedup key of a document and the "seen" set of one build as a Bloom filter under a fixed memory budget.
 
 A Python ``set[int]`` costs ~100 B per entry, tens of GB at the 200 B-token scale; :class:`SeenDocuments` wraps an
-``rbloom.Bloom`` whose bit array is sized from ``memory_mb`` alone (bits = MB x 2^23) and costs O(1) per document.
-Its only error is a false positive — a unique document dropped as a duplicate — never a kept duplicate. The filter
-is deliberately not persisted: a build refills it from the ``hash`` column of the processed shards already on disk
-(:func:`stored_hashes`), which is the same set a full pass would have accumulated.
+``rbloom.Bloom`` sized from ``memory_mb`` alone (bits = MB x 2^23). Its only error is a false positive (a unique
+document dropped as a duplicate), never a kept duplicate. The filter is not persisted: a build refills it from the
+``hash`` column of the processed shards on disk (:func:`stored_hashes`).
 
-rbloom's ``hash_func`` must return a Python int in ``[-2^127, 2^127 - 1]`` (``OverflowError`` otherwise); the
-filter seeds a 128-bit linear congruential generator with it and takes the ``k`` probe positions from successive
-states, so the value should be well mixed across all 128 bits. Python's ``hash(int)`` reduces modulo ``2^61 - 1``
-and would collide distinct 64-bit keys, and a 64-bit key with zero upper bits is a poor LCG seed, hence
-:func:`mix128`. rbloom sizes the filter as ``m = -n ln p / ln(2)^2`` bits (rounded up to whole bytes);
+rbloom's ``hash_func`` must return a Python int in ``[-2^127, 2^127 - 1]`` that is well mixed across all 128 bits
+(the filter seeds a 128-bit LCG with it). Python's ``hash(int)`` reduces modulo ``2^61 - 1`` and would collide
+distinct 64-bit keys, hence :func:`mix128`. rbloom sizes the filter as ``m = -n ln p / ln(2)^2`` bits;
 :func:`expected_items` inverts that so the memory budget, not a row estimate, decides the size.
 """
 
@@ -56,15 +53,15 @@ def _splitmix64(x: int) -> int:
 def mix128(hash64: int) -> int:
     """Spread a 64-bit row hash (signed or unsigned) over a signed 128-bit integer for rbloom's ``hash_func``.
 
-    Two steps of the splitmix64 generator seeded with the key (add the increment, finalise) give the two halves;
-    both steps are bijections, so distinct 64-bit keys give distinct 128-bit values, every output bit depends on
-    every input bit, and no key maps to a zero half (the bare finalizer has the fixed point 0). Pure Python and
-    ~12 integer operations: negligible next to hashing the document text.
+    Two steps of the splitmix64 generator seeded with the key give the two halves. Both steps are bijections, so
+    distinct 64-bit keys give distinct 128-bit values, every output bit depends on every input bit, and no key maps
+    to a zero half (the bare finalizer has the fixed point 0). About 12 integer operations: negligible next to
+    hashing the document text.
     """
-    lo = _splitmix64((hash64 + _GAMMA) & _MASK64)
-    hi = _splitmix64((lo + _GAMMA) & _MASK64)
-    value = (hi << 64) | lo
-    return value - (1 << 128) if hi >> 63 else value
+    low64 = _splitmix64((hash64 + _GAMMA) & _MASK64)
+    high64 = _splitmix64((low64 + _GAMMA) & _MASK64)
+    value = (high64 << 64) | low64
+    return value - (1 << 128) if high64 >> 63 else value
 
 
 def bits_for_budget(memory_mb: int) -> int:

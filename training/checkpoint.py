@@ -1,11 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Checkpoint schema, naming, search, save/load through the backend. Steps in file names are OPTIMIZER steps.
+"""Checkpoint schema, naming, search, and save/load through the backend. Steps in file names are OPTIMIZER steps.
 
-A checkpoint is one `torch.save` dict: the two state dicts `"model"` / `"optimizer"` plus the fields of
-`CheckpointMetadata` (`step`, `stage`, `rng`, `settings`, `model_config`, `dataset_config_hash`, `validation_rows`,
-`data_stream`). `dataset_config_hash` and `validation_rows` are verified on resume by
-`training.data.dataset_resolver.check_dataset_unchanged`; `rng` is `Backend.rng_state()`. There is no loader for
-older layouts (clean break, a standing decision): `CheckpointMetadata.from_state` raises on a missing key.
+A checkpoint is one `torch.save` dict: the `"model"` and `"optimizer"` state dicts plus the `CheckpointMetadata`
+fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key.
 """
 
 import re
@@ -40,18 +37,18 @@ class CheckpointMetadata:
 
     def to_state(self) -> dict[str, Any]:
         """The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied)."""
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        return {field.name: getattr(self, field.name) for field in fields(self)}
 
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "CheckpointMetadata":
         """Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored."""
-        missing = [f.name for f in fields(cls) if f.name not in state]
+        missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(
                 f"checkpoint is missing the metadata key(s) {missing}; it was written by an older version of the "
                 "training code and cannot be resumed (checkpoint formats are a clean break)"
             )
-        return cls(**{f.name: state[f.name] for f in fields(cls)})
+        return cls(**{field.name: state[field.name] for field in fields(cls)})
 
 
 def checkpoint_dir(out_dir: str | Path) -> Path:
@@ -77,21 +74,18 @@ def _step_from_name(path: Path) -> int:
 
 def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]:
     """Highest-step checkpoint of `run_name` under `out_dir/checkpoints`, or None."""
-    base = checkpoint_dir(out_dir)
+    directory = checkpoint_dir(out_dir)
     pattern = re.compile(rf"^step-\d{{8}}-{re.escape(run_name)}(-stage-\d+_end)?{re.escape(CHECKPOINT_SUFFIX)}$")
-    candidates = [p for p in base.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(p.name)]
+    candidates = [path for path in directory.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(path.name)]
     if not candidates:
         return None
     return max(candidates, key=_step_from_name)
 
 
-# A resume that silently mixes two configurations is a chimera, so `restore_checkpoint_if_resuming` compares EVERY
-# `Settings` field against the ones stored in the checkpoint (`allow_settings_change` overrides) — a field added in
-# the future is checked by default until it is deliberately exempted here. Each entry (group) says why differing
-# from the checkpoint is harmless. Deliberately NOT exempt, although they look like reporting knobs: the evaluation
-# settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`) — every forward consumes the global torch RNG
-# (the meta check and the latent `randn_like` of the recurrence), so how often validation runs, how many batches it
-# draws and at how many depths it scores them change the training stream itself.
+# `restore_checkpoint_if_resuming` compares EVERY `Settings` field against the checkpoint (`allow_settings_change`
+# overrides), so a new field is checked until it is exempted here. Each group says why differing is harmless.
+# Not exempt on purpose: the evaluation settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`). Every
+# forward consumes the global torch RNG, so how often and how much validation runs changes the training stream.
 SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # run identity and output location: where results go, not what is computed
     "run_name",
@@ -130,23 +124,19 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "export_hf_path",
 )
 
-# Changing this flag on resume could NEVER take effect: the optimizer's parameter groups are restored from the
-# checkpoint, so the old grouping silently stays. `check_settings_unchanged` therefore refuses a changed value even
-# under `allow_settings_change`.
+# Can never take effect on resume: the optimizer's parameter groups are restored from the checkpoint.
+# `check_settings_unchanged` refuses a changed value even under `allow_settings_change`.
 PARAM_GROUPING_SETTING = "no_weight_decay_for_bias_and_norm_params"
 
 
 def check_settings_unchanged(
     metadata: CheckpointMetadata, settings: "Settings", model_config: dict[str, Any], allow_settings_change: bool
 ) -> None:
-    """Fail a resume whose settings or model config differ from what the checkpoint was written with, unless
-    `allow_settings_change` is set.
+    """Fail a resume whose settings or model config differ from the checkpoint's, unless `allow_settings_change`.
 
-    Every `Settings` field outside :data:`SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME` is compared; a field the (older)
-    checkpoint did not store counts as changed. `model_config` is the current model's `RecurrentConfig.to_dict()`,
-    compared whole against the stored one. A changed :data:`PARAM_GROUPING_SETTING` is refused even with
-    `allow_settings_change`: the restored optimizer keeps the checkpoint's parameter groups, so the new value would
-    be silently ignored.
+    Fields in `SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME` are skipped; a field the checkpoint did not store counts as
+    changed. `model_config` is compared whole. A changed `PARAM_GROUPING_SETTING` is refused even with
+    `allow_settings_change`: the restored optimizer keeps the checkpoint's groups.
     """
     current = asdict(settings)
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
@@ -182,16 +172,16 @@ def check_settings_unchanged(
 
 
 
-def is_checkpoint_step(settings: Settings, done: int, stage_manager: StageManager) -> bool:
-    """Whether to write a checkpoint after `done` completed optimizer steps.
+def is_checkpoint_step(settings: Settings, completed_steps: int, stage_manager: StageManager) -> bool:
+    """Whether to write a checkpoint after `completed_steps` completed optimizer steps.
 
     Three rules: every `save_step_interval` steps (0 disables), at the last step (`stage_manager.total_steps`) if
-    `save_last_step`, and before every stage transition (`done` follows the last plain step of a stage,
-    `StageManager.stage_ending_at(done - 1)`).
+    `save_last_step`, and before every stage transition (`completed_steps` follows the last plain step of a stage,
+    `StageManager.stage_ending_at(completed_steps - 1)`).
     """
-    save_at_interval = settings.save_step_interval > 0 and done % settings.save_step_interval == 0
-    save_at_last_step = settings.save_last_step and done >= stage_manager.total_steps
-    save_at_stage_end = stage_manager.stage_ending_at(done - 1) is not None
+    save_at_interval = settings.save_step_interval > 0 and completed_steps % settings.save_step_interval == 0
+    save_at_last_step = settings.save_last_step and completed_steps >= stage_manager.total_steps
+    save_at_stage_end = stage_manager.stage_ending_at(completed_steps - 1) is not None
     return save_at_interval or save_at_last_step or save_at_stage_end
 
 

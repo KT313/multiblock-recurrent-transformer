@@ -3,37 +3,30 @@
 
 ``pretrain`` rows go through the length filter (``min_chars``; the upper bound is the token truncation at download)
 -> quality filter -> decontamination -> exact dedup (``hash`` column, first occurrence wins); ``instruct`` rows
-(``instruction / input / output / tokens``, converter and filter already applied at download) get their input
-inversions -> empty-field and over-cap removal -> exact dedup over ``instruction\\ninput\\noutput``. Both kinds
-publish ``layout.processed_columns(kind)``; the ``tokens`` of a pretrain row is the stored raw count clamped to the
-current ``max_seq_length``.
+(converter and filter already applied at download) get their input inversions -> empty-field and over-cap removal
+-> exact dedup over ``instruction\\ninput\\noutput``. Both kinds publish ``layout.processed_columns(kind)``; the
+``tokens`` of a pretrain row is the stored raw count clamped to the current ``max_seq_length``.
 
 Two write modes:
 
 * **per raw shard, resumable** (pretrain sources without ``shuffle``): the survivors of one raw shard are published
-  before the next raw shard is read and the processed manifest records the raw shard as covered
-  (``input_shards``), so a failure or a stop request (``should_stop``, checked between raw shards) loses at
-  most one raw shard of work and the next call resumes behind the last covered one. New raw shards are deduplicated
-  against the rows already on disk: the dedup filter (:class:`SeenDocuments`, a Bloom filter under
+  before the next raw shard is read and the manifest records the raw shard as covered (``input_shards``), so a
+  failure or a stop request (checked between raw shards) loses at most one raw shard of work and the next call
+  resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
   ``dedup.bloom_memory_mb``) is refilled from the ``hash`` column of the processed shards at the start of every
   build, so the rows kept are exactly those of one full pass.
-* **all at once** (``config.shuffle_of(name)`` — the default for instruct sources — and ``dedup.mode: minhash``): every
-  raw shard is read, the survivors are shuffled with ``random.Random(source.seed)`` (or, for minhash, run through the
-  LSH index, which needs every signature at once), written into ``processed/<name>.tmp`` and swapped into place
-  rename-aside (:func:`_swap_into_place`: the old folder steps aside as ``processed/<name>.old``, the complete
-  ``.tmp`` is renamed into place, only then is the ``.old`` deleted — at no crash point is there neither folder;
-  the repair step finishes an interrupted swap and removes a leftover ``.old``) — all or nothing; a stale ``.tmp``
-  from an interrupted build is removed first. Why shuffle at all: the training
-  loader reads a source's shards **in order** and only mixes *between* sources; instruct repositories are sorted by
-  task, so without a shuffle the model would see one task for thousands of steps, and the training resolver's
-  "first k rows" validation split would be a single task. Instruct sources are small (all eight of the thesis run
-  hold about 150 M tokens), so rebuilding them whole is cheap; a top-up rebuilds the folder from every raw shard.
+* **all at once** (``config.shuffle_of(name)``, the default for instruct sources, and ``dedup.mode: minhash``): every
+  raw shard is read, the survivors are shuffled with ``random.Random(source.seed)`` (or, for minhash, run through
+  the LSH index), written into ``processed/<name>.tmp`` and swapped into place rename-aside
+  (:func:`_swap_into_place`; the repair step finishes an interrupted swap). Why shuffle: the training loader reads
+  a source's shards in order and only mixes between sources; instruct repositories are sorted by task, so without
+  a shuffle the model would see one task for thousands of steps. Instruct sources are small, so rebuilding them
+  whole is cheap; a top-up rebuilds the folder from every raw shard.
 
 A build is a no-op when the processed manifest is current and covers every raw shard. It starts from a fresh
-manifest — deleting the whole processed folder first, so no shard of an older build survives unlisted — when the
-manifest is stale, when the covered shards are no longer a prefix of the raw shards or when the folder predates the
-current columns. A raw folder that is exhausted with zero shards still gets a (zero-shard) processed manifest, so the
-source counts as complete.
+manifest, deleting the whole processed folder first, when the manifest is stale, when the covered shards are no
+longer a prefix of the raw shards or when the folder predates the current columns. A raw folder that is exhausted
+with zero shards still gets a (zero-shard) processed manifest, so the source counts as complete.
 """
 
 from __future__ import annotations
@@ -243,10 +236,9 @@ class ProcessedOutput:
     @classmethod
     def resume(cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, assessment: ProcessedAssessment) -> ProcessedOutput:
         """The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
-        raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one — and
-        the folder is deleted first, so no shard of the previous build survives unlisted (a per-shard publisher
-        overwrites only the names it reuses). A manifest that cannot be parsed is never deleted here: the repair
-        step does that, after the user confirmed."""
+        raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
+        the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
+        parsed is never deleted here: the repair step does that, after the user confirmed."""
         if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
             return cls(assessment.manifest, processed_dir, is_new=False)
         if assessment.problem == "unreadable_manifest":
@@ -312,11 +304,10 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
 
 class RowPipeline:
     """The row pipeline of one build call, reusable per raw shard: the dedup filter, the statistics, the token
-    counter (instruct inversions) and the decontamination worker pool (a ``with`` resource, ``pass_workers``
-    processes) persist across ``run`` calls. Pretrain: length filter -> quality filter -> decontamination -> hash -> exact dedup; instruct: input
-    inversions -> empty / over-cap removal -> hash -> exact dedup. The filters run **before** the dedup, so the hashes
-    on disk are exactly the dedup's "seen" set and an incremental build keeps the same rows as a full pass (a
-    filtered-out row never claims a hash)."""
+    counter (instruct inversions) and the decontamination worker pool (a ``with`` resource) persist across ``run``
+    calls. Pretrain: length filter -> quality filter -> decontamination -> hash -> exact dedup; instruct: input
+    inversions -> empty / over-cap removal -> hash -> exact dedup. The filters run before the dedup, so the hashes on
+    disk are exactly the dedup's "seen" set and an incremental build keeps the same rows as a full pass."""
 
     def __init__(
         self,
@@ -495,9 +486,9 @@ def _increment(counts: dict[str, int], key: str) -> None:
 
 # --- decontamination -----------------------------------------------------------------------------------------------------
 
-# the per-process parameters of `_contaminated_by`: set by `_init_decontamination` — called directly for
-# `pass_workers <= 1`, and as the pool initializer of every spawn worker otherwise (spawn children start with fresh
-# module globals, so the n-grams are handed over as plain picklable init args, loaded once in the parent)
+# the per-process parameters of `_contaminated_by`, set by `_init_decontamination`: called directly for
+# `pass_workers <= 1`, as the pool initializer of every spawn worker otherwise (spawn children start with fresh
+# module globals, so the n-grams are handed over as picklable init args, loaded once in the parent)
 _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 

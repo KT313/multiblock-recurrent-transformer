@@ -1,31 +1,23 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Terminal dashboard for the preparation stages: one live layout — header, a **downloads** panel, a **builds**
-panel, the **log** panel, a footer — and nothing else on the terminal while it is up.
+"""Terminal dashboard for the preparation stages: one live layout (header, a **downloads** panel, a **builds**
+panel, the **log** panel, a footer) and nothing else on the terminal while it is up.
 
-A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` (the live display, the log panel, the kept lines,
-``suspended``) with exactly one ``rich.live.Live`` display on stderr, redrawn from a cleared screen after a terminal
-resize. Every progress bar is a :class:`Task` rendered *inside* one of the panels: one row per running
-task (bounded: at most ``max_rows`` rows plus "… and k more"), finished rows disappear and are counted in the
-panel's summary line (jobs done, rows done / wanted, bytes fetched, elapsed), which is updated in place. A download
-row also shows the bytes its task fetched and its current download speed (a live byte counter the task was created
-with, sampled at every frame over the last :data:`DOWNLOAD_RATE_WINDOW` seconds). All updates from worker threads
-go through one lock; the display refreshes on its own timer.
+A :class:`DataDashboard` is a :class:`ui.display.LiveDisplay` with one ``rich.live.Live`` display on stderr. Every
+progress bar is a :class:`Task` rendered inside one of the panels: one row per running task (at most ``max_rows``,
+then "… and k more"); finished rows disappear into the panel's summary line (jobs done, rows done / wanted, bytes
+fetched, elapsed). A download row also shows its bytes and current speed (a live byte counter, sampled per frame
+over the last :data:`DOWNLOAD_RATE_WINDOW` seconds). Updates from worker threads go through one lock; the display
+refreshes on its own timer.
 
-While the display is up nothing may print around it (a stray line between two frames shifts the frame and leaves
-its top behind in the scrollback), so ``__enter__`` also (through :mod:`ui.capture`, which the
-training dashboard uses too)
-
-* routes *every* ``logging`` record into the log panel: a handler on the root logger, while the plain
-  ``StreamHandler``\\s that libraries such as ``huggingface_hub`` / ``datasets`` put on their own loggers are
-  detached for the duration (they write to the real stderr behind the display),
-* replaces ``sys.stdout`` / ``sys.stderr`` with line sinks that log what is written to them (``warnings``, stray
-  prints, handlers created later), and
-* silences the tqdm bars of ``huggingface_hub`` / ``datasets``.
+While the display is up nothing may print around it (a stray line shifts the frame), so ``__enter__`` also, through
+:mod:`ui.capture`, routes every ``logging`` record into the log panel (the plain ``StreamHandler``\\s of libraries
+such as ``huggingface_hub`` / ``datasets`` are detached for the duration), replaces ``sys.stdout`` / ``sys.stderr``
+with line sinks that log what is written to them, and silences the tqdm bars of ``huggingface_hub`` / ``datasets``.
 
 Records of WARNING and above, and records logged with ``extra={"keep": True}`` (the plan / status tables), are
-*kept*: shown in the panel like everything else and printed once, unwrapped, after the display closed — so the
-scrollback of a run is exactly the kept lines followed by the final table, never a frozen frame (the display is
-transient). Ctrl-C / an exception leave through the same path.
+*kept*: shown in the panel and printed once, unwrapped, after the display closed. The scrollback of a run is the
+kept lines followed by the final table, never a frozen frame (the display is transient). Ctrl-C / an exception
+leave through the same path.
 
 Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create tasks)::
 
@@ -35,12 +27,13 @@ Usage (``prepare.py`` / auto-prepare wrap the build once; the stages only create
 
 :class:`Task` implements ``lib.progress.Progress`` (``update`` / ``set_postfix`` / context manager / ``n`` /
 ``total``); :func:`progress` creates a task in ``panel`` of the active dashboard (``summary`` makes it the panel's
-one summary task, e.g. the jobs of a pool) and returns the no-op ``NoProgress`` when none is active. :func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended`
-clears the display around a terminal prompt.
+one summary task, e.g. the jobs of a pool) and returns the no-op ``NoProgress`` when none is active.
+:func:`set_status` puts key/value pairs (round, step) into the header; :func:`suspended` clears the display around
+a terminal prompt.
 
-Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal — the same rule as ``lib.progress``): no live display,
-no capture, tasks are no-ops and the log handler writes plain lines to stderr. A terminal that dies mid-run closes
-the display and the run continues headless with ``build.log`` as its output (:mod:`ui.display`).
+Disabled (``DATA_PREP_PROGRESS=0`` or stderr not a terminal, the rule of ``lib.progress``): no live display, no
+capture, tasks are no-ops and the log handler writes plain lines to stderr. A terminal that dies mid-run closes the
+display and the run continues headless with ``build.log`` as its output (:mod:`ui.display`).
 """
 
 from __future__ import annotations
@@ -104,7 +97,7 @@ def _format_byte_rate(bytes_per_second: float) -> str:
 
 
 def _download_cell(task: Task) -> str:
-    """``3.2 MB/s · 320 MB`` for a task that fetched bytes (the speed once its sample window spans a second), else empty."""
+    """``3.2 MB/s · 320 MB`` for a task that fetched bytes (the speed once its samples span a second), else empty."""
     fetched = task.bytes_fetched
     if fetched <= 0:
         return ""
@@ -287,7 +280,7 @@ class _PanelState:
         return table
 
     def _summary_line(self, now: float) -> Text:
-        """``5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03`` — the round's jobs, every row of every task
+        """``5/18 jobs done · 71,500/75,000 rows · 320 MB · 0:01:03``: the round's jobs, every row of every task
         of the round (running and finished), the bytes they fetched, the time since the round began."""
         if self.idle:
             return Text("idle", style="dim")
@@ -317,8 +310,9 @@ class DataDashboard(LiveDisplay):
     ``log_lines`` lines), footer.
 
     ``enabled`` defaults to :func:`lib.progress.progress_enabled` (env var + TTY check); ``console`` is for tests
-    (a ``rich.console.Console`` over a ``StringIO``), ``clock`` too (the elapsed times and download speeds). Exactly one dashboard is active at a time (``with`` block);
-    :func:`progress` and :func:`active_dashboard` find it, entering a second one raises.
+    (a ``rich.console.Console`` over a ``StringIO``), ``clock`` too (elapsed times and download speeds). Exactly one
+    dashboard is active at a time (``with`` block); :func:`progress` and :func:`active_dashboard` find it, entering
+    a second one raises.
     """
 
     _active: DataDashboard | None = None
@@ -350,7 +344,7 @@ class DataDashboard(LiveDisplay):
         self._started_at = clock()
         self._saved_env: dict[str, str | None] = {}
         self._silenced_modules: list[str] = []
-        self._logging_capture = LoggingCapture(self, skip=self.is_attached)
+        self._logging_capture = LoggingCapture(self, already_attached=self.is_attached)
         self._stream_capture = StreamCapture(STDOUT_LOGGER, STDERR_LOGGER)
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
@@ -474,14 +468,14 @@ class DataDashboard(LiveDisplay):
         restored afterwards; with ``log_file`` every record is also appended to that file (named in the footer)."""
         with attach_logger(self, logger, log_file):
             with self._lock:
-                self._attached.append(logger.name)
+                self._attached_logger_names.append(logger.name)
                 if log_file is not None:
                     self._log_file = log_file
             try:
                 yield
             finally:
                 with self._lock:
-                    self._attached.remove(logger.name)
+                    self._attached_logger_names.remove(logger.name)
 
     # --- rendering ------------------------------------------------------------------------------------------------------
 
@@ -490,7 +484,7 @@ class DataDashboard(LiveDisplay):
         with self._lock:
             panels = list(self._panels.values())
             fixed_height = 2 + sum(state.height() for state in panels)  # header + footer + panels
-            log_height = max(3, min(self._log_lines, options.size.height - fixed_height - 2))
+            log_height = max(3, min(self._panel_height, options.size.height - fixed_height - 2))
             status = "".join(f" · {key} {value}" for key, value in self._status.items())
             header = Text.assemble((self.title, "bold"), status, (f" · {_format_elapsed(now - self._started_at)}", "dim"), no_wrap=True, overflow="ellipsis")
             rendered = [state.render(now) for state in panels]

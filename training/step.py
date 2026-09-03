@@ -1,15 +1,12 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """One optimizer step of the training loop: the micro-batch stream, the scheduled learning rate and
-`run_one_optimizer_step` — the only place with autocast / backward / clipping.
+`run_one_optimizer_step`, the only place with autocast / backward / clipping.
 
-Everything here is numerics. The step body is the thesis loop's, bit-identical: `golden_tiny_steps.json`
-(dataset-independent, `test_step.py`) and `golden_tiny_run.json` (the 20-step tiny run, `test_run.py` /
-`testing/golden.py`) pin it. The stream is the reference for the data path: ONE continuous reader per source for the
-whole run with per-SAMPLE source draws from a private `random.Random(seed + resume step)` (so a source shared by
-consecutive stages is never re-read), and the world batch is assembled from unpadded samples and padded once per
-micro-batch, to its own longest sample (so a micro-batch's width depends on its own rows, not on how the loader
-happened to group them). Steps are OPTIMIZER steps: one world batch of `gradient_accumulation_steps` micro-batches,
-one `optimizer.step()`.
+Everything here is numerics, bit-identical to the thesis loop; the golden tests in `test_step.py` and `test_run.py`
+fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
+run, per-SAMPLE source draws from a private `random.Random(seed + resume step)`, and the world batch assembled from
+unpadded samples and padded once per micro-batch. Steps are OPTIMIZER steps: one world batch of
+`gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
 """
 
 import random
@@ -66,32 +63,20 @@ class StepResult:
 
 
 class BatchStream:
-    """Endless stream of micro-batches; every `gradient_accumulation_steps` of them belong to one optimizer step.
+    """Endless stream of micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
 
-    ONE continuous reader per source: for every sample of a world batch the stream draws which source it comes
-    from — in the main process, from its private `rng` — with the current step's weights
-    (`StageManager.data_weights`: the stage's constants, linearly interpolated across a transition window). A
-    per-source buffer holds the samples of the last pulled worker batch; a draw whose buffer is empty pulls the
-    next worker batch from that source's loader until a sample arrives (a batch can come back empty when every row
-    was dropped for lack of a supervised label). The stage structure therefore only changes WEIGHTS: the readers
-    run through the whole run and never re-read rows an earlier stage consumed. Once `world_batch_size` samples
-    are drawn, `world_batch_micro_batches` sorts them (`sort_batches_by_length`), splits them into
-    `gradient_accumulation_steps` micro-batches and pads each one to its own longest sample.
+    One reader per source for the whole run; stages only change the draw weights, so a source shared by two stages
+    is never re-read. Each sample of a world batch comes from a source drawn with the current step's weights; the
+    full world batch is then split and padded by `world_batch_micro_batches`.
 
-    It is also the checkpointable part of the data path (`state_dict` / `load_state_dict`, stored as
-    `CheckpointMetadata.data_stream`): it counts the rows READ per SOURCE — attached at pull time via
-    `WorkerBatch.rows_read`, so a row dropped in a worker still counts, the same unit
-    `ParquetTextDataset.set_resume_offset` skips — and keeps the draw RNG.
+    Checkpointed (`state_dict`): the rows read per source (dropped rows included) and the draw RNG state.
 
-    Numerics: the stream reads `progress.step` once per world batch, lazily, when the first micro-batch of that
-    step is requested (after the previous step advanced the counter); all `world_batch_size` draws of the world
-    batch use that step's weights. Every sample draw consumes the RNG (`rng.choices` over the sources in
-    dataset-config order), inside and outside transitions alike; the RNG is `random.Random(settings.seed +
-    progress.step)` — created here, at construction time, i.e. seeded with the resume step (the stream is created
-    once after the resume) unless `load_state_dict` restores the stored state. Loader iterators are created lazily
-    by `RunDataloaders.next_train_batch` at a source's first pull (and on every restart), each `iter(DataLoader)`
-    drawing one base seed from the global torch RNG — the creation order follows the deterministic draw sequence,
-    and all pulls of a world batch happen before its first forward.
+    Reproducibility rules:
+    - the draw RNG is `random.Random(seed + resume step)`, restored from a checkpoint when there is one; every
+      sample draw consumes it
+    - `progress.step` is read once per world batch, when its first micro-batch is requested
+    - loader iterators are created at a source's first pull and seed themselves from the global torch RNG, so the
+      creation order must stay deterministic
     """
 
     def __init__(
@@ -113,31 +98,26 @@ class BatchStream:
         return next(self._micro_batches)
 
     def state_dict(self) -> dict[str, Any]:
-        """What a checkpoint stores: the rows read per source (dropped rows included) and the draw RNG state.
-
-        A clean break from the per-stage stream's schema (`transition_rng`, `<stage>-<source>` counters): there is
-        no loader for old checkpoints (repo policy).
-        """
+        """What a checkpoint stores: the rows read per source (dropped rows included) and the draw RNG state. Old
+        checkpoint schemas have no loader (repo policy)."""
         return {"consumed_rows": dict(self.consumed_rows), "draw_rng": self.rng.getstate()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it
-        and the draw RNG picks its state back up (instead of re-seeding with `seed + resume step`).
+        """Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it and
+        the draw RNG picks its state back up.
 
-        This is "no repeated rows": the draw sequence and each source's row order continue exactly, but samples
-        that sat in a buffer when the checkpoint was written were already counted as read and are skipped, and the
-        fresh loader iterators draw new base seeds from the global torch RNG — so a resume trains on rows the
-        interrupted run had not consumed, without reproducing its losses bit for bit. The counters are rows READ
-        (`WorkerBatch.rows_read`, dropped rows included) — the unit the offsets skip — so a row dropped for lack
-        of a supervised label is not re-read either.
+        "No repeated rows", not bit-exact: samples that sat in a buffer at checkpoint time were counted as read and
+        are skipped, and fresh loader iterators draw new base seeds, so a resume trains on unseen rows without
+        reproducing the interrupted run's losses. Counters are rows READ (dropped rows included), the unit the
+        offsets skip.
         """
         self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
         self.rng.setstate(state["draw_rng"])
         self.loaders.set_resume_offsets(self.consumed_rows)
 
     def _next_sample(self, source: str) -> Sample:
-        """The next buffered sample of `source`, pulling worker batches until one is there; rows read — dropped
-        rows included — are counted against the source at pull time."""
+        """The next buffered sample of `source`, pulling worker batches until one is there; rows read (dropped rows
+        included) are counted against the source at pull time."""
         buffer = self._buffers[source]
         while not buffer:
             batch = self.loaders.next_train_batch(source)
@@ -193,13 +173,9 @@ def run_one_optimizer_step(
     """Run optimizer step `progress.step`: one world batch of `gradient_accumulation_steps` micro-batches from
     `batches`, one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
 
-    Numerics, in order: `model.step` is set on the unwrapped model (seeds the recurrence sampler), the LR is set on
-    every group; per micro-batch `backend.to_device`, `no_sync` on all but the last, autocast around
-    the forward only, `backward(loss / gradient_accumulation_steps)`, `loss_sum += loss.detach()`; then the mean
-    loss must be finite, `grad_norm = backend.clip_grad_norm(...)` (pre-clip norm, must be finite), `optimizer.step()`
-    only if `progress.step > 0` (the very first update is skipped, as in the thesis), `track_gradient_metrics` at
-    log steps before `zero_grad(set_to_none=True)`. The returned loss is `backend.all_reduce`d every step — identity
-    on one device (the thesis loop reduced only at log steps: same numbers, one place).
+    Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
+    any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
+    loss is all-reduced every step (a no-op on one device).
     """
     step = progress.step
     accumulation_steps = settings.gradient_accumulation_steps
@@ -211,12 +187,12 @@ def run_one_optimizer_step(
     loss_sum = torch.zeros((), device=backend.device)
     log_ppl_sum = torch.zeros((), device=backend.device)
     data_ids: list[str] = []
-    for micro in range(accumulation_steps):
+    for micro_batch_index in range(accumulation_steps):
         input_ids, labels, micro_batch_data_ids = next(batches)
         data_ids.extend(micro_batch_data_ids)
         input_ids = backend.to_device(input_ids)
         labels = backend.to_device(labels)
-        with backend.no_sync(model) if micro < accumulation_steps - 1 else nullcontext():
+        with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
             with backend.autocast():
                 outputs = model(input_ids, labels=labels)
             backend.backward(outputs["loss"] / accumulation_steps)

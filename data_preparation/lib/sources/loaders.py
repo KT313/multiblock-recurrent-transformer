@@ -3,19 +3,15 @@
 at row `offset` of the source's deterministic order (`hf_files`, `hf_split`, `hf_stream`, `github_code`, `local`,
 `synthetic`).
 
-`count` is a **minimum**: a loader yields exactly `count` rows (fewer only when the source runs dry), except that
+`count` is a minimum: a loader yields exactly `count` rows (fewer only when the source runs dry), except that
 `hf_files` / `github_code` reading a large parquet file remotely finish the row group in which `count` was reached
-(`align_to_row_group=True`, the default) so the rows that were downloaded anyway are kept and a later fetch at
-the resulting offset never fetches those bytes again; `align_to_row_group=False` makes every loader exact. The
-caller must consume everything yielded and advance its offset by the number of rows consumed.
+(`align_to_row_group=True`, the default), so rows downloaded anyway are kept and never fetched again. The caller
+must consume everything yielded and advance its offset by the number of rows consumed.
 
-:class:`SharedLoaderParameters` carries what the download stage hands every loader alike; each loader uses the
-members that apply to it. `columns` projects the rows `hf_files` / `github_code` / `local` read, whatever the file
-format (`github_code` adds `language`, its filter column) — they all read through `hub_files.iter_row_batches`, the
-one reading contract; the other loaders yield every column. `index_dir` is where `hf_files` / `github_code` persist
-their file index (None: in memory), `on_file` is called with every repo file they open (progress display) and
-`stats` collects their download counters (`FetchStats`, bytes fetched). `datasets` is imported lazily so the HF
-cache environment can be configured before import."""
+:class:`SharedLoaderParameters` carries what the download stage hands every loader alike. `columns` projects the
+rows `hf_files` / `github_code` / `local` read (all through `hub_files.iter_row_batches`; `github_code` adds
+`language`); the other loaders yield every column. `datasets` is imported lazily so the HF cache environment can be
+configured before import."""
 
 from __future__ import annotations
 
@@ -104,8 +100,8 @@ def hub_load_kwargs(source: SourceConfig, token: str | None, **extra: Any) -> di
     data_files = load_kwargs.pop("data_files", None)
     if data_files is None:
         raise ValueError(f"load_kwargs.builder={builder!r} requires load_kwargs.data_files")
-    at = f"@{source.revision}" if source.revision else ""
-    hub_glob = f"hf://datasets/{source.hf_id}{at}/{data_files}"
+    revision_suffix = f"@{source.revision}" if source.revision else ""
+    hub_glob = f"hf://datasets/{source.hf_id}{revision_suffix}/{data_files}"
     return {"token": token, **extra, "path": builder, "data_files": hub_glob, **load_kwargs}
 
 
@@ -228,7 +224,7 @@ def read_github_code_group(
             raise ValueError(f"{request.name}: github_code group members must share hf_id, revision and data_files")
         if request.source.language is None:  # validated by SourceConfig; repeated for the type checker
             raise ValueError(f"{request.name}: github_code loader requires source.language")
-    languages = [str(r.source.language) for r in requests]
+    languages = [str(request.source.language) for request in requests]
     if len(set(languages)) != len(languages):
         raise ValueError(f"github_code group members must have distinct languages, got {languages}")
 
@@ -238,7 +234,7 @@ def read_github_code_group(
         columns = [*columns, "language"]
     yield from read_rows_multi(
         index,
-        [_language_request(r) for r in requests],
+        [_language_request(request) for request in requests],
         on_file=shared_parameters.on_file,
         fetcher=hub_fetcher(first, shared_parameters),
         columns=columns,
@@ -259,14 +255,14 @@ def _language_request(request: GithubCodeRequest) -> ReadRequest:
 
 def list_local_files(directory: Path) -> list[Path]:
     """`*.parquet` and `*.jsonl` files directly under `directory`, sorted by name (the source's row order)."""
-    files = [p for p in directory.iterdir() if p.is_file() and p.suffix in (".parquet", ".jsonl")]
+    files = [path for path in directory.iterdir() if path.is_file() and path.suffix in (".parquet", ".jsonl")]
     return sorted(files)
 
 
 def _iter_local_rows(directory: Path, columns: list[str] | None = None) -> Iterator[Row]:
-    """Every row of every file under `directory`, files in sorted order, projected to `columns` — through the
-    same reading contract as the Hub loaders (`hub_files.iter_row_batches` via `iter_file`: bounded batches,
-    empty `.jsonl` lines skipped)."""
+    """Every row of every file under `directory`, files in sorted order, projected to `columns`, through the same
+    reading contract as the Hub loaders (`hub_files.iter_row_batches` via `iter_file`: bounded batches, empty
+    `.jsonl` lines skipped)."""
     for file in list_local_files(directory):
         yield from iter_file(file, file.name, 0, columns)
 

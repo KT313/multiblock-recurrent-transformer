@@ -19,12 +19,14 @@ def resolve_pad_id(processor: object, path: Path) -> int:
     EOS. Pad positions in the inputs are replaced by EOS in the collate function anyway; in the labels they become
     the ignore index.
     """
-    for attr in _PAD_ID_FALLBACKS:
-        token_id = cast(int | None, getattr(processor, attr, None))
+    for attribute in _PAD_ID_FALLBACKS:
+        token_id = cast(int | None, getattr(processor, attribute, None))
         if token_id is None:
             continue
-        if attr != "pad_token_id":
-            log.warning("Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attr, token_id)
+        if attribute != "pad_token_id":
+            log.warning(
+                "Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attribute, token_id
+            )
         return token_id
     raise ValueError(f"Tokenizer at {path} defines no pad, unk or eos token; padding/label masking needs one.")
 

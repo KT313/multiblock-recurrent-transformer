@@ -102,10 +102,10 @@ def step_line(
     log_step_interval: int,
     throughput: Throughput,
 ) -> str | None:
-    """The log line of ``step`` (``step 5/30 | stage 0 pretrain | loss 3.0000 | ... | ETA 0:00:50``) — None at a
-    step that is not logged (every ``log_step_interval``\\ th step and the last one are). ``transition`` is the
-    progress of the running stage transition, None outside one; ``throughput`` (with ``step`` already recorded)
-    supplies the seconds per step when the step dict has none, the elapsed time and the ETA."""
+    """The log line of ``step`` (``step 5/30 | stage 0 pretrain | loss 3.0000 | ... | ETA 0:00:50``); None at a step
+    that is not logged (every ``log_step_interval``-th step and the last one are). ``transition`` is the progress of
+    the running stage transition, None outside one; ``throughput`` supplies the seconds per step when the step dict
+    has none, the elapsed time and the ETA."""
     if step % log_step_interval and step < total_steps:
         return None
     stage_name = stage_names[stage_index] if 0 <= stage_index < len(stage_names) else "?"

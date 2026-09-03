@@ -38,13 +38,12 @@ def shard_name(index: int) -> str:
 
 
 class ShardWriter:
-    """Writes dict rows as ``out_dir/data-NNNNN.parquet`` shards of ``shard_size`` rows: ``add(row)`` buffers rows and
-    publishes every full shard as soon as it is written (``data-NNNNN.parquet.tmp`` → ``os.replace``), calling
-    ``on_shard(path)`` right after so the caller records it in a manifest. Numbering starts at ``start_shard``
-    (append mode); stale shards ``>= start_shard`` in ``out_dir`` are removed on enter. An exception leaves the
-    published shards in place and discards only the buffered partial shard: the directories written this way are
-    append-only (raw downloads), where losing a whole increment to a network error or an interrupt would throw away
-    hours of transfer. Several writers (one per output directory) can be fed from one input stream.
+    """Writes dict rows as ``out_dir/data-NNNNN.parquet`` shards of ``shard_size`` rows. ``add(row)`` buffers rows and
+    publishes every full shard as soon as it is written (atomically, then ``on_shard(path)`` so the caller records it
+    in a manifest). Numbering starts at ``start_shard`` (append mode); stale shards ``>= start_shard`` in ``out_dir``
+    are removed on enter. An exception leaves the published shards in place and discards only the buffered partial
+    shard: raw downloads are append-only, and losing a whole increment to a network error would throw away hours of
+    transfer. Several writers (one per output directory) can be fed from one input stream.
     """
 
     def __init__(self, out_dir: Path, shard_size: int, *, start_shard: int = 0, on_shard: Callable[[Path], None]) -> None:
@@ -55,7 +54,7 @@ class ShardWriter:
         self.out_dir = out_dir
         self.shard_size = shard_size
         self.start_shard = start_shard
-        self.written = 0
+        self.shards_written = 0
         self._on_shard = on_shard
         self._buffer: list[dict[str, Any]] = []
 
@@ -82,8 +81,8 @@ class ShardWriter:
 
     def write_shard(self, table: pa.Table) -> None:
         """Publish ``table`` as the next shard (the caller sizes it), then the ``on_shard`` callback."""
-        path = publish_shard(table, self.out_dir / shard_name(self.start_shard + self.written))
-        self.written += 1
+        path = publish_shard(table, self.out_dir / shard_name(self.start_shard + self.shards_written))
+        self.shards_written += 1
         self._on_shard(path)
 
     def _remove_stale_shards(self) -> None:

@@ -82,7 +82,7 @@ def test_scripted_thirty_step_run_drives_the_whole_api(tmp_path: Path, clock: Fa
             console=console,
             clock=clock,
         ) as board:
-            board._log_lines, board._lines = log_lines, deque(board._lines, maxlen=log_lines)  # smaller panels than the defaults
+            board._panel_height, board._panel_lines = log_lines, deque(board._panel_lines, maxlen=log_lines)  # smaller panels than the defaults
             board._events = deque(board._events, maxlen=event_lines)
             board.note_event("no checkpoint found, starting from scratch")  # RunLogger.log_fresh_start
             logger.info("Total training steps: %d", TOTAL, extra={"keep": True})  # RunLogger.open

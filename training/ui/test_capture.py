@@ -73,7 +73,7 @@ def test_handler_formats_and_keeps_warnings_and_marked_records() -> None:
 
 def test_handler_skips_the_loggers_it_is_told_to() -> None:
     sink = RecordingSink()
-    handler = DashboardLogHandler(sink, skip=lambda name: name.startswith("training"))
+    handler = DashboardLogHandler(sink, already_attached=lambda name: name.startswith("training"))
     handler.emit(_record("training.x", logging.INFO, "handled elsewhere"))
     handler.emit(_record("some_library", logging.INFO, "mine"))
     assert sink.texts() == [sink.texts()[0]] and sink.texts()[0].endswith("some_library: mine")
@@ -150,7 +150,7 @@ def test_third_party_console_handlers_are_detached_while_captured() -> None:
 def test_root_handler_skips_what_an_attached_handler_covers() -> None:
     sink = RecordingSink()
     logger = logging.getLogger(LOGGER_NAME + ".covered")
-    capture = TerminalCapture(sink, skip=lambda name: name.startswith(LOGGER_NAME))
+    capture = TerminalCapture(sink, already_attached=lambda name: name.startswith(LOGGER_NAME))
     capture.start()
     try:
         with attach_logger(sink, logger, None, ensure_info_level=True):

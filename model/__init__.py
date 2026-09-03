@@ -12,10 +12,9 @@ _MODEL_KWARGS = ("ignore_index", "gradient_checkpointing")
 
 
 def build_model(config: RecurrentConfig | str | Path, **overrides: Any) -> RecurrentGPT:
-    """Instantiate `RecurrentGPT` from a model architecture YAML (`config/model_architecture/<name>.yaml`, with
-    config overrides applied on top) or from an existing `RecurrentConfig`.
-
-    Keyword arguments `ignore_index` and `gradient_checkpointing` go to the model, everything else to the config."""
+    """A `RecurrentGPT` from a model architecture YAML (`config/model_architecture/<name>.yaml`) plus config
+    overrides, or from an existing `RecurrentConfig`. `ignore_index` and `gradient_checkpointing` go to the model,
+    every other keyword to the config."""
     model_kwargs: dict[str, Any] = {}
     for name in _MODEL_KWARGS:
         if name in overrides:

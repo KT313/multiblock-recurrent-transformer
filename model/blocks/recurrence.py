@@ -2,8 +2,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 """How a core block is iterated: the `(n no-grad, k backprop)` depth sampler, the random latent state, one recurrence
 iteration (adapter over `[latent, input]`, then the block's layers) and the iteration loop with optional activation
-checkpointing. Binding these to a model (its `step`, train/eval mode, config and modules) is `RecurrentGPT`'s job
-(`model/model.py`)."""
+checkpointing. `RecurrentGPT` (`model/model.py`) binds these to a model's `step`, mode, config and modules."""
 
 import math
 from functools import partial
@@ -40,19 +39,19 @@ def canon_steps(steps: StepsSpec) -> StepsPair:
     return int(steps), 0
 
 
-def normalize_num_steps(num_steps_pair: NumSteps, num_blocks: int) -> list[StepsPair | None]:
+def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair | None]:
     """One entry per core block: None (sample per block), one (n_no_grad, k_with_grad) pair broadcast to all blocks,
     or a list of pairs with one entry per block."""
-    if num_steps_pair is None:
+    if num_steps is None:
         return [None] * num_blocks
-    if isinstance(num_steps_pair, list):
-        if len(num_steps_pair) != num_blocks:
-            raise ValueError(f"num_steps_pair has {len(num_steps_pair)} entries but there are {num_blocks} blocks")
+    if isinstance(num_steps, list):
+        if len(num_steps) != num_blocks:
+            raise ValueError(f"num_steps has {len(num_steps)} entries but there are {num_blocks} blocks")
         per_block: list[StepsPair | None] = []
-        for steps in num_steps_pair:
+        for steps in num_steps:
             per_block.append(canon_steps(steps))
         return per_block
-    return [canon_steps(num_steps_pair)] * num_blocks
+    return [canon_steps(num_steps)] * num_blocks
 
 
 def initialize_state(x: Tensor) -> Tensor:
@@ -68,9 +67,8 @@ def sample_recurrence_steps(
     mode return (`mean_recurrence`, 0).
 
     Outputs are long tensors so that they can be passed through compiled functions."""
-    # This one draw does two things: under meta-tensor tracing (flop counting) it detects the meta device, and it
-    # advances the global RNG by one number. The thesis forward pass depends on that RNG consumption (it comes right
-    # after `initialize_state`), so the draw is never skipped.
+    # One draw, two jobs: it detects meta-tensor tracing (flop counting) and advances the global RNG by one number.
+    # The reference forward pass depends on that RNG consumption (right after `initialize_state`); never skip it.
     if torch.rand((1,)).is_meta:
         return mean_recurrence - mean_backprop_depth, mean_backprop_depth  # type: ignore[return-value]  # plain ints are fine for the tracer
 
@@ -79,15 +77,14 @@ def sample_recurrence_steps(
         num_steps_with_grad = torch.as_tensor(0)
         return num_steps_no_grad.to(dtype=torch.long), num_steps_with_grad.to(dtype=torch.long)
 
-    # The depth comes from a private generator seeded by the optimizer step, not from the global RNG, so a re-run of
-    # the forward pass under activation checkpointing draws the same depth again.
-    # With distributed training the seed must be multiplied by (rank + 1) again so ranks draw different depths.
+    # A private generator seeded by the optimizer step, not the global RNG: a forward re-run under activation
+    # checkpointing draws the same depth again. Distributed training must multiply the seed by (rank + 1) so ranks
+    # draw different depths.
     generator = torch.Generator(device="cpu")
     generator.manual_seed((514229 + step) % (2**31 - 1))
 
-    # "poisson-lognormal-filling": the total depth is Poisson(rate) + 1 with a log-normal rate whose mean is
-    # `mean_recurrence`; the last min(total, mean_backprop_depth) iterations get gradient (they "fill" the backprop
-    # budget), everything before runs without.
+    # "poisson-lognormal-filling": total depth = Poisson(rate) + 1 with a log-normal rate of mean `mean_recurrence`;
+    # the last min(total, mean_backprop_depth) iterations get gradient (they "fill" the backprop budget).
     max_steps_with_grad = mean_backprop_depth
     mean_steps_no_grad = max(mean_recurrence - mean_backprop_depth, 0)
     sigma = 0.5

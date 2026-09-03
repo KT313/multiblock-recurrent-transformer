@@ -69,7 +69,7 @@ def test_zero_length_transition_has_no_transition_steps_but_a_stage_end_checkpoi
     sm = StageManager(stages, world_batch_size=4, block_size=256)
     assert _bounds(sm) == [(0, 8, 8), (8, 16, 16)]
     assert all(sm.get_stage_info(s).transition_to is None for s in range(16))
-    assert (sm.get_stage_info(7).stage_idx, sm.get_stage_info(8).stage_idx) == (0, 1)
+    assert (sm.get_stage_info(7).stage_index, sm.get_stage_info(8).stage_index) == (0, 1)
     assert sm.get_stage_info(7).transition_progress == 0.0
     assert sm.stage_ending_at(7) == 0
     assert "Transition OUT: 0 steps (5.0% of current stage)" in sm.get_stage_summary()
@@ -127,23 +127,23 @@ def test_get_stage_info_inside_and_outside_transitions() -> None:
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     info = sm.get_stage_info(3)
     assert isinstance(info, StageInfo)
-    assert (info.stage_idx, info.transition_to, info.transition_progress) == (0, None, 0.0)
+    assert (info.stage_index, info.transition_to, info.transition_progress) == (0, None, 0.0)
     assert info.stage_progress == pytest.approx(3 / 8)
 
     # Inside the transition out of stage 0 the info stays with stage 0 and names stage 1 as the one being entered
     info = sm.get_stage_info(7)
-    assert (info.stage_idx, info.transition_to) == (0, 1)
+    assert (info.stage_index, info.transition_to) == (0, 1)
     assert info.transition_progress == pytest.approx(0.5)
     assert info.stage_progress == pytest.approx(7 / 8)
 
     info = sm.get_stage_info(6)
-    assert (info.stage_idx, info.transition_to, info.transition_progress) == (0, 1, 0.0)
+    assert (info.stage_index, info.transition_to, info.transition_progress) == (0, 1, 0.0)
 
     info = sm.get_stage_info(8)  # first step of stage 1
-    assert (info.stage_idx, info.transition_to, info.stage_progress) == (1, None, 0.0)
+    assert (info.stage_index, info.transition_to, info.stage_progress) == (1, None, 0.0)
 
     info = sm.get_stage_info(15)
-    assert (info.stage_idx, info.transition_to) == (1, 2)
+    assert (info.stage_index, info.transition_to) == (1, 2)
     assert info.transition_progress == pytest.approx(0.5)
 
 
@@ -152,7 +152,7 @@ def test_entering_stage_at_names_the_incoming_stage_inside_a_transition() -> Non
     inside a transition window, where it is the stage being entered (tiny: windows [6, 8) and [14, 16))."""
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     assert [sm.entering_stage_at(step) for step in range(26)] == [0] * 6 + [1] * 8 + [2] * 12
-    assert [sm.get_stage_info(step).stage_idx for step in range(26)] == [0] * 8 + [1] * 8 + [2] * 10
+    assert [sm.get_stage_info(step).stage_index for step in range(26)] == [0] * 8 + [1] * 8 + [2] * 10
 
 
 def weighted_stages() -> list[ResolvedStage]:
@@ -198,7 +198,7 @@ def test_data_weights_returns_a_copy() -> None:
 def test_get_stage_info_past_the_end_reports_last_stage_complete() -> None:
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     for step in (20, 999):
-        assert sm.get_stage_info(step) == StageInfo(stage_idx=2, stage_progress=1.0, transition_to=None, transition_progress=0.0)
+        assert sm.get_stage_info(step) == StageInfo(stage_index=2, stage_progress=1.0, transition_to=None, transition_progress=0.0)
 
 
 def test_stage_ending_at_exact_steps() -> None:

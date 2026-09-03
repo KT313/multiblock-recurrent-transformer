@@ -25,12 +25,12 @@ def get_param_groups(
     embedding_group: list[Tensor] = []
     scale_and_norm_group: list[Tensor] = []
     for name, param in model.named_parameters():
-        lname = name.lower()
-        if "wte" in lname or "embedding" in lname or "lm_head" in lname:
+        name_lower = name.lower()
+        if "wte" in name_lower or "embedding" in name_lower or "lm_head" in name_lower:
             embedding_group.append(param)
-        elif "ln_f" in lname or "norm" in lname or "bias" in lname:
+        elif "ln_f" in name_lower or "norm" in name_lower or "bias" in name_lower:
             scale_and_norm_group.append(param)
-        elif "proj" in lname or "qkv" in lname or "fc" in lname or param.ndim == 2:
+        elif "proj" in name_lower or "qkv" in name_lower or "fc" in name_lower or param.ndim == 2:
             weights_group.append(param)
         else:
             raise ValueError(f"param {name} could not be matched to an optim group")
@@ -69,7 +69,7 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
             decouple_wd=config.decouple_wd,
         )
     defaults = OptimizerConfig()
-    ellis_only_set = [k for k in ELLIS_ONLY_OPTIONS if getattr(config, k) != getattr(defaults, k)]
+    ellis_only_set = [option for option in ELLIS_ONLY_OPTIONS if getattr(config, option) != getattr(defaults, option)]
     if ellis_only_set:
         raise ValueError(f"optim_config option(s) {ellis_only_set} apply only to 'ELLISAdam', not {name!r}")
     if name == "AdamW":
@@ -128,22 +128,22 @@ class ELLISAdam(Optimizer):
         state_steps: list[Tensor],
         running_init: bool = False,
     ) -> None:
-        for p in group["params"]:
-            if p.grad is None:
+        for param in group["params"]:
+            if param.grad is None:
                 continue
-            params_with_grad.append(p)
-            grads.append(p.grad)
+            params_with_grad.append(param)
+            grads.append(param.grad)
 
-            state = self.state[p]
+            state = self.state[param]
             if len(state) == 0:
-                # `step` deliberately lives on the CPU: kernel launches are costly on CUDA.
+                # `step` lives on the CPU: kernel launches are costly on CUDA
                 state["step"] = torch.tensor(0, dtype=torch.long)
                 if running_init:
-                    state["exp_avg"] = p.grad.clone().to(memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = p.grad.pow(2).clone().to(memory_format=torch.preserve_format)
+                    state["exp_avg"] = param.grad.clone().to(memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = param.grad.pow(2).clone().to(memory_format=torch.preserve_format)
                 else:
-                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])

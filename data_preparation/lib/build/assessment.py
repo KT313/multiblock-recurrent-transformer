@@ -1,22 +1,15 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """One health verdict per ``processed/<source>`` folder, with the cheapest repair that heals it attached.
 
-Several code paths judge a processed folder — the repair step (``lib/build/repair.py``), the planner
-(``lib/build/planner.py``, behind ``status`` / ``prepare --dry_run`` / ``prepare``), the build's own resume
-(``lib/stages/build.py``) and the training-side verifier. :func:`assess_processed_folder` is the one place that
-knows what a processed folder can be, so they cannot disagree (``status`` crashing on an unreadable manifest that
-``prepare`` heals; the repair step deleting a crash leftover the resumed build would have healed), and every
-verdict carries the cheapest repair: ``rebuild`` (delete the folder, the build writes it again — derived data, no
-confirmation) or ``nothing``.
+The repair step, the planner, the build's own resume and the training-side verifier all judge processed folders;
+:func:`assess_processed_folder` is the one place that knows what a processed folder can be, so they cannot
+disagree. Every verdict carries the cheapest repair: ``rebuild`` (delete the folder, the build writes it again;
+derived data, no confirmation) or ``nothing``.
 
-The one verdict whose cheapest repair is *nothing* despite a visible anomaly deserves its name: a build that
-crashes between publishing a shard file and saving the manifest leaves exactly one unlisted file —
-``data-{len(manifest.shards):05d}.parquet``, the very name the resumed build publishes next
-(:meth:`~data_preparation.lib.stages.build.ProcessedOutput.publish` names shards by their index and
-``publish_shard`` replaces atomically). While raw shards are still uncovered, the resume rewrites that file from
-the same rows and the folder heals itself; deleting the whole folder for it would redo hours of cleaning for one
-file. The same stray on a folder that covers every raw shard is *not* resumable —
-no build would overwrite it, the training resolver would refuse the folder — so it stays a rebuild.
+``crash_leftover`` is the one anomaly whose repair is *nothing*: a build that crashes between publishing a shard
+and saving the manifest leaves exactly one unlisted file, ``data-{len(manifest.shards):05d}.parquet``, the name the
+resumed build publishes next. While raw shards are still uncovered, the resume rewrites that file and the folder
+heals itself. The same stray on a folder that covers every raw shard is a rebuild: no build would overwrite it.
 """
 
 from __future__ import annotations
@@ -30,7 +23,7 @@ from data_preparation.layout import processed_columns
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name
 
-ShardList = list[list[Any]]  # ``[[shard name, rows], ...]`` — the shape of a processed manifest's ``input_shards``
+ShardList = list[list[Any]]  # ``[[shard name, rows], ...]``, the shape of a processed manifest's ``input_shards``
 
 ProcessedProblem = Literal[
     "none",  # healthy: current manifest, every listed shard verifies, nothing unlisted, raw prefix intact
@@ -56,9 +49,8 @@ _REBUILD: frozenset[ProcessedProblem] = frozenset(
 
 @dataclass(frozen=True)
 class ProcessedAssessment:
-    """The health of one processed folder: the fine-grained problem, one reason line (it reads as the tail of
-    ``processed <reason>`` in the status table), and the manifest when it was readable. :attr:`repair` derives
-    from the problem, so it can never disagree with it."""
+    """The health of one processed folder: the problem, one reason line (the tail of ``processed <reason>`` in the
+    status table), and the manifest when it was readable. :attr:`repair` derives from the problem."""
 
     problem: ProcessedProblem
     reason: str
@@ -73,8 +65,8 @@ class ProcessedAssessment:
 
 def next_shard_to_write(manifest: Manifest) -> str:
     """The file name the next :meth:`~data_preparation.lib.stages.build.ProcessedOutput.publish` call writes:
-    shards are named by their index, so it is ``data-{len(manifest.shards):05d}.parquet`` — the one stray a crash
-    between publishing a shard and saving the manifest leaves behind."""
+    shards are named by their index, so it is ``data-{len(manifest.shards):05d}.parquet``. This is the one stray a
+    crash between publishing a shard and saving the manifest leaves behind."""
     return shard_name(len(manifest.shards))
 
 
@@ -85,8 +77,8 @@ def assess_processed_folder(
     ``[[name, rows], ...]`` (None: the raw folder is being deleted).
 
     ``check_files=True`` (the repair step) also verifies the listed shard files (parquet footers) and looks for
-    unlisted ones; ``check_files=False`` (the planner, the build) reads the manifest only, so ``broken_shard``,
-    ``stray_shards`` and ``crash_leftover`` are never reported — broken files are the repair step's business.
+    unlisted ones. ``check_files=False`` (the planner, the build) reads the manifest only, so ``broken_shard``,
+    ``stray_shards`` and ``crash_leftover`` are never reported: broken files are the repair step's business.
     """
     try:
         manifest = Manifest.load(folder)
@@ -125,6 +117,6 @@ def assess_processed_folder(
 
 
 def _more_raw_follows(covered: ShardList, raw_shards: ShardList) -> bool:
-    """Whether the covered raw shards are a *proper* prefix of the raw shard list — a resumed build has work left,
+    """Whether the covered raw shards are a *proper* prefix of the raw shard list: a resumed build has work left,
     so its next publish overwrites the crash leftover. A folder that covers everything gets no further publish."""
     return len(covered) < len(raw_shards) and raw_shards[: len(covered)] == covered

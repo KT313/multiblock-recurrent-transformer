@@ -51,7 +51,7 @@ def test_evaluate_reports_every_depth(
     forward = RecurrentGPT.forward
 
     def spy(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
-        seen.append((self.training, kwargs.get("num_steps_pair")))
+        seen.append((self.training, kwargs.get("num_steps")))
         return forward(self, *args, **kwargs)
 
     monkeypatch.setattr(RecurrentGPT, "forward", spy)
@@ -74,7 +74,7 @@ def test_evaluate_reports_every_depth(
         torch.manual_seed(1)
         tiny_model.eval()
         replay = [
-            [tiny_model(x, labels=y, num_steps_pair=steps)["loss"] for _, steps in per_batch] for x, y, _ in batches[:2]
+            [tiny_model(x, labels=y, num_steps=steps)["loss"] for _, steps in per_batch] for x, y, _ in batches[:2]
         ]
     for depth_idx, depth in enumerate((1, 3, "[2, 2]")):
         expected_loss = torch.stack([losses[depth_idx] for losses in replay]).mean().item()
@@ -97,7 +97,7 @@ def test_evaluate_averages_the_batches_actually_delivered(
         torch.manual_seed(1)
         tiny_model.eval()
         replay = [
-            [tiny_model(x, labels=y, num_steps_pair=[(d, 0), (d, 0)])["loss"] for d in (1, 2)] for x, y, _ in batches
+            [tiny_model(x, labels=y, num_steps=[(d, 0), (d, 0)])["loss"] for d in (1, 2)] for x, y, _ in batches
         ]
     tiny_model.train()
     for depth_idx, depth in enumerate((1, "[2, 2]")):
@@ -140,7 +140,7 @@ def test_evaluate_scores_every_depth_on_the_same_batches(
     def spy(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         input_ids = args[0] if args else kwargs["input_ids"]
         index = next(i for i, (x, _, _) in enumerate(batches) if torch.equal(x, input_ids))
-        scored.setdefault(str(kwargs.get("num_steps_pair")), []).append(index)
+        scored.setdefault(str(kwargs.get("num_steps")), []).append(index)
         return forward(self, *args, **kwargs)
 
     monkeypatch.setattr(RecurrentGPT, "forward", spy)

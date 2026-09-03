@@ -21,19 +21,13 @@ PARQUET_READ_BATCH_ROWS = 1024
 
 
 class ParquetTextDataset(IterableDataset[Row]):
-    """One ``hfds`` directory of parquet files, streamed in sorted file order without shuffling.
+    """One directory of parquet files, streamed in sorted file order without shuffling.
 
-    Each row is a dict with the ``data_signature["keys"]`` columns plus ``data_signature`` and ``data_id``
-    (the spec prefix, used for batch-composition logging). ``skip_rows`` / ``max_rows`` restrict the dataset to the
-    row range ``[skip_rows, skip_rows + max_rows)`` of the directory (rows counted in sorted file order); the range
-    is clipped to the rows that exist. One pass of ``__iter__`` is one epoch over the range. Rows of the range are
-    dealt round-robin across ``world * num_workers`` shards: shard ``rank * num_workers + worker_id`` takes every
-    ``num_shards``-th row of the range, so all shards together yield every row of the range exactly once.
-
-    ``set_resume_offset`` starts every following epoch that many rows into the range — how a resume skips the rows
-    the interrupted run already trained on. `training.data.loader.RunDataloaders` sets it right before the first
-    epoch after a resume and back to 0 before every later one (a permanent offset would hide the rows before it
-    forever).
+    Each row is a dict with the ``data_signature["keys"]`` columns plus ``data_signature`` and ``data_id``.
+    ``skip_rows`` / ``max_rows`` restrict the dataset to the row range ``[skip_rows, skip_rows + max_rows)``, clipped
+    to the rows that exist. One ``__iter__`` is one epoch over the range, dealt round-robin over
+    ``world * num_workers`` shards. ``set_resume_offset`` starts the next epoch that many rows into the range;
+    `RunDataloaders` sets it before the first epoch after a resume and back to 0 before every later one.
     """
 
     def __init__(
@@ -50,19 +44,19 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.data_dir = Path(data_dir)
         self.prefix = prefix
         self.data_signature = data_signature or DEFAULT_DATA_SIGNATURE
-        self.rank, self.world = shard
+        self.rank, self.world_size = shard
         self.files = sorted(self.data_dir.glob("*.parquet"))
         if not self.files:
             raise FileNotFoundError(f"No parquet files in {self.data_dir}")
         columns = set(pq.ParquetFile(self.files[0]).schema_arrow.names)  # metadata only, no row is read
-        missing = [k for k in self.data_signature["keys"] if k not in columns]
+        missing = [key for key in self.data_signature["keys"] if key not in columns]
         if missing:
             raise ValueError(
                 f"{prefix}: parquet files in {self.data_dir} lack the column(s) {missing} required by "
                 f"data_signature {self.data_signature}; found {sorted(columns)}"
             )
         # per-file row counts from the parquet footers (metadata only), read once per instance
-        self.file_rows = [pq.ParquetFile(f).metadata.num_rows for f in self.files]
+        self.file_rows = [pq.ParquetFile(file).metadata.num_rows for file in self.files]
         self.total_rows = sum(self.file_rows)
         self.start = min(skip_rows, self.total_rows)  # first row of the range (directory index)
         self.stop = self.total_rows if max_rows is None else min(self.total_rows, self.start + max_rows)
@@ -85,15 +79,15 @@ class ParquetTextDataset(IterableDataset[Row]):
         worker = get_worker_info()
         num_workers = worker.num_workers if worker is not None else 1
         worker_id = worker.id if worker is not None else 0
-        return self.rank * num_workers + worker_id, self.world * num_workers
+        return self.rank * num_workers + worker_id, self.world_size * num_workers
 
     def _range_batches(self, keys: list[str]) -> Iterator[tuple[int, pa.RecordBatch]]:
         """``(range_idx, batch)`` pairs covering exactly rows ``[start, stop)``; ``range_idx`` is the position of
         the batch's first row within the range. Files and row groups outside the range are never opened/read."""
         file_start = 0
-        for file, n_rows in zip(self.files, self.file_rows):
-            file_stop = file_start + n_rows
-            if file_stop <= self.start or n_rows == 0:  # entirely before the range (or empty): skip via the footer
+        for file, rows_in_file in zip(self.files, self.file_rows):
+            file_stop = file_start + rows_in_file
+            if file_stop <= self.start or rows_in_file == 0:  # before the range (or empty): skipped via the footer
                 file_start = file_stop
                 continue
             if file_start >= self.stop:
@@ -109,14 +103,14 @@ class ParquetTextDataset(IterableDataset[Row]):
                         first_group_start = group_start
                     row_groups.append(group)
                 group_start = group_stop
-            global_idx = first_group_start
+            batch_start = first_group_start  # directory index of the batch's first row
             for batch in parquet.iter_batches(batch_size=PARQUET_READ_BATCH_ROWS, columns=keys, row_groups=row_groups):
-                batch_stop = global_idx + batch.num_rows
-                lo, hi = max(global_idx, self.start), min(batch_stop, self.stop)
-                if lo < hi:
-                    yield lo - self.start, batch.slice(lo - global_idx, hi - lo)
-                global_idx = batch_stop
-                if global_idx >= self.stop:
+                batch_stop = batch_start + batch.num_rows
+                clip_start, clip_stop = max(batch_start, self.start), min(batch_stop, self.stop)
+                if clip_start < clip_stop:
+                    yield clip_start - self.start, batch.slice(clip_start - batch_start, clip_stop - clip_start)
+                batch_start = batch_stop
+                if batch_start >= self.stop:
                     return
             file_start = file_stop
 
@@ -142,25 +136,24 @@ class ParquetTextDataset(IterableDataset[Row]):
 
 class WeightedMixtureDataset(IterableDataset[T], Generic[T]):
     """Draws each row from one of several datasets with fixed probabilities (a seeded draw per row) until every
-    member is read once: an exhausted member leaves the draw — its weight is dropped, the others renormalise — so
-    one `__iter__` yields every row of every member exactly once and then stops. The validation loaders of a stage
-    with several validation sources read this, and `evaluate` scores the batches it gets."""
+    member is read once; an exhausted member leaves the draw and the others renormalise. The validation loaders of
+    a stage with several validation sources read this."""
 
     def __init__(self, datasets: Sequence[Iterable[T]], weights: Sequence[float], seed: int) -> None:
         if len(datasets) != len(weights) or not datasets:
             raise ValueError("Need one weight per dataset.")
         total = float(sum(weights))
         self.datasets = datasets
-        self.weights = [w / total for w in weights]
+        self.weights = [weight / total for weight in weights]
         self.seed = seed
 
     def __iter__(self) -> Iterator[T]:
         rng = random.Random(self.seed)
-        iterators = [iter(ds) for ds in self.datasets]
+        iterators = [iter(dataset) for dataset in self.datasets]
         remaining = list(range(len(self.datasets)))  # members with rows left, in construction order
         while remaining:
-            (idx,) = rng.choices(remaining, weights=[self.weights[i] for i in remaining], k=1)
+            (member,) = rng.choices(remaining, weights=[self.weights[index] for index in remaining], k=1)
             try:
-                yield next(iterators[idx])
+                yield next(iterators[member])
             except StopIteration:
-                remaining.remove(idx)
+                remaining.remove(member)

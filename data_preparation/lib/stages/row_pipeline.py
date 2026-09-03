@@ -73,16 +73,16 @@ def check_quality(text: str) -> tuple[bool, str]:
     2-grams, <= 20% duplicate 3-grams); returns ``(passes, reason)``."""
     if len(text) < 10:
         return False, "too_short"
-    sentences = [s for s in re.split(r"[.!?]+", text) if len(s.strip()) > 10]
+    sentences = [sentence for sentence in re.split(r"[.!?]+", text) if len(sentence.strip()) > 10]
     if len(sentences) < 3:
         return False, "too_few_sentences"
     words = text.split()
     if len(words) == 0:
         return False, "no_words"
-    caps_words = [w for w in words if w.isupper() and len(w) > 1]
+    caps_words = [word for word in words if word.isupper() and len(word) > 1]
     if len(caps_words) / len(words) > 0.3:
         return False, "too_many_caps"
-    alphanumeric = sum(1 for c in text if c.isalnum() or c.isspace())
+    alphanumeric = sum(1 for char in text if char.isalnum() or char.isspace())
     if alphanumeric / len(text) < 0.25:
         return False, "too_few_alphanumeric"
     if len(words) > 10 and _unique_ratio(get_ngrams(text, 2)) < 0.7:

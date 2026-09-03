@@ -48,9 +48,9 @@ class SingleDeviceBackend:
         self.pin_memory = self.device.type == "cuda"
         _set_torch_flags()
 
-    def setup_model(self, model: Module, compile: bool = False) -> Module:
+    def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         model = model.to(self.device)
-        if compile:
+        if compile_model:
             # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles
             # torch.compile is typed as returning a bare callable; at runtime it is an OptimizedModule (a Module)
             model = cast(Module, torch.compile(model, dynamic=True))
@@ -83,15 +83,13 @@ class SingleDeviceBackend:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, error_if_nonfinite=False)
 
     def save_checkpoint(self, path: str | Path, state: dict[str, Any]) -> None:
-        # Written to a sibling temp file and renamed (`write_atomically`): a crash (or the second Ctrl-C) mid-save
-        # never leaves a truncated file under the final name, which `find_latest_checkpoint` would otherwise pick.
+        # `write_atomically`: a crash mid-save never leaves a truncated file under the final name
         with write_atomically(path) as temporary:
             torch.save(state, temporary)
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
-        # Our own trusted checkpoints contain plain python objects (configs, RNG states), hence weights_only=False.
-        # Loaded on the CPU: `load_state_dict` moves what belongs on the device, and the optimizer's CPU-hosted
-        # step counters stay on the CPU as in a fresh run.
+        # weights_only=False: our checkpoints hold plain python objects (configs, RNG states)
+        # map_location="cpu": `load_state_dict` moves what belongs on the device; optimizer step counters stay there
         return cast(dict[str, Any], torch.load(path, map_location="cpu", weights_only=False))
 
     def seed_everything(self, seed: int) -> None:
@@ -101,8 +99,7 @@ class SingleDeviceBackend:
         torch.cuda.manual_seed_all(seed)
 
     def rng_state(self) -> dict[str, Any]:
-        # Only this backend's device: a CPU run on a GPU box must not initialise CUDA at every checkpoint, and a
-        # checkpoint must not depend on how many GPUs the machine has.
+        # only this backend's device: a CPU run must not initialise CUDA, a checkpoint must not depend on the GPU count
         state = {"python": random.getstate(), "torch": torch.get_rng_state()}
         if self.device.type == "cuda":
             state["cuda"] = torch.cuda.get_rng_state(self.device)

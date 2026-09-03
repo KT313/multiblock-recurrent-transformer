@@ -1,39 +1,28 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """The repair step of ``prepare()``: one pass over every source folder, one report, one confirmation.
 
-Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` looks at the ``raw/`` and
+Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` inspects the ``raw/`` and
 ``processed/`` folder of every source the config uses and decides what has to go:
 
-* **raw** (downloaded, expensive): a *stale* folder (its manifest hash differs from :meth:`DatasetConfig.raw_hash`,
-  so the source identity or the tokenizer changed) or an *outdated* one (stored with a smaller ``max_seq_length``
-  than the config asks for now) is **deleted and downloaded again — after the user confirmed**. A folder with a
-  *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
-  (:func:`good_prefix_length` at inspection, :meth:`RawFolder.truncate_to` when performed; the next download resumes
-  there, with the offset and the reject counters the last kept shard recorded) — unconfirmed when only the broken shard itself is dropped, but when
-  healthy shards after the broken one would be discarded too, the truncation joins the same one confirmation as
-  the deletions (they are downloaded rows lost for a repair, re-downloaded next run); when no prefix can be kept
-  the folder is queued for the confirmed deletion. Shards without a manifest are an error: nothing says where
-  those rows came from, and guessing would either delete data or resume from the wrong offset.
-* **processed** (derived, cheap): judged by the shared verdict (``lib/build/assessment.py``), which attaches the
-  cheapest repair — and this step performs exactly that repair, never more. A rebuild is a deletion without
-  confirmation: stale, broken, without a manifest, unlisted stray shards, built from raw shards that no longer
-  exist (its ``input_shards`` is not a prefix of the raw shard list — e.g. after a truncation), or its
-  raw folder is being deleted — except a manifest that cannot be parsed, whose deletion joins the one
-  confirmation (corruption worth a look first). The other exception is the crash leftover of an interrupted per-shard build — a single
-  unlisted file that is exactly the next shard the resumed build writes: it is left alone (the build overwrites
-  it). The rename-aside swap of an all-at-once build (``lib/stages/build.py:_swap_into_place``) can be interrupted
-  too: a **complete** ``processed/<name>.tmp`` (its own manifest is current and every shard verifies) next to a
-  *missing* processed folder is the swap's data — it is renamed into place instead of deleted; an incomplete
-  ``.tmp`` is removed as the leftover of an interrupted build, and a leftover ``processed/<name>.old`` (the folder
-  the swap already replaced) is removed without asking.
+* **raw** (downloaded, expensive): a *stale* folder (manifest hash differs from :meth:`DatasetConfig.raw_hash`) or
+  an *outdated* one (stored with a smaller ``max_seq_length`` than the config asks for) is deleted and downloaded
+  again, after the user confirmed. A folder with a *broken* shard (missing, unreadable, wrong row count) is
+  truncated to its good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`); the next download
+  resumes there. Dropping only the broken tail needs no confirmation; dropping healthy shards after it joins the
+  one confirmation, and when no prefix can be kept the folder is queued for deletion. Shards without a manifest
+  are an error: nothing says where those rows came from.
+* **processed** (derived, cheap): the shared verdict (``lib/build/assessment.py``) attaches the cheapest repair and
+  this step performs exactly that. A rebuild is a deletion without confirmation, except a manifest that cannot be
+  parsed, which joins the one confirmation. A crash leftover (one unlisted file that is exactly the next shard the
+  resumed build writes) is left alone. Leftovers of an interrupted rename-aside swap
+  (``lib/stages/build.py:_swap_into_place``): a complete ``processed/<name>.tmp`` next to a missing processed
+  folder is renamed into place, an incomplete ``.tmp`` and a ``processed/<name>.old`` are removed without asking.
 
-Nothing is touched until every folder was inspected; the queued raw deletions, healthy-shard-dropping
-truncations and unparsable-manifest deletions are then confirmed **once** with one list, and only then is anything
-deleted or truncated.
-``dry_run=True`` (``prepare.py status``) records what would be done and touches nothing (the report's ``performed``
-stays False). A refused or impossible confirmation raises :class:`ConfirmationRequired` with the same list and
-**nothing** is changed — not even the unconfirmed repairs; ``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts and never
-confirms a repair.
+Nothing is touched until every folder was inspected; the queued raw deletions, healthy-shard-dropping truncations
+and unparsable-manifest deletions are then confirmed once with one list. ``dry_run=True`` (``prepare.py status``)
+records what would be done and touches nothing. A refused or impossible confirmation raises
+:class:`ConfirmationRequired` with the same list and nothing is changed, not even the unconfirmed repairs;
+``prepare.py`` prints it and exits 2; ``train.py``'s auto-prepare never prompts.
 """
 
 from __future__ import annotations
@@ -70,7 +59,7 @@ class RepairError(RuntimeError):
 
 
 class ConfirmationRequired(RepairError):
-    """Raw folders have to be deleted or truncated past healthy shards but the user did not confirm — no terminal
+    """Raw folders have to be deleted or truncated past healthy shards but the user did not confirm: no terminal
     to ask on, or the answer was not yes. Nothing was changed. ``message`` is the confirmation prompt (the list of
     folders and why), ``report`` says what would have been done."""
 
@@ -92,7 +81,7 @@ class RepairAction:
     kind: FolderKind
     action: RepairVerb
     reason: str
-    needs_confirmation: bool = False  # joins the one confirmation: a truncation dropping healthy shards, a processed manifest that cannot be parsed; raw deletions always ask
+    needs_confirmation: bool = False  # joins the one confirmation (healthy-shard-dropping truncation, unparsable manifest); raw deletions always ask
     keep_shards: int | None = None  # truncations: the good prefix the inspection found (`good_prefix_length`)
 
     def describe(self) -> str:
@@ -190,15 +179,11 @@ def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, 
 
 def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
     """Plan what happens to the processed folder of ``name`` given the raw shards it will be able to build from
-    (None: the raw folder is being deleted): the shared verdict of
-    :func:`~data_preparation.lib.build.assessment.assess_processed_folder` decides, and this step performs exactly
-    the cheapest repair the verdict attaches — a ``rebuild`` is a deletion (derived data needs no confirmation, the
-    build writes the folder again), everything else is left alone. The one deletion that asks is a manifest that
-    cannot be parsed: it joins the run's single confirmation, since corruption there is worth a look before the
-    folder goes. In particular the single crash leftover of an
-    interrupted per-shard build (an unlisted file that is exactly the next shard the resumed build writes) is no
-    longer treated as corruption: the build overwrites it, so deleting the whole folder would redo the entire
-    cleaning for one file."""
+    (None: the raw folder is being deleted). The shared verdict of
+    :func:`~data_preparation.lib.build.assessment.assess_processed_folder` decides; this step performs exactly the
+    cheapest repair it attaches: a ``rebuild`` is a deletion (derived data, no confirmation), everything else is
+    left alone. The one deletion that asks is a manifest that cannot be parsed: corruption there is worth a look
+    first. A crash leftover (the next shard the resumed build writes) is not corruption: the build overwrites it."""
     assessment = assess_processed_folder(config, name, folder, raw_shards)
     if assessment.repair == "rebuild":
         asks = assessment.problem == "unreadable_manifest"
@@ -209,10 +194,10 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
 
 def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
     """Plan the cleanup after an interrupted rename-aside swap of an all-at-once build
-    (``lib/stages/build.py:_swap_into_place``): a **complete** ``processed/<name>.tmp`` (the shared verdict on the
-    folder itself is ``ok`` — current manifest, every shard verifies) next to a missing processed folder is the
-    swap's data and is renamed into place; any other leftover ``.tmp`` is removed as an interrupted build's; a
-    leftover ``processed/<name>.old`` (the folder a swap already replaced) is removed without asking."""
+    (``lib/stages/build.py:_swap_into_place``): a complete ``processed/<name>.tmp`` (verdict ``ok``: current
+    manifest, every shard verifies) next to a missing processed folder is the swap's data and is renamed into
+    place; any other leftover ``.tmp`` is removed as an interrupted build's; a leftover ``processed/<name>.old``
+    (the folder a swap already replaced) is removed without asking."""
     temporary = processed_dir.with_name(processed_dir.name + ".tmp")
     if temporary.exists():
         if not processed_dir.exists() and assess_processed_folder(config, name, temporary, raw_shards).problem == "none":
@@ -268,7 +253,7 @@ def confirm_repairs(queued: list[RepairAction], planned: RepairReport, *, assume
 
 def perform_repairs(report: RepairReport) -> None:
     """Carry out every planned action of ``report`` in order: processed folders first (deletions and the swap of a
-    complete ``.tmp`` into place — so a crash never leaves derived data next to a raw folder it no longer matches),
+    complete ``.tmp`` into place, so a crash never leaves derived data next to a raw folder it no longer matches),
     then raw truncations and deletions; the report is marked ``performed``."""
     processed = [action for action in report.actions if action.kind == "processed"]
     raw = [action for action in report.actions if action.kind == "raw"]

@@ -106,7 +106,7 @@ def test_depth_arithmetic() -> None:
         mean_backprop_depth=[2, 1],
     )
     assert cfg.effective_expected_depth == 2 + 1 + (1 * 3 + 2 * 4)
-    assert cfg.n_layer == 1 * 2 + 2 * 1
+    assert cfg.mean_backprop_layers == 1 * 2 + 2 * 1
     assert cfg.init.num_layers == cfg.effective_expected_depth
 
 
@@ -119,7 +119,7 @@ def test_crow_architecture_yaml() -> None:
     assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
     assert cfg.mean_recurrence == [12, 12, 12] and cfg.mean_backprop_depth == [8, 8, 8]
     assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
-    assert cfg.n_layer == 3 * 4 * 8
+    assert cfg.mean_backprop_layers == 3 * 4 * 8
     assert cfg.padded_vocab_size == 32768
     assert cfg.head_size == 64
     assert cfg.intermediate_size == 4096 and cfg.block_size == 2048 and cfg.vocab_size == 32000
@@ -231,7 +231,7 @@ def test_rope_settings_accepts_dict() -> None:
 
 def test_to_dict_contains_only_dataclass_fields() -> None:
     d = tiny().to_dict()
-    assert "init" not in d and "head_size" not in d and "n_layer" not in d
+    assert "init" not in d and "head_size" not in d and "mean_backprop_layers" not in d
     assert d["rope_settings"] == {"rope_base": 50_000}
 
 

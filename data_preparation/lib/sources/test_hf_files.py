@@ -104,9 +104,9 @@ def test_jsonl_counts_known_only_after_full_read(hub: FakeHub, tmp_path: Path) -
     src = _src(load_kwargs={"data_files": "f/*.jsonl"})
     assert _ids(LOADERS["hf_files"](src, 0, 2, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1"]
     index = FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None)
-    assert index.rows == {}  # a.jsonl was not read to its end
+    assert index.row_counts == {}  # a.jsonl was not read to its end
     assert _ids(LOADERS["hf_files"](src, 1, 3, SharedLoaderParameters(index_dir=index_dir))) == ["a1", "a2", "b0"]
-    assert FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None).rows == {"f/a.jsonl": 3}
+    assert FileIndex.open(REPO, REV, "f/*.jsonl", index_dir, None).row_counts == {"f/a.jsonl": 3}
     hub.downloads.clear()
     assert _ids(LOADERS["hf_files"](src, 3, 1, SharedLoaderParameters(index_dir=index_dir))) == ["b0"]
     assert hub.downloads == ["f/b.jsonl"]
@@ -170,14 +170,14 @@ def test_large_json_array_is_streamed_incrementally(hub: FakeHub, tmp_path: Path
     read = _bytes_read(hub.handles["big/a.json"])
     assert 0 < read < size * 0.25, (read, size)
     assert stats.bytes_fetched == read and stats.files_streamed == 1 and stats.files_downloaded == 0
-    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {}  # not read to the end
+    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).row_counts == {}  # not read to the end
     # top-up at an offset re-streams from the start (prefix read: still far less than the file)
     assert _ids(LOADERS["hf_files"](src, 5, 4, SharedLoaderParameters(index_dir=index_dir))) == ["a5", "a6", "a7", "a8"]
     assert hub.streams == ["big/a.json", "big/a.json"]
     assert _bytes_read(hub.handles["big/a.json"]) < size * 0.3
     # reading to the end records the row count, after which a fetch past it opens nothing
     assert len(list(LOADERS["hf_files"](src, 40, 100, SharedLoaderParameters(index_dir=index_dir)))) == 10
-    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).rows == {"big/a.json": 50}
+    assert FileIndex.open(REPO, REV, "big/*.json", index_dir, None).row_counts == {"big/a.json": 50}
     hub.streams.clear()
     assert _ids(LOADERS["hf_files"](src, 50, 5, SharedLoaderParameters(index_dir=index_dir))) == []
     assert hub.streams == []
@@ -296,7 +296,7 @@ def test_read_rows_match_without_key_records_totals(hub: FakeHub) -> None:
     index = FileIndex.open(REPO, REV, "data/*.jsonl", None, None)
     got = list(read_rows(index, 0, 10, token=None, key="k", match=lambda r: r["language"] == "Python"))
     assert _ids(iter(got)) == ["a0", "a3"]
-    assert index.rows == {"data/a.jsonl": 4} and index.counts == {"k": {"data/a.jsonl": 2}}
+    assert index.row_counts == {"data/a.jsonl": 4} and index.keyed_counts == {"k": {"data/a.jsonl": 2}}
 
 
 # --- size-aware fetching (Hub cache vs. remote row groups / streams) ---------------------------------------------------
@@ -423,14 +423,14 @@ def test_large_json_lines_stream_sequentially_and_reread_partial_files(hub: Fake
     load = LOADERS["hf_files"]
     assert _ids(load(src, 0, 2, SharedLoaderParameters(index_dir=index_dir))) == ["a0", "a1"]
     assert hub.streams == [f"f/a{suffix}"] and hub.downloads == []
-    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {}  # not read to the end
+    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).row_counts == {}  # not read to the end
     assert _ids(load(src, 1, 4, SharedLoaderParameters(index_dir=index_dir))) == ["a1", "a2", "a3", "b0"]  # a is re-streamed from its start
     assert hub.streams == [f"f/a{suffix}", f"f/a{suffix}", f"f/b{suffix}"]
-    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {f"f/a{suffix}": 4}
+    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).row_counts == {f"f/a{suffix}": 4}
     hub.streams.clear()
     assert _ids(load(src, 5, 9, SharedLoaderParameters(index_dir=index_dir))) == ["b1", "b2", "b3"]
     assert hub.streams == [f"f/b{suffix}"]  # a is skipped by its recorded count; b read to the end
-    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).rows == {f"f/a{suffix}": 4, f"f/b{suffix}": 4}
+    assert FileIndex.open(REPO, REV, f"f/*{suffix}", index_dir, None).row_counts == {f"f/a{suffix}": 4, f"f/b{suffix}": 4}
 
 
 def test_plain_json_streams_remotely_and_reads_from_cache(hub: FakeHub) -> None:
@@ -562,9 +562,9 @@ def test_index_saves_once_per_read_within_the_save_interval(hub: FakeHub, tmp_pa
     writes = _spy_writes(monkeypatch, clock)
     assert len(_ids(read_rows(index, 0, 100))) == 8  # four files, each read to its end records its row count
     assert writes == [0.0]  # no per-file writes inside the interval; only the read's final save (the backstop)
-    assert index.rows == {f"f/{n}.jsonl": 2 for n in "abcd"}
+    assert index.row_counts == {f"f/{n}.jsonl": 2 for n in "abcd"}
     _forget_open_indexes()
-    assert FileIndex.open(REPO, REV, "f/*.jsonl", tmp_path / "index", None).rows == index.rows  # all persisted
+    assert FileIndex.open(REPO, REV, "f/*.jsonl", tmp_path / "index", None).row_counts == index.row_counts  # all persisted
 
 
 def test_index_saves_between_files_once_the_save_interval_passed(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

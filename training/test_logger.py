@@ -164,7 +164,7 @@ def _step_tiny(tiny_model: RecurrentGPT) -> ELLISAdam:
     torch.manual_seed(0)
     x = torch.randint(0, 512, (2, 16))
     opt = ELLISAdam(get_param_groups(tiny_model, 4e-5), lr=1e-3)
-    loss = tiny_model(x, labels=x, num_steps_pair=(0, 2))["loss"]
+    loss = tiny_model(x, labels=x, num_steps=(0, 2))["loss"]
     assert loss is not None
     loss.backward()
     opt.step()
@@ -237,7 +237,7 @@ def test_non_finite_gradient_is_reported_as_nan(tiny_model: RecurrentGPT) -> Non
     torch.manual_seed(0)
     x = torch.randint(0, 512, (2, 16))
     opt = ELLISAdam(get_param_groups(tiny_model, 4e-5), lr=1e-3)
-    loss = tiny_model(x, labels=x, num_steps_pair=(0, 2))["loss"]
+    loss = tiny_model(x, labels=x, num_steps=(0, 2))["loss"]
     assert loss is not None
     loss.backward()
     params = dict(tiny_model.named_parameters())
@@ -613,7 +613,7 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     released: list[str] = []
     resume_path = tmp_path / "checkpoints" / "step-00000004-steps.pth"
     with open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock, start_step=4, setup_started=490.0) as run_logger:
-        run_logger.resources.callback(released.append, "released")
+        run_logger._exit_stack.callback(released.append, "released")
         run_logger.log_resume(resume_path, 4)
         progress = TrainingProgress(step=4, resume_step=4)
         run_fake_steps(run_logger, stage_manager, progress, clock, 3, 2.0)
@@ -631,7 +631,7 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     assert released == ["released"]
 
     assert isinstance(report, TrainingReport)
-    assert (report.run_directory, report.steps_completed, report.final_step) == (tmp_path, 3, 7)
+    assert (report.run_directory, report.steps_this_process, report.completed_steps) == (tmp_path, 3, 7)
     assert report.resumed_from == resume_path
     assert report.setup_seconds == 10.0 and report.train_seconds == 6.0
     assert report.last_loss == 2.0 and report.last_validation == {}
@@ -667,7 +667,7 @@ def test_fresh_start_report_summary_without_steps(
     report = run_logger.close(TrainingProgress(), None)
     assert recording(run_logger).events == ["no checkpoint found, starting from scratch"]
     assert not any("scratch" in r.getMessage() for r in console_records.records)
-    assert (report.steps_completed, report.final_step, report.resumed_from, report.last_loss) == (0, 0, None, None)
+    assert (report.steps_this_process, report.completed_steps, report.resumed_from, report.last_loss) == (0, 0, None, None)
     assert report.summary() == "\n".join(
         [
             f"Training run in {tmp_path}: 0 optimizer steps completed (final step 0, fresh start)",
@@ -858,7 +858,7 @@ def test_exit_releases_every_resource_even_when_the_tracker_raises(tmp_path: Pat
     tracker = RaisingTracker(tmp_path)
     run_logger = _logger_with(tracker, reference_stage_manager(settings), settings, tmp_path)
     released: list[str] = []
-    run_logger.resources.callback(released.append, "dashboard")
+    run_logger._exit_stack.callback(released.append, "dashboard")
     with pytest.raises(RuntimeError, match="wandb finish failed"), run_logger:
         pass
     assert tracker.finish_calls == 1 and released == ["dashboard"]
@@ -875,7 +875,7 @@ def test_exit_raises_the_first_failure_and_still_releases_the_rest(tmp_path: Pat
         released.append("dashboard")
         raise ValueError("dashboard teardown failed")
 
-    run_logger.resources.callback(failing_release)
+    run_logger._exit_stack.callback(failing_release)
     with pytest.raises(RuntimeError, match="wandb finish failed"):
         run_logger.__exit__(None, None, None)
     assert tracker.finish_calls == 1 and released == ["dashboard"]
@@ -895,7 +895,7 @@ def test_close_of_a_stopped_run(
     run_logger.log_checkpoint(tmp_path / "checkpoints" / "step-00000005-steps.pth")
     report = run_logger.close(progress, None, stopped=True)
     assert recording(run_logger).statuses == ["stopped on request"]
-    assert report.stopped is True and (report.steps_completed, report.final_step) == (5, 5)
+    assert report.stopped is True and (report.steps_this_process, report.completed_steps) == (5, 5)
     assert report.export_dir is None
     lines = report.summary().splitlines()
     assert lines[2] == "  stopped on request after step 5; rerun with resume: true to continue"

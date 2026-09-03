@@ -2,11 +2,10 @@
 """HuggingFace `transformers` wrapper and export for `RecurrentGPT`.
 
 `export_to_hf` writes safetensors + config.json and copies this package's modules flat next to them, so the folder
-loads anywhere with `AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)`. transformers' dynamic-module
-loader (`dynamic_module_utils.get_relative_imports`) only follows `from .name import` lines between files of ONE
-directory and an `auto_map` entry is `module.Class` with exactly one dot, so sub-packages cannot be exported as they
-are: every module `a/b.py` is written as top-level `a_b.py` and its relative imports are rewritten by
-`flatten_relative_imports` (import lines only, see there). The `auto_map` names this module's flat name.
+loads with `AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)`. Flat because transformers' dynamic
+module loader only follows `from .name import` lines within one directory and an `auto_map` entry is `module.Class`
+with exactly one dot: every module `a/b.py` is written as `a_b.py` and `flatten_relative_imports` rewrites its import
+lines. The `auto_map` names this module's flat name.
 """
 
 import os
@@ -67,12 +66,10 @@ def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[
 
 
 def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_size: int) -> torch.Tensor:
-    """`logits` with the columns of the embedding table's padding (`vocab_size:`) set to -inf; unchanged when the
-    table is not padded.
-
-    The table is padded to `padding_multiple` so the matmuls stay aligned, and those columns are trained on no
-    target — with them exposed, `generate(do_sample=True)` can draw an id the tokenizer cannot decode. Only the HF
-    wrapper masks: the training loss must keep seeing the model's own logits (the goldens pin those numbers)."""
+    """`logits` with the embedding table's padding columns (`vocab_size:`) set to -inf; unchanged when the table is
+    not padded. Those columns are trained on no target, and `generate(do_sample=True)` could otherwise draw an id the
+    tokenizer cannot decode. Only the HF wrapper masks: the training loss must see the model's own logits (the golden
+    tests check those numbers)."""
     if padded_vocab_size <= vocab_size:
         return logits
     masked = logits.clone()  # a clone, not an in-place write: `logits` is part of the autograd graph
@@ -86,15 +83,14 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
     model_type = "recurrent_gpt"
 
     def __init__(self, rope_base: int = 50_000, **kwargs: Any) -> None:
-        # Defaults only fill keys missing from a config.json (export_to_hf writes every field); the exported folder
-        # is standalone and has no access to config/model_architecture/, so the dataclass defaults are used.
+        # Defaults fill keys missing from a config.json (export_to_hf writes every field); the exported folder has no
+        # access to config/model_architecture/, so the dataclass defaults apply.
         defaults = RecurrentConfig()
         values: dict[str, Any] = {}
         for name in _MODEL_FIELDS:
             values[name] = kwargs.pop(name, getattr(defaults, name))
-        # The per-block fields take the same int shorthand as `RecurrentConfig` (`mean_recurrence: 12` = every
-        # block), so they are broadcast here the way `RecurrentConfig.__post_init__` does it: everything below and
-        # in the wrapper (`num_hidden_layers`, the eval depths) then reads one entry per core block.
+        # Per-block fields take the int shorthand of `RecurrentConfig` (`mean_recurrence: 12` = every block) and are
+        # broadcast the way `RecurrentConfig.__post_init__` does; everything below reads one entry per core block.
         layers_per_block = values["n_layers_in_recurrent_block"]
         values["n_layers_in_recurrent_block"] = [layers_per_block] if isinstance(layers_per_block, int) else list(layers_per_block)
         num_blocks = len(values["n_layers_in_recurrent_block"])
@@ -153,45 +149,40 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         position_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
-        num_steps_pair: NumSteps = None,
+        num_steps: NumSteps = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
-        """`num_steps_pair` as in `RecurrentGPT.forward`; if None, **in eval mode** `EVAL_RECURRENCE_STEPS` ("12" or
-        "4,12,4") when it is set, else the config's `mean_recurrence` per block; in training mode always the sampler
-        (the env var fixes eval depths with zero backprop iterations — honouring it while training would silently
-        train the recurrence without gradient).
+        """`num_steps` as in `RecurrentGPT.forward`. When None: in eval mode `EVAL_RECURRENCE_STEPS` ("12" or
+        "4,12,4") if set, else the config's `mean_recurrence` per block; in training mode always the sampler (the env
+        var sets zero backprop iterations, which would silently train the recurrence without gradient).
 
-        Logits over the embedding table's padding columns (`vocab_size:` of `padded_vocab_size`) are `-inf`, so
-        sampling can only produce ids the tokenizer can decode. The inner model is left untouched: masking there
-        would change the training numerics.
+        Logits over the padding columns of the embedding table are -inf, so sampling only produces decodable ids. The
+        inner model is untouched: masking there would change the training numerics.
 
-        `labels` follow the HuggingFace contract and are shifted **here**: `model(x, labels=x).loss` is the
-        next-token loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The INNER `RecurrentGPT` takes
-        *pre-shifted* labels instead (the trainer's collate shifts), so it is called with `labels=None`.
-
-        `attention_mask` is the usual `(B, S)` padding mask (1 = keep) and `position_ids` may be 1-D or `(B, S)`;
-        both are forwarded to the inner model, which turns them into a causal-plus-padding mask and per-row RoPE
-        positions."""
+        `labels` follow the HuggingFace contract and are shifted here: `model(x, labels=x).loss` is the next-token
+        loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The inner `RecurrentGPT` expects pre-shifted
+        labels, so it gets `labels=None`. `attention_mask` `(B, S)` (1 = keep) and `position_ids` (1-D or `(B, S)`)
+        are forwarded to the inner model."""
         if return_dict is None:
             return_dict = self.config.return_dict
 
-        if num_steps_pair is None and not self.training:
+        if num_steps is None and not self.training:
             env_steps = os.environ.get("EVAL_RECURRENCE_STEPS", "").strip()
             if env_steps:
-                num_steps_pair = parse_recurrence_steps(env_steps, self.num_recurrent_blocks)
+                num_steps = parse_recurrence_steps(env_steps, self.num_recurrent_blocks)
             else:
                 per_block: list[StepsSpec] = []
                 for mean_recurrence in self.config.mean_recurrence:
                     per_block.append((mean_recurrence, 0))
-                num_steps_pair = per_block
+                num_steps = per_block
 
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            labels=None,  # the inner model's loss is unshifted; the HF contract shifts, see below
+            labels=None,  # the inner loss is unshifted; the HF contract shifts, below
             return_logits=True,
-            num_steps_pair=num_steps_pair,
+            num_steps=num_steps,
         )
         logits = outputs["logits"]
         assert logits is not None  # `return_logits=True`
@@ -209,15 +200,12 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         return (loss, logits)
 
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """The whole (growing) sequence every step — there is no KV cache — plus the padding mask and the positions.
+        """The whole sequence every step (no KV cache), plus the padding mask and the positions.
 
-        A batch of prompts of different lengths is left-padded by `generate`, so without the mask the model would
-        attend to the pad tokens and count them as positions; with it, every row's positions are
-        `cumsum(mask) - 1` (clamped at 0 for the pads themselves), i.e. the first real token of every row sits at
-        position 0 whatever the padding. Everything else `generate` passes (a cache, embeddings) is dropped.
-
-        `*args` / `**kwargs`: transformers' own signature grows parameters between versions and `generate` only ever
-        calls this with keywords."""
+        `generate` left-pads prompts of different lengths; without the mask the model would attend to the pads and
+        count them as positions. With it every row's positions are `cumsum(mask) - 1`, clamped at 0, so the first real
+        token of every row sits at position 0. Everything else `generate` passes (a cache, embeddings) is dropped.
+        `*args` / `**kwargs`: transformers' signature changes between versions and `generate` only passes keywords."""
         attention_mask: torch.Tensor | None = kwargs.get("attention_mask")
         position_ids: torch.Tensor | None = kwargs.get("position_ids")
         model_inputs: dict[str, Any] = {"input_ids": input_ids}
@@ -263,10 +251,8 @@ def flatten_relative_imports(source: str, module: Path, package_dir: Path) -> st
     """Rewrite the package-relative imports of `module` (its path relative to `package_dir`) for the flat export.
 
     Only `from .x import` lines change: `from .layers.norms import X` -> `from .layers_norms import X`, `from ..config
-    import Y` -> `from .config import Y`. An import must name the defining module file; one that resolves to a package
-    (`from .layers import X`, served by an `__init__.py`, or `from . import x`) raises, because `__init__.py` files
-    are not exported.
-    """
+    import Y` -> `from .config import Y`. An import that resolves to a package (`from .layers import X` or
+    `from . import x`) raises: `__init__.py` files are not exported, so imports must name the defining module."""
     # Directory of `module` inside the package, e.g. ("hf",) for hf/modeling.py or () for a top-level module.
     module_package = module.parent.parts
 
@@ -318,8 +304,7 @@ def export_to_hf(
         "AutoModelForCausalLM": f"{this_module}.RecurrentGPTForCausalLM",
     }
 
-    # Build the wrapper without allocating weights, then hand it `model`'s tensors (prefixed with `model.`, the
-    # wrapper's attribute name).
+    # Build the wrapper without allocating weights, then hand it `model`'s tensors under the wrapper's `model.` prefix.
     with torch.device("meta"):
         hf_model = RecurrentGPTForCausalLM(hf_config)
     state_dict: dict[str, torch.Tensor] = {}

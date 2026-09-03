@@ -9,17 +9,17 @@
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 
-``prepare`` materialises a dataset config: tokenizer → repair → (download + build) rounds → status table
+``prepare`` materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
 (``lib/build/runner.py``). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
-manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; ``--yes`` answers it, and without a terminal the command prints the list and exits 2 — nothing is
-changed. ``status`` prints what the repair step would do and the status table and exits 0 iff the dataset is
-complete. ``describe`` renders the config as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir``
-relocates the HuggingFace caches.
+manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; ``--yes`` answers it,
+and without a terminal the command prints the list and exits 2 with nothing changed. ``status`` prints what the
+repair step would do plus the status table and exits 0 iff the dataset is complete. ``describe`` renders the config
+as Markdown (``docs/data_mixture.md`` is generated with it). ``--cache_dir`` relocates the HuggingFace caches.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
-repair, 3 another data preparation is still running (one run at a time: ``lib/build/lock.py``; the message names its
-pid and start time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything
-published is kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
+repair, 3 another data preparation is still running (``lib/build/lock.py``; the message names its pid and start
+time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
+kept). On a terminal the run shows the live dashboard of ``lib/ui/dashboard.py``; the log lines it kept (warnings,
 the tables) and the final status table are printed once it closed.
 """
 
@@ -149,8 +149,8 @@ def run_status(args: argparse.Namespace) -> None:
 
 
 def run_describe(args: argparse.Namespace) -> None:
-    cfg = load_dataset_config(args.dataset_config)
-    sys.stdout.write(describe(cfg, args.dataset_config, notes=leading_comment(args.dataset_config)))
+    dataset_config = load_dataset_config(args.dataset_config)
+    sys.stdout.write(describe(dataset_config, args.dataset_config, notes=leading_comment(args.dataset_config)))
 
 
 def _interrupt_on_sigterm(signum: int, frame: FrameType | None) -> None:

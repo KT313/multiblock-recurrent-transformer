@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""The rule a live display opens under: its environment variable not set to a disabling value, and its stream a
-terminal. ``data_preparation.lib.progress.progress_enabled`` (``DATA_PREP_PROGRESS``, stderr) and
-``training.ui.common.dashboard_enabled`` (``TRAINING_DASHBOARD``, stdout) are this rule with their names filled in."""
+"""When a live display opens: its environment variable is not set to a disabling value and its stream is a
+terminal. ``progress_enabled`` (data preparation: ``DATA_PREP_PROGRESS``, stderr) and ``dashboard_enabled``
+(training: ``TRAINING_DASHBOARD``, stdout) are this rule with their names filled in."""
 
 from __future__ import annotations
 

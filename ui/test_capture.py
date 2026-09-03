@@ -192,7 +192,7 @@ def test_handler_formats_and_keeps_warnings_and_marked_records() -> None:
 
 def test_handler_skips_the_loggers_it_is_told_to() -> None:
     sink = RecordingSink()
-    handler = DashboardLogHandler(sink, skip=lambda name: name.startswith("data_preparation"))
+    handler = DashboardLogHandler(sink, already_attached=lambda name: name.startswith("data_preparation"))
     handler.emit(_record("data_preparation.x", logging.INFO, "handled elsewhere"))
     handler.emit(_record("some_library", logging.INFO, "mine"))
     assert len(sink.texts()) == 1 and sink.texts()[0].endswith("some_library: mine")

@@ -41,8 +41,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
     values: dict[str, Any] = dict(
         run_directory=out_dir,
-        steps_completed=3,
-        final_step=3,
+        steps_this_process=3,
+        completed_steps=3,
         resumed_from=None,
         setup_seconds=1.0,
         train_seconds=2.0,
@@ -231,7 +231,7 @@ def test_main_maps_a_stop_during_training_to_130(monkeypatch: pytest.MonkeyPatch
     def train_until_interrupted(settings: Settings, *, should_stop: StopRequest, started_at: float, **_: Any) -> TrainingReport:
         signal.raise_signal(signal.SIGINT)
         assert should_stop() is True
-        return _report(tmp_path / "out", stopped=True, final_step=7, steps_completed=7)
+        return _report(tmp_path / "out", stopped=True, completed_steps=7, steps_this_process=7)
 
     monkeypatch.setattr(train_module, "train", train_until_interrupted)
     assert main(["--config", str(yaml_path)]) == 130

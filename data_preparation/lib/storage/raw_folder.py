@@ -2,18 +2,16 @@
 """``RawFolder``: the one object that owns the bookkeeping of a ``sources/<source>/raw/`` directory.
 
 A raw manifest records more than its shards: the loader offset reached (``rows_fetched``, where the next download
-resumes), how many source rows were rejected on the way (``skipped_malformed`` / ``dropped_too_long``), whether the
-loader ran dry (``exhausted``, possibly because a ``check_limit`` was reached: ``check_limit_reached``) and the token
-cap the stored rows were cut at (``truncated_at_tokens``). Three code paths change all of that — the per-source
-download, the ``github_code`` group pass and the repair step's truncation — and :class:`RawFolder` is the only
-writer of these fields, so the offset and the reject counters always move together (a resume never counts a rejected
-row twice).
+resumes), how many source rows were rejected on the way (``skipped_malformed``, ``dropped_too_long``), whether the
+loader ran dry (``exhausted``, ``check_limit_reached``) and the token cap the stored rows were cut at
+(``truncated_at_tokens``). :class:`RawFolder` is the only writer of these fields, so the offset and the reject
+counters always move together and a resume never counts a rejected row twice.
 
-The append side is resumable at shard granularity: every published shard is recorded with the loader offset **and**
-the reject totals as of its last stored row (:class:`RowProgress`, handed to :meth:`RawFolder.add` next to the row
-and stored in :class:`~data_preparation.lib.storage.manifest.ShardInfo`), so a stop, a failure or a truncation to the good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`) all leave a
-manifest a resume can continue from without counting any rejected row twice. Manifests written before those per-shard fields existed still load: a truncation then resets the
-counters to 0 and says so in the log (the folder stays usable and is never treated as stale).
+Every published shard is recorded with the loader offset and the reject totals as of its last stored row
+(:class:`RowProgress`, handed to :meth:`RawFolder.add` next to the row), so a stop, a failure or a truncation to
+the good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`) all leave a manifest a resume can
+continue from. Manifests written before those per-shard fields existed still load: a truncation then resets the
+counters to 0 and says so in the log.
 """
 
 from __future__ import annotations
@@ -32,8 +30,8 @@ Row = dict[str, Any]
 
 class RowProgress(NamedTuple):
     """Where an increment stood when a stored row was produced: the loader offset after it and how many rows before
-    it were rejected. Persisted with every shard (its last stored row's values), so a resume — which re-reads the
-    source from that offset — counts every rejected row exactly once."""
+    it were rejected. Persisted with every shard (its last stored row's values), so a resume, which re-reads the
+    source from that offset, counts every rejected row exactly once."""
 
     consumed: int
     skipped_malformed: int
@@ -81,12 +79,13 @@ class RawFolder:
 
     @property
     def cap(self) -> int:
-        """The token cap the rows appended to this folder are cut at: the recorded ``truncated_at_tokens``.
+        """The token cap the rows appended to this folder are cut at: the recorded ``truncated_at_tokens``, else the
+        ``config_cap`` given at construction.
 
-        Appending under a *lower* config cap would otherwise leave a folder whose manifest promises longer rows than
-        the appended part holds, and raising the cap back would not be detected
+        Appending under a lower config cap would leave a folder whose manifest promises longer rows than the
+        appended part holds, and raising the cap back would not be detected
         (:meth:`~data_preparation.lib.storage.manifest.Manifest.is_outdated`). Lowering stays free (the build clamps
-        the stored counts). A manifest without the field falls back to the ``config_cap`` given at construction."""
+        the stored counts)."""
         recorded = self.manifest.truncated_at_tokens
         return recorded if recorded is not None else self._config_cap
 
@@ -113,7 +112,7 @@ class RawFolder:
     def reopen_if_check_limit_grew(self, check_limit: int | None) -> None:
         """A source marked exhausted because its ``check_limit`` was reached may be read further when the limit grew
         (or was removed): ``check_limit`` is not part of the raw hash, so the manifest is not stale, only its flag.
-        Kept in memory — the increment that follows saves it."""
+        Kept in memory; the increment that follows saves it."""
         reached = self.manifest.check_limit_reached
         if not self.exhausted or reached is None:
             return
@@ -174,9 +173,9 @@ class RawFolder:
 
     def truncate_to(self, good_shards: int) -> None:
         """Keep the first ``good_shards`` shards (the good prefix :func:`good_prefix_length` found) and drop the rest:
-        the manifest keeps the prefix, the offset **and every reject counter** become what the last kept shard
-        recorded (so the next download resumes there and counts nothing twice) and the exhaustion flag is cleared.
-        The prefix must hold at least one shard with a recorded offset — the repair step plans a deletion otherwise.
+        the manifest keeps the prefix, the offset and every reject counter become what the last kept shard recorded
+        (so the next download resumes there and counts nothing twice) and the exhaustion flag is cleared. The prefix
+        must hold at least one shard with a recorded offset; the repair step plans a deletion otherwise.
         """
         good = good_shards
         if good >= len(self.manifest.shards):

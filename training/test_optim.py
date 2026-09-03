@@ -341,7 +341,7 @@ def test_ellis_adam_on_tiny_model_reduces_loss(tiny_model: RecurrentGPT) -> None
     opt = ELLISAdam(groups, lr=1e-3, betas=(0.9, 0.95), update_clipping=True)
     losses = []
     for _ in range(5):
-        loss = tiny_model(x, labels=x, num_steps_pair=(0, 2))["loss"]
+        loss = tiny_model(x, labels=x, num_steps=(0, 2))["loss"]
         assert loss is not None
         loss.backward()
         opt.step()

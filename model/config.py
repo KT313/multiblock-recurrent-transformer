@@ -12,11 +12,11 @@ import yaml
 from .layers.init import Init
 
 
-def find_multiple(n: int, k: int) -> int:
-    """Smallest multiple of `k` that is >= `n`."""
-    if n % k == 0:
-        return n
-    return n + k - (n % k)
+def find_multiple(value: int, multiple: int) -> int:
+    """Smallest multiple of `multiple` that is >= `value`."""
+    if value % multiple == 0:
+        return value
+    return value + multiple - (value % multiple)
 
 
 @dataclass
@@ -39,8 +39,8 @@ _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
 
 def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> list[int]:
     """A per-block field as one entry per core block: an int (or a one-element list) is repeated for every block, a
-    longer list must already have one entry per block. `RecurrentConfig.__post_init__` and the HuggingFace wrapper's
-    config (`model/hf/modeling.py`) broadcast the same way, so the int shorthand means the same in both."""
+    longer list must already have one entry per block. `RecurrentConfig.__post_init__` and the HuggingFace config
+    (`model/hf/modeling.py`) both use this, so the int shorthand means the same in both."""
     if isinstance(value, int):
         values = [value]
     else:
@@ -128,17 +128,17 @@ class RecurrentConfig:
         self.effective_expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
 
         # Mean number of core-block layers the gradient flows through (layers times backprop depth, summed).
-        self.n_layer = 0
+        self.mean_backprop_layers = 0
         for n_layers, mean_backprop_depth in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth):
-            self.n_layer += n_layers * mean_backprop_depth
+            self.mean_backprop_layers += n_layers * mean_backprop_depth
 
         self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
 
     def _validate_recurrence(self) -> None:
-        """Values the sampler and the model would accept silently but that cannot mean what was intended: a block
-        without layers, a block that never receives gradient (`mean_backprop_depth` 0), a zero or negative mean
-        recurrence (`log(0)` at the first forward), or a backprop depth above the mean recurrence (the sampler would
-        target `mean_backprop_depth` in training while eval and the init scaling use `mean_recurrence`)."""
+        """Reject values the sampler and the model would accept silently: a block without layers, a block that never
+        gets gradient (`mean_backprop_depth` 0), a mean recurrence <= 0 (`log(0)` at the first forward), or a backprop
+        depth above the mean recurrence (training would target `mean_backprop_depth` while eval and the init scaling
+        use `mean_recurrence`)."""
         if self.n_layers_in_prelude < 0 or self.n_layers_in_coda < 0:
             raise ValueError("n_layers_in_prelude and n_layers_in_coda must be >= 0")
         assert isinstance(self.n_layers_in_recurrent_block, list)
@@ -157,8 +157,8 @@ class RecurrentConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
-        """Build a config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
-        dataclass fields, nested settings as nested mappings), with keyword overrides applied on top."""
+        """A config from a model architecture YAML (`config/model_architecture/<name>.yaml`: a mapping of the
+        dataclass fields, nested settings as nested mappings) with keyword overrides applied on top."""
         with open(path, encoding="utf-8") as yaml_file:
             loaded = yaml.safe_load(yaml_file)
         if not isinstance(loaded, dict):

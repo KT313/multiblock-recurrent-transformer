@@ -1,12 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Everything that could print around the training display, routed into it: :class:`TerminalCapture` — the
-root-logger handler, the detached third-party console handlers, the ``warnings.showwarning`` hook, the ``sys.stdout``
-/ ``sys.stderr`` line sinks and the wandb environment variables, all for the duration of the display.
+"""Everything that could print around the training display, routed into it: :class:`TerminalCapture` (the
+root-logger handler, the detached third-party console handlers, the ``warnings.showwarning`` hook, the stdout /
+stderr line sinks and the wandb environment variables) for the duration of the display.
 
-The generic half — the line sink, the dashboard log handler, ``attach_logger`` and the logging / stream capture
-themselves — lives in :mod:`ui.capture`, shared with the data-prep dashboard; this module adds
-what only a training run needs: the ``training.*`` logger names, the run's log-file and console handlers
-(:func:`run_log_handlers`), the ``warnings`` hook and the wandb environment."""
+The generic half lives in :mod:`ui.capture`, shared with the data-prep dashboard; this module adds what only a
+training run needs: the ``training.*`` logger names, the run's log handlers (:func:`run_log_handlers`), the
+``warnings`` hook and the wandb environment."""
 
 from __future__ import annotations
 
@@ -35,9 +34,8 @@ QUIET_ENV: dict[str, str] = {f"WANDB_{key.upper()}": str(value).lower() for key,
 def format_warning(message: Warning | str, category: type[Warning], filename: str, lineno: int) -> str:
     """One line per warning with the message first: ``UserWarning: the text (/abs/path/module.py:12)``.
 
-    ``warnings.formatwarning`` puts the (absolute, environment-dependent) path first and adds the source line as a
-    second line; here the location trails, so a long path never pushes the message past the terminal width, where the
-    terminal's soft-wrap would split it, and a warning is exactly one kept line."""
+    ``warnings.formatwarning`` puts the absolute path first and adds the source line as a second line; here the
+    location trails, so a warning is exactly one kept line."""
     return f"{category.__name__}: {message} ({filename}:{lineno})"
 
 
@@ -71,11 +69,10 @@ def line_handler(stream_or_file: TextIO | Path) -> logging.Handler:
 
 @contextmanager
 def run_log_handlers(logger: logging.Logger, log_file: Path | None, stream: TextIO | None) -> Iterator[None]:
-    """The run's log file and the console for the block: ONE ``FileHandler`` appending to ``log_file``, on ``logger``
-    (the attached ``training`` logger: its records) and on :data:`~training.ui.common.lines_log` (the dashboard
-    lines) alike, so ``train.log`` is written by a single handler in the order the lines were logged; and, when
-    ``stream`` is given, a ``StreamHandler`` on ``lines_log`` (the console fallback's lines). None leaves a
-    destination out. The handlers are removed and closed afterwards."""
+    """The run's log file and console for the block: ONE ``FileHandler`` on ``log_file``, shared by ``logger`` and
+    :data:`~training.ui.common.lines_log` so ``train.log`` is written in logging order, and a ``StreamHandler`` on
+    ``lines_log`` when ``stream`` is given. None leaves a destination out. Handlers are removed and closed
+    afterwards."""
     added: list[tuple[logging.Logger, logging.Handler]] = []
     if log_file is not None:
         file_handler = line_handler(log_file)
@@ -96,28 +93,21 @@ def run_log_handlers(logger: logging.Logger, log_file: Path | None, stream: Text
 class TerminalCapture:
     """While :meth:`start`\\ed, nothing but the live display reaches the terminal:
 
-    * every ``logging`` record goes to ``sink`` through a handler on the root logger (``skip`` names the loggers
-      an attached handler already covers), while every plain console ``StreamHandler`` of every logger — the ones
-      ``transformers`` / ``datasets`` / ``huggingface_hub`` install on theirs at import — is detached,
-    * ``warnings.showwarning`` is replaced: every ``warnings.warn`` becomes one WARNING (kept) record on
-      :data:`WARNINGS_LOGGER`, :func:`format_warning`\\ ed — whether the process would otherwise write warnings to
-      stderr (the default) or route them through ``logging.captureWarnings`` (``py.warnings``), the hook is what the
-      ``warnings`` module calls, so the text and the routing are the dashboard's. The previous hook is restored
-      afterwards; one installed *inside* the block (a library calling ``logging.captureWarnings(True)``) is left in
-      place — its records reach the panel through the root handler, its stderr lines through the sink below — and
-      a stale reference to the dashboard's hook forwards to the hook the display found,
-    * ``sys.stdout`` / ``sys.stderr`` are replaced by line sinks logging on :data:`STDOUT_LOGGER` (INFO) and
-      :data:`STDERR_LOGGER` (WARNING), so stray prints, bare stderr writes and the final line of a tqdm bar land in
-      the panel (the sink loggers and :data:`WARNINGS_LOGGER` sit under ``training``: the lines also reach the
-      attached log file),
+    * every ``logging`` record goes to ``sink`` through a root-logger handler (``already_attached`` names the loggers an
+      attached handler already covers); the plain console ``StreamHandler``\\s of every logger are detached,
+    * ``warnings.showwarning`` is replaced: every ``warnings.warn`` becomes one kept record on
+      :data:`WARNINGS_LOGGER` (:func:`format_warning`). The previous hook is restored afterwards; one installed
+      inside the block stays, and a stale reference to the dashboard's hook forwards to the hook the display found,
+    * ``sys.stdout`` / ``sys.stderr`` become line sinks logging on :data:`STDOUT_LOGGER` (INFO) and
+      :data:`STDERR_LOGGER` (WARNING), under ``training`` so the lines also reach the log file,
     * :data:`QUIET_ENV` is set for a ``wandb.init`` inside the block.
 
-    :meth:`stop` undoes all of it (idempotent; each part on its own, so a failure in one still restores the rest).
-    :meth:`release_streams` / :meth:`redirect_streams` hand the streams back around a terminal prompt.
+    :meth:`stop` undoes all of it (idempotent, each part on its own). :meth:`release_streams` /
+    :meth:`redirect_streams` hand the streams back around a terminal prompt.
     """
 
-    def __init__(self, sink: LogSink, *, skip: Callable[[str], bool] | None = None) -> None:
-        self._logging = LoggingCapture(sink, skip=skip)
+    def __init__(self, sink: LogSink, *, already_attached: Callable[[str], bool] | None = None) -> None:
+        self._logging = LoggingCapture(sink, already_attached=already_attached)
         self._streams = StreamCapture(STDOUT_LOGGER, STDERR_LOGGER)
         self._saved_env: dict[str, str | None] | None = None
         self._previous_showwarning: _ShowWarning | None = None  # what `warnings.showwarning` was when the capture started
@@ -170,7 +160,8 @@ class TerminalCapture:
         if not self._warnings_captured:
             return
         self._warnings_captured = False
-        if warnings.showwarning == self._show_warning and self._previous_showwarning is not None:  # else: replaced inside the block, theirs stays
+        # replaced inside the block: theirs stays
+        if warnings.showwarning == self._show_warning and self._previous_showwarning is not None:
             warnings.showwarning = self._previous_showwarning
 
     def _show_warning(
@@ -185,7 +176,7 @@ class TerminalCapture:
         """The ``warnings.showwarning`` of the block: one kept record per warning on :data:`WARNINGS_LOGGER`."""
         if self._warnings_captured:
             logging.getLogger(WARNINGS_LOGGER).warning(format_warning(message, category, filename, lineno))
-        elif self._previous_showwarning is not None:  # a stale reference after the display closed: behave like the hook it replaced
+        elif self._previous_showwarning is not None:  # a stale reference after the display closed
             self._previous_showwarning(message, category, filename, lineno, file, line)
 
     def redirect_streams(self) -> None:

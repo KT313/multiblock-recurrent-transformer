@@ -179,7 +179,7 @@ def test_iterate_forward_matches_manual_loop(tiny_model: RecurrentGPT) -> None:
     x = torch.randn(1, 6, 64)
     block = core_block(tiny_model, 1)
     torch.manual_seed(4)
-    got = tiny_model.iterate_forward(x, freqs, None, (2, 1), 1)
+    got = tiny_model.run_core_block(x, freqs, None, (2, 1), 1)
     torch.manual_seed(4)
     x_base = tiny_model.transformer.ln_fs[1](x)
     latent = torch.randn_like(x)
@@ -187,7 +187,7 @@ def test_iterate_forward_matches_manual_loop(tiny_model: RecurrentGPT) -> None:
         latent = recurrence.core_block_forward(latent, x_base, freqs, None, tiny_model.transformer.adapters[1], block)
     torch.testing.assert_close(got, latent)
     assert got.requires_grad
-    no_grad = tiny_model.iterate_forward(x, freqs, None, (2, 0), 1)
+    no_grad = tiny_model.run_core_block(x, freqs, None, (2, 0), 1)
     assert not no_grad.requires_grad  # all steps under no_grad
 
 
@@ -230,7 +230,7 @@ def test_prelude_layers_chain(tiny_model: RecurrentGPT) -> None:
         seen_out.append(output.clone())
 
     handles = [layer.register_forward_hook(hook) for layer in tiny_model.transformer.prelude]
-    tiny_model(x, num_steps_pair=(1, 1))
+    tiny_model(x, num_steps=(1, 1))
     for h in handles:
         h.remove()
     assert len(seen_in) == 2
@@ -246,7 +246,7 @@ def test_forward_matches_hand_composed_pipeline(tiny_model: RecurrentGPT) -> Non
     steps = [(2, 1), (1, 2)]
     x = ids(1, 10)
     torch.manual_seed(9)
-    got = tiny_model(x, return_logits=True, num_steps_pair=steps)["logits"]
+    got = tiny_model(x, return_logits=True, num_steps=steps)["logits"]
 
     t = tiny_model.transformer
     freqs = tiny_model.freqs_cis[:, :10]
@@ -289,7 +289,7 @@ def test_no_labels_gives_zero_loss_and_no_logits(tiny_model: RecurrentGPT) -> No
 def test_eval_sampler_returns_mean_recurrence_and_zero_grad_steps(tiny_model: RecurrentGPT) -> None:
     tiny_model.eval()
     for block_idx, mean in enumerate(per_block(tiny_model.config.mean_recurrence)):
-        n, k = tiny_model.randomized_iteration_sampler(block_idx)
+        n, k = tiny_model.sample_block_depths(block_idx)
         assert n.dtype == torch.long and k.dtype == torch.long
         assert (n.item(), k.item()) == (mean, 0)
 
@@ -310,7 +310,7 @@ def test_eval_forward_is_deterministic_under_a_seed_and_equals_explicit_mean_ste
     # block, kept for bit-identity with the thesis code) is skipped, so the latent init differs under the same seed...
     explicit = [(m, 0) for m in per_block(tiny_model.config.mean_recurrence)]
     torch.manual_seed(5)
-    c = tiny_model(x, return_logits=True, num_steps_pair=explicit)["logits"]
+    c = tiny_model(x, return_logits=True, num_steps=explicit)["logits"]
     assert not torch.equal(a, c)
     # ... and is bit-identical once that draw is replayed (per block: latent init first, then the sampler's rand).
     orig = recurrence.initialize_state  # the function `model.model` calls
@@ -322,43 +322,43 @@ def test_eval_forward_is_deterministic_under_a_seed_and_equals_explicit_mean_ste
 
     monkeypatch.setattr(model_module, "initialize_state", replay)
     torch.manual_seed(5)
-    d = tiny_model(x, return_logits=True, num_steps_pair=explicit)["logits"]
+    d = tiny_model(x, return_logits=True, num_steps=explicit)["logits"]
     assert torch.equal(a, d)
 
 
 def test_num_steps_pair_broadcast_pair_equals_per_block_list(tiny_model: RecurrentGPT) -> None:
     x = ids()
     torch.manual_seed(3)
-    a = tiny_model(x, return_logits=True, num_steps_pair=(1, 2))["logits"]
+    a = tiny_model(x, return_logits=True, num_steps=(1, 2))["logits"]
     torch.manual_seed(3)
-    b = tiny_model(x, return_logits=True, num_steps_pair=[(1, 2), (1, 2)])["logits"]
+    b = tiny_model(x, return_logits=True, num_steps=[(1, 2), (1, 2)])["logits"]
     torch.manual_seed(3)
-    c = tiny_model(x, return_logits=True, num_steps_pair=[torch.tensor([1, 2]), torch.tensor([1, 2])])["logits"]
+    c = tiny_model(x, return_logits=True, num_steps=[torch.tensor([1, 2]), torch.tensor([1, 2])])["logits"]
     torch.manual_seed(3)
-    d = tiny_model(x, return_logits=True, num_steps_pair=torch.tensor([1, 2]))["logits"]
+    d = tiny_model(x, return_logits=True, num_steps=torch.tensor([1, 2]))["logits"]
     assert torch.equal(a, b) and torch.equal(a, c) and torch.equal(a, d)
 
 
 def test_scalar_steps_mean_no_grad_only(tiny_model: RecurrentGPT) -> None:
     x = ids()
     torch.manual_seed(3)
-    a = tiny_model(x, return_logits=True, num_steps_pair=3)["logits"]
+    a = tiny_model(x, return_logits=True, num_steps=3)["logits"]
     torch.manual_seed(3)
-    b = tiny_model(x, return_logits=True, num_steps_pair=(3, 0))["logits"]
+    b = tiny_model(x, return_logits=True, num_steps=(3, 0))["logits"]
     assert torch.equal(a, b)
 
 
 def test_num_steps_pair_list_length_mismatch_raises(tiny_model: RecurrentGPT) -> None:
-    with pytest.raises(ValueError, match="num_steps_pair has 3 entries but there are 2 blocks"):
-        tiny_model(ids(), num_steps_pair=[(1, 1), (1, 1), (1, 1)])
+    with pytest.raises(ValueError, match="num_steps has 3 entries but there are 2 blocks"):
+        tiny_model(ids(), num_steps=[(1, 1), (1, 1), (1, 1)])
 
 
 def test_per_block_depths_actually_differ(tiny_model: RecurrentGPT) -> None:
     x = ids()
     torch.manual_seed(3)
-    a = tiny_model(x, return_logits=True, num_steps_pair=[(1, 1), (1, 1)])["logits"]
+    a = tiny_model(x, return_logits=True, num_steps=[(1, 1), (1, 1)])["logits"]
     torch.manual_seed(3)
-    b = tiny_model(x, return_logits=True, num_steps_pair=[(1, 1), (4, 1)])["logits"]
+    b = tiny_model(x, return_logits=True, num_steps=[(1, 1), (4, 1)])["logits"]
     assert not torch.allclose(a, b)
 
 
@@ -375,13 +375,13 @@ def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
         return orig(*args, **kwargs)
 
     monkeypatch.setattr(recurrence, "core_block_forward", spy)
-    tiny_model.iterate_forward(torch.randn(1, 4, 64), tiny_model.freqs_cis[:, :4], None, (n, k), 0)
+    tiny_model.run_core_block(torch.randn(1, 4, 64), tiny_model.freqs_cis[:, :4], None, (n, k), 0)
     assert grad_modes == [False] * n + [True] * k
 
 
 def test_no_grad_steps_cut_gradient_when_k_is_zero(tiny_model: RecurrentGPT) -> None:
     x = ids()
-    tiny_model(x, labels=x, num_steps_pair=(2, 0))["loss"].backward()
+    tiny_model(x, labels=x, num_steps=(2, 0))["loss"].backward()
     for block in tiny_model.transformer.core_blocks:
         for p in block.parameters():
             assert p.grad is None or p.grad.abs().sum() == 0
@@ -506,7 +506,7 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
     torch.manual_seed(11)
     out_b = ckpt(x, labels=x, return_logits=True)
     # step 0 sampled k >= 1 per block: the checkpoint wrapper ran once per backprop iteration
-    expected_calls = sum(int(ckpt.randomized_iteration_sampler(i)[1].item()) for i in range(2))
+    expected_calls = sum(int(ckpt.sample_block_depths(i)[1].item()) for i in range(2))
     assert expected_calls >= 2 and len(calls) == expected_calls
     assert torch.equal(out_a["logits"], out_b["logits"])
     out_a["loss"].backward()
@@ -524,11 +524,11 @@ def test_randomized_iteration_sampler_binds_step_mode_and_config(training: bool)
     m = seeded_tiny(mean_recurrence=[12, 6], mean_backprop_depth=[8, 3]).train(training)
     m.step = 7
     for block_idx, (mean, depth) in enumerate(zip([12, 6], [8, 3])):
-        n, k = m.randomized_iteration_sampler(block_idx)
+        n, k = m.sample_block_depths(block_idx)
         ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, training=training)
         assert (n.item(), k.item()) == (ref_n.item(), ref_k.item())
     m.step = 8
-    n8, _ = m.randomized_iteration_sampler(0)
+    n8, _ = m.sample_block_depths(0)
     assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, training=training)[0])
 
 
@@ -551,7 +551,7 @@ def test_loss_ignores_ignore_index_labels(tiny_model: RecurrentGPT) -> None:
     labels[0, :10] = -100
     labels[1, 20:] = -100
     torch.manual_seed(2)
-    out = tiny_model(x, labels=labels, return_logits=True, num_steps_pair=(1, 1))
+    out = tiny_model(x, labels=labels, return_logits=True, num_steps=(1, 1))
     logits = out["logits"]
     keep = labels != -100
     manual = torch.nn.functional.cross_entropy(logits[keep], labels[keep])
@@ -566,9 +566,9 @@ def test_out_of_range_labels_are_masked_too(tiny_model: RecurrentGPT) -> None:
     ref = x.clone()
     ref[0, :10] = -100
     torch.manual_seed(2)
-    a = tiny_model(x, labels=labels, num_steps_pair=(1, 1))["loss"]
+    a = tiny_model(x, labels=labels, num_steps=(1, 1))["loss"]
     torch.manual_seed(2)
-    b = tiny_model(x, labels=ref, num_steps_pair=(1, 1))["loss"]
+    b = tiny_model(x, labels=ref, num_steps=(1, 1))["loss"]
     assert torch.equal(a, b)
 
 
@@ -578,7 +578,7 @@ def test_custom_ignore_index() -> None:
     labels = x.clone()
     labels[:, :16] = -1
     torch.manual_seed(2)
-    out = m(x, labels=labels, return_logits=True, num_steps_pair=(1, 1))
+    out = m(x, labels=labels, return_logits=True, num_steps=(1, 1))
     manual = torch.nn.functional.cross_entropy(out["logits"][:, 16:].reshape(-1, VOCAB), x[:, 16:].reshape(-1))
     torch.testing.assert_close(out["loss"], manual)
 

@@ -18,8 +18,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Normalize in float32 (autocast off, so a half-precision `x` does not underflow in `x^2`), cast back to the
-        # input dtype, then scale by the weight. This op order is part of the pinned numerics.
+        # Statistics in float32 (autocast off: a half-precision `x^2` would underflow), cast back, then the weight.
+        # The op order is part of the reference numerics.
         with torch.autocast(enabled=False, device_type=x.device.type):
             return self._norm(x.float()).type_as(x) * self.weight
 

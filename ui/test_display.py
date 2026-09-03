@@ -36,7 +36,7 @@ class MinimalDisplay(LiveDisplay):
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         with self._lock:
-            yield Group(line("header", style="bold"), self._render_log(self._log_lines), self._footer("hint"))
+            yield Group(line("header", style="bold"), self._render_log(self._panel_height), self._footer("hint"))
 
 
 def _live_of(display: LiveDisplay) -> ResizeAwareLive | None:
@@ -98,7 +98,7 @@ def test_suspended_stops_the_display_and_hands_the_streams_back(display: Minimal
 
 def test_is_attached_covers_the_logger_and_its_children(display: MinimalDisplay) -> None:
     assert not display.is_attached("training")
-    display._attached.append("training")
+    display._attached_logger_names.append("training")
     assert display.is_attached("training") and display.is_attached("training.ui") and not display.is_attached("trainingx")
 
 

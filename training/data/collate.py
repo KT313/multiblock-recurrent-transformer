@@ -1,11 +1,9 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
-"""Batch collation in two halves: `collate_samples` tokenizes rows into unpadded samples (the expensive part, run in
-the dataloader workers) and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (the cheap
-part, run in the main process once the world batch is assembled).
+"""Batch collation in two halves: `collate_samples` tokenizes rows into unpadded samples (in the dataloader workers)
+and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (in the main process).
 
-`collate_fn` is the composition of the two and is what a padded loader (validation) uses. Splitting them is what lets
-`training.data.loader.world_batch_micro_batches` group a world batch into micro-batches BEFORE anything is padded,
-instead of re-cutting already padded batches: every micro-batch is padded exactly once, to its own longest sample.
+`collate_fn` composes the two for a padded loader (validation). The split lets `world_batch_micro_batches` group a
+world batch into micro-batches BEFORE padding, so every micro-batch is padded once, to its own longest sample.
 """
 
 from typing import Any, NamedTuple
@@ -23,22 +21,20 @@ Batch = tuple[torch.Tensor, torch.Tensor, list[str]]  # a padded, shifted micro-
 
 class WorkerBatch(NamedTuple):
     """What an unpadded (training) loader yields per worker batch: the samples that survived tokenization plus how
-    many rows were READ to produce them — dropped rows included. A training loader reads exactly one source, so one
-    count is enough.
+    many rows were READ to produce them, dropped rows included.
 
-    The count is computed in the dataloader worker and travels to the main process with the batch itself (worker
-    processes share no state with the trainer), so `training.step.BatchStream` can count consumed rows in the same
-    unit the resume path skips (`ParquetTextDataset.set_resume_offset`): rows read from disk. Counting surviving
-    samples instead would make every dropped row rewind a resume by one row.
+    The count travels with the batch from the worker, so `BatchStream` counts consumed rows in the unit a resume
+    skips (`ParquetTextDataset.set_resume_offset`). Counting surviving samples would rewind a resume by one row per
+    dropped row.
     """
 
     samples: list[Sample]
     rows_read: int
 
 
-def find_multiple(n: int, k: int) -> int:
-    """Smallest multiple of ``k`` that is >= ``n``."""
-    return n if n % k == 0 else n + k - (n % k)
+def find_multiple(value: int, multiple: int) -> int:
+    """Smallest multiple of ``multiple`` that is >= ``value``."""
+    return value if value % multiple == 0 else value + multiple - (value % multiple)
 
 
 def shift_inputs_and_labels(
@@ -80,16 +76,15 @@ def collate_samples(
 ) -> list[Sample]:
     """Format and tokenize dataset rows into unpadded ``(input_ids, labels, data_id)`` samples.
 
-    Rows are truncated to ``block_size + 1`` tokens (the shift turns that into ``block_size`` positions); rows that
-    keep no supervised label (`has_supervised_label`) are DROPPED, never raised on: a `StopIteration` out of the
-    collate function is what torch's worker loop reads as "this worker is done" and the single-process loop as "the
-    epoch is over" — dropping makes an unusable row cost one row, not a loader.
+    Rows are truncated to ``block_size + 1`` tokens (the shift turns that into ``block_size`` positions); rows without
+    a supervised label are DROPPED, never raised on: a `StopIteration` out of a collate function ends the worker or
+    the epoch, so an unusable row must cost one row, not a loader.
     """
-    cap = block_size + 1
+    max_tokens = block_size + 1
     samples: list[Sample] = []
     for row in batch:
         input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
-        input_ids, labels = input_ids[:cap], labels[:cap]
+        input_ids, labels = input_ids[:max_tokens], labels[:max_tokens]
         if has_supervised_label(labels, tokenizer):
             samples.append((input_ids, labels, row["data_id"]))
     return samples
@@ -102,12 +97,8 @@ def collate_worker_batch(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> WorkerBatch:
-    """`collate_samples` plus the count of the rows that went in: the collate function of the unpadded (training)
-    loaders.
-
-    Every row of ``batch`` was read from its dataset whether or not it kept a supervised label, so ``rows_read`` —
-    unlike ``len(samples)`` — advances by rows read from disk, the unit a resume skips.
-    """
+    """`collate_samples` plus the count of rows that went in: the collate function of the training loaders.
+    ``rows_read`` advances by rows read from disk, dropped rows included, the unit a resume skips."""
     return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), len(batch))
 
 
@@ -126,16 +117,16 @@ def pad_and_shift(
     """
     if not samples:
         raise ValueError("pad_and_shift needs at least one sample; empty micro-batches are never assembled")
-    cap = block_size + 1
-    max_len = max(max(inp.shape[0], lab.shape[0]) for inp, lab, _ in samples)
-    local = min(find_multiple(max_len, padding_multiple) if padding_multiple else max_len, cap)
+    max_tokens = block_size + 1
+    longest = max(max(sample_inputs.shape[0], sample_labels.shape[0]) for sample_inputs, sample_labels, _ in samples)
+    width = min(find_multiple(longest, padding_multiple) if padding_multiple else longest, max_tokens)
 
     pad_id = tokenizer.pad_id
-    inputs = torch.full((len(samples), local), pad_id, dtype=torch.long)
-    labels = torch.full((len(samples), local), pad_id, dtype=torch.long)
-    for i, (inp, lab, _) in enumerate(samples):
-        inputs[i, : min(len(inp), local)] = inp[:local]
-        labels[i, : min(len(lab), local)] = lab[:local]
+    inputs = torch.full((len(samples), width), pad_id, dtype=torch.long)
+    labels = torch.full((len(samples), width), pad_id, dtype=torch.long)
+    for row, (sample_inputs, sample_labels, _) in enumerate(samples):
+        inputs[row, : min(len(sample_inputs), width)] = sample_inputs[:width]
+        labels[row, : min(len(sample_labels), width)] = sample_labels[:width]
 
     input_ids, label_ids = shift_inputs_and_labels(inputs, labels, tokenizer)
     label_ids[label_ids == pad_id] = ignore_index
@@ -152,12 +143,8 @@ def collate_fn(
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> Batch:
-    """`collate_samples` followed by `pad_and_shift`: dataset rows straight to a padded micro-batch.
-
-    The collate function of a padded loader (the validation loaders). A batch in which every row was dropped is a
-    hard error — `block_size` too small for a whole validation batch is a configuration mistake, not something to
-    swallow silently.
-    """
+    """`collate_samples` followed by `pad_and_shift`: the collate function of the validation loaders. A batch in which
+    every row was dropped is an error (`block_size` too small for a validation batch is a configuration mistake)."""
     samples = collate_samples(batch, tokenizer, block_size, add_bos, add_eos)
     if not samples:
         raise ValueError(

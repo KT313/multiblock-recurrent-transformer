@@ -294,7 +294,7 @@ def _train_one_step(model: RecurrentGPT) -> tuple[ELLISAdam, torch.Tensor]:
     torch.manual_seed(1)
     x = torch.randint(0, 512, (2, 16))
     opt = ELLISAdam(get_param_groups(model, 4e-5), lr=1e-3, betas=(0.9, 0.95))
-    loss = model(x, labels=x, num_steps_pair=(0, 2))["loss"]
+    loss = model(x, labels=x, num_steps=(0, 2))["loss"]
     assert loss is not None
     loss.backward()
     opt.step()
@@ -329,9 +329,9 @@ def test_save_load_forward_bit_identical(
     fresh.eval()
     with torch.no_grad():  # the recurrent state is drawn from the global RNG: seed before each forward
         torch.manual_seed(7)
-        a = tiny_model(x, return_logits=True, num_steps_pair=(0, 2))["logits"]
+        a = tiny_model(x, return_logits=True, num_steps=(0, 2))["logits"]
         torch.manual_seed(7)
-        b = fresh(x, return_logits=True, num_steps_pair=(0, 2))["logits"]
+        b = fresh(x, return_logits=True, num_steps=(0, 2))["logits"]
     assert a is not None and b is not None and torch.equal(a, b)
     for (n1, p1), (n2, p2) in zip(tiny_model.state_dict().items(), fresh.state_dict().items()):
         assert n1 == n2 and torch.equal(p1, p2)
@@ -346,7 +346,7 @@ def test_save_load_forward_bit_identical(
     fresh.train()
     for model, optimizer in ((tiny_model, opt), (fresh, fresh_opt)):
         torch.manual_seed(3)
-        loss = model(x, labels=x, num_steps_pair=(0, 2))["loss"]
+        loss = model(x, labels=x, num_steps=(0, 2))["loss"]
         assert loss is not None
         loss.backward()
         optimizer.step()

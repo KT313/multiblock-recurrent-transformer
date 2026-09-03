@@ -314,7 +314,7 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
     report: TrainingReport = full_run["report"]
     history: History = full_run["history"]
     assert report.run_directory == full_run["out_dir"]
-    assert (report.steps_completed, report.final_step, report.resumed_from, report.stopped) == (20, 20, None, False)
+    assert (report.steps_this_process, report.completed_steps, report.resumed_from, report.stopped) == (20, 20, None, False)
     assert report.setup_seconds == 0.0  # no `started_at` given
     assert report.train_seconds > 0.0
     assert report.last_loss == history[20]["loss"]
@@ -439,7 +439,7 @@ def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
     allowed = write_tiny_yaml(
         tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, grad_clip=0.5, allow_settings_change=True
     )
-    assert _run(allowed).final_step == 20
+    assert _run(allowed).completed_steps == 20
 
 
 def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path) -> None:
@@ -476,7 +476,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     assert sorted(history) == list(range(15, 21))  # steps 14..19 ran, nothing before
     assert (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").exists()
     assert report.resumed_from == latest  # the report names the checkpoint the run continued from
-    assert (report.steps_completed, report.final_step, report.stopped) == (6, 20, False)
+    assert (report.steps_this_process, report.completed_steps, report.stopped) == (6, 20, False)
     assert [p.name for p in report.checkpoints_written] == ["step-00000020-tiny.pth"]
     assert f"resumed from {latest}" in report.summary()
     full: History = full_run["history"]
@@ -666,7 +666,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
     assert should_stop.count == 5  # polled once per completed step, nothing before the loop
     assert report.stopped is True
-    assert (report.steps_completed, report.final_step, report.resumed_from) == (5, 5, None)
+    assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (5, 5, None)
     assert sorted(report.history) == [1, 2, 3, 4, 5]
     assert [p.name for p in report.checkpoints_written] == ["step-00000005-tiny.pth"]
     assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == ["step-00000005-tiny.pth"]
@@ -679,7 +679,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     resumed_yaml = write_tiny_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, precision="32", export_to_hf=True, resume=True)
     resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
     assert resumed.resumed_from == checkpoint_dir(out_dir) / "step-00000005-tiny.pth"
-    assert (resumed.steps_completed, resumed.final_step, resumed.stopped) == (15, 20, False)
+    assert (resumed.steps_this_process, resumed.completed_steps, resumed.stopped) == (15, 20, False)
     assert sorted(resumed.history) == list(range(6, 21))
     assert [p.name for p in resumed.checkpoints_written] == [
         "step-00000006-tiny-stage-0_end.pth",
@@ -698,7 +698,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     out_dir = tmp_path / "out"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32")
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(6))
-    assert report.stopped and report.final_step == 6
+    assert report.stopped and report.completed_steps == 6
     assert [p.name for p in report.checkpoints_written] == ["step-00000006-tiny-stage-0_end.pth"]
     assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == ["step-00000006-tiny-stage-0_end.pth"]
 

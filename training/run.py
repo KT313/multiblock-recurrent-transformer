@@ -1,9 +1,9 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """`train()`: one training run as a readable entry function, plus the setup helpers it is made of.
 
-    create_backend                    device, precision, torch flags — then `seed_everything`
+    create_backend                    device, precision, torch flags; then `seed_everything`
     prepare_run_directory             out_dir/checkpoints, run_config.json
-    run_lock                          one training run per out_dir, held until the run is over (`data_preparation/lib/build/lock.py`)
+    run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
@@ -14,23 +14,15 @@
     loop                              run_one_optimizer_step -> advance -> evaluate -> log -> checkpoint (or stop)
     export_if_requested               the HuggingFace folder, once training finished
 
-Steps are OPTIMIZER steps (one world batch each). Nothing in `train()` touches a tensor, a device, `torch.*`, a clock
-or `print`: the numerics live in `step.py` and `evaluation.py`, device code in `backend/`, every console line, timer
-and the terminal dashboard (`training/ui/`, entered by `RunLogger.open`, torn down by its `__exit__` on every way out
-of the `with` block; `train()` only sets its status) in `logger.py`. The order of the setup is itself numerics: seed,
-then the dataset and the loaders (no torch RNG draw), then the model — its parameter init is the first consumer of
-the global torch RNG — then the optimizer and the resume, which restores the stored RNG state.
-`golden_tiny_run.json` (`test_run.py`) pins the 20-step tiny run.
+Steps are OPTIMIZER steps (one world batch each). `train()` touches no tensor, device, clock or `print`: numerics
+live in `step.py` and `evaluation.py`, device code in `backend/`, console lines and the dashboard in `logger.py`.
+The setup order is itself numerics: seed, dataset and loaders (no torch RNG draw), model (its init is the first RNG
+consumer), optimizer, resume (restores the stored RNG state). The golden run in `test_run.py` fails on any change.
 
-A resume repeats no rows: the checkpoint carries `BatchStream.state_dict()` (rows READ per source — dropped rows
-included — plus the draw RNG) and every train dataset starts that many rows into its range; the restored RNG
-continues the per-sample source draws exactly. It is not bit-exact: samples buffered in the stream when the
-checkpoint was written are skipped, and the fresh loader iterators draw new base seeds from the global torch RNG,
-so the losses of a resumed run diverge from the uninterrupted one while the data stream itself continues
-(`test_stage_boundary_resume_continues_schedule_and_stream`).
+A resume repeats no rows (the checkpoint carries `BatchStream.state_dict()`) but is not bit-exact: buffered samples
+are skipped and fresh loader iterators draw new base seeds, so losses diverge while the data stream continues.
 
-The CLI around this is `training/train.py`; `TrainingReport`, what `train()` returns, is defined next to `RunLogger`
-in `logger.py` (its `close()` builds it).
+The CLI around this is `training/train.py`; `TrainingReport` is defined next to `RunLogger` in `logger.py`.
 """
 
 from __future__ import annotations
@@ -72,11 +64,8 @@ from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
 
 @dataclass(frozen=True)
 class RunState:
-    """The run once it is set up: what the setup helpers produced, handed to `restore_checkpoint_if_resuming`,
-    `save_run_checkpoint` and `export_if_requested` as one argument. Built once in `train()` (after the optimizer,
-    the last of the setup order — the order itself is numerics, see the module docstring); every member keeps its
-    identity for the whole run, `progress` is the one whose content moves (a resume sets its step, the loop
-    advances it)."""
+    """The run once it is set up, handed to `restore_checkpoint_if_resuming`, `save_run_checkpoint` and
+    `export_if_requested` as one argument. Every member keeps its identity for the whole run; only `progress` moves."""
 
     settings: Settings
     run_directory: Path
@@ -107,27 +96,20 @@ def train(
 ) -> TrainingReport:
     """Run the training run described by `settings` and return its report.
 
-    `backend` is created from the settings unless given (tests inject the CPU backend; it is seeded here either way).
-    `should_stop` is the run's stop request (the CLI's Ctrl-C): polled between the shards of the in-process dataset
-    build (`BuildAborted` when it says stop) and after every optimizer step — the loop then says so in the dashboard
-    status, saves a checkpoint of the completed step, skips the export and returns with `report.stopped`;
-    `resume: true` continues from there.
-    `started_at` is the caller's clock reading at the start of the run (`report.setup_seconds`); the run's own
-    clock lives in `RunLogger`.
-    `keep_history` is a test knob: with it `report.history` holds every log step's metric dict (the golden run and
-    the end-to-end tests read it); the CLI leaves it off, so a long run does not accumulate its metrics in memory.
-    The run directory is locked for the whole run (`data_preparation/lib/build/lock.py`, the build lock's twin): a
-    second run pointed at the same `out_dir` fails with `RunLocked` (naming the running one's start time and pid)
-    instead of sharing checkpoints, `train.log` and `run_config.json` with this one.
+    `backend`: created from the settings unless given (tests inject the CPU backend); seeded here either way.
+    `should_stop`: the run's stop request (the CLI's Ctrl-C), polled between build shards and after every optimizer
+    step; the loop then saves a checkpoint, skips the export and returns with `report.stopped`.
+    `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
+    `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
+    The run directory is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
 
-    Numerics: the setup order (module docstring) and the loop body — the step, the evaluation after it at
-    evaluation steps, the checkpoint after evaluation and logging so the stored RNG state includes the evaluation
-    draws — are the thesis loop's, bit-identical (`test_golden_tiny_run`).
+    Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint, so the
+    stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
     """
     backend = backend or create_backend(settings)
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
-    with run_lock(run_directory / TRAIN_LOCK_NAME, "training"):  # one run per out_dir; released on every way out, exception included
+    with run_lock(run_directory / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
         loaders = build_run_dataloaders(settings, dataset, backend)
@@ -178,16 +160,15 @@ def train(
                 export_dir = None if stopped else export_if_requested(state, logger)
                 return logger.close(progress, export_dir, stopped=stopped)
         finally:
-            loaders.close()  # the loader workers stop now, on every way out, not when the GC finds the iterators
+            loaders.close()  # the loader workers stop now, not when the GC finds the iterators
 
 
 # --- setup -----------------------------------------------------------------------------------------------------------
 
 
 def create_backend(settings: Settings) -> Backend:
-    """The run's backend: `settings.backend` (`single_device`) at `settings.precision`. Its constructor picks the
-    device (`cuda:0`, CPU fallback) and sets the torch flags (TF32, cuDNN benchmark); `train()` seeds it right after,
-    before anything else runs."""
+    """The run's backend (`settings.backend` at `settings.precision`); its constructor picks the device and sets the
+    torch flags. `train()` seeds it right after."""
     return get_backend(settings.backend, precision=settings.precision)
 
 
@@ -199,10 +180,10 @@ def prepare_run_directory(settings: Settings) -> Path:
 
 
 def record_run_config(settings: Settings, run_directory: Path) -> None:
-    """Write `run_config.json` (the settings as parsed, jsonargparse overrides applied) — only for a FRESH run:
-    a resume keeps the file the run was started with, the historical record of what this run is."""
-    with open(run_directory / "run_config.json", "w") as f:
-        json.dump(asdict(settings), f, indent=4)
+    """Write `run_config.json` (the settings as parsed) for a FRESH run only; a resume keeps the file the run was
+    started with."""
+    with open(run_directory / "run_config.json", "w") as file:
+        json.dump(asdict(settings), file, indent=4)
 
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
@@ -232,8 +213,8 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
     """The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
     then `backend.setup_model` (device, optional compile).
 
-    Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`, so this must
-    run after the dataset is resolved and the loaders are built (nothing that draws may move before it).
+    Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`; nothing that
+    draws may run before it.
     """
     model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
     check_block_sizes_agree(settings, model_config)
@@ -241,7 +222,7 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )
     model_config.to_json(run_directory / "model_config.json")
-    return backend.setup_model(model, compile=settings.compile_model)
+    return backend.setup_model(model, compile_model=settings.compile_model)
 
 
 def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> Optimizer:
@@ -254,16 +235,12 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
 
 
 def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
-    """Restore the run from its checkpoint when it resumes, and say where from; None for a fresh run at step 0
-    (`state.progress` untouched).
+    """Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
 
-    With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` under the run
-    directory; a run without one starts fresh. Loading restores the model and optimizer state, verifies the dataset
-    against the checkpoint (`check_dataset_unchanged`: config hash and validation split), restores the RNG state
-    (numerics: the stored state includes the evaluation draws of the checkpoint's step) and sets
-    `progress.step = progress.resume_step = checkpoint step` — the resume warmup derives from it. The returned
-    data-stream state goes into `BatchStream.load_state_dict` once the stream exists (it also carries the draw RNG,
-    which the stream would otherwise re-seed with `seed + resume step`).
+    With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` in the run
+    directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and settings
+    against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step = checkpoint step`.
+    The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
     """
     settings = state.settings
     if not settings.resume:
@@ -292,15 +269,11 @@ def stop_requested(should_stop: StopCheck | None) -> bool:
 
 
 def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> None:
-    """Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger (the status reads
-    `saving checkpoint` meanwhile, the path becomes a dashboard event).
+    """Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
-    `step-{done:08d}-{run_name}.pth` under `checkpoints/`, with `-stage-{i}_end` when the step was the last plain
-    step of stage i (`StageManager.stage_ending_at`); `stage` is the stage the run is heading for at `done`
-    (`StageManager.entering_stage_at`: the one it enters when written as a transition starts). Numerics: called
-    after evaluation and logging of the step, so the stored RNG state includes the evaluation draws;
-    `batches.state_dict()` adds the rows the run has consumed per source, so a resume trains on rows it has not seen
-    (`BatchStream.load_state_dict` says what that does and does not promise).
+    Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
+    the stage the run is heading for (`StageManager.entering_stage_at`). Numerics: called after evaluation and
+    logging, so the stored RNG state includes the evaluation draws.
     """
     settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
     stage_end = stage_manager.stage_ending_at(progress.step - 1)
@@ -324,15 +297,14 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
 
 
 def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
-    """With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`) from
-    the unwrapped model and the dataset's tokenizer, tell the logger (status `exporting`, then the export event) and
-    return the folder; None otherwise."""
+    """With `export_to_hf`: write the HuggingFace folder (`export_hf_path`, default `run_directory / hf_export`), tell
+    the logger and return the folder; None otherwise."""
     settings = state.settings
     if not settings.export_to_hf:
         return None
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else state.run_directory / "hf_export"
     logger.status("exporting")
-    trained = plain_model(state.model)
-    export_to_hf(trained, trained.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
+    trained_model = plain_model(state.model)
+    export_to_hf(trained_model, trained_model.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir

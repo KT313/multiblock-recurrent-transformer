@@ -45,7 +45,7 @@ def test_normalize_num_steps_broadcasts_and_validates() -> None:
     assert normalize_num_steps(3, 2) == [(3, 0), (3, 0)]
     assert normalize_num_steps(torch.tensor([1, 2]), 2) == [(1, 2), (1, 2)]
     assert normalize_num_steps([(1, 2), torch.tensor([4, 1]), 5], 3) == [(1, 2), (4, 1), (5, 0)]
-    with pytest.raises(ValueError, match="num_steps_pair has 3 entries but there are 2 blocks"):
+    with pytest.raises(ValueError, match="num_steps has 3 entries but there are 2 blocks"):
         normalize_num_steps([(1, 1), (1, 1), (1, 1)], 2)
 
 
