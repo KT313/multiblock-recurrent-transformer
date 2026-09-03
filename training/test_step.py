@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for one optimizer step (`training.step`): the progress counter, the micro-batch stream, the LR, the
-accumulation arithmetic, the skipped first update, the non-finite checks — and the dataset-independent numerics
+accumulation arithmetic, the skipped first update, the non-finite checks, and the dataset-independent numerics
 reference `training/golden_tiny_steps.json` (five steps of fixed batches through `run_one_optimizer_step`)."""
 
 import copy
@@ -91,7 +91,7 @@ def reference_stage_manager(settings: Settings, steps: int = 10) -> StageManager
 
 
 def scripted_batches(settings: Settings, seed: int = 0, sequence_length: int = REFERENCE_SEQUENCE_LENGTH) -> Iterator[Batch]:
-    """Endless micro-batches of random token ids (vocab 512) from a seeded generator — independent of the global torch
+    """Endless micro-batches of random token ids (vocab 512) from a seeded generator, independent of the global torch
     RNG, the tokenizer and the data pipeline. Labels are ids too (as `collate_fn` yields them, already shifted)."""
     generator = torch.Generator().manual_seed(seed)
     while True:
@@ -314,7 +314,7 @@ class _Repeat:
 
 
 class _ShortBatches:
-    """A loader whose worker batches cycle through `sizes` rows — a short (or empty) batch is what a loader running
+    """A loader whose worker batches cycle through `sizes` rows; a short (or empty) batch is what a loader running
     out of rows, or a batch whose rows were all dropped for lack of a supervised label, hands the stream."""
 
     def __init__(self, tag: str, sizes: list[int]) -> None:
@@ -336,7 +336,7 @@ def stream_tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
 
 def _abc_stage_manager(settings: Settings) -> StageManager:
     """The tiny stage boundaries ((0,8,6,8), (8,16,14,16), (16,20)) with one fake source per stage: `a` in stage 0,
-    `b` in stage 1, `c` in stage 2 — hand-made so no dataset is resolved for the stream tests."""
+    `b` in stage 1, `c` in stage 2, hand-made so no dataset is resolved for the stream tests."""
     stages = [
         resolved_stage("s0", tokens=8192, base_lr=3e-4, transition_pct=0.25, train_weights={"a": 1.0}),
         resolved_stage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
@@ -444,8 +444,8 @@ def test_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path, str
 def test_batch_stream_fills_the_world_batch_from_short_worker_batches(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
-    """Regression (T-M3/T-M4): a short or empty worker batch — a loader reaching its last rows, or a batch whose rows
-    were all dropped — used to shrink the world batch and permanently misalign it with the optimizer steps. The
+    """Regression (T-M3/T-M4): a short or empty worker batch (a loader reaching its last rows, or a batch whose rows
+    were all dropped) used to shrink the world batch and permanently misalign it with the optimizer steps. The
     stream draws exactly `world_batch_size` samples per world batch, pulling a source's loader until its buffer
     holds one and carrying leftover samples over in the buffer."""
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
@@ -529,7 +529,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
         return BatchStream(settings, loaders, stage_manager, TrainingProgress())
 
     def rows(stream: BatchStream, world_batches: int) -> list[tuple[int, ...]]:
-        """The first 20 tokens of every sample of `world_batches` world batches — a row identity that survives the
+        """The first 20 tokens of every sample of `world_batches` world batches: a row identity that survives the
         different padding widths of two runs. Only plain stage-0 steps, so no transition draw is involved."""
         seen: list[tuple[int, ...]] = []
         for _ in range(world_batches):
@@ -578,7 +578,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """Determinism of the whole stream: two fresh streams over the same dataset and settings yield identical
-    micro-batches — same source draws, same rows, same padding (the draw RNG is private and seeded from
+    micro-batches: same source draws, same rows, same padding (the draw RNG is private and seeded from
     `settings.seed`, and each source's reader walks its range in order)."""
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
@@ -679,7 +679,7 @@ def _sample_ids(samples: list[Sample]) -> list[tuple[int, ...]]:
 def test_batch_stream_counts_rows_read_not_surviving_samples(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
-    """The stored counter advances by rows READ from disk — dropped rows included — so `state_dict` stores exactly
+    """The stored counter advances by rows READ from disk, dropped rows included, so `state_dict` stores exactly
     what `set_resume_offset` will skip. Counting survivors instead undercounted by one row per drop (H7)."""
     settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
     _write_drop_parquet(tmp_path / "drop_data")
@@ -689,7 +689,7 @@ def test_batch_stream_counts_rows_read_not_surviving_samples(
 
     # independent oracle: a draw with an empty buffer pulls worker batches of `micro_batch_size` rows until a
     # sample is there, so after consuming j × world_batch_size samples the rows read are the smallest multiple of
-    # the worker batch size whose survivors cover them — the fixture's drop pattern alone decides it
+    # the worker batch size whose survivors cover them; the fixture's drop pattern alone decides it
     expected_rows = 0
     for j in range(1, world_batches + 1):
         while _drop_survivors(expected_rows) < j * settings.world_batch_size:
@@ -703,7 +703,7 @@ def test_mid_stage_resume_with_dropped_rows_repeats_and_skips_nothing(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """A resume from a mid-stage checkpoint continues at exactly the next unread row also when the workers dropped
-    rows: interrupted + resumed pulls are the very sample sequence of an uninterrupted run over the same data —
+    rows: interrupted + resumed pulls are the very sample sequence of an uninterrupted run over the same data:
     nothing re-read (a repeat), nothing jumped over (a skip). Worker batches of one row (`micro_batch_size` 1)
     keep the stream's buffer empty at the checkpoint, so the counter marks exactly the next unconsumed row."""
     settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=1)
@@ -737,7 +737,7 @@ def test_mid_stage_resume_with_buffered_samples_repeats_nothing(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """With worker batches of several rows, samples can sit in the stream's buffer at the checkpoint; they were
-    already counted as read, so a resume may skip them — but it never repeats a row the first stream pulled."""
+    already counted as read, so a resume may skip them, but it never repeats a row the first stream pulled."""
     settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
     data_dir = tmp_path / "drop_data"
     _write_drop_parquet(data_dir)
@@ -796,7 +796,7 @@ def record_step_reference() -> Path:
         uv run python -c "from training.test_step import record_step_reference; record_step_reference()"
 
     Recorded with torch 2.13.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic algorithms), in
-    the commit that extracted `run_one_optimizer_step` — the tiny golden run passing unchanged in that same commit is
+    the commit that extracted `run_one_optimizer_step`; the tiny golden run passing unchanged in that same commit is
     what ties this reference to the thesis loop.
     """
     GOLDEN_STEPS_PATH.write_text(golden_run_json(step_reference_metrics()))

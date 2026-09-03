@@ -57,7 +57,7 @@ def _report(out_dir: Path, **overrides: Any) -> TrainingReport:
 @pytest.fixture(autouse=True)
 def detached_training_handlers() -> Iterator[logging.Logger]:
     """The `training` logger (yielded) and the `data_preparation` logger without the handlers
-    `configure_console_logging` adds to either of them — removed again afterwards, so a handler bound to a captured
+    `configure_console_logging` adds to either of them, removed again afterwards, so a handler bound to a captured
     stderr never outlives its test (later tests of other modules would log into a closed stream). Autouse: every
     `main()` call configures both hierarchies."""
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
@@ -372,7 +372,7 @@ def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(t
 def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_screen(tiny_dataset_dir: Path, tmp_path: Path) -> None:
     """Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
     finishes its step, saves a checkpoint, exits 130; the screen shows the signal's kept warning, the "stopped on
-    request" line, the static summary and the report once — no frame remnants."""
+    request" line, the static summary and the report once, no frame remnants."""
     out_dir = tmp_path / "out"
     arguments = _tiny_cli_arguments(tiny_dataset_dir, out_dir, "--world_batch_size", "1", "--micro_batch_size", "1")
     code, text = _run_cli_in_pty(arguments, width=140, height=45, interrupt_after=0.5)

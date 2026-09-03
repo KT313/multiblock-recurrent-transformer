@@ -202,7 +202,7 @@ def test_get_stage_info_past_the_end_reports_last_stage_complete() -> None:
 
 
 def test_stage_ending_at_exact_steps() -> None:
-    """The stage index only at the last step before each transition (5 -> 0, 13 -> 1), None everywhere else —
+    """The stage index only at the last step before each transition (5 -> 0, 13 -> 1), None everywhere else,
     including the last stage, which has no transition after it."""
     sm = StageManager(tiny_stages(), world_batch_size=4, block_size=256)
     expected = {5: 0, 13: 1}

@@ -149,7 +149,7 @@ def check_settings_unchanged(
         raise ValueError(
             f"resuming with changed {PARAM_GROUPING_SETTING} ({details[PARAM_GROUPING_SETTING]}): the optimizer's "
             "parameter groups are restored from the checkpoint, so the new value would be silently ignored; "
-            "allow_settings_change cannot override this — keep the checkpoint's value or start a fresh run"
+            "allow_settings_change cannot override this; keep the checkpoint's value or start a fresh run"
         )
     details |= {
         key: "not stored in the checkpoint (written by an older version of the training code)"

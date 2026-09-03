@@ -72,7 +72,7 @@ class RecordingFile(io.FileIO):
 
 class FakeHub:
     """Stand-in for the Hub: `files` maps repo paths to local files; counts downloads and listings. `sha` is the
-    commit hash `REV` currently resolves to — a test moves the repo by assigning a new value."""
+    commit hash `REV` currently resolves to; a test moves the repo by assigning a new value."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -291,7 +291,7 @@ def with_tokenizer(layout: DatasetLayout) -> Callable[[DatasetConfig], DatasetCo
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Callable[[DatasetConfig], Path]:
-    """`config_file(cfg)` writes the config as YAML — what `prepare` / `status` take — and returns the path
+    """`config_file(cfg)` writes the config as YAML (what `prepare` / `status` take) and returns the path
     (`<tmp_path>/<cfg.name>.yaml`; a second call with the same name overwrites it)."""
 
     def write(cfg: DatasetConfig) -> Path:

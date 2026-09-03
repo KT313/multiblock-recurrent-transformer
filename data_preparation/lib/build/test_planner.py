@@ -95,8 +95,8 @@ def test_rows_needed_sums_the_stages_and_scales_with_block_size() -> None:
 
 
 def test_rows_needed_is_the_schema_formula() -> None:
-    """The planner delegates to `DatasetConfig.rows_needed` — the number the shuffled-build cap checks at config
-    load — so the two views of the requirement cannot drift."""
+    """The planner delegates to `DatasetConfig.rows_needed`, the number the shuffled-build cap checks at config
+    load, so the two views of the requirement cannot drift."""
     cfg = two_stage_cfg()
     assert [cfg.rows_needed(name) for name in cfg.sources] == [cfg.rows_needed(name) for name in cfg.sources]
 
@@ -240,7 +240,7 @@ def test_an_exhausted_source_whose_rows_all_go_to_the_holdout_is_failed() -> Non
     all_validation = _ledger(processed_rows=2, training_rows=0, exhausted=True)
     assert all_validation.satisfaction() == (
         False,
-        "exhausted, and 2 processed rows − 2 validation holdout leaves 0 training rows — "
+        "exhausted, and 2 processed rows − 2 validation holdout leaves 0 training rows; "
         "lower the source's validation_fraction or give it more rows",
     )
     assert all_validation.epochs() is None
@@ -323,7 +323,7 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
 
 def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: DatasetLayout, config_file: ConfigFile) -> None:
-    """`Manifest.load` raises next to shards — right for raw, wrong for a processed folder the repair step deletes
+    """`Manifest.load` raises next to shards: right for raw, wrong for a processed folder the repair step deletes
     (after confirmation): `status` (and `prepare --dry_run`, and training's auto-prepare) must report it."""
     cfg = two_stage_cfg()
     path = config_file(cfg)
@@ -367,7 +367,7 @@ def test_exhausted_and_built_source_is_satisfied(layout: DatasetLayout, cfg_fact
 
 def test_prepare_fails_an_exhausted_source_the_validation_holdout_would_empty(layout: DatasetLayout, cfg_factory: CfgFactory, config_file: ConfigFile, write_local: Writer) -> None:
     """End to end: a trained-and-validated source that runs dry with its every processed row going to the
-    training-time holdout is reported FAILED by `prepare` — training would otherwise crash at startup. A val-only
+    training-time holdout is reported FAILED by `prepare`; training would otherwise crash at startup. A val-only
     source holds nothing out, so any row still serves it (`test_exhausted_and_built_source_is_satisfied`)."""
     src_dir = layout.root.parent / "one_row"
     write_local(src_dir, [{"text": "tok_1 tok_2 tok_3"}], "parquet")
@@ -377,7 +377,7 @@ def test_prepare_fails_an_exhausted_source_the_validation_holdout_would_empty(la
     w = _state(report, "w")
     assert not report.complete and not w.satisfaction()[0] and w.exhausted and w.processed_rows == 1
     assert w.satisfaction()[1] == (
-        "exhausted, and 1 processed rows − 1 validation holdout leaves 0 training rows — "
+        "exhausted, and 1 processed rows − 1 validation holdout leaves 0 training rows; "
         "lower the source's validation_fraction or give it more rows"
     )
 

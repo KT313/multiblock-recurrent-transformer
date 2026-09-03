@@ -209,7 +209,7 @@ def test_rng_state_of_a_cpu_backend_never_touches_cuda(monkeypatch: pytest.Monke
 
 @pytest.mark.gpu
 def test_rng_state_of_a_cuda_backend_holds_its_own_device_only() -> None:
-    """The **restore** is what is measured: capture, draw, let the generator move on, restore, draw again — with no
+    """The **restore** is what is measured: capture, draw, let the generator move on, restore, draw again. With no
     reseeding in between, only `set_rng_state` can make the second draw repeat the first (the old version reseeded
     before each draw and passed with the restore stubbed out)."""
     backend = SingleDeviceBackend(device="cuda:0", precision="32")

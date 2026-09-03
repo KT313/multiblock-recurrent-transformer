@@ -3,7 +3,7 @@
 
 Two offline tokenizers: the synthetic WordLevel one of the tiny config (whitespace words, what the rest of the suite
 uses) and a small BPE with a Metaspace pre-tokenizer trained here in milliseconds (llama-style "▁" tokens whose
-offsets overlap the first word — the boundary subtlety the module handles)."""
+offsets overlap the first word, the boundary subtlety the module handles)."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ CORPUS = [
     " " * 100,
 ]
 PROSE = "the quick brown fox jumps over the lazy dog, hello there general kenobi. "
-UNICODE = "日本語 😀 naïve café — über 😀😀 tok_1 tok_2 "
+UNICODE = "日本語 😀 naïve café … über 😀😀 tok_1 tok_2 "
 
 
 def _count(tokenizer: PreTrainedTokenizerFast, text: str) -> int:
@@ -60,7 +60,7 @@ def metaspace_bpe() -> PreTrainedTokenizerFast:
     tok = Tokenizer(models.BPE(unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="first")
     tok.decoder = decoders.Metaspace()
-    alphabet = [chr(i) for i in range(32, 127)] + list("äöüß日本語のテキストです😀ïé—")
+    alphabet = [chr(i) for i in range(32, 127)] + list("äöüß日本語のテキストです😀ïé…")
     trainer = trainers.BpeTrainer(  # type: ignore[no-untyped-call]  # tokenizers ships unannotated constructors
         vocab_size=300, special_tokens=["<unk>", "<s>", "</s>"], initial_alphabet=alphabet
     )
@@ -163,7 +163,7 @@ def test_random_texts_satisfy_the_invariants(tokenizer: PreTrainedTokenizerFast)
 class _ViterbiLikeStub:
     """One token per character, except that "xy" is one token when something follows it (an end-of-word dependent
     segmentation, as a Unigram model can produce): cutting "xyz" after token 0 ("xy") gives "xy", which alone is two
-    tokens — more than the cap of 1 — so the module must cut again."""
+    tokens, more than the cap of 1, so the module must cut again."""
 
     calls: list[list[str]]
 

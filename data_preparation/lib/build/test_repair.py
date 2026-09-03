@@ -155,7 +155,7 @@ def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFac
 def test_broken_raw_shard_mid_folder_truncates_after_the_one_confirmation(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Truncating to the good prefix before a mid-folder broken shard drops the healthy shards after it too — that
+    """Truncating to the good prefix before a mid-folder broken shard drops the healthy shards after it too. That
     loss of downloaded rows joins the one confirmation instead of happening silently."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards
     raw = layout.raw_dir("a")
@@ -314,7 +314,7 @@ def test_processed_shards_without_a_manifest_are_deleted(cfg_factory: CfgFactory
 
 def test_an_unlisted_processed_shard_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     """A shard on disk that the manifest does not list (a crash between publishing and saving) used to be invisible
-    here while the training resolver refused the folder — the repair step must be the one that heals it."""
+    here while the training resolver refused the folder; the repair step must be the one that heals it."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
     folder = layout.processed_dir("a")
     existing = sorted(folder.glob("data-*.parquet"))[0]
@@ -330,7 +330,7 @@ def test_crash_leftover_next_shard_is_left_for_the_resumed_build(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
 ) -> None:
     """The M1 regression: a build that crashes between publishing a shard and saving the manifest leaves one
-    unlisted file — exactly the next shard the resumed build writes. The repair step leaves it alone (deleting the
+    unlisted file: exactly the next shard the resumed build writes. The repair step leaves it alone (deleting the
     folder would redo the whole build for one file), the resumed build overwrites it and completes the folder."""
     cfg = _prepared(cfg_factory, with_tokenizer, layout, rows=12)  # 3 raw shards, fully built
     processed = layout.processed_dir("a")

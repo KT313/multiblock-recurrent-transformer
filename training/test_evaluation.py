@@ -85,7 +85,7 @@ def test_evaluate_averages_the_batches_actually_delivered(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
     """A validation loader shorter than `eval_iters` (the tiny config's finetune split is one micro-batch) is
-    averaged over the batches it delivered, not over the planned `eval_iters` — the bug this replaces divided by
+    averaged over the batches it delivered, not over the planned `eval_iters`; the bug this replaces divided by
     `eval_iters` and reported a loss scaled down by the missing rows."""
     settings.partial_depth_eval = [1]
     settings.eval_iters = 4
@@ -110,7 +110,7 @@ def test_evaluate_averages_the_batches_actually_delivered(
 def test_evaluate_on_an_empty_loader_raises(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
-    """No batch at all is an error naming the situation — never a NaN or a silent zero."""
+    """No batch at all is an error naming the situation, never a NaN or a silent zero."""
     settings.partial_depth_eval = [1]
     settings.eval_iters = 2
     with pytest.raises(RuntimeError, match="validation loader yielded no batch"):

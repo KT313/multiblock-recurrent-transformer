@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Tests for `training.run`: the setup helpers (fast) and end-to-end runs of `train()` on the tiny 3-stage config with
-synthetic data (marked slow) — checkpoints, schedule, evaluation, export, determinism, resume, the stop request and
+synthetic data (marked slow): checkpoints, schedule, evaluation, export, determinism, resume, the stop request and
 the golden 20-step run. One optimizer step is tested in `test_step.py`, evaluation in `test_evaluation.py`, the
 CLI in `test_train.py`."""
 
@@ -244,7 +244,7 @@ def test_non_finite_grad_norm_terminates(
 
 
 # --------------------------------------------------------------------------------------------------------------
-# end-to-end runs (on the backend of the settings: the GPU when there is one, bf16 autocast — the only cover of
+# end-to-end runs (on the backend of the settings: the GPU when there is one, bf16 autocast, the only cover of
 # that path; the golden run and the stop tests inject the fp32 CPU backend)
 
 
@@ -505,7 +505,7 @@ def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, *
 @pytest.mark.slow
 def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
     """Resuming from the stage-0_end checkpoint continues the run: the same remaining steps, the exact LR schedule,
-    the evaluation cadence, and the data stream picks up where the checkpoint stood — the resumed run ends with
+    the evaluation cadence, and the data stream picks up where the checkpoint stood. The resumed run ends with
     exactly the uninterrupted run's per-source consumed-row counters, having repeated no row.
 
     It is deliberately NOT bit-exact any more: the run-wide readers live across stage boundaries, so a resumed

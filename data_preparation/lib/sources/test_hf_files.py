@@ -712,7 +712,7 @@ def test_columns_are_projected_for_parquet(hub: FakeHub, monkeypatch: pytest.Mon
 
 @pytest.mark.parametrize("suffix", [".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".json"])
 def test_columns_are_projected_for_the_json_formats(hub: FakeHub, suffix: str) -> None:
-    """The json family parses whole rows and drops the surplus columns afterwards — cached and streamed alike."""
+    """The json family parses whole rows and drops the surplus columns afterwards, cached and streamed alike."""
     hub.add(f"f/a{suffix}", _rows("a", 4))
     for load_kwargs in ({"data_files": f"f/*{suffix}"}, {"data_files": f"f/*{suffix}", **REMOTE}):
         src = _src(load_kwargs=load_kwargs)

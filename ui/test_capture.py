@@ -112,7 +112,7 @@ def test_line_sink_without_a_real_stream_reports_no_fileno(monkeypatch: pytest.M
 
 
 def test_line_sink_sends_a_re_entrant_write_to_the_real_stream() -> None:
-    """H9: a write caused by the sink's own emit must not be fed back in — that is the recursion bomb."""
+    """H9: a write caused by the sink's own emit must not be fed back in; that is the recursion bomb."""
     real = io.StringIO()
     lines: list[str] = []
 
@@ -159,7 +159,7 @@ def test_line_sink_guard_is_thread_local() -> None:
 def test_a_failing_log_handler_does_not_recurse_into_the_sink(isolated_logger: logging.Logger, tmp_path: Path) -> None:
     """H9 end to end: the train.log handler on a full disk must not end the run with a ``RecursionError``.
 
-    ``logging.Handler.handleError`` writes its report to ``sys.stderr`` — the sink — which logs it — which reaches
+    ``logging.Handler.handleError`` writes its report to ``sys.stderr``, the sink, which logs it, which reaches
     the same failing handler. The thread-local guard sends that second write to the real stream instead."""
     real_err = io.StringIO()
     file_handler = logging.StreamHandler(FailingStream())  # a `FileHandler` whose device filled up behaves like this

@@ -167,7 +167,7 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
 
 
 def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Tokenizer) -> None:
-    """`rows_read` counts every row that went in — the dropped ones too — while `samples` holds only
+    """`rows_read` counts every row that went in, the dropped ones too, while `samples` holds only
     the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips."""
     batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
     samples, rows_read = collate_worker_batch(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)

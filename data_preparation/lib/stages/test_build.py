@@ -335,7 +335,7 @@ def test_build_decontamination_only_when_enabled(
     read_rows: Reader, monkeypatch: pytest.MonkeyPatch, pass_workers: int,
 ) -> None:  # fmt: skip
     """`pass_workers=2` runs the real spawn pool end to end: the n-grams are loaded once in the parent (where the
-    patched loader lives — a spawn child would not see the monkeypatch) and reach the workers as pickled init args."""
+    patched loader lives; a spawn child would not see the monkeypatch) and reach the workers as pickled init args."""
     planted = " ".join(f"w{i}" for i in range(20))
     calls: list[tuple[list[str], int, str]] = []
 
@@ -600,7 +600,7 @@ def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(
 
 
 def test_swap_into_place_is_rename_aside(tmp_path: Path) -> None:
-    """Old aside, new in place, only then a deletion — and without an old folder the aside step is skipped."""
+    """Old aside, new in place, only then a deletion; without an old folder the aside step is skipped."""
     processed = tmp_path / "i"
     processed.mkdir()
     (processed / "data-00000.parquet").write_bytes(b"old")
@@ -631,7 +631,7 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The rename-aside window: a crash on the final delete leaves the new folder in place and the replaced one as
-    ``.old`` — never a moment without the data (the repair step removes the ``.old``)."""
+    ``.old``: never a moment without the data (the repair step removes the ``.old``)."""
     src_dir = layout.root.parent / "swap"
     write_local(src_dir, [_instruct_row(i) for i in range(4)], "jsonl")
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir)

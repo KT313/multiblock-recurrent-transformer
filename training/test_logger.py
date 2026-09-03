@@ -254,7 +254,7 @@ def test_non_finite_gradient_is_reported_as_nan(tiny_model: RecurrentGPT) -> Non
 
 
 # --------------------------------------------------------------------------------------------------------------
-# RunLogger: a run without a dataset — in-memory settings, a stage manager, fake step results, a fake clock
+# RunLogger: a run without a dataset (in-memory settings, a stage manager, fake step results, a fake clock)
 
 
 class FakeClock:
@@ -376,7 +376,7 @@ def open_run_logger(
 ) -> RunLogger:
     """`RunLogger.open` on the CPU backend; `dashboard` defaults to a fresh `RecordingDashboard` (available as
     `run_logger.dashboard`), so no test opens the real factory unless it asks for it (`dashboard=None` explicitly is
-    not possible here — call `RunLogger.open` directly for that)."""
+    not possible here; call `RunLogger.open` directly for that)."""
     progress = TrainingProgress(step=start_step, resume_step=start_step if start_step else -1)
     backend = SingleDeviceBackend(device="cpu", precision="32")
     return RunLogger.open(
@@ -424,8 +424,8 @@ def _record_wandb_logs(monkeypatch: pytest.MonkeyPatch) -> dict[int, dict[str, A
 def test_open_logs_the_run_header_and_ends_the_setup_timer(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
-    """The stage summary, the total-steps line, the parameter line and the setup line — all INFO records on
-    `training.logger` marked `keep` — and the setup timer measured from `setup_started` to `open`."""
+    """The stage summary, the total-steps line, the parameter line and the setup line are INFO records on
+    `training.logger` marked `keep`; the setup timer is measured from `setup_started` to `open`."""
     settings = reference_settings()
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock(1000.0)
@@ -505,7 +505,7 @@ def test_history_is_kept_only_on_request(tmp_path: Path, monkeypatch: pytest.Mon
 def test_log_interval_composition_fractions_sum_to_one_and_reset(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`log_step_interval: 2`: only even steps are logged (no `.item()` in between — the dashboard gets an empty step
+    """`log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
     dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
     counts every world batch since the last log step and starts over afterwards."""
     recorded = _record_wandb_logs(monkeypatch)
@@ -539,7 +539,7 @@ def test_log_step_notes_the_transition_events_and_moves_the_bars_with_the_stage_
     """Stage a: 8 steps, the last two (6, 7) transitioning to b. One "starting transition" event after step 6 is
     done and one "transition complete" event after step 8 is done (worded as the thesis loop printed them, with the
     stage names); no console record for them. The bars get the stage containing `done` (a until 8 steps are done, b
-    from then on) and the transition keys of `done` — while `history` keeps the `stage/*` metrics of the step trained
+    from then on) and the transition keys of `done`, while `history` keeps the `stage/*` metrics of the step trained
     on, one step behind: `stage/current_stage` is the stage containing that step, also inside its transition."""
     settings = reference_settings()
     stage_manager = two_stage_manager(settings)
@@ -765,7 +765,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     """Without an injected dashboard `open` goes through `open_dashboard`: stdout is not a TTY under pytest, so the
     `ConsoleFallbackDashboard` is chosen, built from the run (stage names and step counts from the boundaries, the header
     details, the log interval, the resume step) with the `training` logger attached for the block and
-    `run_directory / train.log` appended — the header records, the fallback's step lines and events all end up there
+    `run_directory / train.log` appended: the header records, the fallback's step lines and events all end up there
     and on stderr (where the CLI's log handlers write too, so a piped run's story stays in one stream);
     `close()` detaches it again."""
     monkeypatch.setenv("TRAINING_DASHBOARD", "1")

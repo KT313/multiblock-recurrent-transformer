@@ -409,7 +409,7 @@ class DatasetConfig:
             if source.kind == "instruct" and self.source_processing(name).dedup.mode == "minhash":
                 raise ValueError(
                     f"source {name!r}: dedup.mode=minhash is not implemented for instruct sources (only pretrain "
-                    "sources run the near-duplicate pass) — use dedup.mode=exact, and set minhash in the "
+                    "sources run the near-duplicate pass); use dedup.mode=exact, and set minhash in the "
                     "`processing` block of each pretrain source instead of the dataset-level one"
                 )
 
@@ -652,7 +652,7 @@ def field_hash_annotation(f: Field[Any], obj: Any) -> str:
     if annotation is None:
         raise TypeError(
             f"{type(obj).__name__}.{f.name} carries no `hash` metadata; annotate it with one of {HASH_ANNOTATIONS} "
-            "(see 'hash annotations' in dataset_config.py) — a schema field must say which hash it belongs to"
+            "(see 'hash annotations' in dataset_config.py); a schema field must say which hash it belongs to"
         )
     name = annotation(obj) if callable(annotation) else annotation
     if name not in HASH_ANNOTATIONS:

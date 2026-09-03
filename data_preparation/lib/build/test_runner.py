@@ -142,10 +142,10 @@ def test_a_source_still_short_after_max_rounds_is_reported(
 def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The 20 % safety margin does not always cover what the build drops — here four of every five rows are exact
+    """The 20 % safety margin does not always cover what the build drops: here four of every five rows are exact
     duplicates. Round 1 downloads `rows_needed` raw rows and lands far short of `rows_sufficient` processed ones;
     the next rounds see that raw is long enough but *processed* is not and top the source up from the yield it
-    showed — no round asking for more than the full requirement (`_top_up_rows` caps it, so one bad yield
+    showed. No round asks for more than the full requirement (`_top_up_rows` caps it, so one bad yield
     measurement cannot ask the loader for billions of rows). Before the ledger the plan only looked at raw rows: it
     planned nothing, the round loop gave up, and `prepare` failed with no way to make progress (open finding H5)."""
     src_dir = layout.root.parent / "dupes"
@@ -170,8 +170,8 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
-    with an empty processed folder. That used to count as satisfied — `prepare` and `status` said "dataset complete",
-    exit 0, and the training run failed much later (open finding H2) — but a failed source is a failed build, so it
+    with an empty processed folder. That used to count as satisfied: `prepare` and `status` said "dataset complete",
+    exit 0, and the training run failed much later (open finding H2). A failed source is a failed build, so it
     is now unsatisfied with a reason that names the likely mistake."""
     src_dir = layout.root.parent / "wrong_fields"
     write_local(src_dir, [{"question": f"q{i}", "answer": f"a{i}"} for i in range(20)], "jsonl")
@@ -367,7 +367,7 @@ def test_an_outer_should_stop_is_honoured(cfg_factory: CfgFactory, layout: Datas
 
 
 def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() -> None:
-    """H6: an exception in the main-thread `on_success` follow-up must stop the pools like a job failure would —
+    """H6: an exception in the main-thread `on_success` follow-up must stop the pools like a job failure would;
     otherwise the pool exits block on downloads polling a flag nobody raised."""
     flag = runner.StopFlag()
     ran: list[str] = []
@@ -873,7 +873,7 @@ def test_prepare_logs_the_stop_reason_of_a_slow_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failing build stops the other running builds at their next shard (the build pool has the download pool's
-    stop semantics). s1 explodes only once s0 and s2 are building — builds start as their downloads finish, so
+    stop semantics). s1 explodes only once s0 and s2 are building: builds start as their downloads finish, so
     without the gate s2 might still be downloading and be stopped there instead."""
     ticks: dict[str, int] = {}
     lock = threading.Lock()

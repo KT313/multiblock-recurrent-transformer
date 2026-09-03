@@ -202,7 +202,7 @@ class RawFolderError(RuntimeError):
 
     def __init__(self, name: str, directory: Path, problem: str) -> None:
         super().__init__(
-            f"{name}: raw folder {directory} is {problem}; it must be deleted and downloaded again — "
+            f"{name}: raw folder {directory} is {problem}; it must be deleted and downloaded again; "
             "the download never deletes raw data, run the repair step (it asks for confirmation)"
         )
         self.name = name

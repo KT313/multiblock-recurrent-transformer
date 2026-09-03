@@ -109,7 +109,7 @@ def test_missing_listed_shard_is_broken_only_when_files_are_checked(cfg_factory:
 
 def test_crash_leftover_next_shard_is_resumable(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     """The M1 state: one unlisted file with exactly the name the resumed build publishes next, while raw shards
-    are still uncovered — the build overwrites it, so the cheapest repair is to do nothing."""
+    are still uncovered. The build overwrites it, so the cheapest repair is to do nothing."""
     cfg = _built(cfg_factory, with_tokenizer, layout)
     manifest = Manifest.load(layout.processed_dir("a"))
     assert manifest is not None and next_shard_to_write(manifest) == "data-00002.parquet"
@@ -157,7 +157,7 @@ def test_covered_shards_must_be_a_prefix_of_the_raw_shards(cfg_factory: CfgFacto
 def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     """One tree, one folder state per source: the repair step deletes exactly the folders whose cheapest repair is a
     rebuild, and the planner's manifest-only state matches the verdict's manifest-level knowledge (file-level
-    problems are invisible to it by design — the repair dry report flags them in ``status``)."""
+    problems are invisible to it by design; the repair dry report flags them in ``status``)."""
     names = ("a", "b", "c", "d", "e", "f", "g")
     cfg = with_tokenizer(cfg_factory({name: SourceConfig(kind="pretrain", loader="synthetic", seed=seed) for seed, name in enumerate(names)}))
     for name in names:
@@ -184,7 +184,7 @@ def test_repair_and_planner_agree_with_the_verdict_on_canonical_states(cfg_facto
         "d": "no_manifest",
         "e": "none",  # manifest-only: the missing shard file is the repair step's finding
         "f": "none",  # manifest-only: so is the stray
-        "g": "behind_raw",  # the crash leftover looks like any pending build — which is exactly what heals it
+        "g": "behind_raw",  # the crash leftover looks like any pending build, which is exactly what heals it
     }
 
 
@@ -192,7 +192,7 @@ def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, config_file: Callable[[DatasetConfig], Path]
 ) -> None:
     """The M1 state through the entry points: ``status`` and ``prepare --dry_run`` report a pending build and no
-    repair, ``prepare`` resumes the build over the leftover and ends complete — all three from the same verdict."""
+    repair, ``prepare`` resumes the build over the leftover and ends complete, all three from the same verdict."""
     cfg = with_tokenizer(cfg_factory({"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=6))
     path = config_file(cfg)
     download(cfg, "a", layout, rows_needed=8, shard_size=4)  # 2 raw shards; rows_needed(cfg) is 8 too

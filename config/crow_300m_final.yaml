@@ -61,7 +61,7 @@ world_batch_size: 1024               # sequences per optimizer step (= micro_bat
 optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
 optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
                                      # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
-  lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step) — changing it changes the regularisation
+  lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation
   weight_decay: 4e-5  # decoupled
   betas: [0.9, 0.95]
   eps: null           # null: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)

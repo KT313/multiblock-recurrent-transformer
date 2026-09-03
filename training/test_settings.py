@@ -216,7 +216,7 @@ def test_unknown_cli_key_is_rejected() -> None:
 
 
 def test_optim_config_field_override_merges_with_yaml() -> None:
-    """`--optim_config.lr` changes one field and keeps every other YAML value — a dict-typed setting would be
+    """`--optim_config.lr` changes one field and keeps every other YAML value; a dict-typed setting would be
     replaced whole, silently dropping the weight decay and the ELLISAdam flags (finding H10)."""
     cfg = parse_settings(["--config", str(CROW_YAML), "--optim_config.lr", "3e-4"])
     assert cfg.optim_config == OptimizerConfig(
@@ -280,7 +280,7 @@ def test_validation_batch_divisibility() -> None:
 
 def test_validation_of_nonsensical_batch_sizes() -> None:
     """A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
-    loop of a step run zero times — the run "trained" and reported loss 0.0. Both fail at settings time now, and so
+    loop of a step run zero times: the run "trained" and reported loss 0.0. Both fail at settings time now, and so
     does a world batch smaller than one micro-batch."""
     for bad in (0, -4):
         with pytest.raises(ValueError, match="micro_batch_size must be positive"):
@@ -294,7 +294,7 @@ def test_validation_of_nonsensical_batch_sizes() -> None:
 
 def test_validation_misaligned_eval_and_log_intervals() -> None:
     """Validation runs every eval_step_interval steps but the logger only emits at log steps, so an evaluation at a
-    non-log step would be computed and silently thrown away — refused at settings time instead."""
+    non-log step would be computed and silently thrown away; refused at settings time instead."""
     with pytest.raises(ValueError, match=r"eval_step_interval \(10\) must be a multiple of log_step_interval \(4\)"):
         _settings(log_step_interval=4, eval_step_interval=10)
 

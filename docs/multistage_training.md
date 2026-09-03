@@ -11,10 +11,10 @@ implementation lives in `training/stage_manager.py` with its integration in
 The stage list lives in the dataset config (`config/datasets/<name>.yaml`,
 `stages:`); each entry defines:
 
-- `train` / `val` — the weights over sources (plain source names; a source in both is split by `validation_fraction`) for
+- `train` / `val`: the weights over sources (plain source names; a source in both is split by `validation_fraction`) for
   the stage, weights summing to 1
-- `tokens` — the stage's global token budget
-- `transition_pct` — fraction of the stage reserved (at its end) for the
+- `tokens`: the stage's global token budget
+- `transition_pct`: fraction of the stage reserved (at its end) for the
   transition into the next stage; `0.0` for the last stage
 
 The run config contributes one base learning rate per stage, positionally, as
@@ -51,24 +51,24 @@ plus the realised data composition of the world batches since the last log step
 
 Steps are optimizer steps: `total steps = Σ stage.tokens / (world_batch_size ×
 block_size)`, independent of `micro_batch_size` and of the number of devices.
-The stage boundary summary is printed at startup — check it before long runs.
+The stage boundary summary is printed at startup; check it before long runs.
 
 ## Example configs
 
-- `config/tiny.yaml` + `config/datasets/tiny.yaml` — 3-stage smoke run on synthetic data (20 steps, seconds)
-- `config/crow_300m_final.yaml` + `config/datasets/crow_300m_final.yaml` — the real final-run config
+- `config/tiny.yaml` + `config/datasets/tiny.yaml`: 3-stage smoke run on synthetic data (20 steps, seconds)
+- `config/crow_300m_final.yaml` + `config/datasets/crow_300m_final.yaml`: the real final-run config
 
 ## Notable bug found during development
 
 The first version of the stage-boundary computation (which counted per-device
 micro-batch steps) did not divide token budgets by `world_size`. On a single GPU
 everything looked correct, but on the 4-GPU DDP setup each stage would have
-silently run 4× longer than configured — there is no error to see, just a
+silently run 4× longer than configured. There is no error to see, just a
 schedule that never ends. It was caught in a code audit before the main runs by
 checking the startup boundary summary against a hand calculation. The current
 code counts optimizer steps (world batches), which removes the `world_size`
 dependence altogether, and validates that `warmup_steps` and `cooldown_steps`
 fit inside the first/last stage. Lesson: in distributed
 training, verify step arithmetic by hand at startup rather than trusting that
-a config "looks right" — silent factor-of-`world_size` errors are cheap to
+a config "looks right"; silent factor-of-`world_size` errors are cheap to
 make and expensive to discover mid-run.

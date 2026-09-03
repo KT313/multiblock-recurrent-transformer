@@ -256,7 +256,7 @@ class SourceLedger:
         if wanted <= self.rows_needed:
             return wanted
         log.warning(
-            "%s: only %.3f%% of %s raw rows survived the build; a top-up of %s rows would serve the budget — "
+            "%s: only %.3f%% of %s raw rows survived the build; a top-up of %s rows would serve the budget; "
             "capping this round at the full requirement of %s rows",
             self.name, 100 * float(observed_yield), f"{self.raw_rows:,}", f"{wanted:,}", f"{self.rows_needed:,}",
         )
@@ -284,14 +284,14 @@ class SourceLedger:
             if self.processed_rows == 0:
                 return False, (
                     f"exhausted and NOT ONE of {self.raw_rows:,} raw rows survived the build "
-                    f"({self.skipped_malformed:,} malformed, {self.dropped_too_long:,} too long) — "
+                    f"({self.skipped_malformed:,} malformed, {self.dropped_too_long:,} too long); "
                     "check the source's fields / converter / filter / language"
                 )
             if self.training_rows < 1:
                 held_out = self.processed_rows - self.training_rows
                 return False, (
                     f"exhausted, and {self.processed_rows:,} processed rows − {held_out:,} validation holdout leaves "
-                    "0 training rows — lower the source's validation_fraction or give it more rows"
+                    "0 training rows; lower the source's validation_fraction or give it more rows"
                 )
             return True, f"exhausted at {self.processed_rows:,} of {self.rows_sufficient:,} rows"
         return False, f"processed rows {self.processed_rows:,} < {self.rows_sufficient:,}"

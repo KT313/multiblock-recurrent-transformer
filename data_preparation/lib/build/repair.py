@@ -156,7 +156,7 @@ def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, 
     manifest = inspection.manifest
     if manifest is None:
         if has_shards(folder):
-            raise RepairError(f"{name}: {folder} holds shards but no manifest; refusing to guess where the rows came from — delete the directory to download the source again")
+            raise RepairError(f"{name}: {folder} holds shards but no manifest; refusing to guess where the rows came from; delete the directory to download the source again")
         return []
     if inspection.state != "current":
         _plan(report, name, folder, "raw", "delete", inspection.reason)
@@ -172,7 +172,7 @@ def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, 
     healthy = len(dropped) - 1  # everything after the broken shard itself verified fine (or was never reached)
     reason = f"broken: {problem}; dropping {len(dropped)} shard(s) {dropped[0]}..{dropped[-1]}, keeping {good}"
     if healthy > 0:
-        reason += f" — {healthy} healthy shard(s) after the broken one are discarded and re-downloaded next run"
+        reason += f"; {healthy} healthy shard(s) after the broken one are discarded and re-downloaded next run"
     _plan(report, name, folder, "raw", "truncate", reason, needs_confirmation=healthy > 0, keep_shards=good)
     return shard_list(kept)
 

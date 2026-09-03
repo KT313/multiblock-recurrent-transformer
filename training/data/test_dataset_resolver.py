@@ -232,7 +232,7 @@ def test_crow_train_sources_are_one_run_wide_reader_per_source(crow_cfg: Dataset
         assert entry.data_signature == (_INSTRUCT if entry.prefix in instruct_names else None), entry.prefix
 
 
-# Not in this list: `model.config`, the known gap — it is framework-neutral by intent but imports
+# Not in this list: `model.config`, the known gap. It is framework-neutral by intent but imports
 # `model/layers/init.py` for its `Init` object, and that imports torch (checked: `import model.config` loads torch).
 FRAMEWORK_NEUTRAL_MODULES = (
     "training.settings",
@@ -245,7 +245,7 @@ FRAMEWORK_NEUTRAL_MODULES = (
 
 
 def test_framework_neutral_modules_do_not_load_torch() -> None:
-    """The JAX/TPU-port readiness claim, enforced: importing any of these modules must not pull in torch — also
+    """The JAX/TPU-port readiness claim, enforced: importing any of these modules must not pull in torch, also
     not through `training/data/__init__.py`, which therefore re-exports nothing."""
     lines = ["import importlib, sys"]
     for module in FRAMEWORK_NEUTRAL_MODULES:
@@ -438,7 +438,7 @@ def test_entry_rows_in_range_clips_to_the_rows_on_disk(tiny_pretrain_dir: Path) 
 
 def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_pretrain_dir: Path) -> None:
     """An entry with fewer rows than its loader has shards leaves a shard empty; the restart of an exhausted
-    loader (or mixture member) then gets a second `StopIteration` and the run dies mid-training — so it is a setup
+    loader (or mixture member) then gets a second `StopIteration` and the run dies mid-training, so it is a setup
     error naming the entry, its rows and the shard count. Train loaders run one worker per source and validation
     loaders in-process, so with one device everything is a single shard and only a larger world can starve one."""
     good = str(tiny_pretrain_dir)
@@ -522,7 +522,7 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
 def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
     tiny_dataset_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The tiny dataset's finetune validation split is a couple of rows — enough for one micro-batch (the run is
+    """The tiny dataset's finetune validation split is a couple of rows: enough for one micro-batch (the run is
     fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so."""
     settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
@@ -545,7 +545,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
 def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(tmp_path: Path, tiny_dataset_dir: Path) -> None:
     """A shard the manifest does not list used to be a dead end: status said complete, training refused, repair saw
-    nothing. Now the repair step owns it — without auto_prepare the run fails saying the dataset needs repair, with
+    nothing. Now the repair step owns it: without auto_prepare the run fails saying the dataset needs repair, with
     auto_prepare the derived folder is rebuilt and the run proceeds."""
     root = tmp_path / "ds"
     shutil.copytree(tiny_dataset_dir, root)
@@ -633,7 +633,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
 
 def test_auto_prepare_forwards_the_stop_request_to_the_build(tmp_path: Path) -> None:
     """`should_stop` (the CLI's Ctrl-C) reaches `prepare`: a request that already says stop ends the in-process build
-    at its first shard with `BuildAborted` — the dataset stays incomplete, nothing is deleted."""
+    at its first shard with `BuildAborted`; the dataset stays incomplete, nothing is deleted."""
     empty = tmp_path / "empty"
     with pytest.raises(BuildAborted):
         resolve_dataset(_settings(TINY_DATASET_YAML, empty), should_stop=lambda: True)

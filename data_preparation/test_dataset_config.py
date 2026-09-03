@@ -361,7 +361,7 @@ def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -
 
 def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
     """Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
-    ``transition tokens × (weight + next stage's weight) / 2`` — a source leaving ramps out, one entering ramps in."""
+    ``transition tokens × (weight + next stage's weight) / 2``: a source leaving ramps out, one entering ramps in."""
     d = _minimal()
     d["stages"][0]["transition_pct"] = 0.2  # transition window: 1000 × 0.2 = 200 tokens at the end of s1
     cfg = _build(d)
@@ -397,7 +397,7 @@ def _over_the_cap_tokens() -> int:
 
 def test_a_shuffled_source_over_the_build_cap_is_refused_at_load(tmp_path: Path) -> None:
     """`shuffle: true` builds all-at-once in memory (`lib/stages/build.py`); a config asking that of a huge source
-    would OOM hours in, so it fails at `load_dataset_config` — before `prepare` or auto-prepare do any work (D4)."""
+    would OOM hours in, so it fails at `load_dataset_config`, before `prepare` or auto-prepare do any work (D4)."""
     d = _minimal()
     d["sources"]["pre"]["shuffle"] = True
     d["stages"][0]["tokens"] = _over_the_cap_tokens()
@@ -446,7 +446,7 @@ def test_source_processing_override() -> None:
 
 # The hashes of the shipped configs, recorded 2026-09-02 (every value hashed, `config_hash` composed). They key data on disk: every folder under `dataset/`
 # carries the `raw_hash` / `processed_hash` of the source that produced it (raw folders are the bandwidth-expensive
-# part — terabytes on the author's machine — and a mismatch makes one stale, i.e. re-downloaded after confirmation),
+# part, terabytes on the author's machine, and a mismatch makes one stale, i.e. re-downloaded after confirmation),
 # and `config_hash` is what a training checkpoint stores to detect a resume against different data. Refactoring *how*
 # the hashes are derived must keep every value below byte-identical; only a deliberate change of *what* a hash counts
 # may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
@@ -564,7 +564,7 @@ def test_source_hash_stable_across_key_order_and_reloads() -> None:
 
 def test_every_schema_field_carries_a_hash_annotation() -> None:
     """A new field must say which hash it belongs to; without the annotation every hash of it raises rather than
-    silently landing in (or missing from) one — the drift this replaces."""
+    silently landing in (or missing from) one, the drift this replaces."""
     samples: list[Any] = [
         TokenizerConfig(name="t", kind="synthetic"),
         DedupConfig(),

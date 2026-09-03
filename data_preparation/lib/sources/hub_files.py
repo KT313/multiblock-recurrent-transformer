@@ -240,7 +240,7 @@ class FileIndex:
                 f"{self.repo_id}: the file index was built at revision {self.resolved_revision} but the repo now "
                 f"resolves to {current}. Pin `revision: {self.resolved_revision}` in the source config to keep "
                 f"going reproducibly (the raw data downloaded so far stays valid), or delete {self.path} (and "
-                f"consider the source's raw folder — its offsets were counted against the old listing) to re-sync."
+                f"consider the source's raw folder, its offsets were counted against the old listing) to re-sync."
             )
 
     @classmethod

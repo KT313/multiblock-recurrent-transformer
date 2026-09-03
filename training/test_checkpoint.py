@@ -217,7 +217,7 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
 
 def test_every_settings_field_is_classified() -> None:
     """Every Settings field is either exempted or compared on resume (with a differing value in the table above),
-    and every exempted name is a real field — a typo in the exemption tuple would silently compare nothing."""
+    and every exempted name is a real field; a typo in the exemption tuple would silently compare nothing."""
     field_names = {f.name for f in fields(Settings)}
     exempt = set(SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME)
     assert exempt <= field_names
@@ -228,7 +228,7 @@ def test_every_settings_field_is_classified() -> None:
 def test_check_settings_unchanged_catches_every_compared_setting(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
-    """Each compared field fails a resume on its own — the eval knobs included: every forward draws from the global
+    """Each compared field fails a resume on its own, the eval knobs included: every forward draws from the global
     torch RNG, so how often and how widely validation runs changes the training stream itself. The weight-decay
     grouping flag is refused even under `allow_settings_change`: the restored optimizer keeps the checkpoint's
     parameter groups, so the new value could never take effect."""
