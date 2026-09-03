@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
-build/
+/build/
 .idea
 .vscode
 .DS_Store
@@ -17,6 +17,16 @@ checkpoints*/
 *.log
 events.out.tfevents*
 
-# test-run artifacts
-tests/train_smoke/data/
-tests/train_smoke/out/
+# local data and runs
+dataset/
+outputs/
+.pytest_cache/
+.ruff_cache/
+
+# local agent instructions, not part of the repo
+CLAUDE.md
+reviews/
+tasks/
+.claude/
+reports/
+tools/

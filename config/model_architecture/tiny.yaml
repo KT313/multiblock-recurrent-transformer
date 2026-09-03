@@ -1,0 +1,40 @@
+# Model architecture of the smoke run / tests: tiny (~256K parameters, two recurrent core blocks). Same fields as
+# crow_300m_final.yaml with shrunk sizes so `config/tiny.yaml` and the tests run in seconds on the CPU.
+#
+# This file is the single definition of a `RecurrentConfig` (model/config.py). A run config (config/<run>.yaml)
+# references it as `model_architecture_config: config/model_architecture/tiny.yaml`, next to its `dataset_config`,
+# and may override single keys with `model_overwrite: {key: value}` (from the CLI: `--model_overwrite '{"n_embd": 32}'`).
+# Every key below is a tunable field; unknown keys are rejected on load.
+#
+# Fixed in this codebase (not knobs): SandwichBlock layout with RMSNorm, GatedMLP/SiLU, sdpa attention, linear
+# injection adapter, normal latent-state init, poisson-lognormal-filling recurrence sampler, takase orthogonal init,
+# per-iteration activation checkpointing, tied embeddings in the HF wrapper (the dataclass fields attn_impl,
+# init_strategy, init_orthogonal, activation_checkpoint_impl, injection_type, state_init, sampling_scheme accept
+# only that one value and are therefore not listed here).
+
+name: tiny                     # label of this architecture (written to model_config.json next to the checkpoints)
+
+# Core sizes
+block_size: 256                # maximum sequence length (size of the RoPE table); the run config's block_size must equal it
+n_embd: 64                     # hidden size of the residual stream
+intermediate_size: 128         # hidden size of the GatedMLP (null: 4 * n_embd)
+num_attention_heads: 4         # attention heads; n_embd must be divisible by it (head size = n_embd / heads = 16)
+
+# Vocabulary
+vocab_size: 512                # size of the tokenizer vocabulary (the synthetic tokenizer has 259 tokens, padded to 512)
+padding_multiple: 512          # the embedding table is padded to a multiple of this
+padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (512); an explicit value also caps vocab_size
+tie_embeddings: true           # lm_head shares the token-embedding weights
+
+# Block details
+rope_settings:
+  rope_base: 50000             # base of the rotary position embedding frequencies
+norm_eps: 1.0e-6               # epsilon of every RMSNorm / LayerNorm (write floats with a dot: YAML reads 1e-6 as a string)
+qk_bias: true                  # learned additive bias on the queries and keys of every attention layer
+
+# Recurrent structure
+n_layers_in_prelude: 2         # SandwichBlocks before the recurrent core (run once, embed the input)
+n_layers_in_coda: 1            # SandwichBlocks after the recurrent core (run once, before the output norm and lm_head)
+n_layers_in_recurrent_block: [1, 1]   # SandwichBlocks per recurrent core block; one entry per core block (here 2 blocks)
+mean_recurrence: [2, 2]        # mean number of iterations per block (training sampler mean and eval depth); one entry per core block
+mean_backprop_depth: [2, 2]    # mean number of iterations with gradients (truncated backprop); one entry per core block

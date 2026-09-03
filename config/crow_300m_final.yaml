@@ -1,0 +1,94 @@
+# Final thesis run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
+#
+# This file lists EVERY run setting (`training/settings.py:Settings`) with its value, so the available knobs are
+# visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
+# command line: `python training/train.py --config config/crow_300m_final.yaml --run_name my-run`.
+#
+# All step values are OPTIMIZER steps. One step = world_batch_size × block_size = 1024 × 2048 ≈ 2.1M tokens,
+# so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on 4 GPUs;
+# on one GPU the same world batch is 256 micro-batches of 4, so a step takes correspondingly longer.
+# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64, resume_warmup 512 → 8,
+#  save 8192 → 128, eval 1024 → 16.)
+#
+# Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/crow_300m_final.yaml;
+# `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets/weights (3.3B + 1.5B + 0.15B
+# tokens) and the tokenizer are defined in config/datasets/crow_300m_final.yaml. Training verifies the prepared data
+# under dataset_dir and builds what is missing (`auto_prepare`);
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_final.yaml` does the same up
+# front (export HF_TOKEN for the gated peS2o source). The only per-stage value that stays here is the base learning
+# rate (`stage_base_lrs`, positional, one per dataset-config stage).
+
+# --- Config references (both required) --------------------------------------------------------------------------
+dataset_config: config/datasets/crow_300m_final.yaml                    # sources, stages, budgets, weights, tokenizer
+model_architecture_config: config/model_architecture/crow_300m_final.yaml   # RecurrentConfig: sizes, depth, recurrence
+
+# --- Data -------------------------------------------------------------------------------------------------------
+dataset_dir: dataset                 # root of the prepared data (sources/, processed/, tokenizers/)
+auto_prepare: true                   # build missing data in-process before training; false: fail with the build command
+prepare_num_workers: 4               # sources processed at a time by the in-process build (= prepare.py --num_workers)
+prepare_pass_workers: 4              # worker processes of EACH build's optional cleaning passes (decontamination / minhash, off in this dataset config; = prepare.py --pass_workers)
+prepare_max_parallel_downloads: 2    # sources downloading at a time during the in-process build
+stage_base_lrs: [3e-4, 1e-4, 5e-5]   # base LR per dataset-config stage, positional: pretrain_phase1, pretrain_phase2, finetune
+allow_dataset_change: false          # allow resuming from a checkpoint written with a different dataset config
+allow_settings_change: false         # allow resuming although settings / model config differ from the checkpoint (all compared but exemptions)
+
+# --- Run --------------------------------------------------------------------------------------------------------
+run_name: crow-300m-final            # name of the run: checkpoint file names, wandb run, resume lookup
+out_dir: outputs                     # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
+resume: true                         # resume from the latest checkpoint of run_name in out_dir if one exists
+resume_checkpoint_path: null         # explicit checkpoint to resume from (overrides the search); null: search
+seed: 233                            # seed for model init, the recurrence sampler and data order
+
+# --- Model ------------------------------------------------------------------------------------------------------
+model_overwrite: {}                  # RecurrentConfig keys overriding the architecture config, e.g. {n_embd: 512}
+block_size: 2048                     # sequence length; must equal the block_size of the architecture config AND of the dataset config (which itself is <= its max_seq_length)
+
+# --- Data loading (every per-source train loader runs one worker; there is no worker-count knob) ----------------
+sort_batches_by_length: true         # regroup each world batch into length-sorted micro-batches (less padding)
+sequence_padding_multiple: 128       # pad micro-batches to a multiple of this many tokens (null: the max length)
+
+# --- Backend ----------------------------------------------------------------------------------------------------
+backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
+precision: bf16-mixed                # autocast precision of the forward/backward pass
+compile_model: true                  # torch.compile the model
+gradient_checkpointing: false        # recompute activations per recurrence iteration in the backward pass
+
+# --- Batching (one optimizer step = world_batch_size sequences) ------------------------------------------------
+micro_batch_size: 4                  # sequences per forward/backward pass
+world_batch_size: 1024               # sequences per optimizer step (= micro_batch_size × gradient accumulation steps)
+
+# --- Optimizer + LR schedule ------------------------------------------------------------------------------------
+optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
+optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
+                                     # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
+  lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation
+  weight_decay: 4e-5  # decoupled
+  betas: [0.9, 0.95]
+  eps: null           # null: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)
+  update_clipping: true  # this and the three below exist only on ELLISAdam
+  atan_adam: true
+  running_init: true
+  decouple_wd: true
+no_weight_decay_for_bias_and_norm_params: true   # biases and norm weights get weight_decay 0
+grad_clip: 1.0                       # gradient-norm clipping threshold
+lr_schedule: trapezoid               # LR shape within and across stages (training/lr_schedule.py)
+warmup_steps: 64                     # linear LR warmup steps at the start of training
+cooldown_steps: 64                   # LR cooldown steps at the end of training
+min_lr: 0                            # LR floor of warmup and cooldown
+resume_warmup_steps: 8               # LR ramps from min_lr back to the schedule over this many steps after a resume
+
+# --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
+log_step_interval: 1                 # log training metrics every this many steps
+log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
+eval_step_interval: 16               # run validation every this many steps
+eval_iters: 50                       # validation micro-batches per evaluated depth
+partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at validation (plus the mean recurrence)
+save_step_interval: 128              # write a checkpoint every this many steps (plus before every stage transition)
+save_last_step: true                 # write a checkpoint at the end of training
+logger_project: recurtrain-baseline  # wandb project
+wandb_offline: true                  # wandb offline mode (files under {out_dir}/wandb, sync later)
+wandb_enabled: true                  # false: no wandb at all
+
+# --- Export -----------------------------------------------------------------------------------------------------
+export_to_hf: false                  # write a HuggingFace trust_remote_code folder at the end of training
+export_hf_path: null                 # target of the export; null: {out_dir}/hf_export

@@ -1,0 +1,26 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""
+Iteration helpers shared by the stages.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+def chunks(items: Iterable[T], size: int) -> Iterator[list[T]]:
+    """
+    items grouped into consecutive lists of size (the last one may be shorter).
+    """
+
+    chunk: list[T] = []
+    for item in items:
+        chunk.append(item)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk

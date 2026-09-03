@@ -1,0 +1,50 @@
+# Tiny smoke-run config: the real train.py code path with a ~256K-parameter model on synthetic data.
+# Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
+# a few seconds on CPU or GPU. The model is defined by config/model_architecture/tiny.yaml, the data (stages, token
+# budgets, weights, tokenizer) by config/datasets/tiny.yaml; training builds the data under dataset/ (sources/,
+# processed/, tokenizers/) when missing (`auto_prepare`), or run
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
+# This file stays short; config/crow_300m_final.yaml lists every `Settings` key with a comment.
+
+run_name: tiny
+out_dir: outputs/tiny
+resume: false
+seed: 42
+
+model_architecture_config: config/model_architecture/tiny.yaml
+block_size: 256              # = block_size of the architecture config AND of the dataset config (which is <= its max_seq_length)
+
+dataset_config: config/datasets/tiny.yaml
+dataset_dir: dataset
+auto_prepare: true
+prepare_num_workers: 1
+stage_base_lrs: [3e-4, 1e-4, 5e-5]   # one per stage of the dataset config: pretrain_a, pretrain_b, finetune
+
+backend: single_device
+precision: bf16-mixed
+compile_model: false
+gradient_checkpointing: false
+
+micro_batch_size: 2
+world_batch_size: 4
+sort_batches_by_length: true
+sequence_padding_multiple: 128
+
+optimizer: AdamW
+optim_config: {lr: 3e-4, weight_decay: 0.1, betas: [0.9, 0.95]}
+no_weight_decay_for_bias_and_norm_params: true
+grad_clip: 1.0
+lr_schedule: trapezoid
+warmup_steps: 2
+cooldown_steps: 2
+min_lr: 0
+
+log_step_interval: 1
+log_gradient_metrics: true
+eval_step_interval: 8
+eval_iters: 2
+partial_depth_eval: [1]
+save_step_interval: 100
+save_last_step: true
+logger_project: train-smoke
+wandb_enabled: false
