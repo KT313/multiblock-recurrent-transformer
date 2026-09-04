@@ -2,8 +2,6 @@
 # (<pad>, <bos>, <eos>, tok_0..tok_255) and random-word documents generated on demand. Builds in seconds, no
 # network. `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
 
-name: tiny
-
 tokenizer: {name: synthetic, kind: synthetic}
 max_seq_length: 256
 block_size: 256                 # config/tiny.yaml must use the same block_size

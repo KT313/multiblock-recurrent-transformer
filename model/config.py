@@ -66,7 +66,6 @@ class RecurrentConfig:
     Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block.
     """
 
-    name: str = ""
     # Core
     block_size: int = 2048
     n_embd: int = 1024

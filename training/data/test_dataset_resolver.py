@@ -186,7 +186,6 @@ def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
     """
 
     return DatasetConfig(
-        name="t",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "a": SourceConfig(kind="pretrain", loader="synthetic"),
@@ -606,7 +605,7 @@ def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(
 
 def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: DatasetLayout) -> None:
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
-    assert isinstance(resolved, ResolvedDataset) and resolved.config.name == "tiny"
+    assert isinstance(resolved, ResolvedDataset)
     assert resolved.config_hash == load_dataset_config(TINY_DATASET_YAML).config_hash()
     assert resolved.tokenizer_dir == str(tiny_layout.tokenizer_dir("synthetic"))
     assert [s.name for s in resolved.stages] == ["pretrain_a", "pretrain_b", "finetune"]

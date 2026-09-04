@@ -1,4 +1,4 @@
-# Dataset `crow-300m-final`
+# Dataset `crow_300m_final`
 
 Generated from `config/datasets/crow_300m_final.yaml` with
 

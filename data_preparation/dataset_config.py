@@ -357,7 +357,6 @@ class DatasetConfig:
 
     Top-level keys:
 
-    - `name`: dataset name (logs, checkpoints).
     - `tokenizer`: which tokenizer defines "a token" (`TokenizerConfig`); saved to `dataset/tokenizers/<name>/`.
     - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/raw/`
       and `dataset/processed/<source>/`.
@@ -377,7 +376,6 @@ class DatasetConfig:
     `ceil(validation_fraction_of(source) × rows)` processed rows are validation, the rest training.
     """
 
-    name: str = field(metadata=_CONFIG)  # non-empty path component
     tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
     sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
     stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
@@ -394,8 +392,6 @@ class DatasetConfig:
     # --- validation ------------------------------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
-        if not self.name or "/" in self.name:
-            raise ValueError("name must be a non-empty path component")
         if self.max_seq_length <= 0:
             raise ValueError("max_seq_length must be positive")
         if self.block_size <= 0:
@@ -634,8 +630,8 @@ class DatasetConfig:
         Hash of everything that defines the training data (recorded in checkpoints so a resume with different
         data is detected), composed of the hashes below it: every source's processed_hash (which folds in its
         raw hash and the *effective* processing block, so a Bloom budget change does not count here either) next
-        to the source's own config fields, the tokenizer hash, and the config fields of the dataset (name,
-        stages, block size, validation fraction). The knobs that only change how data are fetched or described
+        to the source's own config fields, the tokenizer hash, and the config fields of the dataset (stages,
+        block size, validation fraction). The knobs that only change how data are fetched or described
         (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
         """
 

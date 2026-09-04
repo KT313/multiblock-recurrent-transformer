@@ -3,7 +3,7 @@
 `train()`: one training run as a readable entry function, plus the setup helpers it is made of.
 
     create_backend                    device, precision, torch flags; then `seed_everything`
-    prepare_run_directory             out_dir/checkpoints, run_config.json
+    prepare_run_directory             out_dir/<run_name>/checkpoints, run_config.json
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
@@ -108,7 +108,7 @@ def train(
     step; the loop then saves a checkpoint, skips the export and returns with `report.stopped`.
     `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
-    The run directory is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
+    `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
 
     Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint, so the
     stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
@@ -117,7 +117,7 @@ def train(
     backend = backend or create_backend(settings)
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
-    with run_lock(run_directory / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
+    with run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
         loaders = build_run_dataloaders(settings, dataset, backend)
@@ -183,12 +183,20 @@ def create_backend(settings: Settings) -> Backend:
     return get_backend(settings.backend, precision=settings.precision)
 
 
-def prepare_run_directory(settings: Settings) -> Path:
+def run_directory_of(settings: Settings) -> Path:
     """
-    Create the run directory (`settings.out_dir`) with its `checkpoints/` folder. Returns the run directory.
+    The run directory: `out_dir/<run_name>`, where the checkpoints, logs and wandb files of the run go.
     """
 
-    run_directory = Path(settings.out_dir)
+    return Path(settings.out_dir) / settings.run_name
+
+
+def prepare_run_directory(settings: Settings) -> Path:
+    """
+    Create the run directory (`run_directory_of`) with its `checkpoints/` folder. Returns the run directory.
+    """
+
+    run_directory = run_directory_of(settings)
     checkpoint_dir(run_directory).mkdir(parents=True, exist_ok=True)
     return run_directory
 

@@ -88,12 +88,12 @@ def _step_from_name(path: Path) -> int:
     return int(path.name.split("-")[1])
 
 
-def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]:
+def find_latest_checkpoint(run_directory: str | Path, run_name: str) -> Optional[Path]:
     """
-    Most recently written checkpoint of `run_name` under `out_dir/checkpoints` (the step breaks ties), or None.
+    Most recently written checkpoint of `run_name` under `run_directory/checkpoints` (the step breaks ties), or None.
     """
 
-    directory = checkpoint_dir(out_dir)
+    directory = checkpoint_dir(run_directory)
     pattern = re.compile(rf"^step-\d{{8}}-{re.escape(run_name)}(-stage-\d+_end)?{re.escape(CHECKPOINT_SUFFIX)}$")
     candidates = [path for path in directory.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(path.name)]
     if not candidates:

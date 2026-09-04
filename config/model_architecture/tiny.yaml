@@ -12,8 +12,6 @@
 # init_strategy, init_orthogonal, activation_checkpoint_impl, injection_type, state_init, sampling_scheme accept
 # only that one value and are therefore not listed here).
 
-name: tiny                     # label of this architecture (written to model_config.json next to the checkpoints)
-
 # Core sizes
 block_size: 256                # maximum sequence length (size of the RoPE table); the run config's block_size must equal it
 n_embd: 64                     # hidden size of the residual stream

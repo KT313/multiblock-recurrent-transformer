@@ -51,7 +51,6 @@ def _minimal() -> dict[str, Any]:
     """
 
     return {
-        "name": "t",
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
         "block_size": 64,
         "sources": {
@@ -71,7 +70,6 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
     sources = {k: SourceConfig(**({**v, "processing": _processing(v["processing"])} if v.get("processing") else v))
                for k, v in d["sources"].items()}
     return DatasetConfig(
-        name=d["name"],
         tokenizer=TokenizerConfig(**d["tokenizer"]),
         sources=sources,
         stages=[StageConfig(**s) for s in d["stages"]],
@@ -104,18 +102,16 @@ def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
 @pytest.mark.parametrize("path", [CROW, TINY, MINI])
 def test_shipped_configs_load(path: Path) -> None:
     cfg = load_dataset_config(path)
-    assert cfg.name in ("crow-300m-final", "tiny", "crow-300m-mini")
     assert cfg.stages and cfg.sources
     assert cfg.block_size <= cfg.max_seq_length
 
 
 def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
     """
-    The real-source smoke config differs from the thesis config only in name and budgets.
+    The real-source smoke config differs from the thesis config only in its budgets.
     """
 
     final, mini = load_dataset_config(CROW), load_dataset_config(MINI)
-    assert mini.name == "crow-300m-mini"
     assert [s.tokens for s in mini.stages] == [300_000, 150_000, 60_000]
     assert [(s.name, s.train, s.val, s.transition_pct) for s in mini.stages] == [
         (s.name, s.train, s.val, s.transition_pct) for s in final.stages
@@ -231,7 +227,6 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["sources"]["pre"].update({"loader": "local"}), "requires path"),
         (lambda d: d["stages"].append(dict(d["stages"][0])), "unique"),
         (lambda d: d["stages"].clear(), "at least one stage"),
-        (lambda d: d.update({"name": "a/b"}), "path component"),
         (lambda d: d["stages"][0].update({"tokens": 0}), "tokens must be positive"),
         (lambda d: d["stages"][0].update({"transition_pct": 1.0}), "transition_pct"),
         (lambda d: d["stages"][0].update({"train": {}}), "must not be empty"),
@@ -481,7 +476,7 @@ def test_source_processing_override() -> None:
 # may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "4ff8d9e0eed79b78",
+        "config": "09da5413da3c297a",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
             "synthetic_pretrain": ("5f2929b477b8deb5", "bfa35901f2819b63"),
@@ -489,7 +484,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_final": {
-        "config": "dc785383e72873de",
+        "config": "e0f97c2b33aed11e",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
@@ -522,7 +517,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_mini": {
-        "config": "e1dd176c640cd5fe",
+        "config": "b5f1ea961b1a3b16",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
@@ -915,7 +910,7 @@ def test_config_hash_ignores_fetch_and_describe_knobs() -> None:
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:
     names = {f.name for f in fields(DatasetConfig)}
-    assert {"name", "tokenizer", "sources", "stages", "block_size", "max_seq_length", "validation_fraction", "processing"} <= names
+    assert {"tokenizer", "sources", "stages", "block_size", "max_seq_length", "validation_fraction", "processing"} <= names
     assert "instruct_mixtures" not in names
     cfg = _build(_minimal())
     assert asdict(cfg)["sources"]["pre"]["kind"] == "pretrain"

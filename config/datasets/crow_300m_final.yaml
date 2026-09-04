@@ -13,7 +13,6 @@
 # the thesis run's; per-source download sizes are derived from the sequence budget (stage tokens × weight ÷
 # block_size, × 1.2) instead of the fixed row counts of the thesis scripts. Several HuggingFace ids had to move (wikipedia -> wikimedia/wikipedia 20231101.en,
 # gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every source is pinned to a revision.
-name: crow-300m-final
 
 tokenizer:
   name: llama-32k

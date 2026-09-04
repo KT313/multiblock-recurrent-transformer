@@ -402,12 +402,12 @@ def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(t
     assert "saved checkpoint" in shown and "step-00000020-tiny.pth" in shown, shown
     assert shown.index("Training finished after 20 steps") < shown.index("overall") < shown.index("Training run in ")
     assert "20 optimizer steps completed" in shown and "3 checkpoints written" in shown  # the long path may wrap
-    assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == [
+    assert sorted(p.name for p in checkpoint_dir(out_dir / "tiny").glob("*.pth")) == [
         "step-00000006-tiny-stage-0_end.pth",
         "step-00000014-tiny-stage-1_end.pth",
         "step-00000020-tiny.pth",
     ]
-    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    log_text = (out_dir / "tiny" / TRAIN_LOG_NAME).read_text()
     assert "Total training steps: 20" in log_text and "Training finished after 20 steps" in log_text
 
 
@@ -428,10 +428,10 @@ def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_scree
     assert shown.count("Training stopped on request after ") == 1 and "Training finished" not in shown, shown
     assert "rerun with resume: true to continue" in shown and "checkpoints written, last:" in shown, shown
     assert "stopped on request" in shown and "saved checkpoint" in shown, shown
-    checkpoints = sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth"))
+    checkpoints = sorted(p.name for p in checkpoint_dir(out_dir / "tiny").glob("*.pth"))
     assert checkpoints and all(name.startswith("step-000000") for name in checkpoints), checkpoints
     assert checkpoints[-1].endswith("-tiny.pth") and "_end" not in checkpoints[-1], "the last one is the stop checkpoint"
     assert checkpoints[-1][len("step-") : len("step-00000000")].lstrip("0").isdigit(), "named after the stopped step"
     # events are dashboard-only under the live display (the fallback logs them); the records are in train.log
-    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    log_text = (out_dir / "tiny" / TRAIN_LOG_NAME).read_text()
     assert "SIGINT received" in log_text and "Training stopped on request" in log_text

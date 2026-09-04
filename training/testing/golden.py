@@ -26,7 +26,7 @@ import yaml
 from data_preparation.lib.build.runner import prepare
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.run import train
+from training.run import run_directory_of, train
 from training.settings import parse_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -117,12 +117,12 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
             step_metrics = {key: metrics[key] for key in GOLDEN_PER_STEP_KEYS}
             step_metrics |= {key: value for key, value in metrics.items() if key.startswith("val_loss")}
             steps[str(done)] = step_metrics
-        final_checkpoint = find_latest_checkpoint(out_dir, settings.run_name)
+        final_checkpoint = find_latest_checkpoint(run_directory_of(settings), settings.run_name)
         assert final_checkpoint is not None
         final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
         return {
             "steps": steps,
-            "checkpoints": sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")),
+            "checkpoints": sorted(p.name for p in checkpoint_dir(run_directory_of(settings)).glob("*.pth")),
             "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),
             "parameter_norms": {
                 name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state["model"].items()

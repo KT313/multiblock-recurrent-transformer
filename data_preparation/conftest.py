@@ -193,7 +193,6 @@ def cfg_factory() -> CfgFactory:
         block_size: int = 1,
         tokens: int = 10_000,
         tokenizer: TokenizerConfig | None = None,
-        name: str = "t",
     ) -> DatasetConfig:
         sources = dict(sources)
         trained = {kind: [n for n, s in sources.items() if s.kind == kind and s.rows is None] for kind in ("pretrain", "instruct")}
@@ -220,7 +219,6 @@ def cfg_factory() -> CfgFactory:
         processing = processing or ProcessingConfig(min_chars=1)
         processing = replace(processing, dedup=replace(processing.dedup, bloom_memory_mb=TEST_BLOOM_MEMORY_MB))
         return DatasetConfig(
-            name=name,
             tokenizer=tokenizer or TokenizerConfig(name="synthetic", kind="synthetic"),
             sources=sources,
             stages=stages,
@@ -314,11 +312,11 @@ def with_tokenizer(layout: DatasetLayout) -> Callable[[DatasetConfig], DatasetCo
 def config_file(tmp_path: Path) -> Callable[[DatasetConfig], Path]:
     """
     `config_file(cfg)` writes the config as YAML (what `prepare` / `status` take) and returns the path
-    (`<tmp_path>/<cfg.name>.yaml`; a second call with the same name overwrites it).
+    (`<tmp_path>/dataset.yaml`; a second call overwrites it).
     """
 
     def write(cfg: DatasetConfig) -> Path:
-        path = tmp_path / f"{cfg.name}.yaml"
+        path = tmp_path / "dataset.yaml"
         path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
         return path
 

@@ -7,7 +7,7 @@
 # This file stays short; config/crow_300m_final.yaml lists every `Settings` key with a comment.
 
 run_name: tiny
-out_dir: outputs/tiny
+out_dir: outputs
 resume: false
 seed: 42
 

@@ -76,8 +76,8 @@ class Settings:
 
     # Run
     run_name: str = "crow-300m"
-    out_dir: str = "outputs"  # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
-    resume: bool = True  # resume from the most recently written checkpoint of `run_name` in `out_dir` if one exists
+    out_dir: str = "outputs"  # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log, run_config.json
+    resume: bool = True  # resume from the most recently written checkpoint of `run_name` in its run directory if one exists
     resume_checkpoint_path: Optional[str] = None  # explicit checkpoint to resume from (overrides the search)
     seed: int = 1337
 
@@ -123,7 +123,7 @@ class Settings:
 
     # Export
     export_to_hf: bool = False  # write a HuggingFace trust_remote_code folder at the end of training
-    export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
+    export_hf_path: Optional[str] = None  # default: {out_dir}/{run_name}/hf_export
 
     def __post_init__(self) -> None:
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name

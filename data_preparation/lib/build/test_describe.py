@@ -90,7 +90,6 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
 
 def test_validation_only_source_renders_rows() -> None:
     cfg = DatasetConfig(
-        name="t",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "pre": SourceConfig(kind="pretrain", loader="synthetic"),

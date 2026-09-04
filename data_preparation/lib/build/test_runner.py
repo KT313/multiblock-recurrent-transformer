@@ -54,7 +54,7 @@ def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
 
 def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
     sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i) for i in range(3)}
-    return cfg_factory(sources, tokens=600, name="three")
+    return cfg_factory(sources, tokens=600)
 
 
 # --- end to end ------------------------------------------------------------------------------------------------------
@@ -813,7 +813,7 @@ def _github_cfg(cfg_factory: CfgFactory, languages: list[str], **kwargs: Any) ->
         f"code_{lang.lower()}": SourceConfig(kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=lang)
         for lang in languages
     }
-    return cfg_factory(sources, tokens=15, name="code", **kwargs)
+    return cfg_factory(sources, tokens=15, **kwargs)
 
 
 def _code_rows(prefix: str, n: int) -> list[dict[str, Any]]:

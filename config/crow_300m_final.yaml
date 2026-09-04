@@ -34,8 +34,8 @@ allow_settings_change: false         # allow resuming although settings / model 
 
 # --- Run --------------------------------------------------------------------------------------------------------
 run_name: crow-300m-final            # name of the run: checkpoint file names, wandb run, resume lookup
-out_dir: outputs                     # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
-resume: true                         # resume from the most recently written checkpoint of run_name in out_dir if one exists
+out_dir: outputs                     # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log
+resume: true                         # resume from the most recently written checkpoint in the run directory if one exists
 resume_checkpoint_path: null         # explicit checkpoint to resume from (overrides the search); null: search
 seed: 233                            # seed for model init, the recurrence sampler and data order
 
@@ -85,9 +85,9 @@ partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at vali
 save_step_interval: 128              # write a checkpoint every this many steps (plus before every stage transition)
 save_last_step: true                 # write a checkpoint at the end of training
 logger_project: recurtrain-baseline  # wandb project
-wandb_offline: true                  # wandb offline mode (files under {out_dir}/wandb, sync later)
+wandb_offline: true                  # wandb offline mode (files under {out_dir}/{run_name}/wandb, sync later)
 wandb_enabled: true                  # false: no wandb at all
 
 # --- Export -----------------------------------------------------------------------------------------------------
 export_to_hf: false                  # write a HuggingFace trust_remote_code folder at the end of training
-export_hf_path: null                 # target of the export; null: {out_dir}/hf_export
+export_hf_path: null                 # target of the export; null: {out_dir}/{run_name}/hf_export

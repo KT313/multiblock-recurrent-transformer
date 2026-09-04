@@ -145,9 +145,7 @@ def test_config_round_trip() -> None:
     assert hf_cfg.num_hidden_layers == cfg.effective_expected_depth
     assert hf_cfg.tie_word_embeddings is True
     back = hf_cfg.to_recurrent_config()
-    expected = cfg.to_dict()
-    expected["name"] = ""  # the architecture label is not an HF field
-    assert back.to_dict() == expected
+    assert back.to_dict() == cfg.to_dict()
     assert back.head_size == cfg.head_size and back.mean_backprop_layers == cfg.mean_backprop_layers
 
 

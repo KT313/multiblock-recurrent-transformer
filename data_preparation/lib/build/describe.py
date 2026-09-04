@@ -30,7 +30,7 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
 
     config_file = Path(config_path).as_posix()
     lines: list[str] = [
-        f"# Dataset `{config.name}`",
+        f"# Dataset `{Path(config_path).stem}`",
         "",
         f"Generated from `{config_file}` with",
         "",

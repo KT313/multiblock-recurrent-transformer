@@ -120,7 +120,6 @@ def test_depth_arithmetic() -> None:
 
 def test_crow_architecture_yaml() -> None:
     cfg = RecurrentConfig.from_yaml(CROW_ARCHITECTURE)
-    assert cfg.name == "crow-300m-final"
     assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
     assert cfg.mean_recurrence == [12, 12, 12] and cfg.mean_backprop_depth == [8, 8, 8]
     assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
@@ -135,7 +134,6 @@ def test_crow_architecture_yaml() -> None:
 
 def test_tiny_architecture_yaml() -> None:
     cfg = tiny()
-    assert cfg.name == "tiny"
     assert (cfg.block_size, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
     assert (cfg.vocab_size, cfg.padded_vocab_size, cfg.head_size) == (512, 512, 16)
     assert cfg.n_layers_in_prelude == 2 and cfg.n_layers_in_coda == 1
@@ -170,7 +168,6 @@ def test_architecture_yamls_list_every_tunable_field() -> None:
 
 def test_from_yaml_applies_overrides() -> None:
     cfg = tiny(n_embd=32, num_attention_heads=2, mean_recurrence=[7, 9])
-    assert cfg.name == "tiny"
     assert cfg.n_embd == 32
     assert cfg.head_size == 16
     assert cfg.mean_recurrence == [7, 9]

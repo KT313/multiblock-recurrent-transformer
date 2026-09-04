@@ -45,6 +45,7 @@ from training.run import (
     prepare_run_directory,
     record_run_config,
     restore_checkpoint_if_resuming,
+    run_directory_of,
     stop_requested,
     train,
 )
@@ -122,7 +123,7 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
 
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
     run_directory = prepare_run_directory(tiny_settings)
-    assert run_directory == Path(tiny_settings.out_dir)
+    assert run_directory == Path(tiny_settings.out_dir) / "tiny" == run_directory_of(tiny_settings)
     assert checkpoint_dir(run_directory).is_dir()
     assert not (run_directory / "run_config.json").exists(), "written only for a FRESH run, by record_run_config"
     record_run_config(tiny_settings, run_directory)
@@ -134,14 +135,14 @@ def test_train_refuses_a_run_directory_another_run_holds(
     tiny_settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    `train()` takes the run-directory lock right after creating the directory and holds it for the whole run: a
+    `train()` takes the `out_dir` lock right after creating the run directory and holds it for the whole run: a
     second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
     `train.log` and `run_config.json` with the first one.
     """
 
     with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
-    assert list(checkpoint_dir(Path(tiny_settings.out_dir)).glob("*.pth")) == [], "nothing ran"
+    assert list(checkpoint_dir(run_directory_of(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
 
 def test_check_block_sizes_agree_message(tiny_settings: Settings) -> None:
@@ -297,9 +298,11 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
         report = _run(yaml_path)
     finally:
         mp.undo()
-    resolved = resolve_dataset(parse_settings(["--config", str(yaml_path)]))
+    settings = parse_settings(["--config", str(yaml_path)])
+    resolved = resolve_dataset(settings)
     return {
         "out_dir": out_dir,
+        "run_dir": run_directory_of(settings),
         "yaml": yaml_path,
         "report": report,
         "history": report.history,
@@ -313,14 +316,14 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
 def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str, Any]) -> None:
     history: History = full_run["history"]
     assert sorted(history) == list(range(1, 21))
-    names = sorted(p.name for p in checkpoint_dir(full_run["out_dir"]).glob("*.pth"))
+    names = sorted(p.name for p in checkpoint_dir(full_run["run_dir"]).glob("*.pth"))
     assert names == [
         "step-00000006-tiny-stage-0_end.pth",
         "step-00000014-tiny-stage-1_end.pth",
         "step-00000020-tiny.pth",
     ]
-    assert (full_run["out_dir"] / "run_config.json").exists()
-    assert (full_run["out_dir"] / "model_config.json").exists()
+    assert (full_run["run_dir"] / "run_config.json").exists()
+    assert (full_run["run_dir"] / "model_config.json").exists()
     for step, m in history.items():
         assert m["step"] == step and m["total_tokens"] == step * 4 * 256
         assert torch.isfinite(torch.tensor(m["loss"])) and m["grad_norm"] >= 0
@@ -330,7 +333,7 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
     validation_rows: dict[str, int] = full_run["validation_rows"]
     assert set(validation_rows) == {"synthetic_pretrain", "synthetic_instruct"} and min(validation_rows.values()) >= 1
     for name, step, stage in (("step-00000006-tiny-stage-0_end.pth", 6, 1), ("step-00000014-tiny-stage-1_end.pth", 14, 2)):
-        extra = torch.load(checkpoint_dir(full_run["out_dir"]) / name, map_location="cpu", weights_only=False)
+        extra = torch.load(checkpoint_dir(full_run["run_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
         assert extra["settings"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
         assert extra["model_config"]["block_size"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
@@ -346,7 +349,7 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
 
     report: TrainingReport = full_run["report"]
     history: History = full_run["history"]
-    assert report.run_directory == full_run["out_dir"]
+    assert report.run_directory == full_run["run_dir"]
     assert (report.steps_this_process, report.completed_steps, report.resumed_from, report.stopped) == (20, 20, None, False)
     assert report.setup_seconds == 0.0  # no `started_at` given
     assert report.train_seconds > 0.0
@@ -357,9 +360,9 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
         "step-00000014-tiny-stage-1_end.pth",
         "step-00000020-tiny.pth",
     ]
-    assert report.export_dir == full_run["out_dir"] / "hf_export"
+    assert report.export_dir == full_run["run_dir"] / "hf_export"
     summary = report.summary()
-    assert summary.startswith(f"Training run in {full_run['out_dir']}: 20 optimizer steps completed (final step 20, fresh start)")
+    assert summary.startswith(f"Training run in {full_run['run_dir']}: 20 optimizer steps completed (final step 20, fresh start)")
     assert "3 checkpoints written, last:" in summary and "HuggingFace export:" in summary
     assert "stopped on request" not in summary
 
@@ -368,11 +371,11 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
 def test_train_log_of_a_full_run(full_run: dict[str, Any]) -> None:
     """
     Under pytest stdout is not a TTY, so `RunLogger` opened the console fallback of the dashboard: the run left
-    `out_dir / train.log` with the header lines, one line per optimizer step (`log_step_interval: 1`), the
+    the run directory's `train.log` with the header lines, one line per optimizer step (`log_step_interval: 1`), the
     validation lines, the events (checkpoints, transitions, export) and the final line.
     """
 
-    log_text = (full_run["out_dir"] / TRAIN_LOG_NAME).read_text()
+    log_text = (full_run["run_dir"] / TRAIN_LOG_NAME).read_text()
     assert "Total training steps: 20 (2 micro-batches each)" in log_text
     assert "event: no checkpoint found, starting from scratch" in log_text
     assert "step 1/20 | stage 0 pretrain_a | " in log_text and "step 20/20 | stage 2 finetune | " in log_text
@@ -381,8 +384,8 @@ def test_train_log_of_a_full_run(full_run: dict[str, Any]) -> None:
     assert "event: transition complete, now in stage 1 (pretrain_b)" in log_text
     assert "step 8: validation val_loss " in log_text and "val_loss_1 " in log_text
     for name in ("step-00000006-tiny-stage-0_end.pth", "step-00000014-tiny-stage-1_end.pth", "step-00000020-tiny.pth"):
-        assert f"event: saved checkpoint {checkpoint_dir(full_run['out_dir']) / name}" in log_text
-    assert f"event: exported HuggingFace model to {full_run['out_dir'] / 'hf_export'}" in log_text
+        assert f"event: saved checkpoint {checkpoint_dir(full_run['run_dir']) / name}" in log_text
+    assert f"event: exported HuggingFace model to {full_run['run_dir'] / 'hf_export'}" in log_text
     assert "Training finished after 20 steps" in log_text
 
 
@@ -441,7 +444,7 @@ def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
 
 @pytest.mark.slow
 def test_export_to_hf_produces_loadable_folder(full_run: dict[str, Any]) -> None:
-    export_dir = full_run["out_dir"] / "hf_export"
+    export_dir = full_run["run_dir"] / "hf_export"
     assert (export_dir / "config.json").exists() and (export_dir / "model.safetensors").exists()
     model = AutoModelForCausalLM.from_pretrained(export_dir, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(export_dir)
@@ -453,7 +456,7 @@ def test_export_to_hf_produces_loadable_folder(full_run: dict[str, Any]) -> None
 
     # exported weights are the final checkpoint's weights
     final = torch.load(
-        checkpoint_dir(full_run["out_dir"]) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False
+        checkpoint_dir(full_run["run_dir"]) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False
     )["model"]
     wte = final["transformer.wte.weight"]
     assert torch.equal(model.model.transformer.wte.weight.detach(), wte)
@@ -477,7 +480,8 @@ def test_resume_with_changed_numerics_settings_is_refused_unless_allowed(
 
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
-    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()  # leave steps to run after the resume
+    run_dir = out_dir / "tiny"
+    (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()  # leave steps to run after the resume
     changed = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, grad_clip=0.5)
     with pytest.raises(ValueError, match=r"resuming with changed \['grad_clip'\]"):
         _run(changed)
@@ -494,12 +498,13 @@ def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp
 
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
-    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
-    original = json.loads((out_dir / "run_config.json").read_text())
+    run_dir = out_dir / "tiny"
+    (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
+    original = json.loads((run_dir / "run_config.json").read_text())
     assert original["log_step_interval"] != 4
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4)
     _run(yaml_path)  # log_step_interval is not numerics-relevant: the resume runs
-    assert json.loads((out_dir / "run_config.json").read_text()) == original
+    assert json.loads((run_dir / "run_config.json").read_text()) == original
 
 
 
@@ -516,15 +521,16 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
 
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
-    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
-    latest = find_latest_checkpoint(out_dir, "tiny")
+    run_dir = out_dir / "tiny"
+    (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
+    latest = find_latest_checkpoint(run_dir, "tiny")
     assert latest is not None and latest.name == "step-00000014-tiny-stage-1_end.pth"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False)
     report = _run(yaml_path)
     history = report.history
 
     assert sorted(history) == list(range(15, 21))  # steps 14..19 ran, nothing before
-    assert (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").exists()
+    assert (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").exists()
     assert report.resumed_from == latest  # the report names the checkpoint the run continued from
     assert (report.steps_this_process, report.completed_steps, report.stopped) == (6, 20, False)
     assert [p.name for p in report.checkpoints_written] == ["step-00000020-tiny.pth"]
@@ -537,7 +543,7 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert history[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in history.items() if "val_loss" in m] == [16, 20]
     assert history[16]["data_composition/synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
-    final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    final = torch.load(checkpoint_dir(run_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final["validation_rows"] == full_run["validation_rows"]  # the resumed run kept the split
 
 
@@ -568,7 +574,7 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
 
     full_dir = tmp_path / "full" / "out"
     history_full = _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir)).history
-    names = sorted(p.name for p in checkpoint_dir(full_dir).glob("*.pth"))
+    names = sorted(p.name for p in checkpoint_dir(full_dir / "tiny").glob("*.pth"))
     assert names == ["step-00000008-tiny-stage-0_end.pth", "step-00000016-tiny-stage-1_end.pth", "step-00000020-tiny.pth"]
 
     resumed_dir = tmp_path / "resumed" / "out"
@@ -577,7 +583,7 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
         tiny_dataset_dir,
         resumed_dir,
         resume=True,
-        resume_checkpoint_path=str(checkpoint_dir(full_dir) / "step-00000008-tiny-stage-0_end.pth"),
+        resume_checkpoint_path=str(checkpoint_dir(full_dir / "tiny") / "step-00000008-tiny-stage-0_end.pth"),
     )
     history = _run(yaml_path).history
     assert sorted(history) == list(range(9, 21))
@@ -587,8 +593,8 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
         assert torch.isfinite(torch.tensor(history[done]["loss"]))
     assert "val_loss" in history[16] and "val_loss" in history[20]
 
-    final_full = torch.load(checkpoint_dir(full_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
-    final_res = torch.load(checkpoint_dir(resumed_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    final_full = torch.load(checkpoint_dir(full_dir / "tiny") / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    final_res = torch.load(checkpoint_dir(resumed_dir / "tiny") / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final_res["step"] == 20
     # the data stream continued: rows consumed per source add up to the uninterrupted run's counters exactly
     # (no-transition config, worker batches of micro_batch_size 2 divide each step's draws: no buffered leftovers)
@@ -605,7 +611,7 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     """
 
     def consumed(directory: Path, name: str) -> dict[str, int]:
-        state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
+        state = torch.load(checkpoint_dir(directory / "tiny") / name, map_location="cpu", weights_only=False)
         return dict(state["data_stream"]["consumed_rows"])
 
     full_dir = tmp_path / "full" / "out"
@@ -616,7 +622,7 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     assert consumed(full_dir, "step-00000012-tiny.pth") == {"synthetic_pretrain": 48}
 
     resumed_dir = tmp_path / "resumed" / "out"
-    mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
+    mid = checkpoint_dir(full_dir / "tiny") / "step-00000012-tiny.pth"
     _run(
         _no_transition_yaml(
             tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid), **options
@@ -632,7 +638,7 @@ def test_resume_from_explicit_checkpoint_path(full_run: dict[str, Any], tmp_path
     `resume_checkpoint_path` resumes from that file into another run directory, on the plain schedule.
     """
 
-    ckpt = checkpoint_dir(full_run["out_dir"]) / "step-00000006-tiny-stage-0_end.pth"
+    ckpt = checkpoint_dir(full_run["run_dir"]) / "step-00000006-tiny-stage-0_end.pth"
     yaml_path = write_tiny_yaml(
         tmp_path, tiny_dataset_dir, tmp_path / "fresh_out", resume=True, resume_checkpoint_path=str(ckpt), export_to_hf=False
     )
@@ -655,7 +661,8 @@ def test_resume_with_changed_dataset_config_raises_unless_allowed(
 
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
-    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
+    run_dir = out_dir / "tiny"
+    (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
     yaml_path = _no_transition_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False)
     with pytest.raises(RuntimeError, match="dataset config hash"):
         _run(yaml_path)
@@ -678,8 +685,9 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
 
     out_dir = tmp_path / "out"
     shutil.copytree(full_run["out_dir"], out_dir)
-    (checkpoint_dir(out_dir) / "step-00000020-tiny.pth").unlink()
-    latest = checkpoint_dir(out_dir) / "step-00000014-tiny-stage-1_end.pth"
+    run_dir = out_dir / "tiny"
+    (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
+    latest = checkpoint_dir(run_dir) / "step-00000014-tiny-stage-1_end.pth"
     state = torch.load(latest, map_location="cpu", weights_only=False)
     k = state["validation_rows"]["synthetic_pretrain"]
     state["validation_rows"]["synthetic_pretrain"] = k + 1
@@ -691,7 +699,7 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
     yaml_path = write_tiny_yaml(tmp_path / "allowed", tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, allow_dataset_change=True)
     history = _run(yaml_path).history
     assert sorted(history) == list(range(15, 21))
-    final = torch.load(checkpoint_dir(out_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    final = torch.load(checkpoint_dir(run_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final["validation_rows"] == full_run["validation_rows"]  # the new checkpoint stores the current split
 
 
@@ -724,6 +732,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     """
 
     out_dir = tmp_path / "out"
+    run_dir = out_dir / "tiny"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=True)
     should_stop = StopAfterPolls(5)
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
@@ -732,16 +741,16 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (5, 5, None)
     assert sorted(report.history) == [1, 2, 3, 4, 5]
     assert [p.name for p in report.checkpoints_written] == ["step-00000005-tiny.pth"]
-    assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == ["step-00000005-tiny.pth"]
-    assert report.export_dir is None and not (out_dir / "hf_export").exists()
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000005-tiny.pth"]
+    assert report.export_dir is None and not (run_dir / "hf_export").exists()
     assert "stopped on request after step 5; rerun with resume: true to continue" in report.summary()
-    stored = torch.load(checkpoint_dir(out_dir) / "step-00000005-tiny.pth", map_location="cpu", weights_only=False)
+    stored = torch.load(checkpoint_dir(run_dir) / "step-00000005-tiny.pth", map_location="cpu", weights_only=False)
     assert (stored["step"], stored["stage"]) == (5, 0)
 
     (tmp_path / "resumed").mkdir()
     resumed_yaml = write_tiny_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, precision="32", export_to_hf=True, resume=True)
     resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
-    assert resumed.resumed_from == checkpoint_dir(out_dir) / "step-00000005-tiny.pth"
+    assert resumed.resumed_from == checkpoint_dir(run_dir) / "step-00000005-tiny.pth"
     assert (resumed.steps_this_process, resumed.completed_steps, resumed.stopped) == (15, 20, False)
     assert sorted(resumed.history) == list(range(6, 21))
     assert [p.name for p in resumed.checkpoints_written] == [
@@ -749,7 +758,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
         "step-00000014-tiny-stage-1_end.pth",
         "step-00000020-tiny.pth",
     ]
-    assert resumed.export_dir == out_dir / "hf_export" and (out_dir / "hf_export" / "config.json").exists()
+    assert resumed.export_dir == run_dir / "hf_export" and (run_dir / "hf_export" / "config.json").exists()
 
 
 @pytest.mark.slow
@@ -762,11 +771,12 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     """
 
     out_dir = tmp_path / "out"
+    run_dir = out_dir / "tiny"
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32")
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(6))
     assert report.stopped and report.completed_steps == 6
     assert [p.name for p in report.checkpoints_written] == ["step-00000006-tiny-stage-0_end.pth"]
-    assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == ["step-00000006-tiny-stage-0_end.pth"]
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000006-tiny-stage-0_end.pth"]
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -814,13 +824,11 @@ def test_resume_reproduces_the_uninterrupted_run(
     iterator seeds from a private generator instead of the global RNG.
     """
 
-    def run(directory: Path, **overrides: Any) -> TrainingReport:
-        directory.mkdir(parents=True, exist_ok=True)
-        yaml_path = write_tiny_yaml(directory, tiny_dataset_dir, directory / "out", precision="32", export_to_hf=False, **overrides)
-        return train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True, **overrides.pop("train", {}))
-
     with single_thread_deterministic():
-        full = run(tmp_path / "full").history
+        full_dir = tmp_path / "full"
+        full_dir.mkdir()
+        yaml_path = write_tiny_yaml(full_dir, tiny_dataset_dir, full_dir / "out", precision="32", export_to_hf=False)
+        full = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True).history
         stopped_dir = tmp_path / "stopped"
         stopped_dir.mkdir()
         yaml_path = write_tiny_yaml(stopped_dir, tiny_dataset_dir, stopped_dir / "out", precision="32", export_to_hf=False)

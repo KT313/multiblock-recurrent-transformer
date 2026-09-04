@@ -54,7 +54,6 @@ def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, b
     """
 
     return DatasetConfig(
-        name="two",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "a": SourceConfig(kind="pretrain", loader="synthetic", seed=0),

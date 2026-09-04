@@ -426,7 +426,7 @@ def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None
     if len(settings.stage_base_lrs) != len(dataset_config.stages):
         raise ValueError(
             f"stage_base_lrs has {len(settings.stage_base_lrs)} entries but dataset config "
-            f"{settings.dataset_config!r} ({dataset_config.name}) has {len(dataset_config.stages)} stages "
+            f"{settings.dataset_config!r} has {len(dataset_config.stages)} stages "
             f"{[stage.name for stage in dataset_config.stages]}; give one base LR per stage, in order"
         )
     if settings.block_size != dataset_config.block_size:
@@ -463,7 +463,7 @@ def _ensure_prepared(
             + build_command(settings.dataset_config, settings.dataset_dir)
         )
 
-    log.info("dataset %s is incomplete, preparing missing data (%s)", dataset_config.name, missing)
+    log.info("dataset %s is incomplete, preparing missing data (%s)", settings.dataset_config, missing)
     if backend is None or backend.is_main:
         with DataDashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
             try:

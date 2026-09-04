@@ -17,7 +17,6 @@ top-level keys, every field carries a `# ...` comment, `__post_init__` holds the
 that file; this is the shape:
 
 ```yaml
-name: crow-300m-final
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
 max_seq_length: 2048        # pretrain rows are truncated to this many tokens WHEN DOWNLOADED, instruct rows longer than
                             # this are dropped; raising it re-downloads raw (after confirmation), lowering it costs nothing
