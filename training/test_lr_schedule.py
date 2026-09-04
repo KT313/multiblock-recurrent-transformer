@@ -1,14 +1,14 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values, continuity at every stage
-transition and the resume warmup ramp.
+Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values and continuity at every stage
+transition.
 """
 
 from typing import Any
 
 import pytest
 
-from training.lr_schedule import SCHEDULES, _resume_warmup, get_lr_multistage
+from training.lr_schedule import SCHEDULES, get_lr_multistage
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 
@@ -160,44 +160,3 @@ def test_schedule_plateaus_and_cooldown_of_continuity_config() -> None:
     assert _lr(sm, 95) == pytest.approx(1e-3 + (2e-4 - 1e-3) * 5 / 10)
     assert _lr(sm, 190) == pytest.approx(6e-4 + (1e-4 - 6e-4) * 10 / 20)
     assert _lr(sm, 225) == pytest.approx(1e-4 * 5 / 10)
-
-
-def test_resume_warmup_helper() -> None:
-    assert _resume_warmup(0, 4, 0.0, 1e-4) == pytest.approx(0.0)
-    assert _resume_warmup(1, 4, 0.0, 1e-4) == pytest.approx(0.25e-4)
-    assert _resume_warmup(1, 4, 2e-5, 1e-4) == pytest.approx(2e-5 + 0.25 * 8e-5)
-
-
-def test_resume_warmup_applies_only_inside_the_ramp() -> None:
-    """
-    `get_lr_multistage` ramps for `resume_warmup_steps` steps after `resume_step` and is the plain schedule before
-    the resume, after the ramp, without a resume (`resume_step=-1`) and with the ramp disabled.
-    """
-
-    sm = _tiny_manager()
-    plateau = _lr(sm, 5)
-    kw = dict(resume_step=10, resume_warmup_steps=4)
-    assert _lr(sm, 10, **kw) == pytest.approx(0.0)
-    assert _lr(sm, 11, **kw) == pytest.approx(0.25 * _lr(sm, 11))
-    assert _lr(sm, 14, **kw) == pytest.approx(_lr(sm, 14))  # ramp over
-    assert _lr(sm, 9, **kw) == pytest.approx(_lr(sm, 9))  # before the resume
-    assert _lr(sm, 5, resume_step=-1, resume_warmup_steps=4) == pytest.approx(plateau)  # no resume
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=0) == pytest.approx(_lr(sm, 11))  # disabled
-
-
-def test_resume_warmup_ramps_from_min_lr_to_schedule() -> None:
-    sm = _tiny_manager()
-    kw = {"resume_step": 10, "resume_warmup_steps": 4, "min_lr": 0.0}
-    assert _lr(sm, 10, **kw) == pytest.approx(0.0)
-    assert _lr(sm, 11, **kw) == pytest.approx(0.25 * 1e-4)
-    assert _lr(sm, 13, **kw) == pytest.approx(0.75 * 1e-4)
-    assert _lr(sm, 14, **kw) == pytest.approx(1e-4)  # ramp over: back on the schedule
-    assert _lr(sm, 15, **kw) == pytest.approx(7.5e-5)
-    assert _lr(sm, 9, **kw) == pytest.approx(1e-4)  # steps before the resume are untouched
-
-
-def test_resume_warmup_respects_min_lr_and_disabled_cases() -> None:
-    sm = _tiny_manager()
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=4, min_lr=2e-5) == pytest.approx(2e-5 + 0.25 * 8e-5)
-    assert _lr(sm, 11, resume_step=-1, resume_warmup_steps=4) == pytest.approx(1e-4)
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=0) == pytest.approx(1e-4)

@@ -7,7 +7,7 @@
 # All step values are OPTIMIZER steps. One step = world_batch_size × block_size = 1024 × 2048 ≈ 2.1M tokens,
 # so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on 4 GPUs;
 # on one GPU the same world batch is 256 micro-batches of 4, so a step takes correspondingly longer.
-# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64, resume_warmup 512 → 8,
+# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64,
 #  save 8192 → 128, eval 1024 → 16.)
 #
 # Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/crow_300m_final.yaml;
@@ -35,7 +35,7 @@ allow_settings_change: false         # allow resuming although settings / model 
 # --- Run --------------------------------------------------------------------------------------------------------
 run_name: crow-300m-final            # name of the run: checkpoint file names, wandb run, resume lookup
 out_dir: outputs                     # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
-resume: true                         # resume from the latest checkpoint of run_name in out_dir if one exists
+resume: true                         # resume from the most recently written checkpoint of run_name in out_dir if one exists
 resume_checkpoint_path: null         # explicit checkpoint to resume from (overrides the search); null: search
 seed: 233                            # seed for model init, the recurrence sampler and data order
 
@@ -75,7 +75,6 @@ lr_schedule: trapezoid               # LR shape within and across stages (traini
 warmup_steps: 64                     # linear LR warmup steps at the start of training
 cooldown_steps: 64                   # LR cooldown steps at the end of training
 min_lr: 0                            # LR floor of warmup and cooldown
-resume_warmup_steps: 8               # LR ramps from min_lr back to the schedule over this many steps after a resume
 
 # --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
 log_step_interval: 1                 # log training metrics every this many steps

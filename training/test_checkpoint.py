@@ -4,6 +4,7 @@ Tests for the checkpoint schema (`CheckpointMetadata`), naming/search, the save 
 bit-identity and optimizer state.
 """
 
+import os
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from training.checkpoint import (
     SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME,
     CheckpointMetadata,
     _step_from_name,
+    check_param_groups_unchanged,
     check_settings_unchanged,
     checkpoint_dir,
     checkpoint_name,
@@ -133,7 +135,11 @@ def test_step_from_name() -> None:
     assert _step_from_name(Path("step-00000020-my-run.pth")) == 20
 
 
-def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp_path: Path) -> None:
+def test_find_latest_checkpoint_picks_the_newest_file_including_stage_end_names(tmp_path: Path) -> None:
+    """
+    The most recently written checkpoint of the run wins, whatever its step; equal times fall back to the step.
+    """
+
     assert find_latest_checkpoint(tmp_path, "tiny") is None
     d = checkpoint_dir(tmp_path)
     d.mkdir()
@@ -146,6 +152,7 @@ def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp
     ]
     for n in names:
         (d / n).touch()
+        os.utime(d / n, (1_000_000, 1_000_000))  # all written "at the same time"
 
     def latest(run_name: str) -> str:
         found = find_latest_checkpoint(tmp_path, run_name)
@@ -154,11 +161,17 @@ def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp
 
     assert latest("tiny") == "step-00000014-tiny-stage-1_end.pth"
     (d / checkpoint_name(9, "tiny")).touch()  # lexically later ("9" > "1") but a lower step
+    os.utime(d / checkpoint_name(9, "tiny"), (1_000_000, 1_000_000))
     assert latest("tiny") == "step-00000014-tiny-stage-1_end.pth"
     (d / checkpoint_name(20, "tiny")).touch()
+    os.utime(d / checkpoint_name(20, "tiny"), (1_000_000, 1_000_000))
     assert latest("tiny") == "step-00000020-tiny.pth"
     assert latest("other") == "step-00000099-other.pth"
     assert find_latest_checkpoint(tmp_path, "nothing") is None
+
+    # an explicit resume from step 6 wrote a new step 10 later: that file is the newest and wins over 14 and 20
+    os.utime(d / checkpoint_name(10, "tiny"), (2_000_000, 2_000_000))
+    assert latest("tiny") == "step-00000010-tiny.pth"
 
 
 @pytest.mark.parametrize("foreign", ["step-00000099-tiny-v2.pth", "step-00000099-other-tiny.pth"])
@@ -271,7 +284,7 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
-        resume_warmup_steps=10, wandb_enabled=False, export_to_hf=True, auto_prepare=False,
+        wandb_enabled=False, export_to_hf=True, auto_prepare=False,
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )
     check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
@@ -406,5 +419,36 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
     fresh = build_model(TINY_MODEL_ARCHITECTURE)
-    load_training_checkpoint(backend, path, Wrapper(fresh), ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3))
+    load_training_checkpoint(backend, path, Wrapper(fresh), ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
+
+
+def test_load_refuses_changed_optimizer_hyperparameters(
+    tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT
+) -> None:
+    """
+    `optimizer.load_state_dict` replaces the parameter groups with the checkpoint's, so an `optim_config` that
+    differs from the checkpoint's would silently lose: the load fails and names the differing keys.
+    """
+
+    opt, _ = _train_one_step(tiny_model)  # weight_decay 4e-5, betas (0.9, 0.95)
+    path = checkpoint_path(tmp_path, "tiny", 1)
+    save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model, step=1))
+
+    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    changed = ELLISAdam(get_param_groups(fresh, 0.5), lr=1e-3, betas=(0.8, 0.9))
+    with pytest.raises(ValueError, match=r"group 0: betas: checkpoint \(0\.9, 0\.95\) != current \(0\.8, 0\.9\)") as info:
+        load_training_checkpoint(backend, path, fresh, changed)
+    assert "weight_decay: checkpoint 4e-05 != current 0.5" in str(info.value)
+    assert "allow_settings_change cannot override this" in str(info.value)
+
+    same = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
+    load_training_checkpoint(backend, path, fresh, same)  # equal hyperparameters load fine, whatever the LR is
+
+
+def test_check_param_groups_unchanged() -> None:
+    check_param_groups_unchanged([{"betas": (0.9, 0.95)}], [{"betas": (0.9, 0.95)}])
+    with pytest.raises(ValueError, match="different number of optimizer parameter groups"):
+        check_param_groups_unchanged([{}], [{}, {}])
+    with pytest.raises(ValueError, match="group 1: eps: checkpoint 1e-08 != current 1e-06"):
+        check_param_groups_unchanged([{"eps": 1e-6}, {"eps": 1e-6}], [{"eps": 1e-6}, {"eps": 1e-8}])

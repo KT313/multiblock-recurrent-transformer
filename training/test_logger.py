@@ -100,6 +100,7 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
     logger = Logger("proj", "run", tmp_path / "out", offline=True, enabled=True)
     assert calls[0][1]["mode"] == "offline" and calls[0][1]["project"] == "proj"
     assert calls[0][1]["name"] == "run" and calls[0][1]["dir"] == str(tmp_path / "out")
+    assert calls[0][1]["group"] == "run" and calls[0][1]["tags"] == [] and calls[0][1]["config"] == {"resume_step": None}
     quiet = calls[0][1]["settings"]  # no stdout / stderr wrapping and no banner under the dashboard
     assert isinstance(quiet, _Settings) and quiet.values == WANDB_QUIET_SETTINGS == {"console": "off", "silent": True}
     assert (tmp_path / "out").is_dir()
@@ -116,6 +117,11 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
 
     Logger("proj", "run", tmp_path / "online", offline=False, enabled=True)
     assert calls[-1][1]["mode"] == "online"
+
+    Logger("proj", "run", tmp_path / "resumed", enabled=True, resume_step=1000)  # linked to the first process's run
+    resumed = calls[-1][1]
+    assert (resumed["name"], resumed["group"], resumed["tags"]) == ("run-from-1000", "run", ["resumed"])
+    assert resumed["config"] == {"resume_step": 1000}
 
 
 def test_to_scalar() -> None:

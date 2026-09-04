@@ -52,12 +52,20 @@ class Logger:
     """
     wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported).
 
-    The run is created quiet (`WANDB_QUIET_SETTINGS`): wandb's default console wrapping and banner lines would fight
-    the dashboard's stream capture.
+    Every process is its own wandb run, grouped under `run_name`; a resumed process is named
+    `<run_name>-from-<resume_step>` and tagged `resumed`, with `resume_step` in its config. (Continuing one wandb
+    run would drop the re-run steps below its last logged step.) The run is created quiet (`WANDB_QUIET_SETTINGS`):
+    wandb's default console wrapping and banner lines would fight the dashboard's stream capture.
     """
 
     def __init__(
-        self, project: str, run_name: str, out_dir: str | Path, offline: bool = True, enabled: bool = True
+        self,
+        project: str,
+        run_name: str,
+        out_dir: str | Path,
+        offline: bool = True,
+        enabled: bool = True,
+        resume_step: int | None = None,
     ) -> None:
         self.enabled = enabled
         self.run: Optional[Run] = None
@@ -68,8 +76,16 @@ class Logger:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         # the shared constant is a `dict[str, object]`; `wandb.Settings` types every field
         quiet = wandb.Settings(**cast(dict[str, Any], WANDB_QUIET_SETTINGS))
+        resumed = resume_step is not None
         self.run = wandb.init(
-            project=project, name=run_name, dir=str(out_dir), mode="offline" if offline else "online", settings=quiet
+            project=project,
+            name=f"{run_name}-from-{resume_step}" if resumed else run_name,
+            group=run_name,
+            tags=["resumed"] if resumed else [],
+            config={"resume_step": resume_step},
+            dir=str(out_dir),
+            mode="offline" if offline else "online",
+            settings=quiet,
         )
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
@@ -333,6 +349,7 @@ class RunLogger:
             run_directory,
             offline=settings.wandb_offline,
             enabled=settings.wandb_enabled,
+            resume_step=progress.resume_step if progress.resume_step >= 0 else None,
         )
         wandb.log_hyperparams(asdict(settings) | {"dataset_config_hash": dataset.config_hash})
         wandb.log_summary({"num_parameters": num_parameters(plain_model(model))})

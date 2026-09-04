@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.base import Backend
@@ -60,6 +61,7 @@ def build_dataloader(
     ignore_index: int = IGNORE_INDEX,
     pin_memory: bool = False,
     padded: bool = True,
+    generator: torch.Generator | None = None,
 ) -> DataLoader[Row]:
     """
     Loader over entries: a single per-source train entry, or a stage's val_data mixed by weight
@@ -84,6 +86,7 @@ def build_dataloader(
         ignore_index=ignore_index,
         pin_memory=pin_memory,
         padded=padded,
+        generator=generator,
     )
 
 
@@ -97,13 +100,15 @@ def dataloader_over(
     ignore_index: int = IGNORE_INDEX,
     pin_memory: bool = False,
     padded: bool = True,
+    generator: torch.Generator | None = None,
 ) -> DataLoader[Row]:
     """
     The `DataLoader` over one dataset with the run's collate function.
 
     padded (validation, the default) yields ready (input_ids, labels, data_ids) batches; padded=False
     (training) yields a `WorkerBatch`, padded later per micro-batch in `world_batch_micro_batches`. pin_memory
-    is the backend's decision.
+    is the backend's decision. generator is the source of the per-iterator base seed; without one, every
+    `iter()` draws it from the global torch RNG.
     """
 
     collate: Callable[[list[Row]], Any]
@@ -125,6 +130,7 @@ def dataloader_over(
         collate_fn=collate,
         num_workers=num_workers,
         prefetch_factor=4 if num_workers > 0 else None,
+        generator=generator,
     )
 
 
@@ -160,7 +166,7 @@ class RunDataloaders:
     def _start_train_iterator(self, source: str) -> Iterator[WorkerBatch]:
         """
         A fresh iterator over source's loader, its dataset set to start at the pending resume offset (0 when
-        none is pending). Numerics: each `iter(DataLoader)` draws one base seed from the global torch RNG.
+        none is pending).
         """
 
         offset = self.pending_offsets.pop(source, 0)
@@ -175,7 +181,7 @@ class RunDataloaders:
         Next worker batch of source's loader; restarts the loader when its epoch is over.
 
         The restart never spins on an empty range: setup guarantees at least one training row per source
-        (`check_entry_rows`). Numerics: the iterator is created lazily at the first pull and anew on every restart.
+        (`check_entry_rows`). The iterator is created lazily at the first pull and anew on every restart.
         """
 
         iterator = self._train_iterators[source]
@@ -214,10 +220,14 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
     One train loader per train source of `dataset` and one validation loader per stage (its entries mixed with
     constant weights). One tokenizer shared by every loader. Train loaders run `TRAIN_LOADER_NUM_WORKERS` worker each
     and yield unpadded samples; validation loaders read in-process and yield padded batches.
+
+    Every loader draws its iterator base seeds from one private generator, so creating an iterator (first pull,
+    epoch restart, each evaluation) leaves the global torch RNG alone and a resume replays the same latent noise.
     """
 
     tokenizer = Tokenizer(dataset.tokenizer_dir)
     shard = (backend.rank, backend.world_size)
+    generator = torch.Generator().manual_seed(settings.seed + backend.rank)  # the worker RNG itself is unused (no shuffle)
     train_datasets = {entry.prefix: entry_dataset(entry, shard) for entry in dataset.train_sources}
     train_loaders: dict[str, Iterable[WorkerBatch]] = {
         source: dataloader_over(
@@ -230,6 +240,7 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
             ignore_index=IGNORE_INDEX,
             pin_memory=backend.pin_memory,
             padded=False,
+            generator=generator,
         )
         for source, parquet_dataset in train_datasets.items()
     }
@@ -246,6 +257,7 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
             ignore_index=IGNORE_INDEX,
             pin_memory=backend.pin_memory,
             padded=True,
+            generator=generator,
         )
         for stage in dataset.stages
     ]

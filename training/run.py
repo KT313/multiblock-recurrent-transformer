@@ -20,8 +20,9 @@ live in `step.py` and `evaluation.py`, device code in `backend/`, console lines 
 The setup order is itself numerics: seed, dataset and loaders (no torch RNG draw), model (its init is the first RNG
 consumer), optimizer, resume (restores the stored RNG state). The golden run in `test_run.py` fails on any change.
 
-A resume repeats no rows (the checkpoint carries `BatchStream.state_dict()`) but is not bit-exact: buffered samples
-are skipped and fresh loader iterators draw new base seeds, so losses diverge while the data stream continues.
+A resume continues the run exactly (the checkpoint carries `BatchStream.state_dict()`, the RNG states and the
+optimizer state; the loaders seed their iterators from a private generator): on a deterministic backend the resumed
+steps reproduce the uninterrupted run's numbers, on a GPU the usual nondeterminism applies.
 
 The CLI around this is `training/train.py`; `TrainingReport` is defined next to `RunLogger` in `logger.py`.
 """
@@ -265,10 +266,10 @@ def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
     """
     Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
 
-    With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` in the run
-    directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and settings
-    against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step = checkpoint step`.
-    The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
+    With `settings.resume`: `resume_checkpoint_path` if set, else the most recently written checkpoint of `run_name`
+    in the run directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and
+    settings against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step =
+    checkpoint step`. The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
     """
 
     settings = state.settings

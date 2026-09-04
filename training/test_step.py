@@ -161,14 +161,13 @@ def test_training_progress_counts_steps() -> None:
     assert (resumed.step, resumed.resume_step) == (15, 14)
 
 
-def test_scheduled_learning_rate_follows_warmup_and_resume(settings: Settings) -> None:
+def test_scheduled_learning_rate_follows_warmup_and_cooldown(settings: Settings) -> None:
     stage_manager = reference_stage_manager(settings)  # 10 steps, warmup 2, cooldown 2, base LR 3e-4
     lrs = [scheduled_learning_rate(settings, stage_manager, TrainingProgress(step=s)) for s in range(10)]
     assert lrs[:5] == pytest.approx([0.0, 1.5e-4, 3e-4, 3e-4, 3e-4])
     assert lrs[8] == pytest.approx(3e-4) and lrs[9] == pytest.approx(1.5e-4)  # cooldown over the last 2 steps
-    settings.resume_warmup_steps = 2
     resumed = TrainingProgress(step=4, resume_step=4)
-    assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(0.0)  # ramp restarts at min_lr
+    assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(3e-4)  # a resume changes nothing
 
 
 def test_learning_rate_is_set_on_all_groups(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
@@ -547,6 +546,35 @@ def test_batch_stream_state_round_trip(tmp_path: Path, tiny_dataset_dir: Path, s
     assert _tags(resumed, 12) == continued
 
 
+def test_batch_stream_state_carries_the_buffered_samples(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Samples pulled from a loader but not yet trained on are part of the state: a resumed stream serves them first
+    instead of skipping them, so a checkpoint written inside a transition loses no rows.
+    """
+
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    loaders = RunDataloaders({tag: _ShortBatches(tag, [3, 3, 3]) for tag in "abc"}, [], stream_tokenizer, {})
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    next(stream)  # stage 0 draws 4 samples of `a` from worker batches of 3: two samples stay in the buffer
+    state = stream.state_dict()
+    assert state["consumed_rows"] == {"a": 6} and {k: len(v) for k, v in state["buffers"].items()} == {"a": 2}
+
+    resumed = BatchStream(
+        settings, RunDataloaders({tag: _ShortBatches(tag, [3, 3, 3]) for tag in "abc"}, [], stream_tokenizer, {}),
+        stage_manager, TrainingProgress(),
+    )
+    resumed.load_state_dict(state)
+    restored = resumed.state_dict()["buffers"]["a"]
+    assert [(ids.tolist(), labels.tolist(), tag) for ids, labels, tag in restored] == [
+        (ids.tolist(), labels.tolist(), tag) for ids, labels, tag in state["buffers"]["a"]
+    ]
+    next(resumed)  # the two buffered samples plus two new ones: one more worker batch is pulled
+    assert resumed.state_dict()["consumed_rows"] == {"a": 9}
+    assert {k: len(v) for k, v in resumed.state_dict()["buffers"].items()} == {"a": 1}
+
+
 def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
@@ -561,7 +589,7 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
     parquet = loaders.datasets["synthetic_pretrain"]
-    state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate()}
+    state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate(), "buffers": {}}
     stream.load_state_dict(state)
     assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
     next(stream)  # stage 0 draws from the pretrain source only: its reader starts now

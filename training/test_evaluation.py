@@ -169,8 +169,8 @@ def test_evaluate_iterates_the_loader_once(
 ) -> None:
     """
     CHANGED (was one `iter()` per depth): the batch-major loop creates exactly ONE iterator per evaluation.
-    Numerics: each `iter()` of a DataLoader draws a base seed from the global torch RNG, so the number of
-    iterations is part of the RNG stream (`training/golden_tiny_run.json` was re-recorded for it).
+    Each `iter()` of a DataLoader draws a base seed from the loaders' private generator, so the number of
+    iterations decides how far that generator advances.
     """
 
     settings.partial_depth_eval = [1]

@@ -77,14 +77,15 @@ class BatchStream:
     is never re-read. Each sample of a world batch comes from a source drawn with the current step's weights; the
     full world batch is then split and padded by `world_batch_micro_batches`.
 
-    Checkpointed (`state_dict`): the rows read per source (dropped rows included) and the draw RNG state.
+    Checkpointed (`state_dict`): the rows read per source (dropped rows included), the draw RNG state and the
+    samples still buffered per source.
 
     Reproducibility rules:
     - the draw RNG is `random.Random(seed + resume step)`, restored from a checkpoint when there is one; every
       sample draw consumes it
     - `progress.step` is read once per world batch, when its first micro-batch is requested
-    - loader iterators are created at a source's first pull and seed themselves from the global torch RNG, so the
-      creation order must stay deterministic
+    - loader iterators are created at a source's first pull; their base seeds come from the loaders' private
+      generator, never from the global torch RNG
     """
 
     def __init__(
@@ -107,26 +108,31 @@ class BatchStream:
 
     def state_dict(self) -> dict[str, Any]:
         """
-        What a checkpoint stores: the rows read per source (dropped rows included) and the draw RNG state. Old
-        checkpoint schemas have no loader (repo policy).
+        What a checkpoint stores: the rows read per source (dropped rows included), the draw RNG state and the
+        buffered samples per source. Old checkpoint schemas have no loader (repo policy).
         """
 
-        return {"consumed_rows": dict(self.consumed_rows), "draw_rng": self.rng.getstate()}
+        return {
+            "consumed_rows": dict(self.consumed_rows),
+            "draw_rng": self.rng.getstate(),
+            "buffers": {source: list(buffer) for source, buffer in self._buffers.items() if buffer},
+        }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it and
-        the draw RNG picks its state back up.
+        Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it,
+        the draw RNG picks its state back up and the buffered samples are trained on first.
 
-        "No repeated rows", not bit-exact: samples that sat in a buffer at checkpoint time were counted as read and
-        are skipped, and fresh loader iterators draw new base seeds, so a resume trains on unseen rows without
-        reproducing the interrupted run's losses. Counters are rows READ (dropped rows included), the unit the
-        offsets skip.
+        Counters are rows READ (dropped rows included), the unit the offsets skip. Buffered samples of a source
+        that no longer exists are dropped.
         """
 
         self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
         self.rng.setstate(state["draw_rng"])
         self.loaders.set_resume_offsets(self.consumed_rows)
+        for source, samples in state["buffers"].items():
+            if source in self._buffers:
+                self._buffers[source].extend(samples)
 
     def _next_sample(self, source: str) -> Sample:
         """
@@ -164,7 +170,7 @@ class BatchStream:
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:
     """
     The LR of optimizer step `progress.step`: trapezoid warmup / cooldown over the whole run, the per-stage base
-    LR in between (linearly interpolated inside a transition), the resume warmup after `progress.resume_step`.
+    LR in between (linearly interpolated inside a transition).
     """
 
     return get_lr_multistage(
@@ -175,8 +181,6 @@ def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, pro
         warmup_steps=settings.warmup_steps,
         cooldown_steps=settings.cooldown_steps,
         schedule=settings.lr_schedule,
-        resume_step=progress.resume_step,
-        resume_warmup_steps=settings.resume_warmup_steps,
     )
 
 

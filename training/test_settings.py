@@ -64,7 +64,6 @@ CROW_EXPLICIT: dict[str, Any] = {
     "warmup_steps": 64,
     "cooldown_steps": 64,
     "min_lr": 0.0,
-    "resume_warmup_steps": 8,
     "log_step_interval": 1,
     "log_gradient_metrics": True,
     "eval_step_interval": 16,

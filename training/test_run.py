@@ -29,6 +29,7 @@ from training.testing.golden import (
     golden_mismatches,
     golden_run_json,
     golden_run_metrics,
+    single_thread_deterministic,
     write_tiny_yaml,
 )
 from training import logger as logger_module
@@ -507,11 +508,10 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
     full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
     """
-    `resume: true` continues from the latest checkpoint of the run (here the stage-1_end one at step 14).
+    `resume: true` continues from the newest checkpoint of the run (here the stage-1_end one at step 14).
 
-    Losses cannot be compared exactly here: the resumed run rebuilds the loaders, whose fresh iterators draw base
-    seeds from the global torch RNG at points the uninterrupted run does not (see
-    `test_stage_boundary_resume_continues_schedule_and_stream` for what a resume does promise).
+    Losses are not compared here: `full_run` uses the settings' backend (bf16, a GPU when there is one);
+    `test_resume_reproduces_the_uninterrupted_run` asserts the bit-exactness on the CPU.
     """
 
     out_dir = tmp_path / "out"
@@ -562,10 +562,8 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
     the evaluation cadence, and the data stream picks up where the checkpoint stood. The resumed run ends with
     exactly the uninterrupted run's per-source consumed-row counters, having repeated no row.
 
-    It is deliberately NOT bit-exact any more: the run-wide readers live across stage boundaries, so a resumed
-    run's freshly created loader iterators draw base seeds from the global torch RNG at points the uninterrupted
-    run does not, and the losses diverge (the old per-stage loaders happened to make a stage-boundary resume
-    bit-exact because the next stage's loader had not been created yet).
+    Losses are not compared here (settings' backend, possibly a GPU); `test_resume_reproduces_the_uninterrupted_run`
+    does that on the CPU.
     """
 
     full_dir = tmp_path / "full" / "out"
@@ -629,26 +627,22 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
 
 
 @pytest.mark.slow
-def test_resume_from_explicit_checkpoint_path_with_resume_warmup(
-    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
-) -> None:
+def test_resume_from_explicit_checkpoint_path(full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    `resume_checkpoint_path` resumes from that file into another run directory, on the plain schedule.
+    """
+
     ckpt = checkpoint_dir(full_run["out_dir"]) / "step-00000006-tiny-stage-0_end.pth"
     yaml_path = write_tiny_yaml(
-        tmp_path,
-        tiny_dataset_dir,
-        tmp_path / "fresh_out",
-        resume=True,
-        resume_checkpoint_path=str(ckpt),
-        resume_warmup_steps=2,
-        export_to_hf=False,
+        tmp_path, tiny_dataset_dir, tmp_path / "fresh_out", resume=True, resume_checkpoint_path=str(ckpt), export_to_hf=False
     )
     report = _run(yaml_path)
     history = report.history
     assert sorted(history) == list(range(7, 21))
     assert report.resumed_from == ckpt
-    assert history[7]["lr"] == pytest.approx(0.0)  # step 6: ramp starts at min_lr
-    assert history[8]["lr"] == pytest.approx(0.5 * 2e-4)  # step 7: halfway to the schedule's 2e-4
-    assert history[9]["lr"] == pytest.approx(1e-4)  # step 8: back on the schedule
+    full: History = full_run["history"]
+    for done in range(7, 10):
+        assert history[done]["lr"] == pytest.approx(full[done]["lr"])  # no ramp: the scheduled LR right away
 
 
 @pytest.mark.slow
@@ -802,3 +796,49 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
     assert all("val_loss_1" in actual["steps"][str(s)] for s in (8, 16, 20))
     mismatches = golden_mismatches(expected, json.loads(golden_run_json(actual)), exact=golden_exact_requested())
     assert not mismatches, "golden run changed:\n" + "\n".join(mismatches)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# a resume reproduces the uninterrupted run (CPU, fp32, one thread, deterministic algorithms)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("stop_after", [5, 7, 14])  # a plain step, inside the 0 -> 1 transition, the stage-1 end
+def test_resume_reproduces_the_uninterrupted_run(
+    stop_after: int, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    A run stopped after `stop_after` steps and resumed from that checkpoint logs, from the first resumed step on,
+    exactly the losses, gradient norms and validation losses of the uninterrupted run: the checkpoint restores the
+    model, the optimizer, every RNG and the data stream including its buffered samples, and the loaders draw their
+    iterator seeds from a private generator instead of the global RNG.
+    """
+
+    def run(directory: Path, **overrides: Any) -> TrainingReport:
+        directory.mkdir(parents=True, exist_ok=True)
+        yaml_path = write_tiny_yaml(directory, tiny_dataset_dir, directory / "out", precision="32", export_to_hf=False, **overrides)
+        return train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True, **overrides.pop("train", {}))
+
+    with single_thread_deterministic():
+        full = run(tmp_path / "full").history
+        stopped_dir = tmp_path / "stopped"
+        stopped_dir.mkdir()
+        yaml_path = write_tiny_yaml(stopped_dir, tiny_dataset_dir, stopped_dir / "out", precision="32", export_to_hf=False)
+        settings = parse_settings(["--config", str(yaml_path)])
+        stopped = train(settings, backend=cpu_backend, should_stop=StopAfterPolls(stop_after), keep_history=True)
+        assert stopped.stopped and stopped.completed_steps == stop_after
+        resumed_yaml = write_tiny_yaml(
+            stopped_dir, tiny_dataset_dir, stopped_dir / "out", precision="32", export_to_hf=False, resume=True
+        )
+        resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
+
+    assert resumed.resumed_from == stopped.checkpoints_written[-1]
+    assert sorted(resumed.history) == list(range(stop_after + 1, 21))
+    for done in range(1, stop_after + 1):  # the stopped run itself matches the uninterrupted one
+        assert stopped.history[done]["loss"] == full[done]["loss"], done
+    for done in range(stop_after + 1, 21):
+        assert resumed.history[done]["loss"] == full[done]["loss"], done
+        assert resumed.history[done]["grad_norm"] == full[done]["grad_norm"], done
+        assert resumed.history[done]["lr"] == full[done]["lr"], done
+        for key in (k for k in full[done] if k.startswith("val_loss")):
+            assert resumed.history[done][key] == full[done][key], (done, key)

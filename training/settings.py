@@ -32,7 +32,6 @@ NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
     "save_step_interval",
     "warmup_steps",
     "cooldown_steps",
-    "resume_warmup_steps",
 )
 
 
@@ -78,7 +77,7 @@ class Settings:
     # Run
     run_name: str = "crow-300m"
     out_dir: str = "outputs"  # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
-    resume: bool = True  # resume from the latest checkpoint of `run_name` in `out_dir` if one exists
+    resume: bool = True  # resume from the most recently written checkpoint of `run_name` in `out_dir` if one exists
     resume_checkpoint_path: Optional[str] = None  # explicit checkpoint to resume from (overrides the search)
     seed: int = 1337
 
@@ -109,7 +108,6 @@ class Settings:
     warmup_steps: int = 0
     cooldown_steps: int = 0
     min_lr: float = 0.0
-    resume_warmup_steps: int = 0  # LR ramps from min_lr back to schedule over this many steps after a resume
 
     # Evaluation / logging / checkpoints
     log_step_interval: int = 1

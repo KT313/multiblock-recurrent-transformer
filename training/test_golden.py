@@ -28,15 +28,15 @@ def test_write_tiny_yaml_rewrites_paths_and_overrides(tmp_path: Path) -> None:
     a number stays a string), a new key is appended, and the result parses as settings.
     """
 
-    path = write_tiny_yaml(tmp_path, tmp_path / "data", tmp_path / "out", precision="32", resume_warmup_steps=2)
+    path = write_tiny_yaml(tmp_path, tmp_path / "data", tmp_path / "out", precision="32", prepare_pass_workers=2)
     assert path == tmp_path / "tiny.yaml"
     text = path.read_text()
     written = yaml.safe_load(text)
     assert written["out_dir"] == str(tmp_path / "out") and written["dataset_dir"] == str(tmp_path / "data")
     assert text.count("precision:") == 1 and written["precision"] == "32"
-    assert text.rstrip().endswith("resume_warmup_steps: 2")  # appended: tiny.yaml has no such key
+    assert text.rstrip().endswith("prepare_pass_workers: 2")  # appended: tiny.yaml has no such key
     settings = parse_settings(["--config", str(path)])
-    assert settings.precision == "32" and settings.resume_warmup_steps == 2 and settings.run_name == "tiny"
+    assert settings.precision == "32" and settings.prepare_pass_workers == 2 and settings.run_name == "tiny"
 
 
 def test_golden_exact_requested_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:

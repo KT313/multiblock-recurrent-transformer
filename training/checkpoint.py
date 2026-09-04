@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
@@ -89,7 +90,7 @@ def _step_from_name(path: Path) -> int:
 
 def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]:
     """
-    Highest-step checkpoint of `run_name` under `out_dir/checkpoints`, or None.
+    Most recently written checkpoint of `run_name` under `out_dir/checkpoints` (the step breaks ties), or None.
     """
 
     directory = checkpoint_dir(out_dir)
@@ -97,7 +98,9 @@ def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]
     candidates = [path for path in directory.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(path.name)]
     if not candidates:
         return None
-    return max(candidates, key=_step_from_name)
+    # the file time, not the step: after an explicit resume from an older checkpoint, a higher step of the
+    # abandoned trajectory must not win the next plain resume
+    return max(candidates, key=lambda path: (path.stat().st_mtime, _step_from_name(path)))
 
 
 # `restore_checkpoint_if_resuming` compares EVERY `Settings` field against the checkpoint (`allow_settings_change`
@@ -111,7 +114,6 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # the resume feature's own knobs: they exist to differ between the original run and its resume
     "resume",
     "resume_checkpoint_path",
-    "resume_warmup_steps",
     # the override flags themselves: comparing them would make the escape hatches refuse their own use
     "allow_settings_change",
     "allow_dataset_change",
@@ -228,11 +230,53 @@ def load_training_checkpoint(
     """
     Load the model and optimizer state in place and return the checkpoint's metadata.
 
-    The metadata is read first, so a checkpoint of an older layout fails before anything is modified.
+    The metadata is read first, so a checkpoint of an older layout fails before anything is modified. The
+    optimizer's parameter-group hyperparameters must match the checkpoint's (`check_param_groups_unchanged`).
     """
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
     unwrap_compiled(model).load_state_dict(state["model"])
+    expected = _group_hyperparameters(optimizer)
     optimizer.load_state_dict(state["optimizer"])
+    check_param_groups_unchanged(expected, _group_hyperparameters(optimizer))
     return metadata
+
+
+UNCOMPARED_GROUP_KEYS = ("params", "lr")  # `lr` is rewritten by the schedule every step
+
+
+def _group_hyperparameters(optimizer: Optimizer) -> list[dict[str, Any]]:
+    return [
+        {key: _plain(value) for key, value in group.items() if key not in UNCOMPARED_GROUP_KEYS}
+        for group in optimizer.param_groups
+    ]
+
+
+def _plain(value: Any) -> Any:
+    return value.item() if isinstance(value, torch.Tensor) and value.numel() == 1 else value
+
+
+def check_param_groups_unchanged(expected: list[dict[str, Any]], loaded: list[dict[str, Any]]) -> None:
+    """
+    Fail when the optimizer state of a checkpoint carried other parameter-group hyperparameters than the current
+    `optim_config` built (`optimizer.load_state_dict` replaces them, so the checkpoint's would silently win).
+    """
+
+    if len(expected) != len(loaded):
+        raise ValueError(
+            f"resuming with a different number of optimizer parameter groups ({len(loaded)} in the checkpoint, "
+            f"{len(expected)} built); start a fresh run"
+        )
+    differing = [
+        f"group {index}: {key}: checkpoint {after.get(key)!r} != current {before.get(key)!r}"
+        for index, (before, after) in enumerate(zip(expected, loaded))
+        for key in sorted(before.keys() | after.keys())
+        if before.get(key) != after.get(key)
+    ]
+    if differing:
+        raise ValueError(
+            "resuming with changed optimizer hyperparameters: " + "; ".join(differing) + "; the optimizer state is "
+            "restored from the checkpoint and would silently keep the checkpoint's values; allow_settings_change "
+            "cannot override this; keep the checkpoint's optim_config or start a fresh run"
+        )
