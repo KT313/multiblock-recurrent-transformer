@@ -28,6 +28,10 @@ data = [
   "ijson>=3.5.1",
   "zstandard>=0.25.0",
 ]
+# benchmark evaluation (evaluation/benchmarks.py)
+eval = [
+  "lm_eval>=0.4.8",
+]
 
 [dependency-groups]
 dev = [
@@ -47,7 +51,7 @@ package = false
 
 [tool.pytest.ini_options]
 addopts = "-q -n 4 --dist loadgroup"  # four workers: each imports torch and builds its own tiny dataset; -n 0 runs serially
-testpaths = ["model", "training", "data_preparation", "ui"]
+testpaths = ["model", "training", "data_preparation", "ui", "evaluation"]
 pythonpath = ["."]
 markers = [
   "gpu: needs a CUDA device (skipped otherwise)",
@@ -68,18 +72,18 @@ ignore = ["E501", "E731", "E741", "B008", "B905", "SIM108", "C408", "G004", "PLC
 
 [tool.mypy]
 python_version = "3.11"
-files = ["model", "training", "data_preparation", "ui", "conftest.py"]
+files = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["\\.venv/", "\\.claude/", "outputs/", "dataset/"]
 strict = true
 warn_unreachable = true
 # third-party packages without (complete) stubs
 [[tool.mypy.overrides]]
-module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*"]
+module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*", "lm_eval.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]
 pythonVersion = "3.11"
-include = ["model", "training", "data_preparation", "ui", "conftest.py"]
+include = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["**/__pycache__", ".venv", ".claude", "outputs", "dataset"]
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false

@@ -1,0 +1,112 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""
+Benchmark scores through lm-eval-harness (the `eval` extra), on the live model or a checkpoint.
+
+`lm_eval` is imported on first use, so training without the extra works until a benchmark is requested. The task
+datasets come from the HuggingFace Hub (network on first use).
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+from evaluation.wrapper import Recurrence, check_recurrence, hf_wrapper_around, isolated_inference, recurrence_label
+from model.model import RecurrentGPT
+from training.data.tokenizer import Tokenizer
+
+DEFAULT_TASKS: tuple[str, ...] = ("arc_challenge", "hellaswag", "mmlu", "winogrande")  # the thesis benchmarks
+BENCHMARKS_DIR = "benchmarks"  # under the run directory
+METRIC_PREFIX = "benchmark"  # wandb keys: benchmark/<recurrence label>/<task>/<metric>
+EVAL_EXTRA_HINT = "lm_eval is not installed: install the eval extra (uv sync --extra eval) to run benchmarks"
+
+
+def benchmarks_path(run_directory: Path, step: int) -> Path:
+    return run_directory / BENCHMARKS_DIR / f"step-{step:08d}.json"
+
+
+def evaluate_on_benchmarks(
+    model: RecurrentGPT,
+    tokenizer: Tokenizer,
+    tasks: Sequence[str] = DEFAULT_TASKS,
+    *,
+    num_fewshot: int = 0,
+    limit: int | None = None,
+    batch_size: int = 8,
+    recurrences: Sequence[Recurrence] = (None,),
+    out_path: Path | None = None,
+    step: int | None = None,
+) -> dict[str, float]:
+    """
+    Score the model on tasks with lm-eval-harness, once per recurrence setting (steps per core block, None: the
+    mean recurrence), and return `benchmark/<recurrence label>/<task>/<metric>` floats (stderr entries left out).
+    limit caps the examples per task. With out_path the full lm-eval results per setting (plus step and the
+    settings used) are written as JSON.
+    """
+
+    if not tasks:
+        raise ValueError("no benchmark tasks given")
+    if not recurrences:
+        raise ValueError("no recurrence setting given (None stands for the mean recurrence)")
+    for recurrence in recurrences:
+        check_recurrence(recurrence, model)
+    lm_eval, hf_models = _import_lm_eval()
+    metrics: dict[str, float] = {}
+    raw_results: dict[str, Any] = {}
+    versions: dict[str, Any] = {}
+    n_shot: dict[str, Any] = {}
+    for recurrence in recurrences:
+        with isolated_inference(model, recurrence):
+            wrapper = hf_wrapper_around(model, tokenizer)
+            language_model = hf_models.HFLM(pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size)
+            results: dict[str, Any] = lm_eval.simple_evaluate(
+                model=language_model, tasks=list(tasks), num_fewshot=num_fewshot, limit=limit
+            )
+        label = recurrence_label(recurrence)
+        metrics |= flatten_results(results["results"], label)
+        raw_results[label] = results["results"]
+        versions = results.get("versions", versions)
+        n_shot = results.get("n-shot", n_shot)
+    if out_path is not None:
+        record = {
+            "step": step,
+            "tasks": list(tasks),
+            "num_fewshot": num_fewshot,
+            "limit": limit,
+            "recurrences": [None if recurrence is None else list(recurrence) for recurrence in recurrences],
+            "metrics": metrics,
+            "results": raw_results,
+            "versions": versions,
+            "n-shot": n_shot,
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
+    return metrics
+
+
+def flatten_results(results: Mapping[str, Mapping[str, Any]], label: str) -> dict[str, float]:
+    """
+    lm-eval's per-task metric dicts (`{"acc,none": 0.23, "acc_stderr,none": 0.01, "alias": ...}`) as
+    `benchmark/<label>/<task>/<metric>` floats without the stderr entries; label names the recurrence setting.
+    """
+
+    flat: dict[str, float] = {}
+    for task, metrics in results.items():
+        for key, value in metrics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            name = key.split(",")[0]
+            if name.endswith("_stderr"):
+                continue
+            flat[f"{METRIC_PREFIX}/{label}/{task}/{name}"] = float(value)
+    return flat
+
+
+def _import_lm_eval() -> tuple[Any, Any]:
+    try:
+        return importlib.import_module("lm_eval"), importlib.import_module("lm_eval.models.huggingface")
+    except ImportError as error:
+        raise ImportError(EVAL_EXTRA_HINT) from error
