@@ -139,8 +139,9 @@ def train(
                 setup_started=started_at,
                 keep_history=keep_history,
             ) as logger:
-                if resume is None:
+                if resume is None or not (run_directory / "run_config.json").exists():
                     record_run_config(settings, run_directory)
+                if resume is None:
                     logger.log_fresh_start()
                 else:
                     logger.log_resume(resume.checkpoint, progress.step)
@@ -203,8 +204,8 @@ def prepare_run_directory(settings: Settings) -> Path:
 
 def record_run_config(settings: Settings, run_directory: Path) -> None:
     """
-    Write `run_config.json` (the settings as parsed) for a FRESH run only; a resume keeps the file the run was
-    started with.
+    Write `run_config.json` (the settings as parsed). A fresh run always writes it; a resume only into a run
+    directory without one (an explicit `resume_checkpoint_path` into a new directory) and keeps it otherwise.
     """
 
     with open(run_directory / "run_config.json", "w") as file:

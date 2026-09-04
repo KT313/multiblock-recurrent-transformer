@@ -7,7 +7,9 @@ CLI in `test_train.py`.
 """
 
 import json
+import math
 import shutil
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +20,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import RecurrentConfig, RecurrentGPT
+from training.backend.base import plain_model
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data.collate import IGNORE_INDEX
@@ -58,12 +61,14 @@ from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 History = dict[int, dict[str, float]]
 
 
-def _run(yaml_path: Path, backend: SingleDeviceBackend | None = None) -> TrainingReport:
+def _run(
+    yaml_path: Path, backend: SingleDeviceBackend | None = None, should_stop: Callable[[], bool] | None = None
+) -> TrainingReport:
     """
     Run training on the yaml (the backend of the settings unless one is given) and return its report.
     """
 
-    return train(parse_settings(["--config", str(yaml_path)]), backend=backend, keep_history=True)
+    return train(parse_settings(["--config", str(yaml_path)]), backend=backend, should_stop=should_stop, keep_history=True)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -654,6 +659,15 @@ def test_resume_from_explicit_checkpoint_path(full_run: dict[str, Any], tmp_path
     full: History = full_run["history"]
     for done in range(7, 10):
         assert history[done]["lr"] == pytest.approx(full[done]["lr"])  # no ramp: the scheduled LR right away
+    fresh_dir = tmp_path / "fresh_out" / "tiny"  # the new run directory holds everything a fresh one does
+    assert report.run_directory == fresh_dir
+    assert sorted(p.name for p in checkpoint_dir(fresh_dir).glob("*.pth")) == [
+        "step-00000014-tiny-stage-1_end.pth",
+        "step-00000020-tiny.pth",
+    ]
+    for name in ("run_config.json", "model_config.json", TRAIN_LOG_NAME, TRAIN_REPORT_NAME):
+        assert (fresh_dir / name).is_file(), name
+    assert json.loads((fresh_dir / "run_config.json").read_text())["resume_checkpoint_path"] == str(ckpt)
 
 
 @pytest.mark.slow
@@ -855,3 +869,135 @@ def test_resume_reproduces_the_uninterrupted_run(
         assert resumed.history[done]["lr"] == full[done]["lr"], done
         for key in (k for k in full[done] if k.startswith("val_loss")):
             assert resumed.history[done][key] == full[done][key], (done, key)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# resume edge cases: an abandoned trajectory, changed optimizer hyperparameters, the final checkpoint, the GPU path
+
+
+@pytest.mark.slow
+def test_plain_resume_picks_the_newest_file_over_an_abandoned_higher_step(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+) -> None:
+    """
+    An explicit resume from step 6 into a directory that still holds steps 14 and 20 writes step 9 and stops; the
+    next plain `resume: true` continues from 9 (the newest file), not from the abandoned step 20, and overwrites
+    the old files as it passes their steps.
+    """
+
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)  # copy2 keeps the modification times
+    run_dir = out_dir / "tiny"
+    step6 = checkpoint_dir(run_dir) / "step-00000006-tiny-stage-0_end.pth"
+    (tmp_path / "redo").mkdir()
+    redo_yaml = write_tiny_yaml(
+        tmp_path / "redo", tiny_dataset_dir, out_dir, resume=True, resume_checkpoint_path=str(step6), export_to_hf=False
+    )
+    redo = _run(redo_yaml, should_stop=StopAfterPolls(3))
+    assert redo.stopped and redo.completed_steps == 9 and redo.resumed_from == step6
+    assert [p.name for p in redo.checkpoints_written] == ["step-00000009-tiny.pth"]
+
+    (tmp_path / "again").mkdir()
+    again = _run(write_tiny_yaml(tmp_path / "again", tiny_dataset_dir, out_dir, resume=True, export_to_hf=False))
+    assert again.resumed_from == checkpoint_dir(run_dir) / "step-00000009-tiny.pth"
+    assert sorted(again.history) == list(range(10, 21))
+    assert [p.name for p in again.checkpoints_written] == ["step-00000014-tiny-stage-1_end.pth", "step-00000020-tiny.pth"]
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == [
+        "step-00000006-tiny-stage-0_end.pth",
+        "step-00000009-tiny.pth",
+        "step-00000014-tiny-stage-1_end.pth",
+        "step-00000020-tiny.pth",
+    ]
+
+
+@pytest.mark.slow
+def test_resume_with_changed_optim_config_is_refused_even_when_settings_changes_are_allowed(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+) -> None:
+    """
+    A resume with another weight decay fails with the parameter-group message although `allow_settings_change` is
+    set (the restored optimizer would silently keep the checkpoint's value); the checkpoint's value resumes.
+    """
+
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    (checkpoint_dir(out_dir / "tiny") / "step-00000020-tiny.pth").unlink()
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, allow_settings_change=True)
+    original = parse_settings(["--config", str(yaml_path)]).optim_config.weight_decay
+    changed = parse_settings(["--config", str(yaml_path), "--optim_config.weight_decay", str(original * 2 + 0.01)])
+    with pytest.raises(ValueError, match="resuming with changed optimizer hyperparameters") as excinfo:
+        train(changed)
+    assert "weight_decay" in str(excinfo.value) and "allow_settings_change cannot override" in str(excinfo.value)
+    report = train(parse_settings(["--config", str(yaml_path)]), keep_history=True)
+    assert sorted(report.history) == list(range(15, 21))
+
+
+@pytest.mark.slow
+def test_resume_from_the_final_checkpoint_runs_no_step_and_exports_again(
+    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+) -> None:
+    """
+    `resume: true` on a finished run restores step 20: no step runs, no checkpoint is written, the report says so,
+    and the export is written again.
+    """
+
+    out_dir = tmp_path / "out"
+    shutil.copytree(full_run["out_dir"], out_dir)
+    run_dir = out_dir / "tiny"
+    exported_config = run_dir / "hf_export" / "config.json"
+    written_before = exported_config.stat().st_mtime_ns
+    report = _run(write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=True))
+    assert report.resumed_from == checkpoint_dir(run_dir) / "step-00000020-tiny.pth"
+    assert (report.steps_this_process, report.completed_steps, report.stopped) == (0, 20, False)
+    assert report.history == {} and report.checkpoints_written == [] and report.last_loss is None
+    assert report.export_dir == run_dir / "hf_export" and exported_config.stat().st_mtime_ns > written_before
+    assert "0 optimizer steps completed (final step 20, resumed from" in report.summary()
+    assert "no step logged" in report.summary()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    The real run path (settings backend on CUDA, bf16 autocast, `compile_model`): a run stopped after step 5 leaves
+    a checkpoint whose model and optimizer tensors are what a fresh setup restores from it, and the resumed run
+    finishes with finite losses. Losses are not compared: cudnn benchmark and TF32 make the GPU path nondeterministic.
+    """
+
+    out_dir = tmp_path / "out"
+    run_dir = out_dir / "tiny"
+    yaml_path = write_tiny_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, precision="bf16-mixed", compile_model=True, export_to_hf=False
+    )
+    stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterPolls(5), keep_history=True)
+    assert stopped.stopped and stopped.completed_steps == 5
+    checkpoint = checkpoint_dir(run_dir) / "step-00000005-tiny.pth"
+    assert stopped.checkpoints_written == [checkpoint]
+
+    settings = parse_settings(["--config", str(yaml_path), "--resume", "true"])
+    backend = create_backend(settings)
+    assert backend.device.type == "cuda"
+    backend.seed_everything(settings.seed)
+    dataset = resolve_dataset(settings, backend)
+    stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+    model = build_run_model(settings, backend, run_dir)
+    optimizer = build_run_optimizer(settings, model, backend)
+    state = RunState(settings, run_dir, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
+    resume = restore_checkpoint_if_resuming(state)
+    assert resume is not None and resume.checkpoint == checkpoint and state.progress.step == 5
+    stored = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    restored_model = plain_model(model).state_dict()
+    assert restored_model.keys() == stored["model"].keys()
+    for name, tensor in restored_model.items():
+        assert torch.equal(tensor.cpu(), stored["model"][name]), name
+    restored_optimizer = optimizer.state_dict()["state"]
+    assert restored_optimizer.keys() == stored["optimizer"]["state"].keys()
+    for index, entry in restored_optimizer.items():
+        for key, value in entry.items():
+            assert torch.equal(value.cpu(), stored["optimizer"]["state"][index][key]), (index, key)
+    del state, model, optimizer
+
+    resumed = train(parse_settings(["--config", str(yaml_path), "--resume", "true"]), keep_history=True)
+    assert resumed.resumed_from == checkpoint and resumed.completed_steps == 20 and not resumed.stopped
+    assert sorted(resumed.history) == list(range(6, 21))
+    assert all(math.isfinite(metrics["loss"]) for metrics in resumed.history.values())
