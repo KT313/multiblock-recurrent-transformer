@@ -30,6 +30,8 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
 
     Returns `val_loss` / `val_ppl` (mean recurrence) plus `val_loss_<depth>` / `val_ppl_<depth>` per depth. The mean
     is over the batches actually seen (at most `eval_iters`), all-reduced; a loader that yields no batch is an error.
+    `val_loss/<data id>`: the per-token loss at the mean recurrence per validation source (the batch's data ids),
+    computed from the same logits, so `val_loss` itself is unchanged.
     """
 
     model.eval()
@@ -41,12 +43,18 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
         for depth in depths
     ]
     loss_sums = torch.zeros(len(depths), device=backend.device)
+    source_token_losses: dict[str, Tensor] = {}  # data id -> (summed token loss, token count) at the mean recurrence
     number_of_batches_seen = 0
-    for input_ids, labels, _ in islice(val_loader, settings.eval_iters):
+    for input_ids, labels, data_ids in islice(val_loader, settings.eval_iters):
         input_ids, labels = input_ids.to(backend.device), labels.to(backend.device)
+        logits: Tensor | None = None  # the last depth's (the mean recurrence)
         for depth_idx, steps in enumerate(steps_per_depth):
             with backend.autocast():
-                loss_sums[depth_idx] += model(input_ids, labels=labels, num_steps=steps)["loss"]
+                output = model(input_ids, labels=labels, num_steps=steps, return_logits=depth_idx == len(depths) - 1)
+            loss_sums[depth_idx] += output["loss"]
+            logits = output["logits"]
+        assert logits is not None
+        _add_source_token_losses(source_token_losses, plain_model(model), logits, labels, data_ids)
         number_of_batches_seen += 1
     if number_of_batches_seen == 0:
         model.train()  # leave the model as it was found, whichever way this returns
@@ -61,8 +69,32 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     for depth_idx, depth in enumerate(depths):
         metrics[f"val_loss_{depth}"] = losses[depth_idx]
         metrics[f"val_ppl_{depth}"] = losses[depth_idx].exp()
+    # every rank must have seen the same data ids: the stacked sums are reduced by position
+    per_source = backend.all_reduce(torch.stack([source_token_losses[data_id] for data_id in sorted(source_token_losses)]))
+    for data_id, (loss_sum, token_count) in zip(sorted(source_token_losses), per_source):
+        metrics[f"val_loss/{data_id}"] = loss_sum / token_count
     model.train()
     return metrics
+
+
+def _add_source_token_losses(
+    sums: dict[str, Tensor], model: Module, logits: Tensor, labels: Tensor, data_ids: list[str]
+) -> None:
+    """
+    Add each row's summed token loss and token count (the model's label masking) to its data id's entry.
+    """
+
+    n_classes = logits.shape[-1]
+    labels = labels.to(torch.long)
+    ignore_index = cast(int, model.ignore_index)
+    labels = labels.masked_fill((labels < 0) | (labels >= n_classes), ignore_index)
+    token_losses = torch.nn.functional.cross_entropy(
+        logits.view(-1, n_classes), labels.view(-1), ignore_index=ignore_index, reduction="none"
+    ).view(labels.shape)
+    counted = labels != ignore_index
+    for row, data_id in enumerate(data_ids):
+        entry = torch.stack([token_losses[row].sum(), counted[row].sum().to(token_losses.dtype)])
+        sums[data_id] = sums[data_id] + entry if data_id in sums else entry
 
 
 def is_evaluation_step(settings: Settings, completed_steps: int, stage_manager: StageManager) -> bool:

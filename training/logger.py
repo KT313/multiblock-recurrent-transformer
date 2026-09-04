@@ -13,11 +13,13 @@ ending in a `TrainingReport`.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from datetime import datetime
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -33,7 +35,7 @@ from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import KEEP, TRAIN_LOG_NAME, dashboard_enabled
+from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled
 from training.ui.fallback import ConsoleFallbackDashboard
 
 if TYPE_CHECKING:
@@ -155,7 +157,7 @@ def describe_parameters(model: Module) -> str:
 class TrainingReport:
     """
     What `train()` returns: the counts, times, last losses and files of one run (built by `RunLogger.close`,
-    re-exported by `training/run.py`).
+    re-exported by `training/run.py`); `close` also writes it as `train_report.json` into the run directory.
     """
 
     run_directory: Path
@@ -171,9 +173,28 @@ class TrainingReport:
     stopped: bool = False  # the run stopped on request (the CLI's Ctrl-C) before its last step
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step, only with `keep_history`
 
+    def to_dict(self) -> dict[str, Any]:
+        """
+        The report as JSON-ready data: paths as strings, `history` left out (the wandb file holds the metrics),
+        plus `written_at` (local time).
+        """
+
+        data = {name: value for name, value in asdict(self).items() if name != "history"}
+        for name in ("run_directory", "resumed_from", "export_dir"):
+            data[name] = None if data[name] is None else str(data[name])
+        data["checkpoints_written"] = [str(path) for path in self.checkpoints_written]
+        data["written_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        return data
+
+    def write_json(self, path: Path) -> None:
+        with open(path, "w") as file:
+            json.dump(self.to_dict(), file, indent=2)
+            file.write("\n")
+
     def summary(self) -> str:
         """
-        The lines the CLI prints after `train()` returned.
+        The lines the CLI prints after `train()` returned (the per-depth validation losses; the per-source ones
+        are in the JSON report).
         """
 
         origin = f"resumed from {self.resumed_from}" if self.resumed_from is not None else "fresh start"
@@ -187,7 +208,9 @@ class TrainingReport:
         loss = f"last loss {self.last_loss:.4f}" if self.last_loss is not None else "no step logged"
         if self.last_validation:
             losses = ", ".join(
-                f"{name} {value:.4f}" for name, value in self.last_validation.items() if name.startswith("val_loss")
+                f"{name} {value:.4f}"
+                for name, value in self.last_validation.items()
+                if name.startswith("val_loss") and "/" not in name
             )
             lines.append(f"  {loss} | last validation: {losses}")
         else:
@@ -490,7 +513,8 @@ class RunLogger:
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
         * `data_composition/<data id>`: the fraction of world-batch samples per data id since the last log step;
-        * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`, `val_time`).
+        * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`,
+          `val_loss/<data id>` per validation source, `val_time`).
         """
 
         self._sample_counter.update(result.data_ids)
@@ -582,7 +606,8 @@ class RunLogger:
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
         """
         End the run's logging: `train_time` into the wandb summary, the final console line and status, the
-        dashboard closed; returns the report. `stopped` says the run ended on request before its last step.
+        dashboard closed; returns the report, also written to `train_report.json` in the run directory (the last
+        process's report; a resume overwrites it). `stopped` says the run ended on request before its last step.
         """
 
         train_seconds = self._clock() - self._train_started
@@ -592,7 +617,7 @@ class RunLogger:
         console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.status(ending)
         self._exit_stack.close()
-        return TrainingReport(
+        report = TrainingReport(
             run_directory=self.run_directory,
             steps_this_process=progress.step - self.start_step,
             completed_steps=progress.step,
@@ -606,6 +631,8 @@ class RunLogger:
             stopped=stopped,
             history=self.history,
         )
+        report.write_json(self.run_directory / TRAIN_REPORT_NAME)
+        return report
 
 
 # --- gradient / parameter metrics -----------------------------------------------------------------------------------

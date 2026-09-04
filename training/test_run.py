@@ -53,7 +53,7 @@ from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
-from training.ui.common import TRAIN_LOG_NAME
+from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
 History = dict[int, dict[str, float]]
 
@@ -355,6 +355,11 @@ def test_training_report_of_a_full_run(full_run: dict[str, Any]) -> None:
     assert report.train_seconds > 0.0
     assert report.last_loss == history[20]["loss"]
     assert report.last_validation["val_loss"] == history[20]["val_loss"] and report.last_validation["val_time"] >= 0.0
+    per_source = {key for key in report.last_validation if key.startswith("val_loss/")}
+    assert per_source == {"val_loss/finetune-synthetic_instruct"}  # the finetune stage validates on one source
+    written = json.loads((full_run["run_dir"] / TRAIN_REPORT_NAME).read_text())
+    assert written["completed_steps"] == 20 and written["last_validation"] == report.last_validation
+    assert "history" not in written and written["checkpoints_written"][-1].endswith("step-00000020-tiny.pth")
     assert [p.name for p in report.checkpoints_written] == [
         "step-00000006-tiny-stage-0_end.pth",
         "step-00000014-tiny-stage-1_end.pth",

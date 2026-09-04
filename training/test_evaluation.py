@@ -62,7 +62,7 @@ def test_evaluate_reports_every_depth(
     monkeypatch.setattr(RecurrentGPT, "forward", spy)
     torch.manual_seed(1)  # the latent state is drawn from the global RNG; batch 1 is scored at every depth first
     metrics = evaluate(settings, cpu_backend, tiny_model, batches)
-    expected = {"val_loss", "val_ppl"} | {f"val_{k}_{d}" for k in ("loss", "ppl") for d in (1, 3, "[2, 2]")}
+    expected = {"val_loss", "val_ppl", "val_loss/v"} | {f"val_{k}_{d}" for k in ("loss", "ppl") for d in (1, 3, "[2, 2]")}
     assert set(metrics) == expected
     assert all(torch.isfinite(v) for v in metrics.values())
     assert metrics["val_loss"] == metrics["val_loss_[2, 2]"]
@@ -187,6 +187,46 @@ def test_evaluate_iterates_the_loader_once(
 
     evaluate(settings, cpu_backend, tiny_model, CountingLoader())
     assert iterations == 1  # depth 1 and the mean recurrence share the one pass over the loader
+
+
+def test_evaluate_reports_the_per_token_loss_per_validation_source(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    `val_loss/<data id>` is the token-weighted mean loss of that source's rows at the mean recurrence, over the
+    batches seen; `val_loss` itself (the mean of the batch means) is unchanged by the bookkeeping.
+    """
+
+    settings.partial_depth_eval = [1]
+    settings.eval_iters = 2
+    torch.manual_seed(0)
+    batches = _batches(3)
+    batches = [(x, y, ["a", "b"]) for x, y, _ in batches]
+    batches[1][1][1, :6] = -100  # six ignored tokens in a row of source b
+    torch.manual_seed(1)
+    metrics = evaluate(settings, cpu_backend, tiny_model, batches)
+    assert {key for key in metrics if key.startswith("val_loss/")} == {"val_loss/a", "val_loss/b"}
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        tiny_model.eval()
+        sums = {"a": [0.0, 0], "b": [0.0, 0]}
+        batch_means = []
+        for x, y, ids in batches[:2]:
+            tiny_model(x, labels=y, num_steps=[(1, 0), (1, 0)])  # the depth-1 forward draws its latent state first
+            logits = tiny_model(x, labels=y, num_steps=[(2, 0), (2, 0)], return_logits=True)["logits"]
+            assert logits is not None
+            token_losses = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.shape[-1]), y.view(-1), ignore_index=-100, reduction="none"
+            ).view(y.shape)
+            batch_means.append(token_losses.sum() / (y != -100).sum())
+            for row, data_id in enumerate(ids):
+                sums[data_id][0] += float(token_losses[row].sum())
+                sums[data_id][1] += int((y[row] != -100).sum())
+    for data_id, (loss_sum, count) in sums.items():
+        assert metrics[f"val_loss/{data_id}"].item() == pytest.approx(loss_sum / count, rel=1e-5)
+    assert metrics["val_loss"].item() == pytest.approx(torch.stack(batch_means).mean().item(), rel=1e-5)
+    assert metrics["val_loss/a"] != metrics["val_loss/b"]
 
 
 def test_is_evaluation_step_table(settings: Settings) -> None:

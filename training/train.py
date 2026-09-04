@@ -11,7 +11,8 @@ saves a checkpoint and exits 130; during the in-process dataset build it stops a
 
 Console: one stderr handler on the `training` and `data_preparation` logger hierarchies (`configure_console_logging`).
 `RunLogger` opens the terminal dashboard of `training/ui/` for the run (the live display on a TTY, the one-line
-fallback when piped or with `TRAINING_DASHBOARD=0`, `<out_dir>/<run_name>/train.log` in both cases); it swaps the `training`
+fallback when piped or with `TRAINING_DASHBOARD=0`, `<out_dir>/<run_name>/train.log` in both cases, and the report as
+`train_report.json` next to it); it swaps the `training`
 handler out for the duration, so nothing prints twice.
 
 Exit codes: 0 finished, 1 failed (traceback logged), 3 another run holds the lock (the message names its pid and

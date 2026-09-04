@@ -29,6 +29,7 @@ from ui.capture import attach_logger
 from training.ui.capture import TerminalCapture, line_handler, run_log_handlers
 from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
+    depth_losses,
     METRIC_COLUMNS,
     event_line,
     fit_panel_heights,
@@ -285,7 +286,8 @@ class TrainingDashboard(LiveDisplay):
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """
-        The validation losses measured after step (one entry per recurrence depth, e.g. val_loss_4).
+        The validation losses measured after step (per recurrence depth, e.g. val_loss_4, and per source,
+        val_loss/<data id>); the table shows the depths, the log line everything.
         """
 
         self._guarded(lambda: self._apply_validation(step, losses))
@@ -335,7 +337,7 @@ class TrainingDashboard(LiveDisplay):
 
     def _apply_validation(self, step: int, losses: Mapping[str, object]) -> None:
         with self._lock:
-            self._validation = (step, floats(losses))
+            self._validation = (step, depth_losses(floats(losses)))  # per-source losses: log line and wandb only
 
     def _apply_event(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")

@@ -7,6 +7,7 @@ recording fake and on a real `TrainingDashboard` over a StringIO console, the fa
 """
 
 import io
+import json
 import logging
 import math
 import sys
@@ -44,7 +45,7 @@ from training.step import StepResult, TrainingProgress
 from training.test_step import reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import TRAIN_LOG_NAME
+from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 from training.ui.fallback import ConsoleFallbackDashboard
 
 
@@ -699,6 +700,21 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     assert report.last_loss == 2.0 and report.last_validation == {}
     assert report.checkpoints_written == [first, second] and report.export_dir == export_dir
     assert sorted(report.history) == [5, 6, 7] and report.history is run_logger.history
+    written = json.loads((tmp_path / TRAIN_REPORT_NAME).read_text())
+    assert written.pop("written_at").startswith("20")
+    assert written == {
+        "run_directory": str(tmp_path),
+        "steps_this_process": 3,
+        "completed_steps": 7,
+        "resumed_from": str(resume_path),
+        "setup_seconds": 10.0,
+        "train_seconds": 6.0,
+        "last_loss": 2.0,
+        "last_validation": {},
+        "checkpoints_written": [str(first), str(second)],
+        "export_dir": str(export_dir),
+        "stopped": False,
+    }
     assert report.summary() == "\n".join(
         [
             f"Training run in {tmp_path}: 3 optimizer steps completed (final step 7, resumed from {resume_path})",

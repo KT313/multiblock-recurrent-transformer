@@ -137,6 +137,9 @@ def test_validation_losses_render_per_depth(board: TrainingDashboard) -> None:
     text = board.render_text()
     assert "validation (step 10)" in text
     assert "val_loss_4" in text and "3.4567" in text and "val_loss_8" in text and "3.2000" in text and "3.1000" in text
+    board.update_validation(20, {"val_loss_4": 2.6, "val_loss": 2.5, "val_loss/pretrain-a": 2.75})  # per-source: log line only
+    text = board.render_text()
+    assert "validation (step 20)" in text and "2.5000" in text and "val_loss/pretrain-a" not in text and "2.7500" not in text
 
 
 def test_events_list_keeps_the_last_lines(clock: FakeClock) -> None:
