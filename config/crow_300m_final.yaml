@@ -91,3 +91,19 @@ wandb_enabled: true                  # false: no wandb at all
 # --- Export -----------------------------------------------------------------------------------------------------
 export_to_hf: false                  # write a HuggingFace trust_remote_code folder at the end of training
 export_hf_path: null                 # target of the export; null: {out_dir}/{run_name}/hf_export
+
+# --- Samples and benchmarks (evaluation/) ----------------------------------------------------------------------------
+# Both run RNG-isolated, so they never change the training numerics; files go to {run dir}/samples/ and
+# {run dir}/benchmarks/, named by step. Benchmarks need the eval extra (uv sync --extra eval) and network.
+sample_step_interval: 0              # write sample generations every this many steps (0: never)
+sample_at_training_progress: [100]   # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+sample_max_new_tokens: 64            # tokens generated per prompt
+sample_temperature: 0.0              # 0: greedy decoding
+sample_recurrences: []               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
+benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
+benchmark_at_training_progress: []   # ... and at these percentages of the run, like sample_at_training_progress
+benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
+benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
+benchmark_num_fewshot: 0
+benchmark_batch_size: 8              # sequences per lm-eval forward
+benchmark_recurrences: []            # like sample_recurrences, for the benchmarks

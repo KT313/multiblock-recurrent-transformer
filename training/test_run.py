@@ -56,6 +56,7 @@ from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress
+from evaluation.prompts import DEFAULT_PROMPTS
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
 History = dict[int, dict[str, float]]
@@ -1001,3 +1002,107 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
     assert resumed.resumed_from == checkpoint and resumed.completed_steps == 20 and not resumed.stopped
     assert sorted(resumed.history) == list(range(6, 21))
     assert all(math.isfinite(metrics["loss"]) for metrics in resumed.history.values())
+
+
+# --------------------------------------------------------------------------------------------------------------
+# samples and benchmarks during training (evaluation/)
+
+
+@pytest.mark.slow
+def test_samples_during_and_after_training_leave_the_numerics_unchanged(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    Sampling every 10 steps and at 0, 50 and 100 percent of the 20-step run writes `samples/step-00000001.jsonl`,
+    `step-00000010.jsonl` (50 % and the interval coincide: once) and `step-00000020.jsonl`, and every training loss
+    equals the run without sampling: the generations run RNG-isolated.
+    """
+
+    for name in ("plain", "sampling"):
+        (tmp_path / name).mkdir()
+    plain_yaml = write_tiny_yaml(tmp_path / "plain", tiny_dataset_dir, tmp_path / "plain" / "out", precision="32", export_to_hf=False)
+    sampling_yaml = write_tiny_yaml(
+        tmp_path / "sampling", tiny_dataset_dir, tmp_path / "sampling" / "out", precision="32", export_to_hf=False,
+        sample_step_interval=10, sample_at_training_progress=[0, 50, 100], sample_max_new_tokens=4,
+        sample_recurrences=[[1, 1], [2, 2]],
+    )
+    with single_thread_deterministic():
+        plain = train(parse_settings(["--config", str(plain_yaml)]), backend=cpu_backend, keep_history=True)
+        sampling = train(parse_settings(["--config", str(sampling_yaml)]), backend=cpu_backend, keep_history=True)
+    assert sorted(plain.history) == sorted(sampling.history) == list(range(1, 21))
+    for done in plain.history:
+        assert sampling.history[done]["loss"] == plain.history[done]["loss"], done
+    run_dir = tmp_path / "sampling" / "out" / "tiny"
+    expected = ["step-00000001.jsonl", "step-00000010.jsonl", "step-00000020.jsonl"]
+    assert [p.name for p in sampling.samples_written] == expected
+    assert sorted(p.name for p in (run_dir / "samples").glob("*.jsonl")) == expected
+    lines = [json.loads(line) for line in (run_dir / "samples" / "step-00000010.jsonl").read_text().split("\n")[:-1]]
+    prompts = [prompt.text for prompt in DEFAULT_PROMPTS]  # the built-in prompts, once per recurrence setting
+    assert [line["prompt"] for line in lines] == prompts + prompts
+    assert [line["recurrence"] for line in lines] == len(prompts) * [[1, 1]] + len(prompts) * [[2, 2]]
+    assert all(line["step"] == 10 and line["new_tokens"] <= 4 for line in lines)
+    assert plain.samples_written == [] and not (tmp_path / "plain" / "out" / "tiny" / "samples").exists()
+    log_text = (run_dir / TRAIN_LOG_NAME).read_text()
+    assert f"event: wrote {2 * len(prompts)} samples to" in log_text and "event: sample: 'The Eiffel Tower" in log_text
+    assert "3 samples files written, last:" in sampling.summary()
+    assert "samples after steps: 1, 10, 20" in log_text
+    written = json.loads((run_dir / TRAIN_REPORT_NAME).read_text())
+    assert [Path(p).name for p in written["samples_written"]] == expected
+
+
+@pytest.mark.slow
+def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    With a stubbed lm_eval: benchmarks every 10 steps and at the end write `benchmarks/step-XXXXXXXX.json`, the
+    scores reach the report, the JSON report and the log; a harness that raises leaves the run finishing with a
+    warning and no scores.
+    """
+
+    from evaluation.benchmarks import flatten_results
+    from evaluation.test_benchmarks import RESULTS, stub_lm_eval
+
+    calls = stub_lm_eval(monkeypatch)
+    out_dir = tmp_path / "out"
+    yaml_path = write_tiny_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=False, sample_at_training_progress=[],
+        benchmark_step_interval=10, benchmark_at_training_progress=[100], benchmark_tasks=["arc_easy", "hellaswag"], benchmark_limit=5,
+    )
+    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True)
+    run_dir = out_dir / "tiny"
+    assert sorted(p.name for p in (run_dir / "benchmarks").glob("*.json")) == ["step-00000010.json", "step-00000020.json"]
+    assert report.last_benchmarks == flatten_results(RESULTS, "mean") and report.completed_steps == 20
+    assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"] and calls["evaluate"]["limit"] == 5
+    assert json.loads((run_dir / "benchmarks" / "step-00000020.json").read_text())["step"] == 20
+    assert json.loads((run_dir / TRAIN_REPORT_NAME).read_text())["last_benchmarks"] == report.last_benchmarks
+    log_text = (run_dir / TRAIN_LOG_NAME).read_text()
+    assert "event: benchmark arc_easy (recurrence mean) at step 10: acc 0.2500, acc_norm 0.3000" in log_text
+    assert "benchmarks: mean/arc_easy/acc 0.2500" in report.summary()
+
+    stub_lm_eval(monkeypatch, error=RuntimeError("no network"))
+    (tmp_path / "failing").mkdir()
+    failing_yaml = write_tiny_yaml(
+        tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", precision="32", export_to_hf=False,
+        sample_at_training_progress=[], benchmark_at_training_progress=[100], benchmark_tasks=["arc_easy"],
+    )
+    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, keep_history=True)
+    assert failing.completed_steps == 20 and failing.last_benchmarks == {} and not failing.stopped
+    assert not (tmp_path / "failing" / "out" / "tiny" / "benchmarks").exists()
+    assert "benchmark evaluation failed: no network" in (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
+
+
+def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    A recurrence setting with the wrong number of entries fails `train()` before the run directory exists.
+    """
+
+    out_dir = tmp_path / "out"
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, sample_recurrences=[[4, 4], [4, 4, 4]])
+    with pytest.raises(ValueError, match=r"sample_recurrences\[1\] = \[4, 4, 4\] has 3 entries .* 2 recurrent blocks"):
+        train(parse_settings(["--config", str(yaml_path)]))
+    assert not out_dir.exists()
+    (tmp_path / "b").mkdir()
+    yaml_path = write_tiny_yaml(tmp_path / "b", tiny_dataset_dir, out_dir, benchmark_recurrences=[[1]])
+    with pytest.raises(ValueError, match=r"benchmark_recurrences\[0\]"):
+        train(parse_settings(["--config", str(yaml_path)]))

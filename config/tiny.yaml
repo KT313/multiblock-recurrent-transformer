@@ -9,6 +9,7 @@
 run_name: tiny
 out_dir: outputs
 resume: false
+sample_at_training_progress: []   # the golden run is a pure training run
 seed: 42
 
 model_architecture_config: config/model_architecture/tiny.yaml

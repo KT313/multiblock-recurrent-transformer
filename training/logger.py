@@ -18,7 +18,7 @@ import logging
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
@@ -30,6 +30,7 @@ import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from evaluation.samples import GeneratedSample
 from training.backend.base import plain_model
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
@@ -172,6 +173,8 @@ class TrainingReport:
     export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf` (and after a stop)
     stopped: bool = False  # the run stopped on request (the CLI's Ctrl-C) before its last step
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step, only with `keep_history`
+    samples_written: list[Path] = field(default_factory=list)  # every samples file written by this process, in order
+    last_benchmarks: dict[str, float] = field(default_factory=dict)  # `benchmark/<task>/<metric>` of the last run, {} if none
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -183,6 +186,7 @@ class TrainingReport:
         for name in ("run_directory", "resumed_from", "export_dir"):
             data[name] = None if data[name] is None else str(data[name])
         data["checkpoints_written"] = [str(path) for path in self.checkpoints_written]
+        data["samples_written"] = [str(path) for path in self.samples_written]
         data["written_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         return data
 
@@ -215,6 +219,11 @@ class TrainingReport:
             lines.append(f"  {loss} | last validation: {losses}")
         else:
             lines.append(f"  {loss} | no validation")
+        if self.last_benchmarks:
+            scores = ", ".join(f"{name.removeprefix('benchmark/')} {value:.4f}" for name, value in self.last_benchmarks.items())
+            lines.append(f"  benchmarks: {scores}")
+        if self.samples_written:
+            lines.append(f"  {len(self.samples_written)} samples files written, last: {self.samples_written[-1]}")
         if self.checkpoints_written:
             lines.append(f"  {len(self.checkpoints_written)} checkpoints written, last: {self.checkpoints_written[-1]}")
         else:
@@ -329,6 +338,8 @@ class RunLogger:
         self.keep_history = keep_history  # a test knob: fill `history`
         self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats, if kept
         self.checkpoints_written: list[Path] = []
+        self.samples_written: list[Path] = []
+        self._last_benchmarks: dict[str, float] = {}
         self.resumed_from: Path | None = None
         self.tokens_per_step = settings.world_batch_size * settings.block_size
         self._clock = clock
@@ -459,6 +470,13 @@ class RunLogger:
             finally:
                 self._evaluation_seconds = self._clock() - started
 
+    def working(self, text: str) -> AbstractContextManager[None]:
+        """
+        Around a block that is neither a step nor an evaluation (sampling, benchmarking): the status reads text.
+        """
+
+        return self._status_during(text)
+
     def saving_checkpoint(self) -> AbstractContextManager[None]:
         """
         Around one checkpoint write: the status reads `saving checkpoint`.
@@ -495,6 +513,49 @@ class RunLogger:
         """
 
         self.dashboard.note_event(f"exported HuggingFace model to {path}")
+
+    def log_triggers(self, label: str, steps: Sequence[int]) -> None:
+        """
+        One console line naming the steps after which `label` (samples, benchmarks) runs; nothing when none.
+        """
+
+        if steps:
+            console.info("%s after steps: %s", label, ", ".join(str(step) for step in steps))
+
+    def log_samples(self, path: Path, samples: Sequence[GeneratedSample]) -> None:
+        """
+        Sample generations were written to `path`: the event names the file, a second one previews the first sample.
+        """
+
+        self.samples_written.append(path)
+        self.dashboard.note_event(f"wrote {len(samples)} samples to {path}")
+        if samples:
+            preview = f"sample: {samples[0].prompt!r} -> {samples[0].completion!r}"
+            self.dashboard.note_event(preview if len(preview) <= 160 else preview[:157] + "...")
+
+    def log_benchmarks(self, metrics: Mapping[str, float], path: Path, step: int) -> None:
+        """
+        Benchmark scores (`benchmark/<recurrence>/<task>/<metric>`) of `step`: to wandb at that step, one event
+        per recurrence setting and task, and the report's `last_benchmarks`.
+        """
+
+        self._last_benchmarks = dict(metrics)
+        self.wandb.log(dict(metrics), step=step)
+        per_task: dict[tuple[str, str], list[str]] = {}
+        for name, value in metrics.items():
+            _, recurrence, task, metric = name.split("/", 3)
+            per_task.setdefault((recurrence, task), []).append(f"{metric} {value:.4f}")
+        for (recurrence, task), scores in per_task.items():
+            self.dashboard.note_event(f"benchmark {task} (recurrence {recurrence}) at step {step}: {', '.join(scores)}")
+        self.dashboard.note_event(f"wrote benchmark results to {path}")
+
+    def log_benchmark_failure(self, error: BaseException) -> None:
+        """
+        The benchmark run raised: a kept warning and an event; the run goes on.
+        """
+
+        console.warning("benchmark evaluation failed, the run continues: %s", error, extra=KEEP)
+        self.dashboard.note_event(f"benchmark evaluation failed: {error}")
 
     # --- steps -------------------------------------------------------------------------------------------------------
 
@@ -630,6 +691,8 @@ class RunLogger:
             export_dir=export_dir,
             stopped=stopped,
             history=self.history,
+            samples_written=list(self.samples_written),
+            last_benchmarks=dict(self._last_benchmarks),
         )
         report.write_json(self.run_directory / TRAIN_REPORT_NAME)
         return report

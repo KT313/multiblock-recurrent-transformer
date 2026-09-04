@@ -69,6 +69,30 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 make training config/crow_300m_final.yaml
 ```
 
+### Evaluation
+
+Sample generations and lm-eval-harness scores (`evaluation/`), on a checkpoint or during training:
+
+```bash
+uv sync --extra eval      # lm-eval-harness, only needed for benchmarks
+
+# greedy samples for the built-in prompts; --tasks adds benchmarks
+uv run python evaluation/evaluate.py --checkpoint outputs/<run>/checkpoints/<file>.pth
+uv run python evaluation/evaluate.py --checkpoint <file>.pth --tasks arc_challenge,hellaswag --limit 200
+
+# make shortcut (EVAL_TASKS=a,b for benchmarks)
+make evaluate outputs/<run>/checkpoints/<file>.pth
+```
+
+During training the run config decides when they run: every `sample_step_interval` steps and after the steps at
+the percentages of the run in `sample_at_training_progress` (0: after the first step, 100: after the last;
+default `[100]`), combined; `benchmark_step_interval` and `benchmark_at_training_progress` (default: off) likewise.
+The percentages become step numbers once the stage plan is known; `train.log` lists them. Files land in
+`outputs/<run>/samples/` and `outputs/<run>/benchmarks/`, named by step; scores also go to wandb as
+`benchmark/<recurrence>/<task>/<metric>`. `sample_recurrences` and `benchmark_recurrences` list the recurrent
+steps per block to run with, e.g. `[[4, 4, 4], [12, 12, 12]]` (empty: the mean recurrence once); the CLI takes
+`--recurrence 4,4,4` repeatedly. Both run RNG-isolated, so they do not change the training.
+
 ## Architecture
 
 ### Overview

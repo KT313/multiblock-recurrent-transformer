@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from training.settings import (
+    DEFAULT_BENCHMARK_TASKS,
     NON_NEGATIVE_SETTINGS,
     POSITIVE_SETTINGS,
     REQUIRED_SETTINGS,
@@ -362,6 +363,38 @@ def test_value_rule_tables_name_real_fields_and_do_not_overlap() -> None:
     for table in tables:
         assert table and table <= names
     assert sum(len(t) for t in tables) == len(set().union(*tables))
+
+
+def test_sample_and_benchmark_settings() -> None:
+    """
+    The defaults (samples at the end, benchmarks off, the thesis tasks) and the value rules of the evaluation knobs.
+    """
+
+    from evaluation.benchmarks import DEFAULT_TASKS
+
+    settings = _settings()
+    assert (settings.sample_at_training_progress, settings.benchmark_at_training_progress) == ([100.0], [])
+    assert (settings.sample_step_interval, settings.benchmark_step_interval) == (0, 0)
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        _settings(sample_at_training_progress=[0, 101])
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        _settings(benchmark_at_training_progress=[-1])
+    assert (settings.sample_recurrences, settings.benchmark_recurrences) == ([], [])
+    assert _settings(sample_recurrences=[[4, 4, 4], [4, 8, 12]]).sample_recurrences == [[4, 4, 4], [4, 8, 12]]
+    with pytest.raises(ValueError, match="positive step count"):
+        _settings(sample_recurrences=[[4, 0, 4]])
+    with pytest.raises(ValueError, match="positive step count"):
+        _settings(benchmark_recurrences=[[]])
+    assert tuple(settings.benchmark_tasks) == DEFAULT_BENCHMARK_TASKS == DEFAULT_TASKS
+    assert _settings(benchmark_tasks=[]).benchmark_tasks == []  # allowed while no benchmark is requested
+    with pytest.raises(ValueError, match="sample_temperature"):
+        _settings(sample_temperature=-0.1)
+    with pytest.raises(ValueError, match="benchmark_limit"):
+        _settings(benchmark_limit=0)
+    with pytest.raises(ValueError, match="benchmark_tasks is empty"):
+        _settings(benchmark_at_training_progress=[100], benchmark_tasks=[])
+    with pytest.raises(ValueError, match="benchmark_tasks is empty"):
+        _settings(benchmark_step_interval=5, benchmark_tasks=[])
 
 
 @pytest.mark.parametrize("name", sorted(POSITIVE_SETTINGS))

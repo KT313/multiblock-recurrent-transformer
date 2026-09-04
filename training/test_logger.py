@@ -20,6 +20,7 @@ import torch
 from rich.console import Console
 
 from data_preparation.dataset_config import DatasetConfig
+from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
 from training.backend.single_device import SingleDeviceBackend
 from training.data.dataset_resolver import ResolvedDataset
@@ -714,6 +715,8 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
         "checkpoints_written": [str(first), str(second)],
         "export_dir": str(export_dir),
         "stopped": False,
+        "samples_written": [],
+        "last_benchmarks": {},
     }
     assert report.summary() == "\n".join(
         [
@@ -733,6 +736,51 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     assert recording(run_logger).statuses == ["finished", "finished"]  # once per `close()`
     kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
     assert kept.count("Training finished after 7 steps in 6.0s.") == 2 and not any("checkpoint" in k for k in kept)
+
+
+def test_log_samples_and_benchmarks_reach_the_dashboard_wandb_and_report(
+    tiny_model: RecurrentGPT,
+    resolved: ResolvedDataset,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    console_records: pytest.LogCaptureFixture,
+) -> None:
+    """
+    `log_samples` notes the file and previews the first sample; `log_benchmarks` sends the scores to wandb at the
+    step and notes one event per task; a failure is a kept warning plus an event; the report and its JSON carry
+    the samples files and the last scores.
+    """
+
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    recorded = _record_wandb_logs(monkeypatch)
+    metrics = {"benchmark/mean/arc_easy/acc": 0.25, "benchmark/mean/arc_easy/acc_norm": 0.3, "benchmark/4-4/hellaswag/acc": 0.26}
+    first, second = tmp_path / "samples" / "step-00000010.jsonl", tmp_path / "samples" / "step-00000020.jsonl"
+    with open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, FakeClock(0.0)) as run_logger:
+        run_logger.log_samples(first, [GeneratedSample("Once", "continuation", "upon a time", 3, False)])
+        run_logger.log_samples(second, [])
+        with run_logger.working("benchmarking"):
+            pass
+        run_logger.log_benchmarks(metrics, tmp_path / "benchmarks" / "step-00000007.json", 7)
+        run_logger.log_benchmark_failure(RuntimeError("no network"))
+        report = run_logger.close(TrainingProgress(step=7), None)
+    events = recording(run_logger).events
+    assert f"wrote 1 samples to {first}" in events and "sample: 'Once' -> 'upon a time'" in events
+    assert f"wrote 0 samples to {second}" in events
+    assert "benchmark arc_easy (recurrence mean) at step 7: acc 0.2500, acc_norm 0.3000" in events
+    assert "benchmark hellaswag (recurrence 4-4) at step 7: acc 0.2600" in events
+    assert f"wrote benchmark results to {tmp_path / 'benchmarks' / 'step-00000007.json'}" in events
+    assert "benchmark evaluation failed: no network" in events
+    assert "benchmarking" in recording(run_logger).statuses
+    assert recorded == {7: metrics}
+    assert report.samples_written == [first, second] and report.last_benchmarks == metrics
+    summary = report.summary()
+    assert "  benchmarks: mean/arc_easy/acc 0.2500, mean/arc_easy/acc_norm 0.3000, 4-4/hellaswag/acc 0.2600" in summary
+    assert f"  2 samples files written, last: {second}" in summary
+    written = json.loads((tmp_path / TRAIN_REPORT_NAME).read_text())
+    assert written["samples_written"] == [str(first), str(second)] and written["last_benchmarks"] == metrics
+    kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
+    assert "benchmark evaluation failed, the run continues: no network" in kept
 
 
 def test_fresh_start_report_summary_without_steps(

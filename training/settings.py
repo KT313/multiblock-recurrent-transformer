@@ -27,12 +27,17 @@ POSITIVE_SETTINGS: dict[str, str] = {
     "micro_batch_size": "sequences per forward/backward; 0 or less makes the micro-batch loop of a step run zero times",
     "world_batch_size": "sequences per optimizer step",
     "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
+    "sample_max_new_tokens": "tokens generated per sample prompt",
+    "benchmark_batch_size": "sequences per lm-eval forward",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
     "save_step_interval",
     "warmup_steps",
     "cooldown_steps",
+    "sample_step_interval",
+    "benchmark_step_interval",
 )
+DEFAULT_BENCHMARK_TASKS: tuple[str, ...] = ("arc_challenge", "hellaswag", "mmlu", "winogrande")  # the thesis benchmarks
 
 
 @dataclass
@@ -125,6 +130,23 @@ class Settings:
     export_to_hf: bool = False  # write a HuggingFace trust_remote_code folder at the end of training
     export_hf_path: Optional[str] = None  # default: {out_dir}/{run_name}/hf_export
 
+    # Samples and benchmarks (`evaluation/`): text the model writes for fixed prompts, lm-eval-harness scores. Both
+    # run RNG-isolated (`evaluation/wrapper.py`), so they never change the training numerics. The percentages are
+    # turned into step numbers once the stage plan is known (`training/triggers.py`). Files go to
+    # {run dir}/samples/ and {run dir}/benchmarks/, named by step.
+    sample_step_interval: int = 0  # write samples every this many steps (0: never)
+    sample_at_training_progress: list[float] = field(default_factory=lambda: [100.0])  # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+    sample_max_new_tokens: int = 64
+    sample_temperature: float = 0.0  # 0: greedy decoding
+    sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
+    benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)
+    benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress (needs the eval extra: uv sync --extra eval)
+    benchmark_tasks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARK_TASKS))  # lm-eval task names
+    benchmark_limit: Optional[int] = None  # examples per task (None: all); a few hundred keeps in-training runs short
+    benchmark_num_fewshot: int = 0
+    benchmark_batch_size: int = 8
+    benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
+
     def __post_init__(self) -> None:
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name
         if not isinstance(self.optim_config, OptimizerConfig):
@@ -161,6 +183,21 @@ class Settings:
             )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
+        if self.sample_temperature < 0:
+            raise ValueError("sample_temperature must be >= 0 (0: greedy)")
+        if self.benchmark_limit is not None and self.benchmark_limit <= 0:
+            raise ValueError("benchmark_limit must be positive or null (all examples)")
+        for name in ("sample_at_training_progress", "benchmark_at_training_progress"):
+            if any(not 0 <= percentage <= 100 for percentage in getattr(self, name)):
+                raise ValueError(f"{name} must list percentages between 0 and 100, got {getattr(self, name)}")
+        for name in ("sample_recurrences", "benchmark_recurrences"):
+            for setting in getattr(self, name):
+                if not setting or any(steps <= 0 for steps in setting):
+                    raise ValueError(f"{name}: every setting needs one positive step count per recurrent block, got {setting}")
+        if (self.benchmark_at_training_progress or self.benchmark_step_interval) and not self.benchmark_tasks:
+            raise ValueError(
+                "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
+            )
 
     @property
     def gradient_accumulation_steps(self) -> int:

@@ -142,6 +142,19 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "wandb_enabled",
     "export_to_hf",
     "export_hf_path",
+    # samples and benchmarks: RNG-isolated inference, files next to the checkpoints
+    "sample_step_interval",
+    "sample_at_training_progress",
+    "sample_max_new_tokens",
+    "sample_temperature",
+    "sample_recurrences",
+    "benchmark_step_interval",
+    "benchmark_at_training_progress",
+    "benchmark_tasks",
+    "benchmark_limit",
+    "benchmark_num_fewshot",
+    "benchmark_batch_size",
+    "benchmark_recurrences",
 )
 
 # Can never take effect on resume: the optimizer's parameter groups are restored from the checkpoint.

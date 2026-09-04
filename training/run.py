@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import cast, Any
 
 from torch.nn import Module
 from torch.optim import Optimizer
@@ -53,6 +53,10 @@ from training.checkpoint import (
     save_training_checkpoint,
 )
 from training.data.collate import IGNORE_INDEX
+from evaluation.benchmarks import benchmarks_path, evaluate_on_benchmarks
+from evaluation.prompts import load_prompts
+from evaluation.samples import GeneratedSample, generate_and_save_samples, samples_path
+from training.data.tokenizer import Tokenizer
 from training.data.loader import build_run_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.evaluation import evaluate, is_evaluation_step
@@ -61,6 +65,7 @@ from training.optim import build_optimizer, get_param_groups
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
+from training.triggers import StepTriggers
 from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
 
 
@@ -114,12 +119,19 @@ def train(
     stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
     """
 
+    check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
     with run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+        sample_triggers = StepTriggers.from_settings(
+            settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps
+        )
+        benchmark_triggers = StepTriggers.from_settings(
+            settings.benchmark_step_interval, settings.benchmark_at_training_progress, stage_manager.total_steps
+        )
         loaders = build_run_dataloaders(settings, dataset, backend)
         try:
             model = build_run_model(settings, backend, run_directory)
@@ -145,6 +157,8 @@ def train(
                     logger.log_fresh_start()
                 else:
                     logger.log_resume(resume.checkpoint, progress.step)
+                logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
+                logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
                 batches = BatchStream(settings, loaders, stage_manager, progress)
                 if resume is not None and resume.data_stream is not None:
                     batches.load_state_dict(resume.data_stream)
@@ -166,6 +180,11 @@ def train(
                         logger.status("stopping after this step, saving a checkpoint")
                     if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
                         save_run_checkpoint(state, logger, batches)
+                    # after the checkpoint: a failing benchmark (network, the missing extra) never costs one
+                    if not stopped and sample_triggers.due(progress.step):
+                        write_samples(state, logger, loaders.tokenizer)
+                    if not stopped and benchmark_triggers.due(progress.step):
+                        run_benchmarks(state, logger, loaders.tokenizer)
                 export_dir = None if stopped else export_if_requested(state, logger)
                 return logger.close(progress, export_dir, stopped=stopped)
         finally:
@@ -226,6 +245,23 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
         cooldown_steps=settings.cooldown_steps,
         micro_batch_size=settings.micro_batch_size,
     )
+
+
+def check_evaluation_recurrences(settings: Settings) -> None:
+    """
+    Every `sample_recurrences` / `benchmark_recurrences` setting must name one step count per core block of the
+    architecture config (with `model_overwrite` applied).
+    """
+
+    model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
+    blocks = len(cast(list[int], model_config.n_layers_in_recurrent_block))  # a list after __post_init__
+    for name in ("sample_recurrences", "benchmark_recurrences"):
+        for index, setting in enumerate(getattr(settings, name)):
+            if len(setting) != blocks:
+                raise ValueError(
+                    f"{name}[{index}] = {setting} has {len(setting)} entries but the model architecture "
+                    f"{settings.model_architecture_config} has {blocks} recurrent blocks"
+                )
 
 
 def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -> None:
@@ -335,6 +371,57 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
     with logger.saving_checkpoint():
         save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
     logger.log_checkpoint(path)
+
+
+def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> list[GeneratedSample]:
+    """
+    Sample generations of the model as it is now, written to `samples/step-XXXXXXXX.jsonl` of the run directory
+    and noted by the logger. RNG-isolated: the training numerics do not change.
+    """
+
+    settings, step = state.settings, state.progress.step
+    path = samples_path(state.run_directory, step)
+    with logger.working("generating samples"):
+        samples = generate_and_save_samples(
+            plain_model(state.model),
+            tokenizer,
+            path,
+            step=step,
+            prompts=load_prompts(),
+            max_new_tokens=settings.sample_max_new_tokens,
+            temperature=settings.sample_temperature,
+            recurrences=settings.sample_recurrences or [None],
+        )
+    logger.log_samples(path, samples)
+    return samples
+
+
+def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> dict[str, float] | None:
+    """
+    lm-eval scores of the model as it is now, written to `benchmarks/step-XXXXXXXX.json` of the run directory and
+    logged as `benchmark/<recurrence>/<task>/<metric>`; None when the harness failed (logged as a warning, the run goes on).
+    """
+
+    settings, step = state.settings, state.progress.step
+    path = benchmarks_path(state.run_directory, step)
+    try:
+        with logger.working("benchmarking"):
+            metrics = evaluate_on_benchmarks(
+                plain_model(state.model),
+                tokenizer,
+                settings.benchmark_tasks,
+                num_fewshot=settings.benchmark_num_fewshot,
+                limit=settings.benchmark_limit,
+                batch_size=settings.benchmark_batch_size,
+                recurrences=settings.benchmark_recurrences or [None],
+                out_path=path,
+                step=step,
+            )
+    except Exception as error:  # the harness needs the extra and the network; the run must not end on it
+        logger.log_benchmark_failure(error)
+        return None
+    logger.log_benchmarks(metrics, path, step)
+    return metrics
 
 
 # --- after the loop --------------------------------------------------------------------------------------------------
