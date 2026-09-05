@@ -9,7 +9,7 @@ import copy
 import json
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
+import training.data.loader as loader_module
 from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.collate import find_multiple
 from training.data.dataset_resolver import DataEntry, resolve_dataset
@@ -94,11 +95,15 @@ def reference_stage_manager(settings: Settings, steps: int = 10) -> StageManager
     One stage of `steps` optimizer steps (no transition): LR 0 at step 0, 1.5e-4 at step 1, 3e-4 from step 2.
     """
 
-    stage = resolved_stage("only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
+    stage = resolved_stage(
+        "only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0
+    )
     return StageManager([stage], settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
 
 
-def scripted_batches(settings: Settings, seed: int = 0, sequence_length: int = REFERENCE_SEQUENCE_LENGTH) -> Iterator[Batch]:
+def scripted_batches(
+    settings: Settings, seed: int = 0, sequence_length: int = REFERENCE_SEQUENCE_LENGTH
+) -> Iterator[Batch]:
     """
     Endless micro-batches of random token ids (vocab 512) from a seeded generator, independent of the global torch
     RNG, the tokenizer and the data pipeline. Labels are ids too (as `collate_fn` yields them, already shifted).
@@ -131,7 +136,11 @@ def settings() -> Settings:
 
 
 def run_steps(
-    settings: Settings, backend: SingleDeviceBackend, model: torch.nn.Module, optimizer: torch.optim.Optimizer, steps: int
+    settings: Settings,
+    backend: SingleDeviceBackend,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    steps: int,
 ) -> list[StepResult]:
     """
     `steps` consecutive optimizer steps of scripted batches, advancing a fresh progress counter as `train()` does.
@@ -251,7 +260,13 @@ def test_loss_and_grad_norm_match_a_hand_computation(settings: Settings, cpu_bac
 
     torch.manual_seed(11)
     result = run_one_optimizer_step(
-        settings, cpu_backend, model, optimizer, reference_stage_manager(settings), scripted_batches(settings), TrainingProgress()
+        settings,
+        cpu_backend,
+        model,
+        optimizer,
+        reference_stage_manager(settings),
+        scripted_batches(settings),
+        TrainingProgress(),
     )
     assert len(expected_losses) == settings.gradient_accumulation_steps == 2
     assert result.loss.item() == pytest.approx(torch.stack(expected_losses).mean().item(), rel=1e-6)
@@ -467,7 +482,9 @@ def test_batch_stream_draw_rng_is_seeded_with_the_start_step(
 
 
 def test_batch_stream_length_sorting(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
-    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, True, stream_tokenizer, padding_multiple=4)
+    settings, loaders, stage_manager = _stream_setup(
+        tmp_path, tiny_dataset_dir, True, stream_tokenizer, padding_multiple=4
+    )
     assert settings.gradient_accumulation_steps == 4
     progress = TrainingProgress()
     stream = BatchStream(settings, loaders, stage_manager, progress)
@@ -562,8 +579,10 @@ def test_batch_stream_state_carries_the_buffered_samples(
     assert state["consumed_rows"] == {"a": 6} and {k: len(v) for k, v in state["buffers"].items()} == {"a": 2}
 
     resumed = BatchStream(
-        settings, RunDataloaders({tag: _ShortBatches(tag, [3, 3, 3]) for tag in "abc"}, [], stream_tokenizer, {}),
-        stage_manager, TrainingProgress(),
+        settings,
+        RunDataloaders({tag: _ShortBatches(tag, [3, 3, 3]) for tag in "abc"}, [], stream_tokenizer, {}),
+        stage_manager,
+        TrainingProgress(),
     )
     resumed.load_state_dict(state)
     restored = resumed.state_dict()["buffers"]["a"]
@@ -754,19 +773,32 @@ def _drop_stage_manager(settings: Settings) -> StageManager:
     """
 
     stage = resolved_stage(
-        "only", tokens=100 * settings.world_batch_size * settings.block_size, base_lr=1e-4, transition_pct=0.0,
+        "only",
+        tokens=100 * settings.world_batch_size * settings.block_size,
+        base_lr=1e-4,
+        transition_pct=0.0,
         train_weights={"drop": 1.0},
     )
     return StageManager([stage], settings.world_batch_size, settings.block_size)
 
 
-def _drop_stream(settings: Settings, data_dir: Path, tokenizer: Tokenizer) -> tuple[BatchStream, _RecordingLoader]:
+def _drop_stream(
+    settings: Settings, data_dir: Path, tokenizer: Tokenizer, worker_batch_rows: int | None = None
+) -> tuple[BatchStream, _RecordingLoader]:
     """
-    A stream over one drop-heavy source (single shard, in-process, unsorted): rows are read in range order.
+    A stream over one drop-heavy source (single shard, in-process, unsorted): rows are read in range order, in
+    worker batches of `worker_batch_rows` rows (None: `micro_batch_size` rows, the old loaders).
     """
 
     parquet = entry_dataset(DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE))
-    loader = dataloader_over(parquet, tokenizer, DROP_BLOCK_SIZE, settings.micro_batch_size, padded=False)
+    loader = dataloader_over(
+        parquet,
+        tokenizer,
+        DROP_BLOCK_SIZE,
+        settings.micro_batch_size,
+        padded=False,
+        worker_batch_rows=worker_batch_rows,
+    )
     recording = _RecordingLoader(loader)
     loaders = RunDataloaders({"drop": recording}, [], tokenizer, {"drop": parquet})
     return BatchStream(settings, loaders, _drop_stage_manager(settings), TrainingProgress()), recording
@@ -777,6 +809,24 @@ def _run_world_batches(settings: Settings, stream: BatchStream, world_batches: i
         for _ in range(settings.gradient_accumulation_steps):
             next(stream)
         stream.progress.advance()
+
+
+def _micro_batches(settings: Settings, stream: BatchStream, world_batches: int) -> list[Batch]:
+    """
+    What the model would see: every micro-batch of `world_batches` optimizer steps, the step advanced in between.
+    """
+
+    out: list[Batch] = []
+    for _ in range(world_batches):
+        out += [next(stream) for _ in range(settings.gradient_accumulation_steps)]
+        stream.progress.advance()
+    return out
+
+
+def _same_batches(a: list[Batch], b: list[Batch]) -> bool:
+    return len(a) == len(b) and all(
+        torch.equal(x[0], y[0]) and torch.equal(x[1], y[1]) and x[2] == y[2] for x, y in zip(a, b)
+    )
 
 
 def _sample_ids(samples: list[Sample]) -> list[tuple[int, ...]]:
@@ -875,6 +925,98 @@ def test_mid_stage_resume_with_buffered_samples_repeats_nothing(
     assert not set(before) & set(after)  # no repeats: the resumed range starts after every row read before
 
 
+@pytest.mark.parametrize("worker_batch_rows", [1, 5, 64])
+def test_batch_stream_is_the_same_for_any_worker_batch_size(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer, worker_batch_rows: int
+) -> None:
+    """
+    The worker batch size of the train loaders (`TRAIN_LOADER_BATCH_ROWS`, raised so a world batch is tokenized
+    ahead of its pull) is invisible to the model: the one reader per source walks its range in order and the stream
+    buffers its batches per source, so the micro-batches are identical to those of the old loaders with worker
+    batches of `micro_batch_size` rows, across dropped rows and the wrap into the next epoch (40 world batches of 4
+    over 133 surviving rows), with the row counters agreeing at the end of every epoch.
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    data_dir = tmp_path / "drop_data"
+    _write_drop_parquet(data_dir)
+    reference, _ = _drop_stream(settings, data_dir, stream_tokenizer)
+    stream, recording = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=worker_batch_rows)
+    assert recording.loader.batch_size == worker_batch_rows
+    world_batches = 40
+    assert world_batches * settings.world_batch_size > _drop_survivors(200)  # wraps into the second epoch
+    assert _same_batches(
+        _micro_batches(settings, stream, world_batches), _micro_batches(settings, reference, world_batches)
+    )
+    # the counter is rows READ, for any batch size: the survivors of the rows read (the whole range once, then the
+    # fixture's drop pattern again from row 0) are the samples the model saw plus the ones buffered ahead
+    state = stream.state_dict()
+    consumed = state["consumed_rows"]["drop"]
+    assert 200 < consumed <= 400
+    survivors_read = _drop_survivors(200) + _drop_survivors(consumed - 200)
+    assert survivors_read - world_batches * settings.world_batch_size == len(state["buffers"].get("drop", []))
+
+
+def test_batch_stream_with_worker_processes_is_the_same_for_any_worker_batch_size(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The same on the real path (`build_run_dataloaders`: one worker process per source, prefetching, length-sorted
+    micro-batches): the run's loaders at `TRAIN_LOADER_BATCH_ROWS` yield the micro-batches of loaders whose worker
+    batch is the micro-batch, over the pretrain stage and into the finetune source.
+    """
+
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    dataset = resolve_dataset(settings)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    world_batches = stage_manager.total_steps  # 20: both pretrain stages, the transition and the finetune stage
+
+    def batches(worker_batch_rows: int) -> list[Batch]:
+        monkeypatch.setattr(loader_module, "TRAIN_LOADER_BATCH_ROWS", worker_batch_rows)
+        loaders = build_run_dataloaders(settings, dataset, cpu_backend)
+        assert all(
+            cast(DataLoader[Row], loader).batch_size == worker_batch_rows for loader in loaders.train_loaders.values()
+        )
+        try:
+            return _micro_batches(
+                settings, BatchStream(settings, loaders, stage_manager, TrainingProgress()), world_batches
+            )
+        finally:
+            loaders.close()
+
+    assert _same_batches(batches(loader_module.TRAIN_LOADER_BATCH_ROWS), batches(settings.micro_batch_size))
+
+
+def test_mid_run_resume_with_wide_worker_batches_reproduces_the_stream(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    With worker batches far wider than a world batch (64 rows against 4 samples) most of a checkpoint's rows sit
+    in the stream's buffers: they travel in the state, so a stream resumed from a mid-run checkpoint continues with
+    exactly the micro-batches the uninterrupted stream produces, across dropped rows and the epoch wrap.
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer, batch_size=2)
+    data_dir = tmp_path / "drop_data"
+    _write_drop_parquet(data_dir)
+    k = 19  # world batches before the checkpoint: the second worker batch is in the buffers, the epoch wraps after
+
+    full, _ = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
+    uninterrupted = _micro_batches(settings, full, 2 * k)
+
+    first, _ = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
+    before = _micro_batches(settings, first, k)
+    state = first.state_dict()
+    assert state["consumed_rows"] == {"drop": 128} and len(state["buffers"]["drop"]) > 0
+
+    resumed, resumed_recording = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
+    resumed.load_state_dict(state)
+    resumed.progress.step = k
+    after = _micro_batches(settings, resumed, k)
+    assert resumed_recording.rows_read > 0  # the resumed reader started at row 128 and wrapped into epoch two
+    assert _same_batches(before + after, uninterrupted)
+
+
 # --------------------------------------------------------------------------------------------------------------
 # dataset-independent numerics reference: golden_tiny_steps.json
 
@@ -938,7 +1080,9 @@ def test_golden_tiny_steps() -> None:
     chase float-order differences on another machine.
     """
 
-    assert GOLDEN_STEPS_PATH.exists(), "step reference missing; record it with record_step_reference() in a numerics commit"
+    assert GOLDEN_STEPS_PATH.exists(), (
+        "step reference missing; record it with record_step_reference() in a numerics commit"
+    )
     expected = json.loads(GOLDEN_STEPS_PATH.read_text())
     actual = step_reference_metrics()
     assert sorted(actual["steps"], key=int) == [str(s) for s in range(REFERENCE_STEPS)]

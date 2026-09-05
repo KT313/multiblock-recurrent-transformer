@@ -129,6 +129,11 @@ def pad_and_shift(
     The width is the longest sample of THIS micro-batch, rounded up to padding_multiple and capped at
     block_size + 1; the shift then drops one position from it. Pad positions become EOS in the inputs and
     ignore_index in the labels, as do labels outside the tokenizer's vocabulary.
+
+    The tensors are pageable on purpose: a pinned micro-batch that was copied to the device carries a CUDA event,
+    and freeing it inside a forked DataLoader worker (an epoch restart forks one) aborts the worker with
+    "CUDA error: initialization error". The driver stages a copy this small (a few hundred KiB) through its own
+    pinned pool anyway, so the non-blocking copy does not wait for queued kernels.
     """
 
     if not samples:

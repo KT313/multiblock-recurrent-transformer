@@ -371,3 +371,65 @@ def test_ellis_adam_on_tiny_model_reduces_loss(tiny_model: RecurrentGPT) -> None
         opt.zero_grad()
         losses.append(loss.item())
     assert losses[-1] < losses[0]
+
+
+def test_cpu_update_stays_eager_and_scalars_come_as_tensors() -> None:
+    """
+    On the CPU the group update runs eagerly (`torch.compile` is built for CUDA parameters only), and the scalar
+    coefficients handed to it are 0-d float32 tensors, the form that keeps the compiled path free of recompiles.
+    """
+
+    from training import optim
+
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    p.grad = torch.tensor([0.5, 0.25])
+    opt = ELLISAdam([p], lr=0.1, update_clipping=True, atan_adam=True)
+    seen: dict[str, Any] = {}
+    original = optim._adamw_group_update
+
+    def spy(*args: Any, **kwargs: Any) -> None:
+        seen["step_sizes"], seen["bc1"], seen["bc2_sqrt"], seen["decays"] = args[4:8]
+        original(*args, **kwargs)
+
+    optim._adamw_group_update = spy
+    try:
+        opt.step()
+    finally:
+        optim._adamw_group_update = original
+    assert optim._compiled_group_update is None
+    for key in ("step_sizes", "bc1", "bc2_sqrt", "decays"):
+        assert all(t.device.type == "cpu" and t.dtype == torch.float32 and t.ndim == 0 for t in seen[key]), key
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled update is built for CUDA only")
+def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
+    """
+    The `torch.compile`d group update on CUDA reproduces the eager kernel to fp32 rounding (Inductor fuses and may
+    reorder the elementwise chain), across LR changes without a recompile, for every option combination.
+    """
+
+    from training import optim
+
+    for flags in (
+        dict(update_clipping=True, atan_adam=True, running_init=True),
+        dict(update_clipping=False, atan_adam=False, running_init=False, decouple_wd=False),
+    ):
+        results = []
+        for compiled in (False, True):
+            torch.manual_seed(0)
+            p = torch.nn.Parameter(torch.randn(64, 32, device="cuda"))
+            opt = ELLISAdam([p], lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, **flags)
+            optim._compiled_group_update = None
+            original = optim._compiled_adamw_group_update
+            if not compiled:
+                optim._compiled_adamw_group_update = lambda: optim._adamw_group_update
+            try:
+                for step in range(4):
+                    p.grad = torch.randn(64, 32, device="cuda") * 1e-2
+                    set_lr(opt, 1e-3 * (step + 1))
+                    opt.step()
+            finally:
+                optim._compiled_adamw_group_update = original
+            results.append((p.detach().clone(), opt.state[p]["exp_avg"].clone(), opt.state[p]["exp_avg_sq"].clone()))
+        for eager, fused in zip(*results, strict=True):
+            torch.testing.assert_close(fused, eager, rtol=1e-6, atol=1e-7)  # a few fp32 ulps

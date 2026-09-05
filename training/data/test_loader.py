@@ -20,6 +20,8 @@ from training.data.dataset_resolver import (
     validation_batches_available,
 )
 from training.data.loader import (
+    TRAIN_LOADER_BATCH_ROWS,
+    TRAIN_LOADER_PREFETCH_FACTOR,
     RunDataloaders,
     build_dataloader,
     build_run_dataloaders,
@@ -114,7 +116,11 @@ def test_row_range_reaches_the_dataset(tokenizer: Tokenizer, tiny_pretrain_dir: 
     assert len(val) == k and len(train) == total - k
     assert not set(val) & set(train)
     assert val + train == rows(DataEntry("all", directory))
-    both = _loader([DataEntry("val", directory, weight=0.5, max_rows=k), DataEntry("train", directory, weight=0.5, skip_rows=k)], tokenizer, 1)
+    both = _loader(
+        [DataEntry("val", directory, weight=0.5, max_rows=k), DataEntry("train", directory, weight=0.5, skip_rows=k)],
+        tokenizer,
+        1,
+    )
     tags = Counter(b[2][0] for b in _batches(both, 100))
     assert set(tags) == {"val", "train"}  # a mixture keeps every member's range
 
@@ -123,6 +129,21 @@ def test_pin_memory_is_off_unless_requested(tokenizer: Tokenizer, tiny_pretrain_
     entries = [DataEntry("p", str(tiny_pretrain_dir))]
     assert build_dataloader(entries, tokenizer, 64, 2).pin_memory is False
     assert build_dataloader(entries, tokenizer, 64, 2, pin_memory=True).pin_memory is True
+
+
+def test_run_dataloaders_pin_only_the_validation_batches(tiny_settings: Settings) -> None:
+    """
+    The validation loaders yield the padded batches that go to the device, so they pin with the backend; the train
+    loaders yield unpadded samples that `pad_and_shift` copies into a fresh pageable micro-batch, so they never pin.
+    """
+
+    dataset: ResolvedDataset = resolve_dataset(tiny_settings)
+    for pin_memory in (False, True):
+        backend = SingleDeviceBackend(device="cpu", precision="32")
+        backend.pin_memory = pin_memory  # a CUDA backend's choice, without a GPU (the loaders are never iterated)
+        loaders = build_run_dataloaders(tiny_settings, dataset, backend)
+        assert all(cast(DataLoader[Row], loader).pin_memory is False for loader in loaders.train_loaders.values())
+        assert all(cast(DataLoader[Row], loader).pin_memory is pin_memory for loader in loaders.val_loaders)
 
 
 def test_duplicate_prefixes_rejected(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
@@ -192,7 +213,9 @@ def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[Dat
     assert not _same(a, c)
 
 
-def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
+def test_workers_zero_and_two_identical_with_micro_batch_one(
+    tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path
+) -> None:
     """
     Rows are dealt round-robin to workers and DataLoader collects worker batches round-robin, so with
     micro_batch_size=1 the two loaders yield the very same sequence.
@@ -204,7 +227,9 @@ def test_workers_zero_and_two_identical_with_micro_batch_one(tokenizer: Tokenize
     assert _same(a, b)
 
 
-def test_workers_two_micro_batch_gt_one_regroups_rows(tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path) -> None:
+def test_workers_two_micro_batch_gt_one_regroups_rows(
+    tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path
+) -> None:
     """
     With micro_batch_size>1 each worker batches *its* rows (0,2,4.. / 1,3,5..), so batches differ from
     num_workers=0 in composition but cover exactly the same rows over an epoch.
@@ -247,6 +272,64 @@ def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenize
         assert sum(batch.rows_read for batch in batches) == len(rows)
 
 
+def _worker_batches(loader: Iterable[WorkerBatch]) -> list[WorkerBatch]:
+    return list(loader)
+
+
+def _samples_of(batches: list[WorkerBatch]) -> list[tuple[list[int], list[int], str]]:
+    return [(ids.tolist(), labels.tolist(), tag) for batch in batches for ids, labels, tag in batch.samples]
+
+
+@pytest.mark.parametrize("worker_batch_rows", [1, 7, 64])
+def test_worker_batch_rows_regroup_the_same_sample_sequence(
+    tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path, worker_batch_rows: int
+) -> None:
+    """
+    The worker batch size of an unpadded loader is a grouping, not an order: the one reader walks its range in
+    order whatever the batch size, so the concatenated samples of an epoch are the same sequence as with worker
+    batches of `micro_batch_size` rows (the old loaders), every batch but the last holds `worker_batch_rows` rows
+    and the `rows_read` counts still add up to the epoch. This is what lets `BatchStream` buffer wide worker batches
+    without changing which sample reaches which micro-batch.
+    """
+
+    rows = _rows_in(tiny_pretrain_dir)
+    reference = _worker_batches(build_dataloader(entries[:1], tokenizer, 64, 2, padded=False))
+    regrouped = _worker_batches(
+        build_dataloader(entries[:1], tokenizer, 64, 2, padded=False, worker_batch_rows=worker_batch_rows)
+    )
+    assert [len(batch.samples) for batch in reference] == [2] * (rows // 2) + ([rows % 2] if rows % 2 else [])
+    assert [batch.rows_read for batch in regrouped] == [worker_batch_rows] * (rows // worker_batch_rows) + (
+        [rows % worker_batch_rows] if rows % worker_batch_rows else []
+    )
+    assert sum(batch.rows_read for batch in regrouped) == sum(batch.rows_read for batch in reference) == rows
+    assert _samples_of(regrouped) == _samples_of(reference)
+
+
+def test_worker_batch_rows_keep_the_sample_sequence_when_rows_are_dropped(
+    tokenizer: Tokenizer, tiny_instruct_dir: Path
+) -> None:
+    """
+    Dropped rows (no supervised label at `block_size` 16) cost one `rows_read` each in whatever batch they fall
+    into, so the surviving sample sequence and the total rows read are the same for any worker batch size; only
+    the batches are shorter than their row count.
+    """
+
+    entry = DataEntry("ft", str(tiny_instruct_dir), data_signature=INSTRUCT_SIGNATURE)
+    rows = len(list(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE))))
+    reference = _worker_batches(build_dataloader([entry], tokenizer, 16, 4, padded=False))
+    wide = _worker_batches(build_dataloader([entry], tokenizer, 16, 4, padded=False, worker_batch_rows=64))
+    assert sum(batch.rows_read for batch in wide) == sum(batch.rows_read for batch in reference) == rows
+    assert any(len(batch.samples) < batch.rows_read for batch in wide)  # the fixture drops rows at this block size
+    assert _samples_of(wide) == _samples_of(reference)
+
+
+def test_worker_batch_rows_are_refused_where_they_make_no_sense(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+    with pytest.raises(ValueError, match="unpadded loaders only"):
+        build_dataloader(entries[:1], tokenizer, 64, 2, padded=True, worker_batch_rows=64)
+    with pytest.raises(ValueError, match="must be positive"):
+        build_dataloader(entries[:1], tokenizer, 64, 2, padded=False, worker_batch_rows=0)
+
+
 def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
     full = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1)]
     r0 = [tuple(b[0][0].tolist()) for b in _loader(entries[:1], tokenizer, 1, shard=(0, 2))]
@@ -259,14 +342,17 @@ def test_shard_passed_to_datasets(tokenizer: Tokenizer, entries: list[DataEntry]
 
 @pytest.fixture
 def tiny_settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
-    return parse_settings(["--config", str(TINY_YAML), "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(tmp_path / "out")])
+    return parse_settings(
+        ["--config", str(TINY_YAML), "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(tmp_path / "out")]
+    )
 
 
 def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) -> None:
     """
-    One train loader per SOURCE (the whole-run readers, one worker each) and one validation loader per stage of
-    the tiny dataset, tokenizer loaded from the resolved directory, train loaders unpadded, validation loaders
-    padded and restricted to the held-out rows of the split.
+    One train loader per SOURCE (the whole-run readers, one worker each, worker batches of `TRAIN_LOADER_BATCH_ROWS`
+    rows kept `TRAIN_LOADER_PREFETCH_FACTOR` batches ahead) and one validation loader per stage of the tiny dataset
+    (batches of `micro_batch_size` rows), tokenizer loaded from the resolved directory, train loaders unpadded,
+    validation loaders padded and restricted to the held-out rows of the split.
     """
 
     dataset: ResolvedDataset = resolve_dataset(tiny_settings)
@@ -274,7 +360,12 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     assert isinstance(loaders, RunDataloaders)
     assert loaders.train_sources == ["synthetic_pretrain", "synthetic_instruct"]  # dataset-config order
     assert len(loaders.train_loaders) == 2 and len(loaders.val_loaders) == len(dataset.stages) == 3
-    assert all(isinstance(loader, DataLoader) and loader.num_workers == TRAIN_LOADER_NUM_WORKERS for loader in loaders.train_loaders.values())
+    for train_loader in loaders.train_loaders.values():
+        assert isinstance(train_loader, DataLoader) and train_loader.num_workers == TRAIN_LOADER_NUM_WORKERS
+        assert train_loader.batch_size == TRAIN_LOADER_BATCH_ROWS > tiny_settings.micro_batch_size
+        assert train_loader.prefetch_factor == TRAIN_LOADER_PREFETCH_FACTOR
+    for val_loader in loaders.val_loaders:
+        assert isinstance(val_loader, DataLoader) and val_loader.batch_size == tiny_settings.micro_batch_size
     assert list(loaders.datasets) == loaders.train_sources
     for source, parquet in loaders.datasets.items():
         assert isinstance(parquet, ParquetTextDataset) and parquet.prefix == source
@@ -282,13 +373,18 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     assert loaders.tokenizer.path == Path(dataset.tokenizer_dir)
     batch = loaders.next_train_batch("synthetic_pretrain")
     samples = batch.samples
-    assert len(samples) == tiny_settings.micro_batch_size
-    assert batch.rows_read == tiny_settings.micro_batch_size  # no row dropped
-    assert [s[2] for s in samples] == ["synthetic_pretrain"] * tiny_settings.micro_batch_size
+    worker_rows = min(TRAIN_LOADER_BATCH_ROWS, loaders.datasets["synthetic_pretrain"].num_rows)
+    assert len(samples) == worker_rows
+    assert batch.rows_read == worker_rows  # no row dropped
+    assert [s[2] for s in samples] == ["synthetic_pretrain"] * worker_rows
     for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
         assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
     input_ids, labels, _ = world_batch_micro_batches(
-        samples, tiny_settings.micro_batch_size, tokenizer, tiny_settings.block_size, sort_by_length=True,
+        samples,
+        tiny_settings.micro_batch_size,
+        tokenizer,
+        tiny_settings.block_size,
+        sort_by_length=True,
         padding_multiple=tiny_settings.sequence_padding_multiple,
     )[0]
     # padding rounds up to sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
@@ -350,7 +446,9 @@ def test_iterators_are_lazy_and_independent(tokenizer: Tokenizer) -> None:
     assert _first(rd.next_train_batch("a")) == 0
 
 
-def test_set_resume_offsets_are_applied_when_the_iterator_starts(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
+def test_set_resume_offsets_are_applied_when_the_iterator_starts(
+    tokenizer: Tokenizer, entries: list[DataEntry]
+) -> None:
     """
     The offsets wait in `pending_offsets` and land on a source's dataset right before its first iterator is
     created; a source without a pending offset starts at 0.
@@ -377,7 +475,9 @@ def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer,
 
     parquet = entry_dataset(DataEntry("pre", str(tiny_pretrain_dir)))
     total = _rows_in(tiny_pretrain_dir)
-    rd = RunDataloaders({"pre": dataloader_over(parquet, tokenizer, 64, 1, padded=False)}, [], tokenizer, {"pre": parquet})
+    rd = RunDataloaders(
+        {"pre": dataloader_over(parquet, tokenizer, 64, 1, padded=False)}, [], tokenizer, {"pre": parquet}
+    )
     rd.set_resume_offsets({"pre": total - 2})
     first_epoch = [rd.next_train_batch("pre").samples[0][2] for _ in range(2)]
     assert first_epoch == ["pre", "pre"] and parquet.resume_offset == total - 2  # the offset holds for its epoch

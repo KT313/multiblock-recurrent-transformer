@@ -50,7 +50,8 @@ INSTRUCT_DATA_SIGNATURE: dict[str, Any] = {
 Part = Literal["train", "val"]
 
 
-TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting
+TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting (its worker
+# batch size and prefetch depth are `training.data.loader.TRAIN_LOADER_BATCH_ROWS` / `TRAIN_LOADER_PREFETCH_FACTOR`)
 
 
 @dataclass

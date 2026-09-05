@@ -25,6 +25,7 @@ from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data.collate import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
+from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
     TINY_DATASET_YAML,
@@ -621,16 +622,27 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     reached (`BatchStream.load_state_dict` says exactly what that does and does not promise).
     """
 
-    def consumed(directory: Path, name: str) -> dict[str, int]:
+    def data_stream(directory: Path, name: str) -> dict[str, Any]:
         state = torch.load(checkpoint_dir(directory / "tiny") / name, map_location="cpu", weights_only=False)
-        return dict(state["data_stream"]["consumed_rows"])
+        return cast(dict[str, Any], state["data_stream"])
+
+    def consumed(directory: Path, name: str) -> dict[str, int]:
+        return dict(data_stream(directory, name)["consumed_rows"])
 
     full_dir = tmp_path / "full" / "out"
     options: dict[str, Any] = {"save_step_interval": 4, "export_to_hf": False}
     _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
     # 12 steps of 4 rows, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the source and
-    # only change its weight, so the counter keeps counting across the stage boundary at step 8)
-    assert consumed(full_dir, "step-00000012-tiny.pth") == {"synthetic_pretrain": 48}
+    # only change its weight, so the counter keeps counting across the stage boundary at step 8). The counter is rows
+    # READ: the worker batches of `TRAIN_LOADER_BATCH_ROWS` rows that cover the 48 samples, the rest of the last one
+    # sitting in the checkpoint's buffers
+    trained = 12 * 4
+    rows_read = -(-trained // TRAIN_LOADER_BATCH_ROWS) * TRAIN_LOADER_BATCH_ROWS
+    mid_state = data_stream(full_dir, "step-00000012-tiny.pth")
+    assert mid_state["consumed_rows"] == {"synthetic_pretrain": rows_read}
+    assert {source: len(samples) for source, samples in mid_state["buffers"].items()} == {
+        "synthetic_pretrain": rows_read - trained
+    }
 
     resumed_dir = tmp_path / "resumed" / "out"
     mid = checkpoint_dir(full_dir / "tiny") / "step-00000012-tiny.pth"
