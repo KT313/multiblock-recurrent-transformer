@@ -9,14 +9,17 @@ block) and `blocks/recurrence.py` (depth sampler, latent state, one recurrence i
 module assembles them into `RecurrentGPT` and binds the recurrence to the model's `step`, mode, config and modules.
 """
 
+from functools import partial
 from typing import cast
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from .blocks.recurrence import (
     NumSteps,
     StepsPair,
+    adapter_base_projection,
     initialize_state,
     iterate_core_block,
     normalize_num_steps,
@@ -26,6 +29,14 @@ from .blocks.sandwich import SandwichBlock
 from .config import RecurrentConfig
 from .layers.attention import precompute_freqs_cis
 from .layers.init import Linear
+
+# The chunked loss (validation) splits the tokens into this many pieces: a fixed count, so the loop is static under
+# `torch.compile(dynamic=True)` while the chunk lengths stay dynamic (see `RecurrentGPT.chunked_loss`).
+LOSS_CHUNKS = 8
+
+# A chunk of the loss is recomputed in the backward instead of saving its logits (no RNG inside); a no-op without
+# gradients, which is how validation calls it.
+_checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False, determinism_check="none")
 
 
 def prepare_attention_inputs(
@@ -179,15 +190,31 @@ class RecurrentGPT(torch.nn.Module):
         labels: Tensor | None = None,
         return_logits: bool = False,
         num_steps: NumSteps = None,
+        return_token_losses_chunked_nograd: bool = False,
     ) -> dict[str, Tensor | None]:
         """
-        `num_steps`: None (sample per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair
-        per core block.
+        One forward pass: embedding, prelude, the recurrent core blocks, coda, final norm, LM head and, given
+        `labels`, the loss.
 
-        `labels` must be pre-shifted (the trainer's collate shifts): the loss is `CE(logits[t], labels[t])`. The
-        HuggingFace wrapper shifts internally instead. `attention_mask` is a `(B, S)` padding mask (1 = keep),
-        `position_ids` 1-D or `(B, S)`; `prepare_attention_inputs` turns both into what the attention layers need.
-        Both are None on the training path.
+        Inputs. `labels` must be pre-shifted (the trainer's collate shifts; the HuggingFace wrapper shifts
+        internally instead): the loss is `CE(logits[t], labels[t])`. `attention_mask` is a `(B, S)` padding mask
+        (1 = keep), `position_ids` 1-D or `(B, S)`; both are None on the training path. `num_steps`: None (sample
+        the depth per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair per core block.
+
+        Outputs. `loss`: the mean cross-entropy over the valid labels (0 without labels). `log_ppl`: its detached
+        copy. `logits`: the full fp32 `(B, S, padded_vocab)` logits when `return_logits`, else None.
+        `token_losses`: the `(B, S)` fp32 per-token losses (zero at ignored positions) when
+        `return_token_losses_chunked_nograd`, else None.
+
+        Two loss paths. Training and every `return_logits` caller build the full logits and take the loss from
+        them. `return_token_losses_chunked_nograd` (validation only, under `no_grad`) takes `chunked_loss` instead,
+        which never holds the full logits (1 GiB at batch 4): validation used to keep them alive for the
+        per-source token losses. Not for training: there the compiled step gained no memory from it and lost
+        about 3 percent of speed.
+
+        Compilation. Under `torch.compile` this frame becomes two graphs around one graph break at the
+        `run_core_blocks` call (embedding and prelude; coda, final norm, LM head and loss). The core-block loop
+        itself is eager by design, see `run_core_blocks`.
         """
 
         freqs_cis, mask = prepare_attention_inputs(self.freqs_cis, input_ids, attention_mask, position_ids)
@@ -198,46 +225,142 @@ class RecurrentGPT(torch.nn.Module):
         for block in self.transformer.prelude:
             x = block(x, freqs_cis, mask)
 
-        # Each core block is iterated on its input and added back onto it (residual around the whole block).
         per_block_steps = normalize_num_steps(num_steps, len(self.transformer.core_blocks))
-        for block_idx, block_steps in enumerate(per_block_steps):
-            block_out = self.run_core_block(x, freqs_cis, mask, block_steps, block_idx)
-            x = block_out + x
+        x = self.run_core_blocks(x, freqs_cis, mask, per_block_steps)
 
         for block in self.transformer.coda:
             x = block(x, freqs_cis, mask)
         x = self.transformer.ln_final(x)
 
-        logits = self.lm_head(x).float() * self.config.init.logit_scale  # (B, S, padded_vocab), float32
-        if labels is not None:
-            loss = self.loss(logits, labels)
+        loss = torch.as_tensor(0.0)
+        logits: Tensor | None = None
+        token_losses: Tensor | None = None
+        if return_token_losses_chunked_nograd and labels is not None and not return_logits:
+            loss, token_losses = self.chunked_loss(x, labels)
         else:
-            loss = torch.as_tensor(0.0)
-        returned_logits: Tensor | None = None
-        if return_logits:
-            returned_logits = logits
-        return {"loss": loss, "logits": returned_logits, "log_ppl": loss.clone().detach()}
+            logits = self.full_logits(x)  # (B, S, padded_vocab), float32
+            if labels is not None:
+                loss = self.loss(logits, labels)
+                if return_token_losses_chunked_nograd:
+                    token_losses = self.token_losses(logits, labels)
+            if not return_logits:
+                logits = None
+        return {"loss": loss, "logits": logits, "token_losses": token_losses, "log_ppl": loss.clone().detach()}
+
+    def full_logits(self, x: Tensor) -> Tensor:
+        """
+        The fp32 logits `(B, S, padded_vocab)` of the final hidden states `x`: LM head, cast, logit scale (if not 1).
+        """
+
+        logits: Tensor = self.lm_head(x).float()
+        if self.config.init.logit_scale != 1:
+            logits = logits * self.config.init.logit_scale
+        return logits
+
+    def mask_labels(self, labels: Tensor, n_classes: int | None = None) -> Tensor:
+        """
+        `labels` as the loss sees them: long, with every label outside `[0, n_classes)` (default: the padded
+        vocabulary) replaced by `ignore_index`.
+        """
+
+        if n_classes is None:
+            n_classes = self.lm_head.weight.shape[0]
+        labels = labels.to(torch.long)
+        invalid = (labels < 0) | (labels >= n_classes)
+        return labels.masked_fill(invalid, self.ignore_index)
 
     def loss(self, logits: Tensor, labels: Tensor) -> Tensor:
         """
-        Cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`.
+        Mean cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`.
         """
 
         n_classes = logits.shape[-1]
-        labels = labels.to(torch.long)
-        invalid = (labels < 0) | (labels >= n_classes)
-        labels = labels.masked_fill(invalid, self.ignore_index)
+        labels = self.mask_labels(labels, n_classes)
         return torch.nn.functional.cross_entropy(
             logits.view(-1, n_classes), labels.view(-1), ignore_index=self.ignore_index
         )
+
+    def token_losses(self, logits: Tensor, labels: Tensor) -> Tensor:
+        """
+        Per-token cross-entropy `(B, S)`, fp32, zero at ignored positions (the masking of `loss`).
+        """
+
+        n_classes = logits.shape[-1]
+        labels = self.mask_labels(labels, n_classes)
+        losses = torch.nn.functional.cross_entropy(
+            logits.view(-1, n_classes), labels.view(-1), ignore_index=self.ignore_index, reduction="none"
+        )
+        return losses.view(labels.shape)
+
+    def chunked_loss(self, x: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        The loss without the full logits: `(mean loss, per-token losses)` of the final hidden states `x` against
+        `labels`.
+
+        The sequence is cut into `LOSS_CHUNKS` pieces; each piece runs the LM head, the fp32 cast, the logit scale
+        and the per-token cross-entropy on its own, so at most one piece's `(B, S / LOSS_CHUNKS, vocab)` logits
+        exist at a time. The mean is the sum of all token losses over the number of valid labels in the whole
+        batch, the same as `loss` on the full logits up to summation order; the per-token losses match
+        `token_losses`.
+
+        Meant for validation under `no_grad` (the `return_token_losses_chunked_nograd` flag). With gradients enabled
+        each piece runs under an activation checkpoint (recomputed in the backward instead of saved), which eager
+        autograd handles piece by piece but a compiled backward does not: it recomputes every piece before
+        consuming any, so training keeps the full-logits path.
+        """
+
+        labels = self.mask_labels(labels)
+        sequence_length = x.shape[1]
+        chunk_length = sequence_length // LOSS_CHUNKS
+        losses = []
+        for chunk_idx in range(LOSS_CHUNKS):
+            start = chunk_idx * chunk_length
+            length = chunk_length if chunk_idx < LOSS_CHUNKS - 1 else sequence_length - start
+            losses.append(
+                _checkpoint(self._chunk_token_losses, x.narrow(1, start, length), labels.narrow(1, start, length))
+            )
+        token_losses = torch.cat(losses, dim=1)
+        valid_count = (labels != self.ignore_index).sum()
+        return token_losses.sum() / valid_count, token_losses
+
+    def _chunk_token_losses(self, x: Tensor, labels: Tensor) -> Tensor:
+        """
+        One piece of `chunked_loss`: the per-token losses of already masked `labels` from the hidden states `x`.
+        """
+
+        logits = self.full_logits(x)
+        n_classes = logits.shape[-1]
+        losses = torch.nn.functional.cross_entropy(
+            logits.view(-1, n_classes), labels.reshape(-1), ignore_index=self.ignore_index, reduction="none"
+        )
+        return losses.view(labels.shape)
+
+    @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
+    def run_core_blocks(
+        self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None, per_block_steps: list[StepsPair | None]
+    ) -> Tensor:
+        """
+        All core blocks in order: each is iterated on its input and added back onto it (residual around the whole
+        block).
+
+        Dynamo-disabled (not recursively, the callees still compile) because `run_core_block` is disabled too and
+        dynamo cannot resume after a graph break inside a `for` loop: with the loop in `forward`, the whole `forward`
+        frame would be skipped and run eagerly. Here the loop is eager and `forward` compiles around one plain call.
+        """
+
+        for block_idx, block_steps in enumerate(per_block_steps):
+            block_out = self.run_core_block(x, freqs_cis, mask, block_steps, block_idx)
+            x = block_out + x
+        return x
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
     def run_core_block(
         self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None, num_steps: StepsPair | None, block_idx: int
     ) -> Tensor:
         """
-        Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, then iterate
-        the block n times without and k times with gradient (`num_steps`, or the sampler's draw when None).
+        Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, project the
+        normalised input through its half of the adapter once, then iterate the block n times without and k times
+        with gradient (`num_steps`, or the sampler's draw when None).
         """
 
         transformer = self.transformer
@@ -253,6 +376,9 @@ class RecurrentGPT(torch.nn.Module):
 
         # ModuleList is not generic in the torch stubs, so indexing `core_blocks` needs the cast.
         layers = cast(torch.nn.ModuleList, transformer.core_blocks[block_idx])
+        adapter = transformer.adapters[block_idx]
+        # The adapter's input half is the same in every iteration: one GEMM per block instead of one per iteration.
+        base_proj = adapter_base_projection(x_base, adapter)
         # `iterate_core_block` is dynamo-disabled, which makes it untyped for mypy; hence the explicit annotation.
         x_out: Tensor = iterate_core_block(
             x_latent,
@@ -261,9 +387,10 @@ class RecurrentGPT(torch.nn.Module):
             mask,
             num_steps_no_grad,
             num_steps_with_grad,
-            adapter=transformer.adapters[block_idx],
+            adapter=adapter,
             layers=layers,
             gradient_checkpointing=self.gradient_checkpointing,
+            base_proj=base_proj,
         )
         return x_out
 

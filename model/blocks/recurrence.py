@@ -4,10 +4,14 @@
 How a core block is iterated: the `(n no-grad, k backprop)` depth sampler, the random latent state, one recurrence
 iteration (adapter over `[latent, input]`, then the block's layers) and the iteration loop with optional activation
 checkpointing. `RecurrentGPT` (`model/model.py`) binds these to a model's `step`, mode, config and modules.
+
+The adapter is one `Linear` (2E -> E) over `[latent, input]`; its input half does not change over the iterations of a
+block, so `adapter_base_projection` computes it once and the iteration only runs the latent half.
 """
 
 import math
 from functools import partial
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -110,6 +114,19 @@ def sample_recurrence_steps(
     return num_steps_no_grad.to(dtype=torch.long), num_steps_with_grad.to(dtype=torch.long)
 
 
+def adapter_base_projection(x_base: Tensor, adapter: torch.nn.Module) -> Tensor:
+    """
+    The block-input half of the adapter, `x_base @ W[:, E:].T` (plus the bias, if any), for `adapter` a `Linear` with
+    the single (E, 2E) weight over `[latent, input]`. It is constant over the iterations of a block, so the callers
+    compute it once per block and pass it to `core_block_forward` as `base_proj`. The column slice is a strided view
+    of the weight: no copy, and the parameter (and its state-dict key) stays as it is.
+    """
+
+    weight = cast(Tensor, adapter.weight)
+    n_embd = weight.shape[0]
+    return torch.nn.functional.linear(x_base, weight[:, n_embd:], cast(Tensor | None, adapter.bias))
+
+
 def core_block_forward(
     x_latent: Tensor,
     x_base: Tensor,
@@ -117,12 +134,22 @@ def core_block_forward(
     mask: Tensor | None,
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
+    base_proj: Tensor | None = None,
 ) -> Tensor:
     """
     One recurrence iteration: inject the (normalised) block input into the latent state, then run the layers.
+
+    The adapter `W @ [latent, input]` runs as its two halves: `base_proj` is the constant input half
+    (`adapter_base_projection`, hoisted out of the loop by `iterate_core_block`; computed here when not given) and only
+    the latent half `W[:, :E] @ latent` is a GEMM per iteration. Under bf16 autocast both halves are bf16 GEMM outputs
+    (fp32 accumulation) added in bf16: rounding-level different from the single K = 2E GEMM over the concatenation.
     """
 
-    x_latent = adapter(torch.cat([x_latent, x_base], dim=-1))  # (B, S, 2 * E) -> (B, S, E)
+    if base_proj is None:
+        base_proj = adapter_base_projection(x_base, adapter)
+    weight = cast(Tensor, adapter.weight)
+    n_embd = weight.shape[0]
+    x_latent = torch.nn.functional.linear(x_latent, weight[:, :n_embd]) + base_proj  # (B, S, E)
     for layer in layers:
         x_latent = layer(x_latent, freqs_cis, mask)
     return x_latent
@@ -140,19 +167,26 @@ def iterate_core_block(
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
     gradient_checkpointing: bool,
+    base_proj: Tensor | None = None,
 ) -> Tensor:
     """
     Iterate `core_block_forward` first `num_steps_no_grad` times under `torch.no_grad`, then `num_steps_with_grad`
     times with gradient (each of those activation-checkpointed when `gradient_checkpointing`).
+
+    `base_proj` is the adapter's input half (`adapter_base_projection(x_base, adapter)`), shared by all iterations;
+    computed here once when not given. It is an input of every checkpointed iteration, so the recomputation reuses it.
     """
+
+    if base_proj is None:
+        base_proj = adapter_base_projection(x_base, adapter)
 
     with torch.no_grad():
         for _ in range(num_steps_no_grad):
-            x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers)
+            x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
 
     for _ in range(num_steps_with_grad):
         if gradient_checkpointing:
-            x_latent = _checkpoint(core_block_forward, x_latent, x_base, freqs_cis, mask, adapter, layers)
+            x_latent = _checkpoint(core_block_forward, x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
         else:
-            x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers)
+            x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
     return x_latent

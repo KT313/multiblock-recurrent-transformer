@@ -17,6 +17,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
+from model.model import RecurrentGPT
 from training.backend.base import Backend, plain_model
 from training.data.collate import Batch
 from training.settings import Settings
@@ -31,7 +32,9 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     Returns `val_loss` / `val_ppl` (mean recurrence) plus `val_loss_<depth>` / `val_ppl_<depth>` per depth. The mean
     is over the batches actually seen (at most `eval_iters`), all-reduced; a loader that yields no batch is an error.
     `val_loss/<data id>`: the per-token loss at the mean recurrence per validation source (the batch's data ids),
-    computed from the same logits, so `val_loss` itself is unchanged.
+    computed from the same forward's per-token losses (`token_losses`), so `val_loss` itself is unchanged. Those
+    per-token losses come from the model's chunked loss (`return_token_losses_chunked_nograd`), which never holds
+    the full logits: that is what keeps the validation peak small.
     """
 
     model.eval()
@@ -47,14 +50,15 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     number_of_batches_seen = 0
     for input_ids, labels, data_ids in islice(val_loader, settings.eval_iters):
         input_ids, labels = input_ids.to(backend.device), labels.to(backend.device)
-        logits: Tensor | None = None  # the last depth's (the mean recurrence)
+        token_losses: Tensor | None = None  # the last depth's (the mean recurrence)
         for depth_idx, steps in enumerate(steps_per_depth):
             with backend.autocast():
-                output = model(input_ids, labels=labels, num_steps=steps, return_logits=depth_idx == len(depths) - 1)
+                # token losses at every depth: the chunked loss path, which never builds the full logits
+                output = model(input_ids, labels=labels, num_steps=steps, return_token_losses_chunked_nograd=True)
             loss_sums[depth_idx] += output["loss"]
-            logits = output["logits"]
-        assert logits is not None
-        _add_source_token_losses(source_token_losses, plain_model(model), logits, labels, data_ids)
+            token_losses = output["token_losses"]
+        assert token_losses is not None
+        _add_source_token_losses(source_token_losses, plain_model(model), token_losses, labels, data_ids)
         number_of_batches_seen += 1
     if number_of_batches_seen == 0:
         model.train()  # leave the model as it was found, whichever way this returns
@@ -70,7 +74,9 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
         metrics[f"val_loss_{depth}"] = losses[depth_idx]
         metrics[f"val_ppl_{depth}"] = losses[depth_idx].exp()
     # every rank must have seen the same data ids: the stacked sums are reduced by position
-    per_source = backend.all_reduce(torch.stack([source_token_losses[data_id] for data_id in sorted(source_token_losses)]))
+    per_source = backend.all_reduce(
+        torch.stack([source_token_losses[data_id] for data_id in sorted(source_token_losses)])
+    )
     for data_id, (loss_sum, token_count) in zip(sorted(source_token_losses), per_source):
         metrics[f"val_loss/{data_id}"] = loss_sum / token_count
     model.train()
@@ -78,20 +84,14 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
 
 
 def _add_source_token_losses(
-    sums: dict[str, Tensor], model: Module, logits: Tensor, labels: Tensor, data_ids: list[str]
+    sums: dict[str, Tensor], model: RecurrentGPT, token_losses: Tensor, labels: Tensor, data_ids: list[str]
 ) -> None:
     """
-    Add each row's summed token loss and token count (the model's label masking) to its data id's entry.
+    Add each row's summed token loss (`token_losses`: the model's `(B, S)` per-token losses, zero where ignored)
+    and token count (the model's label masking) to its data id's entry.
     """
 
-    n_classes = logits.shape[-1]
-    labels = labels.to(torch.long)
-    ignore_index = cast(int, model.ignore_index)
-    labels = labels.masked_fill((labels < 0) | (labels >= n_classes), ignore_index)
-    token_losses = torch.nn.functional.cross_entropy(
-        logits.view(-1, n_classes), labels.view(-1), ignore_index=ignore_index, reduction="none"
-    ).view(labels.shape)
-    counted = labels != ignore_index
+    counted = model.mask_labels(labels) != model.ignore_index
     for row, data_id in enumerate(data_ids):
         entry = torch.stack([token_losses[row].sum(), counted[row].sum().to(token_losses.dtype)])
         sums[data_id] = sums[data_id] + entry if data_id in sums else entry
