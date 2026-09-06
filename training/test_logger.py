@@ -276,6 +276,33 @@ def test_non_finite_gradient_is_reported_as_nan(tiny_model: RecurrentGPT) -> Non
     assert "ffn2_effective_lr_0" not in metrics  # params with non-finite grads are skipped for effective LRs
 
 
+def test_nan_gradient_metrics_match_the_per_parameter_values() -> None:
+    torch.manual_seed(0)
+    proj = torch.nn.Linear(3, 2)
+    model = torch.nn.Sequential()
+    model.add_module("mlp", torch.nn.Sequential())
+    model[0].add_module("proj", proj)  # named `mlp.proj.weight`: counted as an `ffn2_grad_<i>` weight
+    model.add_module("head", torch.nn.Linear(2, 1))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, eps=1e-8)
+    model(torch.randn(4, 3)).sum().backward()
+    opt.step()
+    assert proj.weight.grad is not None
+    proj.weight.grad.fill_(float("NaN"))
+    metrics = track_gradient_metrics(model, opt)
+
+    assert set(metrics) == {"ffn2_grad_0", "avg_RMS", "local_l1_grad_norm", "l2_param_norm", "l1_param_norm"}
+    assert math.isnan(metrics["ffn2_grad_0"].item())
+    finite = [p for p in model.parameters() if p is not proj.weight]  # in optimizer-group order
+    rms = [
+        p.grad.pow(2).div(opt.state[p]["exp_avg_sq"].clamp(min=1e-16)).mean().sqrt() for p in finite if p.grad is not None
+    ]
+    assert torch.equal(metrics["avg_RMS"], torch.as_tensor(sum(rms) / len(rms)))
+    l1_norms = [p.grad.norm(1.0) for p in finite if p.grad is not None]
+    assert torch.equal(metrics["local_l1_grad_norm"], torch.stack(l1_norms).mean())
+    assert torch.equal(metrics["l2_param_norm"], torch.stack([p.norm() for p in model.parameters()]).norm())
+    assert torch.equal(metrics["l1_param_norm"], torch.stack([p.norm(1.0) for p in model.parameters()]).mean())
+
+
 # --------------------------------------------------------------------------------------------------------------
 # RunLogger: a run without a dataset (in-memory settings, a stage manager, fake step results, a fake clock)
 

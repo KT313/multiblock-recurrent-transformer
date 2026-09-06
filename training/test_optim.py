@@ -122,12 +122,15 @@ def test_build_optimizer_rejects_ellis_only_options_for_adamw() -> None:
         build_optimizer("AdamW", [p], OptimizerConfig(decouple_wd=False))
 
 
-def test_set_lr_sets_a_tensor_lr_on_every_group() -> None:
+def test_set_lr_stores_a_float_for_adamw_and_a_tensor_for_ellis_adam() -> None:
     p1, p2 = torch.nn.Parameter(torch.zeros(1)), torch.nn.Parameter(torch.zeros(1))
-    opt = torch.optim.AdamW([{"params": [p1]}, {"params": [p2]}], lr=1.0)
-    set_lr(opt, 2e-4)
-    assert all(torch.is_tensor(g["lr"]) for g in opt.param_groups)
-    assert [float(g["lr"]) for g in opt.param_groups] == pytest.approx([2e-4, 2e-4])
+    adamw = torch.optim.AdamW([{"params": [p1]}, {"params": [p2]}], lr=1.0)
+    set_lr(adamw, 2e-4)
+    assert all(type(g["lr"]) is float and g["lr"] == 2e-4 for g in adamw.param_groups)
+    ellis = ELLISAdam([{"params": [p1]}, {"params": [p2]}], lr=1.0)
+    set_lr(ellis, 2e-4)
+    assert all(torch.is_tensor(g["lr"]) for g in ellis.param_groups)
+    assert [float(g["lr"]) for g in ellis.param_groups] == pytest.approx([2e-4, 2e-4])
 
 
 def _reference_ellis_adam_step(
