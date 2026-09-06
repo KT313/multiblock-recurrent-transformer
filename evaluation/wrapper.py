@@ -12,12 +12,15 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import torch
 
-from model.hf.modeling import RecurrentGPTConfig, RecurrentGPTForCausalLM
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
+
+if TYPE_CHECKING:
+    from model.hf.modeling import RecurrentGPTForCausalLM
 
 RECURRENCE_ENV = "EVAL_RECURRENCE_STEPS"  # read by the wrapper's forward in eval mode ("12" or "4,12,4")
 Recurrence = Sequence[int] | None  # recurrent steps per core block; None: the architecture's mean recurrence
@@ -45,6 +48,9 @@ def hf_wrapper_around(model: RecurrentGPT, tokenizer: Tokenizer) -> RecurrentGPT
     `RecurrentGPTForCausalLM` over model's own tensors (nothing is copied), in eval mode, with the tokenizer's
     special ids in its generation config.
     """
+
+    # `model.hf` imports transformers (seconds, hundreds of MB): only a run that samples or benchmarks pays for it
+    from model.hf.modeling import RecurrentGPTConfig, RecurrentGPTForCausalLM
 
     with torch.device("meta"):
         wrapper = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(model.config))

@@ -41,7 +41,6 @@ from data_preparation.dataset_config import DatasetConfig
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
-from model.hf import export_to_hf
 from training.backend import get_backend
 from training.backend.base import Backend, plain_model
 from training.checkpoint import (
@@ -493,6 +492,8 @@ def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else state.run_directory / "hf_export"
     logger.status("exporting")
     trained_model = plain_model(state.model)
+    from model.hf import export_to_hf  # transformers behind it: imported when a run exports, not at start-up
+
     export_to_hf(trained_model, trained_model.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir
