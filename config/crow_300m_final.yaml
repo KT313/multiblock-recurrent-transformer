@@ -61,7 +61,7 @@ world_batch_size: 1024               # sequences per optimizer step (= micro_bat
 # Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
 # masked per document (FlexAttention), RoPE positions restarting per document; the step is then measured in tokens.
 # With packing, sort_batches_by_length / sequence_padding_multiple apply to the validation batches only.
-pack_sequences: true                 # true strongly recommended, uses inefficient batch padding otherwise
+pack_sequences: true                 # required, false is refused (padded training weighed short rows like full ones)
 tokens_per_micro_batch: 8192         # pack length in tokens, >= training_max_sequence_length (null: micro_batch_size × training_max_sequence_length)
 micro_batches_per_step: 256          # packed micro-batches per optimizer step, a multiple of the number of devices (null: world_batch_size / micro_batch_size); 256 x 8192 = the padded 1024 x 2048
 

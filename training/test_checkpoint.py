@@ -222,6 +222,8 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "gradient_checkpointing": True,
     "micro_batch_size": 2,
     "world_batch_size": 2048,
+    "tokens_per_micro_batch": 16384,
+    "micro_batches_per_step": 128,
     "optimizer": "AdamW",
     "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
@@ -235,9 +237,9 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "partial_depth_eval": [2],
 }
 
-# Compared like the fields above, but only valid together (`Settings._check_packing`): a resume that switches from
-# sequence packing to padded rows changes all three at once, so they are tested as one switch.
-CHANGED_TOGETHER: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "micro_batches_per_step": None}
+# Compared like the fields above, but with one admissible value (`Settings._check_packing` refuses the other), so no
+# resume can find it changed.
+COMPARED_BUT_FIXED = ("pack_sequences",)
 
 
 def test_every_settings_field_is_classified() -> None:
@@ -249,27 +251,9 @@ def test_every_settings_field_is_classified() -> None:
     field_names = {f.name for f in fields(Settings)}
     exempt = set(SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME)
     assert exempt <= field_names
-    assert set(CHANGED_COMPARED_VALUES) | set(CHANGED_TOGETHER) == field_names - exempt
-    assert not set(CHANGED_COMPARED_VALUES) & set(CHANGED_TOGETHER)
+    assert set(CHANGED_COMPARED_VALUES) | set(COMPARED_BUT_FIXED) == field_names - exempt
+    assert not set(CHANGED_COMPARED_VALUES) & set(COMPARED_BUT_FIXED)
     assert PARAM_GROUPING_SETTING in field_names and PARAM_GROUPING_SETTING not in exempt
-
-
-def test_check_settings_unchanged_catches_a_switch_to_padded_rows(
-    backend: SingleDeviceBackend, tiny_model: RecurrentGPT
-) -> None:
-    """
-    The packing fields are compared too: a resume that turns packing off (all three fields change together) is
-    refused by name unless `allow_settings_change`.
-    """
-
-    metadata = _metadata(backend, tiny_model)
-    config = tiny_model.config.to_dict()
-    padded = _settings(run_name="tiny", seed=42, **CHANGED_TOGETHER)
-    with pytest.raises(
-        ValueError, match=r"resuming with changed \['micro_batches_per_step', 'pack_sequences', 'tokens_per_micro_batch'\]"
-    ):
-        check_settings_unchanged(metadata, padded, config, False)
-    check_settings_unchanged(metadata, padded, config, True)
 
 
 def test_check_settings_unchanged_catches_every_compared_setting(
