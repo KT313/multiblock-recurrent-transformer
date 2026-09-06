@@ -74,7 +74,7 @@ def test_initialize_state_is_a_seeded_standard_normal() -> None:
 
 def test_sampler_eval_returns_mean_recurrence_and_zero_grad_steps() -> None:
     for step in (0, 17):
-        n, k = sample_recurrence_steps(12, 8, step=step, training=False)
+        n, k = sample_recurrence_steps(12, 8, step=step, block_idx=0, training=False)
         assert n.dtype == torch.long and k.dtype == torch.long
         assert (n.item(), k.item()) == (12, 0)
 
@@ -83,7 +83,7 @@ def test_sampler_respects_backprop_bound_and_is_positive() -> None:
     for mean, bound in ((12, 8), (6, 3)):
         ks, ns = set(), set()
         for step in range(300):
-            n, k = sample_recurrence_steps(mean, bound, step=step, training=True)
+            n, k = sample_recurrence_steps(mean, bound, step=step, block_idx=0, training=True)
             assert 1 <= k.item() <= bound
             assert n.item() >= 0
             assert n.item() + k.item() >= 1
@@ -93,31 +93,51 @@ def test_sampler_respects_backprop_bound_and_is_positive() -> None:
         assert bound in ks  # the bound is attained when p >= s
 
 
-def test_sampler_total_depth_mean_is_mean_recurrence_plus_one() -> None:
+def test_sampler_total_depth_mean_is_mean_recurrence() -> None:
     """
-    n + k == p == Poisson(LogNormal(log(t+s) - sigma^2/2, sigma)) + 1, whose mean is mean_recurrence + 1
-    (the +1 is inherited from upstream and kept for identity). Also: k == min(s, p), n == p - k.
+    n + k == p == Poisson(LogNormal(log(mean - 1) - sigma^2/2, sigma)) + 1, whose mean is `mean_recurrence` (the
+    same depth eval mode and the init scaling use) and whose minimum is the one guaranteed pass. Also:
+    k == min(s, p), n == p - k.
     """
 
     for mean, s in ((12, 8), (4, 3)):
         totals = []
         for step in range(2000):
-            n, k = sample_recurrence_steps(mean, s, step=step, training=True)
+            n, k = sample_recurrence_steps(mean, s, step=step, block_idx=0, training=True)
             p = n.item() + k.item()
+            assert p >= 1
             assert k.item() == min(s, p) and n.item() == p - k.item()
             totals.append(p)
         avg = sum(totals) / len(totals)
-        assert avg == pytest.approx(mean + 1, abs=0.5), avg
+        assert avg == pytest.approx(mean, abs=0.5), avg
 
 
-def test_sampler_deterministic_in_step_independent_of_global_rng() -> None:
-    torch.manual_seed(0)
-    a = sample_recurrence_steps(2, 2, step=42, training=True)
-    torch.manual_seed(999)
-    b = sample_recurrence_steps(2, 2, step=42, training=True)
-    assert (a[0].item(), a[1].item()) == (b[0].item(), b[1].item())
-    draws = {tuple(v.item() for v in sample_recurrence_steps(2, 2, step=step, training=True)) for step in range(50)}
+def test_sampler_mean_recurrence_one_always_draws_a_single_pass() -> None:
+    for step in range(50):
+        n, k = sample_recurrence_steps(1, 1, step=step, block_idx=0, training=True)
+        assert (n.item(), k.item()) == (0, 1)
+
+
+def test_sampler_deterministic_in_step_and_block_independent_of_global_rng() -> None:
+    for block_idx in (0, 1):
+        torch.manual_seed(0)
+        a = sample_recurrence_steps(2, 2, step=42, block_idx=block_idx, training=True)
+        torch.manual_seed(999)
+        b = sample_recurrence_steps(2, 2, step=42, block_idx=block_idx, training=True)
+        assert (a[0].item(), a[1].item()) == (b[0].item(), b[1].item())
+    draws = {tuple(v.item() for v in sample_recurrence_steps(2, 2, step=step, block_idx=0, training=True)) for step in range(50)}
     assert len(draws) > 1
+
+
+def test_sampler_blocks_with_equal_means_draw_independently() -> None:
+    def sequence(block_idx: int) -> list[tuple[int, int]]:
+        draws = []
+        for step in range(200):
+            n, k = sample_recurrence_steps(12, 8, step=step, block_idx=block_idx, training=True)
+            draws.append((int(n.item()), int(k.item())))
+        return draws
+
+    assert sequence(0) != sequence(1)
 
 
 def test_sampler_advances_global_rng() -> None:
@@ -127,7 +147,7 @@ def test_sampler_advances_global_rng() -> None:
 
     for training in (True, False):
         torch.manual_seed(0)
-        sample_recurrence_steps(2, 2, step=0, training=training)
+        sample_recurrence_steps(2, 2, step=0, block_idx=0, training=training)
         after = torch.rand(())
         torch.manual_seed(0)
         torch.rand((1,))
@@ -136,7 +156,7 @@ def test_sampler_advances_global_rng() -> None:
 
 def test_sampler_on_meta_device_returns_the_expected_depths() -> None:
     with torch.device("meta"):
-        n, k = sample_recurrence_steps(12, 8, step=3, training=True)
+        n, k = sample_recurrence_steps(12, 8, step=3, block_idx=0, training=True)
     assert (n, k) == (4, 8)
 
 

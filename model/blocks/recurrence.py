@@ -76,11 +76,11 @@ def initialize_state(x: Tensor) -> Tensor:
 
 @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
 def sample_recurrence_steps(
-    mean_recurrence: int, mean_backprop_depth: int, *, step: int, training: bool
+    mean_recurrence: int, mean_backprop_depth: int, *, step: int, block_idx: int, training: bool
 ) -> tuple[Tensor, Tensor]:
     """
-    Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by `step`; in eval
-    mode return (`mean_recurrence`, 0).
+    Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by `step` and
+    `block_idx` (blocks draw independently); in eval mode return (`mean_recurrence`, 0).
 
     Outputs are long tensors so that they can be passed through compiled functions.
     """
@@ -95,19 +95,23 @@ def sample_recurrence_steps(
         num_steps_with_grad = torch.as_tensor(0)
         return num_steps_no_grad.to(dtype=torch.long), num_steps_with_grad.to(dtype=torch.long)
 
-    # A private generator seeded by the optimizer step, not the global RNG: a forward re-run under activation
-    # checkpointing draws the same depth again. Distributed training must multiply the seed by (rank + 1) so ranks
-    # draw different depths.
+    # A private generator seeded by the optimizer step and the block, not the global RNG: a forward re-run under
+    # activation checkpointing draws the same depth again. The block stride is far above any step count, so blocks
+    # never share a seed. Distributed training must multiply the seed by (rank + 1) so ranks draw different depths.
     generator = torch.Generator(device="cpu")
-    generator.manual_seed((514229 + step) % (2**31 - 1))
+    generator.manual_seed((514229 + step + 2**24 * block_idx) % (2**31 - 1))
 
-    # "poisson-lognormal-filling": total depth = Poisson(rate) + 1 with a log-normal rate of mean `mean_recurrence`;
-    # the last min(total, mean_backprop_depth) iterations get gradient (they "fill" the backprop budget).
+    # "poisson-lognormal-filling": total depth = Poisson(rate) + 1, the +1 being the guaranteed pass, with a
+    # log-normal rate of mean `mean_recurrence - 1` so the total has mean `mean_recurrence`; the last
+    # min(total, mean_backprop_depth) iterations get gradient (they "fill" the backprop budget). A mean of 1 leaves
+    # no rate to draw (and no `log(0)`): the total is always 1.
     max_steps_with_grad = mean_backprop_depth
-    mean_steps_no_grad = max(mean_recurrence - mean_backprop_depth, 0)
     sigma = 0.5
-    mu = math.log(mean_steps_no_grad + max_steps_with_grad) - (sigma**2 / 2)
-    rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma, generator=generator)
+    if mean_recurrence > 1:
+        mu = math.log(mean_recurrence - 1) - (sigma**2 / 2)
+        rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma, generator=generator)
+    else:
+        rate = torch.zeros((1,))
     total_steps = torch.poisson(torch.tensor([rate], dtype=torch.float), generator=generator) + 1
     num_steps_no_grad = torch.clamp(total_steps - max_steps_with_grad, min=0)
     num_steps_with_grad = torch.minimum(torch.as_tensor(max_steps_with_grad), total_steps)

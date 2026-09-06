@@ -159,9 +159,9 @@ class RecurrentConfig:
     def _validate_recurrence(self) -> None:
         """
         Reject values the sampler and the model would accept silently: a block without layers, a block that never
-        gets gradient (`mean_backprop_depth` 0), a mean recurrence <= 0 (`log(0)` at the first forward), or a backprop
-        depth above the mean recurrence (training would target `mean_backprop_depth` while eval and the init scaling
-        use `mean_recurrence`).
+        gets gradient (`mean_backprop_depth` 0), or a backprop depth above the mean recurrence (training would target
+        `mean_backprop_depth` while eval and the init scaling use `mean_recurrence`). A mean recurrence of 1 is fine
+        (the sampler then always draws a single pass).
         """
 
         if self.n_layers_in_prelude < 0 or self.n_layers_in_coda < 0:

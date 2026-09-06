@@ -424,11 +424,8 @@ class RecurrentGPT(torch.nn.Module):
     def sample_block_depths(self, block_idx: int = 0) -> tuple[Tensor, Tensor]:
         """
         (n no-grad, k backprop) iterations for core block `block_idx`: the poisson-lognormal-filling draw seeded by
-        `self.step` in training, (`mean_recurrence`, 0) in eval mode.
-
-        The seed is `self.step` alone, as in the reference implementation (the golden test in `test_model.py` fails on
-        any change): `block_idx` only selects the block's means, so blocks with equal `(mean_recurrence,
-        mean_backprop_depth)` draw the same `(n, k)` every step.
+        `self.step` and `block_idx` in training (blocks draw independently; the golden test in `test_model.py` fails
+        on any change), (`mean_recurrence`, 0) in eval mode.
         """
 
         assert isinstance(self.config.mean_recurrence, list)  # normalized by RecurrentConfig.__post_init__
@@ -438,6 +435,7 @@ class RecurrentGPT(torch.nn.Module):
             self.config.mean_recurrence[block_idx],
             self.config.mean_backprop_depth[block_idx],
             step=self.step,
+            block_idx=block_idx,
             training=self.training,
         )
         return steps

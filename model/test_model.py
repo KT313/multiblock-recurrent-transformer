@@ -557,11 +557,11 @@ def test_randomized_iteration_sampler_binds_step_mode_and_config(training: bool)
     m.step = 7
     for block_idx, (mean, depth) in enumerate(zip([12, 6], [8, 3])):
         n, k = m.sample_block_depths(block_idx)
-        ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, training=training)
+        ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, block_idx=block_idx, training=training)
         assert (n.item(), k.item()) == (ref_n.item(), ref_k.item())
     m.step = 8
     n8, _ = m.sample_block_depths(0)
-    assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, training=training)[0])
+    assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, block_idx=0, training=training)[0])
 
 
 def test_train_forward_deterministic_under_seed_and_step(tiny_model: RecurrentGPT) -> None:
