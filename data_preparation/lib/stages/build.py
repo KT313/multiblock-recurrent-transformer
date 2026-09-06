@@ -68,6 +68,7 @@ from data_preparation.lib.stages.download import (
     inspect_raw,
     new_manifest,
 )
+from data_preparation.lib.stages.truncation import SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
 from data_preparation.lib.storage.parquet import publish_shard, shard_name
 from data_preparation.lib.ui.dashboard import progress
@@ -492,8 +493,8 @@ class RowPipeline:
         if not chosen:
             return
         counts = self._counter().count_many([instruct_text(rows[offset]) for offset in chosen])
-        for offset, tokens in zip(chosen, counts):
-            rows[offset]["tokens"] = tokens
+        for offset, count in zip(chosen, counts):
+            rows[offset]["tokens"] = count + SPECIAL_TOKENS  # the download's rule: the trainer's specials included
         self.stats["inverted"] += len(chosen)
 
     def _counter(self) -> TokenCounter:

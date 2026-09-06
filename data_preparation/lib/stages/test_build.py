@@ -32,6 +32,7 @@ from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
+from data_preparation.lib.stages.truncation import SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import Manifest
 
 Row = dict[str, Any]
@@ -82,8 +83,9 @@ def test_build_length_filter_drops_short_and_keeps_stats(
     m = build_source(cfg, "s", layout)
     rows = read_rows(layout.processed_dir("s"))
     assert [r["text"] for r in rows] == ["ok " * 5, _words(6), "y" * 7, "z" * 8], "short / null dropped, nothing truncated"
-    assert [r["tokens"] for r in rows] == [5, 6, 1, 1], "the raw counts are reused as they are"
-    assert m.stats["length_filter"] == {"input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "output_samples": 4}
+    assert [r["tokens"] for r in rows] == [7, 8, 3, 3], "the raw counts (text plus BOS and EOS) are reused as they are"
+    # the download stores a null text as "", so the length filter sees it as too short, not invalid
+    assert m.stats["length_filter"] == {"input_samples": 6, "removed_too_short": 2, "removed_invalid": 0, "output_samples": 4}
     assert m.stats["input_rows"] == 6 and m.rows() == 4
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
     assert m.columns == ["text", "source", "tokens", "hash"] and m.shuffled is False
@@ -128,17 +130,17 @@ def test_build_exact_dedup_tokens_and_idempotence(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, mtimes: Mtimes,
 ) -> None:  # fmt: skip
-    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(64)]  # the last one exactly at the cap
+    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(62)]  # the last one exactly at the cap with BOS and EOS
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=64)
     m = build_source(cfg, "s", layout, shard_size=2)
     processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
     rows = read_rows(processed)
-    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(64)], "normalized duplicates dropped, text untouched"
-    assert [r["tokens"] for r in rows] == [5, 3, 64], "the raw counts (true counts of the stored text) reused"
+    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(62)], "normalized duplicates dropped, text untouched"
+    assert [r["tokens"] for r in rows] == [7, 5, 64], "the raw counts (true counts of the stored text plus the specials) reused"
     assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
     assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
-    assert [(s.rows, s.tokens) for s in m.shards] == [(2, 8), (1, 64)] and m.tokens() == 72
+    assert [(s.rows, s.tokens) for s in m.shards] == [(2, 12), (1, 64)] and m.tokens() == 76
     assert m.stats["dedup"] == {"mode": "exact", "duplicates_removed": 2}
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
     before = mtimes(processed)
@@ -154,12 +156,12 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
     """
 
     cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, max_seq_length=64)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [30, 3]
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5]
     lowered = replace(cfg, max_seq_length=8)
     assert lowered.raw_hash("s") == cfg.raw_hash("s") and lowered.processed_hash("s") != cfg.processed_hash("s")
     m = build_source(lowered, "s", layout)
-    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 3] and m.tokens() == 11
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [30, 3], "raw untouched"
+    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 5] and m.tokens() == 13
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5], "raw untouched"
 
 
 def test_build_estimate_mode_caps_too(
@@ -168,8 +170,8 @@ def test_build_estimate_mode_caps_too(
     cfg = _prepare(cfg_factory, layout, local_dir, ["a" * 40, "b" * 400], with_tokenizer, write=write_local, token_count="estimate", max_seq_length=50)
     m = build_source(cfg, "s", layout)
     assert m.token_count == "estimate" and m.tokenizer is None
-    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [10, 50]
-    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 200], "the download cut the long text at 4 chars/token"
+    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [12, 50]
+    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 192], "the download cut the long text at 4 chars/token, 2 tokens left for the specials"
 
 
 def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
@@ -214,7 +216,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     assert [r["text"] for r in new_rows[len(old_rows) :]] == [_words(6, 50), _words(6, 51)]
     # one processed shard per raw shard with survivors (raw shard 2 is a single duplicate -> no shard; raw shard 3 =
     # two duplicates + one new row -> 1 row)
-    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(3, 18), (3, 18), (1, 6), (1, 6)]
+    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(3, 24), (3, 24), (1, 8), (1, 8)]
 
     # golden: a fresh full pass over the same raw data keeps exactly the same rows
     fresh = DatasetLayout(tmp_path / "fresh")
@@ -520,9 +522,9 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     assert m.columns == ["instruction", "input", "output", "tokens", "hash"] and m.shuffled is True and m.shuffle_seed == 3
     assert m.stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
     assert m.input_shards == [["data-00000.parquet", 8], ["data-00001.parquet", 8], ["data-00002.parquet", 8]]
-    assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 6
+    assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 8
     assert all(r["hash"] == text_hash64(instruct_text(r)) for r in out)
-    expected = [{**_instruct_row(i), "tokens": 6} for i in range(20)]
+    expected = [{**_instruct_row(i), "tokens": 8} for i in range(20)]
     random.Random(3).shuffle(expected)
     assert [{k: r[k] for k in ("instruction", "input", "output", "tokens")} for r in out] == expected, "seeded shuffle of the survivors, in raw order before the shuffle"
     assert not processed.with_name("i.tmp").exists()
@@ -573,7 +575,7 @@ def test_instruct_inversions_are_seeded_per_row_and_survive_a_resume(
     inverted = [r for r in resumed if r["instruction"].startswith("Given this output")]
     assert 4 <= len(inverted) <= 20 and m.stats["inverted"] == len(inverted) and m.shuffled is False
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) != 6 for r in inverted), "tokens recounted"
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + SPECIAL_TOKENS != 8 for r in inverted), "tokens recounted, specials included"
     assert [r["instruction"] for r in resumed if not r["instruction"].startswith("Given")] == [
         r["instruction"] for i, r in enumerate(rows) if not resumed[i]["instruction"].startswith("Given")
     ], "raw order kept without shuffle"
@@ -598,15 +600,15 @@ def test_instruct_rows_over_the_cap_are_dropped_and_counted(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader
 ) -> None:
     src_dir = layout.root.parent / "long"
-    rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 6 and 10 tokens
+    rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 8 and 12 tokens with the specials
     write_local(src_dir, rows, "jsonl")
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, max_seq_length=8)
     raw = download(cfg, "i", layout, rows_needed=10)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [6] * 5, "rows over the cap are dropped at download, never truncated"
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [8] * 5, "rows over the cap are dropped at download, never truncated"
     assert raw.dropped_too_long == 5 and raw.exhausted is True
     m = build_source(cfg, "i", layout)
     out = read_rows(layout.processed_dir("i"))
-    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.stats["removed_too_long"] == 0  # the build's safety net has nothing left to do
+    assert len(out) == 5 and all(r["tokens"] == 8 for r in out) and m.stats["removed_too_long"] == 0  # the build's safety net has nothing left to do
 
 
 def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(

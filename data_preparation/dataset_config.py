@@ -29,6 +29,8 @@ from typing import Any, Literal, Optional
 
 from jsonargparse import ArgumentError, ArgumentParser
 
+from data_preparation.lib.stages.truncation import TOKEN_RULE
+
 SourceKind = Literal["pretrain", "instruct"]
 LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
 DedupMode = Literal["none", "exact", "minhash"]
@@ -578,8 +580,8 @@ class DatasetConfig:
         """
         Hash of a source's raw/ folder: every field annotated raw, i.e. the loader identity (kind, loader,
         repo, revision, files, split, text field, language, path, converter/fields/filter; seed only for
-        loader: synthetic, where it generates the rows) plus token_count and the tokenizer, on which the
-        stored tokens column and the token-boundary truncation depend.
+        loader: synthetic, where it generates the rows) plus token_count, the tokenizer and the counting rule
+        (truncation.TOKEN_RULE), on which the stored tokens column and the token-boundary truncation depend.
 
         Everything else is annotated processed, config or none and stays out: max_seq_length (the raw
         manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
@@ -592,6 +594,7 @@ class DatasetConfig:
         payload = {
             "source": hash_payload(self.sources[source_name], "raw"),
             "token_count": self.token_count,
+            "token_rule": TOKEN_RULE,
             "tokenizer": hash_payload(self.tokenizer, "raw"),
         }
         return _stable_hash(payload)

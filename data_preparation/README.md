@@ -189,13 +189,16 @@ still short then is reported, not looped on forever.
 
 Appends raw shards to `sources/<source>/raw/` until `rows_needed` rows are on disk. Loaders are deterministic and
 read at an offset (below), so a config that needs more rows appends the next slice and one that needs fewer reads
-a prefix. Pretrain rows keep every row, with `text_field` **cut at the token boundary `max_seq_length`**
-(`lib/stages/truncation.py`: the stored text is a prefix of the document and `tokens` is the true count of the
-stored text, so storage is bounded and no count is ever wrong; `token_count: estimate` cuts at `4 × max_seq_length`
-characters). Instruct rows run through the converter and filter at download time and are stored as
-`{instruction, input, output, tokens}`; a row over `max_seq_length` tokens is **dropped**, never cut (an answer
-missing its end would be worse than a missing row; `dropped_too_long` in the manifest), a malformed one is skipped
-(`skipped_malformed`); `check_limit` bounds the source rows inspected. A loader that runs dry marks the source
+a prefix. Pretrain rows keep every row as `{text_field, tokens}` (a string, whatever the loader delivered), with
+`text_field` **cut at a token boundary** (`lib/stages/truncation.py`: the stored text is a prefix of the document,
+so storage is bounded and no count is ever wrong; `token_count: estimate` cuts at 4 characters per token). `tokens`
+is the length the trainer sees: the true count of the stored text plus the BOS and EOS the trainer adds around
+every row (`SPECIAL_TOKENS`), and never exceeds `max_seq_length`. Instruct rows run through the converter and
+filter at download time and are stored as `{instruction, input, output, tokens}` with `tokens` counted the same way
+over the text the trainer formats from them (`instruct_text`); a row whose `tokens` exceeds `max_seq_length` is
+**dropped**, never cut (an answer missing its end would be worse than a missing row; `dropped_too_long` in the
+manifest), a malformed one (converter error, no instruction / output) is skipped (`skipped_malformed`);
+`check_limit` bounds the source rows inspected. A loader that runs dry marks the source
 `exhausted`; the source completes with a warning and the training sampler cycles what is there.
 
 The download **never deletes** a raw folder. A folder whose manifest is *stale* (identity or tokenizer changed) or
@@ -207,8 +210,8 @@ repair step removes it, and only after confirmation.
 Turns the raw shards of a source into `processed/<source>/`, in this order. **Pretrain**: length filter
 (`min_chars`; the upper bound is the truncation at download) → quality filter → decontamination → exact dedup;
 **instruct**: input inversions (a seeded per-row decision keyed by `(seed, global row index)`, so it is independent
-of shard boundaries and of a resume) → drop rows with an empty instruction or output → exact dedup over
-`instruction\ninput\noutput`. Every processed row carries `tokens` (the raw count, clamped to the current
+of shard boundaries and of a resume) → drop rows with an empty instruction or output → exact dedup over the
+trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw count, clamped to the current
 `max_seq_length`) and `hash` (the 64-bit exact-dedup key). Two write modes:
 
 - **per raw shard, resumable** (pretrain sources): the survivors of one raw shard are published before the next raw
@@ -437,8 +440,9 @@ the order they run in.
   on first use.
 - `min_chars` drops shorter pretrain documents; there is no upper character bound; the token truncation at
   download is the upper bound.
-- Token counting (`token_count`) happens at download time: `tokenizer` counts with the config's tokenizer (no
-  special tokens), `estimate` uses chars / 4. Instruct rows are counted whole (instruction + input + output).
+- Token counting (`token_count`) happens at download time: `tokenizer` counts with the config's tokenizer,
+  `estimate` uses chars / 4; both add the two special tokens the trainer puts around a row. Instruct rows are
+  counted whole, as the trainer formats them (instruction, input and output joined by blank lines).
 
 ## Differences from the thesis run
 
