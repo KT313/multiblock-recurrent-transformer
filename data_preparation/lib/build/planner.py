@@ -2,20 +2,18 @@
 """
 Planner: what a dataset config needs on disk versus what the manifests say is there, counted in tokens.
 
-The trainer draws rows from one continuous stream per source with the stage weight and packs them end to end and cuts
-them at the run's training_max_sequence_length, so a source is consumed by the token length of its rows: the run needs the integral of the
-source's weight schedule over the stage token budgets, :meth:`DatasetConfig.token_budget`, in tokens. Rows are what
-a loader delivers, so the planner divides that budget by a tokens-per-row rate: the source's describe_tokens_per_row
-estimate until the first raw shard is on disk, the measured mean of the raw manifest (tokens ÷ rows) from then on,
-either clamped at the training length, or the dataset length when no run is known
-(:meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
+The trainer draws rows from one continuous stream per source with the stage weight and packs them end to end, cut at
+the length the dataset config plans for, training_target_sequence_length: a row serves min(its tokens, target) of the
+token budget. The run needs the integral of the source's weight schedule over the stage token budgets,
+:meth:`DatasetConfig.token_budget`, in tokens. Rows are what a loader delivers, so the planner divides that budget by
+a tokens-per-row rate: the source's describe_tokens_per_row estimate (clamped at the target) until the first raw shard
+is on disk, the mean of the capped row lengths read from the raw shards' tokens column from then on
+(:func:`measured_tokens_per_row`, :meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
 it into a download target (× 1.2 safety margin, ÷ the training share after the validation holdout),
 :meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it, :meth:`DatasetConfig.rows_budget` into
 the rows the run draws (the status table's epochs). A run that pads instead of packing consumes one row per
-sequence and is over-provisioned by training length ÷ rate: a tokens plan never downloads fewer rows than a sequences
-plan would. The clamp is an approximation on the safe side: min(mean, cut) over-estimates the rows a source
-of rows longer than the cut consumes; a rate that turns out lower than the estimate is what the round loop's
-top-ups correct.
+sequence and is over-provisioned by target ÷ rate: a tokens plan never downloads fewer rows than a sequences
+plan would. An estimate that ran high is what the round loop's top-ups correct once the rows are measured.
 
 One :class:`SourceLedger` per source answers both questions the pipeline asks, "what is still to download?"
 (:attr:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`), from one read
@@ -25,9 +23,10 @@ budget. An exhausted source with no rows, or whose few rows all go to the traini
 (:func:`training_rows_after_split`), is a failure: a failed source is a failed build, never a silently smaller
 dataset.
 
-Everything here reads manifests only (no parquet footers): a processed folder's health is the shared verdict of
-lib/build/assessment.py with check_files=False; broken or stray shard files are the repair step's business. A raw
-manifest that cannot be parsed next to shards is a reported state (nothing is planned for it, nobody deletes it).
+Everything here reads manifests, plus the tokens column of current raw shards for the rate (no other shard data):
+a processed folder's health is the shared verdict of lib/build/assessment.py with check_files=False; broken or stray
+shard files are the repair step's business. A raw manifest that cannot be parsed next to shards is a reported state
+(nothing is planned for it, nobody deletes it).
 Pure functions of (config, layout); lib/build/runner.py executes them.
 """
 
@@ -44,7 +43,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, inspect_raw
-from data_preparation.lib.storage.manifest import shard_list, Manifest
+from data_preparation.lib.storage.manifest import shard_list, shard_tokens, Manifest
 
 log = get_logger(__name__)
 
@@ -254,7 +253,7 @@ class SourceLedger:
     rows_needed: int  # raw rows to download (:meth:`DatasetConfig.rows_needed`)
     rows_sufficient: int  # processed rows that serve the budget (:meth:`DatasetConfig.rows_sufficient`)
     rows_budget: int  # rows the whole run draws (token budget ÷ tokens_per_row; 0 when the source is not trained on)
-    tokens_per_row: float  # the rate the three numbers above were planned with (measured mean, else the estimate; clamped at the training length)
+    tokens_per_row: float  # the rate the three numbers above were planned with (measured mean of the capped row lengths, else the estimate)
     raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated" | "unreadable"
     raw_reason: str  # the state's reason line (:func:`inspect_raw`): what the plan and the status table say about it
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
@@ -399,7 +398,7 @@ class SourceLedger:
 
 def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceLedger:
     """
-    Read one source's ledger: the budget from config at the tokens-per-row rate the raw manifest measured (the
+    Read one source's ledger: the budget from config at the tokens-per-row rate measured over the raw shards (the
     config's estimate before the first shard), the rest from the raw and processed manifests. A raw folder that is
     not current contributes nothing (its rows are about to be deleted, were never downloaded, or nobody can read
     their manifest), so its processed folder is not counted either. An unreadable processed manifest is the repair
@@ -413,7 +412,7 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     if processed.problem == "unreadable_manifest":
         log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, layout.processed_dir(name))
     processed_rows = processed.manifest.rows() if processed.manifest is not None and processed.problem in ("none", "behind_raw") else 0
-    measured = measured_tokens_per_row(raw)
+    measured = measured_tokens_per_row(config, name, layout, raw)
     return SourceLedger(
         name=name,
         kind=config.sources[name].kind,
@@ -434,16 +433,19 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     )
 
 
-def measured_tokens_per_row(raw: Manifest | None) -> float | None:
+def measured_tokens_per_row(config: DatasetConfig, name: str, layout: DatasetLayout, raw: Manifest | None) -> float | None:
     """
-    The mean tokens per stored row of a current raw manifest (tokens ÷ rows), the rate the planner divides the
-    token budget by; None without rows or token totals (the config's estimate stands in then).
+    The mean over the stored rows of min(tokens, training_target_sequence_length), the rate the planner divides
+    the token budget by: a 530-token row serves 530 tokens of the budget, a 4000-token one the target. Read from
+    the tokens column of every shard of a current raw manifest (one column per shard, no other data); None without
+    rows or token counts (the config's estimate stands in then).
     """
 
-    if raw is None or raw.rows() <= 0:
+    if raw is None or raw.rows() <= 0 or raw.tokens() is None:
         return None
-    tokens = raw.tokens()
-    return None if tokens is None else tokens / raw.rows()
+    raw_dir = layout.raw_dir(name)
+    capped = sum(shard_tokens(raw_dir / shard.name, cap=config.training_target_sequence_length) for shard in raw.shards)
+    return capped / raw.rows()
 
 
 def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> list[SourceLedger]:

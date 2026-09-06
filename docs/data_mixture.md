@@ -33,7 +33,8 @@ gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every so
 ## Tokenizer, sequence length and token counting
 
 - tokenizer: `llama-32k` (hf, `hf-internal-testing/llama-tokenizer` @ `d02ad6cb9dd2c2296a6332199fa2fdca5938fef0`)
-- `dataset_max_sequence_length`: 2048 (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)
+- `training_target_sequence_length`: 2048 (the run trains at this length: a row counts min(its tokens, this) towards the budget)
+- `dataset_max_sequence_length`: 16384 (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)
 - `token_count`: `tokenizer` (real tokenizer counts)
 - `validation_fraction`: 5% of a source used for training and validation is held out
 - training tokens over all stages: 4.95B

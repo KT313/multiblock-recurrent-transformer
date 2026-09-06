@@ -3,6 +3,7 @@
 # network. `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
 
 tokenizer: {name: synthetic, kind: synthetic}
+training_target_sequence_length: 256
 dataset_max_sequence_length: 256
 token_count: tokenizer
 validation_fraction: 0.05       # every source below is used for training and validation: its first 5 % of rows are held out

@@ -91,8 +91,8 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
         "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),  # used only for validation
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
-    cfg = cfg_factory(sources, tokens=500)
-    report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=1)
+    cfg = cfg_factory(sources, tokens=500, training_target_sequence_length=1)
+    report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and [s.name for s in report.sources] == ["p", "h", "i"]
     p, h, i = report.sources
     assert p.rows_needed == 600 and p.raw_rows == 600 and p.processed_rows >= 500 and p.epochs() is not None
@@ -116,11 +116,11 @@ def test_a_loader_that_falls_short_is_exhausted_until_reopened(
 
     src_dir = layout.root.parent / "growing"
     write_local(src_dir, [{"text": f"tok_{i} tok_2 tok_3"} for i in range(4)], "parquet")
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=10)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=10, training_target_sequence_length=1)
     needed, sufficient = cfg.rows_needed("p"), cfg.rows_sufficient("p")  # 10 rows × 1.2 ÷ 0.95 = 13, 11
     path = config_file(cfg)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1)
+        report = prepare(path, layout.root, assume_yes=False)
     (p,) = report.sources
     assert report.complete and p.exhausted and p.satisfaction() == (True, f"exhausted at 4 of {sufficient} rows") and (needed, sufficient) == (13, 11)
     assert "round 2" not in caplog.text
@@ -130,13 +130,13 @@ def test_a_loader_that_falls_short_is_exhausted_until_reopened(
     write_local(src_dir, [{"text": f"tok_{i} tok_5 tok_6"} for i in range(20)], "parquet")  # the source grew
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        assert _state(prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1), "p").exhausted  # the latch holds
+        assert _state(prepare(path, layout.root, assume_yes=False), "p").exhausted  # the latch holds
     assert "round 1: nothing to download" in caplog.text
     with pytest.raises(ValueError, match="unknown sources"):
-        prepare(path, layout.root, assume_yes=False, reopen=["nope"], training_max_sequence_length=1)
+        prepare(path, layout.root, assume_yes=False, reopen=["nope"])
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False, reopen=["p"], training_max_sequence_length=1)
+        report = prepare(path, layout.root, assume_yes=False, reopen=["p"])
     (p,) = report.sources
     assert "p: reopened; the next download reads on from offset 4" in caplog.text
     assert f"round 1: 1 source(s) short, downloading {needed - 4} rows (p {needed - 4})" in caplog.text
@@ -169,7 +169,7 @@ def test_a_measured_rate_below_the_estimate_gets_a_second_round(
 def test_a_source_still_short_after_max_rounds_is_reported(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=100)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=100, training_target_sequence_length=1)
     calls = 0
 
     def one_row_per_call(config: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
@@ -179,7 +179,7 @@ def test_a_source_still_short_after_max_rounds_is_reported(
 
     monkeypatch.setattr(runner, "download", one_row_per_call)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=1)
+        report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert not report.complete and calls == runner.MAX_ROUNDS == 5
     assert f"round {runner.MAX_ROUNDS}:" in caplog.text and f"round {runner.MAX_ROUNDS + 1}" not in caplog.text
     (p,) = report.sources
@@ -202,10 +202,10 @@ def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     src_dir = layout.root.parent / "dupes"
     rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
     write_local(src_dir, rows, "parquet")
-    cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500)
+    cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500, training_target_sequence_length=1)
     needed, sufficient = cfg.rows_needed("d"), cfg.rows_sufficient("d")
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=1)
+        report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (d,) = report.sources
     assert report.complete and d.satisfaction()[0] and not d.exhausted and d.satisfaction()[1] == "ok"
     assert (needed, sufficient) == (632, 527) and d.processed_rows >= sufficient
@@ -250,9 +250,9 @@ def test_exhausted_source_is_complete_with_a_warning(
 ) -> None:
     src_dir = layout.root.parent / "small"
     write_local(src_dir, [{"text": "tok_1 tok_2 tok_3"}] * 3 + [{"text": "tok_4 tok_5"}], "parquet")
-    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=1000)
+    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=1000, training_target_sequence_length=1)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=1)
+        report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (s,) = report.sources
     assert report.complete and s.satisfaction()[0] and s.exhausted and s.processed_rows == 2  # the duplicates went
     assert f"s: source exhausted (exhausted at 2 of {cfg.rows_sufficient('s'):,} rows)" in caplog.text
@@ -394,7 +394,7 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
     its next shard (published), `prepare` raises `BuildAborted` and the next run resumes.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, training_target_sequence_length=1)
     shards_done: list[int] = []
 
     def slow_download(config: DatasetConfig, name: str, *args: Any, rows_needed: int, should_stop: Any = None, **kwargs: Any) -> Manifest:
@@ -413,14 +413,14 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
     monkeypatch.setattr(runner, "wait", interrupted_wait)
     path = config_file(cfg)
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(BuildAborted, match="interrupted"):
-        prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1)
+        prepare(path, layout.root, assume_yes=False)
     assert 1 <= len(shards_done) < 50, "stopped within a shard of the interrupt, not at the end"
     assert "source p stopped: interrupted" in caplog.text
     raw = Manifest.load(layout.raw_dir("p"))
     assert raw is not None and raw.rows() == 100 and not layout.processed_dir("p").exists()
     monkeypatch.setattr(runner, "wait", concurrent.futures.wait)
     monkeypatch.setattr(runner, "download", real_download)
-    assert prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1).complete  # resumes behind the published shard
+    assert prepare(path, layout.root, assume_yes=False).complete  # resumes behind the published shard
     raw = Manifest.load(layout.raw_dir("p"))
     assert raw is not None and [s.rows for s in raw.shards] == [100, cfg.rows_needed("p") - 100]
 
@@ -669,7 +669,7 @@ def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resum
     published is kept, `prepare` raises `BuildAborted`; the next run resumes both.
     """
 
-    cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500)
+    cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500, training_target_sequence_length=1)
     build_started = threading.Event()
     ticks: dict[str, int] = {}
 
@@ -703,7 +703,7 @@ def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resum
     monkeypatch.setattr(runner, "wait", interrupted_wait)
     path = config_file(cfg)
     with caplog.at_level(logging.INFO, logger="data_preparation"), pytest.raises(BuildAborted, match="interrupted"):
-        prepare(path, layout.root, assume_yes=False, num_workers=1, max_parallel_downloads=2, training_max_sequence_length=1)
+        prepare(path, layout.root, assume_yes=False, num_workers=1, max_parallel_downloads=2)
     assert 1 <= ticks["s0"] < 50 and 1 <= ticks["s1"] < 50, f"both stopped within a shard of the interrupt: {ticks}"
     assert "source s0 stopped: interrupted" in caplog.text and "source s1 stopped: interrupted" in caplog.text
     raw = Manifest.load(layout.raw_dir("s1"))
@@ -712,7 +712,7 @@ def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resum
     monkeypatch.setattr(runner, "wait", concurrent.futures.wait)
     monkeypatch.setattr(runner, "download", real_download)
     monkeypatch.setattr(runner, "build_source", real_build)
-    assert prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1).complete
+    assert prepare(path, layout.root, assume_yes=False).complete
     raw = Manifest.load(layout.raw_dir("s1"))
     assert raw is not None and [s.rows for s in raw.shards] == [100, cfg.rows_needed("s1") - 100]  # resumed, not restarted
 
@@ -815,9 +815,7 @@ def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(
 
     def config(path: Path, seed: int) -> Path:
         cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=seed)}, tokens=500)
-        payload = asdict(cfg)
-        payload.pop("training_max_sequence_length")  # not a YAML key
-        path.write_text(yaml.safe_dump(payload, sort_keys=False))
+        path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
         return path
 
     a, b = config(tmp_path / "a.yaml", 0), config(tmp_path / "b.yaml", 1)
@@ -923,8 +921,7 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
 ) -> None:
     hub.add("data/a.parquet", _code_rows("a", 30))
     hub.add("data/b.parquet", _code_rows("b", 30))
-    cfg = _github_cfg(cfg_factory, ["Python", "Java", "Go"])
-    cfg.training_max_sequence_length = 1  # what `prepare` below plans with; the direct plan calls need it too
+    cfg = _github_cfg(cfg_factory, ["Python", "Java", "Go"], training_target_sequence_length=1)
     single: list[str] = []
 
     def spy_download(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
@@ -935,7 +932,7 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
     jobs = runner.download_jobs(plan_downloads(cfg, layout), cfg, layout, None)
     assert [(job.what, job.name) for job in jobs] == [("github_code group", "code_python, code_java, code_go")]
     assert jobs[0].sources == ("code_python", "code_java", "code_go")
-    report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=1)
+    report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and single == []  # the group pass replaced the per-source downloads
     assert len(hub.streams) == len(set(hub.streams))  # every repo file opened at most once for all three languages
     for name in ("code_python", "code_java", "code_go"):
@@ -944,12 +941,11 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
 
     # `--sources` with one language uses the ordinary per-source path
     hub.streams.clear()
-    bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"])
-    bigger.training_max_sequence_length = 1
+    bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"], training_target_sequence_length=1)
     bigger.stages[0].tokens = 30
     jobs = runner.download_jobs(plan_downloads(bigger, layout, sources=["code_python"]), bigger, layout, None)
     assert [(job.what, job.name) for job in jobs] == [("source", "code_python")]
-    prepare(config_file(bigger), layout.root, assume_yes=False, sources=["code_python"], training_max_sequence_length=1)
+    prepare(config_file(bigger), layout.root, assume_yes=False, sources=["code_python"])
     assert single == ["code_python"]
 
 
@@ -999,8 +995,8 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     from data_preparation.lib.sources import loaders as loaders_mod
 
     monkeypatch.setattr(runner, "download", partial(real_download, shard_size=10))
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=50))
-    prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1)
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=50, training_target_sequence_length=1))
+    prepare(path, layout.root, assume_yes=False)
     raw = layout.raw_dir("p")
     manifest = Manifest.load(raw)
     assert manifest is not None and len(manifest.shards) >= 3, "the test needs several raw shards"
@@ -1015,7 +1011,7 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False, training_max_sequence_length=1)
+        report = prepare(path, layout.root, assume_yes=False)
     assert report.complete and "truncating" in caplog.text
     assert offsets == [manifest.shards[-2].offset], "resumed behind the last good shard instead of from 0"
     repaired = Manifest.load(raw)

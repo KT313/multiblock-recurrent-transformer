@@ -97,6 +97,7 @@ def test_validation_only_source_renders_rows() -> None:
             "heldout": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=40),
         },
         stages=[StageConfig(name="p", tokens=512, train={"pre": 1.0}, val={"heldout": 1.0})],
+        training_target_sequence_length=64,
         dataset_max_sequence_length=64,
     )
     text = describe(cfg, "t.yaml")

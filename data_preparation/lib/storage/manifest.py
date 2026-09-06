@@ -271,12 +271,14 @@ def shard_rows(path: Path) -> int:
     return pq.read_metadata(path).num_rows
 
 
-def shard_tokens(path: Path) -> int:
+def shard_tokens(path: Path, cap: int | None = None) -> int:
     """
-    Sum of a shard's tokens column (one column read).
+    Sum of a shard's tokens column (one column read), every value capped at cap when given.
     """
 
     column = pq.read_table(path, columns=["tokens"]).column("tokens")
+    if cap is not None:
+        column = pc.min_element_wise(column, cap)
     total = pc.sum(column).as_py()
     return 0 if total is None else int(total)
 

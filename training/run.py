@@ -38,6 +38,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from data_preparation.dataset_config import DatasetConfig
+from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
@@ -68,6 +69,9 @@ from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
 from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
+
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -276,20 +280,30 @@ def check_evaluation_recurrences(settings: Settings) -> None:
 
 def check_sequence_lengths(settings: Settings, dataset_config: DatasetConfig, model_config: RecurrentConfig) -> None:
     """
-    The three sequence lengths must nest: the model's RoPE table covers `model_max_sequence_length` positions, the
-    dataset's rows were cut at `dataset_max_sequence_length` tokens, and training cuts them again at
-    `training_max_sequence_length`. Training longer than the model's table is impossible; longer than the data
-    was cut means every row is shorter than the training window, never what was intended.
+    Training cuts rows at `training_max_sequence_length`, which must fit both the model's RoPE table
+    (`model_max_sequence_length` positions) and the stored rows (cut at `dataset_max_sequence_length` when
+    downloaded): longer than the model's table is impossible, longer than the data was cut means every row is
+    shorter than the training window, never what was intended. The two upper bounds are independent (a dataset
+    may store 16k-token rows for a model whose table covers 2k). A run cutting rows at another length than the
+    dataset config planned its downloads for (`training_target_sequence_length`) is warned about: the rows on
+    disk serve fewer tokens than budgeted when the run cuts shorter (the sampler cycles the source), more when it
+    cuts longer.
     """
 
     model, dataset, training = (
         model_config.model_max_sequence_length, dataset_config.dataset_max_sequence_length, settings.training_max_sequence_length
     )
-    if not model >= dataset >= training:
+    if training > model or training > dataset:
         raise ValueError(
-            "the sequence lengths must nest as model_max_sequence_length >= dataset_max_sequence_length >= "
-            f"training_max_sequence_length, got {model} ({settings.model_architecture_config}, with model_overwrite applied) "
-            f">= {dataset} ({settings.dataset_config}) >= {training} (the run config)"
+            f"training_max_sequence_length {training} (the run config) must be at most model_max_sequence_length {model} "
+            f"({settings.model_architecture_config}, with model_overwrite applied) and dataset_max_sequence_length {dataset} "
+            f"({settings.dataset_config})"
+        )
+    target = dataset_config.training_target_sequence_length
+    if training != target:
+        log.warning(
+            "training_max_sequence_length %d differs from training_target_sequence_length %d of %s: the downloads were sized "
+            "for rows cut at %d tokens", training, target, settings.dataset_config, target
         )
 
 

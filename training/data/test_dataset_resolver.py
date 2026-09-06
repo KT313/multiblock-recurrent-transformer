@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from data_preparation.dataset_config import (
     DatasetConfig,
@@ -193,6 +195,7 @@ def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
             "held": SourceConfig(kind="pretrain", loader="synthetic", rows=10),
         },
         stages=[StageConfig(name="s", tokens=100, train={"a": 0.5, "both": 0.5}, val={"both": 0.5, "held": 0.5})],
+        training_target_sequence_length=8,
         dataset_max_sequence_length=8,
     )
 
@@ -746,24 +749,41 @@ def test_auto_prepare_never_deletes_raw(tmp_path: Path, monkeypatch: pytest.Monk
 # --- cross-checks ---------------------------------------------------------------------------------------------------
 
 
-def test_base_lrs_length_mismatch_raises(tmp_path: Path, crow_cfg: DatasetConfig) -> None:
-    settings = _settings(CROW_DATASET_YAML, tmp_path, stage_base_lrs=[1e-3, 1e-4], training_max_sequence_length=2048)
-    with pytest.raises(ValueError, match="stage_base_lrs has 2 entries but dataset config .* has 3 stages"):
-        validate_settings(settings, crow_cfg)
-    with pytest.raises(ValueError, match="stage_base_lrs has 2 entries"):
+def _config_file(tmp_path: Path, config: DatasetConfig) -> Path:
+    """
+    The config written as `<tmp_path>/dataset.yaml`: the cross-check tests below read only values they set here,
+    never a shipped config that is free to change.
+    """
+
+    path = tmp_path / "dataset.yaml"
+    path.write_text(yaml.safe_dump(asdict(config), sort_keys=False))
+    return path
+
+
+@pytest.mark.timeout(3)  # a check that did not fire must not turn into a build (auto_prepare is off too)
+def test_base_lrs_length_mismatch_raises(tmp_path: Path) -> None:
+    config = _synthetic_config()  # one stage; `_settings` gives three base LRs
+    settings = _settings(_config_file(tmp_path, config), tmp_path / "data", auto_prepare=False, training_max_sequence_length=8)
+    with pytest.raises(ValueError, match="stage_base_lrs has 3 entries but dataset config .* has 1 stages"):
+        validate_settings(settings, config)
+    with pytest.raises(ValueError, match="stage_base_lrs has 3 entries"):
         resolve_dataset(settings)  # checked before any data is touched
 
 
-def test_training_longer_than_the_dataset_rows_is_refused_at_load(tmp_path: Path, crow_cfg: DatasetConfig) -> None:
+@pytest.mark.timeout(3)  # a refusal that did not happen must not turn into a build (auto_prepare is off too)
+def test_training_longer_than_the_dataset_rows_is_refused_at_load(tmp_path: Path) -> None:
     """
-    The dataset config is loaded with the run's training length (the planner clamps with it); a run longer than the
-    rows were cut at is refused there, before any data is touched. A shorter run is fine (over-provisioned rows).
+    A run longer than the rows were cut at is refused by the settings cross-check, before any data is touched
+    (`auto_prepare` off and an empty dataset dir: a check that let the run through would fail on the missing data,
+    never build it). A shorter run is fine (the sampler cycles rows that serve fewer tokens than planned).
     """
 
-    expected = f"training_max_sequence_length (4096) exceeds dataset_max_sequence_length (2048) of {Path(CROW_DATASET_YAML).as_posix()}"
+    config = _synthetic_config()  # rows cut at 8 tokens
+    path = _config_file(tmp_path, config)
+    expected = f"training_max_sequence_length (16) exceeds dataset_max_sequence_length (8) of {path.as_posix()}"
     with pytest.raises(ValueError, match=re.escape(expected)):
-        resolve_dataset(_settings(CROW_DATASET_YAML, tmp_path, training_max_sequence_length=4096))
-    validate_settings(_settings(CROW_DATASET_YAML, tmp_path, training_max_sequence_length=256), crow_cfg)
+        resolve_dataset(_settings(path, tmp_path / "data", stage_base_lrs=[1e-3], training_max_sequence_length=16, auto_prepare=False))
+    validate_settings(_settings(path, tmp_path / "data", stage_base_lrs=[1e-3], training_max_sequence_length=4), config)
 
 
 # --- resume checks --------------------------------------------------------------------------------------------------

@@ -18,9 +18,11 @@ that file; this is the shape:
 
 ```yaml
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
+training_target_sequence_length: 2048   # the run trains at this length: a row counts min(its tokens, this) towards the
+                                        # download budget; at most dataset_max_sequence_length
 dataset_max_sequence_length: 2048   # pretrain rows are truncated to this many tokens WHEN DOWNLOADED, instruct rows longer
                                     # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
-                                    # costs nothing; >= the run config's training_max_sequence_length
+                                    # costs nothing; a storage cap (no 100k-token documents stored whole), not the training length
 token_count: tokenizer      # or: estimate (chars / 4)
 validation_fraction: 0.05   # share of a source's rows held out when the source is used for training AND validation
 processing:                 # defaults for every source; a pretrain source may carry its own block
@@ -283,18 +285,19 @@ at most `truncated_at_tokens` long; the build clamps the stored counts, training
 
 The trainer draws **rows** from one continuous reader per source, one draw per sample, weighted by the stage
 schedule (the stage's constant weight, linearly interpolated across a transition window), and packs them end to end,
-cut at the run's `training_max_sequence_length`: a source is consumed by the token length of its rows. The run therefore needs the
+cut at the length the dataset config plans for, `training_target_sequence_length`: a row serves
+`min(its tokens, target)` of the budget (a 530-token row 530 tokens, a 4000-token row the target; a 50k-token row is
+stored cut at `dataset_max_sequence_length` and serves the target too). The run therefore needs the
 integral of a source's weight schedule over the stage token budgets, in tokens. That is the planner's unit, the
 **token budget**: stages sharing a source ADD UP (the reader continues across stage boundaries instead of
 re-reading), each stage contributing `(tokens − transition tokens) × weight` plus the trapezoid
 `transition tokens × (weight + next stage's weight) / 2` for the window at its end. Rows are what a loader delivers,
-so the budget is divided by a **tokens-per-row rate**: the source's `describe_tokens_per_row` until its first raw
-shard is on disk, the measured mean of the raw manifest (`tokens ÷ rows`) from then on, either clamped at the
-run's `training_max_sequence_length` (`prepare.py --training_max_sequence_length`, or the run settings when
-training prepares its own data; without one, at `dataset_max_sequence_length`, i.e. every row counted in full):
+so the budget is divided by a **tokens-per-row rate**: the source's `describe_tokens_per_row` (clamped at the target)
+until its first raw shard is on disk, the mean of the capped row lengths from then on, read from the `tokens` column
+of the raw shards:
 
 ```
-rate                    = min(measured mean tokens per raw row, or describe_tokens_per_row before the first shard; training_max_sequence_length)
+rate                    = mean over raw rows of min(tokens, training_target_sequence_length), or min(describe_tokens_per_row, target) before the first shard
 rows_needed(source)     = ceil(token_budget ÷ rate × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
                         = ceil(source.rows × 1.2)                                                  # source used only in val
 rows_sufficient(source) = rows_needed ÷ 1.2, or source.rows                                        # processed rows that serve it
@@ -305,10 +308,9 @@ The `× 1.2` covers what the length filter and the dedup drop and an estimate th
 *training* part at the budget after the resolver holds `validation_fraction` out. The first download is sized at the
 estimate; the round loop tops the source up at the measured rate when the estimate was more than 20 % too high
 (rows measured shorter), and re-downloads nothing when the processed rows already serve the budget. A run that pads
-instead of packing consumes one row per sequence, so it is over-provisioned by `training_max_sequence_length ÷ rate` and never short.
-The clamp is an approximation on the safe side: `min(mean, cut)` over-estimates the rows a
-source of rows longer than the cut consumes (every token of such a row is trained on too), so a rate that
-proves lower than assumed is what the top-up rounds correct, never one that was too low. A validation-only source's
+instead of packing consumes one row per sequence, so it is over-provisioned by `training_target_sequence_length ÷ rate` and never short.
+A run whose `training_max_sequence_length` differs from the target is warned about at startup: cut shorter, the rows
+serve fewer tokens than budgeted (the sampler cycles the source); cut longer, more. A validation-only source's
 `rows` are delivered rows: `× 1.2` downloaded, `rows` of them have to survive the build.
 
 Whether a source is **satisfied** is `SourceLedger.satisfaction()`: `(satisfied, reason)`, the reason being the
@@ -349,7 +351,7 @@ stage of the run. The chosen `validation_rows` per source travel with every chec
 hash and are verified on resume. A validation-only source reading the same Hub repo and file prefix as a training
 source draws a warning (prefer listing the training source in `val` too). The resolver also checks every stage key
 directly on disk (folder present, at least one shard, a non-empty row range for its part), independent of the
-manifests, and that the three sequence lengths nest: `model_max_sequence_length >= dataset_max_sequence_length >= training_max_sequence_length`.
+manifests, and that the run's `training_max_sequence_length` is at most `model_max_sequence_length` and `dataset_max_sequence_length`.
 
 ## Where things are cached
 

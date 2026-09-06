@@ -85,6 +85,7 @@ def _general(config: DatasetConfig) -> list[str]:
         "## Tokenizer, sequence length and token counting",
         "",
         f"- tokenizer: {_tokenizer_label(config.tokenizer)}",
+        f"- `training_target_sequence_length`: {config.training_target_sequence_length} (the run trains at this length: a row counts min(its tokens, this) towards the budget)",
         f"- `dataset_max_sequence_length`: {config.dataset_max_sequence_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
         f"- `token_count`: {token_count}",
         f"- `validation_fraction`: {config.validation_fraction:.0%} of a source used for training and validation is held out",

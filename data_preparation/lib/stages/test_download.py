@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import pytest
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
+from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
@@ -315,7 +315,7 @@ def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(
     assert "download never deletes raw" in str(info.value)
     assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == m, "nothing deleted or rewritten"
     # a lowered cap is fine: the rows are at most 64 tokens long, which is more than the config now needs
-    assert download(replace(cfg, dataset_max_sequence_length=32), "p", layout, rows_needed=12, shard_size=5) == m
+    assert download(replace(cfg, dataset_max_sequence_length=32, training_target_sequence_length=32), "p", layout, rows_needed=12, shard_size=5) == m
 
 
 def test_download_refuses_to_restart_over_shards_without_a_manifest(
@@ -497,20 +497,18 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
     assert payload["stage"] == "raw"
 
 
-def test_fetch_source_forces_range_requests_by_default() -> None:
-    from dataclasses import replace
-
-    from data_preparation.dataset_config import SourceConfig
+def test_fetch_source_forces_range_requests_by_default(cfg_factory: CfgFactory) -> None:
     from data_preparation.lib.stages.download import fetch_source
 
-    cfg = load_dataset_config(Path("config/datasets/crow_300m_mini.yaml"))
+    files = SourceConfig(kind="pretrain", loader="hf_files", hf_id="o/files", load_kwargs={"data_files": "data/*.parquet"})
+    split = SourceConfig(kind="pretrain", loader="hf_split", hf_id="o/split", load_kwargs={"name": "main"})
+    cfg = cfg_factory({"files": files, "py": _github("Python"), "split": split})
     assert cfg.always_range_requests
-    src = cfg.sources["fineweb_edu"]
+    src = cfg.sources["files"]
     assert fetch_source(cfg, src).load_kwargs["max_cached_file_mb"] == 0
     assert "max_cached_file_mb" not in src.load_kwargs  # original untouched
-    github = cfg.sources["github_code_clean_python"]
-    assert fetch_source(cfg, github).load_kwargs["max_cached_file_mb"] == 0
-    assert fetch_source(cfg, cfg.sources["gsm8k"]) is cfg.sources["gsm8k"]  # hf_split: not a hub_files source
+    assert fetch_source(cfg, cfg.sources["py"]).load_kwargs["max_cached_file_mb"] == 0
+    assert fetch_source(cfg, cfg.sources["split"]) is cfg.sources["split"]  # hf_split: not a hub_files source
     off = replace(cfg, always_range_requests=False)
     assert fetch_source(off, src) is src
     custom = SourceConfig(kind="pretrain", loader="hf_files", hf_id="a/b", load_kwargs={"data_files": "*.parquet", "max_cached_file_mb": 7})
@@ -774,7 +772,7 @@ def test_inspect_raw_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layou
     raised = replace(cfg, dataset_max_sequence_length=4096)
     assert inspect_raw(raised, "p", layout).state == "outdated" and inspect_raw(raised, "p", layout).current_manifest is None
     assert inspect_raw(raised, "p", layout).reason == "outdated: dataset_max_sequence_length 64 -> 4096"
-    lowered = replace(cfg, dataset_max_sequence_length=16)
+    lowered = replace(cfg, dataset_max_sequence_length=16, training_target_sequence_length=16)
     assert inspect_raw(lowered, "p", layout).state == "current" and inspect_raw(lowered, "p", layout).current_manifest == m
 
     other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic"))

@@ -15,6 +15,12 @@ from pathlib import Path
 import pytest
 import torch
 
+# No test may reach the Hub: every Hub request raises `OfflineModeIsEnabled` at once instead of downloading a
+# real source (a wrong config or a failed refusal check would otherwise start a multi-GB download). Set before
+# huggingface_hub / datasets are imported (they read the env at import time); subprocess tests inherit it.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
 if "PYTEST_XDIST_WORKER_COUNT" in os.environ:
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // int(os.environ["PYTEST_XDIST_WORKER_COUNT"])))
 

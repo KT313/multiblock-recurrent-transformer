@@ -36,11 +36,10 @@ from data_preparation.lib.sources.hub_files import file_format
 from data_preparation.lib.stages.download import prepare_tokenizer
 from data_preparation.lib.storage.raw_folder import RawFolder, good_prefix_length
 
-# Must happen before `datasets` is imported anywhere (its config reads the env at import time).
+# Must happen before `datasets` is imported anywhere (its config reads the env at import time); the offline mode
+# every test runs under is set by the root conftest.
 _CACHE = tempfile.mkdtemp(prefix="hf_datasets_cache_")
 os.environ.setdefault("HF_DATASETS_CACHE", _CACHE)
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]
@@ -174,14 +173,15 @@ TEST_BLOOM_MEMORY_MB = 1  # the dedup filter of every test config (the default 1
 @pytest.fixture
 def cfg_factory() -> CfgFactory:
     """
-    `make(sources, processing=..., token_count=..., dataset_max_sequence_length=..., tokens_per_row=..., tokens=...)` -> DatasetConfig.
+    `make(sources, processing=..., token_count=..., dataset_max_sequence_length=..., training_target_sequence_length=..., tokens_per_row=..., tokens=...)` -> DatasetConfig.
 
     A `pretrain` stage trains on every pretrain source without `rows` (equal weights) and a `finetune` stage on
     every instruct source without `rows`; a source with `rows` is used only for validation (in the stage of its
     kind, or the other one). Without any trainable source a synthetic `_pretrain` source is added so the config
     validates. `tokens` is the per-stage budget; `tokens_per_row` (every source's `describe_tokens_per_row`) defaults
-    to 1 so the rows budget of a trained source equals `tokens × weight`. The dedup filter of every config is `TEST_BLOOM_MEMORY_MB` (also when
-    `processing` is given).
+    to 1 so the rows budget of a trained source equals `tokens × weight` at the estimate; `training_target_sequence_length`
+    defaults to the dataset length (1 keeps the measured rate at 1 too). The dedup filter of every config is
+    `TEST_BLOOM_MEMORY_MB` (also when `processing` is given).
     """
 
     def make(
@@ -190,6 +190,7 @@ def cfg_factory() -> CfgFactory:
         processing: ProcessingConfig | None = None,
         token_count: str = "tokenizer",
         dataset_max_sequence_length: int = 64,
+        training_target_sequence_length: int | None = None,
         tokens_per_row: int = 1,
         tokens: int = 10_000,
         tokenizer: TokenizerConfig | None = None,
@@ -222,6 +223,7 @@ def cfg_factory() -> CfgFactory:
             tokenizer=tokenizer or TokenizerConfig(name="synthetic", kind="synthetic"),
             sources=sources,
             stages=stages,
+            training_target_sequence_length=dataset_max_sequence_length if training_target_sequence_length is None else training_target_sequence_length,
             dataset_max_sequence_length=dataset_max_sequence_length,
             token_count=token_count,  # type: ignore[arg-type]  # Literal narrowed by the caller
             processing=processing,
@@ -316,9 +318,7 @@ def config_file(tmp_path: Path) -> Callable[[DatasetConfig], Path]:
 
     def write(cfg: DatasetConfig) -> Path:
         path = tmp_path / "dataset.yaml"
-        payload = asdict(cfg)
-        payload.pop("training_max_sequence_length")  # not a YAML key (set on the config after loading)
-        path.write_text(yaml.safe_dump(payload, sort_keys=False))
+        path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
         return path
 
     return write

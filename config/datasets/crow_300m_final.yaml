@@ -20,7 +20,9 @@ tokenizer:
   hf_id: hf-internal-testing/llama-tokenizer
   revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
 
-dataset_max_sequence_length: 2048            # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
+training_target_sequence_length: 2048        # the run trains at this length: a row counts min(its tokens, this) towards the download
+                                # budget (a 530-token row 530, a 4000-token row 2048); at most dataset_max_sequence_length
+dataset_max_sequence_length: 16384           # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
                                 # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
                                 # costs nothing
 token_count: tokenizer          # or: estimate (chars / 4)

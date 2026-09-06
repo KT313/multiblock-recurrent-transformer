@@ -419,10 +419,16 @@ def check_validation_batches(
 
 def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None:
     """
-    The cross-check between run config and dataset config: one base LR per stage. The sequence lengths are
-    checked with the model config in `training/run.py::check_sequence_lengths`.
+    The cross-checks between run config and dataset config: one base LR per stage, and a run no longer than the
+    rows were cut at (`training/run.py::check_sequence_lengths` checks all three lengths once the model config is
+    known; this one runs before any data is touched).
     """
 
+    if settings.training_max_sequence_length > dataset_config.dataset_max_sequence_length:
+        raise ValueError(
+            f"training_max_sequence_length ({settings.training_max_sequence_length}) exceeds dataset_max_sequence_length "
+            f"({dataset_config.dataset_max_sequence_length}) of {Path(settings.dataset_config).as_posix()}: the rows are cut shorter than the run trains"
+        )
     if len(settings.stage_base_lrs) != len(dataset_config.stages):
         raise ValueError(
             f"stage_base_lrs has {len(settings.stage_base_lrs)} entries but dataset config "
@@ -446,7 +452,7 @@ def _ensure_prepared(
     `should_stop` is polled between shards (`BuildAborted`, everything published so far kept).
     """
 
-    report = status(settings.dataset_config, settings.dataset_dir, training_max_sequence_length=settings.training_max_sequence_length)  # logs the status table
+    report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
     if report.complete:
         return
     missing = ", ".join(report.missing())
@@ -471,7 +477,6 @@ def _ensure_prepared(
                     confirm=lambda _message: False,  # never delete or truncate raw from a training run
                     hf_token=os.environ.get("HF_TOKEN"),
                     should_stop=should_stop,
-                    training_max_sequence_length=settings.training_max_sequence_length,
                 )
             except ConfirmationRequired as error:
                 raise RuntimeError(
@@ -501,7 +506,7 @@ def resolve_dataset(
     validation loader that cannot fill one micro-batch; `ValueError` for an entry with fewer rows than loader shards.
     """
 
-    dataset_config = load_dataset_config(settings.dataset_config, training_max_sequence_length=settings.training_max_sequence_length)
+    dataset_config = load_dataset_config(settings.dataset_config)
     validate_settings(settings, dataset_config)
     layout = DatasetLayout(Path(settings.dataset_dir))
     _ensure_prepared(settings, dataset_config, layout, backend, should_stop)

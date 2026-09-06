@@ -52,7 +52,7 @@ def _minimal() -> dict[str, Any]:
 
     return {
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
-        "training_max_sequence_length": 64,  # not a YAML key: the run's cut, set on the config after loading
+        "training_target_sequence_length": 64,
         "sources": {
             "pre": {"kind": "pretrain", "loader": "synthetic", "describe_tokens_per_row": 64},
             "hold": {"kind": "pretrain", "loader": "synthetic", "rows": 10},
@@ -73,12 +73,12 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
         tokenizer=TokenizerConfig(**d["tokenizer"]),
         sources=sources,
         stages=[StageConfig(**s) for s in d["stages"]],
+        training_target_sequence_length=d["training_target_sequence_length"],
         dataset_max_sequence_length=d.get("dataset_max_sequence_length", 2048),
         validation_fraction=d.get("validation_fraction", 0.05),
         token_count=d.get("token_count", "tokenizer"),
         processing=_processing(d["processing"]) if d.get("processing") else ProcessingConfig(),
     )
-    config.training_max_sequence_length = d.get("training_max_sequence_length")
     return config
 
 
@@ -93,7 +93,7 @@ def _processing(d: dict[str, Any]) -> ProcessingConfig:
 
 def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
     path = tmp_path / "d.yaml"
-    path.write_text(yaml.safe_dump({k: v for k, v in d.items() if k != "training_max_sequence_length"}))  # not a YAML key
+    path.write_text(yaml.safe_dump(d))
     return path
 
 
@@ -132,7 +132,8 @@ def test_crow_config_matches_thesis_run() -> None:
     assert cfg.stages[2].train == FINETUNE_SHARES and cfg.stages[2].val == FINETUNE_SHARES
     assert all(cfg.sources[name].input_inversions == 0.05 for name in _sources_of_kind(cfg, "instruct"))
     assert all(cfg.sources[name].input_inversions == 0.0 for name in _sources_of_kind(cfg, "pretrain"))
-    assert (cfg.token_count, cfg.dataset_max_sequence_length, cfg.validation_fraction) == ("tokenizer", 2048, 0.05)
+    assert (cfg.token_count, cfg.training_target_sequence_length, cfg.dataset_max_sequence_length) == ("tokenizer", 2048, 16384)
+    assert cfg.validation_fraction == 0.05
     assert cfg.processing.dedup.mode == "exact" and cfg.processing.dedup.bloom_memory_mb == 1024
     assert not cfg.processing.quality_filter and not cfg.processing.decontamination.enabled
     assert all(s.revision for s in cfg.sources.values()), "every Hub source must pin a revision"
@@ -200,6 +201,8 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0]["train"].update({"pre": 0.5, "nope": 0.5}), "unknown source 'nope'"),
         (lambda d: d["stages"][0].update({"val": {"pre/validation": 0.5, "hold": 0.5}}), "unknown source 'pre/validation'"),
         (lambda d: d.update({"dataset_max_sequence_length": 0}), "dataset_max_sequence_length"),
+        (lambda d: d.update({"training_target_sequence_length": 0}), "training_target_sequence_length"),
+        (lambda d: d.update({"training_target_sequence_length": 4096}), r"training_target_sequence_length \(4096\) must be positive and at most dataset_max_sequence_length \(2048\)"),
         (lambda d: d.update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d.update({"validation_fraction": -0.1}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d["sources"]["pre"].update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
@@ -390,17 +393,15 @@ def test_rows_budget_divides_by_the_tokens_per_row_rate_clamped_at_the_training_
     """
 
     d = _minimal()
-    cfg = _build(d)  # training length 64, the estimate is 64 too
+    cfg = _build(d)  # target 64, the estimate is 64 too
     assert cfg.tokens_per_row_rate("pre") == 64 and cfg.rows_budget("pre") == ceil(1000 / 64) == 16
     assert cfg.rows_budget("ins") == 8 and cfg.rows_budget("hold") == 0
     assert cfg.tokens_per_row_rate("pre", 100.0) == 64 and cfg.rows_budget("pre", 100.0) == 16  # measured above the cut: clamped too
     assert cfg.tokens_per_row_rate("pre", 20.0) == 20 and cfg.rows_budget("pre", 20.0) == 50  # measured below: the budget takes more rows
     d["sources"]["pre"]["describe_tokens_per_row"] = 40
     assert _build(d).rows_budget("pre") == 25  # the estimate below the cut counts as given
-    d["training_max_sequence_length"] = 32
+    d["training_target_sequence_length"] = 32
     assert _build(d).rows_budget("pre") == 32 and _build(d).rows_budget("pre", 40.0) == 32  # ceil(1000 / 32)
-    del d["training_max_sequence_length"]
-    assert _build(d).tokens_per_row_rate("pre", 4096.0) == 2048  # no run known: the dataset length is the cut
 
 
 def test_token_budget_transition_windows_contribute_the_trapezoid() -> None:
@@ -538,69 +539,69 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_final": {
-        "config": "bdc7e2c844b8e349",
+        "config": "5a11953ee64621d3",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("17794de97d8b0fce", "b30c4d1b178bf3c7"),
-            "wikipedia": ("2ca305f74e65e12a", "64ad80ec86a7a8ce"),
-            "books_gutenberg": ("11e00170dde63b0b", "e87273b90d04b5a7"),
-            "peso": ("3997909d5e2d7f53", "439651724ebd4922"),
-            "arxiv": ("75aee996414124d4", "0588416fdd3561fb"),
-            "openwebmath": ("736958cbfe170c76", "50e3f7dbfd17b77b"),
-            "tinygsm": ("6b5f7acc71352a57", "d4d65fa0328c6504"),
-            "algebraic_stack": ("7f22542f9f87a9a4", "cad75c1bf1160b28"),
-            "gsm8k": ("b3e9dae4b724c271", "3f70873f2e912e24"),
-            "github_code_clean_python": ("507791dfee4f610b", "6b08cb0e29d3a8f7"),
-            "github_code_clean_javascript": ("8c59dd2f3159ab41", "37e0d72d65b57b54"),
-            "github_code_clean_typescript": ("b318812e0e06b87b", "76d0d1105778597f"),
-            "github_code_clean_java": ("2e72d5bd9469f912", "b89c790cbd555f66"),
-            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "4c0d4b73301e1267"),
-            "github_code_clean_go": ("8728ef09468e485a", "91ba3a40f7bb4225"),
-            "github_code_clean_rust": ("12522dcb55267020", "733c93194a3ce25b"),
-            "github_code_clean_shell": ("a9d0b21b03b7b449", "7074d62208691465"),
-            "github_code_clean_sql": ("714cc7959ba71640", "93fd71c55f54e09c"),
-            "github_code_clean_html": ("480f5c19f4cc3c0e", "370826e1e0568c1a"),
-            "flan": ("737c93fe1aeab170", "9ea6046d439b5308"),
-            "metamath": ("1aa94ecfdbb971bb", "87393055e64f956f"),
-            "orca_math": ("44e9a10238afbd47", "41fbd4a597b3ccc8"),
-            "evol_code": ("31f340ec3aef2ecc", "5689375823911b3d"),
-            "code_alpaca": ("8ed84d3abe147bd3", "e95328693881523a"),
-            "slimorca": ("99bef8724af3b10c", "bdd62ebd010b855f"),
-            "sharegpt": ("38fa47e292e58c37", "20646f7df14e1e37"),
-            "wizardlm": ("9fe90a1ff6009cd5", "4a1aee65fec05c26"),
+            "fineweb_edu": ("17794de97d8b0fce", "3b9b506e826d613c"),
+            "wikipedia": ("2ca305f74e65e12a", "b6f2752e7bb4873c"),
+            "books_gutenberg": ("11e00170dde63b0b", "b3e1a761f0bb6f07"),
+            "peso": ("3997909d5e2d7f53", "d716d92733b9d645"),
+            "arxiv": ("75aee996414124d4", "a802bf58301fce8a"),
+            "openwebmath": ("736958cbfe170c76", "0686cc9af9379689"),
+            "tinygsm": ("6b5f7acc71352a57", "a31236e854567da4"),
+            "algebraic_stack": ("7f22542f9f87a9a4", "3a310194423b4c4a"),
+            "gsm8k": ("b3e9dae4b724c271", "a11f58d8399c9fcc"),
+            "github_code_clean_python": ("507791dfee4f610b", "bf59de06cb9a80ee"),
+            "github_code_clean_javascript": ("8c59dd2f3159ab41", "1509fe1edf4ccff6"),
+            "github_code_clean_typescript": ("b318812e0e06b87b", "02f9cda97f613703"),
+            "github_code_clean_java": ("2e72d5bd9469f912", "3fb9660a70e276f0"),
+            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "c80468011690957a"),
+            "github_code_clean_go": ("8728ef09468e485a", "02d7084319234c2b"),
+            "github_code_clean_rust": ("12522dcb55267020", "fc435087534e2f85"),
+            "github_code_clean_shell": ("a9d0b21b03b7b449", "6df53df8d803bf90"),
+            "github_code_clean_sql": ("714cc7959ba71640", "ba7c877384efada2"),
+            "github_code_clean_html": ("480f5c19f4cc3c0e", "e82c1dbc226562f1"),
+            "flan": ("737c93fe1aeab170", "440644b3180c6784"),
+            "metamath": ("1aa94ecfdbb971bb", "a4203d539f6dcbec"),
+            "orca_math": ("44e9a10238afbd47", "7692b2f3865e84b1"),
+            "evol_code": ("31f340ec3aef2ecc", "73e2a85d7ddaa80a"),
+            "code_alpaca": ("8ed84d3abe147bd3", "ab6fdd8296697f09"),
+            "slimorca": ("99bef8724af3b10c", "2ad0ad87478339d1"),
+            "sharegpt": ("38fa47e292e58c37", "8a712dd35fd26693"),
+            "wizardlm": ("9fe90a1ff6009cd5", "4380151d22b17321"),
         },
     },
     "crow_300m_mini": {
-        "config": "a16c91d06320462b",
+        "config": "00f204c9fdc87e0b",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("17794de97d8b0fce", "b30c4d1b178bf3c7"),
-            "wikipedia": ("2ca305f74e65e12a", "64ad80ec86a7a8ce"),
-            "books_gutenberg": ("11e00170dde63b0b", "e87273b90d04b5a7"),
-            "peso": ("3997909d5e2d7f53", "439651724ebd4922"),
-            "arxiv": ("75aee996414124d4", "0588416fdd3561fb"),
-            "openwebmath": ("736958cbfe170c76", "50e3f7dbfd17b77b"),
-            "tinygsm": ("6b5f7acc71352a57", "d4d65fa0328c6504"),
-            "algebraic_stack": ("7f22542f9f87a9a4", "cad75c1bf1160b28"),
-            "gsm8k": ("b3e9dae4b724c271", "3f70873f2e912e24"),
-            "github_code_clean_python": ("507791dfee4f610b", "6b08cb0e29d3a8f7"),
-            "github_code_clean_javascript": ("8c59dd2f3159ab41", "37e0d72d65b57b54"),
-            "github_code_clean_typescript": ("b318812e0e06b87b", "76d0d1105778597f"),
-            "github_code_clean_java": ("2e72d5bd9469f912", "b89c790cbd555f66"),
-            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "4c0d4b73301e1267"),
-            "github_code_clean_go": ("8728ef09468e485a", "91ba3a40f7bb4225"),
-            "github_code_clean_rust": ("12522dcb55267020", "733c93194a3ce25b"),
-            "github_code_clean_shell": ("a9d0b21b03b7b449", "7074d62208691465"),
-            "github_code_clean_sql": ("714cc7959ba71640", "93fd71c55f54e09c"),
-            "github_code_clean_html": ("480f5c19f4cc3c0e", "370826e1e0568c1a"),
-            "flan": ("737c93fe1aeab170", "9ea6046d439b5308"),
-            "metamath": ("1aa94ecfdbb971bb", "87393055e64f956f"),
-            "orca_math": ("44e9a10238afbd47", "41fbd4a597b3ccc8"),
-            "evol_code": ("31f340ec3aef2ecc", "5689375823911b3d"),
-            "code_alpaca": ("8ed84d3abe147bd3", "e95328693881523a"),
-            "slimorca": ("99bef8724af3b10c", "bdd62ebd010b855f"),
-            "sharegpt": ("38fa47e292e58c37", "20646f7df14e1e37"),
-            "wizardlm": ("9fe90a1ff6009cd5", "4a1aee65fec05c26"),
+            "fineweb_edu": ("17794de97d8b0fce", "3b9b506e826d613c"),
+            "wikipedia": ("2ca305f74e65e12a", "b6f2752e7bb4873c"),
+            "books_gutenberg": ("11e00170dde63b0b", "b3e1a761f0bb6f07"),
+            "peso": ("3997909d5e2d7f53", "d716d92733b9d645"),
+            "arxiv": ("75aee996414124d4", "a802bf58301fce8a"),
+            "openwebmath": ("736958cbfe170c76", "0686cc9af9379689"),
+            "tinygsm": ("6b5f7acc71352a57", "a31236e854567da4"),
+            "algebraic_stack": ("7f22542f9f87a9a4", "3a310194423b4c4a"),
+            "gsm8k": ("b3e9dae4b724c271", "a11f58d8399c9fcc"),
+            "github_code_clean_python": ("507791dfee4f610b", "bf59de06cb9a80ee"),
+            "github_code_clean_javascript": ("8c59dd2f3159ab41", "1509fe1edf4ccff6"),
+            "github_code_clean_typescript": ("b318812e0e06b87b", "02f9cda97f613703"),
+            "github_code_clean_java": ("2e72d5bd9469f912", "3fb9660a70e276f0"),
+            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "c80468011690957a"),
+            "github_code_clean_go": ("8728ef09468e485a", "02d7084319234c2b"),
+            "github_code_clean_rust": ("12522dcb55267020", "fc435087534e2f85"),
+            "github_code_clean_shell": ("a9d0b21b03b7b449", "6df53df8d803bf90"),
+            "github_code_clean_sql": ("714cc7959ba71640", "ba7c877384efada2"),
+            "github_code_clean_html": ("480f5c19f4cc3c0e", "e82c1dbc226562f1"),
+            "flan": ("737c93fe1aeab170", "440644b3180c6784"),
+            "metamath": ("1aa94ecfdbb971bb", "a4203d539f6dcbec"),
+            "orca_math": ("44e9a10238afbd47", "7692b2f3865e84b1"),
+            "evol_code": ("31f340ec3aef2ecc", "73e2a85d7ddaa80a"),
+            "code_alpaca": ("8ed84d3abe147bd3", "ab6fdd8296697f09"),
+            "slimorca": ("99bef8724af3b10c", "2ad0ad87478339d1"),
+            "sharegpt": ("38fa47e292e58c37", "8a712dd35fd26693"),
+            "wizardlm": ("9fe90a1ff6009cd5", "4380151d22b17321"),
         },
     },
 }

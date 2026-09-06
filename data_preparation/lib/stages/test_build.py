@@ -159,7 +159,7 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
 
     cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, dataset_max_sequence_length=64)
     assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5]
-    lowered = replace(cfg, dataset_max_sequence_length=8)
+    lowered = replace(cfg, dataset_max_sequence_length=8, training_target_sequence_length=8)  # the target may not exceed the cap
     assert lowered.raw_hash("s") == cfg.raw_hash("s") and lowered.processed_hash("s") != cfg.processed_hash("s")
     m = build_source(lowered, "s", layout)
     assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 5] and m.tokens() == 13

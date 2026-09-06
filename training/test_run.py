@@ -7,6 +7,7 @@ CLI in `test_train.py`.
 """
 
 import json
+import logging
 import math
 import shutil
 from collections.abc import Callable
@@ -156,27 +157,33 @@ def test_train_refuses_a_run_directory_another_run_holds(
     assert list(checkpoint_dir(run_directory_of(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
 
-def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
+def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: ResolvedDataset, caplog: pytest.LogCaptureFixture) -> None:
     """
-    model_max_sequence_length >= dataset_max_sequence_length >= training_max_sequence_length; every other order
-    is refused with the three numbers and their files.
+    training_max_sequence_length <= model_max_sequence_length and <= dataset_max_sequence_length (the two bounds
+    are independent); a longer run is refused with the three numbers and their files. A run cut at another length
+    than the dataset config's training_target_sequence_length is a warning, not an error.
     """
 
     model_config = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config)
-    check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # tiny: all 256
-    tiny_settings.training_max_sequence_length = 128
-    check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # training shorter than the data: fine
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # tiny: all 256
+        assert "differs from training_target_sequence_length" not in caplog.text
+        tiny_settings.training_max_sequence_length = 128
+        check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # training shorter than the data: fine
+        assert "training_max_sequence_length 128 differs from training_target_sequence_length 256 of config/datasets/tiny.yaml" in caplog.text
     tiny_settings.training_max_sequence_length = 256
     smaller = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, model_max_sequence_length=128)
     with pytest.raises(ValueError) as excinfo:
         check_sequence_lengths(tiny_settings, tiny_resolved.config, smaller)
     assert str(excinfo.value) == (
-        "the sequence lengths must nest as model_max_sequence_length >= dataset_max_sequence_length >= "
-        "training_max_sequence_length, got 128 (config/model_architecture/tiny.yaml, with model_overwrite applied) "
-        ">= 256 (config/datasets/tiny.yaml) >= 256 (the run config)"
+        "training_max_sequence_length 256 (the run config) must be at most model_max_sequence_length 128 "
+        "(config/model_architecture/tiny.yaml, with model_overwrite applied) and dataset_max_sequence_length 256 "
+        "(config/datasets/tiny.yaml)"
     )
+    larger = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, model_max_sequence_length=1024)
+    check_sequence_lengths(tiny_settings, tiny_resolved.config, larger)  # the model may cover more than the rows hold
     tiny_settings.training_max_sequence_length = 512
-    with pytest.raises(ValueError, match="must nest .* >= 256 \\(config/datasets/tiny.yaml\\) >= 512"):
+    with pytest.raises(ValueError, match="training_max_sequence_length 512 .* dataset_max_sequence_length 256"):
         check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)
 
 
@@ -197,7 +204,7 @@ def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: Resolve
     written = json.loads((run_directory / "model_config.json").read_text())
     assert written == model.config.to_dict() and written["n_embd"] == 32
     tiny_settings.model_overwrite = {"model_max_sequence_length": 128}
-    with pytest.raises(ValueError, match="must nest .* got 128 "):
+    with pytest.raises(ValueError, match="training_max_sequence_length 256 .* must be at most model_max_sequence_length 128 "):
         build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
 
 
@@ -263,7 +270,7 @@ def test_a_model_shorter_than_the_training_length_is_refused(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite={"model_max_sequence_length": 128})
-    with pytest.raises(ValueError, match="must nest .* got 128 .* >= 256 .* >= 256"):
+    with pytest.raises(ValueError, match="training_max_sequence_length 256 .* must be at most model_max_sequence_length 128 "):
         _run(yaml_path, cpu_backend)
 
 

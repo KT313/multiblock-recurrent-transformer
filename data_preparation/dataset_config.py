@@ -373,9 +373,11 @@ class DatasetConfig:
     - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/raw/`
       and `dataset/processed/<source>/`.
     - `stages`: the training stages in order (`StageConfig`): token budget, train/val weights over sources, transition.
+    - `training_target_sequence_length`: the length the run trains at, what the download planner counts a row
+      with: a row serves min(its tokens, this) of the token budget. At most `dataset_max_sequence_length`.
     - `dataset_max_sequence_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
       this are dropped; raising it above what raw was stored with re-downloads raw (after confirmation), lowering
-      it costs nothing; the run's training_max_sequence_length must be <= it.
+      it costs nothing. A storage cap only: it keeps a stray 100k-token document from being stored whole.
     - `validation_fraction`: share of a source's rows held out when the source is used for training AND validation.
     - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
     - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
@@ -390,11 +392,10 @@ class DatasetConfig:
     tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
     sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
     stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
-    dataset_max_sequence_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); >= the run's training_max_sequence_length
-    # Not a YAML key (init=False): the run's training_max_sequence_length, set by `load_dataset_config` for the caller
-    # that knows the run (prepare / status / training's auto-prepare). Rows are consumed up to it, so the planner clamps
-    # its tokens-per-row rate with it; None plans as if every row were used in full (the dataset length).
-    training_max_sequence_length: Optional[int] = field(default=None, init=False, metadata=_UNHASHED)
+    # Sizes the downloads, changes no data: a row counts min(its tokens, this) towards the token budget, the run's
+    # training_max_sequence_length cuts it there. Not hashed: a different target re-plans, it never rebuilds.
+    training_target_sequence_length: int = field(metadata=_UNHASHED)  # the length the run trains at; <= dataset_max_sequence_length
+    dataset_max_sequence_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); a storage cap, not the training length
     validation_fraction: float = field(default=0.05, metadata=_CONFIG)  # in [0, 1): held-out share of a source used in both train and val
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
     # whole into the Hub cache instead of being read remotely by piece.
@@ -408,6 +409,11 @@ class DatasetConfig:
     def __post_init__(self) -> None:
         if self.dataset_max_sequence_length <= 0:
             raise ValueError("dataset_max_sequence_length must be positive")
+        if not 0 < self.training_target_sequence_length <= self.dataset_max_sequence_length:
+            raise ValueError(
+                f"training_target_sequence_length ({self.training_target_sequence_length}) must be positive and at most "
+                f"dataset_max_sequence_length ({self.dataset_max_sequence_length}): rows are cut there when stored"
+            )
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
         if not self.stages:
@@ -565,17 +571,15 @@ class DatasetConfig:
 
     def tokens_per_row_rate(self, source_name: str, tokens_per_row: float | None = None) -> Fraction:
         """
-        Tokens one stored row serves the token budget with: the measured mean tokens_per_row when given (the raw
-        manifest's tokens ÷ rows), else the source's describe_tokens_per_row estimate, clamped at the run's
-        training_max_sequence_length (training cuts a row there), or at dataset_max_sequence_length when no run is
-        known (a stored row is never longer). The clamp errs towards more rows (packing serves every token of a
-        row below the cut too), so a rate that turns out lower than assumed is what the top-up rounds correct,
-        never a rate that was too low.
+        Tokens one stored row serves the token budget with: a row serves min(its tokens,
+        training_target_sequence_length), the run cuts it there. tokens_per_row is that mean measured over the
+        rows on disk (:func:`lib.build.planner.measured_tokens_per_row`); before the first shard the source's
+        describe_tokens_per_row estimate stands in, clamped at the target (a mean of capped lengths never exceeds
+        the cap). An estimate that ran high is what the top-up rounds correct once the rows are measured.
         """
 
         rate = self.sources[source_name].describe_tokens_per_row if tokens_per_row is None else tokens_per_row
-        cut = self.training_max_sequence_length or self.dataset_max_sequence_length
-        return min(Fraction(rate), Fraction(cut))
+        return min(Fraction(rate), Fraction(self.training_target_sequence_length))
 
     def rows_budget(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
@@ -836,12 +840,9 @@ def _hashable(value: Any, hash_name: HashName) -> Any:
     return value
 
 
-def load_dataset_config(
-    path: str | Path, overrides: Optional[list[str]] = None, *, training_max_sequence_length: Optional[int] = None
-) -> DatasetConfig:
+def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None) -> DatasetConfig:
     """
     Load a dataset config YAML; `overrides` are jsonargparse `--key value` strings (nested keys with dots).
-    training_max_sequence_length is the run's (see the field): the planner sizes downloads with it.
 
     An unknown key raises a `ValueError` naming the file and the key (`<path>: <jsonargparse message>`) instead of
     jsonargparse's usage dump and `sys.exit(2)`.
@@ -855,12 +856,4 @@ def load_dataset_config(
             namespace = parser.parse_args(overrides, namespace=namespace)
     except ArgumentError as error:
         raise ValueError(f"dataset config {Path(path).as_posix()}: {str(error).strip()}") from error
-    config = DatasetConfig(**parser.instantiate(namespace).as_dict())
-    if training_max_sequence_length is not None:
-        if training_max_sequence_length > config.dataset_max_sequence_length:
-            raise ValueError(
-                f"training_max_sequence_length ({training_max_sequence_length}) exceeds dataset_max_sequence_length "
-                f"({config.dataset_max_sequence_length}) of {Path(path).as_posix()}: the rows are cut shorter than the run trains"
-            )
-        config.training_max_sequence_length = training_max_sequence_length
-    return config
+    return DatasetConfig(**parser.instantiate(namespace).as_dict())

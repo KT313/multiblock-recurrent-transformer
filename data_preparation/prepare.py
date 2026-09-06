@@ -4,7 +4,7 @@ Entry point for dataset preparation.
 
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--reopen S ...] [--yes] [--dry_run]
-                                                [--allow_foreign_raw] [--training_max_sequence_length N]
+                                                [--allow_foreign_raw]
                                                 [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
@@ -111,7 +111,6 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
     sub.add_argument("--dataset_config", type=Path, default=config_default, required=config_default is None, help="dataset config YAML")
     sub.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR, help="root of all prepared data")
     sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
-    sub.add_argument("--training_max_sequence_length", type=int, default=None, help="the run's training_max_sequence_length: rows are consumed up to it, so the planner sizes downloads with it (default: the dataset length, every row counted in full)")
 
 
 def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
@@ -157,7 +156,6 @@ def run_prepare(args: argparse.Namespace) -> None:
             steps=STEPS if args.steps is None else args.steps,
             sources=args.sources,
             reopen=args.reopen,
-            training_max_sequence_length=args.training_max_sequence_length,
             hf_token=args.hf_token,
         )
 
@@ -171,7 +169,7 @@ def run_prepare(args: argparse.Namespace) -> None:
 
 def run_status(args: argparse.Namespace) -> None:
     configure_hf_cache(args.cache_dir)
-    report = status(args.dataset_config, args.dataset_dir, training_max_sequence_length=args.training_max_sequence_length)
+    report = status(args.dataset_config, args.dataset_dir)
     print(report.describe())
     if not report.complete:
         log.warning("missing: %s", ", ".join(report.missing()))

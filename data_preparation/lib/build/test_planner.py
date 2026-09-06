@@ -47,13 +47,13 @@ ConfigFile = Callable[[DatasetConfig], Path]
 Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 
-def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, training_max_sequence_length: int = 64, min_chars: int = 1) -> DatasetConfig:
+def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, training_target_sequence_length: int = 64, min_chars: int = 1) -> DatasetConfig:
     """
     `a` trained in both stages (weight 0.5 then 1.0) and validated on in the first (split), `b` only trained on
     in the first, `h` used only for validation (`rows`), instruct source `i` in a finetune stage (split).
     """
 
-    config = DatasetConfig(
+    return DatasetConfig(
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "a": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
@@ -66,11 +66,10 @@ def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, t
             StageConfig(name="s2", tokens=tokens_b, train={"a": 1.0}, val={"h": 1.0}),
             StageConfig(name="ft", tokens=1280, train={"i": 1.0}, val={"i": 1.0}),
         ],
+        training_target_sequence_length=training_target_sequence_length,
         dataset_max_sequence_length=128,
         processing=ProcessingConfig(min_chars=min_chars),
     )
-    config.training_max_sequence_length = training_max_sequence_length  # the run's cut: the planner's clamp
-    return config
 
 
 def _state(report: DatasetReport, name: str) -> SourceLedger:
@@ -97,7 +96,7 @@ def test_rows_needed_sums_the_stages_and_scales_with_the_training_length() -> No
     overlap = two_stage_cfg(tokens_b=12800)  # stage 2 grows: 6400 × 0.5 + 12800 = 16000 tokens = 250 rows
     assert overlap.token_budget("a") == 16000 and overlap.rows_budget("a") == 250 and overlap.rows_needed("a") == 316  # 300 ÷ 0.95 = 315.8
     assert overlap.rows_needed("b") == 60  # stage 1 unchanged
-    wide = two_stage_cfg(training_max_sequence_length=128)  # a row serves twice the tokens: half the rows
+    wide = two_stage_cfg(training_target_sequence_length=128)  # a row serves twice the tokens: half the rows
     assert wide.rows_budget("a") == 50 and wide.rows_needed("a") == 64  # 60 ÷ 0.95 = 63.16
     assert wide.rows_needed("b") == 30
 
@@ -154,7 +153,7 @@ def test_plan_downloads_on_an_empty_dir(layout: DatasetLayout) -> None:
 
 def test_rows_to_fetch_is_the_difference_clamped_at_zero(layout: DatasetLayout, config_file: ConfigFile) -> None:
     cfg = two_stage_cfg()
-    assert prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=64).complete
+    assert prepare(config_file(cfg), layout.root, assume_yes=False).complete
     plan = plan_downloads(cfg, layout)
     assert all(s.rows_to_fetch == (0, "budget served") for s in plan.sources) and plan.summary() == "nothing to download"
     a, b, h, i = plan.sources
@@ -183,7 +182,7 @@ def test_the_measured_tokens_per_row_replace_the_estimate_once_raw_is_on_disk(la
     raw manifest's mean tokens per row, so a source of short rows is asked for more rows than the estimate said.
     """
 
-    cfg = two_stage_cfg(training_max_sequence_length=128)  # rows are cut at 128 tokens: the mean is measurably below the training length
+    cfg = two_stage_cfg(training_target_sequence_length=128)  # rows are cut at 128 tokens: the mean is measurably below the training length
     assert source_ledger(cfg, "a", layout).tokens_per_row == 128 == cfg.tokens_per_row_rate("a")
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw = Manifest.load(layout.raw_dir("a"))
@@ -237,7 +236,7 @@ def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: Data
 
     cfg = two_stage_cfg()
     path = config_file(cfg)
-    prepare(path, layout.root, assume_yes=False, training_max_sequence_length=64)
+    prepare(path, layout.root, assume_yes=False)
     (layout.raw_dir("b") / "MANIFEST.json").write_text("{ not json")
     reason = "raw unreadable manifest next to shards; fix or delete the directory by hand"
 
@@ -247,11 +246,11 @@ def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: Data
     assert b.state() == "incomplete" and not every_source_satisfies_its_budget(cfg, layout)
     assert [s.name for s in plan_downloads(cfg, layout).to_fetch()] == [] and sources_with_pending_raw_shards(cfg, layout) == []
 
-    report = status(path, layout.root, training_max_sequence_length=64)
+    report = status(path, layout.root)
     assert not report.complete and report.missing() == ["b"] and report.needs_repair == []  # the repair step leaves it alone
     assert "b" in report.table() and reason in report.table()
     for dry_run in (True, False):
-        assert not prepare(path, layout.root, assume_yes=True, dry_run=dry_run, training_max_sequence_length=64).complete
+        assert not prepare(path, layout.root, assume_yes=True, dry_run=dry_run).complete
     assert (layout.raw_dir("b") / "data-00000.parquet").is_file() and layout.processed_dir("b").is_dir()  # nothing was deleted
 
 
@@ -278,7 +277,7 @@ def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, 
     """
 
     cfg = two_stage_cfg()
-    prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=64)
+    prepare(config_file(cfg), layout.root, assume_yes=False)
     ledger = source_ledger(cfg, "a", layout)
     assert (ledger.name, ledger.kind, ledger.raw_state, ledger.processed_problem) == ("a", "pretrain", "current", "none")
     assert (ledger.rows_needed, ledger.rows_sufficient, ledger.raw_rows) == (127, 106, 127)
@@ -384,7 +383,7 @@ def test_the_top_up_is_capped_at_the_full_requirement(caplog: pytest.LogCaptureF
 
 def test_sources_are_satisfied_after_prepare(layout: DatasetLayout, config_file: ConfigFile) -> None:
     cfg = two_stage_cfg()
-    report = prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=64)
+    report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and report.tokenizer_complete and report.missing() == []
     a = _state(report, "a")
     assert a.satisfaction()[0] and a.satisfaction()[1] == "ok" and a.state() == "complete" and not a.exhausted
@@ -399,7 +398,7 @@ def test_sources_are_satisfied_after_prepare(layout: DatasetLayout, config_file:
 
 def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: DatasetLayout, config_file: ConfigFile) -> None:
     cfg = two_stage_cfg()
-    prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=64)
+    prepare(config_file(cfg), layout.root, assume_yes=False)
 
     (layout.processed_dir("b") / "MANIFEST.json").unlink()
     b = source_ledger(cfg, "b", layout)
@@ -412,7 +411,7 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
     assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed stale: processing settings, dataset_max_sequence_length or the source changed" and a.raw_rows == 127
 
     bigger = two_stage_cfg(tokens_b=12800)
-    prepare(config_file(bigger), layout.root, assume_yes=False, steps=["download"], training_max_sequence_length=64)  # raw topped up, processed not
+    prepare(config_file(bigger), layout.root, assume_yes=False, steps=["download"])  # raw topped up, processed not
     a = source_ledger(bigger, "a", layout)
     assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed behind raw" and a.raw_rows == 316 and 0 < a.processed_rows < 316
     assert sources_with_pending_raw_shards(bigger, layout) == ["a", "b"]
@@ -426,7 +425,7 @@ def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: Dataset
 
     cfg = two_stage_cfg()
     path = config_file(cfg)
-    prepare(path, layout.root, assume_yes=False, training_max_sequence_length=64)
+    prepare(path, layout.root, assume_yes=False)
     (layout.processed_dir("b") / "MANIFEST.json").write_text("{ not json")
 
     b = source_ledger(cfg, "b", layout)
@@ -435,11 +434,11 @@ def test_an_unreadable_processed_manifest_is_reported_not_raised(layout: Dataset
     assert not every_source_satisfies_its_budget(cfg, layout) and sources_with_pending_raw_shards(cfg, layout) == ["b"]
     assert [s.name for s in plan_downloads(cfg, layout).to_fetch()] == []  # raw is complete; the build is what is missing
 
-    report = status(path, layout.root, training_max_sequence_length=64)  # used to crash with "unreadable manifest ... next to shards"
+    report = status(path, layout.root)  # used to crash with "unreadable manifest ... next to shards"
     assert not report.complete and "b" in report.missing() and "b" in report.needs_repair
     with pytest.raises(ConfirmationRequired):  # the repair step heals it, but only after the user confirmed
-        prepare(path, layout.root, assume_yes=False, training_max_sequence_length=64)
-    assert prepare(path, layout.root, assume_yes=True, training_max_sequence_length=64).complete
+        prepare(path, layout.root, assume_yes=False)
+    assert prepare(path, layout.root, assume_yes=True).complete
 
 
 def test_short_processed_folder_is_not_satisfied(layout: DatasetLayout, config_file: ConfigFile) -> None:
@@ -494,7 +493,7 @@ def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile
     assert lines[0].split() == ["source", "kind", "needed", "tokens/row", "raw", "processed", "epochs", "state", "reason"]
     assert lines[1].split() == ["a", "pretrain", "127", "64", "0", "0", "-", "incomplete", "raw", "missing"]
     assert lines[-1].split() == ["tokenizer", "tokenizer", "incomplete"]
-    prepare(config_file(cfg), layout.root, assume_yes=False, training_max_sequence_length=64)
+    prepare(config_file(cfg), layout.root, assume_yes=False)
     complete = summarize_dataset_state(cfg, layout)
     assert complete.complete and complete.unsatisfied() == []
     assert complete.table().splitlines()[-1].split() == ["tokenizer", "tokenizer", "complete"]
