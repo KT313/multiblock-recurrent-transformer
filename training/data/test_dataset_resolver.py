@@ -173,7 +173,7 @@ def _settings(dataset_config: Path, dataset_dir: Path, **overrides: Any) -> Sett
         "model_architecture_config": "config/model_architecture/tiny.yaml",
         "dataset_dir": str(dataset_dir),
         "stage_base_lrs": [3e-4, 1e-4, 5e-5],
-        "block_size": 256,
+        "training_max_sequence_length": 256,
         "prepare_num_workers": 1,
     }
     return Settings(**(base | overrides))
@@ -193,8 +193,7 @@ def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
             "held": SourceConfig(kind="pretrain", loader="synthetic", rows=10),
         },
         stages=[StageConfig(name="s", tokens=100, train={"a": 0.5, "both": 0.5}, val={"both": 0.5, "held": 0.5})],
-        block_size=8,
-        max_seq_length=8,
+        dataset_max_sequence_length=8,
     )
 
 
@@ -581,7 +580,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
     import training.data.dataset_resolver as resolver_module
 
-    monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir: DatasetReport(tokenizer_complete=True))
+    monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir, **kwargs: DatasetReport(tokenizer_complete=True))
     root = tmp_path / "ds"
     expected_folder = re.escape(str(DatasetLayout(root).processed_dir("synthetic_pretrain")))
     with pytest.raises(FileNotFoundError, match=f"source 'synthetic_pretrain' \\(stage keys pretrain_a.train, pretrain_b.train, pretrain_a.val, pretrain_b.val\\): processed folder {expected_folder} does not exist"):
@@ -748,22 +747,23 @@ def test_auto_prepare_never_deletes_raw(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_base_lrs_length_mismatch_raises(tmp_path: Path, crow_cfg: DatasetConfig) -> None:
-    settings = _settings(CROW_DATASET_YAML, tmp_path, stage_base_lrs=[1e-3, 1e-4], block_size=2048)
+    settings = _settings(CROW_DATASET_YAML, tmp_path, stage_base_lrs=[1e-3, 1e-4], training_max_sequence_length=2048)
     with pytest.raises(ValueError, match="stage_base_lrs has 2 entries but dataset config .* has 3 stages"):
         validate_settings(settings, crow_cfg)
     with pytest.raises(ValueError, match="stage_base_lrs has 2 entries"):
         resolve_dataset(settings)  # checked before any data is touched
 
 
-@pytest.mark.parametrize("block_size", [4096, 256])
-def test_block_size_mismatch_raises_naming_both_files(tmp_path: Path, crow_cfg: DatasetConfig, block_size: int) -> None:
-    settings = _settings(CROW_DATASET_YAML, tmp_path, block_size=block_size)
-    expected = f"block_size {block_size} of the run config does not match block_size 2048 of dataset config {str(CROW_DATASET_YAML)!r}"
+def test_training_longer_than_the_dataset_rows_is_refused_at_load(tmp_path: Path, crow_cfg: DatasetConfig) -> None:
+    """
+    The dataset config is loaded with the run's training length (the planner clamps with it); a run longer than the
+    rows were cut at is refused there, before any data is touched. A shorter run is fine (over-provisioned rows).
+    """
+
+    expected = f"training_max_sequence_length (4096) exceeds dataset_max_sequence_length (2048) of {Path(CROW_DATASET_YAML).as_posix()}"
     with pytest.raises(ValueError, match=re.escape(expected)):
-        validate_settings(settings, crow_cfg)
-    with pytest.raises(ValueError, match=re.escape(expected)):
-        resolve_dataset(settings)  # checked before any data is touched (tmp_path is empty)
-    validate_settings(_settings(CROW_DATASET_YAML, tmp_path, block_size=2048), crow_cfg)  # equal is fine
+        resolve_dataset(_settings(CROW_DATASET_YAML, tmp_path, training_max_sequence_length=4096))
+    validate_settings(_settings(CROW_DATASET_YAML, tmp_path, training_max_sequence_length=256), crow_cfg)
 
 
 # --- resume checks --------------------------------------------------------------------------------------------------

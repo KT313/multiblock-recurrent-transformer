@@ -3,7 +3,7 @@
 Training run settings: the YAML/CLI schema consumed by `training/train.py`.
 
 Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e. world
-batches of `world_batch_size × block_size` tokens. Defaults make a run on one local GPU work out of the box.
+batches of `world_batch_size × training_max_sequence_length` tokens. Defaults make a run on one local GPU work out of the box.
 """
 
 from dataclasses import dataclass, field
@@ -88,7 +88,7 @@ class Settings:
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
-    block_size: int = 2048  # sequence length; must equal the architecture config's and the dataset config's
+    training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and padded rows are sized by it; at most the dataset's and the model's length
 
     # Data loading (train loaders always run one worker per source; there is no worker-count knob)
     sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
@@ -109,11 +109,11 @@ class Settings:
     # row of `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE
     # positions restarting per document. One optimizer step is `micro_batches_per_step` such rows, i.e.
     # `micro_batches_per_step x tokens_per_micro_batch` tokens. Both left unset are the padded equivalents,
-    # `micro_batch_size x block_size` and `world_batch_size / micro_batch_size`, so a config written in rows keeps its
+    # `micro_batch_size x training_max_sequence_length` and `world_batch_size / micro_batch_size`, so a config written in rows keeps its
     # token arithmetic and only the batch layout changes. With packing, `micro_batch_size` / `world_batch_size` only
     # size the validation batches, and `sort_batches_by_length` / `sequence_padding_multiple` apply to validation only.
     pack_sequences: bool = True  # true strongly recommended: false trains on padded rows, which waste the padding
-    tokens_per_micro_batch: Optional[int] = None  # pack length; >= block_size (the longest document after truncation)
+    tokens_per_micro_batch: Optional[int] = None  # pack length; >= training_max_sequence_length (the longest document after truncation)
     micro_batches_per_step: Optional[int] = None  # packed micro-batches per optimizer step (a multiple of the number of devices)
 
     # Optimizer + LR schedule
@@ -226,13 +226,13 @@ class Settings:
                     raise ValueError(f"{name} is set but pack_sequences is false; set pack_sequences: true to use it")
             return
         if self.tokens_per_micro_batch is None:
-            self.tokens_per_micro_batch = self.micro_batch_size * self.block_size
+            self.tokens_per_micro_batch = self.micro_batch_size * self.training_max_sequence_length
         if self.micro_batches_per_step is None:
             self.micro_batches_per_step = self.world_batch_size // self.micro_batch_size
-        if self.tokens_per_micro_batch < self.block_size:
+        if self.tokens_per_micro_batch < self.training_max_sequence_length:
             raise ValueError(
-                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= block_size ({self.block_size}): a "
-                "document is up to block_size tokens after truncation and is never split across packs"
+                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= training_max_sequence_length ({self.training_max_sequence_length}): a "
+                "document is up to training_max_sequence_length tokens after truncation and is never split across packs"
             )
         if self.micro_batches_per_step <= 0:
             raise ValueError(f"micro_batches_per_step must be positive, got {self.micro_batches_per_step}")
@@ -252,14 +252,14 @@ class Settings:
     def tokens_per_optimizer_step(self) -> int:
         """
         Tokens per optimizer step, the unit of the stage budgets and the throughput metrics:
-        `micro_batches_per_step x tokens_per_micro_batch` when packing, else `world_batch_size x block_size` (the
+        `micro_batches_per_step x tokens_per_micro_batch` when packing, else `world_batch_size x training_max_sequence_length` (the
         padded rows counted at full length, as the thesis did).
         """
 
         if self.pack_sequences:
             assert self.micro_batches_per_step is not None and self.tokens_per_micro_batch is not None  # `_check_packing`
             return self.micro_batches_per_step * self.tokens_per_micro_batch
-        return self.world_batch_size * self.block_size
+        return self.world_batch_size * self.training_max_sequence_length
 
 
 

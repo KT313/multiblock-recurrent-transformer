@@ -152,7 +152,7 @@ def test_every_document_equals_its_padded_row(tokenizer: Tokenizer) -> None:
     pack = pack_samples(samples, 20, tokenizer)
     offset = 0
     for sample in samples:
-        row_inputs, row_labels, _ = pad_and_shift([sample], tokenizer, block_size=64)
+        row_inputs, row_labels, _ = pad_and_shift([sample], tokenizer, training_max_sequence_length=64)
         n = row_inputs.shape[1]
         assert torch.equal(pack.input_ids[0, offset : offset + n], row_inputs[0])
         assert torch.equal(pack.labels[0, offset : offset + n], row_labels[0])

@@ -54,7 +54,7 @@ def test_shift_inputs_and_labels(tokenizer: Tokenizer) -> None:
 
 def test_batch_shapes_and_label_shift(tokenizer: Tokenizer) -> None:
     batch = [_row(_words(5), "a"), _row(_words(9, 40), "b")]
-    input_ids, labels, data_ids = collate_fn(batch, tokenizer, block_size=128)
+    input_ids, labels, data_ids = collate_fn(batch, tokenizer, training_max_sequence_length=128)
     # longest row: bos + 9 + eos = 11 tokens -> shifted length 10
     assert input_ids.shape == labels.shape == (2, 10)
     assert data_ids == ["a", "b"]
@@ -66,7 +66,7 @@ def test_batch_shapes_and_label_shift(tokenizer: Tokenizer) -> None:
 
 def test_padding_becomes_ignore_index_and_eos(tokenizer: Tokenizer) -> None:
     batch = [_row(_words(3)), _row(_words(8))]
-    input_ids, labels, _ = collate_fn(batch, tokenizer, block_size=128, ignore_index=-100)
+    input_ids, labels, _ = collate_fn(batch, tokenizer, training_max_sequence_length=128, ignore_index=-100)
     # row 0: bos, 3 tokens, eos = 5 -> inputs [bos t t t eos] + 4 pad->eos ; labels [t t t eos] + 5 ignore
     assert input_ids[0].tolist() == [1, 3, 4, 5, 2, 2, 2, 2, 2]
     assert labels[0].tolist() == [3, 4, 5, 2, -100, -100, -100, -100, -100]
@@ -80,12 +80,12 @@ def test_ignore_index_is_the_default_and_matches_the_model(tokenizer: Tokenizer)
     """
 
     assert IGNORE_INDEX == -100 == inspect.signature(RecurrentGPT.__init__).parameters["ignore_index"].default
-    _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, block_size=128)
+    _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, training_max_sequence_length=128)
     assert (labels == IGNORE_INDEX).sum() == 4
 
 
 def test_custom_ignore_index(tokenizer: Tokenizer) -> None:
-    _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, block_size=128, ignore_index=-1)
+    _, labels, _ = collate_fn([_row(_words(2)), _row(_words(6))], tokenizer, training_max_sequence_length=128, ignore_index=-1)
     assert (labels == -1).sum() == 4
     assert (labels == -100).sum() == 0
 
@@ -98,7 +98,7 @@ def test_prompt_mask_survives_collation(tokenizer: Tokenizer) -> None:
         "data_signature": INSTR_SIG,
         "data_id": "ft",
     }
-    input_ids, labels, _ = collate_fn([row], tokenizer, block_size=128)
+    input_ids, labels, _ = collate_fn([row], tokenizer, training_max_sequence_length=128)
     assert input_ids.tolist() == [[1, 4, 5, 23, 24]]
     assert labels.tolist() == [[-100, -100, 23, 24, 2]]
 
@@ -109,7 +109,7 @@ def test_out_of_vocab_labels_become_ignore_index(tokenizer: Tokenizer, monkeypat
     """
 
     monkeypatch.setattr(type(tokenizer), "vocab_size", property(lambda self: 10))
-    input_ids, labels, _ = collate_fn([_row("tok_1 tok_2 tok_100 tok_3")], tokenizer, block_size=128)
+    input_ids, labels, _ = collate_fn([_row("tok_1 tok_2 tok_100 tok_3")], tokenizer, training_max_sequence_length=128)
     # tokens: bos(1) 4 5 103 6 eos(2); labels: 4 5 103 6 2 -> 103 masked
     assert input_ids.tolist() == [[1, 4, 5, 103, 6]]
     assert labels.tolist() == [[4, 5, -100, 6, 2]]
@@ -118,25 +118,25 @@ def test_out_of_vocab_labels_become_ignore_index(tokenizer: Tokenizer, monkeypat
 @pytest.mark.parametrize(("n_words", "multiple", "expected_len"), [(5, 8, 8), (7, 8, 16), (7, 4, 12), (7, None, 9)])
 def test_padding_multiple(tokenizer: Tokenizer, n_words: int, multiple: int | None, expected_len: int) -> None:
     # raw length = n_words + 2 (bos/eos); padded to multiple; then shifted (-1)
-    input_ids, labels, _ = collate_fn([_row(_words(n_words))], tokenizer, block_size=128, padding_multiple=multiple)
+    input_ids, labels, _ = collate_fn([_row(_words(n_words))], tokenizer, training_max_sequence_length=128, padding_multiple=multiple)
     assert input_ids.shape == labels.shape == (1, expected_len - 1)
 
 
 def test_padding_multiple_capped_at_block_size_plus_one(tokenizer: Tokenizer) -> None:
-    input_ids, labels, _ = collate_fn([_row(_words(20))], tokenizer, block_size=16, padding_multiple=64)
+    input_ids, labels, _ = collate_fn([_row(_words(20))], tokenizer, training_max_sequence_length=16, padding_multiple=64)
     assert input_ids.shape == labels.shape == (1, 16)
 
 
 def test_padding_multiple_not_dividing_cap_still_capped(tokenizer: Tokenizer) -> None:
     # 20 words + bos/eos = 22 -> multiple of 8 = 24 -> capped at 17 -> shifted 16
-    input_ids, labels, _ = collate_fn([_row(_words(20))], tokenizer, block_size=16, padding_multiple=8)
+    input_ids, labels, _ = collate_fn([_row(_words(20))], tokenizer, training_max_sequence_length=16, padding_multiple=8)
     assert input_ids.shape == labels.shape == (1, 16)
     assert (labels == -100).sum() == 0
 
 
 def test_truncation_at_block_size_plus_one(tokenizer: Tokenizer) -> None:
     block = 16
-    input_ids, labels, _ = collate_fn([_row(_words(100))], tokenizer, block_size=block)
+    input_ids, labels, _ = collate_fn([_row(_words(100))], tokenizer, training_max_sequence_length=block)
     assert input_ids.shape == (1, block)
     assert labels.shape == (1, block)
     full = tokenizer.encode(_words(100), bos=True, eos=True)
@@ -147,7 +147,7 @@ def test_truncation_at_block_size_plus_one(tokenizer: Tokenizer) -> None:
 
 def test_short_and_long_rows_mixed(tokenizer: Tokenizer) -> None:
     block = 16
-    input_ids, labels, _ = collate_fn([_row(_words(2)), _row(_words(100))], tokenizer, block_size=block)
+    input_ids, labels, _ = collate_fn([_row(_words(2)), _row(_words(100))], tokenizer, training_max_sequence_length=block)
     assert input_ids.shape == (2, block)
     assert (labels[0] == -100).sum() == block - 3  # 2 words + eos supervised
     assert (labels[1] == -100).sum() == 0
@@ -155,7 +155,7 @@ def test_short_and_long_rows_mixed(tokenizer: Tokenizer) -> None:
 
 def test_all_padding_row_is_dropped(tokenizer: Tokenizer) -> None:
     # Every token unknown -> encoded as <pad> (the synthetic tokenizer's unk) -> labels are all pad.
-    assert collate_samples([_row("zzz yyy")], tokenizer, block_size=128, add_bos=False, add_eos=False) == []
+    assert collate_samples([_row("zzz yyy")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False) == []
 
 
 def test_single_token_row_is_dropped(tokenizer: Tokenizer) -> None:
@@ -163,7 +163,7 @@ def test_single_token_row_is_dropped(tokenizer: Tokenizer) -> None:
     One token leaves nothing after the shift, so the row cannot be trained on.
     """
 
-    assert collate_samples([_row("")], tokenizer, block_size=128, add_bos=False, add_eos=True) == []
+    assert collate_samples([_row("")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=True) == []
 
 
 def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tokenizer) -> None:
@@ -173,8 +173,8 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
     """
 
     batch = [_row("zzz yyy", "bad"), _row(_words(5), "good")]
-    assert [s[2] for s in collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)] == ["good"]
-    _, _, data_ids = collate_fn(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
+    assert [s[2] for s in collate_samples(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)] == ["good"]
+    _, _, data_ids = collate_fn(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert data_ids == ["good"]
 
 
@@ -185,10 +185,10 @@ def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Toke
     """
 
     batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
-    samples, rows_read = collate_worker_batch(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
+    samples, rows_read = collate_worker_batch(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert rows_read == 4
     assert [s[2] for s in samples] == ["a", "b"]
-    reference = collate_samples(batch, tokenizer, block_size=128, add_bos=False, add_eos=False)
+    reference = collate_samples(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert len(samples) == len(reference)
     assert all(torch.equal(s[0], r[0]) and torch.equal(s[1], r[1]) and s[2] == r[2] for s, r in zip(samples, reference))
 
@@ -199,25 +199,25 @@ def test_collate_worker_batch_counts_a_fully_dropped_batch(tokenizer: Tokenizer)
     """
 
     samples, rows_read = collate_worker_batch(
-        [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, block_size=128, add_bos=False, add_eos=False
+        [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False
     )
     assert samples == [] and rows_read == 2
 
 
 def test_batch_of_only_dropped_rows_is_an_error(tokenizer: Tokenizer) -> None:
     with pytest.raises(ValueError, match="every row of the batch was dropped"):
-        collate_fn([_row("zzz yyy")], tokenizer, block_size=128, add_bos=False, add_eos=False)
+        collate_fn([_row("zzz yyy")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
 
 
 def test_prompt_only_window_is_dropped(tokenizer: Tokenizer) -> None:
     """
-    An instruction row whose prompt alone fills block_size+1 has no supervised label left after truncation.
+    An instruction row whose prompt alone fills training_max_sequence_length+1 has no supervised label left after truncation.
     """
 
     row = {"instruction": _words(30), "input": "", "output": "tok_1", "data_signature": INSTR_SIG, "data_id": "ft"}
-    assert collate_samples([row], tokenizer, block_size=16) == []
+    assert collate_samples([row], tokenizer, training_max_sequence_length=16) == []
     # one more token of room and the first output token is supervised from the last prompt position
-    input_ids, labels, _ = collate_fn([row], tokenizer, block_size=31)
+    input_ids, labels, _ = collate_fn([row], tokenizer, training_max_sequence_length=31)
     assert input_ids.shape == (1, 31)
     assert labels[0, :30].tolist() == [-100] * 30 and labels[0, 30].item() == 4
 
@@ -232,7 +232,7 @@ def test_has_supervised_label(tokenizer: Tokenizer) -> None:
 
 
 def test_collate_samples_are_unpadded_and_truncated(tokenizer: Tokenizer) -> None:
-    samples = collate_samples([_row(_words(5), "a"), _row(_words(40), "b")], tokenizer, block_size=16)
+    samples = collate_samples([_row(_words(5), "a"), _row(_words(40), "b")], tokenizer, training_max_sequence_length=16)
     assert [(s[0].shape[0], s[2]) for s in samples] == [(7, "a"), (17, "b")]  # bos + words + eos, capped at 17
     for input_ids, labels, _ in samples:
         assert input_ids.shape == labels.shape and torch.equal(input_ids, labels)
@@ -240,9 +240,9 @@ def test_collate_samples_are_unpadded_and_truncated(tokenizer: Tokenizer) -> Non
 
 def test_collate_fn_is_collate_samples_then_pad_and_shift(tokenizer: Tokenizer) -> None:
     rows = [_row(_words(5), "a"), _row(_words(9, 40), "b")]
-    samples = collate_samples(rows, tokenizer, block_size=128)
-    expected = pad_and_shift(samples, tokenizer, block_size=128, padding_multiple=16)
-    actual = collate_fn(rows, tokenizer, block_size=128, padding_multiple=16)
+    samples = collate_samples(rows, tokenizer, training_max_sequence_length=128)
+    expected = pad_and_shift(samples, tokenizer, training_max_sequence_length=128, padding_multiple=16)
+    actual = collate_fn(rows, tokenizer, training_max_sequence_length=128, padding_multiple=16)
     assert torch.equal(actual[0], expected[0]) and torch.equal(actual[1], expected[1]) and actual[2] == expected[2]
 
 
@@ -251,15 +251,15 @@ def test_pad_and_shift_width_is_this_micro_batch_only(tokenizer: Tokenizer) -> N
     The width comes from the samples handed in, never from how a loader grouped them earlier.
     """
 
-    short = collate_samples([_row(_words(5))], tokenizer, block_size=128)
-    long = collate_samples([_row(_words(60))], tokenizer, block_size=128)
-    assert pad_and_shift(short, tokenizer, block_size=128, padding_multiple=16)[0].shape == (1, 15)
-    assert pad_and_shift(short + long, tokenizer, block_size=128, padding_multiple=16)[0].shape == (2, 63)
+    short = collate_samples([_row(_words(5))], tokenizer, training_max_sequence_length=128)
+    long = collate_samples([_row(_words(60))], tokenizer, training_max_sequence_length=128)
+    assert pad_and_shift(short, tokenizer, training_max_sequence_length=128, padding_multiple=16)[0].shape == (1, 15)
+    assert pad_and_shift(short + long, tokenizer, training_max_sequence_length=128, padding_multiple=16)[0].shape == (2, 63)
 
 
 def test_pad_and_shift_needs_samples(tokenizer: Tokenizer) -> None:
     with pytest.raises(ValueError, match="at least one sample"):
-        pad_and_shift([], tokenizer, block_size=128)
+        pad_and_shift([], tokenizer, training_max_sequence_length=128)
 
 
 def test_shift_keeps_pads_when_tokenizer_has_no_eos(tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,7 +270,7 @@ def test_shift_keeps_pads_when_tokenizer_has_no_eos(tokenizer: Tokenizer, monkey
 
 
 def test_bos_eos_flags(tokenizer: Tokenizer) -> None:
-    input_ids, labels, _ = collate_fn([_row(_words(4))], tokenizer, block_size=128, add_bos=False, add_eos=False)
+    input_ids, labels, _ = collate_fn([_row(_words(4))], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert input_ids.tolist() == [[3, 4, 5]]
     assert labels.tolist() == [[4, 5, 6]]
 
@@ -278,7 +278,7 @@ def test_bos_eos_flags(tokenizer: Tokenizer) -> None:
 def test_collate_on_real_tiny_rows(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
     ds = ParquetTextDataset(tiny_pretrain_dir, "pre")
     rows = list(itertools.islice(iter(ds), 4))
-    input_ids, labels, data_ids = collate_fn(rows, tokenizer, block_size=128, padding_multiple=16)
+    input_ids, labels, data_ids = collate_fn(rows, tokenizer, training_max_sequence_length=128, padding_multiple=16)
     assert input_ids.shape == labels.shape == (4, 128)
     assert data_ids == ["pre"] * 4
     valid = labels != -100

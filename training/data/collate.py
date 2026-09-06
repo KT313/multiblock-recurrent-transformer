@@ -88,7 +88,7 @@ def has_supervised_label(labels: torch.Tensor, tokenizer: Tokenizer) -> bool:
 
     The shift drops labels[0] and the collation masks pad ids and out-of-vocab ids, so the row is trainable iff
     some labels[1:] is a valid, non-pad id. False for a row that is one token long, for a row of pure padding
-    (unknown tokens) and for an instruct row whose masked prompt alone fills block_size + 1.
+    (unknown tokens) and for an instruct row whose masked prompt alone fills training_max_sequence_length + 1.
     """
 
     tail = labels[1:]
@@ -101,19 +101,19 @@ def has_supervised_label(labels: torch.Tensor, tokenizer: Tokenizer) -> bool:
 def collate_samples(
     batch: list[dict[str, Any]],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> list[Sample]:
     """
     Format and tokenize dataset rows into unpadded (input_ids, labels, data_id) samples.
 
-    Rows are truncated to block_size + 1 tokens (the shift turns that into block_size positions); rows without
+    Rows are truncated to training_max_sequence_length + 1 tokens (the shift turns that into training_max_sequence_length positions); rows without
     a supervised label are DROPPED, never raised on: a `StopIteration` out of a collate function ends the worker or
     the epoch, so an unusable row must cost one row, not a loader.
     """
 
-    max_tokens = block_size + 1
+    max_tokens = training_max_sequence_length + 1
     samples: list[Sample] = []
     for row in batch:
         input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
@@ -126,7 +126,7 @@ def collate_samples(
 def collate_worker_batch(
     batch: list[dict[str, Any]],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     add_bos: bool = True,
     add_eos: bool = True,
 ) -> WorkerBatch:
@@ -135,13 +135,13 @@ def collate_worker_batch(
     rows_read advances by rows read from disk, dropped rows included, the unit a resume skips.
     """
 
-    return WorkerBatch(collate_samples(batch, tokenizer, block_size, add_bos, add_eos), len(batch))
+    return WorkerBatch(collate_samples(batch, tokenizer, training_max_sequence_length, add_bos, add_eos), len(batch))
 
 
 def pad_and_shift(
     samples: list[Sample],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
 ) -> Batch:
@@ -149,7 +149,7 @@ def pad_and_shift(
     Pad `samples` to one width and shift them into a (input_ids, labels, data_ids) micro-batch.
 
     The width is the longest sample of THIS micro-batch, rounded up to padding_multiple and capped at
-    block_size + 1; the shift then drops one position from it. Pad positions become EOS in the inputs and
+    training_max_sequence_length + 1; the shift then drops one position from it. Pad positions become EOS in the inputs and
     ignore_index in the labels, as do labels outside the tokenizer's vocabulary.
 
     The tensors are pageable on purpose: a pinned micro-batch that was copied to the device carries a CUDA event,
@@ -160,7 +160,7 @@ def pad_and_shift(
 
     if not samples:
         raise ValueError("pad_and_shift needs at least one sample; empty micro-batches are never assembled")
-    max_tokens = block_size + 1
+    max_tokens = training_max_sequence_length + 1
     longest = max(max(sample_inputs.shape[0], sample_labels.shape[0]) for sample_inputs, sample_labels, _ in samples)
     width = min(find_multiple(longest, padding_multiple) if padding_multiple else longest, max_tokens)
 
@@ -179,7 +179,7 @@ def pad_and_shift(
 def collate_fn(
     batch: list[dict[str, Any]],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
     add_bos: bool = True,
@@ -187,13 +187,13 @@ def collate_fn(
 ) -> Batch:
     """
     `collate_samples` followed by `pad_and_shift`: the collate function of the validation loaders. A batch in which
-    every row was dropped is an error (`block_size` too small for a validation batch is a configuration mistake).
+    every row was dropped is an error (`training_max_sequence_length` too small for a validation batch is a configuration mistake).
     """
 
-    samples = collate_samples(batch, tokenizer, block_size, add_bos, add_eos)
+    samples = collate_samples(batch, tokenizer, training_max_sequence_length, add_bos, add_eos)
     if not samples:
         raise ValueError(
             f"every row of the batch was dropped: none of the {len(batch)} rows keeps a supervised label within "
-            f"block_size + 1 = {block_size + 1} tokens"
+            f"training_max_sequence_length + 1 = {training_max_sequence_length + 1} tokens"
         )
-    return pad_and_shift(samples, tokenizer, block_size, padding_multiple, ignore_index)
+    return pad_and_shift(samples, tokenizer, training_max_sequence_length, padding_multiple, ignore_index)

@@ -34,7 +34,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "resume": True,
     "seed": 233,
     "model_architecture_config": "config/model_architecture/crow_300m_final.yaml",
-    "block_size": 2048,
+    "training_max_sequence_length": 2048,
     "dataset_config": "config/datasets/crow_300m_final.yaml",
     "dataset_dir": "dataset",
     "auto_prepare": True,
@@ -102,7 +102,7 @@ def _field_defaults() -> dict[str, Any]:
 def test_parse_tiny_yaml() -> None:
     cfg = parse_settings(["--config", str(TINY_YAML)])
     assert isinstance(cfg, Settings)
-    assert cfg.run_name == "tiny" and cfg.block_size == 256
+    assert cfg.run_name == "tiny" and cfg.training_max_sequence_length == 256
     assert cfg.model_architecture_config == TINY_MODEL_ARCHITECTURE and cfg.model_overwrite == {}
     assert cfg.dataset_config == TINY_DATASET_CONFIG and cfg.dataset_dir == "dataset"
     assert cfg.auto_prepare is True and cfg.prepare_num_workers == 1 and cfg.allow_dataset_change is False
@@ -121,7 +121,7 @@ def test_parse_crow_yaml() -> None:
     cfg = parse_settings(["--config", str(CROW_YAML)])
     assert cfg.dataset_config == "config/datasets/crow_300m_final.yaml"
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
-    assert cfg.block_size == 2048 and cfg.optimizer == "ELLISAdam"
+    assert cfg.training_max_sequence_length == 2048 and cfg.optimizer == "ELLISAdam"
     assert cfg.model_architecture_config == "config/model_architecture/crow_300m_final.yaml"
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.save_step_interval, cfg.eval_step_interval) == (64, 64, 128, 16)
     assert not hasattr(cfg, "tokenizer_path") and not hasattr(cfg, "training_stages")
@@ -432,9 +432,9 @@ def test_packing_is_the_default_with_the_padded_sizes_derived() -> None:
 
     cfg = _settings(micro_batch_size=2, world_batch_size=8)
     assert cfg.pack_sequences is True
-    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (2 * cfg.block_size, 4)
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (2 * cfg.training_max_sequence_length, 4)
     assert cfg.gradient_accumulation_steps == 4
-    assert cfg.tokens_per_optimizer_step == 8 * cfg.block_size
+    assert cfg.tokens_per_optimizer_step == 8 * cfg.training_max_sequence_length
     assert asdict(cfg)["micro_batches_per_step"] == 4  # recorded resolved (run_config.json, checkpoints)
 
 
@@ -442,14 +442,14 @@ def test_packing_off_uses_the_padded_sizes() -> None:
     cfg = _settings(micro_batch_size=2, world_batch_size=8, pack_sequences=False)
     assert cfg.tokens_per_micro_batch is None and cfg.micro_batches_per_step is None
     assert cfg.gradient_accumulation_steps == 4
-    assert cfg.tokens_per_optimizer_step == 8 * cfg.block_size
+    assert cfg.tokens_per_optimizer_step == 8 * cfg.training_max_sequence_length
 
 
 def test_explicit_packing_fields_define_the_step() -> None:
     cfg = _settings(tokens_per_micro_batch=8192, micro_batches_per_step=32)
     assert cfg.gradient_accumulation_steps == 32
     assert cfg.tokens_per_optimizer_step == 8192 * 32
-    exact = _settings(tokens_per_micro_batch=2048, micro_batches_per_step=1)  # pack = block_size
+    exact = _settings(tokens_per_micro_batch=2048, micro_batches_per_step=1)  # pack = training_max_sequence_length
     assert exact.gradient_accumulation_steps == 1 and exact.tokens_per_optimizer_step == 2048
 
 
@@ -472,7 +472,7 @@ def test_packing_fields_without_packing_are_refused() -> None:
 
 
 def test_pack_must_hold_a_whole_document() -> None:
-    with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(1024\) must be >= block_size \(2048\)"):
+    with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(1024\) must be >= training_max_sequence_length \(2048\)"):
         _settings(pack_sequences=True, tokens_per_micro_batch=1024, micro_batches_per_step=4)
 
 

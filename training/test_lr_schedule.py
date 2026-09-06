@@ -21,7 +21,7 @@ def _tiny_manager(warmup: int = 2, cooldown: int = 2) -> StageManager:
         resolved_stage("b", tokens=8 * TPS, base_lr=1e-4, transition_pct=0.25),
         resolved_stage("c", tokens=4 * TPS, base_lr=5e-5, transition_pct=0.0),
     ]
-    return StageManager(stages, world_batch_size=4, block_size=256, warmup_steps=warmup, cooldown_steps=cooldown)
+    return StageManager(stages, world_batch_size=4, training_max_sequence_length=256, warmup_steps=warmup, cooldown_steps=cooldown)
 
 
 def _lr(sm: StageManager, step: int, **kw: Any) -> float:
@@ -116,7 +116,7 @@ def test_warmup_and_cooldown_boundaries_are_continuous_with_the_plateau() -> Non
 def test_zero_length_transition_switches_lr_hard_at_the_boundary() -> None:
     tps = 4 * 256
     stages = [resolved_stage("a", 8 * tps, base_lr=3e-4, transition_pct=0.05), resolved_stage("b", 8 * tps, base_lr=1e-4)]
-    sm = StageManager(stages, world_batch_size=4, block_size=256)
+    sm = StageManager(stages, world_batch_size=4, training_max_sequence_length=256)
     assert sm.boundaries[0].transition_start_step == sm.boundaries[0].end_step == 8
     assert [_lr(sm, s) for s in (6, 7, 8, 9)] == pytest.approx([3e-4, 3e-4, 1e-4, 1e-4])
 
@@ -129,7 +129,7 @@ def _continuity_manager() -> StageManager:
         resolved_stage("s2", tokens=40 * tps, base_lr=6e-4, transition_pct=0.5),  # transition 20 steps
         resolved_stage("s3", tokens=30 * tps, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(stages, world_batch_size=8, block_size=128, warmup_steps=5, cooldown_steps=10)
+    return StageManager(stages, world_batch_size=8, training_max_sequence_length=128, warmup_steps=5, cooldown_steps=10)
 
 
 def test_multistage_schedule_is_continuous_at_every_boundary() -> None:

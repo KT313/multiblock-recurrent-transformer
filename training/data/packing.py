@@ -64,8 +64,8 @@ class PackPool:
     (`needs_refill`), then `take_pack` walks the pool front to back and takes every document that still fits into
     the pack; the rest stay in the pool, in order, and lead the next pack. A leftover always fits an empty pack, so
     no document waits longer than one pack. A document longer than the pack can never be placed: `add` drops it
-    with a warning (settings make this unreachable: `tokens_per_micro_batch >= block_size`, and documents are
-    truncated to `block_size + 1` tokens, i.e. `block_size` slots).
+    with a warning (settings make this unreachable: `tokens_per_micro_batch >= training_max_sequence_length`, and documents are
+    truncated to `training_max_sequence_length + 1` tokens, i.e. `training_max_sequence_length` slots).
 
     `state` / `restore`: the pool travels in the checkpoint (`BatchStream.state_dict`), so a resume fills the same
     packs from the same documents.
@@ -97,7 +97,7 @@ class PackPool:
         if length > self.pack_length:
             log.warning(
                 "Dropping a %d-token document of %r: longer than the pack length %d, it can never be packed. "
-                "tokens_per_micro_batch must be >= block_size + 1 tokens per document.",
+                "tokens_per_micro_batch must be >= training_max_sequence_length + 1 tokens per document.",
                 length + 1,
                 sample[2],
                 self.pack_length,

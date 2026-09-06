@@ -62,13 +62,13 @@ def _loader(
     seed: int = 1337,
     shard: tuple[int, int] = (0, 1),
     padding_multiple: int | None = None,
-    block_size: int = 64,
+    training_max_sequence_length: int = 64,
     padded: bool = True,
 ) -> DataLoader[Row]:
     return build_dataloader(
         entries,
         tokenizer,
-        block_size,
+        training_max_sequence_length,
         micro_batch_size,
         num_workers=num_workers,
         seed=seed,
@@ -164,7 +164,7 @@ def test_single_spec_batches(tokenizer: Tokenizer, entries: list[DataEntry], tin
 
 
 # Mixtures with the instruct folder use a block size no instruct prompt can fill, so no row is dropped for lack of a
-# supervised label; the processed instruct rows are only bounded by max_seq_length (256).
+# supervised label; the processed instruct rows are only bounded by dataset_max_sequence_length (256).
 MIXTURE_BLOCK_SIZE = 128
 
 
@@ -175,7 +175,7 @@ def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
     The draws follow the weights while every member has rows; the loader ends once each member was read once.
     """
 
-    loader = _loader(entries, tokenizer, 2, seed=0, block_size=MIXTURE_BLOCK_SIZE)
+    loader = _loader(entries, tokenizer, 2, seed=0, training_max_sequence_length=MIXTURE_BLOCK_SIZE)
     batches = list(loader)
     pre_rows, ft_rows = _rows_in(tiny_pretrain_dir), _rows_in(tiny_instruct_dir)
     assert len(batches) == math.ceil((pre_rows + ft_rows) / 2)
@@ -198,7 +198,7 @@ def test_validation_mixture_is_finite_and_matches_the_batch_count(
         DataEntry("s-ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE, max_rows=3),
     ]
     rows = {str(tiny_pretrain_dir): _rows_in(tiny_pretrain_dir), str(tiny_instruct_dir): _rows_in(tiny_instruct_dir)}
-    loader = _loader(stage_entries, tokenizer, 4, seed=0, block_size=MIXTURE_BLOCK_SIZE)
+    loader = _loader(stage_entries, tokenizer, 4, seed=0, training_max_sequence_length=MIXTURE_BLOCK_SIZE)
     batches = list(loader)
     assert len(batches) == validation_batches_available(stage_entries, rows, micro_batch_size=4, world_size=1) == 4
     ids = Counter(itertools.chain.from_iterable(b[2] for b in batches))
@@ -206,9 +206,9 @@ def test_validation_mixture_is_finite_and_matches_the_batch_count(
 
 
 def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    a = _batches(_loader(entries, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
-    b = _batches(_loader(entries, tokenizer, 2, seed=5, block_size=MIXTURE_BLOCK_SIZE), 10)
-    c = _batches(_loader(entries, tokenizer, 2, seed=6, block_size=MIXTURE_BLOCK_SIZE), 10)
+    a = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
+    b = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
+    c = _batches(_loader(entries, tokenizer, 2, seed=6, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
     assert _same(a, b)
     assert not _same(a, c)
 
@@ -248,8 +248,8 @@ def test_workers_two_micro_batch_gt_one_regroups_rows(
 
 
 def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
-    b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, block_size=MIXTURE_BLOCK_SIZE), 12)
+    a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
+    b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
     assert _same(a, b)
 
 
@@ -257,11 +257,11 @@ def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenize
     """
     Regression (T-M4): a row with no supervised label used to raise `StopIteration` out of the collate function,
     which torch's worker loop reads as 'this worker is done' and the single-process loop as 'restart at row 0'. At
-    `block_size` 16 most instruct prompts alone fill the window; the loader still walks its whole epoch.
+    `training_max_sequence_length` 16 most instruct prompts alone fill the window; the loader still walks its whole epoch.
     """
 
     rows = list(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)))
-    kept = len(collate_samples(rows, tokenizer, block_size=16))
+    kept = len(collate_samples(rows, tokenizer, training_max_sequence_length=16))
     assert 0 < kept < len(rows), "the fixture must drop some rows and keep others"
     entry = DataEntry("ft", str(tiny_instruct_dir), data_signature=INSTRUCT_SIGNATURE)
     for num_workers in (0, 2):
@@ -309,7 +309,7 @@ def test_worker_batch_rows_keep_the_sample_sequence_when_rows_are_dropped(
     tokenizer: Tokenizer, tiny_instruct_dir: Path
 ) -> None:
     """
-    Dropped rows (no supervised label at `block_size` 16) cost one `rows_read` each in whatever batch they fall
+    Dropped rows (no supervised label at `training_max_sequence_length` 16) cost one `rows_read` each in whatever batch they fall
     into, so the surviving sample sequence and the total rows read are the same for any worker batch size; only
     the batches are shorter than their row count.
     """
@@ -377,19 +377,19 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     assert len(samples) == worker_rows
     assert batch.rows_read == worker_rows  # no row dropped
     assert [s[2] for s in samples] == ["synthetic_pretrain"] * worker_rows
-    for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at block_size + 1
-        assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.block_size + 1
+    for input_ids, labels, _ in samples:  # unpadded: the true token count, capped at training_max_sequence_length + 1
+        assert input_ids.shape == labels.shape and 0 < input_ids.shape[0] <= tiny_settings.training_max_sequence_length + 1
     input_ids, labels, _ = world_batch_micro_batches(
         samples,
         tiny_settings.micro_batch_size,
         tokenizer,
-        tiny_settings.block_size,
+        tiny_settings.training_max_sequence_length,
         sort_by_length=True,
         padding_multiple=tiny_settings.sequence_padding_multiple,
     )[0]
-    # padding rounds up to sequence_padding_multiple (capped at block_size + 1), then the label shift drops one
-    assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.block_size
-    assert input_ids.shape[1] <= tiny_settings.block_size
+    # padding rounds up to sequence_padding_multiple (capped at training_max_sequence_length + 1), then the label shift drops one
+    assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.training_max_sequence_length
+    assert input_ids.shape[1] <= tiny_settings.training_max_sequence_length
     assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
     assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
@@ -507,7 +507,7 @@ def test_close_shuts_down_the_worker_iterators(tokenizer: Tokenizer, tiny_pretra
 
 # --- world_batch_micro_batches ----------------------------------------------------------------------------------------
 
-BLOCK = 64  # cap of the fake-sample tests: block_size + 1 = 65 tokens
+BLOCK = 64  # cap of the fake-sample tests: training_max_sequence_length + 1 = 65 tokens
 
 
 def _sample(length: int, tag: str) -> Sample:
@@ -631,7 +631,7 @@ def test_world_batch_keeps_every_supervised_label_of_prompt_masked_rows(tokenize
 
 def test_world_batch_keeps_the_labels_of_real_instruct_rows(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
     rows = list(itertools.islice(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)), 8))
-    samples = collate_samples(rows, tokenizer, block_size=255)
+    samples = collate_samples(rows, tokenizer, training_max_sequence_length=255)
     expected = sorted(int((lab[1:] != tokenizer.pad_id).sum()) for _, lab, _ in samples)
     out = world_batch_micro_batches(samples, 4, tokenizer, 255, sort_by_length=True, padding_multiple=128)
     assert len(samples) == 8 and expected[0] > 0

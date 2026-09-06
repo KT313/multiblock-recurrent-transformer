@@ -290,7 +290,7 @@ class FakeClock:
         self.now += seconds
 
 
-TOKENS_PER_STEP = 4 * 256  # reference_settings: world_batch_size 4, block_size 256
+TOKENS_PER_STEP = 4 * 256  # reference_settings: world_batch_size 4, training_max_sequence_length 256
 STEP_KEYS = {
     "loss", "ppl", "lr", "grad_norm", "step", "seconds/step", "tokens/second", "total_tokens", "total_time",
     "remaining_time", "stage/current_stage", "stage/base_lr", "stage/in_transition", "stage/transition_progress",
@@ -307,7 +307,7 @@ def two_stage_manager(settings: Settings) -> StageManager:
         resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
         resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(stages, settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
+    return StageManager(stages, settings.world_batch_size, settings.training_max_sequence_length, warmup_steps=2, cooldown_steps=2)
 
 
 def fake_result(

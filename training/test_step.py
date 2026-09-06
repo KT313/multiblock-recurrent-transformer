@@ -77,7 +77,7 @@ def reference_settings(**overrides: Any) -> Settings:
         run_name="steps",
         out_dir="unused",
         seed=0,
-        block_size=256,
+        training_max_sequence_length=256,
         micro_batch_size=2,
         world_batch_size=4,
         pack_sequences=False,
@@ -103,9 +103,9 @@ def reference_stage_manager(settings: Settings, steps: int = 10) -> StageManager
     """
 
     stage = resolved_stage(
-        "only", tokens=steps * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0
+        "only", tokens=steps * settings.world_batch_size * settings.training_max_sequence_length, base_lr=3e-4, transition_pct=0.0
     )
-    return StageManager([stage], settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
+    return StageManager([stage], settings.world_batch_size, settings.training_max_sequence_length, warmup_steps=2, cooldown_steps=2)
 
 
 def scripted_batches(
@@ -402,7 +402,7 @@ def _abc_stage_manager(settings: Settings) -> StageManager:
         resolved_stage("s1", tokens=8192, base_lr=1e-4, transition_pct=0.25, train_weights={"b": 1.0}),
         resolved_stage("s2", tokens=4096, base_lr=5e-5, transition_pct=0.0, train_weights={"c": 1.0}),
     ]
-    return StageManager(stages, settings.world_batch_size, settings.block_size)
+    return StageManager(stages, settings.world_batch_size, settings.training_max_sequence_length)
 
 
 def _stream_setup(
@@ -625,7 +625,7 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
     parquet = loaders.datasets["synthetic_pretrain"]
     state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate(), "buffers": {}}
@@ -646,7 +646,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
 
     def fresh_stream() -> BatchStream:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -688,7 +688,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
     pretrain = loaders.datasets["synthetic_pretrain"]
@@ -715,7 +715,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
 
     def batches(world_batches: int) -> list[Batch]:
         loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -794,12 +794,12 @@ def _drop_stage_manager(settings: Settings) -> StageManager:
 
     stage = resolved_stage(
         "only",
-        tokens=100 * settings.world_batch_size * settings.block_size,
+        tokens=100 * settings.world_batch_size * settings.training_max_sequence_length,
         base_lr=1e-4,
         transition_pct=0.0,
         train_weights={"drop": 1.0},
     )
-    return StageManager([stage], settings.world_batch_size, settings.block_size)
+    return StageManager([stage], settings.world_batch_size, settings.training_max_sequence_length)
 
 
 def _drop_stream(
@@ -988,7 +988,7 @@ def test_batch_stream_with_worker_processes_is_the_same_for_any_worker_batch_siz
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
+    stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
     world_batches = stage_manager.total_steps  # 20: both pretrain stages, the transition and the finetune stage
 
     def batches(worker_batch_rows: int) -> list[Batch]:
@@ -1092,7 +1092,7 @@ def record_step_reference() -> Path:
 # --------------------------------------------------------------------------------------------------------------
 # sequence packing: the packed stream and the step loop on packed micro-batches
 
-PACK_LENGTH = 256  # = the tiny block_size, the smallest pack the settings allow
+PACK_LENGTH = 256  # = the tiny training_max_sequence_length, the smallest pack the settings allow
 PACKED_MICRO_BATCHES_PER_STEP = 4  # 4 x 256 = 1024, the tiny run's tokens per step, so `_abc_stage_manager` applies unchanged
 
 

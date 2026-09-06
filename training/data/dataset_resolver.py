@@ -419,9 +419,8 @@ def check_validation_batches(
 
 def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None:
     """
-    The two cross-checks between run config and dataset config: one base LR per stage, and the same
-    `block_size` (the planner clamped its tokens-per-row rate with the dataset config's, so the rows on disk are
-    sized for that sequence length; `block_size <= max_seq_length` follows from the dataset-config schema).
+    The cross-check between run config and dataset config: one base LR per stage. The sequence lengths are
+    checked with the model config in `training/run.py::check_sequence_lengths`.
     """
 
     if len(settings.stage_base_lrs) != len(dataset_config.stages):
@@ -429,12 +428,6 @@ def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None
             f"stage_base_lrs has {len(settings.stage_base_lrs)} entries but dataset config "
             f"{settings.dataset_config!r} has {len(dataset_config.stages)} stages "
             f"{[stage.name for stage in dataset_config.stages]}; give one base LR per stage, in order"
-        )
-    if settings.block_size != dataset_config.block_size:
-        raise ValueError(
-            f"block_size {settings.block_size} of the run config does not match block_size {dataset_config.block_size} of dataset "
-            f"config {settings.dataset_config!r}; the planner sized the data with the dataset config's block_size "
-            "(it caps the tokens a row serves), so the two must be equal"
         )
 
 
@@ -453,7 +446,7 @@ def _ensure_prepared(
     `should_stop` is polled between shards (`BuildAborted`, everything published so far kept).
     """
 
-    report = status(settings.dataset_config, settings.dataset_dir)  # logs the status table
+    report = status(settings.dataset_config, settings.dataset_dir, training_max_sequence_length=settings.training_max_sequence_length)  # logs the status table
     if report.complete:
         return
     missing = ", ".join(report.missing())
@@ -478,6 +471,7 @@ def _ensure_prepared(
                     confirm=lambda _message: False,  # never delete or truncate raw from a training run
                     hf_token=os.environ.get("HF_TOKEN"),
                     should_stop=should_stop,
+                    training_max_sequence_length=settings.training_max_sequence_length,
                 )
             except ConfirmationRequired as error:
                 raise RuntimeError(
@@ -507,7 +501,7 @@ def resolve_dataset(
     validation loader that cannot fill one micro-batch; `ValueError` for an entry with fewer rows than loader shards.
     """
 
-    dataset_config = load_dataset_config(settings.dataset_config)
+    dataset_config = load_dataset_config(settings.dataset_config, training_max_sequence_length=settings.training_max_sequence_length)
     validate_settings(settings, dataset_config)
     layout = DatasetLayout(Path(settings.dataset_dir))
     _ensure_prepared(settings, dataset_config, layout, backend, should_stop)

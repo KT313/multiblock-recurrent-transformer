@@ -8,7 +8,7 @@
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
-    build_run_model                   architecture yaml + overrides, block-size check, model_config.json, to device
+    build_run_model                   architecture yaml + overrides, sequence-length check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     RunState                          the objects above in one place for the helpers below
     restore_checkpoint_if_resuming    latest / explicit checkpoint -> model, optimizer, RNG state, progress
@@ -37,6 +37,7 @@ from typing import cast, Any
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from data_preparation.dataset_config import DatasetConfig
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
 from model.hf import export_to_hf
@@ -134,7 +135,7 @@ def train(
         )
         loaders = build_run_dataloaders(settings, dataset, backend)
         try:
-            model = build_run_model(settings, backend, run_directory)
+            model = build_run_model(settings, dataset, backend, run_directory)
             optimizer = build_run_optimizer(settings, model, backend)
             state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
             resume = restore_checkpoint_if_resuming(state)
@@ -247,7 +248,7 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
     return StageManager(
         dataset.stages,
         world_batch_size=settings.world_batch_size,
-        block_size=settings.block_size,
+        training_max_sequence_length=settings.training_max_sequence_length,
         world_size=world_size,
         warmup_steps=settings.warmup_steps,
         cooldown_steps=settings.cooldown_steps,
@@ -273,30 +274,36 @@ def check_evaluation_recurrences(settings: Settings) -> None:
                 )
 
 
-def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -> None:
+def check_sequence_lengths(settings: Settings, dataset_config: DatasetConfig, model_config: RecurrentConfig) -> None:
     """
-    The run config's `block_size` must equal the architecture's (the RoPE table is sized by it). The dataset-side
-    check (`block_size` of the dataset config) is the resolver's.
+    The three sequence lengths must nest: the model's RoPE table covers `model_max_sequence_length` positions, the
+    dataset's rows were cut at `dataset_max_sequence_length` tokens, and training cuts them again at
+    `training_max_sequence_length`. Training longer than the model's table is impossible; longer than the data
+    was cut means every row is shorter than the training window, never what was intended.
     """
 
-    if model_config.block_size != settings.block_size:
+    model, dataset, training = (
+        model_config.model_max_sequence_length, dataset_config.dataset_max_sequence_length, settings.training_max_sequence_length
+    )
+    if not model >= dataset >= training:
         raise ValueError(
-            f"block_size {settings.block_size} of the run config does not match block_size {model_config.block_size} "
-            f"of the model architecture config {settings.model_architecture_config} (with model_overwrite applied)"
+            "the sequence lengths must nest as model_max_sequence_length >= dataset_max_sequence_length >= "
+            f"training_max_sequence_length, got {model} ({settings.model_architecture_config}, with model_overwrite applied) "
+            f">= {dataset} ({settings.dataset_config}) >= {training} (the run config)"
         )
 
 
-def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -> Module:
+def build_run_model(settings: Settings, dataset: ResolvedDataset, backend: Backend, run_directory: Path) -> Module:
     """
-    The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
-    then `backend.setup_model` (device, optional compile).
+    The run's model: architecture yaml + `model_overwrite`, the sequence-length check against the dataset config,
+    `RecurrentGPT`, `model_config.json`, then `backend.setup_model` (device, optional compile).
 
     Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`; nothing that
     draws may run before it.
     """
 
     model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
-    check_block_sizes_agree(settings, model_config)
+    check_sequence_lengths(settings, dataset.config, model_config)
     model = RecurrentGPT(
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )

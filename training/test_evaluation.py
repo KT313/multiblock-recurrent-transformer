@@ -30,7 +30,7 @@ def settings() -> Settings:
         dataset_config="config/datasets/tiny.yaml",
         model_architecture_config=str(TINY_MODEL_ARCHITECTURE),
         stage_base_lrs=[3e-4],
-        block_size=256,
+        training_max_sequence_length=256,
         micro_batch_size=2,
         world_batch_size=4,
         eval_step_interval=8,
@@ -234,8 +234,8 @@ def test_is_evaluation_step_table(settings: Settings) -> None:
     Every `eval_step_interval` completed steps and after the last step (here a 20-step run, interval 8).
     """
 
-    stage = resolved_stage("only", tokens=20 * settings.world_batch_size * settings.block_size, base_lr=3e-4, transition_pct=0.0)
-    stage_manager = StageManager([stage], settings.world_batch_size, settings.block_size)
+    stage = resolved_stage("only", tokens=20 * settings.world_batch_size * settings.training_max_sequence_length, base_lr=3e-4, transition_pct=0.0)
+    stage_manager = StageManager([stage], settings.world_batch_size, settings.training_max_sequence_length)
     assert stage_manager.total_steps == 20
     evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, done, stage_manager)]
     assert evaluated == [8, 16, 20]

@@ -13,7 +13,7 @@ sample_at_training_progress: []   # the golden run is a pure training run
 seed: 42
 
 model_architecture_config: config/model_architecture/tiny.yaml
-block_size: 256              # = block_size of the architecture config AND of the dataset config (which is <= its max_seq_length)
+training_max_sequence_length: 256              # documents are cut to this at training time; <= the dataset's and the model's max_sequence_length
 
 dataset_config: config/datasets/tiny.yaml
 dataset_dir: dataset

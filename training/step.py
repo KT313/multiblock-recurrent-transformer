@@ -196,7 +196,7 @@ class BatchStream:
                 samples,
                 self.settings.micro_batch_size,
                 self.loaders.tokenizer,
-                self.settings.block_size,
+                self.settings.training_max_sequence_length,
                 sort_by_length=self.settings.sort_batches_by_length,
                 padding_multiple=self.settings.sequence_padding_multiple,
                 ignore_index=IGNORE_INDEX,

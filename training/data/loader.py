@@ -63,7 +63,7 @@ def entry_dataset(entry: DataEntry, shard: tuple[int, int] = (0, 1)) -> ParquetT
 def build_dataloader(
     entries: list[DataEntry],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     micro_batch_size: int,
     num_workers: int = 0,
     seed: int = 1337,
@@ -91,7 +91,7 @@ def build_dataloader(
     return dataloader_over(
         dataset,
         tokenizer,
-        block_size,
+        training_max_sequence_length,
         micro_batch_size,
         num_workers=num_workers,
         padding_multiple=padding_multiple,
@@ -106,7 +106,7 @@ def build_dataloader(
 def dataloader_over(
     dataset: IterableDataset[Row],
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     micro_batch_size: int,
     num_workers: int = 0,
     padding_multiple: int | None = None,
@@ -135,12 +135,12 @@ def dataloader_over(
         collate = partial(
             collate_fn,
             tokenizer=tokenizer,
-            block_size=block_size,
+            training_max_sequence_length=training_max_sequence_length,
             padding_multiple=padding_multiple,
             ignore_index=ignore_index,
         )
     else:
-        collate = partial(collate_worker_batch, tokenizer=tokenizer, block_size=block_size)
+        collate = partial(collate_worker_batch, tokenizer=tokenizer, training_max_sequence_length=training_max_sequence_length)
     return DataLoader(
         dataset,
         batch_size=micro_batch_size if worker_batch_rows is None else worker_batch_rows,
@@ -258,7 +258,7 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
         source: dataloader_over(
             parquet_dataset,
             tokenizer,
-            block_size=settings.block_size,
+            training_max_sequence_length=settings.training_max_sequence_length,
             micro_batch_size=settings.micro_batch_size,
             num_workers=TRAIN_LOADER_NUM_WORKERS,
             padding_multiple=settings.sequence_padding_multiple,
@@ -274,7 +274,7 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
         build_dataloader(
             stage.val_data,
             tokenizer,
-            block_size=settings.block_size,
+            training_max_sequence_length=settings.training_max_sequence_length,
             micro_batch_size=settings.micro_batch_size,
             num_workers=0,
             seed=settings.seed + backend.rank,
@@ -302,7 +302,7 @@ def world_batch_micro_batches(
     samples: list[Sample],
     micro_batch_size: int,
     tokenizer: Tokenizer,
-    block_size: int,
+    training_max_sequence_length: int,
     sort_by_length: bool,
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
@@ -318,6 +318,6 @@ def world_batch_micro_batches(
     if sort_by_length:
         samples = sorted(samples, key=sample_length)
     return [
-        pad_and_shift(samples[start : start + micro_batch_size], tokenizer, block_size, padding_multiple, ignore_index)
+        pad_and_shift(samples[start : start + micro_batch_size], tokenizer, training_max_sequence_length, padding_multiple, ignore_index)
         for start in range(0, len(samples), micro_batch_size)
     ]

@@ -4,7 +4,7 @@ Multi-stage training manager: stage boundaries, transitions and stage-dependent 
 
 The stages are the resolver's `ResolvedStage`s (token budget, base LR, transition length, sampling weights); the
 manager turns budgets into optimizer-step boundaries and weights into a per-step schedule. All steps are OPTIMIZER
-steps (one world batch of `world_batch_size * block_size` tokens each), so step counts are independent of the world
+steps (one world batch of `world_batch_size * training_max_sequence_length` tokens each), so step counts are independent of the world
 size; `world_size` only feeds the sanity check that the world batch splits evenly across devices.
 """
 
@@ -86,7 +86,7 @@ class StageManager:
         self,
         stages: list[ResolvedStage],
         world_batch_size: int,
-        block_size: int,
+        training_max_sequence_length: int,
         world_size: int = 1,
         warmup_steps: int = 0,
         cooldown_steps: int = 0,
@@ -95,7 +95,7 @@ class StageManager:
     ) -> None:
         """
         `tokens_per_step` given (sequence packing: `Settings.tokens_per_optimizer_step`) replaces
-        `world_batch_size * block_size` as the size of one optimizer step; the sequence-based checks still run on
+        `world_batch_size * training_max_sequence_length` as the size of one optimizer step; the sequence-based checks still run on
         `world_batch_size` (the validation batches), the `micro_batch_size` check is the caller's to skip.
         """
 
@@ -112,11 +112,11 @@ class StageManager:
             raise ValueError(f"tokens_per_step must be positive, got {tokens_per_step}")
         self.stages = stages
         self.world_batch_size = world_batch_size
-        self.block_size = block_size
+        self.training_max_sequence_length = training_max_sequence_length
         self.world_size = world_size
         self.warmup_steps = warmup_steps
         self.cooldown_steps = cooldown_steps
-        self.tokens_per_step = tokens_per_step if tokens_per_step is not None else world_batch_size * block_size
+        self.tokens_per_step = tokens_per_step if tokens_per_step is not None else world_batch_size * training_max_sequence_length
         self.packed = tokens_per_step is not None  # how the summary describes a step
 
         self.boundaries = self._calculate_stage_boundaries()
@@ -252,7 +252,7 @@ class StageManager:
         lines = ["Multi-Stage Training Configuration:"]
         lines.append(f"  Total stages: {len(self.stages)}")
         lines.append(f"  Total optimizer steps: {self.total_steps:,}")
-        step_shape = "packed sequences" if self.packed else f"world batch {self.world_batch_size} x block {self.block_size}"
+        step_shape = "packed sequences" if self.packed else f"world batch {self.world_batch_size} x block {self.training_max_sequence_length}"
         lines.append(f"  Tokens per optimizer step: {self.tokens_per_step:,} ({step_shape})")
         lines.append(f"  World size: {self.world_size}")
         lines.append("")

@@ -45,7 +45,7 @@ from training.run import (
     build_run_model,
     build_run_optimizer,
     build_stage_manager,
-    check_block_sizes_agree,
+    check_sequence_lengths,
     create_backend,
     prepare_run_directory,
     record_run_config,
@@ -116,13 +116,13 @@ def test_stop_requested() -> None:
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
     """
     `build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
-    block size, world size, warmup / cooldown and the micro-batch divisibility check from the settings.
+    sequence length, world size, warmup / cooldown and the micro-batch divisibility check from the settings.
     """
 
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
     assert sm.stages is tiny_resolved.stages
-    assert (sm.world_batch_size, sm.block_size, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.block_size, 1)
+    assert (sm.world_batch_size, sm.training_max_sequence_length, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.training_max_sequence_length, 1)
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
     assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
@@ -156,19 +156,31 @@ def test_train_refuses_a_run_directory_another_run_holds(
     assert list(checkpoint_dir(run_directory_of(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
 
-def test_check_block_sizes_agree_message(tiny_settings: Settings) -> None:
+def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
+    """
+    model_max_sequence_length >= dataset_max_sequence_length >= training_max_sequence_length; every other order
+    is refused with the three numbers and their files.
+    """
+
     model_config = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config)
-    check_block_sizes_agree(tiny_settings, model_config)  # tiny: both 256
-    mismatched = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, block_size=128)
+    check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # tiny: all 256
+    tiny_settings.training_max_sequence_length = 128
+    check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)  # training shorter than the data: fine
+    tiny_settings.training_max_sequence_length = 256
+    smaller = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, model_max_sequence_length=128)
     with pytest.raises(ValueError) as excinfo:
-        check_block_sizes_agree(tiny_settings, mismatched)
+        check_sequence_lengths(tiny_settings, tiny_resolved.config, smaller)
     assert str(excinfo.value) == (
-        "block_size 256 of the run config does not match block_size 128 of the model architecture config "
-        "config/model_architecture/tiny.yaml (with model_overwrite applied)"
+        "the sequence lengths must nest as model_max_sequence_length >= dataset_max_sequence_length >= "
+        "training_max_sequence_length, got 128 (config/model_architecture/tiny.yaml, with model_overwrite applied) "
+        ">= 256 (config/datasets/tiny.yaml) >= 256 (the run config)"
     )
+    tiny_settings.training_max_sequence_length = 512
+    with pytest.raises(ValueError, match="must nest .* >= 256 \\(config/datasets/tiny.yaml\\) >= 512"):
+        check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)
 
 
-def test_build_run_model_on_tiny(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:
     """
     The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
     settings, `model_config.json` next to the checkpoints, the model on the backend's device.
@@ -176,20 +188,20 @@ def test_build_run_model_on_tiny(tiny_settings: Settings, cpu_backend: SingleDev
 
     tiny_settings.model_overwrite = {"n_embd": 32}
     run_directory = prepare_run_directory(tiny_settings)
-    model = build_run_model(tiny_settings, cpu_backend, run_directory)
+    model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
     assert isinstance(model, RecurrentGPT)
-    assert model.config.n_embd == 32 and model.config.block_size == 256
+    assert model.config.n_embd == 32 and model.config.model_max_sequence_length == 256
     assert model.ignore_index == IGNORE_INDEX
     assert model.gradient_checkpointing is tiny_settings.gradient_checkpointing
     assert all(p.device == cpu_backend.device for p in model.parameters())
     written = json.loads((run_directory / "model_config.json").read_text())
     assert written == model.config.to_dict() and written["n_embd"] == 32
-    tiny_settings.model_overwrite = {"block_size": 128}
-    with pytest.raises(ValueError, match="does not match block_size 128 of the model architecture"):
-        build_run_model(tiny_settings, cpu_backend, run_directory)
+    tiny_settings.model_overwrite = {"model_max_sequence_length": 128}
+    with pytest.raises(ValueError, match="must nest .* got 128 "):
+        build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
 
 
-def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:
     """
     The parameter init consumes the global torch RNG (why `build_run_model` runs after the loaders): the same seed
     gives the same weights, and the init advances the RNG.
@@ -197,10 +209,10 @@ def test_build_run_model_is_seeded_by_the_global_rng(tiny_settings: Settings, cp
 
     run_directory = prepare_run_directory(tiny_settings)
     torch.manual_seed(3)
-    first = build_run_model(tiny_settings, cpu_backend, run_directory)
+    first = build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
     after_first = torch.get_rng_state()
     torch.manual_seed(3)
-    second = build_run_model(tiny_settings, cpu_backend, run_directory)
+    second = build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
     assert all(torch.equal(a, b) for a, b in zip(first.parameters(), second.parameters()))
     assert torch.equal(after_first, torch.get_rng_state())
     torch.manual_seed(3)
@@ -239,20 +251,19 @@ def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
         assert state.progress == TrainingProgress(step=0, resume_step=-1)
 
 
-def test_block_size_mismatch_with_the_dataset_config_raises(
+def test_training_longer_than_the_dataset_rows_is_refused(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", block_size=128)
-    with pytest.raises(ValueError, match="block_size 128 of the run config does not match block_size 256 of dataset config") as excinfo:
-        _run(yaml_path, cpu_backend)
-    assert "'config/datasets/tiny.yaml'" in str(excinfo.value)  # the dataset config as the run config names it
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", training_max_sequence_length=512)
+    with pytest.raises(ValueError, match=r"training_max_sequence_length \(512\) exceeds dataset_max_sequence_length \(256\) of config/datasets/tiny.yaml"):
+        _run(yaml_path, cpu_backend)  # refused where the dataset config is loaded, before any data is touched
 
 
-def test_block_size_mismatch_with_the_model_architecture_raises(
+def test_a_model_shorter_than_the_training_length_is_refused(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite={"block_size": 128})
-    with pytest.raises(ValueError, match="block_size 256 of the run config does not match block_size 128 of the model architecture"):
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", model_overwrite={"model_max_sequence_length": 128})
+    with pytest.raises(ValueError, match="must nest .* got 128 .* >= 256 .* >= 256"):
         _run(yaml_path, cpu_backend)
 
 
@@ -347,7 +358,7 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
         extra = torch.load(checkpoint_dir(full_run["run_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
         assert extra["settings"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
-        assert extra["model_config"]["block_size"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
+        assert extra["model_config"]["model_max_sequence_length"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
         assert extra["dataset_config_hash"] == full_run["dataset_hash"]
         assert extra["validation_rows"] == validation_rows
 
@@ -1041,7 +1052,7 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
     backend.seed_everything(settings.seed)
     dataset = resolve_dataset(settings, backend)
     stage_manager = build_stage_manager(settings, dataset, backend.world_size)
-    model = build_run_model(settings, backend, run_dir)
+    model = build_run_model(settings, dataset, backend, run_dir)
     optimizer = build_run_optimizer(settings, model, backend)
     state = RunState(settings, run_dir, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
     resume = restore_checkpoint_if_resuming(state)

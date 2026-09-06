@@ -80,7 +80,7 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
     assert state["rng"] is metadata.rng  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
     assert restored == metadata
-    assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["block_size"] == 256
+    assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["model_max_sequence_length"] == 256
 
 
 def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
@@ -195,7 +195,7 @@ def test_is_checkpoint_step_table() -> None:
         resolved_stage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
         resolved_stage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
     ]
-    stage_manager = StageManager(stages, world_batch_size=4, block_size=256)
+    stage_manager = StageManager(stages, world_batch_size=4, training_max_sequence_length=256)
     assert stage_manager.total_steps == 20 and stage_manager.stage_ending_at(11) == 0
     settings = _settings(save_step_interval=8, save_last_step=True)
     assert [s for s in range(1, 21) if is_checkpoint_step(settings, s, stage_manager)] == [8, 12, 16, 20]
@@ -213,7 +213,7 @@ def test_is_checkpoint_step_table() -> None:
 CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "stage_base_lrs": [2e-3],
     "seed": 7,
-    "block_size": 128,
+    "training_max_sequence_length": 128,
     "sort_batches_by_length": False,
     "sequence_padding_multiple": 64,
     "backend": "future_ddp",
@@ -291,7 +291,7 @@ def test_check_settings_unchanged_catches_every_compared_setting(
             for allow in (False, True):  # non-overridable
                 with pytest.raises(ValueError, match="parameter groups are restored from the checkpoint"):
                     check_settings_unchanged(metadata, changed, config, allow)
-        else:  # named; block_size and the batch sizes also move the packing token sizes derived from them
+        else:  # named; training_max_sequence_length and the batch sizes also move the packing token sizes derived from them
             with pytest.raises(ValueError, match=rf"resuming with changed \[.*'{key}'.*checkpoint .* != current "):
                 check_settings_unchanged(metadata, changed, config, False)
             check_settings_unchanged(metadata, changed, config, True)  # allow_settings_change
