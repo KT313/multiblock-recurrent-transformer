@@ -43,7 +43,7 @@ from training.settings import Settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 from training.step import StepResult, TrainingProgress
-from training.test_step import reference_settings, reference_stage_manager
+from training.test_step import PACK_LENGTH, reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
@@ -322,7 +322,7 @@ class FakeClock:
         self.now += seconds
 
 
-TOKENS_PER_STEP = 4 * 256  # reference_settings: world_batch_size 4, training_max_sequence_length 256
+TOKENS_PER_STEP = 2 * PACK_LENGTH  # reference_settings: two packs of PACK_LENGTH tokens per optimizer step
 STEP_KEYS = {
     "loss", "ppl", "lr", "grad_norm", "step", "seconds/step", "tokens/second", "total_tokens", "total_time",
     "remaining_time", "stage/current_stage", "stage/base_lr", "stage/in_transition", "stage/transition_progress",
@@ -339,7 +339,14 @@ def two_stage_manager(settings: Settings) -> StageManager:
         resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
         resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(stages, settings.world_batch_size, settings.training_max_sequence_length, warmup_steps=2, cooldown_steps=2)
+    return StageManager(
+        stages,
+        settings.world_batch_size,
+        settings.training_max_sequence_length,
+        warmup_steps=2,
+        cooldown_steps=2,
+        tokens_per_step=settings.tokens_per_optimizer_step,
+    )
 
 
 def fake_result(
