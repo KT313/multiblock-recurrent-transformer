@@ -70,9 +70,9 @@ make training config/crow_300m_final.yaml
 ```
 
 Training packs documents end to end (`pack_sequences: true`, the default): one row of `tokens_per_micro_batch`
-tokens per micro-batch, `tokens_per_step` tokens per optimizer step, attention masked per document; validation
-stays padded. Left unset, the two sizes are the padded equivalents `micro_batch_size × block_size` and
-`world_batch_size × block_size`, so a config written in rows keeps its step arithmetic.
+tokens per micro-batch, `micro_batches_per_step` of them per optimizer step, attention masked per document;
+validation stays padded. Left unset, the two are the padded equivalents `micro_batch_size × block_size` and
+`world_batch_size / micro_batch_size`, so a config written in rows keeps its step arithmetic.
 
 ### Evaluation
 

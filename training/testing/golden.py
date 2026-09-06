@@ -41,7 +41,7 @@ GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
 
 # `write_tiny_yaml` overrides for a run on padded rows (`config/tiny.yaml` packs): the golden run was recorded that
 # way, and the tests of the padded stream pin the row layout
-PADDED_ROWS: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "tokens_per_step": None}
+PADDED_ROWS: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "micro_batches_per_step": None}
 
 
 def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:

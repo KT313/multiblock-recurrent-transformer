@@ -30,9 +30,9 @@ micro_batch_size: 2
 world_batch_size: 4
 sort_batches_by_length: true
 sequence_padding_multiple: 128
-pack_sequences: true
-tokens_per_micro_batch: 512     # = micro_batch_size × block_size
-tokens_per_step: 1024           # = world_batch_size × block_size
+pack_sequences: true            # true strongly recommended, uses inefficient batch padding otherwise
+tokens_per_micro_batch: 512
+micro_batches_per_step: 2
 
 optimizer: AdamW
 optim_config: {lr: 3e-4, weight_decay: 0.1, betas: [0.9, 0.95]}

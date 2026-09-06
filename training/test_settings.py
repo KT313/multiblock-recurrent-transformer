@@ -50,7 +50,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "sequence_padding_multiple": 128,
     "pack_sequences": True,
     "tokens_per_micro_batch": 8192,
-    "tokens_per_step": 2097152,
+    "micro_batches_per_step": 256,
     "optimizer": "ELLISAdam",
     "optim_config": {
         "lr": 1e-4,
@@ -110,7 +110,7 @@ def test_parse_tiny_yaml() -> None:
     assert cfg.backend == "single_device" and cfg.precision == "bf16-mixed"
     assert cfg.resume is False and cfg.wandb_enabled is False
     assert (cfg.micro_batch_size, cfg.world_batch_size) == (2, 4)
-    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.tokens_per_step) == (True, 512, 1024)
+    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (True, 512, 2)
     assert cfg.optimizer == "AdamW"
     assert cfg.optim_config == OptimizerConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95))
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.eval_step_interval, cfg.eval_iters) == (2, 2, 8, 2)
@@ -426,69 +426,67 @@ def test_required_settings_are_rejected_when_empty(name: str) -> None:
 
 def test_packing_is_the_default_with_the_padded_sizes_derived() -> None:
     """
-    Packed by default; the token sizes left unset are the padded equivalents, so a config written in rows keeps its
-    step arithmetic (`tokens_per_optimizer_step`, `gradient_accumulation_steps`) and only the batch layout changes.
+    Packed by default; the packing fields left unset are the padded equivalents, so a config written in rows keeps
+    its step arithmetic (`tokens_per_optimizer_step`, `gradient_accumulation_steps`) and only the batch layout changes.
     """
 
     cfg = _settings(micro_batch_size=2, world_batch_size=8)
     assert cfg.pack_sequences is True
-    assert (cfg.tokens_per_micro_batch, cfg.tokens_per_step) == (2 * cfg.block_size, 8 * cfg.block_size)
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (2 * cfg.block_size, 4)
     assert cfg.gradient_accumulation_steps == 4
     assert cfg.tokens_per_optimizer_step == 8 * cfg.block_size
-    assert asdict(cfg)["tokens_per_step"] == 8 * cfg.block_size  # recorded resolved (run_config.json, checkpoints)
+    assert asdict(cfg)["micro_batches_per_step"] == 4  # recorded resolved (run_config.json, checkpoints)
 
 
 def test_packing_off_uses_the_padded_sizes() -> None:
     cfg = _settings(micro_batch_size=2, world_batch_size=8, pack_sequences=False)
-    assert cfg.tokens_per_micro_batch is None and cfg.tokens_per_step is None
+    assert cfg.tokens_per_micro_batch is None and cfg.micro_batches_per_step is None
     assert cfg.gradient_accumulation_steps == 4
     assert cfg.tokens_per_optimizer_step == 8 * cfg.block_size
 
 
-def test_explicit_packing_sizes_define_the_step() -> None:
-    cfg = _settings(tokens_per_micro_batch=8192, tokens_per_step=8192 * 32)
+def test_explicit_packing_fields_define_the_step() -> None:
+    cfg = _settings(tokens_per_micro_batch=8192, micro_batches_per_step=32)
     assert cfg.gradient_accumulation_steps == 32
     assert cfg.tokens_per_optimizer_step == 8192 * 32
-    exact = _settings(tokens_per_micro_batch=2048, tokens_per_step=2048)  # pack = block_size
-    assert exact.gradient_accumulation_steps == 1
+    exact = _settings(tokens_per_micro_batch=2048, micro_batches_per_step=1)  # pack = block_size
+    assert exact.gradient_accumulation_steps == 1 and exact.tokens_per_optimizer_step == 2048
 
 
-def test_one_explicit_packing_size_derives_the_other() -> None:
+def test_one_explicit_packing_field_derives_the_other() -> None:
     packs = _settings(micro_batch_size=4, world_batch_size=1024, tokens_per_micro_batch=8192)
-    assert (packs.tokens_per_step, packs.gradient_accumulation_steps) == (1024 * 2048, 256)
-    step = _settings(micro_batch_size=4, world_batch_size=1024, tokens_per_step=8192 * 4)
-    assert (step.tokens_per_micro_batch, step.gradient_accumulation_steps) == (8192, 4)
-    with pytest.raises(ValueError, match="must be a positive multiple of tokens_per_micro_batch"):
-        _settings(micro_batch_size=4, world_batch_size=1024, tokens_per_micro_batch=8192 * 3)  # 1024 x 2048 is not
+    assert (packs.micro_batches_per_step, packs.tokens_per_optimizer_step) == (256, 256 * 8192)
+    step = _settings(micro_batch_size=4, world_batch_size=1024, micro_batches_per_step=4)
+    assert (step.tokens_per_micro_batch, step.tokens_per_optimizer_step) == (4 * 2048, 4 * 4 * 2048)
 
 
-def test_packing_sizes_without_packing_are_refused() -> None:
+def test_packing_fields_without_packing_are_refused() -> None:
     """
-    A token size next to `pack_sequences: false` would silently do nothing; the mismatch is an error instead.
+    A packing field next to `pack_sequences: false` would silently do nothing; the mismatch is an error instead.
     """
 
     with pytest.raises(ValueError, match="tokens_per_micro_batch is set but pack_sequences is false"):
         _settings(pack_sequences=False, tokens_per_micro_batch=8192)
-    with pytest.raises(ValueError, match="tokens_per_step is set but pack_sequences is false"):
-        _settings(pack_sequences=False, tokens_per_step=8192)
+    with pytest.raises(ValueError, match="micro_batches_per_step is set but pack_sequences is false"):
+        _settings(pack_sequences=False, micro_batches_per_step=4)
 
 
 def test_pack_must_hold_a_whole_document() -> None:
     with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(1024\) must be >= block_size \(2048\)"):
-        _settings(pack_sequences=True, tokens_per_micro_batch=1024, tokens_per_step=4096)
+        _settings(pack_sequences=True, tokens_per_micro_batch=1024, micro_batches_per_step=4)
 
 
-@pytest.mark.parametrize("tokens_per_step", [0, -8192, 8191, 8192 * 3 + 1])
-def test_step_must_be_whole_packs(tokens_per_step: int) -> None:
-    with pytest.raises(ValueError, match="must be a positive multiple of tokens_per_micro_batch"):
-        _settings(pack_sequences=True, tokens_per_micro_batch=8192, tokens_per_step=tokens_per_step)
+@pytest.mark.parametrize("micro_batches_per_step", [0, -4])
+def test_step_needs_at_least_one_pack(micro_batches_per_step: int) -> None:
+    with pytest.raises(ValueError, match="micro_batches_per_step must be positive"):
+        _settings(pack_sequences=True, tokens_per_micro_batch=8192, micro_batches_per_step=micro_batches_per_step)
 
 
 def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
     yaml_path = tmp_path / "packed.yaml"
-    yaml_path.write_text(TINY_YAML.read_text().replace("tokens_per_step: 1024", "tokens_per_step: 2048"))
+    yaml_path.write_text(TINY_YAML.read_text().replace("micro_batches_per_step: 2", "micro_batches_per_step: 4"))
     cfg = parse_settings(["--config", str(yaml_path)])
-    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.tokens_per_step) == (True, 512, 2048)
+    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (True, 512, 4)
     assert cfg.gradient_accumulation_steps == 4 and cfg.tokens_per_optimizer_step == 2048
-    overridden = parse_settings(["--config", str(yaml_path), "--tokens_per_step", "4096"])
+    overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
     assert overridden.gradient_accumulation_steps == 8

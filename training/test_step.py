@@ -1093,7 +1093,7 @@ def record_step_reference() -> Path:
 # sequence packing: the packed stream and the step loop on packed micro-batches
 
 PACK_LENGTH = 256  # = the tiny block_size, the smallest pack the settings allow
-PACKED_TOKENS_PER_STEP = 1024  # = 4 x 256, the tiny run's tokens per step, so `_abc_stage_manager` applies unchanged
+PACKED_MICRO_BATCHES_PER_STEP = 4  # 4 x 256 = 1024, the tiny run's tokens per step, so `_abc_stage_manager` applies unchanged
 
 
 def _packed_stream_setup(
@@ -1105,7 +1105,7 @@ def _packed_stream_setup(
         tmp_path / "out",
         pack_sequences=True,
         tokens_per_micro_batch=PACK_LENGTH,
-        tokens_per_step=PACKED_TOKENS_PER_STEP,
+        micro_batches_per_step=PACKED_MICRO_BATCHES_PER_STEP,
     )
     settings = parse_settings(["--config", str(yaml_path)])
     loaders = RunDataloaders({t: _Repeat(t) for t in "abc"}, [], tokenizer, {})
@@ -1126,7 +1126,7 @@ def test_packed_stream_yields_one_full_pack_per_micro_batch(
 ) -> None:
     """
     Every micro-batch is one row of `tokens_per_micro_batch` positions filled with whole documents (first-fit from
-    the pool) and a tail shorter than the longest document the loaders hand out; `tokens_per_step` micro-batches
+    the pool) and a tail shorter than the longest document the loaders hand out; `micro_batches_per_step` micro-batches
     form a step. In stage 0 every document comes from source `a`.
     """
 
@@ -1266,7 +1266,7 @@ def packed_reference_settings(**overrides: Any) -> Settings:
     """
 
     return reference_settings(
-        pack_sequences=True, tokens_per_micro_batch=256, tokens_per_step=512, **overrides
+        pack_sequences=True, tokens_per_micro_batch=256, micro_batches_per_step=2, **overrides
     )
 
 
@@ -1294,7 +1294,7 @@ def test_model_inputs_of_padded_and_packed_batches(cpu_backend: SingleDeviceBack
 
 def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> None:
     """
-    The step loop takes packed micro-batches as it takes padded ones: `tokens_per_step / tokens_per_micro_batch`
+    The step loop takes packed micro-batches as it takes padded ones: `micro_batches_per_step`
     of them per step, one data id per document, a finite loss and gradient, and the packing-efficiency metric at
     log steps (2 tails of 32 in 512 tokens).
     """

@@ -237,7 +237,7 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
 
 # Compared like the fields above, but only valid together (`Settings._check_packing`): a resume that switches from
 # sequence packing to padded rows changes all three at once, so they are tested as one switch.
-CHANGED_TOGETHER: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "tokens_per_step": None}
+CHANGED_TOGETHER: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "micro_batches_per_step": None}
 
 
 def test_every_settings_field_is_classified() -> None:
@@ -266,7 +266,7 @@ def test_check_settings_unchanged_catches_a_switch_to_padded_rows(
     config = tiny_model.config.to_dict()
     padded = _settings(run_name="tiny", seed=42, **CHANGED_TOGETHER)
     with pytest.raises(
-        ValueError, match=r"resuming with changed \['pack_sequences', 'tokens_per_micro_batch', 'tokens_per_step'\]"
+        ValueError, match=r"resuming with changed \['micro_batches_per_step', 'pack_sequences', 'tokens_per_micro_batch'\]"
     ):
         check_settings_unchanged(metadata, padded, config, False)
     check_settings_unchanged(metadata, padded, config, True)

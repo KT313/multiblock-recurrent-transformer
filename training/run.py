@@ -234,10 +234,16 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
     """
     The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries. With sequence
-    packing a step is `tokens_per_step` tokens and the sequence-count check of `micro_batch_size` does not apply
-    (`micro_batch_size` then only sizes the validation batches).
+    packing a step is `micro_batches_per_step x tokens_per_micro_batch` tokens and the sequence-count check of
+    `micro_batch_size` does not apply (`micro_batch_size` then only sizes the validation batches); the packed
+    micro-batches must instead split evenly over the devices.
     """
 
+    if settings.pack_sequences and settings.gradient_accumulation_steps % world_size != 0:
+        raise ValueError(
+            f"micro_batches_per_step ({settings.gradient_accumulation_steps}) must be a multiple of the number of "
+            f"devices ({world_size}): every device takes the same number of packed micro-batches per optimizer step"
+        )
     return StageManager(
         dataset.stages,
         world_batch_size=settings.world_batch_size,
@@ -246,7 +252,7 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
         warmup_steps=settings.warmup_steps,
         cooldown_steps=settings.cooldown_steps,
         micro_batch_size=None if settings.pack_sequences else settings.micro_batch_size,
-        tokens_per_step=settings.tokens_per_step if settings.pack_sequences else None,
+        tokens_per_step=settings.tokens_per_optimizer_step if settings.pack_sequences else None,
     )
 
 

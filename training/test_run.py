@@ -10,7 +10,7 @@ import json
 import math
 import shutil
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -28,6 +28,7 @@ from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
+    PADDED_ROWS,
     TINY_DATASET_YAML,
     golden_exact_requested,
     golden_mismatches,
@@ -124,8 +125,11 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     assert (sm.world_batch_size, sm.block_size, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.block_size, 1)
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
-    with pytest.raises(ValueError, match="divisible by world_size"):
+    assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
+    with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of devices \(3\)"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
+    with pytest.raises(ValueError, match="divisible by world_size"):
+        build_stage_manager(replace(tiny_settings, **PADDED_ROWS), tiny_resolved, world_size=3)
 
 
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
@@ -894,7 +898,7 @@ def test_packed_tiny_run_finishes_and_resumes_exactly(
     options: dict[str, Any] = dict(
         pack_sequences=True,
         tokens_per_micro_batch=256,
-        tokens_per_step=1024,
+        micro_batches_per_step=4,
         save_step_interval=4,
         export_to_hf=False,
         precision="32",
