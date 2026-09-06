@@ -412,6 +412,32 @@ def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() 
         assert flag.should_stop(), "the flag must be raised so running jobs stop at their next shard"
 
 
+def test_a_second_interrupt_ends_the_process_without_waiting_for_the_running_job(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Ctrl-C while the pool exit waits for a job that never reaches its next shard (a huge row group, a stalled
+    listing): the executor is abandoned and the process ends with 130 instead of joining the thread at exit.
+    """
+
+    flag = runner.StopFlag()
+    release = threading.Event()
+    exits: list[int] = []
+
+    def interrupt(*args: Any, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "wait", interrupt)  # the first Ctrl-C lands in `wait_for_jobs`
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__exit__", interrupt)  # the second in the pool exit
+    monkeypatch.setattr(os, "_exit", exits.append)
+    pool = runner.JobPool("downloads", max_workers=1, flag=flag, total=1)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pool:
+        pool.submit(runner.Job("source", "a", ("a",), lambda stop: release.wait(10)))
+        failures = runner.wait_for_jobs([pool], flag)
+    assert [type(error) for error in failures] == [BuildAborted] and flag.should_stop(), "the first interrupt: stop at the next shard"
+    assert exits == [130] and not release.is_set(), "the second: ended while the job was still running"
+    assert "second interrupt: ending without waiting for the running transfer" in caplog.text
+    release.set()
+    pool._executor.shutdown(wait=True)  # the test's own thread, not the process's exit
+
 
 def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
     cfg = _three_sources(cfg_factory)  # no raw folders: nothing pending, and an empty plan: nothing to download

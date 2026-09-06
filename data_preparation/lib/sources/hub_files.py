@@ -12,8 +12,8 @@ rows in file order. How a file is fetched depends on its size (known from the in
   whole (count is a minimum, align_to_row_group=True), so the same bytes are never downloaded twice; a
   top-up at a larger offset seeks straight to the right row group.
 * larger .jsonl / .jsonl.zst / .jsonl.gz / .json.gz / .json files are streamed from the
-  start (a .json array incrementally with ijson, :func:`iter_json_array`) and dropped after exactly
-  count rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
+  start (a .json array incrementally with ijson, :func:`iter_json_array`; a .json.gz is an array or json lines,
+  told apart by its first byte) and dropped after exactly count rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
   file re-streams that file's prefix.
 
 A :class:`FileIndex` per (repo, revision, glob) remembers the file list and sizes (one batched
@@ -82,8 +82,10 @@ HUB_REQUEST_TIMEOUT = 30.0  # seconds to connect, and between two reads, of any 
 def configure_hub_http() -> None:
     """
     Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
-    The library passes its own, shorter timeouts to range reads and cache downloads; the repo listing and the size
-    lookup (HfApi.dataset_info / get_paths_info) rely on the client's, which is unset by default.
+    The library passes its own, shorter timeouts to range reads and cache downloads; the size lookup
+    (HfApi.get_paths_info) relies on the client's, which is unset by default. The repo listing
+    (:func:`repo_listing`) gets the timeout as an explicit argument instead: HfApi.dataset_info passes its own
+    default timeout=None down to the client, and an explicit None disables the client's timeout in httpx.
     """
 
     from huggingface_hub import get_session
@@ -102,7 +104,7 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
     from huggingface_hub import HfApi
 
     configure_hub_http()
-    info = HfApi(token=token).dataset_info(repo_id, revision=revision)
+    info = HfApi(token=token).dataset_info(repo_id, revision=revision, timeout=HUB_REQUEST_TIMEOUT)
     if info.sha is None:
         raise RuntimeError(f"{repo_id}@{revision or 'main'}: the Hub returned no commit hash for the listing")
     return [sibling.rfilename for sibling in info.siblings or []], str(info.sha)
@@ -218,14 +220,18 @@ class FileIndex:
             return index
         with _OPEN_INDEXES_LOCK:
             cached = _OPEN_INDEXES.get(path)
-            if cached is not None:
-                index = cached
-            elif path.is_file():
+        if cached is not None:
+            index = cached
+        else:
+            # the Hub round-trip (the listing, or the revision check of a loaded index) runs outside the lock: one
+            # stalled request must not hold up every other open of the process
+            if path.is_file():
                 index = cls._load(repo_id, revision, pattern, path)
                 index._check_revision(token)
             else:
                 index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
-            _OPEN_INDEXES[path] = index
+            with _OPEN_INDEXES_LOCK:
+                index = _OPEN_INDEXES.setdefault(path, index)  # another thread may have published it meanwhile
         index.ensure_sizes(token)
         index.save()
         return index
@@ -432,7 +438,10 @@ def glob_regex(pattern: str) -> re.Pattern[str]:
             if end == -1:
                 parts.append(re.escape(char))
             else:
-                parts.append("[" + pattern[i + 1 : end].replace("\\", "\\\\") + "]")
+                body = pattern[i + 1 : end].replace("\\", "\\\\")
+                if body[:1] in ("!", "^"):
+                    body = "^" + body[1:]  # a glob negation ([!a]); copied literally, ! would only match itself
+                parts.append("[" + body + "]")
                 i = end
         else:
             parts.append(re.escape(char))
@@ -686,11 +695,26 @@ def _json_lines_batches(handle: BinaryIO, name: str, skip: int, columns: list[st
         yield [row]
 
 
+def _json_gz_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """
+    :data:`FORMAT_READERS` entry for .json.gz, which Hub repos use for both shapes: a JSON array (`[` as the
+    first non-blank byte, read like a .json) or json lines (read like a .jsonl.gz). One row per batch, as above.
+    """
+
+    with gzip.GzipFile(fileobj=handle, mode="rb") as decompressed:
+        if decompressed.peek(64).lstrip().startswith(b"["):
+            rows = iter_json_array(cast(BinaryIO, decompressed), name, skip)
+        else:
+            rows = _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
+        for row in rows:
+            yield [row]
+
+
 FORMAT_READERS: dict[str, FormatReader] = {
     ".parquet": _parquet_batches,
     ".jsonl.zst": _json_lines_batches,
     ".jsonl.gz": _json_lines_batches,
-    ".json.gz": _json_lines_batches,
+    ".json.gz": _json_gz_batches,
     ".jsonl": _json_lines_batches,
     ".json": _json_array_batches,
 }
@@ -777,7 +801,7 @@ def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:
 
         with zstandard.ZstdDecompressor().stream_reader(handle, closefd=False) as decompressed:
             yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
-    elif fmt in (".jsonl.gz", ".json.gz"):
+    elif fmt == ".jsonl.gz":
         with gzip.GzipFile(fileobj=handle, mode="rb") as decompressed:
             yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
     else:  # plain .jsonl

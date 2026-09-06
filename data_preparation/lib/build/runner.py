@@ -25,7 +25,8 @@ spawn process pool of pass_workers for its optional cleaning passes (decontamina
 case is num_workers × pass_workers worker processes next to the threads. A failing job stops every running job
 of both pools at its next shard (:class:`StopFlag`) and is re-raised after they stopped: a failed source is a
 failed build. Ctrl-C while waiting does the same and raises :class:`BuildAborted` (prepare.py exits 130);
-everything published so far is kept and the next run resumes at shard granularity.
+everything published so far is kept and the next run resumes at shard granularity. A second Ctrl-C, while the
+pools wait for the running jobs, ends the process right away (:meth:`JobPool._end_without_waiting`).
 
 status is read-only: the repair step's dry report ("would repair: …") plus the same
 :func:`assess_dataset_state` ending, so it and prepare --dry_run cannot call the same tree differently.
@@ -33,6 +34,9 @@ status is read-only: the repair step's dry report ("would repair: …") plus the
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -56,12 +60,12 @@ from data_preparation.lib.build.planner import (
     summarize_dataset_state,
 )
 from data_preparation.lib.build.repair import Confirm, RepairAction, RepairReport, repair_broken_and_stale_folders
-from data_preparation.lib.log import get_logger
+from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
 from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import download, download_github_code_group, prepare_tokenizer
-from data_preparation.lib.ui.dashboard import progress, set_status
+from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
 log = get_logger(__name__)
 
@@ -305,7 +309,8 @@ class JobPool:
     Jobs may be submitted while the pool runs (:meth:`submit`); :func:`wait_for_jobs` waits on :attr:`futures` and
     calls on_success (main thread) for every job that finished without an error; that is where the download
     pool submits the build of what it fetched. Leaving the with block waits for the running jobs (they stop at
-    their next shard once the flag is raised), then closes the bar.
+    their next shard once the flag is raised), then closes the bar; a Ctrl-C during that wait ends the process
+    (:meth:`_end_without_waiting`).
     """
 
     def __init__(
@@ -345,8 +350,29 @@ class JobPool:
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
         try:
             self._executor.__exit__(exc_type, exc, tb)  # waits for the running jobs
+        except KeyboardInterrupt:
+            self._end_without_waiting()
         finally:
             self.bar.__exit__(exc_type, exc, tb)
+
+    def _end_without_waiting(self) -> None:
+        """
+        Ctrl-C while the pool already waits for its running jobs (the second one of a run): end the process now.
+        The running transfer may be a row group of hundreds of MB, and raising out of the with block would not
+        skip it: the interpreter joins every executor thread at exit. So the executor stops handing out jobs,
+        the dashboard closes (the terminal restored, the kept lines printed), the log is flushed and the process
+        exits with prepare.py's interrupted code; everything published so far is on disk already.
+        """
+
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        log.warning("second interrupt: ending without waiting for the running transfer; everything published so far is kept")
+        dashboard = active_dashboard()
+        if dashboard is not None:
+            dashboard.__exit__(None, None, None)
+        for handler in logging.getLogger(ROOT_LOGGER_NAME).handlers:
+            handler.flush()
+        sys.stderr.flush()
+        os._exit(130)
 
 
 class RunningJobs:

@@ -50,6 +50,14 @@ def write_atomically(path: Path | str, *, suffix: str = TEMP_SUFFIX) -> Iterator
     _remove(temporary)
     try:
         yield temporary
+        if temporary.is_file():
+            # the rename is atomic against a crash; the fsync makes the bytes durable across a power loss, which
+            # could otherwise leave the renamed file empty (a directory's files are the caller's concern)
+            fd = os.open(temporary, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         os.replace(temporary, target)
     except BaseException:
         _remove(temporary)

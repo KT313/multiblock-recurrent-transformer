@@ -7,11 +7,13 @@ every supported file format, shared files between two language sources, and the 
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import random
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO
 
 import pyarrow as pa
@@ -34,6 +36,7 @@ from data_preparation.lib.sources.hub_files import (
     iter_row_batches,
     parquet_row_groups,
     read_rows,
+    repo_listing,
 )
 from data_preparation.lib.sources.loaders import (
     LOADERS,
@@ -145,6 +148,19 @@ def test_plain_json_must_be_array(tmp_path: Path) -> None:
     path.write_text(json.dumps([{"a": 1}, 2]))
     with pytest.raises(ValueError, match="element 1 .* not an object"):
         list(iter_file(path, "x.json"))
+
+
+def test_json_gz_is_an_array_or_lines_by_its_content(tmp_path: Path) -> None:
+    """
+    Hub repos ship `.json.gz` in both shapes; the extension cannot tell them apart, the first byte can.
+    """
+
+    rows = _rows("a", 3)
+    path = tmp_path / "x.json.gz"
+    path.write_bytes(gzip.compress(b" \n" + json.dumps(rows).encode()))
+    assert _ids(iter_file(path, "x.json.gz", skip=1)) == ["a1", "a2"]
+    path.write_bytes(gzip.compress(b" \n" + "\n".join(json.dumps(r) for r in rows).encode()))
+    assert _ids(iter_file(path, "x.json.gz", skip=1)) == ["a1", "a2"]
 
 
 def _padded_rows(prefix: str, n: int, pad: int = 16 * 1024) -> list[Row]:
@@ -414,11 +430,24 @@ def test_fetcher_seams_and_stats(hub: FakeHub) -> None:
     assert cached.stats == FetchStats(files_downloaded=1) and hub.downloads == [], "a file already in the cache: no bytes fetched"
 
 
-def test_every_hub_request_is_bounded_by_the_request_timeout() -> None:
-    import httpx
-    from huggingface_hub import get_session
+def test_every_hub_request_is_bounded_by_the_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The listing must pass the timeout itself: `dataset_info`'s own `timeout=None` default would disable the
+    client's. The size lookup has no such parameter and inherits the client's, set once per process.
+    """
 
-    configure_hub_http()
+    import httpx
+    from huggingface_hub import HfApi, get_session
+
+    calls: list[tuple[str, str | None, float | None]] = []
+
+    def dataset_info(self: HfApi, repo_id: str, *, revision: str | None = None, timeout: float | None = None, **kwargs: Any) -> Any:
+        calls.append((repo_id, revision, timeout))
+        return SimpleNamespace(sha="abc", siblings=[SimpleNamespace(rfilename="data/a.parquet")])
+
+    monkeypatch.setattr(HfApi, "dataset_info", dataset_info)
+    assert repo_listing(REPO, REV, None) == (["data/a.parquet"], "abc")
+    assert calls == [(REPO, REV, HUB_REQUEST_TIMEOUT)]
     assert get_session().timeout == httpx.Timeout(HUB_REQUEST_TIMEOUT)
     configure_hub_http()  # idempotent (cached): no second configuration
     assert configure_hub_http.cache_info().hits >= 1
@@ -505,6 +534,31 @@ def test_index_records_the_resolved_commit_and_same_resolution_passes(hub: FakeH
     reloaded = FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
     assert reloaded.resolved_revision == hub.sha
     assert hub.resolutions == 1 and hub.listings == 1  # loading resolved once, never re-listed
+
+
+def test_the_hub_round_trip_of_an_open_runs_outside_the_process_wide_lock(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A stalled listing or revision check must not hold the lock every other `FileIndex.open` waits on.
+    """
+
+    lock_held: list[bool] = []
+
+    def listing(*args: Any) -> tuple[list[str], str]:
+        lock_held.append(hub_files._OPEN_INDEXES_LOCK.locked())
+        return hub.repo_listing(*args)
+
+    def resolution(*args: Any) -> str:
+        lock_held.append(hub_files._OPEN_INDEXES_LOCK.locked())
+        return hub.resolve_revision(*args)
+
+    monkeypatch.setattr(hub_files, "repo_listing", listing)
+    monkeypatch.setattr(hub_files, "resolve_revision", resolution)
+    hub.add("data/a.parquet", _rows("a", 3))
+    index_dir = tmp_path / "index"
+    FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)  # fresh: listed
+    _forget_open_indexes()
+    FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)  # loaded: revision checked
+    assert (hub.listings, hub.resolutions, lock_held) == (1, 1, [False, False])
 
 
 def test_moved_repo_fails_the_loaded_index_with_the_pin_hint(hub: FakeHub, tmp_path: Path) -> None:
@@ -903,3 +957,4 @@ def test_glob_regex_does_not_cross_directories() -> None:
     assert not glob_regex("sample/10BT/0?0_00000.parquet").fullmatch("sample/10BT/0/0_00000.parquet")
     assert glob_regex("MetaMathQA-395K.json").fullmatch("MetaMathQA-395K.json") and not glob_regex("a.json").fullmatch("a_json")
     assert glob_regex("data/[ab]*.parquet").fullmatch("data/b1.parquet") and not glob_regex("data/[ab]*.parquet").fullmatch("data/c1.parquet")
+    assert glob_regex("[!a]*").fullmatch("b.txt") and not glob_regex("[!a]*").fullmatch("a.txt"), "a negated class, not a literal !"

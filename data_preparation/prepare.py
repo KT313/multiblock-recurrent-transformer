@@ -23,8 +23,9 @@ downloads tokenize every row on that one pool, whatever their number.
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
 repair, 3 another data preparation is still running (lib/build/lock.py; the message names its pid and start
 time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
-kept). On a terminal the run shows the live dashboard of lib/ui/dashboard.py; the log lines it kept (warnings,
-the tables) and the final status table are printed once it closed.
+kept; a second Ctrl-C ends the process without waiting for the running transfer). On a terminal the run shows the
+live dashboard of lib/ui/dashboard.py; the log lines it kept (warnings, the tables) and the final status table are
+printed once it closed.
 """
 
 from __future__ import annotations

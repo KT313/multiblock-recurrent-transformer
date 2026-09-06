@@ -166,7 +166,9 @@ spawn process pool of `--pass_workers` for its optional cleaning passes (deconta
 shipped configs), so those toggles cost up to `num_workers × pass_workers` worker processes (2 × 4 = 8 with the
 defaults). Sources with nothing to download are built right away, every other source the
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
-built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
+built while its own download runs; a failure or Ctrl-C stops both pools at their next shard, and a second Ctrl-C
+while they wait for the running jobs ends the process right away (exit 130; a transfer of hundreds of MB is not
+waited for, everything published so far is kept). Because the two pools
 overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
 not the larger of the two. Inside a download job, fetching the next row group and tokenizing the previous batches
 overlap too (a token worker thread per job; the rows are still written in order), and `prepare.py` turns the
