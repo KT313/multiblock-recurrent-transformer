@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import logging
+import multiprocessing
 import os
 import signal
 import threading
@@ -289,3 +290,32 @@ def test_sighup_marks_the_terminal_lost_instead_of_ending_the_process() -> None:
     assert display.headless
     display._stop_live()
     assert signal.getsignal(signal.SIGHUP) is previous, "the previous handler is back once the display stopped"
+
+
+@pytest.mark.timeout(10)
+def test_a_forked_child_gets_a_fresh_lock_and_writes_nowhere(display: MinimalDisplay) -> None:
+    """
+    The lock held by another thread at the fork (the render thread, in a run) must not block the child's first
+    write, and that write must not reach the parent's panel.
+    """
+
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with display._lock:
+            held.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    held.wait()
+    try:
+        child = multiprocessing.get_context("fork").Process(target=display.write, args=("from the child",))
+        child.daemon = True  # a child hung on the lock is killed at exit instead of hanging pytest
+        child.start()
+        child.join(timeout=3)
+    finally:
+        release.set()
+        holder.join()
+    assert child.exitcode == 0, "the child neither hung on the copied lock nor failed"
+    assert "from the child" not in display.lines()
