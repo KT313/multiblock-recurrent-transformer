@@ -63,7 +63,7 @@ world_batch_size: 1024               # sequences per optimizer step (= micro_bat
 # With packing, sort_batches_by_length / sequence_padding_multiple apply to the validation batches only.
 pack_sequences: true                 # false: train on padded rows of micro_batch_size sequences instead
 tokens_per_micro_batch: 8192         # pack length in tokens, >= block_size (null: micro_batch_size × block_size)
-tokens_per_step: 524288              # tokens per optimizer step, a multiple of tokens_per_micro_batch (null: world_batch_size × block_size)
+tokens_per_step: 2097152             # tokens per optimizer step, a multiple of tokens_per_micro_batch (null: world_batch_size × block_size)
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
 optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
