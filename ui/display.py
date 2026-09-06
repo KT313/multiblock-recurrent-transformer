@@ -11,8 +11,8 @@ capture and implements `_release_streams` / `_redirect_streams` for prompts. Eve
 Terminal resize: `ResizeAwareLive` clears the screen before the first frame at a new size. The check runs on
 the refresh timer, so no SIGWINCH handler is needed.
 
-Dead terminal (`_terminal_lost`): on a failed frame write or SIGHUP the display closes, stdout/stderr go to
-`/dev/null`, one WARNING names the log file and the run continues headless. The SIGHUP handler only silences
+Dead terminal (`_terminal_lost`): on a failed frame write or SIGHUP the display closes, the terminal's descriptor
+goes to `/dev/null`, one WARNING names the log file and the run continues headless. The SIGHUP handler only silences
 the streams and leaves a note for the refresh thread; a teardown inside the handler could deadlock on `_lock`.
 Ctrl-C and SIGTERM are unchanged.
 """
@@ -63,7 +63,15 @@ class ResizeAwareLive(Live):
         super().__init__(*args, **kwargs)
         self._frame_size: ConsoleDimensions | None = None  # the terminal size the previous frame was drawn for
         self._on_terminal_lost = on_terminal_lost
+        self._starting = False  # inside `start`, where rich handles a failed first frame itself (see `refresh`)
         self.terminal_lost_pending: str | None = None  # set by the SIGHUP handler, handled at the next refresh
+
+    def start(self, refresh: bool = False) -> None:
+        self._starting = True
+        try:
+            super().start(refresh)
+        finally:
+            self._starting = False
 
     def refresh(self) -> None:
         reason = self.terminal_lost_pending
@@ -72,6 +80,8 @@ class ResizeAwareLive(Live):
                 super().refresh()
                 return
             except OSError as error:  # the terminal is gone (EIO / EBADF)
+                if self._starting:  # let rich's start stop the display and raise, else it would still start its refresh thread
+                    raise
                 reason = str(error)
         if self._on_terminal_lost is not None:
             self._on_terminal_lost(reason)
@@ -127,7 +137,13 @@ class LiveDisplay:
             on_terminal_lost=self._terminal_lost,
         )
         self._install_sighup_handler()
-        self._live.start(refresh=True)  # first frame right away
+        # a terminal gone before the first frame: rich's start either stopped the display itself (a failed frame) or
+        # never got as far as its render hook (a failed hide-cursor write), so there is nothing left to stop
+        try:
+            self._live.start(refresh=True)  # first frame right away
+        except OSError as error:
+            self._live = None
+            self._terminal_lost(str(error))
 
     def _stop_live(self) -> None:
         live, self._live = self._live, None
@@ -198,14 +214,15 @@ class LiveDisplay:
     def _silence_terminal(self) -> None:
         """
         Point the console and the plain stream at /dev/null; when the display drew on the process's own
-        stdout / stderr, those file descriptors too. Lock-free, a signal handler calls it.
+        stdout or stderr, that file descriptor too (only that one: the other may be a redirected report).
+        Lock-free, a signal handler calls it.
         """
 
         if self._null_file is None:
             self._null_file = open(os.devnull, "w")  # noqa: SIM115  # stays open for the rest of the process
-            if self._console.file is self._stream and _fileno(self._stream) in (1, 2):
-                for fd in (1, 2):
-                    os.dup2(self._null_file.fileno(), fd)
+            fd = _fileno(self._stream)
+            if self._console.file is self._stream and fd in (1, 2):
+                os.dup2(self._null_file.fileno(), fd)
         self._console.file = self._null_file
         self._plain_stream = self._null_file
 
