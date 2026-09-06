@@ -14,10 +14,10 @@ prepare materialises a dataset config: tokenizer, repair, (download + build) rou
 (lib/build/runner.py). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
 manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
 and without a terminal the command prints the list and exits 2 with nothing changed. A raw folder downloaded under
-another dataset config (raw folders are shared by source name) goes only with --allow_foreign_raw on top. --reopen clears the exhausted
-flag of the named sources first (a loader that yielded fewer rows than asked is latched exhausted; say so when it
-has more rows now). status prints what the
-repair step would do plus the status table and exits 0 iff the dataset is complete. describe renders the config
+another dataset config (raw folders are shared by source name) goes only with --allow_foreign_raw on top. --reopen
+clears the exhausted flag of the named sources first (a loader that yielded fewer rows than asked is latched
+exhausted; say so when it has more rows now). status prints what the repair step would do plus the status table
+and exits 0 iff the dataset is complete. describe renders the config
 as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches. prepare
 turns the tokenizer's thread pool on with TOKENIZER_POOL_THREADS threads (TOKENIZERS_PARALLELISM=true and
 RAYON_NUM_THREADS=8 unless set in the environment): this process never forks after loading the tokenizer, and
