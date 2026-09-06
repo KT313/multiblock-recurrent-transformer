@@ -129,8 +129,8 @@ def _auto_tokenizer() -> Any:
         # the tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination /
         # minhash pools are spawn and immune) is the well-known tokenizers deadlock; the library's own
         # mitigation, set before the first load (spawn children inherit it through the environment). The
-        # prepare CLI, which never forks after this point, sets "true" before it gets here (prepare.py): a batch
-        # then tokenizes on every core instead of one, the biggest lever on the download rate.
+        # prepare CLI, which never forks after this point, sets "true" (and the pool size) before it gets here
+        # (prepare.py): a batch then tokenizes on several cores instead of one, the biggest lever on the download rate.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from transformers import AutoTokenizer
 
