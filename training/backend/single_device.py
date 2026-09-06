@@ -56,17 +56,18 @@ class SingleDeviceBackend:
         self.pin_memory = self.device.type == "cuda"
         _set_torch_flags()
 
-    def setup_model(self, model: Module, compile_model: bool = False, dynamic: bool = True) -> Module:
+    def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         model = model.to(self.device)
         if compile_model:
             # The recurrence iteration is compiled as one frame with several legitimate variants (no-grad and grad
             # iterations, a checkpointed one, the latent with and without gradient); past dynamo's default limit of
             # 8 recompiles it silently runs the frame eagerly (a warning in the log, a 10 percent slower step).
             torch._dynamo.config.recompile_limit = DYNAMO_RECOMPILE_LIMIT
-            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles; packed
-            # sequences have one shape and compile static (dynamic=False)
+            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles. Packed
+            # training has one shape, but its validation is still padded: a static compile recompiled the forward for
+            # every validation length and ran past the limit into eager (measured: validation three times slower).
             # torch.compile is typed as returning a bare callable; at runtime it is an OptimizedModule (a Module)
-            model = cast(Module, torch.compile(model, dynamic=dynamic))
+            model = cast(Module, torch.compile(model, dynamic=True))
         return model
 
     def setup_optimizer(self, optimizer: Optimizer) -> Optimizer:

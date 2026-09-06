@@ -48,10 +48,9 @@ class Backend(Protocol):
     is_main: bool
     pin_memory: bool  # whether dataloaders should pin host memory (true on CUDA)
 
-    def setup_model(self, model: Module, compile_model: bool = False, dynamic: bool = True) -> Module:
+    def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         """
-        Move the model to the device, optionally compile it (`dynamic`: sequence lengths vary between batches, the
-        padded path; False for the one static shape of packed sequences), and wrap it (DDP/FSDP later).
+        Move the model to the device, optionally compile it, and wrap it (DDP/FSDP later).
         """
 
         ...

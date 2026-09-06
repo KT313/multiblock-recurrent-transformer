@@ -295,8 +295,7 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )
     model_config.to_json(run_directory / "model_config.json")
-    # packed micro-batches all have one shape; padded ones vary in length, and compiling them dynamic avoids recompiles
-    return backend.setup_model(model, compile_model=settings.compile_model, dynamic=not settings.pack_sequences)
+    return backend.setup_model(model, compile_model=settings.compile_model)
 
 
 def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> Optimizer:
