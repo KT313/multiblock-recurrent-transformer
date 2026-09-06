@@ -69,6 +69,11 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 make training config/crow_300m_final.yaml
 ```
 
+Training packs documents end to end (`pack_sequences: true`, the default): one row of `tokens_per_micro_batch`
+tokens per micro-batch, `tokens_per_step` tokens per optimizer step, attention masked per document; validation
+stays padded. Left unset, the two sizes are the padded equivalents `micro_batch_size × block_size` and
+`world_batch_size × block_size`, so a config written in rows keeps its step arithmetic.
+
 ### Evaluation
 
 Sample generations and lm-eval-harness scores (`evaluation/`), on a checkpoint or during training:

@@ -39,6 +39,10 @@ GOLDEN_RELATIVE_TOLERANCE = 1e-5
 GOLDEN_PER_STEP_KEYS = ("loss", "grad_norm", "lr")
 GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
 
+# `write_tiny_yaml` overrides for a run on padded rows (`config/tiny.yaml` packs): the golden run was recorded that
+# way, and the tests of the padded stream pin the row layout
+PADDED_ROWS: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "tokens_per_step": None}
+
 
 def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
     """
@@ -95,7 +99,7 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
     The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms), reduced to its numerics.
 
     `config/tiny.yaml` with `precision: "32"`, `wandb_enabled: false`, `export_to_hf: false`,
-    `resume: false` and `out_dir` in a temporary directory, through
+    `resume: false`, `PADDED_ROWS` and `out_dir` in a temporary directory, through
     `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. Returns
     `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss, val_loss_<depth>...]}}, "checkpoints": [file names],
     "optimizer_steps": number of optimizer.step() calls, "parameter_norms": {name: L2 norm in the final checkpoint}}`.
@@ -107,7 +111,8 @@ def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
         tmp_path = Path(tmp)
         out_dir = tmp_path / "out"
         yaml_path = write_tiny_yaml(
-            tmp_path, tiny_dataset_dir, out_dir, precision="32", wandb_enabled=False, export_to_hf=False, resume=False
+            tmp_path, tiny_dataset_dir, out_dir, precision="32", wandb_enabled=False, export_to_hf=False, resume=False,
+            **PADDED_ROWS,
         )
         settings = parse_settings(["--config", str(yaml_path)])
         report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)

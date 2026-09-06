@@ -632,17 +632,14 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     full_dir = tmp_path / "full" / "out"
     options: dict[str, Any] = {"save_step_interval": 4, "export_to_hf": False}
     _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
-    # 12 steps of 4 rows, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the source and
-    # only change its weight, so the counter keeps counting across the stage boundary at step 8). The counter is rows
-    # READ: the worker batches of `TRAIN_LOADER_BATCH_ROWS` rows that cover the 48 samples, the rest of the last one
-    # sitting in the checkpoint's buffers
-    trained = 12 * 4
-    rows_read = -(-trained // TRAIN_LOADER_BATCH_ROWS) * TRAIN_LOADER_BATCH_ROWS
+    # 12 steps of 1024 packed tokens, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the
+    # source and only change its weight, so the counter keeps counting across the stage boundary at step 8). The
+    # counter is rows READ: the one worker batch of `TRAIN_LOADER_BATCH_ROWS` rows that covers the documents of the
+    # 12 steps, the rest of it sitting in the checkpoint's packing pool and buffers
     mid_state = data_stream(full_dir, "step-00000012-tiny.pth")
-    assert mid_state["consumed_rows"] == {"synthetic_pretrain": rows_read}
-    assert {source: len(samples) for source, samples in mid_state["buffers"].items()} == {
-        "synthetic_pretrain": rows_read - trained
-    }
+    assert mid_state["consumed_rows"] == {"synthetic_pretrain": TRAIN_LOADER_BATCH_ROWS}
+    unconsumed = len(mid_state["buffers"]["synthetic_pretrain"]) + len(mid_state["pool"])
+    assert 0 < unconsumed < TRAIN_LOADER_BATCH_ROWS
 
     resumed_dir = tmp_path / "resumed" / "out"
     mid = checkpoint_dir(full_dir / "tiny") / "step-00000012-tiny.pth"

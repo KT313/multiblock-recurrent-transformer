@@ -100,17 +100,19 @@ class Settings:
     compile_model: bool = False
     gradient_checkpointing: bool = False
 
-    # Batching (one optimizer step = world_batch_size sequences). Validation always batches `micro_batch_size` padded
-    # rows; training does too unless `pack_sequences`.
+    # Batching in padded rows: validation always batches `micro_batch_size` rows, and with `pack_sequences: false`
+    # training does too (one optimizer step = world_batch_size sequences).
     micro_batch_size: int = 4
     world_batch_size: int = 1024
 
-    # Sequence packing (training only; validation stays padded). Documents are laid end to end into ONE row of
-    # `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE positions
-    # restarting per document. The step is then measured in tokens: `tokens_per_step` = micro-batches x
-    # `tokens_per_micro_batch`. With packing, `micro_batch_size` / `world_batch_size` only size the validation
-    # batches, and `sort_batches_by_length` / `sequence_padding_multiple` apply to validation only.
-    pack_sequences: bool = False
+    # Sequence packing, the default (training only; validation stays padded). Documents are laid end to end into ONE
+    # row of `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE
+    # positions restarting per document. The step is then measured in tokens: `tokens_per_step` = micro-batches x
+    # `tokens_per_micro_batch`. Both sizes left unset are the padded equivalents, `micro_batch_size x block_size` and
+    # `world_batch_size x block_size`, so a config written in rows keeps its token arithmetic and only the batch
+    # layout changes. With packing, `micro_batch_size` / `world_batch_size` only size the validation batches, and
+    # `sort_batches_by_length` / `sequence_padding_multiple` apply to validation only.
+    pack_sequences: bool = True
     tokens_per_micro_batch: Optional[int] = None  # pack length; >= block_size (the longest document after truncation)
     tokens_per_step: Optional[int] = None  # tokens per optimizer step; a multiple of tokens_per_micro_batch
 
@@ -212,8 +214,9 @@ class Settings:
 
     def _check_packing(self) -> None:
         """
-        The packing fields: both token sizes iff `pack_sequences`, the pack at least one full document long, the
-        step a whole number of micro-batches.
+        The packing fields: no token size without `pack_sequences`; with it, a size left unset becomes its padded
+        equivalent (checked like a given one, and recorded that way in run_config.json and the checkpoints), the
+        pack at least one full document long, the step a whole number of micro-batches.
         """
 
         if not self.pack_sequences:
@@ -221,8 +224,10 @@ class Settings:
                 if getattr(self, name) is not None:
                     raise ValueError(f"{name} is set but pack_sequences is false; set pack_sequences: true to use it")
             return
-        if self.tokens_per_micro_batch is None or self.tokens_per_step is None:
-            raise ValueError("pack_sequences needs tokens_per_micro_batch (the pack length) and tokens_per_step")
+        if self.tokens_per_micro_batch is None:
+            self.tokens_per_micro_batch = self.micro_batch_size * self.block_size
+        if self.tokens_per_step is None:
+            self.tokens_per_step = self.world_batch_size * self.block_size
         if self.tokens_per_micro_batch < self.block_size:
             raise ValueError(
                 f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= block_size ({self.block_size}): a "

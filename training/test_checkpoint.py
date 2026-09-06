@@ -235,9 +235,9 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "partial_depth_eval": [2],
 }
 
-# Compared like the fields above, but only valid together (`Settings._check_packing`): a resume that switches to
-# sequence packing changes all three at once, so they are tested as one switch.
-CHANGED_TOGETHER: dict[str, Any] = {"pack_sequences": True, "tokens_per_micro_batch": 4096, "tokens_per_step": 8192}
+# Compared like the fields above, but only valid together (`Settings._check_packing`): a resume that switches from
+# sequence packing to padded rows changes all three at once, so they are tested as one switch.
+CHANGED_TOGETHER: dict[str, Any] = {"pack_sequences": False, "tokens_per_micro_batch": None, "tokens_per_step": None}
 
 
 def test_every_settings_field_is_classified() -> None:
@@ -254,22 +254,22 @@ def test_every_settings_field_is_classified() -> None:
     assert PARAM_GROUPING_SETTING in field_names and PARAM_GROUPING_SETTING not in exempt
 
 
-def test_check_settings_unchanged_catches_a_switch_to_sequence_packing(
+def test_check_settings_unchanged_catches_a_switch_to_padded_rows(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    The packing fields are compared too: a resume that turns packing on (all three fields change together) is
+    The packing fields are compared too: a resume that turns packing off (all three fields change together) is
     refused by name unless `allow_settings_change`.
     """
 
     metadata = _metadata(backend, tiny_model)
     config = tiny_model.config.to_dict()
-    packed = _settings(run_name="tiny", seed=42, **CHANGED_TOGETHER)
+    padded = _settings(run_name="tiny", seed=42, **CHANGED_TOGETHER)
     with pytest.raises(
         ValueError, match=r"resuming with changed \['pack_sequences', 'tokens_per_micro_batch', 'tokens_per_step'\]"
     ):
-        check_settings_unchanged(metadata, packed, config, False)
-    check_settings_unchanged(metadata, packed, config, True)
+        check_settings_unchanged(metadata, padded, config, False)
+    check_settings_unchanged(metadata, padded, config, True)
 
 
 def test_check_settings_unchanged_catches_every_compared_setting(
@@ -291,8 +291,8 @@ def test_check_settings_unchanged_catches_every_compared_setting(
             for allow in (False, True):  # non-overridable
                 with pytest.raises(ValueError, match="parameter groups are restored from the checkpoint"):
                     check_settings_unchanged(metadata, changed, config, allow)
-        else:
-            with pytest.raises(ValueError, match=rf"resuming with changed \['{key}'\].*checkpoint .* != current "):
+        else:  # named; block_size and the batch sizes also move the packing token sizes derived from them
+            with pytest.raises(ValueError, match=rf"resuming with changed \[.*'{key}'.*checkpoint .* != current "):
                 check_settings_unchanged(metadata, changed, config, False)
             check_settings_unchanged(metadata, changed, config, True)  # allow_settings_change
 

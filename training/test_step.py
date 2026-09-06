@@ -30,6 +30,7 @@ from training.data.dataset_resolver import DataEntry, resolve_dataset
 from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
 from training.testing.golden import (
+    PADDED_ROWS,
     golden_exact_requested,
     golden_mismatches,
     golden_run_json,
@@ -79,6 +80,7 @@ def reference_settings(**overrides: Any) -> Settings:
         block_size=256,
         micro_batch_size=2,
         world_batch_size=4,
+        pack_sequences=False,
         precision="32",
         optimizer="ELLISAdam",
         optim_config=OptimizerConfig(
@@ -417,6 +419,7 @@ def _stream_setup(
         tmp_path / "out",
         sort_batches_by_length=sort,
         sequence_padding_multiple=padding_multiple,
+        **PADDED_ROWS,
     )
     settings = parse_settings(
         ["--config", str(yaml_path), "--micro_batch_size", str(batch_size)]  # 4 / batch_size micro-batches per step
@@ -619,7 +622,7 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     the interrupted run consumed.
     """
 
-    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
@@ -641,7 +644,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
     not reached, while a stream that only restarts the loaders serves the very same rows again.
     """
 
-    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
@@ -683,7 +686,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     every sample up to there and beyond is a distinct row (until the source genuinely wraps around).
     """
 
-    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     loaders = build_run_dataloaders(settings, dataset, cpu_backend)
@@ -710,7 +713,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
     `settings.seed`, and each source's reader walks its range in order).
     """
 
-    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
 
@@ -983,7 +986,7 @@ def test_batch_stream_with_worker_processes_is_the_same_for_any_worker_batch_siz
     batch is the micro-batch, over the pretrain stage and into the finetune source.
     """
 
-    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
+    settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", **PADDED_ROWS))])
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.block_size)
     world_batches = stage_manager.total_steps  # 20: both pretrain stages, the transition and the finetune stage
