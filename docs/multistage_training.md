@@ -51,10 +51,9 @@ plus the realised data composition of the world batches since the last log step
 
 Steps are optimizer steps of `micro_batches_per_step × tokens_per_micro_batch` tokens:
 `total steps = Σ stage.tokens / (micro_batches_per_step × tokens_per_micro_batch)`, independent of the number of
-devices (`micro_batches_per_step` must be a multiple of it). Sequence packing is the default;
-`tokens_per_micro_batch` and `micro_batches_per_step` left unset are the padded equivalents `micro_batch_size ×
-training_max_sequence_length` and `world_batch_size / micro_batch_size`. With `pack_sequences: false` a step is `world_batch_size`
-padded rows, `total steps = Σ stage.tokens / (world_batch_size × training_max_sequence_length)`.
+devices (`micro_batches_per_step` must be a multiple of it). Sequence packing is required (`pack_sequences: false`
+is refused); `tokens_per_micro_batch` and `micro_batches_per_step` left unset are the padded equivalents
+`micro_batch_size × training_max_sequence_length` and `world_batch_size / micro_batch_size`.
 The stage boundary summary is printed at startup; check it before long runs.
 
 ## Example configs

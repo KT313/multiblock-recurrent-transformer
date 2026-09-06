@@ -30,7 +30,7 @@ micro_batch_size: 2
 world_batch_size: 4
 sort_batches_by_length: true
 sequence_padding_multiple: 128
-pack_sequences: true            # true strongly recommended, uses inefficient batch padding otherwise
+pack_sequences: true            # required, false is refused (padded training weighed short rows like full ones)
 tokens_per_micro_batch: 512
 micro_batches_per_step: 2
 

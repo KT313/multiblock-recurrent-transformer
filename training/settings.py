@@ -100,19 +100,18 @@ class Settings:
     compile_model: bool = False
     gradient_checkpointing: bool = False
 
-    # Batching in padded rows: validation always batches `micro_batch_size` rows, and with `pack_sequences: false`
-    # training does too (one optimizer step = world_batch_size sequences).
+    # Batching in padded rows: validation batches `micro_batch_size` rows; for training the two only size the packing
+    # defaults below.
     micro_batch_size: int = 4
     world_batch_size: int = 1024
 
-    # Sequence packing, the default (training only; validation stays padded). Documents are laid end to end into ONE
+    # Sequence packing, required (training only; validation stays padded). Documents are laid end to end into ONE
     # row of `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE
     # positions restarting per document. One optimizer step is `micro_batches_per_step` such rows, i.e.
     # `micro_batches_per_step x tokens_per_micro_batch` tokens. Both left unset are the padded equivalents,
     # `micro_batch_size x training_max_sequence_length` and `world_batch_size / micro_batch_size`, so a config written in rows keeps its
-    # token arithmetic and only the batch layout changes. With packing, `micro_batch_size` / `world_batch_size` only
-    # size the validation batches, and `sort_batches_by_length` / `sequence_padding_multiple` apply to validation only.
-    pack_sequences: bool = True  # true strongly recommended: false trains on padded rows, which waste the padding
+    # token arithmetic. `sort_batches_by_length` / `sequence_padding_multiple` apply to the validation batches.
+    pack_sequences: bool = True  # false is refused (`_check_packing` says why); the field stays for old configs
     tokens_per_micro_batch: Optional[int] = None  # pack length; >= training_max_sequence_length (the longest document after truncation)
     micro_batches_per_step: Optional[int] = None  # packed micro-batches per optimizer step (a multiple of the number of devices)
 
@@ -214,17 +213,20 @@ class Settings:
 
     def _check_packing(self) -> None:
         """
-        The packing fields: none without `pack_sequences`; with it, a field left unset becomes its padded
-        equivalent (checked like a given one, and recorded that way in run_config.json and the checkpoints), the
-        pack at least one full document long, the step at least one micro-batch. Whether the micro-batches split
-        evenly over the devices is the stage manager's check (it knows the world size).
+        Packing is required; a packing field left unset becomes its padded equivalent (checked like a given one,
+        and recorded that way in run_config.json and the checkpoints), the pack at least one full document long,
+        the step at least one micro-batch. Whether the micro-batches split evenly over the devices is the stage
+        manager's check (it knows the world size).
         """
 
         if not self.pack_sequences:
-            for name in ("tokens_per_micro_batch", "micro_batches_per_step"):
-                if getattr(self, name) is not None:
-                    raise ValueError(f"{name} is set but pack_sequences is false; set pack_sequences: true to use it")
-            return
+            raise ValueError(
+                "pack_sequences: false is not supported. Training on padded rows averages the per-micro-batch mean "
+                "losses while the loader sorts each world batch by length, so a micro-batch of short rows gets the "
+                "same gradient weight as one of full-length rows, up to the ratio of their token counts. With "
+                "packing every micro-batch holds the same number of tokens and the step loss is token-weighted; "
+                "validation batches stay padded either way. Set pack_sequences: true."
+            )
         if self.tokens_per_micro_batch is None:
             self.tokens_per_micro_batch = self.micro_batch_size * self.training_max_sequence_length
         if self.micro_batches_per_step is None:
