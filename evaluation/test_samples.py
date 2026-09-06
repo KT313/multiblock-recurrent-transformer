@@ -100,14 +100,14 @@ def test_prompts_file(tmp_path: Path) -> None:
         load_prompts_file(path)
 
 
-def test_sample_from_cuts_at_eos_and_strips_padding(tokenizer: Tokenizer) -> None:
+def test_sample_from_cuts_at_eos_and_keeps_generated_pad_ids(tokenizer: Tokenizer) -> None:
     eos, pad = tokenizer.eos_id, tokenizer.pad_id
     assert eos is not None and eos != pad
     prompt = Prompt("p")
-    cut = _sample_from(prompt, [5, 6, eos, 7], tokenizer)
+    cut = _sample_from(prompt, [5, 6, eos, pad, pad], tokenizer)  # the filler after EOS goes with the cut
     assert cut == GeneratedSample("p", CONTINUATION, tokenizer.decode([5, 6], skip_special_tokens=True), 2, True)
-    padded = _sample_from(prompt, [5, 6, pad, pad], tokenizer)
-    assert (padded.new_tokens, padded.stopped_at_eos) == (2, False)
+    unfinished = _sample_from(prompt, [5, 6, pad, pad], tokenizer)  # no EOS: the pad ids are the model's own output
+    assert (unfinished.new_tokens, unfinished.stopped_at_eos) == (4, False)
 
 
 def test_generate_samples_greedy_is_deterministic_and_bounded(tiny_model: RecurrentGPT, tokenizer: Tokenizer) -> None:

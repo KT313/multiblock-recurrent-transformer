@@ -88,13 +88,12 @@ def generate_samples(
 def _sample_from(
     prompt: Prompt, generated_ids: list[int], tokenizer: Tokenizer, recurrence: Recurrence = None
 ) -> GeneratedSample:
+    # `generate` pads a row only after its EOS, so the cut at the first EOS drops the filler too; a row without EOS
+    # ran to max_new_tokens and every id in it, a pad id included, is model output (an untrained model emits them)
     eos_id = tokenizer.eos_id
     stopped_at_eos = eos_id is not None and eos_id in generated_ids
     if eos_id is not None and stopped_at_eos:
         generated_ids = generated_ids[: generated_ids.index(eos_id)]
-    else:  # a row that finished early is padded by `generate`
-        while generated_ids and generated_ids[-1] == tokenizer.pad_id:
-            generated_ids.pop()
     completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
     steps = None if recurrence is None else [int(value) for value in recurrence]
     return GeneratedSample(prompt.text, prompt.kind, completion, len(generated_ids), stopped_at_eos, steps)
