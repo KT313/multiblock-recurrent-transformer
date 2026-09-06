@@ -45,7 +45,7 @@ def test_tiny_snippets_and_determinism() -> None:
     assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 5.1K tokens (~80 rows at 64 tokens/row), input inversions 10%, shuffled (seed 2) |" in text
     assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 15.4K tokens (~69 rows at 224 tokens/row) |" in text
     assert "- tokenizer: `synthetic` (synthetic)" in text and "- `token_count`: `tokenizer`" in text
-    assert "- `block_size`: 256" in text and "- `validation_fraction`: 5%" in text
+    assert "- `dataset_max_sequence_length`: 256" in text and "- `validation_fraction`: 5%" in text
     assert "- dedup: `exact` (normalize: on, Bloom filter 1 MB per source)" in text and "- quality filter: off" in text
     assert "## Notes" not in text  # no notes given
     assert "mixture" not in text.lower().replace("data_mixture.md", "")  # no mixture section any more
@@ -97,14 +97,14 @@ def test_validation_only_source_renders_rows() -> None:
             "heldout": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=40),
         },
         stages=[StageConfig(name="p", tokens=512, train={"pre": 1.0}, val={"heldout": 1.0})],
-        block_size=64,
+        dataset_max_sequence_length=64,
     )
     text = describe(cfg, "t.yaml")
     assert "| `heldout` | val only | all rows (40 downloaded) |" in text
     assert "| `pre` | train only | none |" in text
     assert "| `heldout` | pretrain | `synthetic` | generated (seed 1) | - | rows 40 (validation only) |" in text
     assert "| `pre` | pretrain | `synthetic` | generated (seed 0) | - | budget 512 tokens (~8 rows at 64 tokens/row) |" not in text  # seed 42
-    assert "budget 512 tokens (~8 rows at 64 tokens/row)" in text  # the default estimate of 500 clamped at block_size 64
+    assert "budget 512 tokens (~8 rows at 64 tokens/row)" in text  # the default estimate of 500 clamped at the dataset length 64
 
 
 def _tokens(n: int) -> str:

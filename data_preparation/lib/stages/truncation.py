@@ -6,8 +6,8 @@ The download step cuts the text itself instead of storing the whole document wit
 count is the true count of the stored text and storage is bounded. Tokens are counted like TokenCounter in
 stages/download.py: the config tokenizer with add_special_tokens=False, or len(text) // 4 in
 token_count: estimate mode. The trainer adds :data:`NUMBER_OF_SPECIAL_TOKENS` around every row, so the download asks for
-max_seq_length - NUMBER_OF_SPECIAL_TOKENS here and stores count + NUMBER_OF_SPECIAL_TOKENS as the row's tokens (the length the
-trainer sees, never above max_seq_length).
+dataset_max_sequence_length - NUMBER_OF_SPECIAL_TOKENS here and stores count + NUMBER_OF_SPECIAL_TOKENS as the row's tokens (the length the
+trainer sees, never above dataset_max_sequence_length).
 
 Invariants of :func:`truncate_many` (tested): the returned text is a prefix of the input, its count is the
 tokenizer's count of that text, and the count is <= max_tokens.

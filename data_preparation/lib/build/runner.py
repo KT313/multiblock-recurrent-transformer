@@ -92,6 +92,7 @@ def prepare(
     steps: Iterable[str] = STEPS,
     sources: Iterable[str] | None = None,
     reopen: Iterable[str] | None = None,
+    training_max_sequence_length: int | None = None,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     confirm: Confirm | None = None,
@@ -110,9 +111,11 @@ def prepare(
     same tree. steps (a subset of :data:`STEPS`) and sources restrict the work, and the satisfaction check,
     to the named steps / sources; the returned report always covers the whole config. reopen names sources
     whose exhausted flag is cleared before planning (:func:`reopen_raw`: their loader has more rows now).
+    training_max_sequence_length is the run's, when known: rows are consumed up to it, so the planner sizes the
+    downloads with it (:class:`DatasetConfig.training_max_sequence_length`); None counts every row in full.
     """
 
-    config = load_dataset_config(config_path)
+    config = load_dataset_config(config_path, training_max_sequence_length=training_max_sequence_length)
     config_name = Path(config_path).name
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
@@ -150,13 +153,13 @@ def prepare(
     return report
 
 
-def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
+def status(config_path: str | Path, dataset_dir: str | Path, *, training_max_sequence_length: int | None = None) -> DatasetReport:
     """
     Read-only: what the repair step would do ("would repair: …"; such sources count as incomplete) and the
-    status table, logged and returned.
+    status table, logged and returned; training_max_sequence_length as for :func:`prepare`.
     """
 
-    config = load_dataset_config(config_path)
+    config = load_dataset_config(config_path, training_max_sequence_length=training_max_sequence_length)
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
     repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name)

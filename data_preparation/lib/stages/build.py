@@ -6,7 +6,7 @@ pretrain rows go through the length filter (min_chars; the upper bound is the to
 -> quality filter -> decontamination -> exact dedup (hash column, first occurrence wins); instruct rows
 (converter and filter already applied at download) get their input inversions -> empty-field and over-cap removal
 -> exact dedup over instruction\\ninput\\noutput. Both kinds publish layout.processed_columns(kind); the
-tokens of a pretrain row is the stored raw count clamped to the current max_seq_length.
+tokens of a pretrain row is the stored raw count clamped to the current dataset_max_sequence_length.
 
 Two write modes:
 
@@ -326,7 +326,7 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
     else:
         stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
         stats["removed_empty"] = 0  # rows without instruction or output after stripping
-        stats["removed_too_long"] = 0  # rows over `max_seq_length` tokens (a safety net; the download already drops them)
+        stats["removed_too_long"] = 0  # rows over `dataset_max_sequence_length` tokens (a safety net; the download already drops them)
     manifest.columns = list(processed_columns(source.kind))
     manifest.shuffled = config.shuffle_of(name)
     manifest.shuffle_seed = source.seed
@@ -364,7 +364,7 @@ class RowPipeline:
         self.source: SourceConfig = config.sources[name]
         self.kind = self.source.kind
         self.processing = config.source_processing(name)
-        self.max_seq_length = config.max_seq_length
+        self.dataset_max_sequence_length = config.dataset_max_sequence_length
         self.pass_workers = pass_workers
         self.batch_size = batch_size
         self.stats = stats
@@ -407,13 +407,13 @@ class RowPipeline:
             rows = self.decontaminator(rows)
         normalize = processing.dedup.normalize
         for row in rows:
-            # stored counts are clamped to the current cap: lowering `max_seq_length` after the download never
+            # stored counts are clamped to the current cap: lowering `dataset_max_sequence_length` after the download never
             # re-downloads (the raw manifest's `truncated_at_tokens` bounds the stored texts), so a raw count may
-            # exceed the cap; training truncates at block_size <= max_seq_length anyway
+            # exceed the cap; training cuts rows at its own length, at most dataset_max_sequence_length, anyway
             yield {
                 "text": row["text"],
                 "source": self.name,
-                "tokens": min(int(row["tokens"]), self.max_seq_length),
+                "tokens": min(int(row["tokens"]), self.dataset_max_sequence_length),
                 "hash": text_hash64(row["text"], normalize),
             }
 
@@ -442,7 +442,7 @@ class RowPipeline:
         """
         {instruction, input, output, tokens, hash} rows of the raw shards: inversions decided per row by
         random.Random(f"{seed}:{global row index}") (deterministic, independent of shard boundaries and of a
-        resume), then rows without instruction / output and rows over max_seq_length tokens dropped (an inversion
+        resume), then rows without instruction / output and rows over dataset_max_sequence_length tokens dropped (an inversion
         prepends a fixed instruction, so it can push a row over the cap that fitted before).
         """
 
@@ -464,7 +464,7 @@ class RowPipeline:
                     if not has_required_fields(row):
                         self.stats["removed_empty"] += 1
                         continue
-                    if int(row["tokens"]) > self.max_seq_length:
+                    if int(row["tokens"]) > self.dataset_max_sequence_length:
                         self.stats["removed_too_long"] += 1
                         continue
                     yield {

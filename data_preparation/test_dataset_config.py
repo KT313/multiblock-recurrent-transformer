@@ -52,11 +52,11 @@ def _minimal() -> dict[str, Any]:
 
     return {
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
-        "block_size": 64,
+        "training_max_sequence_length": 64,  # not a YAML key: the run's cut, set on the config after loading
         "sources": {
-            "pre": {"kind": "pretrain", "loader": "synthetic"},
+            "pre": {"kind": "pretrain", "loader": "synthetic", "describe_tokens_per_row": 64},
             "hold": {"kind": "pretrain", "loader": "synthetic", "rows": 10},
-            "ins": {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}},
+            "ins": {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}, "describe_tokens_per_row": 64},
         },
         "stages": [
             {"name": "s1", "tokens": 1000, "train": {"pre": 1.0}, "val": {"hold": 0.5, "pre": 0.5}},
@@ -69,16 +69,17 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
     d = copy.deepcopy(d)
     sources = {k: SourceConfig(**({**v, "processing": _processing(v["processing"])} if v.get("processing") else v))
                for k, v in d["sources"].items()}
-    return DatasetConfig(
+    config = DatasetConfig(
         tokenizer=TokenizerConfig(**d["tokenizer"]),
         sources=sources,
         stages=[StageConfig(**s) for s in d["stages"]],
-        block_size=d["block_size"],
-        max_seq_length=d.get("max_seq_length", 2048),
+        dataset_max_sequence_length=d.get("dataset_max_sequence_length", 2048),
         validation_fraction=d.get("validation_fraction", 0.05),
         token_count=d.get("token_count", "tokenizer"),
         processing=_processing(d["processing"]) if d.get("processing") else ProcessingConfig(),
     )
+    config.training_max_sequence_length = d.get("training_max_sequence_length")
+    return config
 
 
 def _processing(d: dict[str, Any]) -> ProcessingConfig:
@@ -92,7 +93,7 @@ def _processing(d: dict[str, Any]) -> ProcessingConfig:
 
 def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
     path = tmp_path / "d.yaml"
-    path.write_text(yaml.safe_dump(d))
+    path.write_text(yaml.safe_dump({k: v for k, v in d.items() if k != "training_max_sequence_length"}))  # not a YAML key
     return path
 
 
@@ -103,7 +104,6 @@ def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
 def test_shipped_configs_load(path: Path) -> None:
     cfg = load_dataset_config(path)
     assert cfg.stages and cfg.sources
-    assert cfg.block_size <= cfg.max_seq_length
 
 
 def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
@@ -117,8 +117,8 @@ def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
         (s.name, s.train, s.val, s.transition_pct) for s in final.stages
     ]
     assert mini.sources == final.sources and mini.tokenizer == final.tokenizer
-    assert (mini.processing, mini.max_seq_length, mini.block_size, mini.token_count, mini.validation_fraction) == (
-        final.processing, final.max_seq_length, final.block_size, final.token_count, final.validation_fraction
+    assert (mini.processing, mini.dataset_max_sequence_length, mini.token_count, mini.validation_fraction) == (
+        final.processing, final.dataset_max_sequence_length, final.token_count, final.validation_fraction
     )
 
 
@@ -132,7 +132,7 @@ def test_crow_config_matches_thesis_run() -> None:
     assert cfg.stages[2].train == FINETUNE_SHARES and cfg.stages[2].val == FINETUNE_SHARES
     assert all(cfg.sources[name].input_inversions == 0.05 for name in _sources_of_kind(cfg, "instruct"))
     assert all(cfg.sources[name].input_inversions == 0.0 for name in _sources_of_kind(cfg, "pretrain"))
-    assert (cfg.token_count, cfg.max_seq_length, cfg.block_size, cfg.validation_fraction) == ("tokenizer", 2048, 2048, 0.05)
+    assert (cfg.token_count, cfg.dataset_max_sequence_length, cfg.validation_fraction) == ("tokenizer", 2048, 0.05)
     assert cfg.processing.dedup.mode == "exact" and cfg.processing.dedup.bloom_memory_mb == 1024
     assert not cfg.processing.quality_filter and not cfg.processing.decontamination.enabled
     assert all(s.revision for s in cfg.sources.values()), "every Hub source must pin a revision"
@@ -147,7 +147,7 @@ def test_tiny_config_is_synthetic_only() -> None:
     cfg = load_dataset_config(TINY)
     assert cfg.tokenizer.kind == "synthetic"
     assert {s.loader for s in cfg.sources.values()} == {"synthetic"}
-    assert (cfg.max_seq_length, cfg.block_size) == (256, 256)
+    assert cfg.dataset_max_sequence_length == 256
     assert set(cfg.sources) == {"synthetic_pretrain", "synthetic_instruct"}
     assert cfg.sources["synthetic_instruct"].input_inversions == 0.1
     assert all(cfg.used_in_train(n) and cfg.used_in_val(n) for n in cfg.sources)
@@ -155,20 +155,19 @@ def test_tiny_config_is_synthetic_only() -> None:
 
 
 def test_overrides_apply_to_nested_keys() -> None:
-    cfg = load_dataset_config(TINY, ["--max_seq_length", "512", "--processing.dedup.mode", "none"])
-    assert cfg.max_seq_length == 512 and cfg.processing.dedup.mode == "none"
+    cfg = load_dataset_config(TINY, ["--dataset_max_sequence_length", "512", "--processing.dedup.mode", "none"])
+    assert cfg.dataset_max_sequence_length == 512 and cfg.processing.dedup.mode == "none"
 
 
 def test_load_from_written_yaml(tmp_path: Path) -> None:
     cfg = load_dataset_config(_write(tmp_path, _minimal()))
-    assert cfg.sources["hold"].rows == 10 and cfg.stages[1].train == {"ins": 1.0} and cfg.block_size == 64
+    assert cfg.sources["hold"].rows == 10 and cfg.stages[1].train == {"ins": 1.0}
 
 
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
         (lambda d: d["sources"]["hold"].update({"kind": "validation"}), r"Literal\['pretrain', 'instruct'\]"),
-        (lambda d: d.pop("block_size"), r"required: block_size"),
         (lambda d: d.update({"bogus": 1}), r"d\.yaml: Option 'bogus' is not accepted$"),
     ],
 )
@@ -200,9 +199,7 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0]["train"].update({"pre": 2.0, "ins": -1.0}), "weights must be > 0"),
         (lambda d: d["stages"][0]["train"].update({"pre": 0.5, "nope": 0.5}), "unknown source 'nope'"),
         (lambda d: d["stages"][0].update({"val": {"pre/validation": 0.5, "hold": 0.5}}), "unknown source 'pre/validation'"),
-        (lambda d: d.update({"block_size": 0}), "block_size must be positive"),
-        (lambda d: d.update({"block_size": 4096}), r"block_size \(4096\) must be <= max_seq_length \(2048\)"),
-        (lambda d: d.update({"max_seq_length": 0}), "max_seq_length"),
+        (lambda d: d.update({"dataset_max_sequence_length": 0}), "dataset_max_sequence_length"),
         (lambda d: d.update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d.update({"validation_fraction": -0.1}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d["sources"]["pre"].update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
@@ -386,22 +383,24 @@ def test_token_budget_is_the_weight_schedule_integral() -> None:
     assert cfg.token_budget("hold") == 0  # validation only: `rows` says how many to deliver
 
 
-def test_rows_budget_divides_by_the_tokens_per_row_rate_clamped_at_block_size() -> None:
+def test_rows_budget_divides_by_the_tokens_per_row_rate_clamped_at_the_training_length() -> None:
     """
     The rate is the source's `describe_tokens_per_row` estimate (500 by default) until a measured mean is given,
-    never more than `block_size`: a longer row serves at most one sequence of the budget.
+    never more than the run's training length (the dataset length when no run is known): a longer row is cut there.
     """
 
     d = _minimal()
-    cfg = _build(d)  # block_size 64: the default estimate of 500 is clamped
+    cfg = _build(d)  # training length 64, the estimate is 64 too
     assert cfg.tokens_per_row_rate("pre") == 64 and cfg.rows_budget("pre") == ceil(1000 / 64) == 16
     assert cfg.rows_budget("ins") == 8 and cfg.rows_budget("hold") == 0
-    assert cfg.tokens_per_row_rate("pre", 100.0) == 64 and cfg.rows_budget("pre", 100.0) == 16  # measured above block_size: clamped too
+    assert cfg.tokens_per_row_rate("pre", 100.0) == 64 and cfg.rows_budget("pre", 100.0) == 16  # measured above the cut: clamped too
     assert cfg.tokens_per_row_rate("pre", 20.0) == 20 and cfg.rows_budget("pre", 20.0) == 50  # measured below: the budget takes more rows
     d["sources"]["pre"]["describe_tokens_per_row"] = 40
-    assert _build(d).rows_budget("pre") == 25  # the estimate below block_size counts as given
-    d["block_size"] = 32
+    assert _build(d).rows_budget("pre") == 25  # the estimate below the cut counts as given
+    d["training_max_sequence_length"] = 32
     assert _build(d).rows_budget("pre") == 32 and _build(d).rows_budget("pre", 40.0) == 32  # ceil(1000 / 32)
+    del d["training_max_sequence_length"]
+    assert _build(d).tokens_per_row_rate("pre", 4096.0) == 2048  # no run known: the dataset length is the cut
 
 
 def test_token_budget_transition_windows_contribute_the_trapezoid() -> None:
@@ -442,8 +441,8 @@ def test_rows_needed_counts_the_margin_and_the_split() -> None:
 
 def _over_the_cap_tokens() -> int:
     """
-    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (block_size 64, split 0.05):
-    ceil(80e6 / 64) = 1,250,000 sequences; × 1.2 ÷ 0.95 = 1,578,948 rows.
+    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (64 tokens per row, split 0.05):
+    ceil(80e6 / 64) = 1,250,000 rows; × 1.2 ÷ 0.95 = 1,578,948 rows.
     """
 
     return 80_000_000
@@ -497,7 +496,7 @@ def test_a_minhash_source_over_its_lower_build_cap_is_refused_at_load(tmp_path: 
 
     d = _minimal()
     d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
-    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 sequences; × 1.2 ÷ 0.95 = 394,737 rows: under the shuffle cap
+    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 rows; × 1.2 ÷ 0.95 = 394,737: under the shuffle cap
     with pytest.raises(ValueError, match=re.escape(
         "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 394,737 rows exceed "
         "the limit of 250,000. Use dedup.mode=exact or a smaller source."
@@ -531,7 +530,7 @@ def test_source_processing_override() -> None:
 # may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "78ce03ee555ebfdb",
+        "config": "53727ae9777ebba0",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
             "synthetic_pretrain": ("d64ba322292f4287", "06f171b42f4b7c27"),
@@ -539,7 +538,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_final": {
-        "config": "14505b0c688db439",
+        "config": "bdc7e2c844b8e349",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("17794de97d8b0fce", "b30c4d1b178bf3c7"),
@@ -572,7 +571,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_mini": {
-        "config": "c6e17b72113c1fc1",
+        "config": "a16c91d06320462b",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("17794de97d8b0fce", "b30c4d1b178bf3c7"),
@@ -809,12 +808,11 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
 
     unchanged: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("tokens", 999_999),  # budget: same rows on disk
-        lambda d: d.__setitem__("block_size", 32),  # sequence budget only
         lambda d: d["sources"]["pre"].__setitem__("describe_tokens_per_row", 3),  # describe only
         lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),  # processing → processed only
         lambda d: d["sources"]["pre"].__setitem__("processing", {"dedup": {"mode": "minhash"}}),
         lambda d: d.__setitem__("processing", {"quality_filter": True, "decontamination": {"enabled": True}}),
-        lambda d: d.__setitem__("max_seq_length", 64),  # the raw manifest records the truncation cap itself
+        lambda d: d.__setitem__("dataset_max_sequence_length", 64),  # the raw manifest records the truncation cap itself
         lambda d: d.__setitem__("validation_fraction", 0.2),  # training-time split
         lambda d: d["sources"]["pre"].__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),  # processed order only
@@ -853,7 +851,6 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
 
     unchanged: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("tokens", 999_999),
-        lambda d: d.__setitem__("block_size", 32),
         lambda d: d["sources"]["pre"].__setitem__("describe_tokens_per_row", 3),
         lambda d: d.__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["pre"].__setitem__("validation_fraction", 0.2),
@@ -867,7 +864,7 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         assert _build(d).processed_hash("pre") == h, change
 
     invalidating: list[Mutation] = [
-        lambda d: d.__setitem__("max_seq_length", 64),
+        lambda d: d.__setitem__("dataset_max_sequence_length", 64),
         lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"dedup": {"normalize": False}}),
@@ -944,7 +941,7 @@ def test_hash_payload_golden_defaults() -> None:
         "validation_fraction": None, "rows": None, "describe_tokens_per_row": 500,
     }  # fmt: skip
     cfg = _build(_minimal())
-    assert (cfg.max_seq_length, cfg.validation_fraction, cfg.token_count, cfg.always_range_requests) == (2048, 0.05, "tokenizer", True)
+    assert (cfg.dataset_max_sequence_length, cfg.validation_fraction, cfg.token_count, cfg.always_range_requests) == (2048, 0.05, "tokenizer", True)
     assert isinstance(dc.SAFETY_MARGIN, Fraction) and float(dc.SAFETY_MARGIN) == 1.2
 
 
@@ -959,7 +956,6 @@ def test_config_hash_changes_on_any_field() -> None:
     base = _build(_minimal()).config_hash()
     changes: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("transition_pct", 0.5),
-        lambda d: d.__setitem__("block_size", 32),
         lambda d: d.__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["ins"].__setitem__("input_inversions", 0.5),
     ]
@@ -986,7 +982,7 @@ def test_config_hash_ignores_fetch_and_describe_knobs() -> None:
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:
     names = {f.name for f in fields(DatasetConfig)}
-    assert {"tokenizer", "sources", "stages", "block_size", "max_seq_length", "validation_fraction", "processing"} <= names
+    assert {"tokenizer", "sources", "stages", "dataset_max_sequence_length", "validation_fraction", "processing"} <= names
     assert "instruct_mixtures" not in names
     cfg = _build(_minimal())
     assert asdict(cfg)["sources"]["pre"]["kind"] == "pretrain"

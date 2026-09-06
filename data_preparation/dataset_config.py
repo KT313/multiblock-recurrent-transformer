@@ -9,7 +9,7 @@ carries a trailing comment, `DatasetConfig` lists the top-level keys.
 
 Layout produced on disk (see `data_preparation/README.md`):
 
-    dataset/sources/<source>/raw/     rows as downloaded (text truncated to max_seq_length tokens); shared, append-only
+    dataset/sources/<source>/raw/     rows as downloaded (text truncated to dataset_max_sequence_length tokens); shared, append-only
     dataset/processed/<source>/       rows after cleaning (what training reads); derived from raw, shared
     dataset/tokenizers/<name>/
 
@@ -52,7 +52,7 @@ DEFAULT_BENCHMARKS = [
 SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers filter / dedup losses and a tokens-per-row estimate that ran high); a Fraction so 50 × 1.2 is exactly 60
 
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
-# derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
+# derivation, keep as a comment: processed rows are TEXT bounded by dataset_max_sequence_length tokens at download
 # (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
 MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, plus its LSH index; the same check, a lower limit
 # derivation: the LSH index holds every kept row at roughly 3-5 KB (num_perm 256, `lib/stages/fuzzy_dedup.py`) next
@@ -179,7 +179,7 @@ class ProcessingConfig:
     Per-source processing options; the dataset-level block is the default, a pretrain source may override it.
     """
 
-    min_chars: int = field(default=50, metadata=_PROCESSED)  # drop shorter texts (pretrain only; the upper bound is `max_seq_length` at download)
+    min_chars: int = field(default=50, metadata=_PROCESSED)  # drop shorter texts (pretrain only; the upper bound is `dataset_max_sequence_length` at download)
     dedup: DedupConfig = field(default_factory=DedupConfig, metadata=_PROCESSED)  # exact / minhash / none, see DedupConfig
     quality_filter: bool = field(default=False, metadata=_PROCESSED)  # prose heuristics (sentences, caps ratio, repetition); thesis run: off
     decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig, metadata=_PROCESSED)  # benchmark overlap filter, see DecontaminationConfig
@@ -293,7 +293,7 @@ class SourceConfig:
     input_inversions: float = field(default=0.0, metadata=_PROCESSED)  # instruct: share of rows turned into "given the output, what was the instruction?"
     shuffle: Optional[bool] = field(default=None, metadata=_PROCESSED)  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
     validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
-    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at block_size) and the row columns of `describe`
+    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at the training length) and the row columns of `describe`
 
     def __post_init__(self) -> None:
         self._check_field_scopes()
@@ -348,7 +348,7 @@ class StageConfig:
     """
 
     name: str = field(metadata=_CONFIG)  # stage label (checkpoints, logs); unique per config
-    tokens: int = field(metadata=_CONFIG)  # training tokens of this stage (steps = tokens // (world_batch_size × block_size))
+    tokens: int = field(metadata=_CONFIG)  # training tokens of this stage (steps = tokens // tokens per optimizer step)
     train: dict[str, float] = field(metadata=_CONFIG)  # source name -> sampling weight (> 0, sum 1)
     val: dict[str, float] = field(metadata=_CONFIG)  # source name -> validation weight (> 0, sum 1)
     transition_pct: float = field(default=0.0, metadata=_CONFIG)  # fraction of this stage (at its end) blending into the next stage's data/LR
@@ -373,10 +373,9 @@ class DatasetConfig:
     - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/raw/`
       and `dataset/processed/<source>/`.
     - `stages`: the training stages in order (`StageConfig`): token budget, train/val weights over sources, transition.
-    - `block_size`: training sequence length; the planner clamps its tokens-per-row rate with it; the run config must match.
-    - `max_seq_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
+    - `dataset_max_sequence_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
       this are dropped; raising it above what raw was stored with re-downloads raw (after confirmation), lowering
-      it costs nothing; `block_size` must be <= it.
+      it costs nothing; the run's training_max_sequence_length must be <= it.
     - `validation_fraction`: share of a source's rows held out when the source is used for training AND validation.
     - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
     - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
@@ -391,8 +390,11 @@ class DatasetConfig:
     tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
     sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
     stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
-    block_size: int = field(metadata=_CONFIG)  # training sequence length (sequences per stage = tokens ÷ block_size; caps the tokens a row serves the planner); <= max_seq_length
-    max_seq_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); block_size must be <= this
+    dataset_max_sequence_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); >= the run's training_max_sequence_length
+    # Not a YAML key (init=False): the run's training_max_sequence_length, set by `load_dataset_config` for the caller
+    # that knows the run (prepare / status / training's auto-prepare). Rows are consumed up to it, so the planner clamps
+    # its tokens-per-row rate with it; None plans as if every row were used in full (the dataset length).
+    training_max_sequence_length: Optional[int] = field(default=None, init=False, metadata=_UNHASHED)
     validation_fraction: float = field(default=0.05, metadata=_CONFIG)  # in [0, 1): held-out share of a source used in both train and val
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
     # whole into the Hub cache instead of being read remotely by piece.
@@ -404,12 +406,8 @@ class DatasetConfig:
     # --- validation ------------------------------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
-        if self.max_seq_length <= 0:
-            raise ValueError("max_seq_length must be positive")
-        if self.block_size <= 0:
-            raise ValueError("block_size must be positive")
-        if self.block_size > self.max_seq_length:
-            raise ValueError(f"block_size ({self.block_size}) must be <= max_seq_length ({self.max_seq_length})")
+        if self.dataset_max_sequence_length <= 0:
+            raise ValueError("dataset_max_sequence_length must be positive")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
         if not self.stages:
@@ -568,13 +566,16 @@ class DatasetConfig:
     def tokens_per_row_rate(self, source_name: str, tokens_per_row: float | None = None) -> Fraction:
         """
         Tokens one stored row serves the token budget with: the measured mean tokens_per_row when given (the raw
-        manifest's tokens ÷ rows), else the source's describe_tokens_per_row estimate, clamped at block_size. The
-        clamp errs towards more rows (packing serves every token of a longer row too), so a rate that turns out
-        lower than assumed is what the top-up rounds correct, never a rate that was too low.
+        manifest's tokens ÷ rows), else the source's describe_tokens_per_row estimate, clamped at the run's
+        training_max_sequence_length (training cuts a row there), or at dataset_max_sequence_length when no run is
+        known (a stored row is never longer). The clamp errs towards more rows (packing serves every token of a
+        row below the cut too), so a rate that turns out lower than assumed is what the top-up rounds correct,
+        never a rate that was too low.
         """
 
         rate = self.sources[source_name].describe_tokens_per_row if tokens_per_row is None else tokens_per_row
-        return min(Fraction(rate), Fraction(self.block_size))
+        cut = self.training_max_sequence_length or self.dataset_max_sequence_length
+        return min(Fraction(rate), Fraction(cut))
 
     def rows_budget(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
@@ -623,7 +624,7 @@ class DatasetConfig:
         loader: synthetic, where it generates the rows) plus token_count, the tokenizer and the counting rule
         (truncation.TOKEN_RULE), on which the stored tokens column and the token-boundary truncation depend.
 
-        Everything else is annotated processed, config or none and stays out: max_seq_length (the raw
+        Everything else is annotated processed, config or none and stays out: dataset_max_sequence_length (the raw
         manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
         rows / check_limit (how many rows are needed or read, not what is read), validation_fraction,
         input_inversions, shuffle, the non-synthetic seed (inversions and shuffle order are build-time),
@@ -643,7 +644,7 @@ class DatasetConfig:
     def processed_hash(self, source_name: str) -> str:
         """
         Hash of a source's processed/ folder: the raw hash, plus the processed fields as the build
-        resolves them: max_seq_length (stored counts are clamped to it), the *effective* processing block (only
+        resolves them: dataset_max_sequence_length (stored counts are clamped to it), the *effective* processing block (only
         the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
         input_inversions, the resolved shuffle and the seed behind both. These four are written out
         rather than taken from :func:`hash_payload`, because the build uses their resolved values (shuffle_of,
@@ -656,7 +657,7 @@ class DatasetConfig:
         processing = self.source_processing(source_name)
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
-            "max_seq_length": self.max_seq_length,
+            "max_seq_length": self.dataset_max_sequence_length,  # the key keeps the field's old name: a renamed key would rebuild every folder
             "processing": hash_payload(processing, "processed"),
             "input_inversions": source.input_inversions,
             "shuffle": self.shuffle_of(source_name),
@@ -835,9 +836,12 @@ def _hashable(value: Any, hash_name: HashName) -> Any:
     return value
 
 
-def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None) -> DatasetConfig:
+def load_dataset_config(
+    path: str | Path, overrides: Optional[list[str]] = None, *, training_max_sequence_length: Optional[int] = None
+) -> DatasetConfig:
     """
     Load a dataset config YAML; `overrides` are jsonargparse `--key value` strings (nested keys with dots).
+    training_max_sequence_length is the run's (see the field): the planner sizes downloads with it.
 
     An unknown key raises a `ValueError` naming the file and the key (`<path>: <jsonargparse message>`) instead of
     jsonargparse's usage dump and `sys.exit(2)`.
@@ -851,4 +855,12 @@ def load_dataset_config(path: str | Path, overrides: Optional[list[str]] = None)
             namespace = parser.parse_args(overrides, namespace=namespace)
     except ArgumentError as error:
         raise ValueError(f"dataset config {Path(path).as_posix()}: {str(error).strip()}") from error
-    return DatasetConfig(**parser.instantiate(namespace).as_dict())
+    config = DatasetConfig(**parser.instantiate(namespace).as_dict())
+    if training_max_sequence_length is not None:
+        if training_max_sequence_length > config.dataset_max_sequence_length:
+            raise ValueError(
+                f"training_max_sequence_length ({training_max_sequence_length}) exceeds dataset_max_sequence_length "
+                f"({config.dataset_max_sequence_length}) of {Path(path).as_posix()}: the rows are cut shorter than the run trains"
+            )
+        config.training_max_sequence_length = training_max_sequence_length
+    return config

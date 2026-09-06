@@ -18,13 +18,13 @@ that file; this is the shape:
 
 ```yaml
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
-max_seq_length: 2048        # pretrain rows are truncated to this many tokens WHEN DOWNLOADED, instruct rows longer than
-                            # this are dropped; raising it re-downloads raw (after confirmation), lowering it costs nothing
-block_size: 2048            # training sequence length; the planner caps its tokens-per-row rate with it; the run config must match
+dataset_max_sequence_length: 2048   # pretrain rows are truncated to this many tokens WHEN DOWNLOADED, instruct rows longer
+                                    # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
+                                    # costs nothing; >= the run config's training_max_sequence_length
 token_count: tokenizer      # or: estimate (chars / 4)
 validation_fraction: 0.05   # share of a source's rows held out when the source is used for training AND validation
 processing:                 # defaults for every source; a pretrain source may carry its own block
-  min_chars: 50             # drop shorter documents (pretrain only; the upper bound is max_seq_length at download)
+  min_chars: 50             # drop shorter documents (pretrain only; the upper bound is dataset_max_sequence_length at download)
   dedup: {mode: exact, normalize: true, bloom_memory_mb: 1024}   # or {mode: minhash, ...} (not for scale), or none
   quality_filter: false
   decontamination: {enabled: false}
@@ -51,7 +51,7 @@ row shape, the filters that apply and how training formats a row. Stage keys are
 weights that are zero or do not sum to 1, a source used by no stage, a source used only in `val` without `rows`, a
 training source with `rows`, and so on. The keys of the earlier schema (`instruct_mixtures`, `validation_tokens`,
 `max_chars`, `max_tokens`, `tokens_per_row_estimate`, `<source>/validation` stage keys) are simply unknown now:
-mixing and the validation split are the training dataloader's job, rows are truncated to `max_seq_length` tokens at
+mixing and the validation split are the training dataloader's job, rows are truncated to `dataset_max_sequence_length` tokens at
 download, and the planner counts tokens (`describe_tokens_per_row` is its starting rate, not a description).
 
 The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
@@ -64,7 +64,7 @@ build of a few MB that exercises every loader; needs `HF_TOKEN` for `mini-peS2o`
 ```
 dataset/
 ├── sources/<source>/raw/     MANIFEST.json + data-*.parquet   rows as downloaded (converter applied, pretrain text
-│                                                              truncated to max_seq_length tokens, `tokens` column);
+│                                                              truncated to dataset_max_sequence_length tokens, `tokens` column);
 │                                                              append-only; the ONLY tree the download step writes
 ├── processed/<source>/       MANIFEST.json + data-*.parquet   rows after cleaning; derived from raw, cheap to rebuild;
 │                                                              the ONLY tree the build step writes  <- training reads this
@@ -87,9 +87,9 @@ and the truncation to a good prefix); the per-source download, the `github_code`
 go through it, so a repair followed by a resume restores every counter instead of only the offset.
 
 - `raw/` is keyed on `DatasetConfig.raw_hash`: the loader identity (repo, revision, files, split, converter, fields,
-  filter, seed, ...) plus `token_count` and the tokenizer. Processing options, `max_seq_length`, budgets, weights,
+  filter, seed, ...) plus `token_count` and the tokenizer. Processing options, `dataset_max_sequence_length`, budgets, weights,
   `rows`, `check_limit`, `validation_fraction`, `input_inversions` and `shuffle` are *not* part of it.
-- `processed/` is keyed on `processed_hash`: the raw hash, `max_seq_length`, the processing block reduced to the
+- `processed/` is keyed on `processed_hash`: the raw hash, `dataset_max_sequence_length`, the processing block reduced to the
   fields of the active dedup mode, `input_inversions` and the resolved `shuffle`. A change rebuilds `processed/`
   from the raw shards; nothing is downloaded.
 
@@ -197,9 +197,9 @@ a prefix. Pretrain rows keep every row as `{text_field, tokens}` (a string, what
 `text_field` **cut at a token boundary** (`lib/stages/truncation.py`: the stored text is a prefix of the document,
 so storage is bounded and no count is ever wrong; `token_count: estimate` cuts at 4 characters per token). `tokens`
 is the length the trainer sees: the true count of the stored text plus the BOS and EOS the trainer adds around
-every row (`NUMBER_OF_SPECIAL_TOKENS`), and never exceeds `max_seq_length`. Instruct rows run through the converter and
+every row (`NUMBER_OF_SPECIAL_TOKENS`), and never exceeds `dataset_max_sequence_length`. Instruct rows run through the converter and
 filter at download time and are stored as `{instruction, input, output, tokens}` with `tokens` counted the same way
-over the text the trainer formats from them (`instruct_text`); a row whose `tokens` exceeds `max_seq_length` is
+over the text the trainer formats from them (`instruct_text`); a row whose `tokens` exceeds `dataset_max_sequence_length` is
 **dropped**, never cut (an answer missing its end would be worse than a missing row; `dropped_too_long` in the
 manifest), a malformed one (converter error, no instruction / output) is skipped (`skipped_malformed`);
 `check_limit` bounds the source rows inspected. A loader that yields fewer rows than asked
@@ -210,7 +210,7 @@ stopped by its own `check_limit`: the manifest records the limit, and a grown (o
 Everything else is `prepare --reopen NAME`: it clears the flag and the download resumes at the recorded offset.
 
 The download **never deletes** a raw folder. A folder whose manifest is *stale* (identity or tokenizer changed) or
-*outdated* (stored with a smaller `max_seq_length` than the config asks for now) is an error at this point; only the
+*outdated* (stored with a smaller `dataset_max_sequence_length` than the config asks for now) is an error at this point; only the
 repair step removes it, and only after confirmation.
 
 ### Build (`lib/stages/build.py`)
@@ -220,7 +220,7 @@ Turns the raw shards of a source into `processed/<source>/`, in this order. **Pr
 **instruct**: input inversions (a seeded per-row decision keyed by `(seed, global row index)`, so it is independent
 of shard boundaries and of a resume) → drop rows with an empty instruction or output → exact dedup over the
 trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw count, clamped to the current
-`max_seq_length`) and `hash` (the 64-bit exact-dedup key). Two write modes:
+`dataset_max_sequence_length`) and `hash` (the 64-bit exact-dedup key). Two write modes:
 
 - **per raw shard, resumable** (pretrain sources): the survivors of one raw shard are published before the next raw
   shard is read and the manifest records the raw shard as covered, so a stop loses at most one raw shard of work
@@ -261,7 +261,7 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
 `--dry_run` and for the report a refused confirmation carries):
 
 - **raw** (downloaded, expensive): a *stale* folder (identity or tokenizer changed) or an *outdated* one
-  (`max_seq_length` raised above `truncated_at_tokens`) is deleted and downloaded again, **only after the user
+  (`dataset_max_sequence_length` raised above `truncated_at_tokens`) is deleted and downloaded again, **only after the user
   confirmed**. A folder with a *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
   and the next download resumes there (when no prefix can be kept, it is queued for the same confirmed deletion).
   Shards without a manifest are an error (nothing says where those rows came from). Raw folders are shared by
@@ -273,27 +273,28 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
   build refuses such a folder until then.
 
 Nothing is touched until every folder was inspected; the queued confirmations are answered **once**, with one
-list ("The following folders will be deleted or truncated (...): fineweb_edu: outdated: max_seq_length 2048
+list ("The following folders will be deleted or truncated (...): fineweb_edu: outdated: dataset_max_sequence_length 2048
 -> 4096 ... Continue? [y/N]"). `--yes` answers it; without a terminal and without `--yes` the command prints the
 list and exits 2 with nothing changed. `train.py`'s auto-prepare never prompts and **never deletes raw**: it fails
-with the same list and the `prepare.py prepare --yes` command. Lowering `max_seq_length` never touches raw (rows are
-at most `truncated_at_tokens` long; the build clamps the stored counts, training truncates at `block_size` anyway).
+with the same list and the `prepare.py prepare --yes` command. Lowering `dataset_max_sequence_length` never touches raw (rows are
+at most `truncated_at_tokens` long; the build clamps the stored counts, training cuts rows at its own length anyway).
 
 ### Tokens, not sequences (`lib/build/planner.py`)
 
 The trainer draws **rows** from one continuous reader per source, one draw per sample, weighted by the stage
-schedule (the stage's constant weight, linearly interpolated across a transition window), and packs them end to end
-into `block_size` sequences: a source is consumed by the token length of its rows. The run therefore needs the
+schedule (the stage's constant weight, linearly interpolated across a transition window), and packs them end to end,
+cut at the run's `training_max_sequence_length`: a source is consumed by the token length of its rows. The run therefore needs the
 integral of a source's weight schedule over the stage token budgets, in tokens. That is the planner's unit, the
 **token budget**: stages sharing a source ADD UP (the reader continues across stage boundaries instead of
 re-reading), each stage contributing `(tokens − transition tokens) × weight` plus the trapezoid
 `transition tokens × (weight + next stage's weight) / 2` for the window at its end. Rows are what a loader delivers,
 so the budget is divided by a **tokens-per-row rate**: the source's `describe_tokens_per_row` until its first raw
-shard is on disk, the measured mean of the raw manifest (`tokens ÷ rows`) from then on, either clamped at
-`block_size`:
+shard is on disk, the measured mean of the raw manifest (`tokens ÷ rows`) from then on, either clamped at the
+run's `training_max_sequence_length` (`prepare.py --training_max_sequence_length`, or the run settings when
+training prepares its own data; without one, at `dataset_max_sequence_length`, i.e. every row counted in full):
 
 ```
-rate                    = min(measured mean tokens per raw row, or describe_tokens_per_row before the first shard; block_size)
+rate                    = min(measured mean tokens per raw row, or describe_tokens_per_row before the first shard; training_max_sequence_length)
 rows_needed(source)     = ceil(token_budget ÷ rate × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
                         = ceil(source.rows × 1.2)                                                  # source used only in val
 rows_sufficient(source) = rows_needed ÷ 1.2, or source.rows                                        # processed rows that serve it
@@ -304,9 +305,9 @@ The `× 1.2` covers what the length filter and the dedup drop and an estimate th
 *training* part at the budget after the resolver holds `validation_fraction` out. The first download is sized at the
 estimate; the round loop tops the source up at the measured rate when the estimate was more than 20 % too high
 (rows measured shorter), and re-downloads nothing when the processed rows already serve the budget. A run that pads
-instead of packing consumes one row per sequence, so it is over-provisioned by `block_size ÷ rate` and never short.
-The clamp at `block_size` is an approximation on the safe side: `min(mean, block_size)` over-estimates the rows a
-source of rows longer than `block_size` consumes (every token of such a row is trained on too), so a rate that
+instead of packing consumes one row per sequence, so it is over-provisioned by `training_max_sequence_length ÷ rate` and never short.
+The clamp is an approximation on the safe side: `min(mean, cut)` over-estimates the rows a
+source of rows longer than the cut consumes (every token of such a row is trained on too), so a rate that
 proves lower than assumed is what the top-up rounds correct, never one that was too low. A validation-only source's
 `rows` are delivered rows: `× 1.2` downloaded, `rows` of them have to survive the build.
 
@@ -324,7 +325,7 @@ status table's last column. The plan, the round loop and the status table all re
 | `raw <reason>` | nothing downloaded / stale or outdated raw, or a raw manifest nobody can parse | no: download, let the repair step delete it, or fix the manifest by hand |
 
 The consequence to keep in mind: **the weights mix rows, not tokens.** The realised token share of a source in a
-stage is proportional to `weight × mean_tokens_per_row`. Example: `block_size` 2048, one 1 B-token stage,
+stage is proportional to `weight × mean_tokens_per_row`. Example: rows of at most 2048 tokens, one 1 B-token stage,
 `{fineweb: 0.5 (~1000 tokens/row), gsm8k: 0.5 (~300 tokens/row, 7.5 k rows)}`: the planner books 500 M tokens per
 source, 500 k fineweb rows (600 k downloaded) and 1.67 M gsm8k draws, so gsm8k is cycled ~220 times (`epochs` in the
 status table) for a realised token mix of about 77 / 23. Set weights with the row lengths of the sources in mind;
@@ -348,7 +349,7 @@ stage of the run. The chosen `validation_rows` per source travel with every chec
 hash and are verified on resume. A validation-only source reading the same Hub repo and file prefix as a training
 source draws a warning (prefer listing the training source in `val` too). The resolver also checks every stage key
 directly on disk (folder present, at least one shard, a non-empty row range for its part), independent of the
-manifests, and that the run config's `block_size` equals the dataset config's.
+manifests, and that the three sequence lengths nest: `model_max_sequence_length >= dataset_max_sequence_length >= training_max_sequence_length`.
 
 ## Where things are cached
 
@@ -470,7 +471,7 @@ the order they run in.
 The thesis data was prepared with exact dedup, fuzzy dedup at Jaccard 0.95, tokenizer counts truncated to 2048
 tokens and the quality filter, decontamination and PII masking skipped; the pretrain sources were fetched as fixed
 row counts (e.g. 9.0M fineweb-edu documents) and the finetune data as a 400k-example mixture built up front. The
-crow config mirrors that with exact dedup on, `max_seq_length` 2048 and everything else off, but: fuzzy dedup is
+crow config mirrors that with exact dedup on, `dataset_max_sequence_length` 2048 and everything else off, but: fuzzy dedup is
 off by default (available as `dedup: {mode: minhash, threshold: 0.95}`), PII masking no longer exists, texts are
 truncated at the token cap when downloaded instead of stored whole, download sizes follow the token budgets
 (÷ the measured tokens per row, × 1.2) instead of fixed row counts, the finetune stage mixes the eight instruct sources by weight in the

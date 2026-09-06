@@ -60,7 +60,7 @@ class RawFolder:
     """
     The bookkeeping of one raw directory around its (already loaded) manifest.
 
-    config_cap is the config's max_seq_length, used as :attr:`cap` only when the manifest records none yet
+    config_cap is the config's dataset_max_sequence_length, used as :attr:`cap` only when the manifest records none yet
     (a fresh folder, or one written before the truncation existed); a folder opened just to inspect or repair needs
     none. should_stop is polled after every published shard.
     """

@@ -8,16 +8,16 @@ second call with nothing new returns the stored manifest without touching the sh
 data allow it. Raw folders are append-only and precious (bandwidth): :func:`download` appends to a *current* raw
 manifest, starts a fresh folder when there is none, and never deletes one. A folder whose manifest is *stale*
 (DatasetConfig.raw_hash: loader identity, token_count or tokenizer changed) or *outdated* (stored with a
-smaller max_seq_length than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
+smaller dataset_max_sequence_length than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
 the repair step (lib/build/repair.py) deletes such folders after the user confirmed, nothing else does.
 
 What a raw row is: pretrain rows carry text_field only (a string, whatever the loader delivered) truncated at
 a token boundary so that tokens, the true count of the stored text plus the BOS and EOS the trainer adds
-(truncation.NUMBER_OF_SPECIAL_TOKENS), is at most max_seq_length; instruct rows carry instruction / input / output with
+(truncation.NUMBER_OF_SPECIAL_TOKENS), is at most dataset_max_sequence_length; instruct rows carry instruction / input / output with
 tokens = the count of the text the trainer formats from them (row_pipeline.instruct_text) plus the same two
-specials, uncapped. An instruct row whose tokens exceeds max_seq_length is not stored at all (dropped_too_long;
+specials, uncapped. An instruct row whose tokens exceeds dataset_max_sequence_length is not stored at all (dropped_too_long;
 cutting an answer would be worse than losing the row). So a stored tokens is the length the trainer sees and
-never exceeds max_seq_length. The raw manifest records truncated_at_tokens (the cap used, both kinds),
+never exceeds dataset_max_sequence_length. The raw manifest records truncated_at_tokens (the cap used, both kinds),
 token_count and the tokenizer name.
 
 A download pass (:func:`_fetch`) is a two-stage pipeline: the job's own thread pulls rows from the loader, converts
@@ -176,7 +176,7 @@ def new_manifest(
 ) -> Manifest:
     """
     An empty manifest for stage; with tokens it records how token counts are measured, raw manifests
-    record truncated_at_tokens (the max_seq_length their rows were cut / dropped at) and dataset_config
+    record truncated_at_tokens (the dataset_max_sequence_length their rows were cut / dropped at) and dataset_config
     (the file name of the config the folder is downloaded under, when the caller knows it).
     """
 
@@ -221,7 +221,7 @@ class RawInspection(NamedTuple):
 
     state: RawManifestState
     manifest: Manifest | None
-    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: max_seq_length 2048 -> 4096" | "unreadable manifest ..."
+    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: dataset_max_sequence_length 2048 -> 4096" | "unreadable manifest ..."
 
     @property
     def current_manifest(self) -> Manifest | None:
@@ -236,7 +236,7 @@ def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawI
     """
     missing (no manifest; the folder may still hold shards, which :func:`download` refuses to start over),
     stale (the manifest's hash differs from config.raw_hash(name): loader identity, token_count or
-    tokenizer changed, or it is another stage's manifest), outdated (config.max_seq_length was raised above
+    tokenizer changed, or it is another stage's manifest), outdated (config.dataset_max_sequence_length was raised above
     the cap the rows were truncated / dropped at), unreadable (a manifest next to shards that does not parse:
     a state every caller reports and nobody repairs, the rows may have been expensive) or current.
     """
@@ -249,8 +249,8 @@ def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawI
         return RawInspection("missing", None, "missing")
     if manifest.stage != "raw" or not manifest.is_current(config.raw_hash(name)):
         return RawInspection("stale", manifest, "stale: source identity or tokenizer changed")
-    if manifest.is_outdated(config.max_seq_length):
-        return RawInspection("outdated", manifest, f"outdated: max_seq_length {manifest.truncated_at_tokens} -> {config.max_seq_length}")
+    if manifest.is_outdated(config.dataset_max_sequence_length):
+        return RawInspection("outdated", manifest, f"outdated: dataset_max_sequence_length {manifest.truncated_at_tokens} -> {config.dataset_max_sequence_length}")
     return RawInspection("current", manifest, "current")
 
 
@@ -343,7 +343,7 @@ class _IncrementCounters:
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
     kept: int = 0  # rows written to disk
     skipped_malformed: int = 0  # instruct rows whose converter raised ValueError or left out instruction / output
-    dropped_too_long: int = 0  # instruct rows with more than `max_seq_length` tokens
+    dropped_too_long: int = 0  # instruct rows with more than `dataset_max_sequence_length` tokens
     exhausted: bool = False  # the loader ran dry, or check_limit was reached
 
 
@@ -366,9 +366,9 @@ def download(
     :class:`RawFolderError` (nothing is deleted here), a missing one starts the folder from shard 0 (refused when
     shards without a manifest are present). manifest.rows_fetched is the loader offset reached (source rows
     consumed). Pretrain sources keep every row (converter applied, text_field alone and a string, the text
-    truncated so that tokens, its count with the trainer's specials, is at most max_seq_length). Instruct sources
+    truncated so that tokens, its count with the trainer's specials, is at most dataset_max_sequence_length). Instruct sources
     run the converter and filter at download time and store only standardized {instruction, input, output} rows
-    of at most max_seq_length tokens; malformed rows (the converter raises ValueError or yields no instruction /
+    of at most dataset_max_sequence_length tokens; malformed rows (the converter raises ValueError or yields no instruction /
     output) are counted in skipped_malformed, longer rows in dropped_too_long. check_limit bounds the source rows
     inspected in total. A loader that yields fewer rows than requested sets exhausted (the training sampler cycles
     a source smaller than its budget).
@@ -430,7 +430,7 @@ def _raw_folder_to_append_to(
 ) -> RawFolder:
     """
     The raw folder of name around its current manifest, or a fresh one (truncated_at_tokens =
-    max_seq_length, dataset_config = config_name) when the directory has none. Refused when the folder is stale, outdated or unreadable
+    dataset_max_sequence_length, dataset_config = config_name) when the directory has none. Refused when the folder is stale, outdated or unreadable
     (:class:`RawFolderError`; deleting it is the repair step's or the user's decision) or holds shards without any manifest:
     nothing would say where those rows came from, and starting over would delete them.
     """
@@ -444,9 +444,9 @@ def _raw_folder_to_append_to(
         if has_shards(raw_dir):
             raise RuntimeError(f"{name}: {raw_dir} holds shards but no manifest; delete the directory to download the source again")
         manifest = new_manifest(
-            config, name, config.raw_hash(name), "raw", tokens=True, truncated_at_tokens=config.max_seq_length, dataset_config=config_name
+            config, name, config.raw_hash(name), "raw", tokens=True, truncated_at_tokens=config.dataset_max_sequence_length, dataset_config=config_name
         )
-    return RawFolder(raw_dir, manifest, config_cap=config.max_seq_length, should_stop=should_stop)
+    return RawFolder(raw_dir, manifest, config_cap=config.dataset_max_sequence_length, should_stop=should_stop)
 
 
 UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop consuming once `rows_to_keep` rows are kept
@@ -472,7 +472,7 @@ class _TokenStep:
 
     def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _IncrementCounters) -> None:
         if max_tokens < NUMBER_OF_SPECIAL_TOKENS:
-            raise ValueError(f"max_seq_length {max_tokens} leaves no room for the {NUMBER_OF_SPECIAL_TOKENS} special tokens of a row")
+            raise ValueError(f"dataset_max_sequence_length {max_tokens} leaves no room for the {NUMBER_OF_SPECIAL_TOKENS} special tokens of a row")
         self._counter = counter
         self._max_tokens = max_tokens
         self._counters = counters

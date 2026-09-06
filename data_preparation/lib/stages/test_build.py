@@ -133,7 +133,7 @@ def test_build_exact_dedup_tokens_and_idempotence(
     read_rows: Reader, mtimes: Mtimes,
 ) -> None:  # fmt: skip
     texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(62)]  # the last one exactly at the cap with BOS and EOS
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=64)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=64)
     m = build_source(cfg, "s", layout, shard_size=2)
     processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
@@ -153,13 +153,13 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
     """
-    Lowering `max_seq_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
+    Lowering `dataset_max_sequence_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
     counts to the new cap instead.
     """
 
-    cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, max_seq_length=64)
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, dataset_max_sequence_length=64)
     assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5]
-    lowered = replace(cfg, max_seq_length=8)
+    lowered = replace(cfg, dataset_max_sequence_length=8)
     assert lowered.raw_hash("s") == cfg.raw_hash("s") and lowered.processed_hash("s") != cfg.processed_hash("s")
     m = build_source(lowered, "s", layout)
     assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 5] and m.tokens() == 13
@@ -169,7 +169,7 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
 def test_build_estimate_mode_caps_too(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
-    cfg = _prepare(cfg_factory, layout, local_dir, ["a" * 40, "b" * 400], with_tokenizer, write=write_local, token_count="estimate", max_seq_length=50)
+    cfg = _prepare(cfg_factory, layout, local_dir, ["a" * 40, "b" * 400], with_tokenizer, write=write_local, token_count="estimate", dataset_max_sequence_length=50)
     m = build_source(cfg, "s", layout)
     assert m.token_count == "estimate" and m.tokenizer is None
     assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [12, 50]
@@ -242,7 +242,7 @@ def test_incremental_build_with_quality_filter_equals_a_full_pass(
     bad_caps = GOOD.upper()  # dropped: too many ALL-CAPS words; same normalized hash as GOOD
     proc = ProcessingConfig(min_chars=5, quality_filter=True)
     cfg = _prepare(cfg_factory, layout, local_dir, [bad_caps, "Another good text. It has sentences. Three of them here."],
-                   with_tokenizer, write=write_local, processing=proc, max_seq_length=500, shard_size=2)  # fmt: skip
+                   with_tokenizer, write=write_local, processing=proc, dataset_max_sequence_length=500, shard_size=2)  # fmt: skip
     m1 = build_source(cfg, "s", layout)
     assert m1.rows() == 1 and m1.stats["quality_filter"]["filtered_count"] == 1
     write_local(local_dir, [{"text": GOOD}], "parquet")
@@ -363,10 +363,10 @@ def test_build_quality_filter_only_when_enabled(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
     texts = [GOOD, "This is one sentence. Another one here."]
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=500)
     build_source(cfg, "s", layout)
     assert len(read_rows(layout.processed_dir("s"))) == 2
-    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, quality_filter=True), max_seq_length=500))
+    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, quality_filter=True), dataset_max_sequence_length=500))
     download(on, "s", layout, rows_needed=2)
     m = build_source(on, "s", layout)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
@@ -392,11 +392,11 @@ def test_build_decontamination_only_when_enabled(
 
     monkeypatch.setattr(stages_build, "load_benchmark_ngrams", fake_load)
     texts = [planted, GOOD, planted + " tail"]
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=500)
     build_source(cfg, "s", layout, pass_workers=pass_workers)
     assert len(read_rows(layout.processed_dir("s"))) == 3 and calls == []
     decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test", "mmlu_test"])
-    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon), max_seq_length=500))
+    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon), dataset_max_sequence_length=500))
     download(on, "s", layout, rows_needed=3)
     m = build_source(on, "s", layout, pass_workers=pass_workers)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
@@ -413,7 +413,7 @@ def test_build_benchmark_load_failure_is_an_error(
 
     monkeypatch.setattr(stages_build, "load_benchmark_ngrams", failing)
     proc = ProcessingConfig(min_chars=1, decontamination=DecontaminationConfig(enabled=True))
-    cfg = _prepare(cfg_factory, layout, local_dir, [GOOD], with_tokenizer, write=write_local, processing=proc, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, [GOOD], with_tokenizer, write=write_local, processing=proc, dataset_max_sequence_length=500)
     with pytest.raises(OSError, match="hub unreachable"):
         build_source(cfg, "s", layout)
     assert not (layout.processed_dir("s") / "MANIFEST.json").exists()
@@ -430,7 +430,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     short_a, short_b, short_a_variant = "hello world", "SELECT * FROM users;", "Hello   World"  # < 5 words: no n-grams
     proc = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="minhash", threshold=0.8, num_perm=64))
     cfg = _prepare(cfg_factory, layout, local_dir, [base, near, other, base, partial, short_a, short_b, short_a_variant], with_tokenizer,
-                   write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
+                   write=write_local, processing=proc, dataset_max_sequence_length=500)  # fmt: skip
     m = build_source(cfg, "s", layout)
     processed = layout.processed_dir("s")
     # minhash mode = the normalized exact pass first (second `base`, the case variant of `short_a`), then the fuzzy
@@ -484,7 +484,7 @@ def test_concurrent_in_process_builds_keep_their_own_pass_settings(
         "a": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(2, "gsm8k_test", 5)),
         "b": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(200, "mmlu_test", 13)),  # 200 > every text: nothing signed
     }
-    cfg = cfg_factory(sources, max_seq_length=500)
+    cfg = cfg_factory(sources, dataset_max_sequence_length=500)
 
     def build_both(root: Path, threads: int) -> dict[str, tuple[list[str], dict[str, Any]]]:
         target = DatasetLayout(root)
@@ -577,9 +577,9 @@ def _instruct_row(i: int, n_out: int = 4) -> Row:
     return {"instruction": f"tok_{i} tok_{i + 1}", "input": "", "output": " ".join(f"tok_{(i * 7 + j) % 256}" for j in range(n_out))}
 
 
-def _instruct_cfg(cfg_factory: CfgFactory, with_tokenizer: Prep, local_dir: Path, max_seq_length: int = 64, **source_kwargs: Any) -> DatasetConfig:
+def _instruct_cfg(cfg_factory: CfgFactory, with_tokenizer: Prep, local_dir: Path, dataset_max_sequence_length: int = 64, **source_kwargs: Any) -> DatasetConfig:
     src = SourceConfig(kind="instruct", loader="local", path=str(local_dir), converter="instruction_input_output", **source_kwargs)
-    return with_tokenizer(cfg_factory({"i": src}, max_seq_length=max_seq_length))
+    return with_tokenizer(cfg_factory({"i": src}, dataset_max_sequence_length=dataset_max_sequence_length))
 
 
 def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
@@ -678,7 +678,7 @@ def test_instruct_rows_over_the_cap_are_dropped_and_counted(
     src_dir = layout.root.parent / "long"
     rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 8 and 12 tokens with the specials
     write_local(src_dir, rows, "jsonl")
-    cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, max_seq_length=8)
+    cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, dataset_max_sequence_length=8)
     raw = download(cfg, "i", layout, rows_needed=10)
     assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [8] * 5, "rows over the cap are dropped at download, never truncated"
     assert raw.dropped_too_long == 5 and raw.exhausted is True

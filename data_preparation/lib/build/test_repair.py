@@ -179,7 +179,7 @@ def test_stale_raw_is_deleted_with_its_processed_folder_after_confirmation(
 
 
 def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    cfg = _prepared(cfg_factory, with_tokenizer, layout)  # max_seq_length 64
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)  # dataset_max_sequence_length 64
     _edit_manifest(layout.raw_dir("a"), truncated_at_tokens=64)
     assert repair_broken_and_stale_folders(cfg, layout, assume_yes=True).actions == []  # equal cap: fine
     _edit_manifest(layout.raw_dir("a"), truncated_at_tokens=128)
@@ -187,7 +187,7 @@ def test_outdated_raw_is_queued_only_when_the_cap_was_raised(cfg_factory: CfgFac
     _edit_manifest(layout.raw_dir("a"), truncated_at_tokens=32)
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
     assert _kinds(report) == [("a", "raw", "delete"), ("a", "processed", "delete")]
-    assert report.actions[0].reason == "outdated: max_seq_length 32 -> 64"
+    assert report.actions[0].reason == "outdated: dataset_max_sequence_length 32 -> 64"
     assert not layout.raw_dir("a").exists()
 
 
@@ -629,7 +629,7 @@ def test_one_prompt_for_two_queued_raw_folders(cfg_factory: CfgFactory, with_tok
 
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=confirm)
     assert prompts == [
-        f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n  c: outdated: max_seq_length 16 -> 64\n{CONFIRMATION_QUESTION}"
+        f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n  c: outdated: dataset_max_sequence_length 16 -> 64\n{CONFIRMATION_QUESTION}"
     ]
     assert prompts[0].endswith("Continue? [y/N] ")
     assert [action.source for action in raw_deleted(report)] == ["a", "c"] and [action.source for action in processed_deleted(report)] == ["a", "c"]

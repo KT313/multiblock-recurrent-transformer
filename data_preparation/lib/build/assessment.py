@@ -104,7 +104,7 @@ def assess_processed_folder(
     if manifest.stage != "processed":
         return ProcessedAssessment("stale", f"stale: a {manifest.stage} manifest where a processed one belongs", manifest)
     if not manifest.is_current(config.processed_hash(name)):
-        return ProcessedAssessment("stale", "stale: processing settings, max_seq_length or the source changed", manifest)
+        return ProcessedAssessment("stale", "stale: processing settings, dataset_max_sequence_length or the source changed", manifest)
     if manifest.columns != list(processed_columns(config.sources[name].kind)):
         return ProcessedAssessment("stale", "stale: the shards predate the current columns", manifest)
     covered = manifest.input_shards

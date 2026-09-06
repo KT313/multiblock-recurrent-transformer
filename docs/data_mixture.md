@@ -7,9 +7,9 @@ uv run python data_preparation/prepare.py describe --dataset_config config/datas
 ```
 
 Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the
-config times the stage weights; the training loader packs rows end to end into `block_size` sequences, so a
+config times the stage weights; the training loader packs rows end to end, so a
 source is consumed by the token length of its rows. The rows columns estimate how many rows that is from
-`describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at `block_size`; the
+`describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at the training length; the
 downloaded shards then measure the real one).
 
 ## Notes
@@ -33,15 +33,14 @@ gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every so
 ## Tokenizer, sequence length and token counting
 
 - tokenizer: `llama-32k` (hf, `hf-internal-testing/llama-tokenizer` @ `d02ad6cb9dd2c2296a6332199fa2fdca5938fef0`)
-- `max_seq_length`: 2048 (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)
-- `block_size`: 2048 (training sequence length; the run config must use the same value)
+- `dataset_max_sequence_length`: 2048 (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)
 - `token_count`: `tokenizer` (real tokenizer counts)
 - `validation_fraction`: 5% of a source used for training and validation is held out
-- training tokens over all stages: 4.95B (2,416,993 sequences)
+- training tokens over all stages: 4.95B
 
 ## Processing defaults
 
-- length filter: 50 <= chars (pretrain only; rows are cut at `max_seq_length` tokens when downloaded)
+- length filter: 50 <= chars (pretrain only; rows are cut at `dataset_max_sequence_length` tokens when downloaded)
 - dedup: `exact` (normalize: on, Bloom filter 1024 MB per source)
 - quality filter: off
 - decontamination: off

@@ -6,7 +6,7 @@ Before anything is downloaded or built, :func:`repair_broken_and_stale_folders` 
 processed/ folder of every source the config uses and decides what has to go:
 
 * raw (downloaded, expensive): a *stale* folder (manifest hash differs from :meth:`DatasetConfig.raw_hash`) or
-  an *outdated* one (stored with a smaller max_seq_length than the config asks for) is deleted and downloaded
+  an *outdated* one (stored with a smaller dataset_max_sequence_length than the config asks for) is deleted and downloaded
   again, after the user confirmed. A folder with a *broken* shard (missing, unreadable, wrong row count) is
   truncated to its good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`); the next download
   resumes there. Dropping only the broken tail needs no confirmation; dropping healthy shards after it joins the

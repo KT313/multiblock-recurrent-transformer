@@ -8,7 +8,7 @@ raw/ (loader identity plus token settings, so processing changes never invalidat
 :meth:`DatasetConfig.processed_hash` for processed/, tokenizer_hash for tokenizers. A manifest whose hash
 differs from the current config is stale: a processed folder is rebuilt, a raw folder is an error until the repair
 step deletes it after confirmation (raw is never re-downloaded silently). A raw manifest also records
-truncated_at_tokens (the max_seq_length its texts were cut at): raising the cap above it makes the folder
+truncated_at_tokens (the dataset_max_sequence_length its texts were cut at): raising the cap above it makes the folder
 *outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification reads parquet metadata only.
 """
 
@@ -66,7 +66,7 @@ class Manifest:
     shards: list[ShardInfo] = field(default_factory=list)
     token_count: str | None = None
     tokenizer: str | None = None
-    # raw manifests: texts were truncated to this many tokens at download time (the config's `max_seq_length` then);
+    # raw manifests: texts were truncated to this many tokens at download time (the config's `dataset_max_sequence_length` then);
     # None for processed / tokenizer manifests and for raw folders downloaded before truncation existed
     truncated_at_tokens: int | None = None
     versions: dict[str, str] = field(default_factory=dict)
@@ -111,17 +111,17 @@ class Manifest:
     def is_current(self, source_hash: str) -> bool:
         return self.source_hash == source_hash
 
-    def is_outdated(self, max_seq_length: int) -> bool:
+    def is_outdated(self, dataset_max_sequence_length: int) -> bool:
         """
         Whether a raw folder was stored with a smaller cap than the config asks for now.
 
-        Cap rule: rows are at most truncated_at_tokens long, so raising max_seq_length above it outdates the
+        Cap rule: rows are at most truncated_at_tokens long, so raising dataset_max_sequence_length above it outdates the
         folder (its texts are missing tokens the config now wants; it is re-downloaded after confirmation), while
-        lowering it never does (the build clamps stored counts, training truncates at block_size anyway). A
+        lowering it never does (the build clamps stored counts, training cuts rows at its own length anyway). A
         manifest without truncated_at_tokens is never outdated by this rule.
         """
 
-        return self.truncated_at_tokens is not None and max_seq_length > self.truncated_at_tokens
+        return self.truncated_at_tokens is not None and dataset_max_sequence_length > self.truncated_at_tokens
 
     def add_shard(
         self,

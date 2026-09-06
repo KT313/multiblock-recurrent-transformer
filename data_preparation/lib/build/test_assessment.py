@@ -98,7 +98,7 @@ def test_wrong_hash_is_stale(cfg_factory: CfgFactory, with_tokenizer: Prep, layo
     manifest.save(layout.processed_dir("a"))
     assessment = _assess(cfg, layout, _raw_shards(layout))
     assert (assessment.problem, assessment.repair) == ("stale", "rebuild")
-    assert assessment.reason == "stale: processing settings, max_seq_length or the source changed"
+    assert assessment.reason == "stale: processing settings, dataset_max_sequence_length or the source changed"
 
 
 def test_missing_listed_shard_is_broken_only_when_files_are_checked(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:

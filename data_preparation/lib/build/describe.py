@@ -40,9 +40,9 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
         "```",
         "",
         "Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the",
-        "config times the stage weights; the training loader packs rows end to end into `block_size` sequences, so a",
+        "config times the stage weights; the training loader packs rows end to end, so a",
         "source is consumed by the token length of its rows. The rows columns estimate how many rows that is from",
-        "`describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at `block_size`; the",
+        "`describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at the training length; the",
         "downloaded shards then measure the real one).",
         "",
     ]
@@ -85,11 +85,10 @@ def _general(config: DatasetConfig) -> list[str]:
         "## Tokenizer, sequence length and token counting",
         "",
         f"- tokenizer: {_tokenizer_label(config.tokenizer)}",
-        f"- `max_seq_length`: {config.max_seq_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
-        f"- `block_size`: {config.block_size} (training sequence length; the run config must use the same value)",
+        f"- `dataset_max_sequence_length`: {config.dataset_max_sequence_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
         f"- `token_count`: {token_count}",
         f"- `validation_fraction`: {config.validation_fraction:.0%} of a source used for training and validation is held out",
-        f"- training tokens over all stages: {_tokens(total_tokens)} ({_sequences(total_tokens, config.block_size)} sequences)",
+        f"- training tokens over all stages: {_tokens(total_tokens)}",
         "",
         "## Processing defaults",
         "",
@@ -113,7 +112,7 @@ def _tokenizer_label(tokenizer: TokenizerConfig) -> str:
 
 def _processing_lines(processing: ProcessingConfig) -> list[str]:
     return [
-        f"- length filter: {processing.min_chars} <= chars (pretrain only; rows are cut at `max_seq_length` tokens when downloaded)",
+        f"- length filter: {processing.min_chars} <= chars (pretrain only; rows are cut at `dataset_max_sequence_length` tokens when downloaded)",
         f"- dedup: {_dedup_label(processing)}",
         f"- quality filter: {_yn(processing.quality_filter)}",
         f"- decontamination: {_decontamination_label(processing)}",
@@ -247,17 +246,9 @@ def _details(config: DatasetConfig, name: str) -> str:
     return ", ".join(parts)
 
 
-def _sequences(tokens: float, block_size: int) -> str:
-    """
-    Sequences of block_size tokens, rounded up like the planner does: 1,611,329.
-    """
-
-    return f"{ceil(tokens / block_size):,}"
-
-
 def _rate(rate: Fraction) -> str:
     """
-    A tokens-per-row rate as the planner uses it: the estimate, or `block_size` where the estimate exceeds it.
+    A tokens-per-row rate as the planner uses it: the estimate, clamped at the dataset length.
     """
 
     return f"{float(rate):,.0f}"

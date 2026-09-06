@@ -2,18 +2,19 @@
 """
 Planner: what a dataset config needs on disk versus what the manifests say is there, counted in tokens.
 
-The trainer draws rows from one continuous stream per source with the stage weight and packs them end to end into
-block_size sequences, so a source is consumed by the token length of its rows: the run needs the integral of the
+The trainer draws rows from one continuous stream per source with the stage weight and packs them end to end and cuts
+them at the run's training_max_sequence_length, so a source is consumed by the token length of its rows: the run needs the integral of the
 source's weight schedule over the stage token budgets, :meth:`DatasetConfig.token_budget`, in tokens. Rows are what
 a loader delivers, so the planner divides that budget by a tokens-per-row rate: the source's describe_tokens_per_row
 estimate until the first raw shard is on disk, the measured mean of the raw manifest (tokens ÷ rows) from then on,
-either clamped at block_size (:meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
+either clamped at the training length, or the dataset length when no run is known
+(:meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
 it into a download target (× 1.2 safety margin, ÷ the training share after the validation holdout),
 :meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it, :meth:`DatasetConfig.rows_budget` into
 the rows the run draws (the status table's epochs). A run that pads instead of packing consumes one row per
-sequence and is over-provisioned by block_size ÷ rate: a tokens plan never downloads fewer rows than a sequences
-plan would. The clamp is an approximation on the safe side: min(mean, block_size) over-estimates the rows a source
-of rows longer than block_size consumes; a rate that turns out lower than the estimate is what the round loop's
+sequence and is over-provisioned by training length ÷ rate: a tokens plan never downloads fewer rows than a sequences
+plan would. The clamp is an approximation on the safe side: min(mean, cut) over-estimates the rows a source
+of rows longer than the cut consumes; a rate that turns out lower than the estimate is what the round loop's
 top-ups correct.
 
 One :class:`SourceLedger` per source answers both questions the pipeline asks, "what is still to download?"
@@ -253,7 +254,7 @@ class SourceLedger:
     rows_needed: int  # raw rows to download (:meth:`DatasetConfig.rows_needed`)
     rows_sufficient: int  # processed rows that serve the budget (:meth:`DatasetConfig.rows_sufficient`)
     rows_budget: int  # rows the whole run draws (token budget ÷ tokens_per_row; 0 when the source is not trained on)
-    tokens_per_row: float  # the rate the three numbers above were planned with (measured mean, else the estimate; clamped at block_size)
+    tokens_per_row: float  # the rate the three numbers above were planned with (measured mean, else the estimate; clamped at the training length)
     raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated" | "unreadable"
     raw_reason: str  # the state's reason line (:func:`inspect_raw`): what the plan and the status table say about it
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
