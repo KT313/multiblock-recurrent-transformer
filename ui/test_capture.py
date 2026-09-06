@@ -104,6 +104,19 @@ def test_line_sink_splits_lines_and_flushes_the_rest() -> None:
     sink.close_flush()
     assert emitted == ["a", "bc", "", "d"] and sink.encoding == "utf-8" and sink.writable()
     assert not sink.isatty()
+    sink.write("e\r\nf\r")
+    sink.write("\n")
+    assert emitted[-2:] == ["e", "f"], "a CRLF line keeps its text, in one write or split at the newline"
+
+
+def test_line_sink_holds_one_frame_of_a_bar_that_only_sends_carriage_returns() -> None:
+    emitted: list[str] = []
+    sink = LineSink(emitted.append)
+    for i in range(1000):
+        sink.write(f"bar {i}%\r")
+    assert emitted == [] and len(sink._pending) <= len("bar 999%\r"), "the frames replace each other, the remainder never grows"
+    sink.close_flush()
+    assert emitted == ["bar 999%"]
 
 
 def test_line_sink_fileno_is_the_replaced_stream_s(tmp_path: Path) -> None:
@@ -380,6 +393,37 @@ def test_logging_capture_detaches_console_handlers_and_routes_the_root_logger() 
     finally:
         capture.stop()
         library.removeHandler(plain)
+
+
+def test_a_console_handler_created_under_the_capture_is_detached_at_its_first_record_and_rebound_after() -> None:
+    """
+    huggingface_hub / datasets are imported inside the stages, under the display: the StreamHandler they put on
+    their logger holds sys.stderr of that moment, the line sink. Every warning came back a second time as a
+    stderr record, and after the display closed the handler kept writing into the dead sink.
+    """
+
+    sink = RecordingSink()
+    real_err = sys.stderr
+    library = logging.getLogger("fake_hub_library_late")
+    library.setLevel(logging.WARNING)
+    logging_capture, streams = LoggingCapture(sink), StreamCapture(STDOUT_LOGGER, STDERR_LOGGER)
+    plain: logging.StreamHandler[Any] | None = None
+    try:
+        logging_capture.start()
+        with streams:
+            plain = logging.StreamHandler()  # what the library does at import: sys.stderr is the sink now
+            library.addHandler(plain)
+            library.warning("repo card missing")
+            assert library.handlers == [], "detached at its first record"
+            library.warning("second")
+        logging_capture.stop()
+        assert library.handlers == [plain] and plain.stream is real_err, "back on the logger, on the stream the sink replaced"
+        messages = [text.split(": ")[-1] for text in sink.texts()]
+        assert messages == ["repo card missing", "repo card missing", "second"], "only the first passed the sink-bound handler"
+    finally:
+        logging_capture.stop()
+        if plain is not None:
+            library.removeHandler(plain)
 
 
 def test_stream_capture_redirects_releases_and_is_idempotent() -> None:

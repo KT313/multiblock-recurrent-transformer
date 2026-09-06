@@ -40,14 +40,22 @@ class DyingFile(io.StringIO):
         super().__init__()
         self.dead = False
         self.refused = 0  # writes attempted after the death
+        self.spared = 0  # writes still accepted after `die(after=...)`
 
-    def die(self) -> None:
+    def die(self, *, after: int = 0) -> None:
+        """
+        Dead from now on, or after that many more writes (the hide-cursor code, say, but not the first frame).
+        """
+
         self.dead = True
+        self.spared = after
 
     def write(self, text: str) -> int:
-        if self.dead:
+        if self.dead and self.spared == 0:
             self.refused += 1
             raise OSError(errno.EIO, "Input/output error")
+        if self.dead:
+            self.spared -= 1
         return super().write(text)
 
 

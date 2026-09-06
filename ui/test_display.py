@@ -201,6 +201,54 @@ def test_a_loss_noticed_while_stopping_is_handled_too() -> None:
     assert display.headless and _live_of(display) is None
 
 
+def test_a_terminal_gone_before_the_display_opens_is_handled_without_raising() -> None:
+    """
+    `suspended()` reopens the display after a prompt; a terminal that died during the prompt fails rich's very
+    first write (the hide-cursor code), which used to escape `_start_live`.
+    """
+
+    file = DyingFile()
+    display = MinimalDisplay(Console(file=file, force_terminal=True, width=80, height=24))
+    file.die()
+    display._start_live()
+    assert display.headless and not display.enabled and _live_of(display) is None and file.refused >= 1
+
+
+def test_a_first_frame_that_fails_leaves_no_refresh_thread_behind() -> None:
+    """
+    Closing the display from inside rich's `start` (the first frame is written there) let `start` go on and
+    start its refresh thread on the stopped Live, ticking for the rest of the process.
+    """
+
+    threads = set(threading.enumerate())
+    file = DyingFile()
+    display = MinimalDisplay(Console(file=file, force_terminal=True, width=80, height=24))
+    file.die(after=1)  # the hide-cursor code gets through, the first frame does not
+    display._start_live()
+    assert "\x1b[?25l" in file.getvalue() and file.refused >= 1, "the death came between the two writes"
+    assert display.headless and _live_of(display) is None
+    assert not set(threading.enumerate()) - threads, "no refresh thread was started for the closed display"
+
+
+def test_silencing_the_terminal_redirects_only_the_display_s_own_descriptor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `prepare.py > report.txt`: the data dashboard draws on stderr; stdout is the report and must survive the
+    terminal's death.
+    """
+
+    class Stderr(io.StringIO):
+        def fileno(self) -> int:
+            return 2
+
+    stream = Stderr()
+    redirected: list[int] = []
+    monkeypatch.setattr(os, "dup2", lambda _null, fd: redirected.append(fd))
+    display = MinimalDisplay(Console(file=stream, force_terminal=True, width=80), stream=stream)
+    display._silence_terminal()
+    display._silence_terminal()
+    assert redirected == [2], "once, and stdout is left alone"
+
+
 def test_a_pending_loss_left_by_a_signal_handler_is_acted_on_at_the_next_refresh(caplog: pytest.LogCaptureFixture) -> None:
     display, file = _dying_display()
     live = _live_of(display)
