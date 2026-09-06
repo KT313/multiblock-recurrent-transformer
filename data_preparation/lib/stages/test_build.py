@@ -11,7 +11,9 @@ import logging
 import random
 import shutil
 import sys
+import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -304,6 +306,26 @@ def test_build_refuses_a_processed_manifest_it_cannot_parse(
     assert read_rows(processed) == rows, "nothing was deleted"
 
 
+def test_all_at_once_build_refuses_a_processed_manifest_it_cannot_parse_too(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    """
+    The all-at-once path (shuffled sources, minhash) rebuilds into a .tmp folder and swaps it over the old one; a
+    manifest nobody can parse is refused before that, like on the per-shard path, so the folder stays for the
+    repair step's confirmation.
+    """
+
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local, source={"shuffle": True})
+    build_source(cfg, "s", layout)
+    processed = layout.processed_dir("s")
+    rows = read_rows(processed)
+    (processed / "MANIFEST.json").write_text("{ not json")
+    with pytest.raises(RuntimeError, match="cannot be parsed; the repair step deletes the folder after confirmation"):
+        build_source(cfg, "s", layout)
+    assert (processed / "MANIFEST.json").read_text() == "{ not json" and read_rows(processed) == rows, "nothing was rebuilt or deleted"
+    assert not processed.with_name("s.tmp").exists() and not processed.with_name("s.old").exists()
+
+
 def test_stale_rebuild_removes_the_shards_of_the_previous_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
@@ -429,6 +451,60 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     m2 = build_source(cfg, "s", layout)
     assert m2.stats["input_rows"] == 9 and m2.stats["dedup"]["near_duplicates_removed"] == 2
     assert [r["text"] for r in read_rows(processed)] == [base, other, partial, short_a, short_b]
+
+
+def test_concurrent_in_process_builds_keep_their_own_pass_settings(
+    cfg_factory: CfgFactory, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    `lib/build/runner.py` builds several sources in threads of one process; with `pass_workers=1` each build's
+    decontamination and minhash pass must use its own source's settings, not whichever build set up last. The
+    stubbed benchmark loader holds both builds at a barrier, so their passes are set up side by side.
+    """
+
+    pytest.importorskip("datasketch")
+    base = " ".join(f"word{i}" for i in range(100))
+    near = base.replace("word50", "changed")
+    planted = {"gsm8k_test": " ".join(f"a{i}" for i in range(20)), "mmlu_test": " ".join(f"b{i}" for i in range(20))}
+    texts = [planted["gsm8k_test"], base, near, planted["mmlu_test"], GOOD]
+    gate = [threading.Barrier(1)]
+
+    def fake_load(names: list[str], n: int = 13, cache_dir: str | None = None) -> dict[str, set[str]]:
+        gate[0].wait(timeout=30)
+        return {name: get_ngram_set(planted[name], n) for name in names}
+
+    monkeypatch.setattr(stages_build, "load_benchmark_ngrams", fake_load)
+
+    def processing(ngram: int, benchmark: str, decontamination_ngram: int) -> ProcessingConfig:
+        dedup = DedupConfig(mode="minhash", threshold=0.8, num_perm=64, ngram=ngram, bloom_memory_mb=1)
+        return ProcessingConfig(min_chars=5, dedup=dedup, decontamination=DecontaminationConfig(enabled=True, benchmarks=[benchmark], ngram=decontamination_ngram))
+
+    write_local(layout.root.parent / "src", [{"text": t} for t in texts], "parquet")
+    sources = {
+        "a": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(2, "gsm8k_test", 5)),
+        "b": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(200, "mmlu_test", 13)),  # 200 > every text: nothing signed
+    }
+    cfg = cfg_factory(sources, max_seq_length=500)
+
+    def build_both(root: Path, threads: int) -> dict[str, tuple[list[str], dict[str, Any]]]:
+        target = DatasetLayout(root)
+        prepare_tokenizer(cfg, target)
+        for name in sources:
+            download(cfg, name, target, rows_needed=len(texts))
+        with ThreadPoolExecutor(threads) as pool:
+            manifests = list(pool.map(lambda name: build_source(cfg, name, target, pass_workers=1), sources))
+        results = {}
+        for name, manifest in zip(sources, manifests):
+            stats = dict(manifest.stats)
+            stats["dedup"] = {key: value for key, value in stats["dedup"].items() if key != "seconds"}
+            results[name] = ([r["text"] for r in read_rows(target.processed_dir(name))], stats)
+        return results
+
+    sequential = build_both(tmp_path / "sequential", threads=1)
+    assert sequential["a"][0] == [base, planted["mmlu_test"], GOOD], "a: its planted text decontaminated, `near` a near-duplicate at ngram 2"
+    assert sequential["b"][0] == [planted["gsm8k_test"], base, near, GOOD], "b: the other planted text, nothing signed at ngram 200"
+    gate[0] = threading.Barrier(2)
+    assert build_both(tmp_path / "concurrent", threads=2) == sequential
 
 
 def test_build_minhash_without_datasketch_raises(

@@ -107,6 +107,28 @@ def test_rows_stream_before_input_is_exhausted(pass_workers: int) -> None:
 
 
 @needs_datasketch
+def test_interleaved_in_process_passes_keep_their_own_parameters() -> None:
+    """
+    Builds run in threads of one process (`lib/build/runner.py`), each with its own dedup settings: two
+    in-process passes advanced turn by turn must keep exactly the rows each keeps on its own.
+    """
+
+    docs = make_corpus()
+    settings = {ngram: DedupConfig(mode="minhash", threshold=0.8, num_perm=32, ngram=ngram) for ngram in (2, 200)}  # 200 > every doc: nothing signed
+    alone = {ngram: [r["i"] for r in fuzzy_dedup(_rows(docs), dedup, {})] for ngram, dedup in settings.items()}
+    assert alone[2] != alone[200]
+    passes = {ngram: fuzzy_dedup(_rows(docs), dedup, {}) for ngram, dedup in settings.items()}
+    together: dict[int, list[int]] = {ngram: [] for ngram in passes}
+    while passes:
+        for ngram, rows in list(passes.items()):
+            try:
+                together[ngram].append(next(rows)["i"])
+            except StopIteration:
+                del passes[ngram]
+    assert together == alone
+
+
+@needs_datasketch
 def test_rows_too_short_for_an_ngram_are_not_collapsed() -> None:
     rows = [{"text": t} for t in ("int main() {}", "SELECT * FROM users;", "hello world", "another short doc")]
     stats: dict[str, Any] = {}

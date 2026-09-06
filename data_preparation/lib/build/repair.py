@@ -25,6 +25,12 @@ and unparsable-manifest deletions are then confirmed once with one list. dry_run
 records what would be done and touches nothing. A refused or impossible confirmation raises
 :class:`ConfirmationRequired` with the same list and nothing is changed, not even the unconfirmed repairs;
 prepare.py prints it and exits 2; train.py's auto-prepare never prompts.
+
+Raw folders are keyed by source name and shared by every dataset config, so a config that gives a name another
+identity (revision, tokenizer, text field) sees the other config's folder as stale. Its raw manifest records the
+file name of the config it was downloaded under (`Manifest.dataset_config`); a queued deletion of a folder written
+under another config is *foreign* and needs allow_foreign_raw (prepare.py --allow_foreign_raw) before the
+confirmation is even asked, `--yes` alone does not delete it.
 """
 
 from __future__ import annotations
@@ -54,6 +60,8 @@ Confirm = Callable[[str], bool]
 CONFIRMATION_HEADER = "The following folders will be deleted or truncated (raw: the dropped rows are downloaded again; processed: rebuilt from raw):"
 CONFIRMATION_QUESTION = "Continue? [y/N] "
 YES_ANSWERS = ("y", "yes")
+FOREIGN_HEADER = "The following raw folders were downloaded under another dataset config and would be deleted:"
+FOREIGN_HINT = "rerun with --allow_foreign_raw (prepare.py) to let this config delete them, nothing was changed"
 
 
 class RepairError(RuntimeError):
@@ -65,15 +73,17 @@ class RepairError(RuntimeError):
 class ConfirmationRequired(RepairError):
     """
     Raw folders have to be deleted or truncated past healthy shards but the user did not confirm: no terminal
-    to ask on, or the answer was not yes. Nothing was changed. message is the confirmation prompt (the list of
-    folders and why), report says what would have been done.
+    to ask on, or the answer was not yes, or (hint given) a raw folder of another dataset config is queued
+    without allow_foreign_raw. Nothing was changed. message is the confirmation prompt (the list of folders and
+    why), report says what would have been done.
     """
 
-    def __init__(self, report: RepairReport, message: str, *, interactive: bool) -> None:
+    def __init__(self, report: RepairReport, message: str, *, interactive: bool, hint: str | None = None) -> None:
         self.report = report
         self.message = message
         self.interactive = interactive
-        hint = "not confirmed, nothing was changed" if interactive else "no terminal to ask on; rerun with --yes (prepare.py) to confirm, nothing was changed"
+        if hint is None:
+            hint = "not confirmed, nothing was changed" if interactive else "no terminal to ask on; rerun with --yes (prepare.py) to confirm, nothing was changed"
         super().__init__(f"{message.rstrip()}\n{hint}")
 
 
@@ -91,6 +101,7 @@ class RepairAction:
     reason: str
     needs_confirmation: bool = False  # joins the one confirmation (healthy-shard-dropping truncation, unparsable manifest); raw deletions always ask
     keep_shards: int | None = None  # truncations: the good prefix the inspection found (`good_prefix_length`)
+    foreign_config: str | None = None  # raw deletions: the dataset config the folder was downloaded under, when it is another one
 
     def describe(self) -> str:
         return f"{self.action} {self.kind} {self.folder} ({self.source}): {self.reason}"
@@ -125,6 +136,13 @@ class RepairReport:
 
         return [action for action in self.actions if (action.kind == "raw" and action.action == "delete") or action.needs_confirmation]
 
+    def foreign_deletions_planned(self) -> list[RepairAction]:
+        """
+        The queued raw deletions of folders another dataset config downloaded (see the module docstring).
+        """
+
+        return [action for action in self.actions if action.foreign_config is not None]
+
 
 # --- the step ------------------------------------------------------------------------------------------------------------
 
@@ -137,6 +155,8 @@ def repair_broken_and_stale_folders(
     dry_run: bool = False,
     confirm: Confirm | None = None,
     sources: Iterable[str] | None = None,
+    config_name: str | None = None,
+    allow_foreign_raw: bool = False,
 ) -> RepairReport:
     """
     Inspect the raw and processed folder of every source in config (or of sources), confirm the raw
@@ -145,15 +165,21 @@ def repair_broken_and_stale_folders(
 
     assume_yes skips the prompt; otherwise confirm(message) decides when given, else the question is put on
     stdin when it is a terminal. Without a terminal, or on an answer other than yes, :class:`ConfirmationRequired`
-    is raised and nothing is changed. dry_run inspects only and returns the plan (performed False) without
-    raising. Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
+    is raised and nothing is changed. config_name (the dataset config's file name) tells a raw folder another
+    config downloaded: its deletion raises :class:`ConfirmationRequired` naming allow_foreign_raw unless that is
+    given, before any prompt. dry_run inspects only and returns the plan (performed False) without raising.
+    Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
     """
 
     planned = RepairReport()
     for name in config.sources if sources is None else sources:
-        inspect_source(config, name, layout, planned)
+        inspect_source(config, name, layout, planned, config_name=config_name)
     if dry_run:
         return planned
+    foreign = planned.foreign_deletions_planned()
+    if foreign and not allow_foreign_raw:
+        lines = [FOREIGN_HEADER, *(f"  {action.source}: {action.reason}" for action in foreign)]
+        raise ConfirmationRequired(planned, "\n".join(lines), interactive=False, hint=FOREIGN_HINT)
     queued = planned.confirmations_planned()
     if queued:
         confirm_repairs(queued, planned, assume_yes=assume_yes, confirm=confirm)
@@ -164,7 +190,7 @@ def repair_broken_and_stale_folders(
 # --- inspection (read-only) ----------------------------------------------------------------------------------------------
 
 
-def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, report: RepairReport) -> None:
+def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, report: RepairReport, *, config_name: str | None = None) -> None:
     """
     Plan the repairs of one source: the raw folder, then the processed folder and the swap leftovers against
     the raw shards that remain. A raw manifest nobody can parse is listed as left alone and ends the inspection:
@@ -175,16 +201,19 @@ def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, repo
     if inspection.state == "unreadable":
         _plan(report, name, layout.raw_dir(name), "raw", "leave", inspection.reason)
         return
-    raw_shards = inspect_raw_folder(config, name, layout, inspection, report)
+    raw_shards = inspect_raw_folder(config, name, layout, inspection, report, config_name=config_name)
     inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, report)
     inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, report)
 
 
-def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, inspection: RawInspection, report: RepairReport) -> ShardList | None:
+def inspect_raw_folder(
+    config: DatasetConfig, name: str, layout: DatasetLayout, inspection: RawInspection, report: RepairReport, *, config_name: str | None = None
+) -> ShardList | None:
     """
     Plan what happens to the raw folder of name (inspection is its :func:`inspect_raw` state) and return the
     shards it will hold afterwards as [[name, rows], ...] (empty when there is no folder), or None when the
-    folder is queued for deletion.
+    folder is queued for deletion. A stale or outdated folder whose manifest names another dataset config than
+    config_name (both known) is queued as foreign.
     """
 
     folder = layout.raw_dir(name)
@@ -194,7 +223,11 @@ def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, 
             raise RepairError(f"{name}: {folder} holds shards but no manifest; refusing to guess where the rows came from; delete the directory to download the source again")
         return []
     if inspection.state != "current":
-        _plan(report, name, folder, "raw", "delete", inspection.reason)
+        reason, foreign = inspection.reason, None
+        if config_name is not None and manifest.dataset_config not in (None, config_name):
+            foreign = manifest.dataset_config
+            reason += f"; downloaded under dataset config {foreign}, deleting it needs --allow_foreign_raw"
+        _plan(report, name, folder, "raw", "delete", reason, foreign_config=foreign)
         return None
     good, problem = good_prefix_length(folder, manifest)
     if problem is None:
@@ -252,10 +285,13 @@ def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path
 
 def _plan(
     report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *,
-    needs_confirmation: bool = False, keep_shards: int | None = None,
+    needs_confirmation: bool = False, keep_shards: int | None = None, foreign_config: str | None = None,
 ) -> None:  # fmt: skip
     report.actions.append(
-        RepairAction(source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation, keep_shards=keep_shards)
+        RepairAction(
+            source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation,
+            keep_shards=keep_shards, foreign_config=foreign_config,
+        )
     )
 
 

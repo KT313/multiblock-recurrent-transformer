@@ -311,6 +311,20 @@ def test_processing_validation() -> None:
     assert ProcessingConfig(min_chars=0).min_chars == 0
 
 
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"ngram": 0}, "decontamination.ngram must be positive"),
+        ({"threshold": -0.1}, r"decontamination.threshold must be in \[0, 1\]"),
+        ({"threshold": 1.5}, r"decontamination.threshold must be in \[0, 1\]"),
+    ],
+)
+def test_decontamination_validation(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        dc.DecontaminationConfig(**kwargs)
+    assert (dc.DecontaminationConfig(threshold=0.0).threshold, dc.DecontaminationConfig(threshold=1.0).threshold) == (0.0, 1.0)
+
+
 def test_weights_tolerate_float_noise() -> None:
     d = _minimal()
     d["stages"][0]["train"] = {"pre": 0.1 + 0.2 + 0.7}  # 1.0000000000000002
@@ -473,6 +487,28 @@ def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> No
         _build(val_only)
     val_only["sources"]["hold"]["rows"] = 10
     assert _build(val_only).rows_needed("hold") == 12
+
+
+def test_a_minhash_source_over_its_lower_build_cap_is_refused_at_load(tmp_path: Path) -> None:
+    """
+    `dedup.mode: minhash` builds all-at-once too and holds an LSH index of every kept row on top, so its cap is
+    lower than the shuffle cap; the same rows under exact dedup stream per shard and load fine.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
+    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 sequences; × 1.2 ÷ 0.95 = 394,737 rows: under the shuffle cap
+    with pytest.raises(ValueError, match=re.escape(
+        "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 394,737 rows exceed "
+        "the limit of 250,000. Use dedup.mode=exact or a smaller source."
+    )):
+        load_dataset_config(_write(tmp_path, d))
+    assert dc.MINHASH_BUILD_MAX_ROWS == 250_000 < dc.SHUFFLED_BUILD_MAX_ROWS
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "exact"}}
+    assert _build(d).rows_needed("pre") == 394_737
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
+    d["stages"][0]["tokens"] = 1000
+    assert _build(d).source_processing("pre").dedup.mode == "minhash"
 
 
 def test_source_processing_override() -> None:
@@ -866,6 +902,27 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
     assert _build(d).processed_hash("ins") != base.processed_hash("ins")
     d["sources"]["ins"]["shuffle"] = True  # the same as the instruct default
     assert _build(d).processed_hash("ins") == base.processed_hash("ins")
+
+
+def test_processed_hash_pins_the_benchmarks_only_with_decontamination_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    What a decontaminated folder was filtered against is the benchmarks at their pinned Hub commits: a re-pin
+    rebuilds it and leaves every folder without decontamination alone.
+    """
+
+    from data_preparation.lib.stages import benchmarks as bm
+
+    off = _build(_minimal()).processed_hash("pre")
+    d = _minimal()
+    d["processing"] = {"decontamination": {"enabled": True, "benchmarks": ["gsm8k_test"]}}
+    on = _build(d).processed_hash("pre")
+    assert on != off
+    monkeypatch.setitem(bm.BENCHMARKS, "gsm8k_test", bm.BENCHMARKS["gsm8k_test"]._replace(revision="0" * 40))
+    assert _build(d).processed_hash("pre") != on
+    assert _build(_minimal()).processed_hash("pre") == off
+    d["processing"]["decontamination"]["benchmarks"] = ["gsm8k_test", "nope"]
+    with pytest.raises(KeyError, match="unknown benchmark"):
+        _build(d).processed_hash("pre")
 
 
 def test_hash_payload_golden_defaults() -> None:

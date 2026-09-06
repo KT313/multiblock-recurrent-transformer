@@ -95,6 +95,7 @@ def prepare(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     confirm: Confirm | None = None,
+    allow_foreign_raw: bool = False,
 ) -> DatasetReport:
     """
     Materialise the dataset config at config_path under dataset_dir (see the module docstring) and return
@@ -102,7 +103,9 @@ def prepare(
 
     assume_yes answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
     cannot be parsed) without asking; otherwise confirm (or the terminal) is asked once and a refusal raises
-    :class:`ConfirmationRequired` before anything is changed. dry_run reports what the repair and the first
+    :class:`ConfirmationRequired` before anything is changed. A raw folder another dataset config downloaded
+    (raw folders are shared by name) is deleted only with allow_foreign_raw on top, whatever the answer;
+    raw manifests written by this run carry the config's file name for that. dry_run reports what the repair and the first
     round would do and writes nothing (not even the lock file); its report is the one :func:`status` gives for the
     same tree. steps (a subset of :data:`STEPS`) and sources restrict the work, and the satisfaction check,
     to the named steps / sources; the returned report always covers the whole config. reopen names sources
@@ -110,6 +113,7 @@ def prepare(
     """
 
     config = load_dataset_config(config_path)
+    config_name = Path(config_path).name
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
     selected = checked_sources(config, sources)
@@ -120,7 +124,10 @@ def prepare(
     with build_lock(layout.root) if not dry_run else nullcontext():
         if "tokenizer" in active_steps and not dry_run:
             prepare_tokenizer(config, layout, hf_token=hf_token)
-        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected)
+        repair_report = repair_broken_and_stale_folders(
+            config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected,
+            config_name=config_name, allow_foreign_raw=allow_foreign_raw,
+        )
         log_repair(repair_report)
         reopen_sources(config, layout, reopened, dry_run=dry_run)
         for round_number in range(1, MAX_ROUNDS + 1):
@@ -132,7 +139,7 @@ def prepare(
             set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download + build")
             download_and_build_missing(
                 download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
-                num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop,
+                num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
             )
             if every_source_satisfies_its_budget(config, layout, sources=selected):
                 break
@@ -152,7 +159,7 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
-    repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True)
+    repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name)
     log_repair(repair_report)
     return assess_dataset_state(config, layout, repair_report)
 
@@ -172,6 +179,7 @@ def download_and_build_missing(
     pass_workers: int,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
+    config_name: str | None = None,
 ) -> None:
     """
     One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
@@ -180,10 +188,11 @@ def download_and_build_missing(
     (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`; each build hands
     pass_workers to its optional cleaning passes. Sources with nothing to download are built right away; every
     other source is built as soon as its download job finished, so a source is never built while its own download
-    runs. steps restricts the round to its download / build part, sources to the named sources.
+    runs. steps restricts the round to its download / build part, sources to the named sources; config_name
+    (the dataset config's file name) is recorded in the raw manifests the downloads create.
     """
 
-    downloads = download_jobs(download_plan, config, layout, hf_token) if "download" in steps else []
+    downloads = download_jobs(download_plan, config, layout, hf_token, config_name) if "download" in steps else []
     downloading = {name for job in downloads for name in job.sources}
     pending = sources_with_pending_raw_shards(config, layout, sources) if "build" in steps else []
     builds = [build_source_job(config, name, layout, pass_workers) for name in pending if name not in downloading]
@@ -227,7 +236,9 @@ class Job:
     action: Callable[[StopCheck], object]
 
 
-def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None) -> list[Job]:
+def download_jobs(
+    download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None, config_name: str | None = None
+) -> list[Job]:
     """
     One job per source with rows to fetch; the github_code sources of one repo are grouped into one. The
     download takes a target (rows_needed=), so every job is asked for :attr:`SourceLedger.rows_target`: the
@@ -239,11 +250,11 @@ def download_jobs(download_plan: DownloadPlan, config: DatasetConfig, layout: Da
     jobs: list[Job] = []
     grouped: set[str] = set()
     for names in github_code_groups(config, list(rows_needed)):
-        jobs.append(github_code_group_job(config, names, layout, {name: rows_needed[name] for name in names}, hf_token))
+        jobs.append(github_code_group_job(config, names, layout, {name: rows_needed[name] for name in names}, hf_token, config_name))
         grouped.update(names)
     for name, needed in rows_needed.items():
         if name not in grouped:
-            jobs.append(download_source_job(config, name, layout, needed, hf_token))
+            jobs.append(download_source_job(config, name, layout, needed, hf_token, config_name))
     return jobs
 
 
@@ -262,16 +273,22 @@ def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str
     return [group for group in groups.values() if len(group) >= 2]
 
 
-def download_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None) -> Job:
+def download_source_job(
+    config: DatasetConfig, name: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None, config_name: str | None = None
+) -> Job:
     def action(should_stop: StopCheck) -> object:
-        return download(config, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop)
+        return download(config, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name)
 
     return Job("source", name, (name,), action)
 
 
-def github_code_group_job(config: DatasetConfig, names: list[str], layout: DatasetLayout, rows_needed: dict[str, int], hf_token: str | None) -> Job:
+def github_code_group_job(
+    config: DatasetConfig, names: list[str], layout: DatasetLayout, rows_needed: dict[str, int], hf_token: str | None, config_name: str | None = None
+) -> Job:
     def action(should_stop: StopCheck) -> object:
-        return download_github_code_group(config, names, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop)
+        return download_github_code_group(
+            config, names, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name
+        )
 
     return Job("github_code group", ", ".join(names), tuple(names), action)
 

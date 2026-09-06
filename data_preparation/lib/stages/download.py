@@ -165,11 +165,19 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
 
 
 def new_manifest(
-    config: DatasetConfig, source: str, source_hash: str, stage: str, *, tokens: bool = False, truncated_at_tokens: int | None = None
+    config: DatasetConfig,
+    source: str,
+    source_hash: str,
+    stage: str,
+    *,
+    tokens: bool = False,
+    truncated_at_tokens: int | None = None,
+    dataset_config: str | None = None,
 ) -> Manifest:
     """
     An empty manifest for stage; with tokens it records how token counts are measured, raw manifests
-    record truncated_at_tokens (the max_seq_length their rows were cut / dropped at).
+    record truncated_at_tokens (the max_seq_length their rows were cut / dropped at) and dataset_config
+    (the file name of the config the folder is downloaded under, when the caller knows it).
     """
 
     return Manifest(
@@ -180,6 +188,7 @@ def new_manifest(
         tokenizer=config.tokenizer.name if tokens and config.token_count == "tokenizer" else None,
         truncated_at_tokens=truncated_at_tokens,
         versions=library_versions(),
+        dataset_config=dataset_config,
     )
 
 
@@ -347,9 +356,11 @@ def download(
     shard_size: int = DEFAULT_SHARD_SIZE,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
+    config_name: str | None = None,
 ) -> Manifest:
     """
-    Append raw shards until rows_needed rows are on disk (no-op if they already are).
+    Append raw shards until rows_needed rows are on disk (no-op if they already are). config_name (the
+    dataset config's file name) is recorded in a manifest this call creates, for the repair step.
 
     The folder's manifest must be current (:func:`inspect_raw`): a stale or outdated one raises
     :class:`RawFolderError` (nothing is deleted here), a missing one starts the folder from shard 0 (refused when
@@ -373,7 +384,9 @@ def download(
     complete shard without counting anything twice.
     """
 
-    folder, increment = _plan_increment(config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout), should_stop=should_stop)
+    folder, increment = _plan_increment(
+        config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout), should_stop=should_stop, config_name=config_name
+    )
     if increment is None:
         return folder.manifest
     log.info("%s: fetching %d rows from offset %d -> %s", name, increment.rows_to_keep, folder.rows_fetched, folder.directory)
@@ -412,10 +425,12 @@ def _log_increment(name: str, counters: _IncrementCounters, manifest: Manifest) 
     )
 
 
-def _raw_folder_to_append_to(config: DatasetConfig, name: str, layout: DatasetLayout, *, should_stop: StopCheck | None = None) -> RawFolder:
+def _raw_folder_to_append_to(
+    config: DatasetConfig, name: str, layout: DatasetLayout, *, should_stop: StopCheck | None = None, config_name: str | None = None
+) -> RawFolder:
     """
     The raw folder of name around its current manifest, or a fresh one (truncated_at_tokens =
-    max_seq_length) when the directory has none. Refused when the folder is stale, outdated or unreadable
+    max_seq_length, dataset_config = config_name) when the directory has none. Refused when the folder is stale, outdated or unreadable
     (:class:`RawFolderError`; deleting it is the repair step's or the user's decision) or holds shards without any manifest:
     nothing would say where those rows came from, and starting over would delete them.
     """
@@ -428,7 +443,9 @@ def _raw_folder_to_append_to(config: DatasetConfig, name: str, layout: DatasetLa
     if manifest is None:
         if has_shards(raw_dir):
             raise RuntimeError(f"{name}: {raw_dir} holds shards but no manifest; delete the directory to download the source again")
-        manifest = new_manifest(config, name, config.raw_hash(name), "raw", tokens=True, truncated_at_tokens=config.max_seq_length)
+        manifest = new_manifest(
+            config, name, config.raw_hash(name), "raw", tokens=True, truncated_at_tokens=config.max_seq_length, dataset_config=config_name
+        )
     return RawFolder(raw_dir, manifest, config_cap=config.max_seq_length, should_stop=should_stop)
 
 
@@ -595,6 +612,7 @@ def _plan_increment(
     *,
     token_counter: Callable[[], TokenCounter],
     should_stop: StopCheck | None,
+    config_name: str | None = None,
 ) -> tuple[RawFolder, _Increment | None]:
     """
     Open the raw folder of name and decide what this pass fetches for it: None when there is nothing to do
@@ -602,7 +620,7 @@ def _plan_increment(
     """
 
     source = fetch_source(config, config.sources[name])
-    folder = _raw_folder_to_append_to(config, name, layout, should_stop=should_stop)
+    folder = _raw_folder_to_append_to(config, name, layout, should_stop=should_stop, config_name=config_name)
     folder.reopen_if_check_limit_grew(source.check_limit)
     if folder.exhausted:
         log.info("%s: source exhausted after %d rows, nothing more to fetch", name, folder.rows_fetched)
@@ -798,6 +816,7 @@ def download_github_code_group(
     shard_size: int = DEFAULT_SHARD_SIZE,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
+    config_name: str | None = None,
 ) -> dict[str, Manifest]:
     """
     :func:`download` for several `github_code` sources of one repo in a single pass over its files: every
@@ -819,7 +838,9 @@ def download_github_code_group(
     results: dict[str, Manifest] = {}
     increments: list[_Increment] = []
     for name in names:
-        folder, increment = _plan_increment(config, name, layout, rows_needed[name], token_counter=token_counter, should_stop=should_stop)
+        folder, increment = _plan_increment(
+            config, name, layout, rows_needed[name], token_counter=token_counter, should_stop=should_stop, config_name=config_name
+        )
         results[name] = folder.manifest
         if increment is not None:
             increments.append(increment)

@@ -4,7 +4,7 @@ Entry point for dataset preparation.
 
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--reopen S ...] [--yes] [--dry_run]
-                                                [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
+                                                [--allow_foreign_raw] [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
@@ -13,7 +13,8 @@ Entry point for dataset preparation.
 prepare materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
 (lib/build/runner.py). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
 manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
-and without a terminal the command prints the list and exits 2 with nothing changed. --reopen clears the exhausted
+and without a terminal the command prints the list and exits 2 with nothing changed. A raw folder downloaded under
+another dataset config (raw folders are shared by source name) goes only with --allow_foreign_raw on top. --reopen clears the exhausted
 flag of the named sources first (a loader that yielded fewer rows than asked is latched exhausted; say so when it
 has more rows now). status prints what the
 repair step would do plus the status table and exits 0 iff the dataset is complete. describe renders the config
@@ -117,6 +118,7 @@ def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--reopen", nargs="+", default=None, metavar="NAME", help="clear the exhausted flag of these sources before planning (their loader has more rows now)")
     sub.add_argument("--yes", "-y", action="store_true", help="answer the repair confirmation (stale / outdated raw folders, unparsable processed manifests) without asking")
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
+    sub.add_argument("--allow_foreign_raw", action="store_true", help="let the repair step delete stale / outdated raw folders that another dataset config downloaded (they are shared by source name)")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
     sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")
@@ -149,6 +151,7 @@ def run_prepare(args: argparse.Namespace) -> None:
             max_parallel_downloads=args.max_parallel_downloads,
             assume_yes=args.yes,
             dry_run=args.dry_run,
+            allow_foreign_raw=args.allow_foreign_raw,
             steps=STEPS if args.steps is None else args.steps,
             sources=args.sources,
             reopen=args.reopen,

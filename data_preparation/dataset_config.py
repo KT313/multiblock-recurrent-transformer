@@ -29,6 +29,7 @@ from typing import Any, Literal, Optional
 
 from jsonargparse import ArgumentError, ArgumentParser
 
+from data_preparation.lib.stages.benchmarks import benchmark_revisions
 from data_preparation.lib.stages.truncation import TOKEN_RULE
 
 SourceKind = Literal["pretrain", "instruct"]
@@ -53,6 +54,9 @@ SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
 # derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
 # (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
+MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, plus its LSH index; the same check, a lower limit
+# derivation: the LSH index holds every kept row at roughly 3-5 KB (num_perm 256, `lib/stages/fuzzy_dedup.py`) next
+# to the texts above, so 250k rows is ~1 GB of index plus a worst case of ~2.5 GB of text held once.
 
 # --- hash annotations --------------------------------------------------------------------------------------------------
 #
@@ -161,6 +165,12 @@ class DecontaminationConfig:
     benchmarks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARKS), metadata=_PROCESSED)  # test sets to check (lib/stages/benchmarks.py)
     ngram: int = field(default=13, metadata=_PROCESSED)  # word n-gram size compared between a document and the benchmarks
     threshold: float = field(default=0.1, metadata=_PROCESSED)  # share of a document's n-grams found in one benchmark
+
+    def __post_init__(self) -> None:
+        if self.ngram <= 0:
+            raise ValueError("decontamination.ngram must be positive")
+        if not 0.0 <= self.threshold <= 1.0:
+            raise ValueError("decontamination.threshold must be in [0, 1]")
 
 
 @dataclass
@@ -463,18 +473,22 @@ class DatasetConfig:
         (`lib/stages/build.py`). A config can legally ask that of a huge source and OOM hours into the build, so a
         shuffled source whose planned row requirement (:meth:`rows_needed` at the config's tokens-per-row estimate) exceeds
         `SHUFFLED_BUILD_MAX_ROWS` is refused here; both `prepare.py` and training's auto-prepare load the config
-        before any work.
+        before any work. A pretrain source under `dedup.mode: minhash` takes the same all-at-once path and holds
+        an LSH index of every kept row on top, so it is refused above the lower `MINHASH_BUILD_MAX_ROWS`.
         """
 
-        for name in self.sources:
-            if not self.shuffle_of(name):
-                continue
+        for name, source in self.sources.items():
             needed = self.rows_needed(name)
-            if needed > SHUFFLED_BUILD_MAX_ROWS:
+            if self.shuffle_of(name) and needed > SHUFFLED_BUILD_MAX_ROWS:
                 raise ValueError(
                     f"{name}: shuffle=true builds all-at-once in memory; {needed:,} rows exceed the limit of "
                     f"{SHUFFLED_BUILD_MAX_ROWS:,}. Split the source or turn shuffle off. "
                     "(A read-time shuffle that would lift this limit is not implemented.)"
+                )
+            if source.kind == "pretrain" and self.source_processing(name).dedup.mode == "minhash" and needed > MINHASH_BUILD_MAX_ROWS:
+                raise ValueError(
+                    f"{name}: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; "
+                    f"{needed:,} rows exceed the limit of {MINHASH_BUILD_MAX_ROWS:,}. Use dedup.mode=exact or a smaller source."
                 )
 
     # --- source usage ----------------------------------------------------------------------------------------------
@@ -633,19 +647,23 @@ class DatasetConfig:
         the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
         input_inversions, the resolved shuffle and the seed behind both. These four are written out
         rather than taken from :func:`hash_payload`, because the build uses their resolved values (shuffle_of,
-        source_processing) whether or not they were spelled in the YAML. A change rebuilds processed/ from
-        the raw shards (no download).
+        source_processing) whether or not they were spelled in the YAML. With decontamination on, the pinned
+        Hub revisions of the benchmarks it checks against (`lib/stages/benchmarks.py`) enter too: a re-pin changes
+        what the build filtered out. A change rebuilds processed/ from the raw shards (no download).
         """
 
         source = self.sources[source_name]
+        processing = self.source_processing(source_name)
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
             "max_seq_length": self.max_seq_length,
-            "processing": hash_payload(self.source_processing(source_name), "processed"),
+            "processing": hash_payload(processing, "processed"),
             "input_inversions": source.input_inversions,
             "shuffle": self.shuffle_of(source_name),
             "seed": source.seed,
         }
+        if processing.decontamination.enabled:
+            payload["benchmark_revisions"] = benchmark_revisions(list(processing.decontamination.benchmarks))
         return _stable_hash(payload)
 
     def tokenizer_hash(self) -> str:

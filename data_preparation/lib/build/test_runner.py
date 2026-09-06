@@ -14,12 +14,14 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from data_preparation import prepare as prepare_cli
 from data_preparation.conftest import REPO, REV, FakeHub
@@ -800,6 +802,35 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
     assert report.complete and "without asking" in caplog.text
     raw = Manifest.load(raw_dir)
     assert raw is not None and raw.token_count == "estimate" and raw.is_current(cfg.raw_hash("p"))
+
+
+def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(
+    cfg_factory: CfgFactory, layout: DatasetLayout, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Raw folders are shared by source name: config b gives `p` another loader identity, so a's raw folder is
+    stale for it. b's prepare refuses to delete it (`--yes` or not) until allowed, then downloads its own and
+    records itself in the manifest; status names the flag.
+    """
+
+    def config(path: Path, seed: int) -> Path:
+        cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=seed)}, tokens=500)
+        path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
+        return path
+
+    a, b = config(tmp_path / "a.yaml", 0), config(tmp_path / "b.yaml", 1)
+    assert prepare(a, layout.root, assume_yes=True).complete
+    raw = Manifest.load(layout.raw_dir("p"))
+    assert raw is not None and raw.dataset_config == "a.yaml"
+    with pytest.raises(ConfirmationRequired, match="downloaded under dataset config a.yaml, deleting it needs --allow_foreign_raw"):
+        prepare(b, layout.root, assume_yes=True)
+    assert Manifest.load(layout.raw_dir("p")) == raw, "nothing was changed"
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        assert not status(b, layout.root).complete
+    assert "would delete raw" in caplog.text and "deleting it needs --allow_foreign_raw" in caplog.text
+    assert prepare(b, layout.root, assume_yes=True, allow_foreign_raw=True).complete
+    replaced = Manifest.load(layout.raw_dir("p"))
+    assert replaced is not None and replaced.dataset_config == "b.yaml" and replaced.source_hash != raw.source_hash
 
 
 def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
