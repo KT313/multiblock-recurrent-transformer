@@ -61,7 +61,7 @@ def test_structure_follows_config(tiny_model: RecurrentGPT) -> None:
     assert len(t.coda) == cfg.n_layers_in_coda == 1
     assert t.wte.weight.shape == (cfg.padded_vocab_size, cfg.n_embd)
     assert tiny_model.lm_head.weight is t.wte.weight  # tied
-    assert tiny_model.freqs_cis.shape == (1, cfg.block_size, 1, cfg.head_size // 2, 2)
+    assert tiny_model.freqs_cis.shape == (1, cfg.model_max_sequence_length, 1, cfg.head_size // 2, 2)
     assert tiny_model.emb_scale == pytest.approx(cfg.n_embd**0.5)
     assert sum(p.numel() for p in tiny_model.parameters()) == 256_256
 
@@ -155,7 +155,7 @@ def test_transformer_module_dict_and_buffer() -> None:
 def test_precompute_freqs_cis_method_matches_function() -> None:
     m = seeded_tiny()
     cfg = m.config
-    expected = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)
+    expected = precompute_freqs_cis(cfg.head_size, cfg.model_max_sequence_length, cfg.rope_settings.rope_base)
     assert torch.equal(m._precompute_freqs_cis(), expected)
     assert torch.equal(m.freqs_cis, expected)
 

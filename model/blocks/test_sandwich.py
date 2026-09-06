@@ -21,7 +21,7 @@ def make_block(**overrides: Any) -> tuple[SandwichBlock, RecurrentConfig, Tensor
     cfg = tiny_config(**overrides)
     torch.manual_seed(0)
     block = SandwichBlock(cfg)
-    freqs = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)
+    freqs = precompute_freqs_cis(cfg.head_size, cfg.model_max_sequence_length, cfg.rope_settings.rope_base)
     return block, cfg, freqs
 
 

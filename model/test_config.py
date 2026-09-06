@@ -126,7 +126,7 @@ def test_crow_architecture_yaml() -> None:
     assert cfg.mean_backprop_layers == 3 * 4 * 8
     assert cfg.padded_vocab_size == 32768
     assert cfg.head_size == 64
-    assert cfg.intermediate_size == 4096 and cfg.block_size == 2048 and cfg.vocab_size == 32000
+    assert cfg.intermediate_size == 4096 and cfg.model_max_sequence_length == 2048 and cfg.vocab_size == 32000
     assert isinstance(cfg.norm_eps, float) and cfg.norm_eps == 1e-6  # YAML floats need a dot: 1e-6 would be a str
     assert cfg.rope_settings == RoPESettings(rope_base=50_000)
     assert cfg.qk_bias is True and cfg.tie_embeddings is True
@@ -134,7 +134,7 @@ def test_crow_architecture_yaml() -> None:
 
 def test_tiny_architecture_yaml() -> None:
     cfg = tiny()
-    assert (cfg.block_size, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
+    assert (cfg.model_max_sequence_length, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
     assert (cfg.vocab_size, cfg.padded_vocab_size, cfg.head_size) == (512, 512, 16)
     assert cfg.n_layers_in_prelude == 2 and cfg.n_layers_in_coda == 1
     assert cfg.n_layers_in_recurrent_block == [1, 1]

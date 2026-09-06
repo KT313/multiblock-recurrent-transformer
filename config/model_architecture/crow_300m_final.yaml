@@ -12,7 +12,7 @@
 # only that one value and are therefore not listed here).
 
 # Core sizes
-block_size: 2048               # maximum sequence length (size of the RoPE table); the run config's block_size must equal it
+model_max_sequence_length: 2048   # the longest sequence the model accepts (the RoPE table covers this many positions); >= the run config's training_max_sequence_length
 n_embd: 1024                   # hidden size of the residual stream
 intermediate_size: 4096        # hidden size of the GatedMLP (null: 4 * n_embd)
 num_attention_heads: 16        # attention heads; n_embd must be divisible by it (head size = n_embd / heads = 64)

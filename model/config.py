@@ -70,7 +70,7 @@ class RecurrentConfig:
     """
 
     # Core
-    block_size: int = 2048
+    model_max_sequence_length: int = 2048  # the longest sequence the model accepts: the RoPE table covers this many positions (a checkpoint or config.json still saying block_size does not load)
     n_embd: int = 1024
     intermediate_size: int | None = None
     num_attention_heads: int = 16

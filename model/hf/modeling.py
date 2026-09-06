@@ -25,7 +25,7 @@ from ..model import RecurrentGPT
 
 # The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
-    "block_size",
+    "model_max_sequence_length",
     "n_embd",
     "intermediate_size",
     "num_attention_heads",

@@ -185,10 +185,10 @@ class RecurrentGPT(torch.nn.Module):
 
     def _precompute_freqs_cis(self) -> Tensor:
         """
-        The RoPE table for every position up to `block_size`.
+        The RoPE table for every position up to `model_max_sequence_length`.
         """
 
-        return precompute_freqs_cis(self.config.head_size, self.config.block_size, self.config.rope_settings.rope_base)
+        return precompute_freqs_cis(self.config.head_size, self.config.model_max_sequence_length, self.config.rope_settings.rope_base)
 
     def reset_parameters(self) -> None:
         """

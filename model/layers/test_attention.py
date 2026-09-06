@@ -29,7 +29,7 @@ def make_attn(**overrides: Any) -> tuple[CausalSelfAttention, RecurrentConfig, T
     cfg = tiny_config(**overrides)
     torch.manual_seed(0)
     attn = CausalSelfAttention(cfg)
-    freqs = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)
+    freqs = precompute_freqs_cis(cfg.head_size, cfg.model_max_sequence_length, cfg.rope_settings.rope_base)
     return attn, cfg, freqs
 
 
