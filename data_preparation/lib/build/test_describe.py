@@ -17,9 +17,9 @@ TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 EXPECTED_TINY_STAGE = """### Stage 1: `pretrain_a` (8.2K tokens, transition 25%)
 
-| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |
-|---|---:|---:|---:|---:|---:|
-| `synthetic_pretrain` | 100.00% | 8.2K | 32 | 224 | 7.2K |
+| Train source | Weight | Tokens | Tokens/row (est.) | Rows (est.) |
+|---|---:|---:|---:|---:|
+| `synthetic_pretrain` | 100.00% | 8.2K | 224 | 37 |
 
 Validation: `synthetic_pretrain` at 100%
 """
@@ -39,11 +39,11 @@ def test_tiny_snippets_and_determinism() -> None:
     assert GENERATED_WITH.format(config="config/datasets/tiny.yaml") + " > docs/data_mixture.md" in text
     assert EXPECTED_TINY_STAGE in text and EXPECTED_TINY_SPLIT in text
     assert "### Stage 3: `finetune` (4.1K tokens, transition 0%)" in text
-    assert "| `synthetic_instruct` | 100.00% | 4.1K | 16 | 64 | 1.0K |" in text
+    assert "| `synthetic_instruct` | 100.00% | 4.1K | 64 | 64 |" in text  # 4096 tokens at the 64 tokens/row estimate
     # budgets are the run-total weight-schedule integral: instruct ramps in over pretrain_b's transition window
-    # (8192 × 0.25 / 2 + 4096 = 5120 tokens), pretrain ramps out over it (8192 + 8192 × 0.875 = 15360 tokens)
-    assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 20 sequences (5.1K tokens), input inversions 10%, shuffled (seed 2) |" in text
-    assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 60 sequences (15.4K tokens) |" in text
+    # (8192 × 0.25 / 2 + 4096 = 5120 tokens = 80 rows at 64), pretrain ramps out over it (8192 + 8192 × 0.875 = 15360 tokens = 68.6 rows at 224)
+    assert "| `synthetic_instruct` | instruct | `synthetic` | generated (seed 2) | - | budget 5.1K tokens (~80 rows at 64 tokens/row), input inversions 10%, shuffled (seed 2) |" in text
+    assert "| `synthetic_pretrain` | pretrain | `synthetic` | generated (seed 0) | - | budget 15.4K tokens (~69 rows at 224 tokens/row) |" in text
     assert "- tokenizer: `synthetic` (synthetic)" in text and "- `token_count`: `tokenizer`" in text
     assert "- `block_size`: 256" in text and "- `validation_fraction`: 5%" in text
     assert "- dedup: `exact` (normalize: on, Bloom filter 1 MB per source)" in text and "- quality filter: off" in text
@@ -70,15 +70,16 @@ def test_crow_lists_every_source_and_matches_planner_budgets() -> None:
         assert src.revision is not None and src.revision[:12] in text
     for stage in cfg.stages:
         assert f"`{stage.name}`" in text
-    # per-source budgets shown in the source table are the planner's sequence budgets: the integral of the weight
-    # schedule over the whole run (stages sharing a source add up, transition windows count as trapezoids)
-    budget = cfg.sequence_budget("fineweb_edu")
-    assert budget == ceil(2_594_250_000 / 2048) == 1_266_724
-    assert f"budget {budget:,} sequences ({_tokens(budget * 2048)} tokens)" in text
-    assert f"| `fineweb_edu` | 65.00% | 2.15B | 1,047,364 | 2000 | {_tokens(1_047_364 * 2000)} |" in text  # 2000 tokens/row of 2048
+    # per-source budgets shown in the source table are the planner's token budgets: the integral of the weight
+    # schedule over the whole run (stages sharing a source add up, transition windows count as trapezoids), and
+    # the rows they are at the config's tokens-per-row estimate
+    budget = cfg.token_budget("fineweb_edu")
+    assert budget == 2_594_250_000 and cfg.rows_budget("fineweb_edu") == ceil(budget / 2000) == 1_297_125
+    assert f"budget {_tokens(budget)} tokens (~1,297,125 rows at 2,000 tokens/row)" in text
+    assert "| `fineweb_edu` | 65.00% | 2.15B | 2,000 | 1,072,500 |" in text  # 2145M tokens at 2000 tokens/row
     # the finetune stage renders like the others: eight instruct sources with their shares
     assert "### Stage 3: `finetune` (150.0M tokens, transition 0%)" in text
-    assert f"| `flan` | 40.00% | 60.0M | {ceil(60_000_000 / 2048):,} | 300 | {_tokens(ceil(60_000_000 / 2048) * 300)} |" in text  # short rows realise far less than their sequences
+    assert "| `flan` | 40.00% | 60.0M | 300 | 200,000 |" in text  # short rows: many of them per token
     assert "Validation: `flan` at 40%, `metamath` at 15%" in text
     assert "| `fineweb_edu` | train + val | 5% held out (the first rows of `processed/fineweb_edu`) |" in text
     assert "| `wikipedia` | train only | none |" in text
@@ -102,8 +103,8 @@ def test_validation_only_source_renders_rows() -> None:
     assert "| `heldout` | val only | all rows (40 downloaded) |" in text
     assert "| `pre` | train only | none |" in text
     assert "| `heldout` | pretrain | `synthetic` | generated (seed 1) | - | rows 40 (validation only) |" in text
-    assert "| `pre` | pretrain | `synthetic` | generated (seed 0) | - | budget 8 sequences (512 tokens) |" not in text  # seed 42
-    assert "budget 8 sequences (512 tokens)" in text
+    assert "| `pre` | pretrain | `synthetic` | generated (seed 0) | - | budget 512 tokens (~8 rows at 64 tokens/row) |" not in text  # seed 42
+    assert "budget 512 tokens (~8 rows at 64 tokens/row)" in text  # the default estimate of 500 clamped at block_size 64
 
 
 def _tokens(n: int) -> str:

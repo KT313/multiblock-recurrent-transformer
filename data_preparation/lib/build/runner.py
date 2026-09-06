@@ -7,6 +7,7 @@ prepare runs tokenizer, repair, (download + build) rounds, report, under the dat
     prepare_tokenizer                                  tokenizers/<name>/ (downloads count tokens with it)
     repair_broken_and_stale_folders                    truncate broken raw, delete stale processed, confirm before any raw
                                                        folder is deleted (lib/build/repair.py)
+    reopen_raw                                         clear the exhausted flag of the --reopen sources
     for round in 1..MAX_ROUNDS:
         plan_downloads                                 rows still missing per source (lib/build/planner.py: one
                                                        SourceLedger per source answers both "what to download" and
@@ -64,7 +65,7 @@ from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
 from data_preparation.lib.stages.build import build_source
-from data_preparation.lib.stages.download import download, download_github_code_group, prepare_tokenizer
+from data_preparation.lib.stages.download import download, download_github_code_group, prepare_tokenizer, reopen_raw
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
 log = get_logger(__name__)
@@ -90,6 +91,7 @@ def prepare(
     dry_run: bool = False,
     steps: Iterable[str] = STEPS,
     sources: Iterable[str] | None = None,
+    reopen: Iterable[str] | None = None,
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     confirm: Confirm | None = None,
@@ -103,13 +105,15 @@ def prepare(
     :class:`ConfirmationRequired` before anything is changed. dry_run reports what the repair and the first
     round would do and writes nothing (not even the lock file); its report is the one :func:`status` gives for the
     same tree. steps (a subset of :data:`STEPS`) and sources restrict the work, and the satisfaction check,
-    to the named steps / sources; the returned report always covers the whole config.
+    to the named steps / sources; the returned report always covers the whole config. reopen names sources
+    whose exhausted flag is cleared before planning (:func:`reopen_raw`: their loader has more rows now).
     """
 
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
     selected = checked_sources(config, sources)
+    reopened = checked_sources(config, reopen) or []
     check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
     warn_about_overlaps(config)
 
@@ -118,6 +122,7 @@ def prepare(
             prepare_tokenizer(config, layout, hf_token=hf_token)
         repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected)
         log_repair(repair_report)
+        reopen_sources(config, layout, reopened, dry_run=dry_run)
         for round_number in range(1, MAX_ROUNDS + 1):
             download_plan = plan_downloads(config, layout, sources=selected)
             if dry_run:
@@ -506,13 +511,26 @@ def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_work
         )
 
 
+def reopen_sources(config: DatasetConfig, layout: DatasetLayout, names: list[str], *, dry_run: bool) -> None:
+    """
+    Clear the exhausted flag of the named sources (:func:`reopen_raw`); a dry run only says which it would.
+    """
+
+    for name in names:
+        if dry_run:
+            log.info("dry run, would reopen %s", name)
+        elif not reopen_raw(config, name, layout):
+            log.info("%s: nothing to reopen", name)
+
+
 def another_round_can_fetch_more(config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None) -> bool:
     """
     Whether a further round would download anything: the download step is active and the plan (the same
     :class:`~data_preparation.lib.build.planner.SourceLedger` objects the satisfaction check reads) still has rows
-    to fetch for some selected source. That is a loader that returned fewer rows than asked without being exhausted,
-    or a source whose build dropped more than the safety margin covers: the next round tops it up by the shortfall
-    scaled with the yield it showed, instead of planning nothing and leaving the run stuck.
+    to fetch for some selected source. That is a source whose raw shards measured fewer tokens per row than the
+    estimate its first download was sized with, or whose build dropped more than the safety margin covers: the
+    next round tops it up (by the measured rate, or by the shortfall scaled with the yield it showed) instead of
+    planning nothing and leaving the run stuck.
     """
 
     if "download" not in active_steps:
@@ -528,10 +546,11 @@ def warn_about_overlaps(config: DatasetConfig) -> None:
 def outstanding_repairs(report: RepairReport) -> list[RepairAction]:
     """
     The actions of a repair pass that were planned but not carried out: everything of a dry run, nothing of a
-    pass that performed them. They are what still stands between the tree and a complete dataset.
+    pass that performed them. They are what still stands between the tree and a complete dataset (a folder the
+    step leaves alone is not one of them: nothing of the step's stands there).
     """
 
-    return [] if report.performed else list(report.actions)
+    return [] if report.performed else [action for action in report.actions if action.action != "leave"]
 
 
 def log_repair(report: RepairReport) -> None:
@@ -562,13 +581,17 @@ def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_re
 
 def log_report(report: DatasetReport) -> None:
     """
-    The status table (kept in the scrollback) plus one warning per exhausted or unsatisfied source.
+    The status table (kept in the scrollback), then one warning per exhausted or unsatisfied source, after the
+    table so they stand next to the verdict instead of scrolling away above it.
     """
 
+    log.info("dataset status:\n%s", report.describe(), extra={"keep": True})  # keep: printed unwrapped into the scrollback
     for source in report.sources:
         satisfied, reason = source.satisfaction()
         if satisfied and source.exhausted:
-            log.warning("%s: source exhausted (%s); the training sampler cycles the rows on disk", source.name, reason)
+            log.warning(
+                "%s: source exhausted (%s); the training sampler cycles the rows on disk; rerun with --reopen %s if the source has more rows",
+                source.name, reason, source.name,
+            )
         elif not satisfied:
             log.warning("%s: %s", source.name, reason)
-    log.info("dataset status:\n%s", report.describe(), extra={"keep": True})  # keep: printed unwrapped into the scrollback

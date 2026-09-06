@@ -10,8 +10,8 @@
 # allows: exact dedup on, tokenizer counts capped at 2048, quality filter and decontamination off. Fuzzy dedup is
 # off here (it is available as `dedup: {mode: minhash, threshold: 0.95, num_perm: 256}`), and PII masking no longer
 # exists. The per-stage token budgets are the thesis budgets (3.3B + 1.5B + 0.15B tokens); the stage weights are
-# the thesis run's; per-source download sizes are derived from the sequence budget (stage tokens × weight ÷
-# block_size, × 1.2) instead of the fixed row counts of the thesis scripts. Several HuggingFace ids had to move (wikipedia -> wikimedia/wikipedia 20231101.en,
+# the thesis run's; per-source download sizes are derived from the token budget (stage tokens × weight ÷ the
+# source's tokens per row, × 1.2) instead of the fixed row counts of the thesis scripts. Several HuggingFace ids had to move (wikipedia -> wikimedia/wikipedia 20231101.en,
 # gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every source is pinned to a revision.
 
 tokenizer:
@@ -23,7 +23,7 @@ tokenizer:
 max_seq_length: 2048            # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
                                 # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
                                 # costs nothing
-block_size: 2048                # training sequence length; the planner counts sequences with it; the run config must match
+block_size: 2048                # training sequence length; the planner caps its tokens-per-row rate with it; the run config must match
 token_count: tokenizer          # or: estimate (chars / 4)
 validation_fraction: 0.05       # share of a source's rows held out when it is used for training AND validation
 

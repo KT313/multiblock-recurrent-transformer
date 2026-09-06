@@ -29,7 +29,7 @@ from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import RunLocked, build_lock
-from data_preparation.lib.build.planner import DownloadPlan, plan_downloads
+from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.download import download as real_download
@@ -50,6 +50,10 @@ def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
     """
 
     return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file() and (include_lock or p.name != ".build.lock")}
+
+
+def _state(report: DatasetReport, name: str) -> SourceLedger:
+    return next(source for source in report.sources if source.name == name)
 
 
 def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
@@ -90,7 +94,7 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
     assert report.complete and [s.name for s in report.sources] == ["p", "h", "i"]
     p, h, i = report.sources
     assert p.rows_needed == 600 and p.raw_rows == 600 and p.processed_rows >= 500 and p.epochs() is not None
-    assert h.rows_needed == 4 and h.raw_rows == 4 and h.epochs() is None
+    assert h.rows_needed == 5 and h.rows_sufficient == 4 and h.raw_rows == 5 and h.epochs() is None  # 4 delivered rows, × 1.2 downloaded
     assert i.kind == "instruct" and i.satisfaction()[0]
     processed_i = Manifest.load(layout.processed_dir("i"))
     assert processed_i is not None and processed_i.columns == ["instruction", "input", "output", "tokens", "hash"]
@@ -99,31 +103,65 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
 # --- rounds ----------------------------------------------------------------------------------------------------------
 
 
-def test_a_download_that_falls_short_gets_a_second_round(
-    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_loader_that_falls_short_is_exhausted_until_reopened(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    A loader that returns fewer rows than asked (without being exhausted) leaves the source short after round 1;
-    round 2 plans the difference and tops it up.
+    A loader that yields fewer rows than asked is latched exhausted, whatever the reason: the source is
+    satisfied with the rows it has (warning, no second round), and a later run does not read on by itself even
+    when the source grew. `prepare(reopen=[name])` clears the latch; the download then resumes at its offset.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
-    calls: list[int] = []
+    src_dir = layout.root.parent / "growing"
+    write_local(src_dir, [{"text": f"tok_{i} tok_2 tok_3"} for i in range(4)], "parquet")
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=10)
+    needed, sufficient = cfg.rows_needed("p"), cfg.rows_sufficient("p")  # 10 rows × 1.2 ÷ 0.95 = 13, 11
+    path = config_file(cfg)
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        report = prepare(path, layout.root, assume_yes=False)
+    (p,) = report.sources
+    assert report.complete and p.exhausted and p.satisfaction() == (True, f"exhausted at 4 of {sufficient} rows") and (needed, sufficient) == (13, 11)
+    assert "round 2" not in caplog.text
+    assert f"p: source exhausted (exhausted at 4 of {sufficient} rows); the training sampler cycles the rows on disk; rerun with --reopen p if the source has more rows" in caplog.text
+    assert caplog.text.index("dataset status:") < caplog.text.index("p: source exhausted")  # the warning follows the table
 
-    def half_the_first_time(config: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
-        calls.append(rows_needed)
-        asked = rows_needed // 2 if len(calls) == 1 else rows_needed
-        return real_download(config, name, *args, rows_needed=asked, **kwargs)
+    write_local(src_dir, [{"text": f"tok_{i} tok_5 tok_6"} for i in range(20)], "parquet")  # the source grew
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        assert _state(prepare(path, layout.root, assume_yes=False), "p").exhausted  # the latch holds
+    assert "round 1: nothing to download" in caplog.text
+    with pytest.raises(ValueError, match="unknown sources"):
+        prepare(path, layout.root, assume_yes=False, reopen=["nope"])
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        report = prepare(path, layout.root, assume_yes=False, reopen=["p"])
+    (p,) = report.sources
+    assert "p: reopened; the next download reads on from offset 4" in caplog.text
+    assert f"round 1: 1 source(s) short, downloading {needed - 4} rows (p {needed - 4})" in caplog.text
+    assert report.complete and not p.exhausted and p.satisfaction() == (True, "ok") and p.raw_rows == p.processed_rows == needed
+    raw = Manifest.load(layout.raw_dir("p"))
+    assert raw is not None and raw.rows_fetched == needed and [s.rows for s in raw.shards] == [4, needed - 4]  # appended, not rewritten
 
-    monkeypatch.setattr(runner, "download", half_the_first_time)
-    needed = cfg.rows_needed("p")  # 500 sequences × 1.2 ÷ 0.95 (the factory validates on the trained source too) = 632
+
+def test_a_measured_rate_below_the_estimate_gets_a_second_round(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Round 1 is sized at the config's tokens-per-row estimate (500 by default, clamped at block_size); the raw
+    shards then measure the real mean. Synthetic rows cut at 256 tokens average well under 256 ÷ 1.2, so the
+    margin does not cover the difference and round 2 tops the source up at the measured rate.
+    """
+
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=25_600, block_size=256, max_seq_length=256)
+    first = cfg.rows_needed("p")  # 25600 ÷ 256 = 100 rows × 1.2 ÷ 0.95 = 127
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
-    assert report.complete and calls == [needed, needed] == [632, 632]
-    assert "round 1: 1 source(s) short, downloading 632 rows (p 632)" in caplog.text
-    assert "round 2: 1 source(s) short, downloading 316 rows (p 316)" in caplog.text and "round 3" not in caplog.text
-    raw = Manifest.load(layout.raw_dir("p"))
-    assert raw is not None and raw.rows() == 632 and [s.rows for s in raw.shards] == [316, 316]  # appended, not rewritten
+    (p,) = report.sources
+    assert first == 127 and f"round 1: 1 source(s) short, downloading {first} rows (p {first})" in caplog.text
+    assert "round 2: 1 source(s) short" in caplog.text and "round 3" not in caplog.text
+    assert report.complete and p.satisfaction() == (True, "ok") and p.rows_to_fetch == (0, "budget served")
+    assert p.tokens_per_row < 256 / 1.2 and p.raw_rows > first and p.rows_needed == cfg.rows_needed("p", p.tokens_per_row) > first
+    assert p.processed_rows >= p.rows_sufficient and p.epochs() == pytest.approx(p.rows_budget / p.training_rows)
 
 
 def test_a_source_still_short_after_max_rounds_is_reported(
