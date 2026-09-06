@@ -18,7 +18,8 @@ from typing import NamedTuple
 
 import torch
 
-from training.data.collate import IGNORE_INDEX, Sample, mask_label_ids, shift_inputs_and_labels
+from training.data.collate import Sample, mask_label_ids, shift_inputs_and_labels
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.tokenizer import Tokenizer
 
 log = logging.getLogger(__name__)

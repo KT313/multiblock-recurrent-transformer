@@ -21,7 +21,8 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
-from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
+from training.data.collate import Batch, Sample, WorkerBatch
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.packing import PackedBatch, shifted_length
 import training.data.loader as loader_module
 from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset

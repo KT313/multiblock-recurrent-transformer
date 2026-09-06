@@ -9,7 +9,6 @@ import torch
 
 from model import RecurrentGPT
 from training.data.collate import (
-    IGNORE_INDEX,
     collate_fn,
     collate_samples,
     collate_worker_batch,
@@ -19,7 +18,7 @@ from training.data.collate import (
     shift_inputs_and_labels,
 )
 from training.data.datasets import ParquetTextDataset
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 SIG: dict[str, Any] = {"keys": ["text"], "format_fn": "pass_text"}
 INSTR_SIG: dict[str, Any] = {

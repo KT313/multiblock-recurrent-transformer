@@ -24,7 +24,7 @@ from model import RecurrentConfig, RecurrentGPT
 from training.backend.base import plain_model
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data.collate import IGNORE_INDEX
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (

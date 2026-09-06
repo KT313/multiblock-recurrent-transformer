@@ -25,7 +25,8 @@ from torch.optim import Optimizer
 
 from model.layers.attention import document_attention_mask
 from training.backend.base import Backend, plain_model
-from training.data.collate import IGNORE_INDEX, Batch, Sample
+from training.data.collate import Batch, Sample
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.loader import RunDataloaders, world_batch_micro_batches
 from training.data.packing import PackedBatch, PackPool, pack_samples
 from training.logger import track_gradient_metrics

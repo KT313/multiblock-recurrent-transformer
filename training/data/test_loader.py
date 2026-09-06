@@ -12,7 +12,8 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.single_device import SingleDeviceBackend
-from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
+from training.data.collate import Batch, Sample, WorkerBatch, collate_samples
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.dataset_resolver import (
     TRAIN_LOADER_NUM_WORKERS,
     DataEntry,
@@ -260,15 +261,16 @@ class _SignalDispositions(IterableDataset[Any]):
         yield signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
 
 
-def test_workers_ignore_sigint_and_sigterm(tokenizer: Tokenizer) -> None:
+def test_workers_ignore_sigint_but_not_sigterm(tokenizer: Tokenizer) -> None:
     """
-    A Ctrl-C reaches the whole process group; a worker must leave it to the parent's handler.
+    A Ctrl-C reaches the whole process group; a worker must leave it to the parent's handler. SIGTERM stays the
+    default: it is how a leftover worker is ended at exit.
     """
 
     assert dataloader_over(_SignalDispositions(), tokenizer, 64, 1).worker_init_fn is worker_init_fn
     loader = DataLoader(_SignalDispositions(), batch_size=None, num_workers=1, worker_init_fn=worker_init_fn)
     (sigint, sigterm), = list(loader)
-    assert sigint == signal.SIG_IGN and sigterm == signal.SIG_IGN
+    assert sigint == signal.SIG_IGN and sigterm == signal.SIG_DFL
 
 
 def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:

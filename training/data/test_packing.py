@@ -9,7 +9,8 @@ import logging
 import pytest
 import torch
 
-from training.data.collate import IGNORE_INDEX, Sample, pad_and_shift
+from training.data.collate import Sample, pad_and_shift
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.packing import POOL_TOKEN_FACTOR, PackedBatch, PackPool, pack_samples, shifted_length
 from training.data.tokenizer import Tokenizer
 
