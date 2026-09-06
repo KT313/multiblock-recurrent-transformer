@@ -50,7 +50,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "sequence_padding_multiple": 128,
     "pack_sequences": True,
     "tokens_per_micro_batch": 8192,
-    "tokens_per_step": 524288,
+    "tokens_per_step": 2097152,
     "optimizer": "ELLISAdam",
     "optim_config": {
         "lr": 1e-4,
