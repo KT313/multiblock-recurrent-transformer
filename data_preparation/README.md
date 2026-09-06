@@ -264,7 +264,9 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
   (`max_seq_length` raised above `truncated_at_tokens`) is deleted and downloaded again, **only after the user
   confirmed**. A folder with a *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
   and the next download resumes there (when no prefix can be kept, it is queued for the same confirmed deletion).
-  Shards without a manifest are an error (nothing says where those rows came from).
+  Shards without a manifest are an error (nothing says where those rows came from). Raw folders are shared by
+  source name across dataset configs and their manifest records the config file they were downloaded under, so a
+  deletion that another config's folder would suffer needs `--allow_foreign_raw` on top of the confirmation.
 - **processed** (derived, cheap): deleted without confirmation when stale, broken, without a manifest, built from
   raw shards that no longer exist, or when its raw folder is being deleted; a leftover `.tmp` folder goes too. The
   one processed deletion that asks is a manifest that cannot be parsed: it joins the confirmation below, and the
@@ -414,7 +416,7 @@ last a `SharedLoaderParameters`: token, index directory, file callback, download
 | `hf_split` | split-name based repos (e.g. `gsm8k` with `name: main`) | `train[a:b]` slicing; `datasets` downloads and caches the file once and slices locally; `load_kwargs` go to `load_dataset` (`name`, `data_files`, ...) |
 | `hf_stream` | fallback | `datasets` streaming with `skip(offset)`; **caches nothing**: every fetch re-streams from the start, so avoid it for anything large |
 | `github_code` | `codeparrot/github-code-clean` | `hf_files` over `data/*.parquet` keeping rows of `language:` (`text_field: code`); all language sources of a repo download in one pass over the shared files and the index stores per-language row counts (per row group for partially read parquet files) |
-| `local` | your own data | `path:` directory of `*.parquet` / `*.jsonl` files, read in sorted file order |
+| `local` | your own data | `path:` directory of `*.parquet`, `*.jsonl` (plain, `.zst` or `.gz`), `*.json.gz` or `*.json` files (the Hub reader's formats), read in sorted file order |
 | `synthetic` | tests / smoke runs | random-word rows from `seed:` |
 
 Pretrain sources need a text column (`text_field`, default `text`); instruct sources need either
@@ -438,7 +440,8 @@ stages:
   - {name: pretrain, tokens: 100_000_000, train: {my_corpus: 1.0}, val: {my_corpus: 1.0}}   # first 5 % of rows = validation
 ```
 
-`local` reads every `*.parquet` / `*.jsonl` file directly under `path` in sorted order. Listing the source in `val`
+`local` reads every file directly under `path` in a format the Hub reader knows (`*.parquet`, `*.jsonl`, `*.jsonl.zst`,
+`*.jsonl.gz`, `*.json.gz`, `*.json`) in sorted order. Listing the source in `val`
 too gives a held-out split without a second source; a separate validation-only source (`rows: N`, `val` only)
 should point at files no training source reads.
 
@@ -454,8 +457,8 @@ the order they run in.
   ≤ 30 % repeated 2-grams and ≤ 20 % repeated 3-grams: prose heuristics, wrong for code.
 - `decontamination.enabled: true` drops documents whose 13-grams overlap more than `threshold` with a benchmark test
   set (`benchmarks`: gsm8k_test, math_test, humaneval, mbpp_test, arc_challenge_test, hellaswag_test, mmlu_test,
-  winogrande_test; downloaded once into `dataset/benchmarks/`, `lib/stages/benchmarks.py`). Needs network access
-  on first use.
+  winogrande_test; each pinned to a Hub commit that enters the processed hash, downloaded once into
+  `dataset/benchmarks/`, `lib/stages/benchmarks.py`). Needs network access on first use.
 - `min_chars` drops shorter pretrain documents; there is no upper character bound; the token truncation at
   download is the upper bound.
 - Token counting (`token_count`) happens at download time: `tokenizer` counts with the config's tokenizer,

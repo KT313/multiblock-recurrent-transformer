@@ -31,6 +31,7 @@ import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.storage.parquet import shard_index
 
 log = get_logger(__name__)
 
@@ -82,6 +83,9 @@ class Manifest:
     check_limit_reached: int | None = None  # the `check_limit` that exhausted the source (a grown limit reopens it)
     skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
     dropped_too_long: int = 0  # rows with more than the folder's token cap
+    # Raw folders are keyed by source name and shared by every dataset config: the file name of the config the folder
+    # was downloaded under (None when unknown) lets the repair step tell a deletion another config asks for.
+    dataset_config: str | None = None
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
@@ -129,7 +133,8 @@ class Manifest:
         dropped_too_long: int | None = None,
     ) -> None:
         """
-        Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name.
+        Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by index (not
+        by name: data-100000 would sort before data-99999).
         """
 
         self.shards = [shard for shard in self.shards if shard.name != name]
@@ -139,7 +144,7 @@ class Manifest:
                 skipped_malformed=skipped_malformed, dropped_too_long=dropped_too_long,
             )
         )
-        self.shards.sort(key=lambda shard: shard.name)
+        self.shards.sort(key=lambda shard: (shard_index(Path(shard.name)) or 0, shard.name))
 
     # --- (de)serialisation -------------------------------------------------------------------------------------------
 
@@ -160,6 +165,8 @@ class Manifest:
                 extra["exhausted"] = True
             if self.check_limit_reached is not None:
                 extra["check_limit"] = self.check_limit_reached
+            if self.dataset_config is not None:
+                extra["dataset_config"] = self.dataset_config
         payload["extra"] = extra
         return payload
 
@@ -222,6 +229,7 @@ class Manifest:
 _PROCESSED_KEYS = {"input_shards": "input_shards", "columns": "columns", "shuffled": "shuffled", "seed": "shuffle_seed", "stats": "stats"}
 _RAW_KEYS = {
     "exhausted": "exhausted", "check_limit": "check_limit_reached", "skipped_malformed": "skipped_malformed", "dropped_too_long": "dropped_too_long",
+    "dataset_config": "dataset_config",
 }  # fmt: skip
 _PROCESSED_FIELDS = tuple(_PROCESSED_KEYS.values())
 _RAW_FIELDS = tuple(_RAW_KEYS.values())

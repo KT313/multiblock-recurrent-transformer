@@ -26,6 +26,7 @@ from typing import Any, Protocol
 from data_preparation.dataset_config import SourceConfig
 from data_preparation.lib.sources.hub_files import (
     DEFAULT_MAX_CACHED_FILE_MB,
+    FORMATS,
     FetchStats,
     FileIndex,
     HubFetcher,
@@ -293,10 +294,11 @@ def _language_request(request: GithubCodeRequest) -> ReadRequest:
 
 def list_local_files(directory: Path) -> list[Path]:
     """
-    `*.parquet` and `*.jsonl` files directly under `directory`, sorted by name (the source's row order).
+    The files directly under `directory` in a format the Hub reader knows (`hub_files.FORMATS`: parquet, json
+    lines, plain or compressed, json arrays), sorted by name (the source's row order).
     """
 
-    files = [path for path in directory.iterdir() if path.is_file() and path.suffix in (".parquet", ".jsonl")]
+    files = [path for path in directory.iterdir() if path.is_file() and path.name.lower().endswith(FORMATS)]
     return sorted(files)
 
 

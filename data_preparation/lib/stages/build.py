@@ -107,6 +107,12 @@ def build_source(
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")
     assessment = assess_processed_folder(config, name, processed_dir, shard_list(raw.shards), check_files=False)
+    if assessment.problem == "unreadable_manifest":
+        # never deleted here, on either path: the repair step does that, after the user confirmed
+        raise RuntimeError(
+            f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
+            "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
+        )
 
     if all_at_once:
         if assessment.problem == "none" and assessment.manifest is not None:
@@ -261,16 +267,11 @@ class ProcessedOutput:
         The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
         raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
         the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
-        parsed is never deleted here: the repair step does that, after the user confirmed.
+        parsed never gets here (:func:`build_source` refuses it before choosing a path).
         """
 
         if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
             return cls(assessment.manifest, processed_dir, is_new=False)
-        if assessment.problem == "unreadable_manifest":
-            raise RuntimeError(
-                f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
-                "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
-            )
         if assessment.problem != "absent":
             log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
         if processed_dir.exists():
@@ -540,9 +541,10 @@ def _increment(counts: dict[str, int], key: str) -> None:
 
 # --- decontamination -----------------------------------------------------------------------------------------------------
 
-# the per-process parameters of `_contaminated_by`, set by `_init_decontamination`: called directly for
-# `pass_workers <= 1`, as the pool initializer of every spawn worker otherwise (spawn children start with fresh
-# module globals, so the n-grams are handed over as picklable init args, loaded once in the parent)
+# the parameters of `_contaminated_by` in a spawn worker, set by `_init_decontamination`, the pool initializer
+# (spawn children start with fresh module globals, so the n-grams are handed over as picklable init args, loaded
+# once in the parent). The in-process path never touches them: several builds run in threads of one process
+# (`lib/build/runner.py`), each with its own decontamination settings, so `Decontaminator` keeps its own.
 _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 
@@ -555,7 +557,7 @@ def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float)
 
 def _contaminated_by(text: str) -> list[str]:
     """
-    Benchmarks text is contaminated by, using the process-global n-grams of _init_decontamination.
+    Benchmarks text is contaminated by, using the worker-global n-grams of _init_decontamination.
     """
 
     return check_contamination(text, _BENCHMARK_NGRAMS, _DECONTAM["n"], _DECONTAM["threshold"])[1]
@@ -564,10 +566,10 @@ def _contaminated_by(text: str) -> list[str]:
 class Decontaminator:
     """
     Drops rows contaminated by a benchmark (counts hits per benchmark in stats); the benchmark n-grams are
-    loaded once, in this process, and checked in-process (pass_workers <= 1) or in a pool of pass_workers
-    spawn processes that lives for the whole with block. Spawn, not fork: the pool is created from a build
-    worker thread (`lib/build/runner.py` runs one build per thread), and a fork of a multi-threaded process can
-    inherit a lock another thread holds mid-operation; spawn children start clean.
+    loaded once, in this process, and checked in-process (pass_workers <= 1, against the n-grams this object
+    holds) or in a pool of pass_workers spawn processes that lives for the whole with block. Spawn, not fork:
+    the pool is created from a build worker thread (`lib/build/runner.py` runs one build per thread), and a fork
+    of a multi-threaded process can inherit a lock another thread holds mid-operation; spawn children start clean.
     """
 
     def __init__(self, config: DecontaminationConfig, pass_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
@@ -575,16 +577,15 @@ class Decontaminator:
         self.pass_workers = pass_workers
         self.stats = stats
         self.cache_dir = str(layout.benchmark_cache_dir())
+        self._ngrams: dict[str, set[str]] = {}
         self._pool: multiprocessing.pool.Pool | None = None
 
     def __enter__(self) -> Decontaminator:
         if not self.config.enabled:
             return self
-        ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
-        init_args = (ngrams, self.config.ngram, self.config.threshold)
-        if self.pass_workers <= 1:
-            _init_decontamination(*init_args)
-        else:
+        self._ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
+        if self.pass_workers > 1:
+            init_args = (self._ngrams, self.config.ngram, self.config.threshold)
             self._pool = multiprocessing.get_context("spawn").Pool(self.pass_workers, initializer=_init_decontamination, initargs=init_args)
         return self
 
@@ -610,7 +611,7 @@ class Decontaminator:
 
         if self._pool is None:
             for row in rows:
-                yield row, _contaminated_by(row["text"])
+                yield row, check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
             return
         for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]

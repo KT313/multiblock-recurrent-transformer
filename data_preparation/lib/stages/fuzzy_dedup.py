@@ -21,6 +21,7 @@ import multiprocessing
 import time
 from collections import deque
 from collections.abc import Iterator
+from functools import partial
 from multiprocessing.pool import AsyncResult
 from typing import Any
 
@@ -37,9 +38,10 @@ Signature = NDArray[np.uint64]
 CHUNK_SIZE = 1024
 MINHASH_SEED = 1  # datasketch default; pinned so signatures are stable
 
-# Signature parameters of *this* process: the n-gram size and the MinHash constructor arguments. Set once per process
-# by _init_worker before _signature is used: the spawn-pool initializer (spawn children start with fresh
-# module globals; its arguments are two plain ints), or called directly when pass_workers <= 1.
+# Signature parameters of a spawn worker: the n-gram size and the MinHash constructor arguments, set once per
+# worker by _init_worker (the pool initializer; spawn children start with fresh module globals, its arguments
+# are two plain ints). The in-process path (pass_workers <= 1) never touches them: several builds run in threads
+# of one process (`lib/build/runner.py`), each with its own dedup settings, so it binds its parameters locally.
 _NGRAM: int = 0
 _MINHASH_KWARGS: dict[str, Any] = {}
 
@@ -74,7 +76,7 @@ def _minhash_kwargs(num_perm: int) -> dict[str, Any]:
 
 def _init_worker(num_perm: int, ngram: int) -> None:
     """
-    Set the per-process signature parameters (pool initializer).
+    Set the signature parameters of a spawn worker (pool initializer).
     """
 
     global _NGRAM
@@ -83,7 +85,7 @@ def _init_worker(num_perm: int, ngram: int) -> None:
     _MINHASH_KWARGS.update(_minhash_kwargs(num_perm))
 
 
-def _signature(text: str) -> Signature:
+def _signature(text: str, ngram: int, minhash_kwargs: dict[str, Any]) -> Signature:
     """
     MinHash hash values of the word n-grams of text (plain numpy array, cheap to pickle); an empty array for
     a text with fewer than ngram words: such texts have no n-grams, and the empty-set signature would make every
@@ -91,31 +93,31 @@ def _signature(text: str) -> Signature:
     """
 
     MinHash, _ = _import_datasketch()
-    ngrams = get_ngrams(text, n=_NGRAM)
+    ngrams = get_ngrams(text, n=ngram)
     if not ngrams:
         return np.empty(0, dtype=np.uint64)
-    minhash = MinHash(**_MINHASH_KWARGS)
-    for ngram in ngrams:
-        minhash.update(ngram.encode("utf-8"))
+    minhash = MinHash(**minhash_kwargs)
+    for item in ngrams:
+        minhash.update(item.encode("utf-8"))
     return np.asarray(minhash.hashvalues, dtype=np.uint64)
 
 
 def _signatures(texts: list[str]) -> list[Signature]:
     """
-    Worker task: the signatures of one chunk of texts.
+    Worker task: the signatures of one chunk of texts, with the worker's parameters of _init_worker.
     """
 
-    return [_signature(text) for text in texts]
+    return [_signature(text, _NGRAM, _MINHASH_KWARGS) for text in texts]
 
 
 def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[tuple[Row, Signature]]:
     """
-    (row, signature) pairs computed in this process.
+    (row, signature) pairs computed in this process, the parameters bound to this call.
     """
 
-    _init_worker(dedup.num_perm, dedup.ngram)
+    signature = partial(_signature, ngram=dedup.ngram, minhash_kwargs=_minhash_kwargs(dedup.num_perm))
     for row in rows:
-        yield row, _signature(row["text"])
+        yield row, signature(row["text"])
 
 
 def _signatures_in_pool(

@@ -21,6 +21,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.repair import (
     CONFIRMATION_HEADER,
     CONFIRMATION_QUESTION,
+    FOREIGN_HEADER,
     ConfirmationRequired,
     RepairAction,
     RepairError,
@@ -319,6 +320,59 @@ def test_raw_without_a_resume_offset_cannot_be_truncated(cfg_factory: CfgFactory
     (layout.raw_dir("a") / "data-00001.parquet").write_bytes(b"corrupt")
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
     assert _kinds(report)[0] == ("a", "raw", "delete") and report.actions[0].reason.startswith("broken: unreadable shard data-00001.parquet")
+
+
+# --- raw folders of another dataset config -------------------------------------------------------------------------------
+
+
+def test_a_stale_raw_folder_of_another_config_is_deleted_only_with_allow_foreign_raw(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Raw folders are shared by source name: a config that gives `a` another identity sees the folder another
+    config downloaded as stale. Its deletion needs allow_foreign_raw before the ordinary confirmation is even
+    asked (`--yes` alone does not do it); the report lists the folder either way.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"a": _synthetic()}))
+    download(cfg, "a", layout, rows_needed=8, shard_size=4, config_name="other.yaml")
+    build_source(cfg, "a", layout, shard_size=4)
+    _edit_manifest(layout.raw_dir("a"), source_hash="changed")
+    before = _snapshot(layout.root)
+    reason = "stale: source identity or tokenizer changed; downloaded under dataset config other.yaml, deleting it needs --allow_foreign_raw"
+
+    dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, config_name="mine.yaml")
+    assert _kinds(dry) == [("a", "raw", "delete"), ("a", "processed", "delete")]
+    assert dry.actions[0].reason == reason and dry.actions[0].foreign_config == "other.yaml"
+    assert dry.foreign_deletions_planned() == dry.actions[:1]
+
+    monkeypatch.setattr(sys, "stdin", _Terminal())
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("asked before the foreign check"))
+    with pytest.raises(ConfirmationRequired) as info:
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=True, config_name="mine.yaml")
+    assert info.value.message == f"{FOREIGN_HEADER}\n  a: {reason}" and str(info.value).endswith("rerun with --allow_foreign_raw (prepare.py) to let this config delete them, nothing was changed")
+    assert _kinds(info.value.report) == _kinds(dry) and _snapshot(layout.root) == before, "--yes alone: nothing was changed"
+
+    prompts: list[str] = []
+    report = repair_broken_and_stale_folders(
+        cfg, layout, assume_yes=False, confirm=_recording_confirm(prompts, True), config_name="mine.yaml", allow_foreign_raw=True
+    )
+    assert len(prompts) == 1 and f"  a: {reason}" in prompts[0], "allowed: the ordinary confirmation still applies"
+    assert [action.source for action in raw_deleted(report)] == ["a"] and not layout.raw_dir("a").exists()
+
+
+def test_a_raw_folder_of_this_or_of_an_unknown_config_is_not_foreign(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    cfg = with_tokenizer(cfg_factory({"a": _synthetic(0), "b": _synthetic(1)}))
+    download(cfg, "a", layout, rows_needed=8, shard_size=4, config_name="mine.yaml")
+    download(cfg, "b", layout, rows_needed=8, shard_size=4)  # a direct caller: no config name recorded
+    for name in ("a", "b"):
+        _edit_manifest(layout.raw_dir(name), source_hash="changed")
+    for config_name in (None, "mine.yaml"):  # a caller without a name (None) never marks anything foreign either
+        dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, config_name=config_name)
+        assert _kinds(dry) == [("a", "raw", "delete"), ("b", "raw", "delete")] and dry.foreign_deletions_planned() == []
+        assert all(action.reason == "stale: source identity or tokenizer changed" for action in dry.actions)
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True, config_name="mine.yaml")
+    assert [action.source for action in raw_deleted(report)] == ["a", "b"]
 
 
 # --- processed folder branches -----------------------------------------------------------------------------------------

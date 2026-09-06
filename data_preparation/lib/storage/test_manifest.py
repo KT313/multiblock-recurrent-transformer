@@ -136,6 +136,18 @@ def test_add_shard_replaces_and_sorts() -> None:
     m.add_shard("data-00000.parquet", 1, 10)
     m.add_shard("data-00001.parquet", 3, 30)
     assert m.shards == [ShardInfo("data-00000.parquet", 1, 10), ShardInfo("data-00001.parquet", 3, 30)]
+    m.add_shard("data-100000.parquet", 1)
+    m.add_shard("data-99999.parquet", 1)
+    assert [shard.name for shard in m.shards][-2:] == ["data-99999.parquet", "data-100000.parquet"], "by index, not by name"
+
+
+def test_a_raw_manifest_records_the_dataset_config_it_was_downloaded_under(tmp_path: Path) -> None:
+    m = Manifest(source="s", source_hash="h", stage="raw", dataset_config="crow.yaml")
+    assert m.to_dict()["extra"]["dataset_config"] == "crow.yaml"
+    m.save(tmp_path)
+    loaded = Manifest.load(tmp_path)
+    assert loaded is not None and loaded.dataset_config == "crow.yaml" and loaded.extra == {}
+    assert "dataset_config" not in Manifest(source="s", source_hash="h", stage="raw").to_dict()["extra"], "unknown: not written"
 
 
 def test_shard_rows_and_verify(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ dataset configs is registered. Offline, CPU, fast.
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import types
@@ -17,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import zstandard
 
 from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources.converters import (
@@ -169,6 +171,27 @@ def test_local_reads_parquet_and_jsonl_in_sorted_order(tmp_path: Path) -> None:
     assert [r["text"] for r in LOADERS["local"](source, 1, 2)] == ["a1", "b0"]
     assert list(LOADERS["local"](source, 4, 2)) == []
     assert list(LOADERS["local"](source, 0, 0)) == []
+
+
+def test_local_reads_every_format_of_the_hub_reader(tmp_path: Path) -> None:
+    """
+    `local` accepts what the Hub file reader accepts (`hub_files.FORMATS`): compressed json lines and json
+    arrays too, the suffix matched case-insensitively, everything else ignored.
+    """
+
+    def lines(*texts: str) -> bytes:
+        return "".join(json.dumps({"text": text}) + "\n" for text in texts).encode()
+
+    (tmp_path / "a.jsonl.zst").write_bytes(zstandard.ZstdCompressor().compress(lines("a0")))
+    with gzip.open(tmp_path / "b.jsonl.gz", "wb") as fh:
+        fh.write(lines("b0"))
+    with gzip.open(tmp_path / "c.json.gz", "wb") as fh:
+        fh.write(lines("c0"))
+    (tmp_path / "d.json").write_text(json.dumps([{"text": "d0"}]))
+    (tmp_path / "e.JSONL").write_bytes(lines("e0"))
+    (tmp_path / "f.txt").write_text("ignored")
+    source = _src(loader="local", path=str(tmp_path), hf_id=None, revision=None)
+    assert [r["text"] for r in LOADERS["local"](source, 0, 10)] == ["a0", "b0", "c0", "d0", "e0"]
 
 
 def test_local_projects_jsonl_and_parquet_to_the_requested_columns(tmp_path: Path) -> None:
