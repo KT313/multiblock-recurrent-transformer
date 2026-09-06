@@ -780,7 +780,8 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
             exp_avg_sq = state.get("exp_avg_sq")
             if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
                 continue
-            rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
+            # out of place: `.float()` aliases an fp32 buffer, an in-place clamp would edit the optimizer state
+            rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp(min=group["eps"] ** 2)).mean().sqrt()
             total_rms += rms
             num_params_with_grad += 1
             if wte_weight is not None and param is wte_weight:

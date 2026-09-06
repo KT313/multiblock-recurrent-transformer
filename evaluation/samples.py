@@ -47,16 +47,18 @@ def generate_samples(
     temperature: float = 0.0,
     recurrence: Recurrence = None,
     batch_size: int = 8,
+    seed: int = 0,
 ) -> list[GeneratedSample]:
     """
     One completion per prompt: greedy when temperature is 0, sampled at that temperature otherwise; at most
     max_new_tokens tokens, cut at the first EOS. recurrence (steps per core block, e.g. [4, 4, 4]) overrides the
-    model's mean recurrence.
+    model's mean recurrence. seed seeds the isolated RNG (the initial latent state, and the sampling), so the
+    output is reproducible whatever the global RNG state.
     """
 
     check_recurrence(recurrence, model)
     samples: list[GeneratedSample] = []
-    with isolated_inference(model, recurrence):
+    with isolated_inference(model, recurrence, seed=seed):
         wrapper = hf_wrapper_around(model, tokenizer)
         generate = cast(Any, wrapper).generate  # set dynamically by transformers, invisible to the type checkers
         device = next(model.parameters()).device
@@ -109,6 +111,7 @@ def generate_and_save_samples(
     temperature: float = 0.0,
     recurrences: Sequence[Recurrence] = (None,),
     batch_size: int = 8,
+    seed: int = 0,
 ) -> list[GeneratedSample]:
     """
     `generate_samples` once per recurrence setting, then one JSON line per sample in out_path (parents created):
@@ -126,9 +129,10 @@ def generate_and_save_samples(
                 temperature=temperature,
                 recurrence=recurrence,
                 batch_size=batch_size,
+                seed=seed,
             )
         )
-    decoding = {"temperature": temperature, "max_new_tokens": max_new_tokens}
+    decoding = {"temperature": temperature, "max_new_tokens": max_new_tokens, "seed": seed}
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as file:
         for sample in samples:

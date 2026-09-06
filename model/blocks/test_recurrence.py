@@ -37,6 +37,10 @@ def test_canon_steps_all_input_forms() -> None:
     assert canon_steps(torch.tensor(4)) == (4, 0)
     assert canon_steps(torch.tensor([4])) == (4, 0)
     assert canon_steps(torch.tensor([[3], [2]])) == (3, 2)
+    assert canon_steps((0, 1)) == (0, 1)
+    for depthless in (0, (0, 0), torch.tensor([0]), (-1, 2)):  # zero steps would hand the random initial state on as the output
+        with pytest.raises(ValueError, match="at least one recurrent step"):
+            canon_steps(depthless)
     n, k = canon_steps(torch.tensor([3, 2], dtype=torch.long))
     assert isinstance(n, int) and isinstance(k, int)
 

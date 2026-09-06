@@ -194,7 +194,12 @@ N_ATTN_LAYERS = 2 + 2 + 1  # prelude + core blocks (1 layer each) + coda
 
 def test_track_gradient_metrics_on_tiny_model(tiny_model: RecurrentGPT) -> None:
     opt = _step_tiny(tiny_model)
+    state_before = {id(p): {k: v.clone() for k, v in s.items() if torch.is_tensor(v)} for p, s in opt.state.items()}
     metrics = track_gradient_metrics(tiny_model, opt)
+    for param, state in opt.state.items():  # a log step changes no state (the resume checks rely on it)
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                assert torch.equal(value, state_before[id(param)][key]), key
 
     for i in range(N_ATTN_LAYERS):
         for key in (

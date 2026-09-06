@@ -45,7 +45,7 @@ Logged per step (wandb): `stage/current_stage`, `stage/base_lr`,
 plus the realised data composition of the world batches since the last log step
 (`data_composition/<source>`) and the validation metrics `val_loss`, `val_ppl`,
 `val_loss_<depth>` / `val_ppl_<depth>` for every `partial_depth_eval` depth and
-`val_time` (of the stage the run is in at that step, not per stage).
+`val_time` (of the stage the run is in at that step; inside a transition window, of the stage being entered).
 
 ## Step accounting
 

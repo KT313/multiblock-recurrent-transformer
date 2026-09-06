@@ -18,9 +18,10 @@ from model.hf.modeling import RecurrentGPTForCausalLM
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 
-RESULTS = {
+RESULTS: dict[str, dict[str, Any]] = {
     "arc_easy": {"acc,none": 0.25, "acc_stderr,none": 0.02, "acc_norm,none": 0.3, "acc_norm_stderr,none": 0.02, "alias": "arc_easy"},
     "hellaswag": {"acc,none": 0.26, "acc_stderr,none": 0.01, "alias": "hellaswag", "samples": 40},
+    "gsm8k": {"exact_match,strict-match": 0.1, "exact_match_stderr,strict-match": 0.01, "exact_match,flexible-extract": 0.2},
 }
 
 
@@ -59,8 +60,10 @@ def test_flatten_results_keeps_the_metrics_without_stderr() -> None:
         "benchmark/mean/arc_easy/acc_norm": 0.3,
         "benchmark/mean/hellaswag/acc": 0.26,
         "benchmark/mean/hellaswag/samples": 40.0,
+        "benchmark/mean/gsm8k/exact_match_strict-match": 0.1,  # two filters of one metric stay two entries
+        "benchmark/mean/gsm8k/exact_match_flexible-extract": 0.2,
     }
-    assert set(flatten_results(RESULTS, "4-8")) == {f"benchmark/4-8/{k}" for k in ("arc_easy/acc", "arc_easy/acc_norm", "hellaswag/acc", "hellaswag/samples")}
+    assert set(flatten_results(RESULTS, "4-8")) == {f"benchmark/4-8/{k}" for k in ("arc_easy/acc", "arc_easy/acc_norm", "hellaswag/acc", "hellaswag/samples", "gsm8k/exact_match_strict-match", "gsm8k/exact_match_flexible-extract")}
 
 
 def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
@@ -79,6 +82,8 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     assert isinstance(wrapper, RecurrentGPTForCausalLM) and not wrapper.training
     assert wrapper.model.transformer.wte.weight.data_ptr() == tiny_model.transformer.wte.weight.data_ptr()
     assert calls["hflm"]["tokenizer"] is tokenizer.processor and calls["hflm"]["batch_size"] == 4
+    assert calls["hflm"]["add_bos_token"] is True  # scored on inputs shaped like the training rows
+    assert calls["hflm"]["max_length"] == tiny_model.config.model_max_sequence_length
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"]
     assert (calls["evaluate"]["num_fewshot"], calls["evaluate"]["limit"]) == (2, 40)
     assert calls["evaluate"]["model"].__class__.__name__ == "HFLM"
@@ -116,4 +121,4 @@ def test_real_harness_scores_arc_easy(tiny_model: RecurrentGPT, tiny_tokenizer_d
     metrics = evaluate_on_benchmarks(
         tiny_model, Tokenizer(tiny_tokenizer_dir), ["arc_easy"], limit=4, batch_size=2, out_path=benchmarks_path(tmp_path, 1)
     )
-    assert "benchmark/arc_easy/acc" in metrics and 0.0 <= metrics["benchmark/arc_easy/acc"] <= 1.0
+    assert "benchmark/mean/arc_easy/acc" in metrics and 0.0 <= metrics["benchmark/mean/arc_easy/acc"] <= 1.0

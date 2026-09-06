@@ -38,16 +38,14 @@ def canon_steps(steps: StepsSpec) -> StepsPair:
 
     if isinstance(steps, torch.Tensor):
         values = steps.detach().reshape(-1)
-        num_steps_no_grad = int(values[0].item())
-        if values.numel() == 1:
-            return num_steps_no_grad, 0
-        return num_steps_no_grad, int(values[1].item())
-    if isinstance(steps, (list, tuple)):
-        num_steps_with_grad = 0
-        if len(steps) > 1:
-            num_steps_with_grad = int(steps[1])
-        return int(steps[0]), num_steps_with_grad
-    return int(steps), 0
+        pair = (int(values[0].item()), int(values[1].item()) if values.numel() > 1 else 0)
+    elif isinstance(steps, (list, tuple)):
+        pair = (int(steps[0]), int(steps[1]) if len(steps) > 1 else 0)
+    else:
+        pair = (int(steps), 0)
+    if min(pair) < 0 or sum(pair) < 1:
+        raise ValueError(f"num_steps {steps!r}: a block runs at least one recurrent step (n + k >= 1, both >= 0), else its output is the random initial state")
+    return pair
 
 
 def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair | None]:

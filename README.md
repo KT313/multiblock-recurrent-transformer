@@ -6,7 +6,7 @@ This repository contains the code for my thesis "Efficient Large Language Models
 
 ## Work
 
-The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
+The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, input norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
 Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
@@ -73,6 +73,13 @@ Training packs documents end to end (`pack_sequences: true`, the default): one r
 tokens per micro-batch, `micro_batches_per_step` of them per optimizer step, attention masked per document;
 validation stays padded. Left unset, the two are the padded equivalents `micro_batch_size × training_max_sequence_length` and
 `world_batch_size / micro_batch_size`, so a config written in rows keeps its step arithmetic.
+
+A run resumes by default (`resume: true`): the most recently written checkpoint of `run_name` in its run directory is
+loaded, or `resume_checkpoint_path` names one; a checkpoint written with other settings, model config or dataset config
+is refused unless `allow_settings_change` / `allow_dataset_change` say so. `compile_model: true` compiles the model with
+`torch.compile`. The architecture's `bf16_residual_stream` (`none`, `core`, `all`) decides which RMSNorm outputs are
+rounded to the autocast dtype under bf16-mixed precision: none, the core blocks' (the recurrence runs on a bf16 stream),
+or every norm's.
 
 ### Evaluation
 

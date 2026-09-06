@@ -72,10 +72,12 @@ def check_recurrence(recurrence: Recurrence, model: RecurrentGPT) -> None:
 
 
 @contextmanager
-def isolated_inference(model: torch.nn.Module, recurrence: Recurrence = None) -> Iterator[None]:
+def isolated_inference(model: torch.nn.Module, recurrence: Recurrence = None, *, seed: int = 0) -> Iterator[None]:
     """
-    Eval mode and no autograd for the block, the global RNGs (CPU and the model's CUDA device) restored on exit,
-    the model back in the mode it had, and `EVAL_RECURRENCE_STEPS` set to recurrence for the duration.
+    Eval mode and no autograd for the block, the global RNGs (CPU and the model's CUDA device) seeded with seed
+    inside and restored on exit (the recurrent blocks draw their initial state from them, so even greedy output
+    depends on the RNG), the model back in the mode it had, and `EVAL_RECURRENCE_STEPS` set to recurrence for the
+    duration, unset for the mean recurrence (a value left over from elsewhere must not win).
     """
 
     device = next(model.parameters()).device
@@ -83,16 +85,18 @@ def isolated_inference(model: torch.nn.Module, recurrence: Recurrence = None) ->
     was_training = model.training
     previous = os.environ.get(RECURRENCE_ENV)
     env_value = recurrence_env(recurrence)
-    if env_value is not None:
+    if env_value is None:
+        os.environ.pop(RECURRENCE_ENV, None)
+    else:
         os.environ[RECURRENCE_ENV] = env_value
     try:
         with torch.random.fork_rng(devices=devices), torch.inference_mode():
+            torch.manual_seed(seed)
             model.eval()
             yield
     finally:
         model.train(was_training)
-        if env_value is not None:
-            if previous is None:
-                os.environ.pop(RECURRENCE_ENV, None)
-            else:
-                os.environ[RECURRENCE_ENV] = previous
+        if previous is None:
+            os.environ.pop(RECURRENCE_ENV, None)
+        else:
+            os.environ[RECURRENCE_ENV] = previous

@@ -61,7 +61,10 @@ def evaluate_on_benchmarks(
     for recurrence in recurrences:
         with isolated_inference(model, recurrence):
             wrapper = hf_wrapper_around(model, tokenizer)
-            language_model = hf_models.HFLM(pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size)
+            language_model = hf_models.HFLM(  # BOS as in training and sampling; the table length caps the few-shot prompts
+                pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size, add_bos_token=True,
+                max_length=model.config.model_max_sequence_length,
+            )
             results: dict[str, Any] = lm_eval.simple_evaluate(
                 model=language_model, tasks=list(tasks), num_fewshot=num_fewshot, limit=limit
             )
@@ -90,7 +93,9 @@ def evaluate_on_benchmarks(
 def flatten_results(results: Mapping[str, Mapping[str, Any]], label: str) -> dict[str, float]:
     """
     lm-eval's per-task metric dicts (`{"acc,none": 0.23, "acc_stderr,none": 0.01, "alias": ...}`) as
-    `benchmark/<label>/<task>/<metric>` floats without the stderr entries; label names the recurrence setting.
+    `benchmark/<label>/<task>/<metric>` floats without the stderr entries; label names the recurrence setting. A
+    metric under a filter other than `none` keeps it as a suffix (`exact_match,strict-match` -> `exact_match_strict-match`),
+    so two filters of one metric stay two entries.
     """
 
     flat: dict[str, float] = {}
@@ -98,9 +103,11 @@ def flatten_results(results: Mapping[str, Mapping[str, Any]], label: str) -> dic
         for key, value in metrics.items():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
-            name = key.split(",")[0]
+            name, _, metric_filter = key.partition(",")
             if name.endswith("_stderr"):
                 continue
+            if metric_filter and metric_filter != "none":
+                name = f"{name}_{metric_filter}"
             flat[f"{METRIC_PREFIX}/{label}/{task}/{name}"] = float(value)
     return flat
 

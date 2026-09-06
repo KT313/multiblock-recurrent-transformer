@@ -85,10 +85,11 @@ def test_padded_vocab_size_derived_from_padding_multiple() -> None:
     assert cfg.vocab_size == 500
 
 
-def test_explicit_padded_vocab_size_clamps_vocab_size() -> None:
-    cfg = tiny(vocab_size=1000, padded_vocab_size=768)
-    assert cfg.padded_vocab_size == 768
-    assert cfg.vocab_size == 768
+def test_explicit_padded_vocab_size_must_hold_the_vocabulary() -> None:
+    cfg = tiny(vocab_size=700, padded_vocab_size=768)
+    assert (cfg.padded_vocab_size, cfg.vocab_size) == (768, 700)
+    with pytest.raises(ValueError, match="padded_vocab_size 768 is smaller than vocab_size 1000"):
+        tiny(vocab_size=1000, padded_vocab_size=768)  # used to truncate the vocabulary silently
 
 
 def test_head_size_and_intermediate_size() -> None:

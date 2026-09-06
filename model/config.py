@@ -121,8 +121,8 @@ class RecurrentConfig:
         # explicitly, in which case the vocabulary must fit into it.
         if self.padded_vocab_size is None:
             self.padded_vocab_size = find_multiple(self.vocab_size, self.padding_multiple)
-        else:
-            self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
+        elif self.padded_vocab_size < self.vocab_size:
+            raise ValueError(f"padded_vocab_size {self.padded_vocab_size} is smaller than vocab_size {self.vocab_size}: the vocabulary must fit into the padded table")
 
         # Derived sizes.
         if self.n_embd % self.num_attention_heads != 0:

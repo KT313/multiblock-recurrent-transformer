@@ -61,8 +61,9 @@ def test_isolated_inference_restores_rng_mode_and_env(tiny_model: RecurrentGPT, 
     with isolated_inference(tiny_model, [3, 3]):
         assert os.environ[RECURRENCE_ENV] == "3,3"
     assert os.environ[RECURRENCE_ENV] == "1"
-    with isolated_inference(tiny_model):  # no recurrence given: the variable is left alone
-        assert os.environ[RECURRENCE_ENV] == "1"
+    with isolated_inference(tiny_model):  # no recurrence given: a value left over from elsewhere must not win
+        assert RECURRENCE_ENV not in os.environ
+    assert os.environ[RECURRENCE_ENV] == "1"
 
 
 def test_check_recurrence_rejects_a_wrong_block_count(tiny_model: RecurrentGPT) -> None:
@@ -114,16 +115,14 @@ def test_generate_samples_greedy_is_deterministic_and_bounded(tiny_model: Recurr
     tiny_model.train()
     torch.manual_seed(0)
     first = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=5, batch_size=2)
-    torch.manual_seed(0)
+    torch.manual_seed(1)  # the isolated RNG is seeded inside: the global state does not reach the initial latent draw
     second = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=5, batch_size=3)
-    assert first == second and len(first) == 3 and tiny_model.training  # batching does not change greedy output
+    assert first == second and len(first) == 3 and tiny_model.training  # neither batching nor the global RNG changes greedy output
     assert [sample.kind for sample in first] == [CONTINUATION, INSTRUCTION, CONTINUATION]
     assert all(0 <= sample.new_tokens <= 5 for sample in first)  # an untrained model may emit EOS at once
-    torch.manual_seed(0)
     sampled_a = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
-    torch.manual_seed(1)
-    sampled_b = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
-    assert sampled_a != sampled_b
+    sampled_b = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5, seed=1)
+    assert sampled_a != sampled_b and sampled_a == generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
 
 
 def test_generate_and_save_samples_writes_jsonl(tiny_model: RecurrentGPT, tokenizer: Tokenizer, tmp_path: Path) -> None:
@@ -137,5 +136,5 @@ def test_generate_and_save_samples_writes_jsonl(tiny_model: RecurrentGPT, tokeni
     assert [line["prompt"] for line in lines] == 2 * [prompt.text for prompt in DEFAULT_PROMPTS]
     assert [line["recurrence"] for line in lines] == len(DEFAULT_PROMPTS) * [[1, 1]] + len(DEFAULT_PROMPTS) * [None]
     assert lines[0]["step"] == 12 and lines[0]["completion"] == samples[0].completion
-    assert lines[0]["decoding"] == {"temperature": 0.0, "max_new_tokens": 4}
+    assert lines[0]["decoding"] == {"temperature": 0.0, "max_new_tokens": 4, "seed": 0}
     assert set(lines[0]) == {"step", "prompt", "kind", "completion", "new_tokens", "stopped_at_eos", "recurrence", "decoding"}
