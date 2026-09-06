@@ -553,20 +553,25 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     assert "stage s: its validation data (s-a, s-b) yields 1 micro-batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
 
 
-def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
+def test_resolve_dataset_warns_about_the_short_tiny_validation_splits(
     tiny_dataset_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    The tiny dataset's finetune validation split is a couple of rows: enough for one micro-batch (the run is
-    fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so.
+    The tiny dataset's validation splits are a handful of rows: enough for a micro-batch (the run is fine,
+    `evaluate` averages what it gets) but fewer than `eval_iters` batches once those ask for more, and the
+    resolver says so per stage.
     """
 
-    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2)
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=4)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         resolved = resolve_dataset(settings)
-    assert resolved.validation_rows["synthetic_instruct"] < 2 * 2  # fewer rows than eval_iters micro-batches
-    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 1 micro-batch(es)" in caplog.text
-    assert "stage pretrain_a" not in caplog.text  # the pretrain split is long enough
+    assert resolved.validation_rows["synthetic_instruct"] == 6 < 2 * 4  # fewer rows than eval_iters micro-batches
+    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 3 micro-batch(es)" in caplog.text
+    assert "stage pretrain_a: its validation data (pretrain_a-synthetic_pretrain) yields 3 micro-batch(es)" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2))
+    assert "micro-batch(es)" not in caplog.text  # two batches of two rows fit every split
 
 
 def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

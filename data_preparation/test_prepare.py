@@ -52,9 +52,9 @@ def test_commands_are_registered() -> None:
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 2 and args.pass_workers == 4 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
-    assert not args.dry_run and not args.yes
-    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--dry_run", "--yes", "--num_workers", "3", "--pass_workers", "5", "--max_parallel_downloads", "4"])
-    assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.dry_run and args.yes
+    assert not args.dry_run and not args.yes and args.reopen is None
+    args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--reopen", "a", "--dry_run", "--yes", "--num_workers", "3", "--pass_workers", "5", "--max_parallel_downloads", "4"])
+    assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.reopen == ["a"] and args.dry_run and args.yes
     assert args.num_workers == 3 and args.pass_workers == 5 and args.max_parallel_downloads == 4
     assert parser.parse_args(["prepare", "--dataset_config", "x.yaml", "-y"]).yes
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
@@ -90,6 +90,29 @@ def test_status_exit_codes(tmp_path: Path, tiny_layout: DatasetLayout, capsys: p
     assert "INCOMPLETE" in capsys.readouterr().out
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(tiny_layout.root)])  # exit 0
     assert "dataset complete" in capsys.readouterr().out
+
+
+def test_an_unreadable_raw_manifest_is_reported_without_a_traceback(
+    tmp_path: Path, tiny_layout: DatasetLayout, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    `status` and `prepare --dry_run` on a raw folder whose manifest does not parse print the status table with
+    the state and leave the folder alone; they used to die with the `Manifest.load` traceback.
+    """
+
+    root = tmp_path / "dataset"
+    shutil.copytree(tiny_layout.root, root)
+    manifest = DatasetLayout(root).raw_dir("synthetic_pretrain") / "MANIFEST.json"
+    manifest.write_text("{ not json")
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
+    out = capsys.readouterr().out
+    assert exc.value.code == 1 and "INCOMPLETE" in out and "Traceback" not in out
+    assert "synthetic_pretrain  pretrain" in out and "raw unreadable manifest next to shards; fix or delete the directory by hand" in out
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--dry_run"])  # a dry run exits 0
+    assert "dataset INCOMPLETE" in caplog.text and "would leave raw" in caplog.text and "Traceback" not in caplog.text
+    assert manifest.read_text() == "{ not json" and (manifest.parent / "data-00000.parquet").is_file()
 
 
 def test_describe_prints_markdown_with_the_config_notes(capsys: pytest.CaptureFixture[str]) -> None:

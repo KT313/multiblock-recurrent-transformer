@@ -354,7 +354,7 @@ def test_validation_fraction_of() -> None:
     assert cfg.validation_fraction_of("hold") == 0.0 and cfg.validation_fraction_of("only_train") == 0.0
 
 
-def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -> None:
+def test_token_budget_is_the_weight_schedule_integral() -> None:
     """
     One continuous stream per source: the budgets of stages sharing a source ADD UP (they used to be maximised
     when every stage re-read the source from the top).
@@ -365,16 +365,32 @@ def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -
     d["stages"][0]["train"] = {"pre": 0.6, "pre2": 0.4}
     d["stages"][1] = {"name": "s2", "tokens": 4000, "train": {"pre": 0.1, "pre2": 0.9}, "val": {"pre": 1.0}}
     d["stages"].append({"name": "s3", "tokens": 500, "train": {"ins": 1.0}, "val": {"ins": 1.0}})
-    cfg = _build(d)  # block_size 64; no transitions: the integral is the plain sum of stage.tokens × weight
-    assert cfg.sequence_budget("pre") == ceil((1000 * 0.6 + 4000 * 0.1) / 64) == 16
-    assert cfg.sequence_budget("pre2") == ceil((1000 * 0.4 + 4000 * 0.9) / 64) == 63
-    assert cfg.sequence_budget("ins") == 8  # ceil(500 / 64)
-    assert cfg.sequence_budget("hold") == 0  # validation only: `rows` says how many to download
+    cfg = _build(d)  # no transitions: the integral is the plain sum of stage.tokens × weight
+    assert cfg.token_budget("pre") == 1000 * 0.6 + 4000 * 0.1 == 1000
+    assert cfg.token_budget("pre2") == 1000 * 0.4 + 4000 * 0.9 == 4000
+    assert cfg.token_budget("ins") == 500
+    assert cfg.token_budget("hold") == 0  # validation only: `rows` says how many to deliver
+
+
+def test_rows_budget_divides_by_the_tokens_per_row_rate_clamped_at_block_size() -> None:
+    """
+    The rate is the source's `describe_tokens_per_row` estimate (500 by default) until a measured mean is given,
+    never more than `block_size`: a longer row serves at most one sequence of the budget.
+    """
+
+    d = _minimal()
+    cfg = _build(d)  # block_size 64: the default estimate of 500 is clamped
+    assert cfg.tokens_per_row_rate("pre") == 64 and cfg.rows_budget("pre") == ceil(1000 / 64) == 16
+    assert cfg.rows_budget("ins") == 8 and cfg.rows_budget("hold") == 0
+    assert cfg.tokens_per_row_rate("pre", 100.0) == 64 and cfg.rows_budget("pre", 100.0) == 16  # measured above block_size: clamped too
+    assert cfg.tokens_per_row_rate("pre", 20.0) == 20 and cfg.rows_budget("pre", 20.0) == 50  # measured below: the budget takes more rows
+    d["sources"]["pre"]["describe_tokens_per_row"] = 40
+    assert _build(d).rows_budget("pre") == 25  # the estimate below block_size counts as given
     d["block_size"] = 32
-    assert _build(d).sequence_budget("pre2") == 125  # ceil(4000 / 32)
+    assert _build(d).rows_budget("pre") == 32 and _build(d).rows_budget("pre", 40.0) == 32  # ceil(1000 / 32)
 
 
-def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
+def test_token_budget_transition_windows_contribute_the_trapezoid() -> None:
     """
     Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
     transition tokens × (weight + next stage's weight) / 2: a source leaving ramps out, one entering ramps in.
@@ -383,25 +399,28 @@ def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
     d = _minimal()
     d["stages"][0]["transition_pct"] = 0.2  # transition window: 1000 × 0.2 = 200 tokens at the end of s1
     cfg = _build(d)
-    assert cfg.sequence_budget("pre") == ceil((800 * 1.0 + 200 * (1.0 + 0.0) / 2) / 64) == 15  # ramps out over s1's end
-    assert cfg.sequence_budget("ins") == ceil((200 * (0.0 + 1.0) / 2 + 500 * 1.0) / 64) == 10  # ramps in over the same window
+    assert cfg.token_budget("pre") == 800 * 1.0 + 200 * (1.0 + 0.0) / 2 == 900  # ramps out over s1's end
+    assert cfg.token_budget("ins") == 200 * (0.0 + 1.0) / 2 + 500 * 1.0 == 600  # ramps in over the same window
 
 
-def test_sequence_budget_of_the_crow_config() -> None:
+def test_token_budget_of_the_crow_config() -> None:
     cfg = load_dataset_config(CROW)
     # fineweb_edu: 3.3B × (0.9 × 0.65 + 0.1 × (0.65 + 0.35)/2) + 1.5B × (0.9 × 0.35 + 0.1 × (0.35 + 0)/2) = 2 594.25M tokens
-    assert cfg.sequence_budget("fineweb_edu") == -(-2_594_250_000 // 2048) == 1_266_724
+    assert cfg.token_budget("fineweb_edu") == 2_594_250_000
+    assert cfg.rows_budget("fineweb_edu") == -(-2_594_250_000 // 2000) == 1_297_125  # at the config's 2000 tokens/row
     # gsm8k (phase 2 only): ramp-in 3.3B × 0.1 × 0.022/2 + phase 2 1.5B × (0.9 × 0.022 + 0.1 × 0.022/2) = 34.98M tokens
-    assert cfg.sequence_budget("gsm8k") == -(-34_980_000 // 2048) == 17_081
+    assert cfg.token_budget("gsm8k") == 34_980_000
     # flan (finetune only; no transition out of the last stage): ramp-in 1.5B × 0.1 × 0.40/2 + 150M × 0.40 = 90M tokens
-    assert cfg.sequence_budget("flan") == -(-90_000_000 // 2048) == 43_946
+    assert cfg.token_budget("flan") == 90_000_000
+    assert cfg.rows_budget("flan") == -(-90_000_000 // 300) == 300_000
 
 
 def test_rows_needed_counts_the_margin_and_the_split() -> None:
     cfg = _build(_minimal())
-    assert cfg.rows_needed("pre") == 21  # ceil(1000/64) = 16 sequences; × 1.2 ÷ (1 − 0.05) = 20.2 -> 21
-    assert cfg.rows_needed("ins") == 11  # ceil(500/64) = 8 sequences; × 1.2 ÷ 0.95 = 10.1 -> 11
-    assert cfg.rows_needed("hold") == 10  # validation-only: its `rows`
+    assert cfg.rows_needed("pre") == 20  # 1000 tokens ÷ 64 per row = 15.625 rows; × 1.2 ÷ (1 − 0.05) = 19.7 -> 20 (no rounding in between)
+    assert cfg.rows_needed("ins") == 10  # 500 ÷ 64 = 7.8125 rows; × 1.2 ÷ 0.95 = 9.87 -> 10
+    assert cfg.rows_needed("pre", 32.0) == 40  # a measured 32 tokens per row: 31.25 rows × 1.2 ÷ 0.95 = 39.5 -> 40
+    assert cfg.rows_needed("hold") == 12 and cfg.rows_sufficient("hold") == 10  # validation-only: its `rows` survive the build, × 1.2 downloaded
 
 
 # --- the shuffled-build row cap ---------------------------------------------------------------------------------------
@@ -449,11 +468,11 @@ def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> No
     with pytest.raises(ValueError, match="ins: shuffle=true builds all-at-once"):
         _build(instruct)
     val_only = _minimal()
-    val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows`
-    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,000,000 rows"):
+    val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows` (× the download margin)
+    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,400,000 rows"):
         _build(val_only)
     val_only["sources"]["hold"]["rows"] = 10
-    assert _build(val_only).rows_needed("hold") == 10
+    assert _build(val_only).rows_needed("hold") == 12
 
 
 def test_source_processing_override() -> None:

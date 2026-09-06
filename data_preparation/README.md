@@ -20,7 +20,7 @@ that file; this is the shape:
 tokenizer: {name: llama-32k, kind: hf, hf_id: hf-internal-testing/llama-tokenizer, revision: <sha>}
 max_seq_length: 2048        # pretrain rows are truncated to this many tokens WHEN DOWNLOADED, instruct rows longer than
                             # this are dropped; raising it re-downloads raw (after confirmation), lowering it costs nothing
-block_size: 2048            # training sequence length; the planner counts sequences with it; the run config must match
+block_size: 2048            # training sequence length; the planner caps its tokens-per-row rate with it; the run config must match
 token_count: tokenizer      # or: estimate (chars / 4)
 validation_fraction: 0.05   # share of a source's rows held out when the source is used for training AND validation
 processing:                 # defaults for every source; a pretrain source may carry its own block
@@ -34,7 +34,7 @@ sources:                    # keyed by name; `kind` selects the converter and th
   gsm8k:       {kind: pretrain, loader: hf_split, hf_id: openai/gsm8k, revision: <sha>, load_kwargs: {name: main},
                 converter: gsm8k_question_answer}
   heldout:     {kind: pretrain, loader: hf_files, hf_id: some/other-corpus, revision: <sha>,
-                load_kwargs: {data_files: "*.parquet"}, rows: 5000}     # only in `val` below -> all rows validation
+                load_kwargs: {data_files: "*.parquet"}, rows: 5000}     # only in `val` below -> all rows validation (5000 delivered)
   flan:        {kind: instruct, loader: hf_files, hf_id: Open-Orca/FLAN, revision: <sha>,
                 load_kwargs: {data_files: "flan_zsopt_data/*.parquet"},
                 fields: {instruction: inputs, output: targets}, input_inversions: 0.05}
@@ -52,7 +52,7 @@ weights that are zero or do not sum to 1, a source used by no stage, a source us
 training source with `rows`, and so on. The keys of the earlier schema (`instruct_mixtures`, `validation_tokens`,
 `max_chars`, `max_tokens`, `tokens_per_row_estimate`, `<source>/validation` stage keys) are simply unknown now:
 mixing and the validation split are the training dataloader's job, rows are truncated to `max_seq_length` tokens at
-download, and the planner counts sequences.
+download, and the planner counts tokens (`describe_tokens_per_row` is its starting rate, not a description).
 
 The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
 generated from it), `config/datasets/crow_300m_mini.yaml` (the same sources with tiny budgets: a real-source smoke
@@ -112,7 +112,7 @@ or dropped source row twice. All-at-once builds (shuffled sources, minhash) writ
 
 ```bash
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-        [--sources NAME ...] [--steps tokenizer download build] [--yes] [--dry_run]
+        [--sources NAME ...] [--steps tokenizer download build] [--reopen NAME ...] [--yes] [--dry_run]
         [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
@@ -120,7 +120,8 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
 ```
 
 - `prepare` materialises the config (missing parts only; a second run is a no-op). `--sources` / `--steps` restrict
-  it, `--dry_run` prints what the repair step and the first round would do and writes nothing (not even the lock).
+  it, `--reopen` clears the exhausted flag of the named sources first (below), `--dry_run` prints what the repair
+  step and the first round would do and writes nothing (not even the lock).
   Exit codes: 0 ok, 1 a failed source (logged with its traceback; the other jobs stop at their next shard: a
   failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 3
   another data preparation still running, 130 Ctrl-C (every running step stops at its next shard, everything
@@ -128,12 +129,12 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
   `<out_dir>/.train.lock` the same way): a second `prepare` or a `train.py` auto-prepare on the same directory exits 3
   right away, naming the running one's start time and pid and how to stop it (`kill -INT <pid>`); the lock is the
   OS's, released when the holder ends, so it never goes stale.
-- `status` is read-only: what the repair step *would* do plus the status table (rows needed / raw / processed /
-  epochs / state / reason per source and the tokenizer); exit 0 iff the dataset is complete. A source the repair
-  step would touch counts as incomplete.
+- `status` is read-only: what the repair step *would* do plus the status table (rows needed / tokens per row / raw /
+  processed / epochs / state / reason per source and the tokenizer); exit 0 iff the dataset is complete. A source the
+  repair step would touch counts as incomplete.
 - `describe` renders the config as Markdown: tokenizer and token counting, processing defaults, one table per stage
-  (weights, token budgets, sequences, an estimated row count), the validation split per source and the source
-  registry. The comment block at the top of the YAML becomes its "Notes" section. `docs/data_mixture.md` is that
+  (weights, token budgets, the tokens-per-row estimate and the rows it makes of them), the validation split per
+  source and the source registry. The comment block at the top of the YAML becomes its "Notes" section. `docs/data_mixture.md` is that
   output for the crow config; regenerate it after editing the config.
 
 ## What `prepare` does
@@ -147,6 +148,7 @@ def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel
     with build_lock(layout.root):
         prepare_tokenizer(config, layout)                                    # tokenizers/<name>/ (downloads count with it)
         repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm)
+        reopen_sources(config, layout, reopened, dry_run=dry_run)            # --reopen: clear the exhausted latch
         for round_number in range(1, MAX_ROUNDS + 1):                        # MAX_ROUNDS = 5
             download_plan = plan_downloads(config, layout, sources=selected)  # rows still missing per source
             download_and_build_missing(download_plan, config, layout, ...)   # downloads (sources/<s>/raw) and builds (processed/<s>)
@@ -175,13 +177,15 @@ prepares data in-process forks DataLoader workers afterwards) with 8 threads (`R
 per process and shared by every download job, and past 8 threads a batch barely gets faster). A single download is
 therefore bound by its network fetch; `--max_parallel_downloads` scales from there.
 
-A round is normally enough. A second one happens when a loader returned fewer rows than asked without being
-exhausted, or when the length filter and the dedup dropped more than the 20 % safety margin covers, and it really
-tops the source up: one `SourceLedger` per source (`lib/build/planner.py`) answers both "what is still to download?"
-and "is this source done?" from one read of the config and the manifests, so the plan sees a folder whose *raw* rows
-suffice but whose *processed* rows do not, and asks for `shortfall ÷ observed yield × 1.2` more raw rows. The loop
-stops when every source serves its budget, when nothing more can be fetched, or after `MAX_ROUNDS` (5); a source
-still short then is reported, not looped on forever.
+A round is normally enough. A second one happens when the raw shards of the first measured fewer tokens per row than
+the estimate the download was sized with (by more than the 20 % safety margin covers), or when the length filter and
+the dedup dropped more than that margin, and it really tops the source up: one `SourceLedger` per source
+(`lib/build/planner.py`) answers both "what is still to download?" and "is this source done?" from one read of the
+config and the manifests, so the plan sees a folder whose *raw* rows suffice but whose *processed* rows do not, and
+asks for `shortfall ÷ observed yield × 1.2` more raw rows, and it never re-downloads a source whose processed rows
+already serve the budget. A loader that yielded fewer rows than asked does **not** get a second round: it is
+exhausted (below). The loop stops when every source serves its budget, when nothing more can be fetched, or after
+`MAX_ROUNDS` (5); a source still short then is reported, not looped on forever.
 
 ### Download (`lib/stages/download.py`)
 
@@ -193,8 +197,12 @@ stored text, so storage is bounded and no count is ever wrong; `token_count: est
 characters). Instruct rows run through the converter and filter at download time and are stored as
 `{instruction, input, output, tokens}`; a row over `max_seq_length` tokens is **dropped**, never cut (an answer
 missing its end would be worse than a missing row; `dropped_too_long` in the manifest), a malformed one is skipped
-(`skipped_malformed`); `check_limit` bounds the source rows inspected. A loader that runs dry marks the source
-`exhausted`; the source completes with a warning and the training sampler cycles what is there.
+(`skipped_malformed`); `check_limit` bounds the source rows inspected. A loader that yields fewer rows than asked
+marks the source `exhausted`, whatever the reason (the source really ended, a partial listing, a loader bug): the
+source completes with a warning (after the status table) and the training sampler cycles what is there. The flag is
+a latch: a later run does not read on by itself, a bigger budget fetches nothing. The one exception is a source
+stopped by its own `check_limit`: the manifest records the limit, and a grown (or removed) limit reopens the source.
+Everything else is `prepare --reopen NAME`: it clears the flag and the download resumes at the recorded offset.
 
 The download **never deletes** a raw folder. A folder whose manifest is *stale* (identity or tokenizer changed) or
 *outdated* (stored with a smaller `max_seq_length` than the config asks for now) is an error at this point; only the
@@ -264,26 +272,36 @@ list and exits 2 with nothing changed. `train.py`'s auto-prepare never prompts a
 with the same list and the `prepare.py prepare --yes` command. Lowering `max_seq_length` never touches raw (rows are
 at most `truncated_at_tokens` long; the build clamps the stored counts, training truncates at `block_size` anyway).
 
-### Sequences, not tokens (`lib/build/planner.py`)
+### Tokens, not sequences (`lib/build/planner.py`)
 
 The trainer draws **rows** from one continuous reader per source, one draw per sample, weighted by the stage
-schedule (the stage's constant weight, linearly interpolated across a transition window), and pads or truncates
-every row to `block_size` (no packing). The run therefore consumes the integral of a source's weight schedule over
-the stage token budgets, ÷ `block_size`. That is the planner's unit, the **sequence budget**: stages sharing a
-source ADD UP (the reader continues across stage boundaries instead of re-reading), each stage contributing
-`(tokens − transition tokens) × weight` plus the trapezoid `transition tokens × (weight + next stage's weight) / 2`
-for the window at its end:
+schedule (the stage's constant weight, linearly interpolated across a transition window), and packs them end to end
+into `block_size` sequences: a source is consumed by the token length of its rows. The run therefore needs the
+integral of a source's weight schedule over the stage token budgets, in tokens. That is the planner's unit, the
+**token budget**: stages sharing a source ADD UP (the reader continues across stage boundaries instead of
+re-reading), each stage contributing `(tokens − transition tokens) × weight` plus the trapezoid
+`transition tokens × (weight + next stage's weight) / 2` for the window at its end. Rows are what a loader delivers,
+so the budget is divided by a **tokens-per-row rate**: the source's `describe_tokens_per_row` until its first raw
+shard is on disk, the measured mean of the raw manifest (`tokens ÷ rows`) from then on, either clamped at
+`block_size`:
 
 ```
-rows_needed(source)     = ceil(sequence_budget × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
-                        = source.rows                                                          # source used only in val
-rows_sufficient(source) = rows_needed ÷ 1.2                                                    # processed rows that serve it
-epochs (status table)   = sequence_budget ÷ training rows after the split
+rate                    = min(measured mean tokens per raw row, or describe_tokens_per_row before the first shard; block_size)
+rows_needed(source)     = ceil(token_budget ÷ rate × 1.2 ÷ (1 − validation_fraction_of(source)))   # source used in train
+                        = ceil(source.rows × 1.2)                                                  # source used only in val
+rows_sufficient(source) = rows_needed ÷ 1.2, or source.rows                                        # processed rows that serve it
+epochs (status table)   = (token_budget ÷ rate) ÷ training rows after the split
 ```
 
-The `× 1.2` covers what the length filter and the dedup drop, the division keeps the *training* part at the
-sequence budget after the resolver holds `validation_fraction` out. There is no tokens-per-row estimate anywhere in
-this arithmetic (`describe_tokens_per_row` on a source feeds only the row column of `describe`).
+The `× 1.2` covers what the length filter and the dedup drop and an estimate that ran high, the division keeps the
+*training* part at the budget after the resolver holds `validation_fraction` out. The first download is sized at the
+estimate; the round loop tops the source up at the measured rate when the estimate was more than 20 % too high
+(rows measured shorter), and re-downloads nothing when the processed rows already serve the budget. A run that pads
+instead of packing consumes one row per sequence, so it is over-provisioned by `block_size ÷ rate` and never short.
+The clamp at `block_size` is an approximation on the safe side: `min(mean, block_size)` over-estimates the rows a
+source of rows longer than `block_size` consumes (every token of such a row is trained on too), so a rate that
+proves lower than assumed is what the top-up rounds correct, never one that was too low. A validation-only source's
+`rows` are delivered rows: `× 1.2` downloaded, `rows` of them have to survive the build.
 
 Whether a source is **satisfied** is `SourceLedger.satisfaction()`: `(satisfied, reason)`, the reason being the
 status table's last column. The plan, the round loop and the status table all read it:
@@ -291,20 +309,19 @@ status table's last column. The plan, the round loop and the status table all re
 | reason | when | satisfied |
 |---|---|---|
 | `ok` | processed rows ≥ `rows_sufficient` | yes |
-| `exhausted at N of M rows` | the loader ran dry with fewer, but some, training rows | yes, state `exhausted` (the sampler cycles them) |
+| `exhausted at N of M rows` | the loader yielded fewer rows than asked, some of them training rows | yes, state `exhausted` (the sampler cycles them; `--reopen` if the source has more) |
 | `exhausted and NOT ONE of N raw rows survived the build` | the loader ran dry and every row was rejected | **no**: a wrong `fields` / `converter` / `filter` / `language`, and a failed source is a failed build |
 | `exhausted, and … leaves 0 training rows` | the few rows all go to the validation holdout | **no**: lower the source's `validation_fraction` or give it more rows |
 | `processed rows N < M` | too few processed rows, the loader has more | no: the next round tops it up |
 | `processed <reason>` | `processed/` missing, stale or behind the raw shards | no: build it |
-| `raw <reason>` | nothing downloaded / stale or outdated raw | no: download, or let the repair step delete it |
+| `raw <reason>` | nothing downloaded / stale or outdated raw, or a raw manifest nobody can parse | no: download, let the repair step delete it, or fix the manifest by hand |
 
 The consequence to keep in mind: **the weights mix rows, not tokens.** The realised token share of a source in a
-stage is proportional to `weight × mean_tokens_per_row` (rows capped at `block_size`), so a stage's token mix is
-`weight × mean_tokens_per_row ÷ block_size`-weighted. Example: `block_size` 2048, one 1 B-token stage,
-`{fineweb: 0.5 (~1000 tokens/row), gsm8k: 0.5 (~300 tokens/row, 7.5 k rows)}`: the stage draws 488 k sequences,
-244 k rows of each source, a realised token mix of about 77 / 23, and gsm8k is cycled ~33 times (`epochs` 33 in the
-status table). The planner downloads 293 k fineweb rows for it (244 k × 1.2). Set weights with the row lengths of the sources in mind; `docs/data_mixture.md` prints
-tokens, sequences and an estimated row count per source and stage.
+stage is proportional to `weight × mean_tokens_per_row`. Example: `block_size` 2048, one 1 B-token stage,
+`{fineweb: 0.5 (~1000 tokens/row), gsm8k: 0.5 (~300 tokens/row, 7.5 k rows)}`: the planner books 500 M tokens per
+source, 500 k fineweb rows (600 k downloaded) and 1.67 M gsm8k draws, so gsm8k is cycled ~220 times (`epochs` in the
+status table) for a realised token mix of about 77 / 23. Set weights with the row lengths of the sources in mind;
+`docs/data_mixture.md` prints tokens, the tokens-per-row estimate and the rows it makes of them per source and stage.
 
 ### The validation split happens at training time
 
@@ -314,7 +331,7 @@ decides, once per source and run, from how the stages use it:
 | the source appears in | training rows | validation rows |
 |---|---|---|
 | `train` only | all | none |
-| `val` only (`rows` says how many to download) | none | all |
+| `val` only (`rows` says how many processed rows it delivers) | none | all |
 | both | the rest | the **first** `ceil(validation_fraction_of(source) × rows)` processed rows |
 
 `rows` is the row count of `processed/<source>` on disk (parquet footers, cross-checked against the manifest); the
@@ -380,7 +397,8 @@ dataset config is an error unless the run config sets `allow_dataset_change: tru
 
 One YAML entry under `sources:` plus its weight in the stages that use it. Pin the `revision` (`git ls-remote` on
 the Hub repo, or the commit shown on the dataset page) so row order is stable across increments; give
-`describe_tokens_per_row` a ballpark value if you care about the row column of `describe`.
+`describe_tokens_per_row` the source's ballpark mean row length in tokens: the planner sizes the first download with
+it (the raw shards then measure the real rate; an estimate within 20 % above the truth costs no second round).
 
 Loaders (`lib/sources/loaders.py`, `loader:`; all are `(source, offset, count, shared_parameters) -> Iterator[row]`, the
 last a `SharedLoaderParameters`: token, index directory, file callback, download counters, column projection):
@@ -445,8 +463,8 @@ tokens and the quality filter, decontamination and PII masking skipped; the pret
 row counts (e.g. 9.0M fineweb-edu documents) and the finetune data as a 400k-example mixture built up front. The
 crow config mirrors that with exact dedup on, `max_seq_length` 2048 and everything else off, but: fuzzy dedup is
 off by default (available as `dedup: {mode: minhash, threshold: 0.95}`), PII masking no longer exists, texts are
-truncated at the token cap when downloaded instead of stored whole, download sizes follow the sequence budgets
-(× 1.2) instead of fixed row counts, the finetune stage mixes the eight instruct sources by weight in the
+truncated at the token cap when downloaded instead of stored whole, download sizes follow the token budgets
+(÷ the measured tokens per row, × 1.2) instead of fixed row counts, the finetune stage mixes the eight instruct sources by weight in the
 dataloader (no prebuilt mixture, no cross-source dedup of instruct data), validation is the first 5 % of the
 fineweb-edu training source (`validation_fraction`) instead of fineweb-edu's `sample-10BT` (which overlapped the
 training dump: about a fifth of that validation set was training data), several HuggingFace ids moved

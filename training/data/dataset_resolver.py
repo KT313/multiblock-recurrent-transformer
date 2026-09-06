@@ -420,8 +420,8 @@ def check_validation_batches(
 def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None:
     """
     The two cross-checks between run config and dataset config: one base LR per stage, and the same
-    `block_size` (the planner counted sequences with the dataset config's; `block_size <= max_seq_length` follows
-    from the dataset-config schema).
+    `block_size` (the planner clamped its tokens-per-row rate with the dataset config's, so the rows on disk are
+    sized for that sequence length; `block_size <= max_seq_length` follows from the dataset-config schema).
     """
 
     if len(settings.stage_base_lrs) != len(dataset_config.stages):
@@ -433,8 +433,8 @@ def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None
     if settings.block_size != dataset_config.block_size:
         raise ValueError(
             f"block_size {settings.block_size} of the run config does not match block_size {dataset_config.block_size} of dataset "
-            f"config {settings.dataset_config!r}; the planner sized the data in sequences of the dataset config's "
-            "block_size, so the two must be equal"
+            f"config {settings.dataset_config!r}; the planner sized the data with the dataset config's block_size "
+            "(it caps the tokens a row serves), so the two must be equal"
         )
 
 

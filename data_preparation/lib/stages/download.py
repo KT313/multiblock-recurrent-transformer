@@ -193,7 +193,7 @@ def text_row(source: SourceConfig, row: Row, name: str) -> Row:
 
 # --- raw manifest state ------------------------------------------------------------------------------------------------
 
-RawManifestState = Literal["missing", "current", "stale", "outdated"]
+RawManifestState = Literal["missing", "current", "stale", "outdated", "unreadable"]
 
 
 class RawInspection(NamedTuple):
@@ -204,7 +204,7 @@ class RawInspection(NamedTuple):
 
     state: RawManifestState
     manifest: Manifest | None
-    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: max_seq_length 2048 -> 4096"
+    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: max_seq_length 2048 -> 4096" | "unreadable manifest ..."
 
     @property
     def current_manifest(self) -> Manifest | None:
@@ -220,10 +220,14 @@ def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawI
     missing (no manifest; the folder may still hold shards, which :func:`download` refuses to start over),
     stale (the manifest's hash differs from config.raw_hash(name): loader identity, token_count or
     tokenizer changed, or it is another stage's manifest), outdated (config.max_seq_length was raised above
-    the cap the rows were truncated / dropped at) or current.
+    the cap the rows were truncated / dropped at), unreadable (a manifest next to shards that does not parse:
+    a state every caller reports and nobody repairs, the rows may have been expensive) or current.
     """
 
-    manifest = Manifest.load(layout.raw_dir(name))
+    try:
+        manifest = Manifest.load(layout.raw_dir(name))
+    except RuntimeError:
+        return RawInspection("unreadable", None, "unreadable manifest next to shards; fix or delete the directory by hand")
     if manifest is None:
         return RawInspection("missing", None, "missing")
     if manifest.stage != "raw" or not manifest.is_current(config.raw_hash(name)):
@@ -235,18 +239,34 @@ def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawI
 
 class RawFolderError(RuntimeError):
     """
-    A raw folder that :func:`download` may not append to (stale or outdated; problem is the
+    A raw folder that :func:`download` may not append to (stale, outdated or unreadable; problem is the
     :func:`inspect_raw` reason). The download never deletes raw data; the repair step does, after the user
-    confirmed (lib/build/repair.py).
+    confirmed (lib/build/repair.py), and an unreadable manifest is the user's to fix or delete.
     """
 
     def __init__(self, name: str, directory: Path, problem: str) -> None:
-        super().__init__(
-            f"{name}: raw folder {directory} is {problem}; it must be deleted and downloaded again; "
-            "the download never deletes raw data, run the repair step (it asks for confirmation)"
-        )
+        remedy = "the download never deletes raw data"
+        if not problem.startswith("unreadable"):
+            remedy = f"it must be deleted and downloaded again; {remedy}, run the repair step (it asks for confirmation)"
+        super().__init__(f"{name}: raw folder {directory} is {problem}; {remedy}")
         self.name = name
         self.directory = directory
+
+
+def reopen_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
+    """
+    prepare --reopen: clear the exhausted flag of sources/<name>/raw so the next download reads on from its
+    offset. A loader that yielded fewer rows than asked is latched exhausted whatever the reason, and only the
+    user knows whether the source has more rows now (a grown check_limit reopens by itself,
+    :meth:`RawFolder.reopen_if_check_limit_grew`). Returns whether there was a flag to clear; a folder that is
+    not current has nothing to reopen.
+    """
+
+    manifest = inspect_raw(config, name, layout).current_manifest
+    if manifest is None or not manifest.exhausted:
+        return False
+    RawFolder(layout.raw_dir(name), manifest).reopen()
+    return True
 
 
 # --- tokenizer ---------------------------------------------------------------------------------------------------------
@@ -383,14 +403,14 @@ def _log_increment(name: str, counters: _IncrementCounters, manifest: Manifest) 
 def _raw_folder_to_append_to(config: DatasetConfig, name: str, layout: DatasetLayout, *, should_stop: StopCheck | None = None) -> RawFolder:
     """
     The raw folder of name around its current manifest, or a fresh one (truncated_at_tokens =
-    max_seq_length) when the directory has none. Refused when the folder is stale or outdated
-    (:class:`RawFolderError`; deleting it is the repair step's decision) or holds shards without any manifest:
+    max_seq_length) when the directory has none. Refused when the folder is stale, outdated or unreadable
+    (:class:`RawFolderError`; deleting it is the repair step's or the user's decision) or holds shards without any manifest:
     nothing would say where those rows came from, and starting over would delete them.
     """
 
     raw_dir = layout.raw_dir(name)
     inspection = inspect_raw(config, name, layout)
-    if inspection.manifest is not None and inspection.state != "current":
+    if inspection.state not in ("missing", "current"):
         raise RawFolderError(name, raw_dir, inspection.reason)
     manifest = inspection.manifest
     if manifest is None:

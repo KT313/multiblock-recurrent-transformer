@@ -143,6 +143,17 @@ class RawFolder:
             self.manifest.exhausted = False
             self.manifest.check_limit_reached = None
 
+    def reopen(self) -> None:
+        """
+        Clear the exhaustion and save (prepare --reopen: the user says the source has more rows); the next
+        download reads on from the recorded offset.
+        """
+
+        log.info("%s: reopened; the next download reads on from offset %d", self.name, self.rows_fetched)
+        self.manifest.exhausted = False
+        self.manifest.check_limit_reached = None
+        self.save()
+
     def mark_exhausted(self, *, check_limit: int | None = None) -> None:
         """
         Record that there is nothing more to fetch and save; check_limit names the limit that stopped the

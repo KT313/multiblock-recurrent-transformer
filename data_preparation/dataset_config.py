@@ -46,7 +46,7 @@ DEFAULT_BENCHMARKS = [
     "mmlu_test",
     "winogrande_test",
 ]
-SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (covers filter / dedup losses); a Fraction so 50 × 1.2 is exactly 60
+SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers filter / dedup losses and a tokens-per-row estimate that ran high); a Fraction so 50 × 1.2 is exactly 60
 
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
 # derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
@@ -274,14 +274,14 @@ class SourceConfig:
     fields: Optional[dict[str, str]] = field(default=None, metadata=_RAW)  # instruct: {instruction: <col>, input: <col>, output: <col>}
     filter: Optional[str] = field(default=None, metadata=_RAW)  # instruct: named row filter applied at download, e.g. sharegpt_quality
     check_limit: Optional[int] = field(default=None, metadata=_CONFIG)  # stop after inspecting this many source rows even if short of target (> 0)
-    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # rows to download for a validation-only source (required there, forbidden for train sources)
+    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # processed rows a validation-only source delivers (required there, forbidden for train sources; the download adds the safety margin)
     seed: int = field(default=42, metadata={"hash": _seed_hash})  # synthetic generator seed; instruct: input-inversion and shuffle seed
     # hashed through the source's *effective* processing block (`source_processing`), not as a field of its own
     processing: Optional[ProcessingConfig] = field(default=None, metadata=_PROCESSED)  # pretrain: override of the dataset-level processing block
     input_inversions: float = field(default=0.0, metadata=_PROCESSED)  # instruct: share of rows turned into "given the output, what was the instruction?"
     shuffle: Optional[bool] = field(default=None, metadata=_PROCESSED)  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
     validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
-    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # only used by `describe` for its token table; never a planner input
+    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at block_size) and the row columns of `describe`
 
     def __post_init__(self) -> None:
         self._check_field_scopes()
@@ -361,7 +361,7 @@ class DatasetConfig:
     - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/raw/`
       and `dataset/processed/<source>/`.
     - `stages`: the training stages in order (`StageConfig`): token budget, train/val weights over sources, transition.
-    - `block_size`: training sequence length; the planner counts sequences with it; the run config must match.
+    - `block_size`: training sequence length; the planner clamps its tokens-per-row rate with it; the run config must match.
     - `max_seq_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
       this are dropped; raising it above what raw was stored with re-downloads raw (after confirmation), lowering
       it costs nothing; `block_size` must be <= it.
@@ -371,7 +371,7 @@ class DatasetConfig:
     - `processing`: dataset-level processing defaults (`ProcessingConfig`); a pretrain source may override.
 
     Stage keys are plain source names in `train` and `val`. A source used only in `val` states `rows` (how many to
-    download); a source used in `train` is sized by `sequence_budget` and must not give `rows`; a source used
+    deliver); a source used in `train` is sized by `token_budget` and must not give `rows`; a source used
     nowhere is rejected. A source in both `train` and `val` is split by the training resolver: its first
     `ceil(validation_fraction_of(source) × rows)` processed rows are validation, the rest training.
     """
@@ -379,7 +379,7 @@ class DatasetConfig:
     tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
     sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
     stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
-    block_size: int = field(metadata=_CONFIG)  # training sequence length (sequences per stage = tokens ÷ block_size); <= max_seq_length
+    block_size: int = field(metadata=_CONFIG)  # training sequence length (sequences per stage = tokens ÷ block_size; caps the tokens a row serves the planner); <= max_seq_length
     max_seq_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); block_size must be <= this
     validation_fraction: float = field(default=0.05, metadata=_CONFIG)  # in [0, 1): held-out share of a source used in both train and val
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
@@ -459,7 +459,7 @@ class DatasetConfig:
         """
         A shuffled source is built all-at-once: every processed row is held in memory, shuffled, then written
         (`lib/stages/build.py`). A config can legally ask that of a huge source and OOM hours into the build, so a
-        shuffled source whose planned row requirement (:meth:`rows_needed`, the planner's number) exceeds
+        shuffled source whose planned row requirement (:meth:`rows_needed` at the config's tokens-per-row estimate) exceeds
         `SHUFFLED_BUILD_MAX_ROWS` is refused here; both `prepare.py` and training's auto-prepare load the config
         before any work.
         """
@@ -524,10 +524,10 @@ class DatasetConfig:
 
     # --- budgets ---------------------------------------------------------------------------------------------------
 
-    def sequence_budget(self, source_name: str) -> int:
+    def token_budget(self, source_name: str) -> int:
         """
-        Sequences (rows padded / truncated to block_size) the whole run draws from the source: the integral
-        of its sampling-weight schedule over the stage token budgets, rounded up.
+        Tokens the whole run draws from the source: the integral of its sampling-weight schedule over the stage
+        token budgets, rounded up.
 
         The trainer reads every source as ONE continuous stream for the whole run (a stage does not restart the
         source, it only changes the sampling weight), so stages sharing a source add up instead of overlapping.
@@ -547,30 +547,56 @@ class DatasetConfig:
             transition = Fraction(str(stage.transition_pct)) * stage.tokens
             next_weight = Fraction(str(next_stage.train.get(source_name, 0.0)))
             total += (stage.tokens - transition) * weight + transition * (weight + next_weight) / 2
-        return ceil(total / self.block_size)
+        return ceil(total)
 
-    def rows_needed(self, source_name: str) -> int:
+    def tokens_per_row_rate(self, source_name: str, tokens_per_row: float | None = None) -> Fraction:
+        """
+        Tokens one stored row serves the token budget with: the measured mean tokens_per_row when given (the raw
+        manifest's tokens ÷ rows), else the source's describe_tokens_per_row estimate, clamped at block_size. The
+        clamp errs towards more rows (packing serves every token of a longer row too), so a rate that turns out
+        lower than assumed is what the top-up rounds correct, never a rate that was too low.
+        """
+
+        rate = self.sources[source_name].describe_tokens_per_row if tokens_per_row is None else tokens_per_row
+        return min(Fraction(rate), Fraction(self.block_size))
+
+    def rows_budget(self, source_name: str, tokens_per_row: float | None = None) -> int:
+        """
+        Rows the whole run draws from the source: token_budget ÷ :meth:`tokens_per_row_rate`, rounded up (0 for
+        a source not used in training). The status table's epochs divide it by the training rows on disk.
+        """
+
+        return ceil(self._rows_budget(source_name, tokens_per_row))
+
+    def _rows_budget(self, source_name: str, tokens_per_row: float | None) -> Fraction:
+        return self.token_budget(source_name) / self.tokens_per_row_rate(source_name, tokens_per_row)
+
+    def rows_needed(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
         Raw rows to download for the source, the planner's row requirement (`_check_shuffled_build_sizes` reads
-        the same number). A source used for training: ceil(sequence_budget × SAFETY_MARGIN ÷ (1 −
-        validation_fraction_of(name))); the margin covers what the length filter and the dedup drop, the division
-        keeps the *training* part at the sequence budget after the validation holdout. A source used only for
-        validation: its rows. Exact `Fraction` arithmetic: 50 × 1.2 is 60, not 60.000000000000007.
+        the same number at the estimate). A source used for training: ceil(token_budget ÷ rate × SAFETY_MARGIN ÷
+        (1 − validation_fraction_of(name))) with rate = :meth:`tokens_per_row_rate`; the margin covers what the
+        length filter and the dedup drop and an estimate that ran high, the division keeps the *training* part at
+        the budget after the validation holdout. A source used only for validation: ceil(rows × SAFETY_MARGIN),
+        so that `rows` processed rows survive the build. Exact `Fraction` arithmetic: 50 × 1.2 is 60, not
+        60.000000000000007.
         """
 
         source = self.sources[source_name]
         if not self.used_in_train(source_name):
-            return int(source.rows or 0)
+            return ceil((source.rows or 0) * SAFETY_MARGIN)
         held_out = Fraction(str(self.validation_fraction_of(source_name)))
-        return ceil(self.sequence_budget(source_name) * SAFETY_MARGIN / (1 - held_out))
+        return ceil(self._rows_budget(source_name, tokens_per_row) * SAFETY_MARGIN / (1 - held_out))
 
-    def rows_sufficient(self, source_name: str) -> int:
+    def rows_sufficient(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
-        Processed rows at which a source serves its budget: rows_needed ÷ SAFETY_MARGIN (the sequence budget
-        over the training share of the rows, or the rows of a validation-only source, less the download margin).
+        Processed rows at which a source serves its budget: rows_needed ÷ SAFETY_MARGIN (the rows budget over the
+        training share of the rows), or the `rows` of a validation-only source.
         """
 
-        return ceil(self.rows_needed(source_name) / SAFETY_MARGIN)
+        if not self.used_in_train(source_name):
+            return int(self.sources[source_name].rows or 0)
+        return ceil(self.rows_needed(source_name, tokens_per_row) / SAFETY_MARGIN)
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
@@ -585,7 +611,8 @@ class DatasetConfig:
         manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
         rows / check_limit (how many rows are needed or read, not what is read), validation_fraction,
         input_inversions, shuffle, the non-synthetic seed (inversions and shuffle order are build-time),
-        describe_tokens_per_row, load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the
+        describe_tokens_per_row (how many rows the first download plans, not what is read),
+        load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the
         bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
         """
 
@@ -631,8 +658,8 @@ class DatasetConfig:
         data is detected), composed of the hashes below it: every source's processed_hash (which folds in its
         raw hash and the *effective* processing block, so a Bloom budget change does not count here either) next
         to the source's own config fields, the tokenizer hash, and the config fields of the dataset (stages,
-        block size, validation fraction). The knobs that only change how data are fetched or described
-        (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
+        block size, validation fraction). The knobs that only change how (or how far ahead) data are fetched or
+        described (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
         """
 
         payload = hash_payload(self, "config")

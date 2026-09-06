@@ -145,6 +145,25 @@ def test_raw_shards_without_a_manifest_are_an_error(cfg_factory: CfgFactory, wit
     assert (layout.raw_dir("a") / "data-00000.parquet").exists() and layout.processed_dir("a").exists()
 
 
+def test_an_unreadable_raw_manifest_is_left_alone_and_listed(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """
+    A raw manifest nobody can parse next to shards is not the repair step's to delete (the rows may have been
+    expensive) nor to guess about: the report lists the folder as left alone, asks nothing, touches nothing,
+    and the processed folder is not judged against raw shards nobody knows.
+    """
+
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    (layout.raw_dir("a") / MANIFEST_NAME).write_text("{ not json")
+    before = _snapshot(layout.root)
+    reason = "unreadable manifest next to shards; fix or delete the directory by hand"
+    for dry_run in (True, False):
+        report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=dry_run, confirm=lambda message: pytest.fail("nothing to confirm"))
+        assert _kinds(report) == [("a", "raw", "leave")] and report.actions[0].reason == reason and report.performed is not dry_run
+        assert report.confirmations_planned() == [] and raw_deleted(report) == [] and processed_deleted(report) == []
+        assert _snapshot(layout.root) == before
+    assert report.describe() == f"leave raw {layout.raw_dir('a')} (a): {reason}"
+
+
 def test_stale_raw_is_deleted_with_its_processed_folder_after_confirmation(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout
 ) -> None:

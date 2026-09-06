@@ -41,6 +41,7 @@ from data_preparation.lib.stages.download import (
     download_github_code_group,
     inspect_raw,
     prepare_tokenizer,
+    reopen_raw,
 )
 from data_preparation.lib.stages.truncation import estimate_tokens
 
@@ -735,6 +736,47 @@ def test_inspect_raw_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layou
     # a manifest of another stage in the raw folder is stale too
     Manifest(source="p", source_hash=cfg.raw_hash("p"), stage="processed").save(layout.raw_dir("p"))
     assert inspect_raw(cfg, "p", layout).state == "stale"
+
+
+def test_an_unreadable_raw_manifest_is_a_state_the_download_refuses(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """
+    `Manifest.load` raises for a manifest it cannot parse next to shards; `inspect_raw` reports that as a state
+    (status and the planner describe it) and the download refuses the folder like a stale one, deleting nothing.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    download(cfg, "p", layout, rows_needed=5)
+    (layout.raw_dir("p") / "MANIFEST.json").write_text("{ not json")
+    inspection = inspect_raw(cfg, "p", layout)
+    assert (inspection.state, inspection.manifest, inspection.current_manifest) == ("unreadable", None, None)
+    assert inspection.reason == "unreadable manifest next to shards; fix or delete the directory by hand"
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is unreadable manifest next to shards; fix or delete the directory by hand; the download never deletes raw data$"):
+        download(cfg, "p", layout, rows_needed=10)
+    assert (layout.raw_dir("p") / "data-00000.parquet").is_file()
+    with pytest.raises(RuntimeError, match="unreadable manifest"):
+        Manifest.load(layout.raw_dir("p"))  # other callers still get the error
+
+
+def test_reopen_raw_clears_the_exhausted_latch(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer) -> None:
+    """
+    A loader that yielded fewer rows than asked leaves the manifest exhausted for good; `reopen_raw` (prepare
+    --reopen) clears the flag and the limit it recorded, so the next download reads on from the offset.
+    """
+
+    src_dir = layout.root.parent / "small"
+    write_local(src_dir, [{"text": f"tok_{i}"} for i in range(3)], "parquet")
+    cfg = with_tokenizer(cfg_factory({"g": _local(src_dir, check_limit=3)}))
+    assert not reopen_raw(cfg, "g", layout)  # no folder yet
+    m = download(cfg, "g", layout, rows_needed=5)
+    assert m.exhausted and m.check_limit_reached == 3
+    assert download(cfg, "g", layout, rows_needed=5) == m  # exhausted: a no-op
+    assert reopen_raw(cfg, "g", layout) and not reopen_raw(cfg, "g", layout)  # cleared once, nothing to clear twice
+    reopened = Manifest.load(layout.raw_dir("g"))
+    assert reopened is not None and not reopened.exhausted and reopened.check_limit_reached is None and reopened.rows_fetched == 3
+    write_local(src_dir, [{"text": f"tok_{i}"} for i in range(3, 8)], "parquet")
+    cfg.sources["g"].check_limit = None
+    m2 = download(cfg, "g", layout, rows_needed=5)
+    assert m2.rows() == 5 and m2.rows_fetched == 5 and not m2.exhausted and [s.rows for s in m2.shards] == [3, 2]
 
 
 def test_download_github_code_group_raises_for_an_outdated_member(

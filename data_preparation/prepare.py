@@ -3,7 +3,7 @@
 Entry point for dataset preparation.
 
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
-                                                [--sources S ...] [--steps tokenizer download build] [--yes] [--dry_run]
+                                                [--sources S ...] [--steps tokenizer download build] [--reopen S ...] [--yes] [--dry_run]
                                                 [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
@@ -13,7 +13,9 @@ Entry point for dataset preparation.
 prepare materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
 (lib/build/runner.py). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
 manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
-and without a terminal the command prints the list and exits 2 with nothing changed. status prints what the
+and without a terminal the command prints the list and exits 2 with nothing changed. --reopen clears the exhausted
+flag of the named sources first (a loader that yielded fewer rows than asked is latched exhausted; say so when it
+has more rows now). status prints what the
 repair step would do plus the status table and exits 0 iff the dataset is complete. describe renders the config
 as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches. prepare
 turns the tokenizer's thread pool on with TOKENIZER_POOL_THREADS threads (TOKENIZERS_PARALLELISM=true and
@@ -111,6 +113,7 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
 def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
     sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
+    sub.add_argument("--reopen", nargs="+", default=None, metavar="NAME", help="clear the exhausted flag of these sources before planning (their loader has more rows now)")
     sub.add_argument("--yes", "-y", action="store_true", help="answer the repair confirmation (stale / outdated raw folders, unparsable processed manifests) without asking")
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
@@ -147,6 +150,7 @@ def run_prepare(args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
             steps=STEPS if args.steps is None else args.steps,
             sources=args.sources,
+            reopen=args.reopen,
             hf_token=args.hf_token,
         )
 

@@ -11,7 +11,8 @@ processed/ folder of every source the config uses and decides what has to go:
   truncated to its good prefix (:func:`good_prefix_length`, :meth:`RawFolder.truncate_to`); the next download
   resumes there. Dropping only the broken tail needs no confirmation; dropping healthy shards after it joins the
   one confirmation, and when no prefix can be kept the folder is queued for deletion. Shards without a manifest
-  are an error: nothing says where those rows came from.
+  are an error: nothing says where those rows came from. A manifest that cannot be parsed next to shards is
+  reported and left alone (the rows may have been expensive; the user fixes or deletes the folder by hand).
 * processed (derived, cheap): the shared verdict (lib/build/assessment.py) attaches the cheapest repair and
   this step performs exactly that. A rebuild is a deletion without confirmation, except a manifest that cannot be
   parsed, which joins the one confirmation. A crash leftover (one unlisted file that is exactly the next shard the
@@ -41,13 +42,13 @@ from data_preparation.lib.build.assessment import ShardList, assess_processed_fo
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended
 from data_preparation.lib.storage.manifest import shard_list, Manifest, has_shards
-from data_preparation.lib.stages.download import inspect_raw
+from data_preparation.lib.stages.download import RawInspection, inspect_raw
 from data_preparation.lib.storage.raw_folder import RawFolder, good_prefix_length
 
 log = get_logger(__name__)
 
 FolderKind = Literal["raw", "processed"]
-RepairVerb = Literal["delete", "truncate", "swap"]
+RepairVerb = Literal["delete", "truncate", "swap", "leave"]
 Confirm = Callable[[str], bool]
 
 CONFIRMATION_HEADER = "The following folders will be deleted or truncated (raw: the dropped rows are downloaded again; processed: rebuilt from raw):"
@@ -79,8 +80,8 @@ class ConfirmationRequired(RepairError):
 @dataclass(frozen=True)
 class RepairAction:
     """
-    One thing the repair step does (delete / truncate / swap) to one folder; whether it was done is the
-    report's :attr:`RepairReport.performed`.
+    One thing the repair step does (delete / truncate / swap, or leave: a raw folder it refuses to touch) to
+    one folder; whether it was done is the report's :attr:`RepairReport.performed`.
     """
 
     source: str
@@ -150,9 +151,7 @@ def repair_broken_and_stale_folders(
 
     planned = RepairReport()
     for name in config.sources if sources is None else sources:
-        raw_shards = inspect_raw_folder(config, name, layout, planned)
-        inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, planned)
-        inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, planned)
+        inspect_source(config, name, layout, planned)
     if dry_run:
         return planned
     queued = planned.confirmations_planned()
@@ -165,14 +164,30 @@ def repair_broken_and_stale_folders(
 # --- inspection (read-only) ----------------------------------------------------------------------------------------------
 
 
-def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, report: RepairReport) -> ShardList | None:
+def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, report: RepairReport) -> None:
     """
-    Plan what happens to the raw folder of name and return the shards it will hold afterwards as
-    [[name, rows], ...] (empty when there is no folder), or None when the folder is queued for deletion.
+    Plan the repairs of one source: the raw folder, then the processed folder and the swap leftovers against
+    the raw shards that remain. A raw manifest nobody can parse is listed as left alone and ends the inspection:
+    the processed folder is not judged against raw shards nobody knows.
+    """
+
+    inspection = inspect_raw(config, name, layout)
+    if inspection.state == "unreadable":
+        _plan(report, name, layout.raw_dir(name), "raw", "leave", inspection.reason)
+        return
+    raw_shards = inspect_raw_folder(config, name, layout, inspection, report)
+    inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, report)
+    inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, report)
+
+
+def inspect_raw_folder(config: DatasetConfig, name: str, layout: DatasetLayout, inspection: RawInspection, report: RepairReport) -> ShardList | None:
+    """
+    Plan what happens to the raw folder of name (inspection is its :func:`inspect_raw` state) and return the
+    shards it will hold afterwards as [[name, rows], ...] (empty when there is no folder), or None when the
+    folder is queued for deletion.
     """
 
     folder = layout.raw_dir(name)
-    inspection = inspect_raw(config, name, layout)
     manifest = inspection.manifest
     if manifest is None:
         if has_shards(folder):
@@ -293,7 +308,9 @@ def perform_repairs(report: RepairReport) -> None:
     processed = [action for action in report.actions if action.kind == "processed"]
     raw = [action for action in report.actions if action.kind == "raw"]
     for action in processed + raw:
-        if action.action == "delete":
+        if action.action == "leave":
+            log.warning("%s: leaving %s alone (%s)", action.source, action.folder, action.reason)
+        elif action.action == "delete":
             log.warning("%s: deleting %s (%s)", action.source, action.folder, action.reason)
             shutil.rmtree(action.folder)
         elif action.action == "truncate":
