@@ -35,6 +35,7 @@ from data_preparation.lib.sources.converters import (
 )
 from data_preparation.lib.sources.loaders import LOADERS, Row, SharedLoaderParameters, get_loader, load_local
 from data_preparation.lib.sources.synthetic import VOCAB_SIZE, synthetic_row, write_synthetic_tokenizer
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
 CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config" / "datasets" / "tiny.yaml"]
@@ -240,13 +241,11 @@ def test_synthetic_row_shapes() -> None:
 
 
 def test_write_synthetic_tokenizer(tmp_path: Path) -> None:
-    from transformers import AutoTokenizer
-
     write_synthetic_tokenizer(tmp_path / "tok")
-    tokenizer = AutoTokenizer.from_pretrained(str(tmp_path / "tok"))
-    assert tokenizer.convert_tokens_to_ids(["<pad>", "<bos>", "<eos>", "tok_0", "tok_255"]) == [0, 1, 2, 3, 258]
-    assert tokenizer.encode("tok_1 tok_2", add_special_tokens=False) == [4, 5]
-    assert len(tokenizer) == VOCAB_SIZE == 259
+    tokenizer = SavedTokenizer(tmp_path / "tok")
+    assert (tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id) == (0, 1, 2)
+    assert tokenizer.encode("tok_0 tok_255") == [3, 258] and tokenizer.encode("tok_1 tok_2") == [4, 5]
+    assert len(tokenizer) == tokenizer.vocab_size == VOCAB_SIZE == 259
 
 
 # --- registries -------------------------------------------------------------------------------------------------------

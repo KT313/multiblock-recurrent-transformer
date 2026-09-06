@@ -24,7 +24,7 @@ A download pass (:func:`_fetch`) is a two-stage pipeline: the job's own thread p
 them and buffers :data:`TOKEN_BATCH` rows per source, and a token worker thread (:class:`_TokenWorker`) tokenizes
 the batches and writes the shards, in order. Fetching the next row group (network, parquet decode) so overlaps
 tokenizing the previous batches, which took as long as the fetch itself in one thread. The tokenizer's own thread
-pool is a separate matter (`TOKENIZERS_PARALLELISM`, see :func:`_auto_tokenizer`).
+pool is a separate matter (`TOKENIZERS_PARALLELISM`, see :func:`_guard_tokenizers_parallelism`).
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from data_preparation.lib.sources.loaders import (
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.stages.row_pipeline import instruct_text
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS, estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
@@ -74,7 +75,7 @@ DEFAULT_SHARD_SIZE = 10_000
 
 class TokenCounter:
     """
-    Token counts with the config's tokenizer (token_count: tokenizer, add_special_tokens=False) or
+    Token counts with the config's tokenizer (token_count: tokenizer, no special tokens) or
     len(text) // 4 (estimate): the text's own tokens, without the BOS and EOS the trainer adds (the token step adds
     truncation.NUMBER_OF_SPECIAL_TOKENS to what it stores). Counts are never capped here: the download truncates pretrain
     *text* at the cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
@@ -83,22 +84,19 @@ class TokenCounter:
     def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
         self.mode = config.token_count
         self.tokenizer_name = config.tokenizer.name
-        self._tokenizer: Any = None
+        self._tokenizer: SavedTokenizer | None = None
         if self.mode == "tokenizer":
             self._tokenizer = _load_tokenizer(layout.tokenizer_dir(config.tokenizer.name), config.tokenizer.name)
 
     def count(self, text: str) -> int:
         if self._tokenizer is None:
             return estimate_tokens(text)
-        return len(self._tokenizer.encode(text, add_special_tokens=False))
+        return len(self._tokenizer.encode(text))
 
     def count_many(self, texts: list[str]) -> list[int]:
-        if not texts:
-            return []  # HF fast tokenizers choke on an empty batch
         if self._tokenizer is None:
             return [estimate_tokens(text) for text in texts]
-        encoded = self._tokenizer(texts, add_special_tokens=False)["input_ids"]
-        return [len(ids) for ids in encoded]
+        return [len(encoding.ids) for encoding in self._tokenizer.encode_batch(texts)]  # `encode_batch([])` is `[]`
 
     def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
         """
@@ -109,34 +107,44 @@ class TokenCounter:
         return truncate_many(texts, max_tokens, self._tokenizer)
 
 
-def _load_tokenizer(tokenizer_dir: Path, name: str) -> Any:
+def _load_tokenizer(tokenizer_dir: Path, name: str) -> SavedTokenizer:
     """
-    The saved HF tokenizer in tokenizer_dir; fails if the tokenizer stage has not run yet.
+    The saved tokenizer in tokenizer_dir (:class:`SavedTokenizer`: the `tokenizers` library alone, transformers
+    would cost every download job seconds and hundreds of MB); fails if the tokenizer stage has not run yet.
     """
 
     has_tokenizer_files = (tokenizer_dir / "tokenizer.json").is_file() or (tokenizer_dir / "tokenizer_config.json").is_file()
     if not has_tokenizer_files:
         raise FileNotFoundError(f"tokenizer {name!r} not found at {tokenizer_dir}; run the tokenizer stage first")
-    return _auto_tokenizer().from_pretrained(str(tokenizer_dir))
+    _guard_tokenizers_parallelism()
+    return SavedTokenizer(tokenizer_dir)
 
 
 _IMPORT_LOCK = threading.Lock()
 
 
+def _guard_tokenizers_parallelism() -> None:
+    """
+    The tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination / minhash pools
+    are spawn and immune) is the well-known tokenizers deadlock; the library's own mitigation, set before the first
+    load (spawn children inherit it through the environment). The prepare CLI, which never forks after this point,
+    sets "true" (and the pool size) before it gets here (prepare.py): a batch then tokenizes on several cores
+    instead of one, the biggest lever on the download rate.
+    """
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
 def _auto_tokenizer() -> Any:
     """
-    transformers.AutoTokenizer, imported lazily (the HF cache env must be configurable before the import)
-    and under a lock: transformers initialises its lazy modules on first import, which is not thread-safe and
-    the build runs items in threads.
+    transformers.AutoTokenizer for the Hub download of :func:`prepare_tokenizer`, imported lazily (the HF cache env
+    must be configurable before the import, and transformers costs seconds no other step needs) and under a lock:
+    transformers initialises its lazy modules on first import, which is not thread-safe and the build runs items
+    in threads.
     """
 
     with _IMPORT_LOCK:
-        # the tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination /
-        # minhash pools are spawn and immune) is the well-known tokenizers deadlock; the library's own
-        # mitigation, set before the first load (spawn children inherit it through the environment). The
-        # prepare CLI, which never forks after this point, sets "true" (and the pool size) before it gets here
-        # (prepare.py): a batch then tokenizes on several cores instead of one, the biggest lever on the download rate.
-        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        _guard_tokenizers_parallelism()
         from transformers import AutoTokenizer
 
     return AutoTokenizer

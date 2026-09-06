@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from data_preparation.lib.sources.synthetic import N_WORD_TOKENS, SPECIALS
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 from training.data.tokenizer import Tokenizer
 
 
@@ -76,7 +77,7 @@ def test_missing_pad_token_pads_generation_with_eos(tiny_tokenizer_dir: Path, tm
     """
 
     tokenizer = Tokenizer(_without(tiny_tokenizer_dir, tmp_path, "pad_token"))
-    assert tokenizer.processor.pad_token_id is None
+    assert SavedTokenizer(tokenizer.path).pad_id is None
     assert tokenizer.pad_id == tokenizer.eos_id == 2
 
 
@@ -92,5 +93,5 @@ def test_resolve_pad_id_prefers_the_pad_token() -> None:
 
     from training.data.tokenizer import resolve_pad_id
 
-    assert resolve_pad_id(SimpleNamespace(pad_token_id=5), eos_id=2) == 5
-    assert resolve_pad_id(SimpleNamespace(pad_token_id=None), eos_id=2) == 2
+    assert resolve_pad_id(SimpleNamespace(pad_id=5), eos_id=2) == 5
+    assert resolve_pad_id(SimpleNamespace(pad_id=None), eos_id=2) == 2

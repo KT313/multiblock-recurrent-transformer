@@ -9,15 +9,17 @@ offsets overlap the first word, the boundary subtlety the module handles).
 
 from __future__ import annotations
 
+import json
 import random
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from data_preparation.lib.stages import truncation
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 from data_preparation.lib.stages.truncation import (
     CHARS_PER_TOKEN_ESTIMATE,
     PRE_CUT_CHARS_PER_TOKEN,
@@ -26,7 +28,7 @@ from data_preparation.lib.stages.truncation import (
 )
 
 
-def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> tuple[str, int]:
+def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: SavedTokenizer | None) -> tuple[str, int]:
     """
     `truncate_many` for one text.
     """
@@ -44,12 +46,12 @@ PROSE = "the quick brown fox jumps over the lazy dog, hello there general kenobi
 UNICODE = "日本語 😀 naïve café … über 😀😀 tok_1 tok_2 "
 
 
-def _count(tokenizer: PreTrainedTokenizerFast, text: str) -> int:
+def _count(tokenizer: SavedTokenizer, text: str) -> int:
     """
     The count definition of TokenCounter: no special tokens.
     """
 
-    return len(tokenizer.encode(text, add_special_tokens=False))
+    return len(tokenizer.encode(text))
 
 
 def _words(n: int) -> str:
@@ -57,14 +59,12 @@ def _words(n: int) -> str:
 
 
 @pytest.fixture(scope="module")
-def wordlevel(tiny_tokenizer_dir: Path) -> PreTrainedTokenizerFast:
-    tok = AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir))
-    assert isinstance(tok, PreTrainedTokenizerFast)
-    return tok
+def wordlevel(tiny_tokenizer_dir: Path) -> SavedTokenizer:
+    return SavedTokenizer(tiny_tokenizer_dir)
 
 
 @pytest.fixture(scope="module")
-def metaspace_bpe() -> PreTrainedTokenizerFast:
+def metaspace_bpe(tmp_path_factory: pytest.TempPathFactory) -> SavedTokenizer:
     tok = Tokenizer(models.BPE(unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="first")
     tok.decoder = decoders.Metaspace()
@@ -73,19 +73,20 @@ def metaspace_bpe() -> PreTrainedTokenizerFast:
         vocab_size=300, special_tokens=["<unk>", "<s>", "</s>"], initial_alphabet=alphabet
     )
     tok.train_from_iterator(CORPUS, trainer)
-    return PreTrainedTokenizerFast(  # type: ignore[no-untyped-call]  # transformers 5: unannotated __init__
-        tokenizer_object=tok, unk_token="<unk>", bos_token="<s>", eos_token="</s>"
-    )
+    directory = tmp_path_factory.mktemp("metaspace_bpe")
+    tok.save(str(directory / "tokenizer.json"))
+    (directory / "tokenizer_config.json").write_text(json.dumps({"unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}))
+    return SavedTokenizer(directory)
 
 
 @pytest.fixture(params=["wordlevel", "metaspace_bpe"])
-def tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFast:
+def tokenizer(request: pytest.FixtureRequest) -> SavedTokenizer:
     tok = request.getfixturevalue(request.param)
-    assert isinstance(tok, PreTrainedTokenizerFast)
+    assert isinstance(tok, SavedTokenizer)
     return tok
 
 
-def _check_invariants(tokenizer: PreTrainedTokenizerFast, text: str, max_tokens: int) -> tuple[str, int]:
+def _check_invariants(tokenizer: SavedTokenizer, text: str, max_tokens: int) -> tuple[str, int]:
     cut, count = truncate_to_token_cap(text, max_tokens, tokenizer)
     assert text.startswith(cut)
     assert count <= max_tokens
@@ -96,12 +97,12 @@ def _check_invariants(tokenizer: PreTrainedTokenizerFast, text: str, max_tokens:
 # --- tokenizer mode ---------------------------------------------------------------------------------------------------
 
 
-def test_short_text_is_unchanged_with_its_real_count(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_short_text_is_unchanged_with_its_real_count(tokenizer: SavedTokenizer) -> None:
     text = PROSE * 2
     assert truncate_to_token_cap(text, 10_000, tokenizer) == (text, _count(tokenizer, text))
 
 
-def test_long_text_is_cut_at_a_token_boundary(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_long_text_is_cut_at_a_token_boundary(tokenizer: SavedTokenizer) -> None:
     text = PROSE * 50
     cut, count = _check_invariants(tokenizer, text, 37)
     assert len(cut) < len(text)
@@ -109,7 +110,7 @@ def test_long_text_is_cut_at_a_token_boundary(tokenizer: PreTrainedTokenizerFast
     assert count == 37 or _count(tokenizer, cut + text[len(cut)]) > 37
 
 
-def test_exact_boundary_wordlevel(wordlevel: PreTrainedTokenizerFast) -> None:
+def test_exact_boundary_wordlevel(wordlevel: SavedTokenizer) -> None:
     exact = _words(16)
     assert truncate_to_token_cap(exact, 16, wordlevel) == (exact, 16)
     one_more = _words(17)
@@ -117,7 +118,7 @@ def test_exact_boundary_wordlevel(wordlevel: PreTrainedTokenizerFast) -> None:
     assert truncate_to_token_cap(exact, 15, wordlevel) == (_words(15) + " ", 15)
 
 
-def test_exact_boundary_bpe(metaspace_bpe: PreTrainedTokenizerFast) -> None:
+def test_exact_boundary_bpe(metaspace_bpe: SavedTokenizer) -> None:
     text = "the lazy dog hello world there"
     n = _count(metaspace_bpe, text)
     assert truncate_to_token_cap(text, n, metaspace_bpe) == (text, n)
@@ -125,28 +126,28 @@ def test_exact_boundary_bpe(metaspace_bpe: PreTrainedTokenizerFast) -> None:
     assert len(cut) < len(text) and count == n - 1
 
 
-def test_empty_string(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_empty_string(tokenizer: SavedTokenizer) -> None:
     assert truncate_to_token_cap("", 5, tokenizer) == ("", 0)
     assert truncate_to_token_cap("", 0, tokenizer) == ("", 0)
 
 
-def test_max_tokens_one_and_zero(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_max_tokens_one_and_zero(tokenizer: SavedTokenizer) -> None:
     for text in (PROSE, "tok_3 tok_4", "a" * 50, "  leading spaces", UNICODE):
         cut, count = _check_invariants(tokenizer, text, 1)
         assert count <= 1
         assert truncate_to_token_cap(text, 0, tokenizer) == ("", 0)
 
 
-def test_wordlevel_max_tokens_one_keeps_first_word(wordlevel: PreTrainedTokenizerFast) -> None:
+def test_wordlevel_max_tokens_one_keeps_first_word(wordlevel: SavedTokenizer) -> None:
     assert truncate_to_token_cap("tok_3 tok_4", 1, wordlevel) == ("tok_3 ", 1)
 
 
-def test_negative_cap_is_rejected(wordlevel: PreTrainedTokenizerFast) -> None:
+def test_negative_cap_is_rejected(wordlevel: SavedTokenizer) -> None:
     with pytest.raises(ValueError, match="max_tokens"):
         truncate_to_token_cap("x", -1, wordlevel)
 
 
-def test_metaspace_prefix_token_overlapping_the_first_word(metaspace_bpe: PreTrainedTokenizerFast) -> None:
+def test_metaspace_prefix_token_overlapping_the_first_word(metaspace_bpe: SavedTokenizer) -> None:
     """
     'aaaa…' tokenizes to ['▁' (0, 1), 'aaaa…' (0, 32), …]: token 1 starts at offset 0, so a cap of 1 keeps
     nothing (a single 'a' would already be two tokens) and the recount (0) is what is returned.
@@ -159,7 +160,7 @@ def test_metaspace_prefix_token_overlapping_the_first_word(metaspace_bpe: PreTra
     assert cut and count <= 2
 
 
-def test_random_texts_satisfy_the_invariants(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_random_texts_satisfy_the_invariants(tokenizer: SavedTokenizer) -> None:
     rng = random.Random(0)
     pieces = PROSE.split() + UNICODE.split() + ["aaaa", "   ", "\n\n", "tok_9", "😀"]
     for _ in range(60):
@@ -198,20 +199,18 @@ class _ViterbiLikeStub:
                 i += 1
         return ids, offsets
 
-    def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+    def encode(self, text: str) -> list[int]:
         return self._one(text)[0]
 
-    def __call__(self, texts: list[str], add_special_tokens: bool, return_offsets_mapping: bool) -> dict[str, Any]:
-        assert not add_special_tokens and return_offsets_mapping
+    def encode_batch(self, texts: list[str]) -> list[Any]:
         self.calls.append(list(texts))
-        encoded = [self._one(t) for t in texts]
-        return {"input_ids": [e[0] for e in encoded], "offset_mapping": [e[1] for e in encoded]}
+        return [SimpleNamespace(ids=ids, offsets=offsets) for ids, offsets in (self._one(t) for t in texts)]
 
 
 def test_recount_above_the_cap_cuts_again_until_it_fits() -> None:
     stub = _ViterbiLikeStub()
-    tokenizer = cast(PreTrainedTokenizerFast, stub)  # duck-typed stand-in: the module only uses __call__
-    assert stub.encode("xyz", False) == [1, 2] and stub.encode("xy", False) == [2, 2]
+    tokenizer = cast(SavedTokenizer, stub)  # duck-typed stand-in: the module only uses encode_batch
+    assert stub.encode("xyz") == [1, 2] and stub.encode("xy") == [2, 2]
     assert truncate_to_token_cap("xyz", 1, tokenizer) == ("x", 1)
     assert [len(c) for c in stub.calls] == [1, 1, 1]  # "xyz" -> "xy" (2 > 1) -> "x"
     assert truncate_many(["xyz", "xyzw", "ab", ""], 1, tokenizer) == [("x", 1), ("x", 1), ("a", 1), ("", 0)]
@@ -220,7 +219,7 @@ def test_recount_above_the_cap_cuts_again_until_it_fits() -> None:
 # --- pre-cut ---------------------------------------------------------------------------------------------------------
 
 
-def test_pre_cut_bounds_the_tokenized_text_and_keeps_the_invariants(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_pre_cut_bounds_the_tokenized_text_and_keeps_the_invariants(tokenizer: SavedTokenizer) -> None:
     max_tokens = 4
     text = "a" * 100_000  # one whitespace word / long merged runs: far more than 32 chars per token
     cut, count = _check_invariants(tokenizer, text, max_tokens)
@@ -231,7 +230,7 @@ def test_pre_cut_bounds_the_tokenized_text_and_keeps_the_invariants(tokenizer: P
 
 
 def test_pre_cut_does_not_change_the_result_of_ordinary_text(
-    tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+    tokenizer: SavedTokenizer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     text = PROSE * 300
     with_pre_cut = truncate_to_token_cap(text, 64, tokenizer)
@@ -270,14 +269,14 @@ def test_estimate_mode_many_equals_single() -> None:
 # --- batches and unicode ------------------------------------------------------------------------------------------------
 
 
-def test_truncate_many_equals_per_text(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_truncate_many_equals_per_text(tokenizer: SavedTokenizer) -> None:
     texts = ["", "tok_1", PROSE * 40, UNICODE * 40, "a" * 5_000, "  ", PROSE]
     for max_tokens in (0, 1, 7, 50):
         assert truncate_many(texts, max_tokens, tokenizer) == [truncate_to_token_cap(t, max_tokens, tokenizer) for t in texts]
     assert truncate_many([], 5, tokenizer) == []
 
 
-def test_unicode_offsets_are_characters_not_bytes(wordlevel: PreTrainedTokenizerFast) -> None:
+def test_unicode_offsets_are_characters_not_bytes(wordlevel: SavedTokenizer) -> None:
     # every emoji is one whitespace word (an <unk> token); 10 tokens end after 10 x 2 characters (40 bytes in UTF-8)
     text = "😀 " * 50
     assert truncate_to_token_cap(text, 10, wordlevel) == ("😀 " * 10, 10)
@@ -286,7 +285,7 @@ def test_unicode_offsets_are_characters_not_bytes(wordlevel: PreTrainedTokenizer
     assert cut == " ".join(mixed.split()[:13]) + " "
 
 
-def test_unicode_text_with_bpe(metaspace_bpe: PreTrainedTokenizerFast) -> None:
+def test_unicode_text_with_bpe(metaspace_bpe: SavedTokenizer) -> None:
     text = UNICODE * 20
     for max_tokens in (1, 2, 5, 33):
         cut, _ = _check_invariants(metaspace_bpe, text, max_tokens)

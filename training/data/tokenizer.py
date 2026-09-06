@@ -1,11 +1,13 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 """
-Thin wrapper around a HuggingFace fast tokenizer directory (tokenizer.json + tokenizer_config.json).
+Thin wrapper around a saved tokenizer directory (tokenizer.json + tokenizer_config.json), loaded without transformers.
 """
 
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 # Label value of positions without a loss (padding, masked prompts, out-of-vocab); the model defaults to it too.
 # Never a token id: a real `<unk>` or `<pad>` token in a document is a supervised label like any other.
@@ -18,31 +20,44 @@ def resolve_pad_id(processor: object, eos_id: int) -> int:
     one, else EOS. Training never pads with it: pad positions are EOS in the inputs and `IGNORE_INDEX` in the labels.
     """
 
-    pad_id = cast(int | None, getattr(processor, "pad_token_id", None))
+    pad_id = cast(int | None, getattr(processor, "pad_id", None))
     return eos_id if pad_id is None else pad_id
 
 
 class Tokenizer:
     """
-    Loads a HF tokenizer directory and encodes text without automatic special tokens.
+    Loads a saved tokenizer directory and encodes text without automatic special tokens.
 
     BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them. Both must exist: the
     formats prepend BOS, every document ends in EOS, and pack tails are EOS.
     """
 
     def __init__(self, path: str | Path) -> None:
-        from transformers import AutoTokenizer
-
         self.path = Path(path)
         if not (self.path / "tokenizer.json").is_file():
             raise FileNotFoundError(f"No tokenizer.json in {self.path}")
-        self.processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=False, add_eos_token=False)
-        bos_id, eos_id = self.processor.bos_token_id, self.processor.eos_token_id
+        self._backend = SavedTokenizer(self.path)
+        self._processor: Any = None
+        bos_id, eos_id = self._backend.bos_id, self._backend.eos_id
         if bos_id is None or eos_id is None:
             raise ValueError(f"Tokenizer at {self.path} must define a BOS and an EOS token")
         self.bos_id: int = bos_id
         self.eos_id: int = eos_id
-        self.pad_id: int = resolve_pad_id(self.processor, self.eos_id)
+        self.pad_id: int = resolve_pad_id(self._backend, self.eos_id)
+
+    @property
+    def processor(self) -> Any:
+        """
+        The transformers tokenizer over the same directory, which lm-eval (`evaluation.benchmarks`) needs: built on
+        first use, because transformers imports torch and scikit-learn, with automatic BOS and EOS off, the object
+        the benchmarks were scored with when this wrapper still loaded through transformers.
+        """
+
+        if self._processor is None:
+            from transformers import AutoTokenizer
+
+            self._processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=False, add_eos_token=False)
+        return self._processor
 
     @property
     def vocab_size(self) -> int:
@@ -50,10 +65,10 @@ class Tokenizer:
         Size of the base vocabulary (without added tokens), used to mask out-of-range labels.
         """
 
-        return self.processor.vocab_size
+        return self._backend.vocab_size
 
     def __len__(self) -> int:
-        return len(self.processor)
+        return len(self._backend)
 
     def __reduce__(self) -> tuple[type["Tokenizer"], tuple[Path]]:
         """
@@ -67,7 +82,7 @@ class Tokenizer:
         Tokenize text; prepend BOS / append EOS when requested.
         """
 
-        tokens: list[int] = self.processor.encode(text)
+        tokens = self._backend.encode(text)
         if bos:
             tokens = [self.bos_id] + tokens
         if eos:
@@ -75,5 +90,4 @@ class Tokenizer:
         return tokens
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
-        # decode() of a flat id list is always a str; the stub's `str | list[str]` covers the batched overload.
-        return cast(str, self.processor.decode(ids, skip_special_tokens=skip_special_tokens))
+        return self._backend.decode(ids, skip_special_tokens=skip_special_tokens)

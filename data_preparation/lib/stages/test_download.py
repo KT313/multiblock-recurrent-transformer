@@ -34,7 +34,7 @@ from data_preparation.lib.ui.dashboard import DataDashboard
 from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages.download import (
-    _auto_tokenizer,
+    _load_tokenizer,
     RawFolderError,
     TokenCounter,
     current_manifest,
@@ -584,16 +584,16 @@ def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactor
 # --- truncation at the token cap, dropped instruct rows, raw manifest state ---------------------------------------------
 
 
-def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch, tiny_tokenizer_dir: Path) -> None:
     """
     Rust tokenizer threads plus a later fork is the known `tokenizers` deadlock; loading must set the guard.
     """
 
     monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
-    _auto_tokenizer()
+    _load_tokenizer(tiny_tokenizer_dir, "synthetic")
     assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")  # an explicit user choice is respected
-    _auto_tokenizer()
+    _load_tokenizer(tiny_tokenizer_dir, "synthetic")
     assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
 
 

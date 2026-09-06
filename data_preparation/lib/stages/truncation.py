@@ -4,7 +4,7 @@ Truncate document text at a token boundary so the stored text has at most max_to
 
 The download step cuts the text itself instead of storing the whole document with a capped count, so the stored
 count is the true count of the stored text and storage is bounded. Tokens are counted like TokenCounter in
-stages/download.py: the config tokenizer with add_special_tokens=False, or len(text) // 4 in
+stages/download.py: the config tokenizer without special tokens, or len(text) // 4 in
 token_count: estimate mode. The trainer adds :data:`NUMBER_OF_SPECIAL_TOKENS` around every row, so the download asks for
 dataset_max_sequence_length - NUMBER_OF_SPECIAL_TOKENS here and stores count + NUMBER_OF_SPECIAL_TOKENS as the row's tokens (the length the
 trainer sees, never above dataset_max_sequence_length).
@@ -15,10 +15,7 @@ tokenizer's count of that text, and the count is <= max_tokens.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # transformers is imported lazily by the tokenizer stage (HF cache env must be settable first)
-    from transformers import PreTrainedTokenizerFast
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 CHARS_PER_TOKEN_ESTIMATE = 4  # token_count: estimate counts len(text) // CHARS_PER_TOKEN_ESTIMATE
 
@@ -42,7 +39,7 @@ def estimate_tokens(text: str) -> int:
     return len(text) // CHARS_PER_TOKEN_ESTIMATE
 
 
-def truncate_many(texts: list[str], max_tokens: int, tokenizer: PreTrainedTokenizerFast | None) -> list[tuple[str, int]]:
+def truncate_many(texts: list[str], max_tokens: int, tokenizer: SavedTokenizer | None) -> list[tuple[str, int]]:
     """
     (prefix, count) per text: the longest prefix found with at most max_tokens tokens and its count. One
     batched tokenizer call per round instead of one per text.
@@ -59,8 +56,6 @@ def truncate_many(texts: list[str], max_tokens: int, tokenizer: PreTrainedTokeni
 
     if max_tokens < 0:
         raise ValueError(f"max_tokens must be >= 0, got {max_tokens}")
-    if not texts:
-        return []  # HF fast tokenizers choke on an empty batch
     if tokenizer is None:
         limit = CHARS_PER_TOKEN_ESTIMATE * max_tokens
         return [(text[:limit], estimate_tokens(text[:limit])) for text in texts]
@@ -71,15 +66,13 @@ def truncate_many(texts: list[str], max_tokens: int, tokenizer: PreTrainedTokeni
     pending = list(range(len(texts)))
     while pending:
         batch = [current[index] for index in pending]
-        encoded = tokenizer(batch, add_special_tokens=False, return_offsets_mapping=True)
-        ids: list[list[int]] = encoded["input_ids"]
-        offsets: list[Offsets] = encoded["offset_mapping"]
+        encoded = tokenizer.encode_batch(batch)  # an empty batch encodes to an empty list
         still_pending: list[int] = []
-        for index, token_ids, token_offsets in zip(pending, ids, offsets, strict=True):
-            if len(token_ids) <= max_tokens:
-                result[index] = (current[index], len(token_ids))
+        for index, encoding in zip(pending, encoded, strict=True):
+            if len(encoding.ids) <= max_tokens:
+                result[index] = (current[index], len(encoding.ids))
             else:
-                current[index] = _cut_before_token(current[index], token_offsets, max_tokens)
+                current[index] = _cut_before_token(current[index], encoding.offsets, max_tokens)
                 still_pending.append(index)
         pending = still_pending
     return [entry for entry in result if entry is not None]
