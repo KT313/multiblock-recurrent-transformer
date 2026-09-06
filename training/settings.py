@@ -240,7 +240,8 @@ class Settings:
     @property
     def gradient_accumulation_steps(self) -> int:
         """
-        Micro-batches per optimizer step on one device (divide by world_size once distributed training exists).
+        Micro-batches per optimizer step on one device (divide by world_size once distributed training exists; until
+        then `train()` refuses `world_size != 1`, a second rank would double the world batch).
         """
 
         if self.pack_sequences:

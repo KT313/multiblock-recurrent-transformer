@@ -126,6 +126,13 @@ def train(
 
     check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
+    if backend.world_size != 1:
+        raise NotImplementedError(
+            f"world_size {backend.world_size}: the loop is single-device. Two places count per rank where they must count"
+            " per world before a multi-rank backend can exist: `BatchStream._next_sample` (training/step.py) adds the rows this"
+            " rank pulled to consumed_rows while `set_resume_offset` skips range rows over all shards, and"
+            " `Settings.gradient_accumulation_steps` (training/settings.py) is per device, never divided by the world size."
+        )
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
     with run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included

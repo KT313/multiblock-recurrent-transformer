@@ -170,6 +170,10 @@ class BatchStream:
         """
         The next buffered sample of `source`, pulling worker batches until one is there; rows read (dropped rows
         included) are counted against the source at pull time.
+
+        Single-shard: `rows_read` counts the rows THIS rank's loader yielded, while `set_resume_offset` skips range rows
+        over all shards, so with several ranks a resume would rewind every rank by the world size. `train()` refuses
+        `world_size != 1` until this counts range rows.
         """
 
         buffer = self._buffers[source]
@@ -290,7 +294,9 @@ def run_one_optimizer_step(
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
     loss is all-reduced every step (a no-op on one device). Packed micro-batches (`PackedBatch`) go through the same
     loop; the loss stays the mean over the valid tokens of each micro-batch, averaged over the micro-batches (with
-    full packs the valid-token counts are nearly equal, so this is close to token-weighted).
+    full packs the valid-token counts are nearly equal, so this is close to token-weighted; on padded rows, where
+    the loader sorts a world batch by length, a micro-batch of short rows weighs as much as one of full rows, which
+    is why the settings refuse `pack_sequences: false`).
     """
 
     step = progress.step
