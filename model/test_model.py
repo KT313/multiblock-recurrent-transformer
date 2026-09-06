@@ -18,6 +18,7 @@ from model.blocks import recurrence
 from model.blocks.recurrence import sample_recurrence_steps
 from model.blocks.sandwich import SandwichBlock
 from model.layers.attention import precompute_freqs_cis
+from model.layers.norms import RMSNorm
 from model.model import RecurrentGPT, TransformerModules
 
 GOLDEN_PATH = Path(__file__).with_name("golden_tiny_forward.pt")
@@ -667,3 +668,116 @@ def test_compile_smoke() -> None:
     out = compiled(x, labels=x, return_logits=True)
     assert out["logits"].shape == (2, 32, VOCAB)
     out["loss"].backward()
+
+
+# --- the bf16 residual stream ------------------------------------------------------------------------------------------
+
+
+def norm_output_dtypes(model: RecurrentGPT, autocast: bool) -> dict[str, torch.dtype]:
+    """
+    The output dtype of every RMSNorm and LayerNorm of `model` on one eval-mode forward (fixed depths), by name.
+    """
+
+    seen: dict[str, torch.dtype] = {}
+    handles = []
+    for name, module in model.named_modules():
+        if isinstance(module, (RMSNorm, torch.nn.LayerNorm)):
+            handles.append(
+                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, out.dtype))
+            )
+    model.eval()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        model(ids(), num_steps=(1, 1))
+    for handle in handles:
+        handle.remove()
+    return seen
+
+
+def rmsnorm_names(model: RecurrentGPT, prefix: str) -> list[str]:
+    return [name for name, m in model.named_modules() if isinstance(m, RMSNorm) and name.startswith(prefix)]
+
+
+@pytest.mark.parametrize("value", ["none", "core", "all"])
+def test_bf16_residual_stream_rounds_the_right_norms_under_autocast(value: str) -> None:
+    """
+    "core": the core blocks' RMSNorms emit bf16, the prelude's and coda's stay fp32; "all": every RMSNorm emits
+    bf16; "none": nothing. The LayerNorms (`ln_fs`, `ln_final`) are not switched: with an fp32 input ("none",
+    "core") they emit fp32 on any device; with the bf16 input of "all" the CUDA autocast policy still gives fp32
+    while the CPU policy follows the input, so that case is left to the GPU smoke test.
+    """
+
+    model = seeded_tiny(bf16_residual_stream=value)
+    dtypes = norm_output_dtypes(model, autocast=True)
+    core = rmsnorm_names(model, "transformer.core_blocks")
+    outer = rmsnorm_names(model, "transformer.prelude") + rmsnorm_names(model, "transformer.coda")
+    assert core and outer
+    expected_core = torch.bfloat16 if value != "none" else torch.float32
+    expected_outer = torch.bfloat16 if value == "all" else torch.float32
+    assert all(dtypes[name] == expected_core for name in core)
+    assert all(dtypes[name] == expected_outer for name in outer)
+    if value != "all":
+        assert all(dtypes[name] == torch.float32 for name in dtypes if "ln_f" in name)
+
+
+def test_bf16_residual_stream_is_fp32_without_autocast() -> None:
+    model = seeded_tiny(bf16_residual_stream="all")
+    assert set(norm_output_dtypes(model, autocast=False).values()) == {torch.float32}
+
+
+def test_bf16_residual_stream_matches_the_fp32_stream_closely_and_trains() -> None:
+    """
+    Same seeded weights, same latent draw: the "core" loss under bf16 autocast stays within bf16 tolerance of the
+    fp32-stream loss, and every parameter receives a finite gradient.
+    """
+
+    losses = {}
+    for value in ("none", "core"):
+        model = seeded_tiny(bf16_residual_stream=value)
+        x = ids()
+        torch.manual_seed(7)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = model(x, labels=x, num_steps=(1, 2))
+        losses[value] = out["loss"]
+        out["loss"].backward()
+        for name, param in model.named_parameters():
+            assert param.grad is not None and torch.isfinite(param.grad).all(), name
+    torch.testing.assert_close(losses["core"], losses["none"], atol=0.0, rtol=2e-2)
+    assert not torch.equal(losses["core"], losses["none"])  # the rounding is real
+
+
+def test_bf16_residual_stream_latent_enters_the_first_iteration_in_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Under autocast with "core" the initial latent is rounded to the autocast dtype before the first iteration (the
+    adapter GEMM would cast it anyway; a fp32 first iteration was a second dtype variant of the compiled frame).
+    """
+
+    seen: list[torch.dtype] = []
+    original = recurrence.iterate_core_block
+
+    def spy(x_latent: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        seen.append(x_latent.dtype)
+        return cast(Tensor, original(x_latent, *args, **kwargs))
+
+    monkeypatch.setattr(model_module, "iterate_core_block", spy)
+    for value, autocast, expected in (
+        ("core", True, torch.bfloat16),
+        ("core", False, torch.float32),
+        ("none", True, torch.float32),
+    ):
+        seen.clear()
+        model = seeded_tiny(bf16_residual_stream=value).eval()
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            model(ids(), num_steps=(1, 1))
+        assert seen and set(seen) == {expected}, (value, autocast, seen)
+
+
+@pytest.mark.gpu
+def test_compile_smoke_bf16_residual_stream() -> None:
+    model = seeded_tiny(bf16_residual_stream="core").cuda()
+    compiled = torch.compile(model, dynamic=True)
+    x = ids().cuda()
+    torch.manual_seed(1)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = compiled(x, labels=x)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and all(p.grad is not None for p in model.parameters())

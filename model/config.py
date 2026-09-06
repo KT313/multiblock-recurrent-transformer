@@ -29,6 +29,9 @@ class RoPESettings:
     rope_base: int = 50_000
 
 
+# The accepted values of `bf16_residual_stream` (see the field).
+BF16_RESIDUAL_STREAM_VALUES = ("none", "core", "all")
+
 # Fields that only ever had one value in the thesis run. They stay in the config (and in exported config.json files)
 # so that a different value is rejected loudly instead of silently running a different architecture.
 _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
@@ -81,6 +84,11 @@ class RecurrentConfig:
     attn_impl: Literal["sdpa"] = "sdpa"
     norm_eps: float = 1e-6
     qk_bias: bool = True
+    # The dtype of the residual stream under autocast: "none" keeps it fp32 (the RMSNorm outputs promote to the fp32
+    # weight), "core" rounds the core blocks' RMSNorm outputs to the autocast dtype so the stream inside the recurrence
+    # is bf16 (prelude, coda, the residual across blocks and the block input stay fp32), "all" rounds every RMSNorm.
+    # Without autocast the stream is fp32 whatever the value. Parameters, gradients and optimizer state are unaffected.
+    bf16_residual_stream: Literal["none", "core", "all"] = "none"
     init_strategy: Literal["takase"] = "takase"
     init_orthogonal: Literal[True] = True
     activation_checkpoint_impl: Literal["per-iteration"] = "per-iteration"
@@ -103,6 +111,11 @@ class RecurrentConfig:
             actual_value = getattr(self, field_name)
             if actual_value != allowed_value:
                 raise ValueError(f"{field_name}={actual_value!r} is not supported, only {allowed_value!r}")
+        if self.bf16_residual_stream not in BF16_RESIDUAL_STREAM_VALUES:
+            raise ValueError(
+                f"bf16_residual_stream={self.bf16_residual_stream!r} is not supported, only one of "
+                f"{BF16_RESIDUAL_STREAM_VALUES}"
+            )
 
         # Vocabulary: pad the embedding table up to a multiple of `padding_multiple`, unless the padded size is given
         # explicitly, in which case the vocabulary must fit into it.

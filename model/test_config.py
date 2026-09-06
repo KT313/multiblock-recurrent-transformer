@@ -256,6 +256,7 @@ def test_invalid_single_value_fields_rejected(field: str, value: object) -> None
     with pytest.raises(ValueError, match=f"{field}="):
         tiny(**{field: value})
 
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -276,3 +277,19 @@ def test_degenerate_recurrence_values_are_rejected_at_config_time(overrides: dic
         tiny(**overrides)
 
 
+@pytest.mark.parametrize("value", ["none", "core", "all"])
+def test_bf16_residual_stream_values(value: str, tmp_path: Path) -> None:
+    cfg = tiny_config(bf16_residual_stream=value)
+    assert cfg.bf16_residual_stream == value
+    cfg.to_json(tmp_path / "cfg.json")
+    assert RecurrentConfig.from_json(tmp_path / "cfg.json").bf16_residual_stream == value
+
+
+def test_bf16_residual_stream_rejects_other_values() -> None:
+    with pytest.raises(ValueError, match="bf16_residual_stream='everywhere'"):
+        tiny_config(bf16_residual_stream="everywhere")
+
+
+def test_bf16_residual_stream_default_is_off_in_every_architecture_yaml() -> None:
+    for path in (TINY_ARCHITECTURE, CROW_ARCHITECTURE):
+        assert RecurrentConfig.from_yaml(path).bf16_residual_stream == "none", path

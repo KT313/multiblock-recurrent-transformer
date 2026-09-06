@@ -28,6 +28,7 @@ rope_settings:
   rope_base: 50000             # base of the rotary position embedding frequencies
 norm_eps: 1.0e-6               # epsilon of every RMSNorm / LayerNorm (write floats with a dot: YAML reads 1e-6 as a string)
 qk_bias: true                  # learned additive bias on the queries and keys of every attention layer
+bf16_residual_stream: none     # residual stream under bf16 autocast: none = fp32 (the RMSNorm outputs promote to fp32), core = bf16 inside the core blocks, all = bf16 everywhere; fp32 without autocast
 
 # Recurrent structure
 n_layers_in_prelude: 2         # SandwichBlocks before the recurrent core (run once, embed the input)

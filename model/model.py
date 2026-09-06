@@ -118,16 +118,22 @@ class RecurrentGPT(torch.nn.Module):
         padded_vocab_size = config.padded_vocab_size
         assert padded_vocab_size is not None
 
+        # The bf16 residual stream (`bf16_residual_stream`): "core" rounds the core blocks' norm outputs to the
+        # autocast dtype, "all" the prelude's and coda's as well; see `RMSNorm`.
+        core_bf16_stream = config.bf16_residual_stream != "none"
+        outer_bf16_stream = config.bf16_residual_stream == "all"
+        self.core_bf16_stream = core_bf16_stream
+
         # Construction order matters: it fixes the RNG consumption of the parameter init.
         prelude = torch.nn.ModuleList()
         for _ in range(config.n_layers_in_prelude):
-            prelude.append(SandwichBlock(config))
+            prelude.append(SandwichBlock(config, bf16_stream=outer_bf16_stream))
 
         core_blocks = torch.nn.ModuleList()
         for n_layers in n_layers_per_block:
             layers = torch.nn.ModuleList()
             for _ in range(n_layers):
-                layers.append(SandwichBlock(config))
+                layers.append(SandwichBlock(config, bf16_stream=core_bf16_stream))
             core_blocks.append(layers)
 
         adapters = torch.nn.ModuleList()
@@ -136,7 +142,7 @@ class RecurrentGPT(torch.nn.Module):
 
         coda = torch.nn.ModuleList()
         for _ in range(config.n_layers_in_coda):
-            coda.append(SandwichBlock(config))
+            coda.append(SandwichBlock(config, bf16_stream=outer_bf16_stream))
 
         ln_fs = torch.nn.ModuleList()
         for _ in n_layers_per_block:
@@ -366,6 +372,11 @@ class RecurrentGPT(torch.nn.Module):
         transformer = self.transformer
         x_base = transformer.ln_fs[block_idx](x)
         x_latent = initialize_state(x)  # consumes the global RNG first, then (if sampling) the sampler's draw
+        if self.core_bf16_stream and torch.is_autocast_enabled(x.device.type):
+            # The bf16 stream: the latent enters the first iteration in the dtype every later iteration has. The
+            # adapter GEMM would cast it to this dtype anyway, so the values are the same; what it avoids is a second
+            # dtype variant of the compiled iteration, which pushed the recompile count past dynamo's limit.
+            x_latent = x_latent.to(torch.get_autocast_dtype(x.device.type))
 
         steps: tuple[int, int] | tuple[Tensor, Tensor]
         if num_steps is None:

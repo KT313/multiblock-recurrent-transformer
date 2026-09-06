@@ -36,6 +36,7 @@ _MODEL_FIELDS = (
     "attn_impl",
     "norm_eps",
     "qk_bias",
+    "bf16_residual_stream",
     "init_strategy",
     "init_orthogonal",
     "activation_checkpoint_impl",

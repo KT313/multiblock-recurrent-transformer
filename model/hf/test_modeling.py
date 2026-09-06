@@ -15,6 +15,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import model.model as model_module
+from model.layers.norms import RMSNorm
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
 from model.test_config import TINY_ARCHITECTURE, tiny_config
@@ -508,3 +509,15 @@ print("STANDALONE_OK")
     )
     assert result.returncode == 0, result.stderr[-3000:]
     assert "STANDALONE_OK" in result.stdout
+
+
+def test_hf_config_carries_bf16_residual_stream(tmp_path: Path) -> None:
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config(bf16_residual_stream="core"))
+    assert hf_cfg.bf16_residual_stream == "core"
+    hf_cfg.save_pretrained(tmp_path)
+    loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
+    assert loaded.to_recurrent_config().bf16_residual_stream == "core"
+    model = RecurrentGPTForCausalLM(loaded)
+    core_norm = cast(RMSNorm, model.model.get_submodule("transformer.core_blocks.0.0.norm_1"))
+    prelude_norm = cast(RMSNorm, model.model.get_submodule("transformer.prelude.0.norm_1"))
+    assert core_norm.autocast_output is True and prelude_norm.autocast_output is False

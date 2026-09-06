@@ -19,16 +19,19 @@ class SandwichBlock(torch.nn.Module):
 
         x = norm_2(attn(norm_1(x)) + x)
         x = norm_4(mlp(norm_3(x)) + x)
+
+    `bf16_stream` makes the four norms round their output to the autocast dtype (see `RMSNorm`), which makes the
+    residual stream through this block bf16 under autocast; `RecurrentGPT` sets it per `bf16_residual_stream`.
     """
 
-    def __init__(self, config: RecurrentConfig) -> None:
+    def __init__(self, config: RecurrentConfig, bf16_stream: bool = False) -> None:
         super().__init__()
-        self.norm_1 = RMSNorm(config.n_embd, eps=config.norm_eps)
+        self.norm_1 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
         self.attn = CausalSelfAttention(config)
-        self.norm_2 = RMSNorm(config.n_embd, eps=config.norm_eps)
+        self.norm_2 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
         self.mlp = GatedMLP(config)
-        self.norm_3 = RMSNorm(config.n_embd, eps=config.norm_eps)
-        self.norm_4 = RMSNorm(config.n_embd, eps=config.norm_eps)
+        self.norm_3 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
+        self.norm_4 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
         attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
