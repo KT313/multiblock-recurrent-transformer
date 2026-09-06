@@ -7,6 +7,7 @@ The stage structure never touches the train loaders: `training.step.BatchStream`
 the stage-interpolated weights, so a reader continues across stage boundaries and never re-reads rows.
 """
 
+import signal
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -16,7 +17,6 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.base import Backend
 from training.data.collate import (
-    IGNORE_INDEX,
     Batch,
     Sample,
     WorkerBatch,
@@ -26,7 +26,7 @@ from training.data.collate import (
 )
 from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 from training.settings import Settings
 
 SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (the `samples` half of a WorkerBatch)
@@ -103,6 +103,19 @@ def build_dataloader(
     )
 
 
+def worker_init_fn(worker_id: int) -> None:
+    """
+    A DataLoader worker ignores SIGINT. A terminal Ctrl-C signals the whole process group; a worker that took it
+    would exit on the KeyboardInterrupt and the parent would fail with "DataLoader worker exited unexpectedly"
+    instead of finishing the step and checkpointing (`training.train.stop_on_interrupt`). Ignoring changes nothing
+    about a worker's lifetime: the parent ends it by message (a sentinel once its iterator is dropped) and torch's
+    watchdog ends it when the parent dies. SIGTERM keeps its default: torch's shutdown fallback and the interpreter's
+    exit both end a leftover worker with it, and a worker that ignored it would hang the parent's exit.
+    """
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def dataloader_over(
     dataset: IterableDataset[Row],
     tokenizer: Tokenizer,
@@ -150,6 +163,7 @@ def dataloader_over(
         num_workers=num_workers,
         prefetch_factor=TRAIN_LOADER_PREFETCH_FACTOR if num_workers > 0 else None,
         generator=generator,
+        worker_init_fn=worker_init_fn,
     )
 
 

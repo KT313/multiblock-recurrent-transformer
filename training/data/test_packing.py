@@ -9,7 +9,8 @@ import logging
 import pytest
 import torch
 
-from training.data.collate import IGNORE_INDEX, Sample, pad_and_shift
+from training.data.collate import Sample, pad_and_shift
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.packing import POOL_TOKEN_FACTOR, PackedBatch, PackPool, pack_samples, shifted_length
 from training.data.tokenizer import Tokenizer
 
@@ -162,25 +163,18 @@ def test_every_document_equals_its_padded_row(tokenizer: Tokenizer) -> None:
 
 def test_prompt_masks_and_out_of_vocab_labels_are_ignored(tokenizer: Tokenizer) -> None:
     """
-    An instruct row masks its prompt with the pad id; the collation turns that into the ignore index, as it does a
-    label outside the vocabulary. Both survive the packing, at the document's own positions.
+    An instruct row masks its prompt with the ignore index; the collation turns a label outside the vocabulary into
+    it too. Both survive the packing, at the document's own positions.
     """
 
     ids, labels, tag = _sample(6, "instruct")
     labels = labels.clone()
-    labels[:3] = tokenizer.pad_id  # bos and two prompt tokens
+    labels[:3] = IGNORE_INDEX  # bos and two prompt tokens
     labels[5] = tokenizer.vocab_size  # out of range
     pack = pack_samples([_sample(2, "a"), (ids, labels, tag)], 10, tokenizer)
     doc = pack.labels[0, 2:8]  # the instruct document's six slots
     assert doc.tolist() == [IGNORE_INDEX, IGNORE_INDEX, *labels[3:5].tolist(), IGNORE_INDEX, labels[6].item()]
-    assert (pack.input_ids != tokenizer.pad_id).all(), "pad ids never reach the inputs"
-
-
-def test_tail_uses_the_pad_id_without_an_eos(tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokenizer, "eos_id", None)
-    pack = pack_samples([_sample(3)], 6, tokenizer)
-    assert pack.input_ids[0, 3:].tolist() == [tokenizer.pad_id] * 3
-    assert pack.labels[0, 3:].tolist() == [IGNORE_INDEX] * 3
+    assert (pack.input_ids >= 0).all(), "the sentinel never reaches the inputs"
 
 
 def test_pack_samples_rejects_empty_and_overfull_packs(tokenizer: Tokenizer) -> None:

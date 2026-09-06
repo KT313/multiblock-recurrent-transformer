@@ -54,7 +54,7 @@ from training.checkpoint import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
-from training.data.collate import IGNORE_INDEX
+from training.data.tokenizer import IGNORE_INDEX
 from evaluation.benchmarks import benchmarks_path, evaluate_on_benchmarks
 from evaluation.prompts import load_prompts
 from evaluation.samples import GeneratedSample, generate_and_save_samples, samples_path

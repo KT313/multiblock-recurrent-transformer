@@ -4,42 +4,30 @@
 Thin wrapper around a HuggingFace fast tokenizer directory (tokenizer.json + tokenizer_config.json).
 """
 
-import logging
 from pathlib import Path
 from typing import cast
 
-log = logging.getLogger(__name__)
+# Label value of positions without a loss (padding, masked prompts, out-of-vocab); the model defaults to it too.
+# Never a token id: a real `<unk>` or `<pad>` token in a document is a supervised label like any other.
+IGNORE_INDEX = -100
 
-# Tried in order when picking the padding id (see `resolve_pad_id`).
-_PAD_ID_FALLBACKS = ("pad_token_id", "unk_token_id", "eos_token_id")
 
-
-def resolve_pad_id(processor: object, path: Path) -> int:
+def resolve_pad_id(processor: object, eos_id: int) -> int:
     """
-    The id used for padding and for masking labels.
-
-    Tokenizers without a pad token (the Llama tokenizer) fall back to the unk token (Llama's `<unk>`, id 0), then to
-    EOS. Pad positions in the inputs are replaced by EOS in the collate function anyway; in the labels they become
-    the ignore index.
+    The id generation pads with (`evaluation.wrapper`, `evaluation.samples`): the pad token if the tokenizer defines
+    one, else EOS. Training never pads with it: pad positions are EOS in the inputs and `IGNORE_INDEX` in the labels.
     """
 
-    for attribute in _PAD_ID_FALLBACKS:
-        token_id = cast(int | None, getattr(processor, attribute, None))
-        if token_id is None:
-            continue
-        if attribute != "pad_token_id":
-            log.warning(
-                "Tokenizer at %s defines no pad token; using its %s (id %d) for padding", path, attribute, token_id
-            )
-        return token_id
-    raise ValueError(f"Tokenizer at {path} defines no pad, unk or eos token; padding/label masking needs one.")
+    pad_id = cast(int | None, getattr(processor, "pad_token_id", None))
+    return eos_id if pad_id is None else pad_id
 
 
 class Tokenizer:
     """
     Loads a HF tokenizer directory and encodes text without automatic special tokens.
 
-    BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them.
+    BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them. Both must exist: the
+    formats prepend BOS, every document ends in EOS, and pack tails are EOS.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -49,9 +37,12 @@ class Tokenizer:
         if not (self.path / "tokenizer.json").is_file():
             raise FileNotFoundError(f"No tokenizer.json in {self.path}")
         self.processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=False, add_eos_token=False)
-        self.bos_id: int | None = self.processor.bos_token_id
-        self.eos_id: int | None = self.processor.eos_token_id
-        self.pad_id: int = resolve_pad_id(self.processor, self.path)
+        bos_id, eos_id = self.processor.bos_token_id, self.processor.eos_token_id
+        if bos_id is None or eos_id is None:
+            raise ValueError(f"Tokenizer at {self.path} must define a BOS and an EOS token")
+        self.bos_id: int = bos_id
+        self.eos_id: int = eos_id
+        self.pad_id: int = resolve_pad_id(self.processor, self.eos_id)
 
     @property
     def vocab_size(self) -> int:
@@ -73,13 +64,13 @@ class Tokenizer:
 
     def encode(self, text: str, bos: bool = False, eos: bool = False) -> list[int]:
         """
-        Tokenize text; prepend BOS / append EOS when requested and the tokenizer defines them.
+        Tokenize text; prepend BOS / append EOS when requested.
         """
 
         tokens: list[int] = self.processor.encode(text)
-        if bos and self.bos_id is not None:
+        if bos:
             tokens = [self.bos_id] + tokens
-        if eos and self.eos_id is not None:
+        if eos:
             tokens = tokens + [self.eos_id]
         return tokens
 

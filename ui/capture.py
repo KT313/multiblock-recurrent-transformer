@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import sys
 import threading
 import traceback
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -78,6 +80,27 @@ def existing_loggers() -> list[logging.Logger]:
     return loggers
 
 
+_sinks: weakref.WeakSet[LineSink] = weakref.WeakSet()
+_fork_hook_registered = False  # `register_at_fork` cannot be undone, so the hook is registered once
+
+
+def _reset_in_child() -> None:
+    """
+    A fresh lock for every sink in a forked child (a DataLoader worker): the copied lock may be held by a
+    parent thread that does not exist in the child, and the worker's first print would block on it forever.
+    """
+
+    for sink in _sinks:
+        sink._lock = threading.Lock()
+
+
+def _register_fork_hook() -> None:
+    global _fork_hook_registered
+    if not _fork_hook_registered and hasattr(os, "register_at_fork"):
+        _fork_hook_registered = True
+        os.register_at_fork(after_in_child=_reset_in_child)
+
+
 class LineSink(io.TextIOBase):
     """
     A sys.stdout / sys.stderr replacement: complete lines go to emit, a carriage return discards the
@@ -95,6 +118,8 @@ class LineSink(io.TextIOBase):
         self._lock = threading.Lock()
         self._real_stream = real_stream
         self._thread_local = threading.local()
+        _register_fork_hook()
+        _sinks.add(self)
 
     @property
     def real_stream(self) -> TextIO | None:

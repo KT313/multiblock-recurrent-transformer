@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import multiprocessing
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -137,6 +138,20 @@ def test_line_sink_without_a_real_stream_reports_no_fileno(monkeypatch: pytest.M
     monkeypatch.setattr(sys, "__stderr__", None)
     with pytest.raises(io.UnsupportedOperation):
         LineSink(lambda _line: None).fileno()
+
+
+@pytest.mark.timeout(10)
+def test_line_sink_lock_is_fresh_in_a_forked_child() -> None:
+    sink = LineSink(lambda _: None)
+    sink._lock.acquire()  # a plain lock: any thread may hold it, so the forking one can
+    try:
+        child = multiprocessing.get_context("fork").Process(target=sink.write, args=("from the child\n",))
+        child.daemon = True  # a child hung on the lock is killed at exit instead of hanging pytest
+        child.start()
+        child.join(timeout=3)
+    finally:
+        sink._lock.release()
+    assert child.exitcode == 0, "the child did not hang on the copied lock"
 
 
 def test_line_sink_sends_a_re_entrant_write_to_the_real_stream() -> None:

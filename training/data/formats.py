@@ -2,8 +2,8 @@
 """
 Row -> (input_ids, labels) formatting functions, selected by data_signature["format_fn"].
 
-Every function returns two equal-length torch.long tensors. Positions that must not be supervised are set to
-tokenizer.pad_id in labels; the collate function turns those into the ignore index. Two formats exist:
+Every function returns two equal-length torch.long tensors. Positions that must not be supervised are
+`IGNORE_INDEX` in labels, never a token id, so a real `<unk>` or `<pad>` token stays supervised. Two formats exist:
 pass_text (pretrain sources) and concatenate_instruction_input_output (instruct sources,
 `INSTRUCT_DATA_SIGNATURE` of the dataset resolver).
 """
@@ -13,7 +13,7 @@ from typing import Any, Callable
 import torch
 
 from data_preparation.lib.stages.row_pipeline import instruct_text
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 Row = dict[str, Any]
 FormatFn = Callable[[Row, Tokenizer, bool, bool], tuple[torch.Tensor, torch.Tensor]]
@@ -52,7 +52,7 @@ def concatenate_instruction_input_output(
     prompt_len = len(tokenizer.encode(prompt, bos=add_bos, eos=False))
     input_ids = torch.tensor(tokenizer.encode(full, bos=add_bos, eos=add_eos), dtype=torch.long)
     labels = input_ids.clone()
-    labels[:prompt_len] = tokenizer.pad_id
+    labels[:prompt_len] = IGNORE_INDEX
     return input_ids, labels
 
 

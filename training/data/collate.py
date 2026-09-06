@@ -12,9 +12,7 @@ from typing import Any, NamedTuple
 import torch
 
 from training.data.formats import apply_formatting
-from training.data.tokenizer import Tokenizer
-
-IGNORE_INDEX = -100  # label value of positions without a loss (padding, out-of-vocab); the model defaults to it too
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
 
@@ -53,31 +51,23 @@ def find_multiple(value: int, multiple: int) -> int:
     return value if value % multiple == 0 else value + multiple - (value % multiple)
 
 
-def shift_inputs_and_labels(
-    inputs: torch.Tensor, labels: torch.Tensor, tokenizer: Tokenizer
-) -> tuple[torch.Tensor, torch.Tensor]:
+def shift_inputs_and_labels(inputs: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Next-token shift: inputs drop the last position, labels drop the first.
-
-    Trailing pad ids in the inputs are replaced by EOS so they are valid embedding indices; the labels keep their
-    pad ids so the caller can turn them into the ignore index.
     """
 
     seq_len = inputs.shape[1]
     input_ids = inputs[:, : seq_len - 1].contiguous().long()
     label_ids = labels[:, 1:seq_len].contiguous().long()
-    if tokenizer.eos_id is not None:
-        input_ids[input_ids == tokenizer.pad_id] = tokenizer.eos_id
     return input_ids, label_ids
 
 
 def mask_label_ids(label_ids: torch.Tensor, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
     """
-    Shifted labels as the loss sees them: pad ids (padding, masked prompts) and ids outside the tokenizer's
-    vocabulary become `ignore_index`, in place; returns `label_ids`.
+    Shifted labels as the loss sees them: ids outside the tokenizer's vocabulary become `ignore_index`, in place;
+    returns `label_ids`. `IGNORE_INDEX` (padding, masked prompts) is negative, so it passes through unchanged.
     """
 
-    label_ids[label_ids == tokenizer.pad_id] = ignore_index
     label_ids[(label_ids < 0) | (label_ids >= tokenizer.vocab_size)] = ignore_index
     return label_ids
 
@@ -86,15 +76,15 @@ def has_supervised_label(labels: torch.Tensor, tokenizer: Tokenizer) -> bool:
     """
     Whether the shift of this unpadded labels row leaves a single position with a loss.
 
-    The shift drops labels[0] and the collation masks pad ids and out-of-vocab ids, so the row is trainable iff
-    some labels[1:] is a valid, non-pad id. False for a row that is one token long, for a row of pure padding
-    (unknown tokens) and for an instruct row whose masked prompt alone fills training_max_sequence_length + 1.
+    The shift drops labels[0] and the collation masks out-of-vocab ids, so the row is trainable iff some labels[1:]
+    is a valid id (not `IGNORE_INDEX`). False for a row that is one token long and for an instruct row whose masked
+    prompt alone fills training_max_sequence_length + 1.
     """
 
     tail = labels[1:]
     if tail.numel() == 0:
         return False
-    valid = (tail != tokenizer.pad_id) & (tail >= 0) & (tail < tokenizer.vocab_size)
+    valid = (tail != IGNORE_INDEX) & (tail >= 0) & (tail < tokenizer.vocab_size)
     return bool(valid.any())
 
 
@@ -149,8 +139,8 @@ def pad_and_shift(
     Pad `samples` to one width and shift them into a (input_ids, labels, data_ids) micro-batch.
 
     The width is the longest sample of THIS micro-batch, rounded up to padding_multiple and capped at
-    training_max_sequence_length + 1; the shift then drops one position from it. Pad positions become EOS in the inputs and
-    ignore_index in the labels, as do labels outside the tokenizer's vocabulary.
+    training_max_sequence_length + 1; the shift then drops one position from it. Pad positions are EOS in the inputs and
+    ignore_index in the labels, as are labels outside the tokenizer's vocabulary.
 
     The tensors are pageable on purpose: a pinned micro-batch that was copied to the device carries a CUDA event,
     and freeing it inside a forked DataLoader worker (an epoch restart forks one) aborts the worker with
@@ -164,14 +154,13 @@ def pad_and_shift(
     longest = max(max(sample_inputs.shape[0], sample_labels.shape[0]) for sample_inputs, sample_labels, _ in samples)
     width = min(find_multiple(longest, padding_multiple) if padding_multiple else longest, max_tokens)
 
-    pad_id = tokenizer.pad_id
-    inputs = torch.full((len(samples), width), pad_id, dtype=torch.long)
-    labels = torch.full((len(samples), width), pad_id, dtype=torch.long)
+    inputs = torch.full((len(samples), width), tokenizer.eos_id, dtype=torch.long)
+    labels = torch.full((len(samples), width), ignore_index, dtype=torch.long)
     for row, (sample_inputs, sample_labels, _) in enumerate(samples):
         inputs[row, : min(len(sample_inputs), width)] = sample_inputs[:width]
         labels[row, : min(len(sample_labels), width)] = sample_labels[:width]
 
-    input_ids, label_ids = shift_inputs_and_labels(inputs, labels, tokenizer)
+    input_ids, label_ids = shift_inputs_and_labels(inputs, labels)
     mask_label_ids(label_ids, tokenizer, ignore_index)
     return Batch(input_ids, label_ids, [data_id for _, _, data_id in samples])
 

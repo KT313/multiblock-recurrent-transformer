@@ -84,12 +84,14 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:
     """
-    Apply the scheduled learning rate to every group, as a tensor (ELLISAdam stores its LR as a float32 tensor and
-    clones it in its step; torch AdamW accepts a tensor LR on CUDA too).
+    Apply the scheduled learning rate to every group. ELLISAdam stores its LR as a float32 tensor and clones it in
+    its step; torch AdamW gets the plain float, a tensor LR silently drops its foreach/fused path on CUDA and calls
+    `lr.item()` per parameter every step.
     """
 
+    value: torch.Tensor | float = torch.as_tensor(lr) if isinstance(optimizer, ELLISAdam) else lr
     for group in optimizer.param_groups:
-        group["lr"] = torch.as_tensor(lr)
+        group["lr"] = value
 
 
 class ELLISAdam(Optimizer):

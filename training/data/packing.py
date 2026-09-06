@@ -18,7 +18,8 @@ from typing import NamedTuple
 
 import torch
 
-from training.data.collate import IGNORE_INDEX, Sample, mask_label_ids, shift_inputs_and_labels
+from training.data.collate import Sample, mask_label_ids, shift_inputs_and_labels
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.tokenizer import Tokenizer
 
 log = logging.getLogger(__name__)
@@ -148,10 +149,9 @@ def pack_samples(
     """
     The `PackedBatch` of `samples` (in this order) for a pack of `pack_length` tokens.
 
-    Every sample is shifted on its own (`shift_inputs_and_labels`, so pad ids in the inputs become EOS exactly as
-    in the padded path) and appended; the tail is EOS (the pad id without an EOS) in the inputs, `ignore_index` in
-    the labels. Labels get the padded path's masking (`mask_label_ids`): pad ids (masked prompts) and out-of-vocab
-    ids become `ignore_index`. The tensors are pageable on purpose, see `pad_and_shift`.
+    Every sample is shifted on its own (`shift_inputs_and_labels`) and appended; the tail is EOS in the inputs,
+    `ignore_index` in the labels. Labels get the padded path's masking (`mask_label_ids`): out-of-vocab ids become
+    `ignore_index`, masked prompts already are. The tensors are pageable on purpose, see `pad_and_shift`.
     """
 
     if not samples:
@@ -160,15 +160,14 @@ def pack_samples(
     if total > pack_length:
         raise ValueError(f"the samples occupy {total} slots but the pack holds {pack_length}")
 
-    tail_id = tokenizer.eos_id if tokenizer.eos_id is not None else tokenizer.pad_id
-    input_ids = torch.full((1, pack_length), tail_id, dtype=torch.long)
+    input_ids = torch.full((1, pack_length), tokenizer.eos_id, dtype=torch.long)
     labels = torch.full((1, pack_length), ignore_index, dtype=torch.long)
     position_ids = torch.zeros((1, pack_length), dtype=torch.long)
     document_ids = torch.full((1, pack_length), len(samples), dtype=torch.int32)  # the tail's id unless overwritten
 
     offset = 0
     for document, (sample_inputs, sample_labels, _) in enumerate(samples):
-        shifted_inputs, shifted_labels = shift_inputs_and_labels(sample_inputs[None], sample_labels[None], tokenizer)
+        shifted_inputs, shifted_labels = shift_inputs_and_labels(sample_inputs[None], sample_labels[None])
         length = shifted_inputs.shape[1]
         input_ids[0, offset : offset + length] = shifted_inputs[0]
         labels[0, offset : offset + length] = shifted_labels[0]

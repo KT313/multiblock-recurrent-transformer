@@ -11,7 +11,7 @@ import logging
 import math
 import shutil
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,12 +24,11 @@ from model import RecurrentConfig, RecurrentGPT
 from training.backend.base import plain_model
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data.collate import IGNORE_INDEX
+from training.data.tokenizer import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
-    PADDED_ROWS,
     TINY_DATASET_YAML,
     golden_exact_requested,
     golden_mismatches,
@@ -117,7 +116,7 @@ def test_stop_requested() -> None:
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
     """
     `build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
-    sequence length, world size, warmup / cooldown and the micro-batch divisibility check from the settings.
+    sequence length, world size, warmup / cooldown and the packed micro-batches split over the devices.
     """
 
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
@@ -129,8 +128,6 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
     with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of devices \(3\)"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
-    with pytest.raises(ValueError, match="divisible by world_size"):
-        build_stage_manager(replace(tiny_settings, **PADDED_ROWS), tiny_resolved, world_size=3)
 
 
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
@@ -866,7 +863,7 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
     Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
 
     The golden is a refactor guard, not a promise about CPU training: it was recorded in fp32 on the CPU with one
-    thread and deterministic algorithms (torch 2.13.0+cu130, see `training.testing.golden.record_golden_run`), so it catches
+    thread and deterministic algorithms (torch 2.14.0+cu130, see `training.testing.golden.record_golden_run`), so it catches
     a changed operation order, an extra RNG draw or a moved forward pass in the loop. It does NOT exercise the bf16
     autocast path used for real training (the bf16 "finite / same seed" tests above are the only cover there).
     Every float is compared with `rel=1e-5`; `GOLDEN_EXACT=1` compares with `==` (bit-identical on the recording

@@ -10,7 +10,7 @@ from training.data.formats import (
     concatenate_instruction_input_output,
     pass_text,
 )
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 
 def _sig(fmt: str, keys: list[str] | None = None) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def test_instruction_format_masks_prompt(tokenizer: Tokenizer, with_input: bool)
     prompt_ids = [1, 4, 5] + ([8] if with_input else [])
     output_ids = [23, 24, 25, 2]
     assert inp.tolist() == prompt_ids + output_ids
-    assert lab.tolist() == [tokenizer.pad_id] * len(prompt_ids) + output_ids
+    assert lab.tolist() == [IGNORE_INDEX] * len(prompt_ids) + output_ids  # masked straight out of the format
     assert inp.shape == lab.shape
 
 
@@ -62,7 +62,7 @@ def test_instruction_format_without_bos_eos(tokenizer: Tokenizer) -> None:
         {"instruction": "tok_1", "output": "tok_2"}, tokenizer, add_bos=False, add_eos=False
     )
     assert inp.tolist() == [4, 5]
-    assert lab.tolist() == [tokenizer.pad_id, 5]
+    assert lab.tolist() == [IGNORE_INDEX, 5]
 
 
 def test_instruction_format_missing_fields_raise(tokenizer: Tokenizer) -> None:
@@ -91,7 +91,7 @@ def test_apply_formatting_dispatches(tokenizer: Tokenizer) -> None:
     assert inp.tolist() == [1, 4]
     row = {"instruction": "tok_1", "output": "tok_2", "data_signature": _sig("concatenate_instruction_input_output")}
     inp, lab = apply_formatting(row, tokenizer, add_bos=False, add_eos=False)
-    assert lab.tolist() == [tokenizer.pad_id, 5]
+    assert lab.tolist() == [IGNORE_INDEX, 5]
 
 
 def test_apply_formatting_unknown_format_raises(tokenizer: Tokenizer) -> None:

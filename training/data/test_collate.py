@@ -9,7 +9,6 @@ import torch
 
 from model import RecurrentGPT
 from training.data.collate import (
-    IGNORE_INDEX,
     collate_fn,
     collate_samples,
     collate_worker_batch,
@@ -19,7 +18,7 @@ from training.data.collate import (
     shift_inputs_and_labels,
 )
 from training.data.datasets import ParquetTextDataset
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 SIG: dict[str, Any] = {"keys": ["text"], "format_fn": "pass_text"}
 INSTR_SIG: dict[str, Any] = {
@@ -41,13 +40,12 @@ def test_find_multiple(n: int, k: int, out: int) -> None:
     assert find_multiple(n, k) == out
 
 
-def test_shift_inputs_and_labels(tokenizer: Tokenizer) -> None:
-    pad = tokenizer.pad_id
-    inputs = torch.tensor([[1, 4, 5, 6, 2, pad, pad]])
-    labels = inputs.clone()
-    inp, lab = shift_inputs_and_labels(inputs, labels, tokenizer)
-    assert inp.tolist() == [[1, 4, 5, 6, 2, tokenizer.eos_id]]
-    assert lab.tolist() == [[4, 5, 6, 2, pad, pad]]
+def test_shift_inputs_and_labels() -> None:
+    inputs = torch.tensor([[1, 4, 5, 6, 2, 2, 2]])
+    labels = torch.tensor([[1, 4, 5, 6, 2, IGNORE_INDEX, IGNORE_INDEX]])
+    inp, lab = shift_inputs_and_labels(inputs, labels)
+    assert inp.tolist() == [[1, 4, 5, 6, 2, 2]]
+    assert lab.tolist() == [[4, 5, 6, 2, IGNORE_INDEX, IGNORE_INDEX]]
     assert inp.dtype == torch.long and lab.dtype == torch.long
     assert inp.is_contiguous() and lab.is_contiguous()
 
@@ -70,8 +68,7 @@ def test_padding_becomes_ignore_index_and_eos(tokenizer: Tokenizer) -> None:
     # row 0: bos, 3 tokens, eos = 5 -> inputs [bos t t t eos] + 4 pad->eos ; labels [t t t eos] + 5 ignore
     assert input_ids[0].tolist() == [1, 3, 4, 5, 2, 2, 2, 2, 2]
     assert labels[0].tolist() == [3, 4, 5, 2, -100, -100, -100, -100, -100]
-    assert (input_ids == tokenizer.pad_id).sum() == 0
-    assert (labels == tokenizer.pad_id).sum() == 0
+    assert (input_ids >= 0).all()
 
 
 def test_ignore_index_is_the_default_and_matches_the_model(tokenizer: Tokenizer) -> None:
@@ -153,9 +150,18 @@ def test_short_and_long_rows_mixed(tokenizer: Tokenizer) -> None:
     assert (labels[1] == -100).sum() == 0
 
 
-def test_all_padding_row_is_dropped(tokenizer: Tokenizer) -> None:
-    # Every token unknown -> encoded as <pad> (the synthetic tokenizer's unk) -> labels are all pad.
-    assert collate_samples([_row("zzz yyy")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False) == []
+def test_unknown_tokens_are_supervised(tokenizer: Tokenizer) -> None:
+    """
+    Id 0 (the synthetic tokenizer's unk, once its pad id too) is a token like any other: it stays in the inputs and
+    is a supervised label; only the sentinel marks "no loss".
+    """
+
+    batch = [_row("tok_1 zzz tok_2"), _row(_words(6))]
+    samples = collate_samples(batch, tokenizer, training_max_sequence_length=128)
+    assert samples[0][0].tolist() == [1, 4, 0, 5, 2]
+    input_ids, labels, _ = pad_and_shift(samples, tokenizer, training_max_sequence_length=128)
+    assert input_ids[0].tolist() == [1, 4, 0, 5, 2, 2, 2]
+    assert labels[0].tolist() == [4, 0, 5, 2, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
 
 
 def test_single_token_row_is_dropped(tokenizer: Tokenizer) -> None:
@@ -172,7 +178,7 @@ def test_dropped_rows_do_not_take_the_rest_of_the_batch_with_them(tokenizer: Tok
     'this worker is finished'. It now costs exactly that one row.
     """
 
-    batch = [_row("zzz yyy", "bad"), _row(_words(5), "good")]
+    batch = [_row("tok_1", "bad"), _row(_words(5), "good")]  # a single token leaves nothing after the shift
     assert [s[2] for s in collate_samples(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)] == ["good"]
     _, _, data_ids = collate_fn(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert data_ids == ["good"]
@@ -184,7 +190,7 @@ def test_collate_worker_batch_counts_rows_read_including_dropped(tokenizer: Toke
     the survivors. Rows read is the unit `BatchStream.consumed_rows` stores and a resume skips.
     """
 
-    batch = [_row(_words(5), "a"), _row("zzz yyy", "a"), _row(_words(3), "b"), _row("zzz", "b")]
+    batch = [_row(_words(5), "a"), _row("tok_1", "a"), _row(_words(3), "b"), _row("tok_2", "b")]
     samples, rows_read = collate_worker_batch(batch, tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
     assert rows_read == 4
     assert [s[2] for s in samples] == ["a", "b"]
@@ -199,14 +205,14 @@ def test_collate_worker_batch_counts_a_fully_dropped_batch(tokenizer: Tokenizer)
     """
 
     samples, rows_read = collate_worker_batch(
-        [_row("zzz yyy", "a"), _row("yyy zzz", "a")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False
+        [_row("tok_1", "a"), _row("tok_2", "a")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False
     )
     assert samples == [] and rows_read == 2
 
 
 def test_batch_of_only_dropped_rows_is_an_error(tokenizer: Tokenizer) -> None:
     with pytest.raises(ValueError, match="every row of the batch was dropped"):
-        collate_fn([_row("zzz yyy")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
+        collate_fn([_row("tok_1")], tokenizer, training_max_sequence_length=128, add_bos=False, add_eos=False)
 
 
 def test_prompt_only_window_is_dropped(tokenizer: Tokenizer) -> None:
@@ -223,9 +229,9 @@ def test_prompt_only_window_is_dropped(tokenizer: Tokenizer) -> None:
 
 
 def test_has_supervised_label(tokenizer: Tokenizer) -> None:
-    pad = tokenizer.pad_id
-    assert has_supervised_label(torch.tensor([pad, 4, 5]), tokenizer)
-    assert not has_supervised_label(torch.tensor([4, pad, pad]), tokenizer)
+    assert has_supervised_label(torch.tensor([IGNORE_INDEX, 4, 5]), tokenizer)
+    assert has_supervised_label(torch.tensor([4, 0, 0]), tokenizer)  # id 0 is a token, not padding
+    assert not has_supervised_label(torch.tensor([4, IGNORE_INDEX, IGNORE_INDEX]), tokenizer)
     assert not has_supervised_label(torch.tensor([4]), tokenizer)
     assert not has_supervised_label(torch.tensor([], dtype=torch.long), tokenizer)
     assert not has_supervised_label(torch.tensor([4, tokenizer.vocab_size]), tokenizer)
@@ -260,13 +266,6 @@ def test_pad_and_shift_width_is_this_micro_batch_only(tokenizer: Tokenizer) -> N
 def test_pad_and_shift_needs_samples(tokenizer: Tokenizer) -> None:
     with pytest.raises(ValueError, match="at least one sample"):
         pad_and_shift([], tokenizer, training_max_sequence_length=128)
-
-
-def test_shift_keeps_pads_when_tokenizer_has_no_eos(tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokenizer, "eos_id", None)
-    pad = tokenizer.pad_id
-    inp, lab = shift_inputs_and_labels(torch.tensor([[1, 4, pad, pad]]), torch.tensor([[1, 4, pad, pad]]), tokenizer)
-    assert inp.tolist() == [[1, 4, pad]] and lab.tolist() == [[4, pad, pad]]
 
 
 def test_bos_eos_flags(tokenizer: Tokenizer) -> None:

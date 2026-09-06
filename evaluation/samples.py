@@ -91,8 +91,8 @@ def _sample_from(
     # `generate` pads a row only after its EOS, so the cut at the first EOS drops the filler too; a row without EOS
     # ran to max_new_tokens and every id in it, a pad id included, is model output (an untrained model emits them)
     eos_id = tokenizer.eos_id
-    stopped_at_eos = eos_id is not None and eos_id in generated_ids
-    if eos_id is not None and stopped_at_eos:
+    stopped_at_eos = eos_id in generated_ids
+    if stopped_at_eos:
         generated_ids = generated_ids[: generated_ids.index(eos_id)]
     completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
     steps = None if recurrence is None else [int(value) for value in recurrence]

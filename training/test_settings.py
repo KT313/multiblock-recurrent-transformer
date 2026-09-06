@@ -438,11 +438,18 @@ def test_packing_is_the_default_with_the_padded_sizes_derived() -> None:
     assert asdict(cfg)["micro_batches_per_step"] == 4  # recorded resolved (run_config.json, checkpoints)
 
 
-def test_packing_off_uses_the_padded_sizes() -> None:
-    cfg = _settings(micro_batch_size=2, world_batch_size=8, pack_sequences=False)
-    assert cfg.tokens_per_micro_batch is None and cfg.micro_batches_per_step is None
-    assert cfg.gradient_accumulation_steps == 4
-    assert cfg.tokens_per_optimizer_step == 8 * cfg.training_max_sequence_length
+def test_padded_rows_are_refused() -> None:
+    """
+    `pack_sequences: false` is no training mode: the step averaged micro-batch means over length-sorted
+    micro-batches, so short rows weighed as much as full ones. The error says so and names the fix.
+    """
+
+    with pytest.raises(ValueError, match="pack_sequences: false is not supported") as excinfo:
+        _settings(pack_sequences=False)
+    message = str(excinfo.value)
+    assert "per-micro-batch mean" in message and "sorts each world batch by length" in message
+    assert "token-weighted" in message and "validation batches stay padded" in message
+    assert message.endswith("Set pack_sequences: true.")
 
 
 def test_explicit_packing_fields_define_the_step() -> None:
@@ -458,17 +465,6 @@ def test_one_explicit_packing_field_derives_the_other() -> None:
     assert (packs.micro_batches_per_step, packs.tokens_per_optimizer_step) == (256, 256 * 8192)
     step = _settings(micro_batch_size=4, world_batch_size=1024, micro_batches_per_step=4)
     assert (step.tokens_per_micro_batch, step.tokens_per_optimizer_step) == (4 * 2048, 4 * 4 * 2048)
-
-
-def test_packing_fields_without_packing_are_refused() -> None:
-    """
-    A packing field next to `pack_sequences: false` would silently do nothing; the mismatch is an error instead.
-    """
-
-    with pytest.raises(ValueError, match="tokens_per_micro_batch is set but pack_sequences is false"):
-        _settings(pack_sequences=False, tokens_per_micro_batch=8192)
-    with pytest.raises(ValueError, match="micro_batches_per_step is set but pack_sequences is false"):
-        _settings(pack_sequences=False, micro_batches_per_step=4)
 
 
 def test_pack_must_hold_a_whole_document() -> None:
