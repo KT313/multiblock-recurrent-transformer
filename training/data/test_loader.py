@@ -390,7 +390,7 @@ def test_build_run_dataloaders(tiny_settings: Settings, tokenizer: Tokenizer) ->
     # padding rounds up to sequence_padding_multiple (capped at training_max_sequence_length + 1), then the label shift drops one
     assert (input_ids.shape[1] + 1) % 128 == 0 or input_ids.shape[1] == tiny_settings.training_max_sequence_length
     assert input_ids.shape[1] <= tiny_settings.training_max_sequence_length
-    assert (labels == IGNORE_INDEX).any() or (input_ids != tokenizer.pad_id).all()
+    assert (input_ids[labels == IGNORE_INDEX] == tokenizer.eos_id).all()  # pretrain rows: padding is EOS in the inputs
     _, _, val_ids = next(iter(loaders.val_loaders[2]))
     assert val_ids == ["finetune-synthetic_instruct"] * tiny_settings.micro_batch_size
     # the validation loaders read only the held-out first rows of the split (a single dataset is one finite epoch)
@@ -604,14 +604,14 @@ def test_world_batch_on_real_loader_preserves_every_sample(tokenizer: Tokenizer,
         assert input_ids.shape == labels.shape and (input_ids.shape[1] + 1) % 128 == 0
 
 
-def _prompt_masked_sample(prompt: int, answer: int, tag: str, pad_id: int) -> Sample:
+def _prompt_masked_sample(prompt: int, answer: int, tag: str) -> Sample:
     """
-    An instruct-shaped sample: `prompt` masked positions (pad id in the labels), then `answer` supervised ones.
+    An instruct-shaped sample: `prompt` masked positions (`IGNORE_INDEX` in the labels), then `answer` supervised ones.
     """
 
     ids = torch.full((prompt + answer,), 3, dtype=torch.long)
     labels = ids.clone()
-    labels[:prompt] = pad_id
+    labels[:prompt] = IGNORE_INDEX
     return ids, labels, tag
 
 
@@ -621,8 +621,7 @@ def test_world_batch_keeps_every_supervised_label_of_prompt_masked_rows(tokenize
     derived from the count of supervised labels would cut the answers off long-prompt rows.
     """
 
-    pad = tokenizer.pad_id
-    samples = [_prompt_masked_sample(200, 12, "a", pad), _prompt_masked_sample(150, 30, "b", pad)]
+    samples = [_prompt_masked_sample(200, 12, "a"), _prompt_masked_sample(150, 30, "b")]
     out = world_batch_micro_batches(samples, 2, tokenizer, 255, sort_by_length=True, padding_multiple=128)
     assert _widths(out) == [(2, 255)]
     # the shift drops the first label of each row; both rows keep every supervised position they had
@@ -632,7 +631,7 @@ def test_world_batch_keeps_every_supervised_label_of_prompt_masked_rows(tokenize
 def test_world_batch_keeps_the_labels_of_real_instruct_rows(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
     rows = list(itertools.islice(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)), 8))
     samples = collate_samples(rows, tokenizer, training_max_sequence_length=255)
-    expected = sorted(int((lab[1:] != tokenizer.pad_id).sum()) for _, lab, _ in samples)
+    expected = sorted(int((lab[1:] != IGNORE_INDEX).sum()) for _, lab, _ in samples)
     out = world_batch_micro_batches(samples, 4, tokenizer, 255, sort_by_length=True, padding_multiple=128)
     assert len(samples) == 8 and expected[0] > 0
     assert sorted(int((lab != IGNORE_INDEX).sum()) for _, labs, _ in out for lab in labs) == expected
