@@ -17,9 +17,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from torch.nn.attention.flex_attention import BlockMask
+
 from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch
+from training.data.packing import PackedBatch, shifted_length
 import training.data.loader as loader_module
 from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.collate import find_multiple
@@ -39,8 +42,10 @@ from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 from training.step import (
     BatchStream,
+    MicroBatch,
     StepResult,
     TrainingProgress,
+    model_inputs,
     run_one_optimizer_step,
     scheduled_learning_rate,
 )
@@ -113,7 +118,7 @@ def scripted_batches(
     while True:
         input_ids = torch.randint(1, 512, (settings.micro_batch_size, sequence_length), generator=generator)
         labels = torch.randint(1, 512, (settings.micro_batch_size, sequence_length), generator=generator)
-        yield input_ids, labels, ["scripted"] * settings.micro_batch_size
+        yield Batch(input_ids, labels, ["scripted"] * settings.micro_batch_size)
 
 
 def fresh_tiny_model(backend: SingleDeviceBackend, seed: int = 0) -> torch.nn.Module:
@@ -420,8 +425,20 @@ def _stream_setup(
     return settings, loaders, _abc_stage_manager(settings)
 
 
-def _tags(stream: Iterator[Batch], n: int) -> list[str]:
-    return [next(stream)[2][0] for _ in range(n)]  # never pull an extra element (zip would)
+def _tags(stream: Iterator[MicroBatch], n: int) -> list[str]:
+    return [next(stream).data_ids[0] for _ in range(n)]  # never pull an extra element (zip would)
+
+
+def _next_batch(stream: Iterator[MicroBatch]) -> Batch:
+    batch = next(stream)
+    assert isinstance(batch, Batch)
+    return batch
+
+
+def _next_pack(stream: Iterator[MicroBatch]) -> PackedBatch:
+    batch = next(stream)
+    assert isinstance(batch, PackedBatch)
+    return batch
 
 
 def test_batch_stream_samples_by_transition_progress(
@@ -641,7 +658,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
         seen: list[tuple[int, ...]] = []
         for _ in range(world_batches):
             for _ in range(settings.gradient_accumulation_steps):
-                input_ids, _, _ = next(stream)
+                input_ids, _, _ = _next_batch(stream)
                 seen += [tuple(row[:20].tolist()) for row in input_ids]
             stream.progress.advance()
         return seen
@@ -677,7 +694,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     seen: list[tuple[int, ...]] = []
     for _ in range(steps):
         for _ in range(settings.gradient_accumulation_steps):
-            input_ids, _, data_ids = next(stream)
+            input_ids, _, data_ids = _next_batch(stream)
             assert set(data_ids) == {"synthetic_pretrain"}  # both stages train on the same source
             seen += [tuple(row[:20].tolist()) for row in input_ids]
         stream.progress.advance()
@@ -702,7 +719,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
         stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
         out: list[Batch] = []
         for _ in range(world_batches):
-            out += [next(stream) for _ in range(settings.gradient_accumulation_steps)]
+            out += [_next_batch(stream) for _ in range(settings.gradient_accumulation_steps)]
             stream.progress.advance()
         return out
 
@@ -818,7 +835,7 @@ def _micro_batches(settings: Settings, stream: BatchStream, world_batches: int) 
 
     out: list[Batch] = []
     for _ in range(world_batches):
-        out += [next(stream) for _ in range(settings.gradient_accumulation_steps)]
+        out += [_next_batch(stream) for _ in range(settings.gradient_accumulation_steps)]
         stream.progress.advance()
     return out
 
@@ -1067,6 +1084,274 @@ def record_step_reference() -> Path:
 
     GOLDEN_STEPS_PATH.write_text(golden_run_json(step_reference_metrics()))
     return GOLDEN_STEPS_PATH
+
+
+# --------------------------------------------------------------------------------------------------------------
+# sequence packing: the packed stream and the step loop on packed micro-batches
+
+PACK_LENGTH = 256  # = the tiny block_size, the smallest pack the settings allow
+PACKED_TOKENS_PER_STEP = 1024  # = 4 x 256, the tiny run's tokens per step, so `_abc_stage_manager` applies unchanged
+
+
+def _packed_stream_setup(
+    tmp_path: Path, tiny_dataset_dir: Path, tokenizer: Tokenizer
+) -> tuple[Settings, RunDataloaders, StageManager]:
+    yaml_path = write_tiny_yaml(
+        tmp_path,
+        tiny_dataset_dir,
+        tmp_path / "out",
+        pack_sequences=True,
+        tokens_per_micro_batch=PACK_LENGTH,
+        tokens_per_step=PACKED_TOKENS_PER_STEP,
+    )
+    settings = parse_settings(["--config", str(yaml_path)])
+    loaders = RunDataloaders({t: _Repeat(t) for t in "abc"}, [], tokenizer, {})
+    return settings, loaders, _abc_stage_manager(settings)
+
+
+def _document_slots(batch: PackedBatch) -> list[int]:
+    """
+    Positions per document of a pack, in pack order (0 for a one-token document, which occupies no position).
+    """
+
+    documents = len(batch.data_ids)
+    return torch.bincount(batch.document_ids[0].long(), minlength=documents + 1)[:documents].tolist()
+
+
+def test_packed_stream_yields_one_full_pack_per_micro_batch(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Every micro-batch is one row of `tokens_per_micro_batch` positions filled with whole documents (first-fit from
+    the pool) and a tail shorter than the longest document the loaders hand out; `tokens_per_step` micro-batches
+    form a step. In stage 0 every document comes from source `a`.
+    """
+
+    settings, loaders, stage_manager = _packed_stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    assert settings.gradient_accumulation_steps == 4 and settings.tokens_per_optimizer_step == 1024
+    progress = TrainingProgress()
+    stream = BatchStream(settings, loaders, stage_manager, progress)
+    for _ in range(2):
+        for _ in range(settings.gradient_accumulation_steps):
+            batch = next(stream)
+            assert isinstance(batch, PackedBatch)
+            for tensor in (batch.input_ids, batch.labels, batch.position_ids, batch.document_ids):
+                assert tensor.shape == (1, PACK_LENGTH)
+            assert set(batch.data_ids) == {"a"} and len(batch.data_ids) > 10
+            assert 0 <= batch.padding_tokens <= 6, "`_Repeat` documents have at most 6 positions: one always fits"
+            assert sum(_document_slots(batch)) + batch.padding_tokens == PACK_LENGTH
+            assert int((batch.labels != IGNORE_INDEX).sum()) == PACK_LENGTH - batch.padding_tokens
+            assert torch.all(batch.document_ids[0, 1:] >= batch.document_ids[0, :-1]), "documents lie side by side"
+        progress.advance()
+
+
+def test_packed_stream_draws_exactly_the_documents_the_padded_stream_would(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Packing changes the grouping, not the data: after one step the documents in its packs plus those waiting in
+    the pool are exactly the first `consumed_rows` draws of the loader (`_Repeat("a")` hands out sample i with
+    `1 + (i + 1) % 7` tokens), each document whole and none dropped or duplicated.
+    """
+
+    settings, loaders, stage_manager = _packed_stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    packs = [_next_pack(stream) for _ in range(settings.gradient_accumulation_steps)]
+    state = stream.state_dict()
+    drawn = sum(len(pack.data_ids) for pack in packs) + len(state["pool"])
+    assert state["consumed_rows"] == {"a": drawn} and state["buffers"] == {}
+    in_packs = [slots for pack in packs for slots in _document_slots(pack)]
+    in_pool = [shifted_length(sample) for sample in state["pool"]]
+    assert sorted(in_packs + in_pool) == sorted((1 + (i + 1) % 7) - 1 for i in range(drawn))
+    # refilled to two pack lengths before the last pack was taken, which removed at most one pack length
+    assert sum(in_pool) >= PACK_LENGTH
+
+
+def test_packed_stream_follows_the_stage_weights(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    settings, loaders, stage_manager = _packed_stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stage_1 = BatchStream(settings, loaders, stage_manager, TrainingProgress(step=10))
+    assert set(next(stage_1).data_ids) == {"b"}
+    transition = BatchStream(settings, loaders, stage_manager, TrainingProgress(step=15))  # 1 -> 2, weights mix
+    assert set(next(transition).data_ids) == {"b", "c"}
+
+
+def test_packed_stream_state_round_trip_carries_the_pool(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    A resumed packed stream continues with the same packs: the draw RNG, the row counters (the fakes are set to
+    the consumed rows, what `set_resume_offset` does for a real dataset) and the pooled documents come back.
+    """
+
+    settings, loaders, stage_manager = _packed_stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress(step=15))
+    for _ in range(3):
+        next(stream)
+    state = stream.state_dict()
+    assert state["pool"] and set(state["consumed_rows"]) == {"b", "c"}
+    continued = [_next_pack(stream) for _ in range(6)]
+
+    fresh = {t: _Repeat(t) for t in "abc"}
+    for tag, loader in fresh.items():
+        loader.count = state["consumed_rows"].get(tag, 0)
+    resumed = BatchStream(
+        settings, RunDataloaders(dict(fresh), [], stream_tokenizer, {}), stage_manager, TrainingProgress(step=15)
+    )
+    resumed.load_state_dict(state)
+    restored = resumed.state_dict()
+    assert restored["consumed_rows"] == state["consumed_rows"]
+    assert [(s[0].tolist(), s[2]) for s in restored["pool"]] == [(s[0].tolist(), s[2]) for s in state["pool"]]
+    for expected in continued:
+        got = _next_pack(resumed)
+        assert got.data_ids == expected.data_ids and got.padding_tokens == expected.padding_tokens
+        assert torch.equal(got.input_ids, expected.input_ids) and torch.equal(got.labels, expected.labels)
+        assert torch.equal(got.position_ids, expected.position_ids)
+        assert torch.equal(got.document_ids, expected.document_ids)
+
+
+def test_packed_stream_loads_a_checkpoint_from_before_packing(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    A data-stream state without a `pool` entry (written before packing existed) means an empty pool; a padded
+    stream stores an empty pool and ignores a stored one.
+    """
+
+    settings, loaders, stage_manager = _packed_stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    stream.load_state_dict({"consumed_rows": {"a": 3}, "draw_rng": stream.rng.getstate(), "buffers": {}})
+    assert stream.state_dict()["pool"] == [] and stream.state_dict()["consumed_rows"] == {"a": 3}
+    padded_settings, padded_loaders, _ = _stream_setup(tmp_path, tiny_dataset_dir, False, stream_tokenizer)
+    padded = BatchStream(padded_settings, padded_loaders, stage_manager, TrainingProgress())
+    assert padded.state_dict()["pool"] == []
+    padded.load_state_dict({**padded.state_dict(), "pool": _fake_samples("a", [3])})
+    assert padded.state_dict()["pool"] == []
+
+
+def scripted_packed_batches(settings: Settings, seed: int = 0) -> Iterator[PackedBatch]:
+    """
+    Endless packed micro-batches of random ids (vocab 512): three documents of L/2, L/4 and L/8 positions and a
+    tail of L/8, laid out as `pack_samples` lays them out, labels random too (already shifted), the tail ignored.
+    """
+
+    pack_length = settings.tokens_per_micro_batch
+    assert pack_length is not None
+    lengths = [pack_length // 2, pack_length // 4, pack_length // 8]
+    tail = pack_length - sum(lengths)
+    generator = torch.Generator().manual_seed(seed)
+    while True:
+        input_ids = torch.full((1, pack_length), 2, dtype=torch.long)
+        labels = torch.full((1, pack_length), IGNORE_INDEX, dtype=torch.long)
+        position_ids = torch.zeros((1, pack_length), dtype=torch.long)
+        document_ids = torch.full((1, pack_length), len(lengths), dtype=torch.int32)
+        offset = 0
+        for document, length in enumerate(lengths):
+            input_ids[0, offset : offset + length] = torch.randint(1, 512, (length,), generator=generator)
+            labels[0, offset : offset + length] = torch.randint(1, 512, (length,), generator=generator)
+            position_ids[0, offset : offset + length] = torch.arange(length)
+            document_ids[0, offset : offset + length] = document
+            offset += length
+        position_ids[0, offset:] = torch.arange(tail)
+        yield PackedBatch(input_ids, labels, ["scripted"] * len(lengths), position_ids, document_ids, tail)
+
+
+def packed_reference_settings(**overrides: Any) -> Settings:
+    """
+    `reference_settings` in packed mode: packs of the block size (256), two per optimizer step.
+    """
+
+    return reference_settings(
+        pack_sequences=True, tokens_per_micro_batch=256, tokens_per_step=512, **overrides
+    )
+
+
+def test_model_inputs_of_padded_and_packed_batches(cpu_backend: SingleDeviceBackend) -> None:
+    """
+    A padded batch reaches the model as `input_ids` and `labels`; a packed one also as `position_ids` and the ready
+    document mask (dense on the CPU), built outside the model.
+    """
+
+    settings = packed_reference_settings()
+    padded = next(scripted_batches(reference_settings()))
+    assert set(model_inputs(padded, cpu_backend)) == {"input_ids", "labels"}
+    packed = next(scripted_packed_batches(settings))
+    inputs = model_inputs(packed, cpu_backend)
+    assert set(inputs) == {"input_ids", "labels", "position_ids", "attention_mask"}
+    assert torch.equal(inputs["position_ids"], packed.position_ids)
+    mask = inputs["attention_mask"]
+    assert isinstance(mask, torch.Tensor) and mask.dtype == torch.bool and mask.shape == (1, 1, 256, 256)
+    # documents of 128, 64 and 32 positions: document 1 spans 128..191, the tail 224..255
+    assert not bool(mask[0, 0, 128, 0]), "document 1 does not see document 0"
+    assert bool(mask[0, 0, 128, 128]) and bool(mask[0, 0, 190, 128]) and not bool(mask[0, 0, 128, 129])
+    assert not bool(mask[0, 0, 200, 128]), "document 2 does not see document 1"
+    assert bool(mask[0, 0, 230, 230]) and not bool(mask[0, 0, 230, 223]), "the tail is its own document"
+
+
+def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> None:
+    """
+    The step loop takes packed micro-batches as it takes padded ones: `tokens_per_step / tokens_per_micro_batch`
+    of them per step, one data id per document, a finite loss and gradient, and the packing-efficiency metric at
+    log steps (2 tails of 32 in 512 tokens).
+    """
+
+    settings = packed_reference_settings()
+    assert settings.gradient_accumulation_steps == 2
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    batches = scripted_packed_batches(settings)
+    progress = TrainingProgress()
+    results = []
+    for _ in range(2):
+        results.append(run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress))
+        progress.advance()
+    for result in results:
+        assert torch.isfinite(result.loss) and result.loss > 0
+        assert torch.isfinite(result.grad_norm) and result.grad_norm > 0
+        assert result.data_ids == ["scripted"] * 6
+        assert float(result.metrics["packing/padding_fraction"]) == pytest.approx(2 * 32 / 512)
+        assert len(result.metrics) > 1, "the gradient metrics of a log step are there too"
+
+
+def test_padding_metric_only_at_log_steps_and_only_when_packing(cpu_backend: SingleDeviceBackend) -> None:
+    settings = packed_reference_settings(log_step_interval=2, log_gradient_metrics=False)
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    batches = scripted_packed_batches(settings)
+    progress = TrainingProgress()
+    first = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+    progress.advance()
+    second = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+    assert first.metrics == {} and set(second.metrics) == {"packing/padding_fraction"}
+    padded = reference_settings(log_gradient_metrics=False)
+    result = run_one_optimizer_step(
+        padded, cpu_backend, model, fresh_optimizer(padded, model, cpu_backend), reference_stage_manager(padded),
+        scripted_batches(padded), TrainingProgress(),
+    )
+    assert result.metrics == {}
+
+
+@pytest.mark.gpu
+def test_packed_step_on_cuda_runs_through_flex_attention() -> None:
+    """
+    On CUDA the document mask is a FlexAttention `BlockMask` and the step (bf16 autocast, forward and backward)
+    runs through `flex_attention`.
+    """
+
+    backend = SingleDeviceBackend(device="cuda:0", precision="bf16-mixed")
+    settings = packed_reference_settings(precision="bf16-mixed")
+    inputs = model_inputs(next(scripted_packed_batches(settings)), backend)
+    assert isinstance(inputs["attention_mask"], BlockMask)
+    model = fresh_tiny_model(backend)
+    optimizer = fresh_optimizer(settings, model, backend)
+    result = run_one_optimizer_step(
+        settings, backend, model, optimizer, reference_stage_manager(settings), scripted_packed_batches(settings),
+        TrainingProgress(step=1),
+    )
+    assert torch.isfinite(result.loss) and torch.isfinite(result.grad_norm) and result.grad_norm > 0
 
 
 def test_golden_tiny_steps() -> None:

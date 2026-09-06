@@ -1,0 +1,187 @@
+# (c) 2025-2026 Tobias Kerner. Apache-2.0.
+"""
+Sequence packing: documents laid end to end into one row of a fixed length, never split, each with its own
+attention mask block and its own RoPE positions.
+
+`PackPool` is the rolling pool of drawn documents `BatchStream` fills a pack from (first-fit from the front of the
+pool), `pack_samples` turns the chosen documents into a `PackedBatch`. The padded path (`training.data.collate`)
+is untouched; the two share `Sample`, `IGNORE_INDEX` and the label masking.
+
+Per-document shift, then concatenation: every sample is shifted like a row of the padded path (inputs drop the
+last token, labels the first) BEFORE it is appended, so the last input of a document is labelled with that document's
+own EOS and no label ever points into the next document. Per document, inputs and labels are identical to the
+padded path; the model sees the same tokens, only side by side instead of row by row.
+"""
+
+import logging
+from typing import NamedTuple
+
+import torch
+
+from training.data.collate import IGNORE_INDEX, Sample, mask_label_ids, shift_inputs_and_labels
+from training.data.tokenizer import Tokenizer
+
+log = logging.getLogger(__name__)
+
+# The pool holds at least this many pack lengths of tokens before a pack is filled: the lookahead of the first-fit
+# scan. It decides which documents share a pack, so it is a fixed constant like `TRAIN_LOADER_BATCH_ROWS`, not a
+# setting (a setting would have to be compared on resume).
+POOL_TOKEN_FACTOR = 2
+
+
+class PackedBatch(NamedTuple):
+    """
+    One packed micro-batch: a single row of `pack_length` tokens.
+
+    `input_ids` / `labels` `(1, L)`: the shifted documents back to back, the tail filled with EOS in the inputs and
+    `IGNORE_INDEX` in the labels. `position_ids` `(1, L)`: `0, 1, ...` restarting at every document and at the tail.
+    `document_ids` `(1, L)` int32: `0, 1, ...` per document, the tail its own id (a self-attending "pad document",
+    so no attention row is ever fully masked). `data_ids`: one per document in pack order (the tail has none).
+    `padding_tokens`: the tail length, for the packing-efficiency metric.
+    """
+
+    input_ids: torch.Tensor
+    labels: torch.Tensor
+    data_ids: list[str]
+    position_ids: torch.Tensor
+    document_ids: torch.Tensor
+    padding_tokens: int
+
+
+def shifted_length(sample: Sample) -> int:
+    """
+    The slots a sample occupies in a pack: its tokens minus one (the next-token shift drops one position).
+    """
+
+    return sample[0].shape[0] - 1
+
+
+class PackPool:
+    """
+    The rolling pool of drawn documents a pack is filled from.
+
+    `BatchStream` adds documents (in draw order) until the pool holds `POOL_TOKEN_FACTOR` pack lengths of tokens
+    (`needs_refill`), then `take_pack` walks the pool front to back and takes every document that still fits into
+    the pack; the rest stay in the pool, in order, and lead the next pack. A leftover always fits an empty pack, so
+    no document waits longer than one pack. A document longer than the pack can never be placed: `add` drops it
+    with a warning (settings make this unreachable: `tokens_per_micro_batch >= block_size`, and documents are
+    truncated to `block_size + 1` tokens, i.e. `block_size` slots).
+
+    `state` / `restore`: the pool travels in the checkpoint (`BatchStream.state_dict`), so a resume fills the same
+    packs from the same documents.
+    """
+
+    def __init__(self, pack_length: int) -> None:
+        if pack_length <= 0:
+            raise ValueError(f"pack_length must be positive, got {pack_length}")
+        self.pack_length = pack_length
+        self._samples: list[Sample] = []
+        self.tokens = 0  # total shifted length of the pooled samples
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def needs_refill(self) -> bool:
+        """
+        Whether the pool holds fewer than `POOL_TOKEN_FACTOR` pack lengths of tokens.
+        """
+
+        return self.tokens < POOL_TOKEN_FACTOR * self.pack_length
+
+    def add(self, sample: Sample) -> bool:
+        """
+        Append a drawn document; False (and a warning) for one that is longer than the pack and can never be placed.
+        """
+
+        length = shifted_length(sample)
+        if length > self.pack_length:
+            log.warning(
+                "Dropping a %d-token document of %r: longer than the pack length %d, it can never be packed. "
+                "tokens_per_micro_batch must be >= block_size + 1 tokens per document.",
+                length + 1,
+                sample[2],
+                self.pack_length,
+            )
+            return False
+        self._samples.append(sample)
+        self.tokens += length
+        return True
+
+    def take_pack(self) -> list[Sample]:
+        """
+        First-fit from the front: the documents of the next pack, in pool order, removed from the pool.
+        """
+
+        room = self.pack_length
+        taken: list[Sample] = []
+        kept: list[Sample] = []
+        for sample in self._samples:
+            length = shifted_length(sample)
+            if length <= room:
+                taken.append(sample)
+                room -= length
+            else:
+                kept.append(sample)
+        self._samples = kept
+        self.tokens -= self.pack_length - room
+        return taken
+
+    def state(self) -> list[Sample]:
+        """
+        The pooled documents in order (what a checkpoint stores).
+        """
+
+        return list(self._samples)
+
+    def restore(self, samples: list[Sample]) -> None:
+        """
+        Replace the pool's contents with `samples` (what `state` returned).
+        """
+
+        self._samples = list(samples)
+        self.tokens = sum(shifted_length(sample) for sample in samples)
+
+
+def pack_samples(
+    samples: list[Sample], pack_length: int, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX
+) -> PackedBatch:
+    """
+    The `PackedBatch` of `samples` (in this order) for a pack of `pack_length` tokens.
+
+    Every sample is shifted on its own (`shift_inputs_and_labels`, so pad ids in the inputs become EOS exactly as
+    in the padded path) and appended; the tail is EOS (the pad id without an EOS) in the inputs, `ignore_index` in
+    the labels. Labels get the padded path's masking (`mask_label_ids`): pad ids (masked prompts) and out-of-vocab
+    ids become `ignore_index`. The tensors are pageable on purpose, see `pad_and_shift`.
+    """
+
+    if not samples:
+        raise ValueError("pack_samples needs at least one sample; empty packs are never assembled")
+    total = sum(shifted_length(sample) for sample in samples)
+    if total > pack_length:
+        raise ValueError(f"the samples occupy {total} slots but the pack holds {pack_length}")
+
+    tail_id = tokenizer.eos_id if tokenizer.eos_id is not None else tokenizer.pad_id
+    input_ids = torch.full((1, pack_length), tail_id, dtype=torch.long)
+    labels = torch.full((1, pack_length), ignore_index, dtype=torch.long)
+    position_ids = torch.zeros((1, pack_length), dtype=torch.long)
+    document_ids = torch.full((1, pack_length), len(samples), dtype=torch.int32)  # the tail's id unless overwritten
+
+    offset = 0
+    for document, (sample_inputs, sample_labels, _) in enumerate(samples):
+        shifted_inputs, shifted_labels = shift_inputs_and_labels(sample_inputs[None], sample_labels[None], tokenizer)
+        length = shifted_inputs.shape[1]
+        input_ids[0, offset : offset + length] = shifted_inputs[0]
+        labels[0, offset : offset + length] = shifted_labels[0]
+        position_ids[0, offset : offset + length] = torch.arange(length)
+        document_ids[0, offset : offset + length] = document
+        offset += length
+    position_ids[0, offset:] = torch.arange(pack_length - offset)
+    mask_label_ids(labels, tokenizer, ignore_index)
+    return PackedBatch(
+        input_ids,
+        labels,
+        [data_id for _, _, data_id in samples],
+        position_ids,
+        document_ids,
+        pack_length - offset,
+    )

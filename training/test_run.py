@@ -884,6 +884,53 @@ def test_resume_reproduces_the_uninterrupted_run(
             assert resumed.history[done][key] == full[done][key], (done, key)
 
 
+@pytest.mark.slow
+def test_packed_tiny_run_finishes_and_resumes_exactly(
+    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    The tiny run with sequence packing (packs of 256 tokens, 1024 tokens per step: the same 20 steps): it trains,
+    logs the packing efficiency, checkpoints the packing pool, and a run resumed from its step-12 checkpoint logs
+    exactly the losses and gradient norms of the uninterrupted run from step 13 on. Validation stays padded.
+    """
+
+    options: dict[str, Any] = dict(
+        pack_sequences=True,
+        tokens_per_micro_batch=256,
+        tokens_per_step=1024,
+        save_step_interval=4,
+        export_to_hf=False,
+        precision="32",
+    )
+    with single_thread_deterministic():
+        full_dir = tmp_path / "full"
+        full_dir.mkdir()
+        full_yaml = write_tiny_yaml(full_dir, tiny_dataset_dir, full_dir / "out", **options)
+        full = train(parse_settings(["--config", str(full_yaml)]), backend=cpu_backend, keep_history=True)
+        assert sorted(full.history) == list(range(1, 21))
+        for done, metrics in full.history.items():
+            assert 0.0 <= metrics["packing/padding_fraction"] < 0.5, done
+            assert math.isfinite(metrics["loss"])
+        assert "val_loss" in full.history[8], "validation (padded batches) runs as before"
+        mid = checkpoint_dir(full_dir / "out" / "tiny") / "step-00000012-tiny.pth"
+        stream_state = torch.load(mid, map_location="cpu", weights_only=False)["data_stream"]
+        assert stream_state["pool"], "the packing pool travels in the checkpoint"
+        assert stream_state["consumed_rows"]["synthetic_pretrain"] > 0
+
+        resumed_dir = tmp_path / "resumed"
+        resumed_dir.mkdir()
+        resumed_yaml = write_tiny_yaml(
+            resumed_dir, tiny_dataset_dir, resumed_dir / "out", resume=True, resume_checkpoint_path=str(mid), **options
+        )
+        resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
+
+    assert sorted(resumed.history) == list(range(13, 21))
+    for done in range(13, 21):
+        assert resumed.history[done]["loss"] == full.history[done]["loss"], done
+        assert resumed.history[done]["grad_norm"] == full.history[done]["grad_norm"], done
+        assert resumed.history[done]["packing/padding_fraction"] == full.history[done]["packing/padding_fraction"], done
+
+
 # --------------------------------------------------------------------------------------------------------------
 # resume edge cases: an abandoned trajectory, changed optimizer hyperparameters, the final checkpoint, the GPU path
 

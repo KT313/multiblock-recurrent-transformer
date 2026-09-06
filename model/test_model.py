@@ -17,7 +17,7 @@ import model.model as model_module
 from model.blocks import recurrence
 from model.blocks.recurrence import sample_recurrence_steps
 from model.blocks.sandwich import SandwichBlock
-from model.layers.attention import precompute_freqs_cis
+from model.layers.attention import document_attention_mask, precompute_freqs_cis
 from model.layers.norms import RMSNorm
 from model.model import RecurrentGPT, TransformerModules
 
@@ -483,7 +483,7 @@ def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
     x = ids(2, 4)
     ints = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
     _rotary, mask = model_module.prepare_attention_inputs(table, x, attention_mask=ints)
-    assert mask is not None and mask.dtype == torch.bool and mask.shape == (2, 1, 4, 4)
+    assert isinstance(mask, Tensor) and mask.dtype == torch.bool and mask.shape == (2, 1, 4, 4)
     assert torch.equal(mask[1, 0], torch.ones(4, 4, dtype=torch.bool).tril()), "an all-ones mask is plain causality"
     expected_padded = torch.tensor(
         [[True, False, False, False],  # a pad query keeps only itself
@@ -494,7 +494,7 @@ def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
     assert torch.equal(mask[0, 0], expected_padded)
     assert bool(mask.any(dim=-1).all()), "no row attends to nothing"
     _rotary, from_bools = model_module.prepare_attention_inputs(table, x, attention_mask=ints.bool())
-    assert from_bools is not None and torch.equal(from_bools, mask), "1/0 ints and bools mean the same"
+    assert isinstance(from_bools, Tensor) and torch.equal(from_bools, mask), "1/0 ints and bools mean the same"
 
 
 def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
@@ -603,6 +603,101 @@ def test_out_of_range_labels_are_masked_too(tiny_model: RecurrentGPT) -> None:
     torch.manual_seed(2)
     b = tiny_model(x, labels=ref, num_steps=(1, 1))["loss"]
     assert torch.equal(a, b)
+
+
+# --- packed sequences ---------------------------------------------------------------------------------------------------
+
+
+def _packed_inputs(documents: list[Tensor], pack_length: int) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    `(input_ids, position_ids, document_ids)` of `documents` (1-D id tensors) laid end to end in a row of
+    `pack_length`, the tail EOS (2) with its own document id, as `training.data.packing.pack_samples` lays them out.
+    """
+
+    input_ids = torch.full((1, pack_length), 2, dtype=torch.long)
+    position_ids = torch.zeros((1, pack_length), dtype=torch.long)
+    document_ids = torch.full((1, pack_length), len(documents), dtype=torch.int32)
+    offset = 0
+    for document, tokens in enumerate(documents):
+        n = tokens.shape[0]
+        input_ids[0, offset : offset + n] = tokens
+        position_ids[0, offset : offset + n] = torch.arange(n)
+        document_ids[0, offset : offset + n] = document
+        offset += n
+    position_ids[0, offset:] = torch.arange(pack_length - offset)
+    return input_ids, position_ids, document_ids
+
+
+def test_prepare_attention_inputs_passes_a_ready_mask_through_and_needs_positions() -> None:
+    """
+    A ready document mask (dense bool on the CPU, a `BlockMask` on CUDA) is not rebuilt; it needs the `(B, S)`
+    per-document positions, because the RoPE rows are what make a document start at position 0 again.
+    """
+
+    table = freqs_table()
+    x = ids(1, 6)
+    document_ids = torch.tensor([[0, 0, 1, 1, 1, 2]], dtype=torch.int32)
+    ready = document_attention_mask(document_ids)
+    positions = torch.tensor([[0, 1, 0, 1, 2, 0]])
+    rotary, mask = model_module.prepare_attention_inputs(table, x, attention_mask=ready, position_ids=positions)
+    assert mask is ready
+    assert torch.equal(rotary[0], table[0].index_select(0, positions[0]))
+    with pytest.raises(ValueError, match="needs \\(B, S\\) position_ids"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=ready)
+    with pytest.raises(ValueError, match="needs \\(B, S\\) position_ids"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=ready, position_ids=positions[0])
+
+
+def test_packed_forward_equals_the_documents_on_their_own(tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The parity check of the packing migration: two documents packed into one row, with the document mask and the
+    per-document positions, get the logits they get as separate sequences; the tail is finite. The latent state is
+    zeroed (it is drawn per token and would differ between the two layouts).
+    """
+
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+    tiny_model.eval()
+    a, b = ids(1, 11, seed=3)[0], ids(1, 6, seed=4)[0]
+    input_ids, position_ids, document_ids = _packed_inputs([a, b], pack_length=20)
+    mask = document_attention_mask(document_ids)
+    packed = tiny_model(input_ids, attention_mask=mask, position_ids=position_ids, return_logits=True)["logits"]
+    alone_a = tiny_model(a[None], return_logits=True)["logits"]
+    alone_b = tiny_model(b[None], return_logits=True)["logits"]
+    assert packed is not None and alone_a is not None and alone_b is not None
+    torch.testing.assert_close(packed[:, :11], alone_a, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(packed[:, 11:17], alone_b, atol=1e-5, rtol=1e-5)
+    assert torch.isfinite(packed).all()
+    # without the mask (plain causality over the whole row) document b sees document a: a different result
+    unmasked = tiny_model(input_ids, position_ids=position_ids, return_logits=True)["logits"]
+    assert unmasked is not None and not torch.allclose(unmasked[:, 11:17], alone_b, atol=1e-3)
+
+
+def test_packed_loss_and_token_losses_follow_the_documents(tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    With per-document labels (the tail ignored), the packed loss is the mean over all supervised positions of both
+    documents, and the chunked per-token losses are those of the documents on their own.
+    """
+
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+    tiny_model.eval()
+    a, b = ids(1, 9, seed=5)[0], ids(1, 8, seed=6)[0]  # 9 + 8 = 17 supervised positions, 7 of tail
+    input_ids, position_ids, document_ids = _packed_inputs([a, b], pack_length=24)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, :9], labels[0, 9:17] = ids(1, 9, seed=7)[0], ids(1, 8, seed=8)[0]
+    mask = document_attention_mask(document_ids)
+    packed = tiny_model(
+        input_ids, attention_mask=mask, position_ids=position_ids, labels=labels, return_token_losses_chunked_nograd=True
+    )
+    token_losses = packed["token_losses"]
+    assert token_losses is not None and torch.isfinite(token_losses).all()
+    alone_a = tiny_model(a[None], labels=labels[:, :9], return_token_losses_chunked_nograd=True)["token_losses"]
+    alone_b = tiny_model(b[None], labels=labels[:, 9:17], return_token_losses_chunked_nograd=True)["token_losses"]
+    assert alone_a is not None and alone_b is not None
+    torch.testing.assert_close(token_losses[:, :9], alone_a, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(token_losses[:, 9:17], alone_b, atol=1e-5, rtol=1e-5)
+    assert torch.equal(token_losses[:, 17:], torch.zeros(1, 7))
+    expected = (alone_a.sum() + alone_b.sum()) / 17
+    torch.testing.assert_close(packed["loss"], expected, atol=1e-5, rtol=1e-5)
 
 
 def test_custom_ignore_index() -> None:

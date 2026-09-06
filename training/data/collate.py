@@ -17,7 +17,18 @@ from training.data.tokenizer import Tokenizer
 IGNORE_INDEX = -100  # label value of positions without a loss (padding, out-of-vocab); the model defaults to it too
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
-Batch = tuple[torch.Tensor, torch.Tensor, list[str]]  # a padded, shifted micro-batch: (input_ids, labels, data_ids)
+
+
+class Batch(NamedTuple):
+    """
+    A padded, shifted micro-batch: `(input_ids, labels, data_ids)`, one data id per row. A tuple, so
+    `input_ids, labels, data_ids = batch` keeps working; the names let the step loop treat it and the packed
+    `training.data.packing.PackedBatch` alike.
+    """
+
+    input_ids: torch.Tensor
+    labels: torch.Tensor
+    data_ids: list[str]
 
 
 class WorkerBatch(NamedTuple):
@@ -58,6 +69,17 @@ def shift_inputs_and_labels(
     if tokenizer.eos_id is not None:
         input_ids[input_ids == tokenizer.pad_id] = tokenizer.eos_id
     return input_ids, label_ids
+
+
+def mask_label_ids(label_ids: torch.Tensor, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
+    """
+    Shifted labels as the loss sees them: pad ids (padding, masked prompts) and ids outside the tokenizer's
+    vocabulary become `ignore_index`, in place; returns `label_ids`.
+    """
+
+    label_ids[label_ids == tokenizer.pad_id] = ignore_index
+    label_ids[(label_ids < 0) | (label_ids >= tokenizer.vocab_size)] = ignore_index
+    return label_ids
 
 
 def has_supervised_label(labels: torch.Tensor, tokenizer: Tokenizer) -> bool:
@@ -150,9 +172,8 @@ def pad_and_shift(
         labels[row, : min(len(sample_labels), width)] = sample_labels[:width]
 
     input_ids, label_ids = shift_inputs_and_labels(inputs, labels, tokenizer)
-    label_ids[label_ids == pad_id] = ignore_index
-    label_ids[(label_ids < 0) | (label_ids >= tokenizer.vocab_size)] = ignore_index
-    return input_ids, label_ids, [data_id for _, _, data_id in samples]
+    mask_label_ids(label_ids, tokenizer, ignore_index)
+    return Batch(input_ids, label_ids, [data_id for _, _, data_id in samples])
 
 
 def collate_fn(

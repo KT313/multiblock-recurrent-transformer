@@ -233,7 +233,9 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
     """
-    The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries.
+    The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries. With sequence
+    packing a step is `tokens_per_step` tokens and the sequence-count check of `micro_batch_size` does not apply
+    (`micro_batch_size` then only sizes the validation batches).
     """
 
     return StageManager(
@@ -243,7 +245,8 @@ def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size
         world_size=world_size,
         warmup_steps=settings.warmup_steps,
         cooldown_steps=settings.cooldown_steps,
-        micro_batch_size=settings.micro_batch_size,
+        micro_batch_size=None if settings.pack_sequences else settings.micro_batch_size,
+        tokens_per_step=settings.tokens_per_step if settings.pack_sequences else None,
     )
 
 
@@ -292,7 +295,8 @@ def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )
     model_config.to_json(run_directory / "model_config.json")
-    return backend.setup_model(model, compile_model=settings.compile_model)
+    # packed micro-batches all have one shape; padded ones vary in length, and compiling them dynamic avoids recompiles
+    return backend.setup_model(model, compile_model=settings.compile_model, dynamic=not settings.pack_sequences)
 
 
 def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> Optimizer:

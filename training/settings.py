@@ -100,9 +100,19 @@ class Settings:
     compile_model: bool = False
     gradient_checkpointing: bool = False
 
-    # Batching (one optimizer step = world_batch_size sequences)
+    # Batching (one optimizer step = world_batch_size sequences). Validation always batches `micro_batch_size` padded
+    # rows; training does too unless `pack_sequences`.
     micro_batch_size: int = 4
     world_batch_size: int = 1024
+
+    # Sequence packing (training only; validation stays padded). Documents are laid end to end into ONE row of
+    # `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE positions
+    # restarting per document. The step is then measured in tokens: `tokens_per_step` = micro-batches x
+    # `tokens_per_micro_batch`. With packing, `micro_batch_size` / `world_batch_size` only size the validation
+    # batches, and `sort_batches_by_length` / `sequence_padding_multiple` apply to validation only.
+    pack_sequences: bool = False
+    tokens_per_micro_batch: Optional[int] = None  # pack length; >= block_size (the longest document after truncation)
+    tokens_per_step: Optional[int] = None  # tokens per optimizer step; a multiple of tokens_per_micro_batch
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
@@ -176,6 +186,7 @@ class Settings:
                 f"({self.micro_batch_size}): gradient_accumulation_steps is their integer quotient, so anything else "
                 "silently trains on fewer sequences per step than configured"
             )
+        self._check_packing()
         if self.eval_step_interval % self.log_step_interval != 0:  # both are POSITIVE_SETTINGS, no 0-disables case
             raise ValueError(
                 f"eval_step_interval ({self.eval_step_interval}) must be a multiple of log_step_interval "
@@ -199,13 +210,52 @@ class Settings:
                 "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
             )
 
+    def _check_packing(self) -> None:
+        """
+        The packing fields: both token sizes iff `pack_sequences`, the pack at least one full document long, the
+        step a whole number of micro-batches.
+        """
+
+        if not self.pack_sequences:
+            for name in ("tokens_per_micro_batch", "tokens_per_step"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name} is set but pack_sequences is false; set pack_sequences: true to use it")
+            return
+        if self.tokens_per_micro_batch is None or self.tokens_per_step is None:
+            raise ValueError("pack_sequences needs tokens_per_micro_batch (the pack length) and tokens_per_step")
+        if self.tokens_per_micro_batch < self.block_size:
+            raise ValueError(
+                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= block_size ({self.block_size}): a "
+                "document is up to block_size tokens after truncation and is never split across packs"
+            )
+        if self.tokens_per_step <= 0 or self.tokens_per_step % self.tokens_per_micro_batch != 0:
+            raise ValueError(
+                f"tokens_per_step ({self.tokens_per_step}) must be a positive multiple of tokens_per_micro_batch "
+                f"({self.tokens_per_micro_batch}): one optimizer step is a whole number of packed micro-batches"
+            )
+
     @property
     def gradient_accumulation_steps(self) -> int:
         """
         Micro-batches per optimizer step on one device (divide by world_size once distributed training exists).
         """
 
+        if self.pack_sequences:
+            assert self.tokens_per_step is not None and self.tokens_per_micro_batch is not None  # `_check_packing`
+            return self.tokens_per_step // self.tokens_per_micro_batch
         return self.world_batch_size // self.micro_batch_size
+
+    @property
+    def tokens_per_optimizer_step(self) -> int:
+        """
+        Tokens per optimizer step, the unit of the stage budgets and the throughput metrics: `tokens_per_step` when
+        packing, else `world_batch_size x block_size` (the padded rows counted at full length, as the thesis did).
+        """
+
+        if self.pack_sequences:
+            assert self.tokens_per_step is not None  # `_check_packing`
+            return self.tokens_per_step
+        return self.world_batch_size * self.block_size
 
 
 

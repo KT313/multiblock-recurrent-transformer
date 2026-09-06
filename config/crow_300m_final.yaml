@@ -54,8 +54,16 @@ compile_model: true                  # torch.compile the model
 gradient_checkpointing: false        # recompute activations per recurrence iteration in the backward pass
 
 # --- Batching (one optimizer step = world_batch_size sequences) ------------------------------------------------
-micro_batch_size: 4                  # sequences per forward/backward pass
+micro_batch_size: 4                  # sequences per forward/backward pass (with pack_sequences: validation batches only)
 world_batch_size: 1024               # sequences per optimizer step (= micro_batch_size × gradient accumulation steps)
+
+# --- Sequence packing (training only; validation stays padded) ---------------------------------------------------
+# Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
+# masked per document (FlexAttention), RoPE positions restarting per document; the step is then measured in tokens.
+# With packing, sort_batches_by_length / sequence_padding_multiple apply to the validation batches only.
+pack_sequences: false                # true: pack the training data (e.g. tokens_per_micro_batch 8192 ~ 4 x 2048 padded rows)
+tokens_per_micro_batch: null         # pack length in tokens, >= block_size; required with pack_sequences
+tokens_per_step: null                # tokens per optimizer step, a multiple of tokens_per_micro_batch; required with pack_sequences
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
 optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
