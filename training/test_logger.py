@@ -565,7 +565,8 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     """
     `log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
     dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
-    counts every world batch since the last log step and starts over afterwards.
+    counts every world batch since the last log step and starts over afterwards. The final step is logged whatever
+    the interval (with `log_step_interval: 3` it would otherwise be dropped, its validation with it).
     """
 
     recorded = _record_wandb_logs(monkeypatch)
@@ -581,6 +582,13 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         clock.advance(1.0)
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
+    final_logger = open_run_logger(reference_settings(log_step_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
+    final_progress = TrainingProgress()
+    while final_progress.step < stage_manager.total_steps:
+        result = fake_result(stage_manager, final_progress.step, data_ids=["a"] * 4)
+        final_progress.advance()
+        final_logger.log_step(result, final_progress)
+    assert stage_manager.total_steps % 3 != 0 and stage_manager.total_steps in final_logger.history
     shown = recording(run_logger).steps
     assert [(step, stage) for step, stage, _, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
     assert shown[0][3] == {} and shown[2][3] == {}, "nothing is read from the step's tensors at a non-log step"

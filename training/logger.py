@@ -565,8 +565,8 @@ class RunLogger:
 
         Every step: the data ids join the composition counter, a transition starting or ending becomes an event, a
         set `result.validation` becomes the dashboard's validation row, the bars move (with an empty metric dict, so
-        no tensor is read). At log steps (`step % log_step_interval == 0`) the metric dict goes to wandb, to
-        `history` with `keep_history`, and to the dashboard:
+        no tensor is read). At log steps (`step % log_step_interval == 0`, and the final step whatever the interval)
+        the metric dict goes to wandb, to `history` with `keep_history`, and to the dashboard:
 
         * `loss`, `ppl`, `lr`, `grad_norm` (pre-clip), `step`;
         * `seconds/step`, `tokens/second`, `total_tokens` (from step 0, also after a resume), `total_time`,
@@ -583,7 +583,8 @@ class RunLogger:
         self._note_transition(result.stage, stage_at_done)
         validation = self._log_validation(result, progress)
         transition = stage_at_done.transition_progress if stage_at_done.transition_to is not None else None
-        if progress.step % self.settings.log_step_interval != 0:
+        final = progress.step >= self.stage_manager.total_steps  # always logged: its metrics and validation close the run
+        if progress.step % self.settings.log_step_interval != 0 and not final:
             self.dashboard.update_step(progress.step, stage_at_done.stage_index, transition, {})
             return
         metrics = self._step_metrics(result, progress, validation)

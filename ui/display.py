@@ -56,7 +56,8 @@ def line(text: str, style: str = "") -> Text:
 class ResizeAwareLive(Live):
     """
     A rich.live.Live that clears the screen before a frame drawn for a new terminal size and reports a
-    dead terminal through on_terminal_lost(reason) instead of crashing the refresh thread.
+    dead terminal, or a frame that fails to render, through on_terminal_lost(reason) instead of crashing the
+    refresh thread (the display then closes and the run goes on with plain logging).
     """
 
     def __init__(self, *args: Any, on_terminal_lost: Callable[[str], None] | None = None, **kwargs: Any) -> None:
@@ -79,10 +80,10 @@ class ResizeAwareLive(Live):
             try:
                 super().refresh()
                 return
-            except OSError as error:  # the terminal is gone (EIO / EBADF)
+            except Exception as error:  # the terminal is gone (OSError: EIO / EBADF), or a frame failed to render
                 if self._starting:  # let rich's start stop the display and raise, else it would still start its refresh thread
                     raise
-                reason = str(error)
+                reason = str(error) if isinstance(error, OSError) else f"render failed: {error!r}"
         if self._on_terminal_lost is not None:
             self._on_terminal_lost(reason)
 

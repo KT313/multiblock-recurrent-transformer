@@ -47,6 +47,7 @@ from training.step import (
     StepResult,
     TrainingProgress,
     model_inputs,
+    NonFiniteLossError,
     run_one_optimizer_step,
     scheduled_learning_rate,
 )
@@ -321,7 +322,7 @@ def test_non_finite_loss_raises_with_the_exact_message(
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
     with pytest.raises(RuntimeError) as excinfo:
         run_steps(settings, cpu_backend, model, optimizer, steps=1)
-    assert str(excinfo.value) == "Loss is nan at step 0. Terminating."
+    assert str(excinfo.value) == "Loss is nan at step 0" and isinstance(excinfo.value, NonFiniteLossError)
 
 
 def test_non_finite_grad_norm_raises_with_the_exact_message(
@@ -335,7 +336,7 @@ def test_non_finite_grad_norm_raises_with_the_exact_message(
     progress = TrainingProgress(step=3)
     with pytest.raises(RuntimeError) as excinfo:
         run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
-    assert str(excinfo.value) == "Gradient norm is non-finite at step 3. Terminating."
+    assert str(excinfo.value) == "Gradient norm is non-finite at step 3" and isinstance(excinfo.value, NonFiniteLossError)
 
 
 # --------------------------------------------------------------------------------------------------------------

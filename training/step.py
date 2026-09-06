@@ -37,6 +37,13 @@ from training.stage_manager import StageInfo, StageManager
 MicroBatch = Batch | PackedBatch  # what the stream yields: a padded micro-batch, or a packed one with `pack_sequences`
 
 
+class NonFiniteLossError(RuntimeError):
+    """
+    The step's loss or gradient norm is not finite. Raised before `optimizer.step`, so the model is still the one
+    of the completed steps; `train()` checkpoints it and stops.
+    """
+
+
 @dataclass
 class TrainingProgress:
     """
@@ -312,11 +319,11 @@ def run_one_optimizer_step(
     loss = loss_sum / accumulation_steps
     log_ppl = log_ppl_sum / accumulation_steps
     if not torch.isfinite(loss):
-        raise RuntimeError(f"Loss is {loss.item()} at step {step}. Terminating.")
+        raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")
 
     grad_norm = backend.clip_grad_norm(model, settings.grad_clip)
     if not torch.isfinite(grad_norm):
-        raise RuntimeError(f"Gradient norm is non-finite at step {step}. Terminating.")
+        raise NonFiniteLossError(f"Gradient norm is non-finite at step {step}")
     if step > 0:  # as in the thesis runs: the very first update is skipped (LR is 0 there anyway with warmup)
         optimizer.step()
     metrics: dict[str, Tensor] = {}

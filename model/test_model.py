@@ -73,7 +73,6 @@ def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
     """
 
     expected = [
-        "freqs_cis",
         "transformer.wte.weight",
         "transformer.prelude.0.norm_1.weight",
         "transformer.prelude.0.attn.qk_bias",
@@ -148,8 +147,8 @@ def test_transformer_module_dict_and_buffer() -> None:
     m = seeded_tiny()
     assert isinstance(m.transformer, TransformerModules)
     assert set(m.transformer.keys()) == {"wte", "prelude", "adapters", "core_blocks", "coda", "ln_fs", "ln_final"}
-    assert "freqs_cis" in dict(m.named_buffers())  # persistent buffer -> part of the state dict
-    assert "freqs_cis" in m.state_dict()
+    assert "freqs_cis" in dict(m.named_buffers())
+    assert "freqs_cis" not in m.state_dict()  # not persistent: a checkpoint cannot override the config's RoPE table
 
 
 def test_precompute_freqs_cis_method_matches_function() -> None:

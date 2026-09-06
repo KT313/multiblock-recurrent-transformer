@@ -148,6 +148,9 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
     def __init__(self, config: RecurrentGPTConfig) -> None:
         super().__init__(config)
         self.model: RecurrentGPT = RecurrentGPT(config.to_recurrent_config())
+        # persistent here: `from_pretrained` materialises only the tensors of the saved state dict, a non-persistent
+        # buffer would stay uninitialised (in the training model it is not persistent, so the config always wins)
+        self.model.register_buffer("freqs_cis", self.model.freqs_cis, persistent=True)
         self.num_recurrent_blocks = len(self.model.transformer.core_blocks)
         self.post_init()  # type: ignore[no-untyped-call]  # untyped in transformers
 
@@ -342,6 +345,7 @@ def export_to_hf(
     state_dict: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
         state_dict[f"model.{name}"] = tensor.detach().cpu()
+    state_dict["model.freqs_cis"] = model.freqs_cis.detach().cpu()  # persistent in the wrapper only (see its __init__)
     hf_model.load_state_dict(state_dict, assign=True)
     hf_model.save_pretrained(out_dir, safe_serialization=True)
     export_sources(_PACKAGE_DIR, out_dir)

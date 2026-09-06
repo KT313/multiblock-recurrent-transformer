@@ -177,7 +177,8 @@ class RecurrentGPT(torch.nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.transformer.wte.weight
 
-        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+        # not persistent: the table follows the config (`rope_base`, the length), a checkpoint never overrides it
+        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
         # Set externally each optimizer step; seeds the recurrence sampler.
         self.step: int = 0

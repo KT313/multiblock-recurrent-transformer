@@ -249,6 +249,21 @@ def test_silencing_the_terminal_redirects_only_the_display_s_own_descriptor(monk
     assert redirected == [2], "once, and stdout is left alone"
 
 
+def test_a_frame_that_fails_to_render_closes_the_display_and_the_run_goes_on(caplog: pytest.LogCaptureFixture) -> None:
+    display, _ = _dying_display()
+    live = _live_of(display)
+    assert live is not None
+    display._console.file = _RaisingFile()  # not an OSError: a rich layout error looks the same to the refresh thread
+    with caplog.at_level(logging.WARNING, logger="ui.display"):
+        live.refresh()
+    assert display.headless and not display.enabled and "render failed: RuntimeError('boom')" in caplog.text
+
+
+class _RaisingFile(io.StringIO):
+    def write(self, text: str) -> int:
+        raise RuntimeError("boom")
+
+
 def test_a_pending_loss_left_by_a_signal_handler_is_acted_on_at_the_next_refresh(caplog: pytest.LogCaptureFixture) -> None:
     display, file = _dying_display()
     live = _live_of(display)

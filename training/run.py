@@ -68,7 +68,7 @@ from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
-from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
+from training.step import BatchStream, NonFiniteLossError, TrainingProgress, run_one_optimizer_step
 
 
 log = get_logger(__name__)
@@ -170,9 +170,12 @@ def train(
                 logger.status("training")
                 stopped = False
                 while progress.step < stage_manager.total_steps and not stopped:
-                    result = run_one_optimizer_step(
-                        settings, backend, model, optimizer, stage_manager, batches, progress
-                    )
+                    try:
+                        result = run_one_optimizer_step(
+                            settings, backend, model, optimizer, stage_manager, batches, progress
+                        )
+                    except NonFiniteLossError as error:
+                        raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
                     progress.advance()
                     if is_evaluation_step(settings, progress.step, stage_manager):
                         validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
@@ -376,7 +379,20 @@ def stop_requested(should_stop: StopCheck | None) -> bool:
     return should_stop is not None and should_stop()
 
 
-def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> None:
+def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: BatchStream) -> str:
+    """
+    A step that produced a non-finite loss or gradient norm did not update the model (`optimizer.step` never ran),
+    so the model and optimizer state are those of the completed steps: save them, unless no step completed yet.
+    Returns the note for the error message.
+    """
+
+    if state.progress.step == 0:
+        return "no checkpoint written (the first step failed)"
+    state.optimizer.zero_grad(set_to_none=True)
+    return f"the model before this step is checkpointed as {save_run_checkpoint(state, logger, batches)}"
+
+
+def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> Path:
     """
     Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
@@ -401,6 +417,7 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
     with logger.saving_checkpoint():
         save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
     logger.log_checkpoint(path)
+    return path
 
 
 def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> list[GeneratedSample]:

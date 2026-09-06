@@ -48,7 +48,9 @@ def hf_wrapper_around(model: RecurrentGPT, tokenizer: Tokenizer) -> RecurrentGPT
 
     with torch.device("meta"):
         wrapper = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(model.config))
-    wrapper.load_state_dict({f"model.{name}": tensor for name, tensor in model.state_dict().items()}, assign=True)
+    tensors = {f"model.{name}": tensor for name, tensor in model.state_dict().items()}
+    tensors["model.freqs_cis"] = model.freqs_cis  # persistent in the wrapper only, so it is expected here
+    wrapper.load_state_dict(tensors, assign=True)
     generation = wrapper.generation_config
     generation.pad_token_id = tokenizer.pad_id
     generation.eos_token_id = tokenizer.eos_id

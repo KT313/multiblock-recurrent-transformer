@@ -287,8 +287,34 @@ def test_non_finite_loss_terminates(
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
-    with pytest.raises(RuntimeError, match="Loss is nan at step 0"):
+    with pytest.raises(RuntimeError, match="Loss is nan at step 0. Terminating; no checkpoint written"):
         _run(yaml_path, cpu_backend)
+    assert not list((tmp_path / "out").rglob("*.pth"))
+
+
+def test_non_finite_loss_after_the_first_step_checkpoints_the_model_before_it(
+    tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    A NaN loss at step 3 ends the run with an error that names the checkpoint of the three completed steps: the
+    failed step never reached `optimizer.step`, so the saved model is the one before it.
+    """
+
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", save_step_interval=100)
+    forward = RecurrentGPT.forward
+
+    def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
+        out = forward(self, *args, **kwargs)
+        if self.step == 3:
+            assert out["loss"] is not None
+            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        return out
+
+    monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
+    with pytest.raises(RuntimeError, match=r"Loss is nan at step 3. Terminating; the model before this step is checkpointed as .*step-00000003") as info:
+        _run(yaml_path, cpu_backend)
+    checkpoints = list((tmp_path / "out").rglob("*.pth"))
+    assert len(checkpoints) == 1 and checkpoints[0].name.startswith("step-00000003") and str(checkpoints[0]) in str(info.value)
 
 
 def test_non_finite_grad_norm_terminates(

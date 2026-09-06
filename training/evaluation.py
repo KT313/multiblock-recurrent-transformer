@@ -37,6 +37,13 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
     the full logits: that is what keeps the validation peak small.
     """
 
+    # the recurrent blocks draw their initial state from the global RNG: validation must not shift the training draws
+    devices = [backend.device.index or 0] if backend.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        return _evaluate(settings, backend, model, val_loader)
+
+
+def _evaluate(settings: Settings, backend: Backend, model: Module, val_loader: Iterable[Batch]) -> dict[str, Tensor]:
     model.eval()
     config = plain_model(model).config
     mean_recurrence = cast(list[int], config.mean_recurrence)  # broadcast to a list in RecurrentConfig.__post_init__
