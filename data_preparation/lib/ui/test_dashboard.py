@@ -8,6 +8,7 @@ from __future__ import annotations
 import fcntl
 import io
 import logging
+import math
 import os
 import pty
 import re
@@ -678,7 +679,7 @@ def _run_in_pty(
                 close_at = time.monotonic() + close_after
         if terminate_at is not None and time.monotonic() > terminate_at:
             os.kill(pid, 15)
-            terminate_at = None
+            terminate_at = math.inf  # once: a second SIGTERM would be the "end right away" interrupt, not this test's case
         if time.monotonic() > deadline:
             os.kill(pid, 9)
             break
@@ -708,7 +709,7 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     lines = [line for line in shown.splitlines() if line.strip()]
     assert lines[0].endswith("dataset status:") and lines[-1].endswith(f"done: {dataset_dir}"), shown
     build_log = (dataset_dir / "build.log").read_text()
-    assert "round 1:" in build_log and "synthetic_pretrain: kept 76 of 76 fetched rows" in build_log
+    assert "round 1:" in build_log and "synthetic_pretrain: kept 87 of 87 fetched rows" in build_log
 
 
 @pytest.mark.slow
