@@ -153,10 +153,17 @@ def check_contamination(
 
 def instruct_text(row: Row) -> str:
     """
-    The text whose token count decides an instruct row's length: instruction, input and output joined.
+    An instruct row as one text, exactly the string the trainer tokenizes (training/data/formats.py builds its
+    token ids from this function): instruction, the input when it is not blank, and output, each stripped and
+    joined by blank lines. Its token count decides the row's length; the build's exact dedup hashes it.
     """
 
-    return f"{row['instruction']}\n{row.get('input') or ''}\n{row['output']}"
+    text: str = row["instruction"].strip()
+    input_text: str = (row.get("input") or "").strip()
+    if input_text:
+        text += "\n\n" + input_text
+    output: str = row["output"].strip()
+    return text + "\n\n" + output
 
 
 def create_input_inversion(row: Row) -> Row:

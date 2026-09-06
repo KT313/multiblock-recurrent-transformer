@@ -11,12 +11,14 @@ manifest, starts a fresh folder when there is none, and never deletes one. A fol
 smaller max_seq_length than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
 the repair step (lib/build/repair.py) deletes such folders after the user confirmed, nothing else does.
 
-What a raw row is: pretrain rows carry text_field truncated at the token boundary max_seq_length (the
-stored tokens is the true count of the stored text, see truncation.py); instruct rows carry instruction /
-input / output with tokens = the count of their concatenation, uncapped. An instruct row longer than
-max_seq_length is not stored at all (dropped_too_long; cutting an answer would be worse than losing the
-row). The raw manifest records truncated_at_tokens (the cap used, both kinds), token_count and the
-tokenizer name.
+What a raw row is: pretrain rows carry text_field only (a string, whatever the loader delivered) truncated at
+a token boundary so that tokens, the true count of the stored text plus the BOS and EOS the trainer adds
+(truncation.SPECIAL_TOKENS), is at most max_seq_length; instruct rows carry instruction / input / output with
+tokens = the count of the text the trainer formats from them (row_pipeline.instruct_text) plus the same two
+specials, uncapped. An instruct row whose tokens exceeds max_seq_length is not stored at all (dropped_too_long;
+cutting an answer would be worse than losing the row). So a stored tokens is the length the trainer sees and
+never exceeds max_seq_length. The raw manifest records truncated_at_tokens (the cap used, both kinds),
+token_count and the tokenizer name.
 
 A download pass (:func:`_fetch`) is a two-stage pipeline: the job's own thread pulls rows from the loader, converts
 them and buffers :data:`TOKEN_BATCH` rows per source, and a token worker thread (:class:`_TokenWorker`) tokenizes
@@ -30,6 +32,7 @@ from __future__ import annotations
 import functools
 import os
 import queue
+import shutil
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
@@ -54,8 +57,9 @@ from data_preparation.lib.sources.loaders import (
     read_github_code_group,
 )
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
+from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.stages.row_pipeline import instruct_text
-from data_preparation.lib.stages.truncation import estimate_tokens, truncate_many
+from data_preparation.lib.stages.truncation import SPECIAL_TOKENS, estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import RawFolder, RowProgress
@@ -71,8 +75,9 @@ DEFAULT_SHARD_SIZE = 10_000
 class TokenCounter:
     """
     Token counts with the config's tokenizer (token_count: tokenizer, add_special_tokens=False) or
-    len(text) // 4 (estimate). Counts are never capped here: the download truncates pretrain *text* at the
-    cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
+    len(text) // 4 (estimate): the text's own tokens, without the BOS and EOS the trainer adds (the token step adds
+    truncation.SPECIAL_TOKENS to what it stores). Counts are never capped here: the download truncates pretrain
+    *text* at the cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
     """
 
     def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
@@ -180,7 +185,10 @@ def new_manifest(
 
 def text_row(source: SourceConfig, row: Row, name: str) -> Row:
     """
-    Apply a pretrain source's converter (if any) and check that text_field is present.
+    The pretrain row to store for a source row: the converter (if any) applied, then text_field alone, as a
+    string (None becomes "", which the build's min_chars filter drops). Only the Hub file reader projects
+    columns; hf_split and hf_stream deliver every source column, and a surplus column of varying type would
+    fail the shard write, a nested one bloat it.
     """
 
     converter = get_converter(source)
@@ -188,7 +196,7 @@ def text_row(source: SourceConfig, row: Row, name: str) -> Row:
         row = converter(row)
     if source.text_field not in row:
         raise ValueError(f"{name}: row has no {source.text_field!r} column; columns: {sorted(row)}")
-    return row
+    return {source.text_field: text_or_empty(row[source.text_field])}
 
 
 # --- raw manifest state ------------------------------------------------------------------------------------------------
@@ -252,9 +260,11 @@ class RawFolderError(RuntimeError):
 # --- tokenizer ---------------------------------------------------------------------------------------------------------
 
 
-def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Manifest:
+def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout, *, hf_token: str | None = None) -> Manifest:
     """
-    Save the config's tokenizer to layout.tokenizer_dir(name) (Hub download or the synthetic WordLevel one).
+    Save the config's tokenizer to layout.tokenizer_dir(name) (Hub download, with hf_token for a gated
+    repo, or the synthetic WordLevel one). The files are written to a sibling directory and swapped into place, so
+    a stale tokenizer's files never linger next to the new ones.
     """
 
     tokenizer = config.tokenizer
@@ -265,11 +275,12 @@ def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Manifest:
         return manifest
 
     log.info("preparing tokenizer %s (%s) -> %s", tokenizer.name, tokenizer.kind, tokenizer_dir)
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
-    if tokenizer.kind == "synthetic":
-        write_synthetic_tokenizer(tokenizer_dir)
-    else:
-        _auto_tokenizer().from_pretrained(tokenizer.hf_id, revision=tokenizer.revision).save_pretrained(str(tokenizer_dir))
+    with write_atomically(tokenizer_dir) as temporary:
+        if tokenizer.kind == "synthetic":
+            write_synthetic_tokenizer(temporary)
+        else:
+            _auto_tokenizer().from_pretrained(tokenizer.hf_id, revision=tokenizer.revision, token=hf_token).save_pretrained(str(temporary))
+        shutil.rmtree(tokenizer_dir, ignore_errors=True)  # a non-empty directory cannot be replaced
     manifest = new_manifest(config, tokenizer.name, source_hash, "tokenizer")
     manifest.extra = {"kind": tokenizer.kind, "hf_id": tokenizer.hf_id, "revision": tokenizer.revision}
     manifest.save(tokenizer_dir)
@@ -302,7 +313,7 @@ class _IncrementCounters:
 
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
     kept: int = 0  # rows written to disk
-    skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
+    skipped_malformed: int = 0  # instruct rows whose converter raised ValueError or left out instruction / output
     dropped_too_long: int = 0  # instruct rows with more than `max_seq_length` tokens
     exhausted: bool = False  # the loader ran dry, or check_limit was reached
 
@@ -323,12 +334,13 @@ def download(
     The folder's manifest must be current (:func:`inspect_raw`): a stale or outdated one raises
     :class:`RawFolderError` (nothing is deleted here), a missing one starts the folder from shard 0 (refused when
     shards without a manifest are present). manifest.rows_fetched is the loader offset reached (source rows
-    consumed). Pretrain sources keep every row (converter applied, text_field guaranteed, the text truncated to
-    max_seq_length tokens with its true count in tokens). Instruct sources run the converter and filter at
-    download time and store only standardized {instruction, input, output} rows of at most max_seq_length
-    tokens; malformed rows (converter raises ValueError) are counted in skipped_malformed, longer rows in
-    dropped_too_long. check_limit bounds the source rows inspected in total. A loader that yields fewer rows
-    than requested sets exhausted (the training sampler cycles a source smaller than its budget).
+    consumed). Pretrain sources keep every row (converter applied, text_field alone and a string, the text
+    truncated so that tokens, its count with the trainer's specials, is at most max_seq_length). Instruct sources
+    run the converter and filter at download time and store only standardized {instruction, input, output} rows
+    of at most max_seq_length tokens; malformed rows (the converter raises ValueError or yields no instruction /
+    output) are counted in skipped_malformed, longer rows in dropped_too_long. check_limit bounds the source rows
+    inspected in total. A loader that yields fewer rows than requested sets exhausted (the training sampler cycles
+    a source smaller than its budget).
 
     rows_needed is a minimum: a loader reading a large parquet file remotely finishes the row group it is in
     (see sources/loaders.py), every row it yields is written and rows_fetched advances to that row-group
@@ -414,13 +426,16 @@ class _TokenStep:
     buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls
     tokenize(batch) on those batches, in order, and gets the rows ready to store.
 
-    Pretrain rows: text_field is truncated at token max_tokens (truncation.py) and tokens is the
-    true count of the stored text. Instruct rows: tokens counts instruction + input + output uncapped; a row over
-    max_tokens is dropped (counters.dropped_too_long), never cut, and every stored row's progress carries the
+    Every stored tokens counts the text plus :data:`SPECIAL_TOKENS` (the BOS and EOS the trainer adds), the one
+    place the specials enter a count. Pretrain rows: text_field is truncated (truncation.py) so that this sum is at
+    most max_tokens. Instruct rows: tokens counts the trainer's text (row_pipeline.instruct_text) uncapped; a row
+    over max_tokens is dropped (counters.dropped_too_long), never cut, and every stored row's progress carries the
     drop count of the rows before it (exact per row, so a resume never double counts).
     """
 
     def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _IncrementCounters) -> None:
+        if max_tokens < SPECIAL_TOKENS:
+            raise ValueError(f"max_seq_length {max_tokens} leaves no room for the {SPECIAL_TOKENS} special tokens of a row")
         self._counter = counter
         self._max_tokens = max_tokens
         self._counters = counters
@@ -462,16 +477,16 @@ class _TokenStep:
         return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
 
     def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
-        texts = [text_or_empty(row.get(self._text_field)) for row, _ in batch]
-        for (row, _), text, (cut, tokens) in zip(batch, texts, self._counter.truncate_many(texts, self._max_tokens), strict=True):
-            if cut != text:
-                row[self._text_field] = cut
-            row["tokens"] = tokens
+        texts = [row[self._text_field] for row, _ in batch]
+        for (row, _), (cut, tokens) in zip(batch, self._counter.truncate_many(texts, self._max_tokens - SPECIAL_TOKENS), strict=True):
+            row[self._text_field] = cut
+            row["tokens"] = tokens + SPECIAL_TOKENS
         return batch
 
     def _drop_long_instruct_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
         stored: list[StoredRow] = []
-        for (row, before), tokens in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
+        for (row, before), count in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
+            tokens = count + SPECIAL_TOKENS
             if tokens > self._max_tokens:
                 self._counters.dropped_too_long += 1
                 continue
@@ -751,7 +766,7 @@ def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], 
     for row, row_progress in stored:
         increment.folder.add(writer, row, row_progress)
         increment.counters.kept += 1
-        bar.update(1)
+    bar.update(len(stored))  # once per batch: the dashboard bar takes a lock per update
 
 
 def download_github_code_group(
@@ -833,13 +848,17 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
 
 def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
     """
-    The standardized {instruction, input, output} row for raw.
+    The standardized {instruction, input, output} row for raw, every field a string (None becomes "").
 
-    A ValueError raised by the converter (malformed row) propagates to the caller, which skips the row.
+    A malformed row raises ValueError, which the caller counts and skips: the converter's own, or a result
+    without instruction / output.
     """
 
-    row = converter(raw) if converter is not None else dict(raw)
-    return {"instruction": row["instruction"], "input": row.get("input", ""), "output": row["output"]}
+    row = converter(raw) if converter is not None else raw
+    missing = [key for key in ("instruction", "output") if key not in row]
+    if missing:
+        raise ValueError(f"row has no {missing} column; columns: {sorted(row)}")
+    return {"instruction": text_or_empty(row["instruction"]), "input": text_or_empty(row.get("input")), "output": text_or_empty(row["output"])}
 
 
 class _DownloadPostfix:

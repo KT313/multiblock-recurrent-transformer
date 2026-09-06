@@ -168,8 +168,9 @@ def test_check_contamination_with_planted_13gram_overlap() -> None:
 # --- instruct rows -----------------------------------------------------------------------------------------------------
 
 
-def test_instruct_text() -> None:
-    assert rp.instruct_text({"instruction": "a", "input": "b", "output": "c"}) == "a\nb\nc"
+def test_instruct_text_is_the_trainers_text() -> None:
+    assert rp.instruct_text({"instruction": "a", "input": "b", "output": "c"}) == "a\n\nb\n\nc"
+    assert rp.instruct_text({"instruction": " a ", "input": "  ", "output": "c\n"}) == "a\n\nc", "stripped; a blank input is no input"
     assert rp.instruct_text({"instruction": "a", "input": None, "output": "c"}) == "a\n\nc"
     assert rp.instruct_text({"instruction": "a", "output": "c"}) == "a\n\nc"
 

@@ -18,6 +18,7 @@ from typing import Any
 
 import os
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from rich.console import Console
@@ -42,7 +43,7 @@ from data_preparation.lib.stages.download import (
     inspect_raw,
     prepare_tokenizer,
 )
-from data_preparation.lib.stages.truncation import estimate_tokens
+from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, SPECIAL_TOKENS, estimate_tokens
 
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
@@ -107,14 +108,14 @@ def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
     real = transformers.AutoTokenizer.from_pretrained
 
     def fake(name: str, *args: Any, **kwargs: Any) -> Any:
-        calls.append((name, kwargs.get("revision")))
+        calls.append((name, kwargs.get("revision"), kwargs.get("token")))
         return real(str(tiny_tokenizer_dir), *args)
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", fake)
     tok = TokenizerConfig(name="llama", kind="hf", hf_id="org/tok", revision="abc")
     cfg = cfg_factory({"p": _synthetic()}, tokenizer=tok)
-    manifest = prepare_tokenizer(cfg, layout)
-    assert calls == [("org/tok", "abc")]
+    manifest = prepare_tokenizer(cfg, layout, hf_token="hf_secret")
+    assert calls == [("org/tok", "abc", "hf_secret")]
     assert (layout.tokenizer_dir("llama") / "tokenizer_config.json").is_file()
     assert manifest.extra == {"kind": "hf", "hf_id": "org/tok", "revision": "abc"}
     assert prepare_tokenizer(cfg, layout) == manifest and len(calls) == 1
@@ -232,7 +233,7 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     m = download(cfg, "g", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 7 and m.rows_fetched == 7 and m.exhausted is True
     rows = read_rows(layout.raw_dir("g"))
-    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6}
+    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6 + SPECIAL_TOKENS}
     assert m.token_count == "tokenizer" and m.tokenizer == "synthetic" and m.tokens() == sum(r["tokens"] for r in rows)
     # exhausted: a larger request is a no-op
     assert download(cfg, "g", layout, rows_needed=100, shard_size=4) == m
@@ -250,13 +251,38 @@ def test_download_projects_to_the_text_field_and_requires_it(
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
     download(cfg, "c", layout, rows_needed=1)
-    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40}]  # tokens of `code`; no `lang`
+    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40 + SPECIAL_TOKENS}]  # tokens of `code`; no `lang`
     bad = cfg_factory({"c": _local(src_dir, text_field="text")})
     other = DatasetLayout(layout.root / "other")
     prepare_tokenizer(bad, other)
     with pytest.raises(ValueError, match="no 'text' column"):
         download(bad, "c", other, rows_needed=1)
 
+
+
+def test_pretrain_rows_are_projected_to_a_string_text_field_whatever_the_loader_yields(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    Loaders without a column projection (hf_split, hf_stream) deliver every source column: a surplus column whose
+    type varies between rows would fail the Arrow conversion, and a non-string text value would be stored as-is.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        yield {"text": "tok_1 tok_2", "meta": {"nested": 1}}
+        yield {"text": 42, "meta": "a string this time"}
+        yield {"text": None, "meta": None}
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    download(cfg, "p", layout, rows_needed=3)
+    (shard,) = sorted(layout.raw_dir("p").glob("data-*.parquet"))
+    schema = pq.read_schema(shard)
+    assert schema.names == ["text", "tokens"]
+    assert pa.types.is_string(schema.field("text").type) and pa.types.is_integer(schema.field("tokens").type)
+    assert [r["text"] for r in read_rows(layout.raw_dir("p"))] == ["tok_1 tok_2", "42", ""]
 
 
 def test_a_written_shard_holds_only_the_row_columns(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -379,10 +405,32 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     m = download(cfg, "i", layout, rows_needed=3, shard_size=10)
     assert m.rows() == 3 and m.rows_fetched == 5 and m.skipped_malformed == 2
     assert read_rows(layout.raw_dir("i")) == [
-        {"instruction": "what", "input": "", "output": "that", "tokens": 2},
-        {"instruction": "how", "input": "background", "output": "so", "tokens": 3},
-        {"instruction": "why", "input": "", "output": "because", "tokens": 2},
-    ]  # tokens: instruction + input + output
+        {"instruction": "what", "input": "", "output": "that", "tokens": 2 + SPECIAL_TOKENS},
+        {"instruction": "how", "input": "background", "output": "so", "tokens": 3 + SPECIAL_TOKENS},
+        {"instruction": "why", "input": "", "output": "because", "tokens": 2 + SPECIAL_TOKENS},
+    ]  # tokens: instruction + input + output, plus the trainer's BOS and EOS
+
+
+def test_download_instruct_skips_converter_results_without_instruction_or_output(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A converter that returns a row without `instruction` / `output` is as malformed as one that raises; the row
+    is skipped and counted, the download goes on.
+    """
+
+    from data_preparation.lib.sources import converters as converters_mod
+
+    def half_converter(row: Row) -> Row:
+        return {key: row[key] for key in ("instruction", "output") if key in row}
+
+    monkeypatch.setitem(converters_mod.CONVERTERS, "half", half_converter)
+    src_dir = layout.root.parent / "half"
+    write_local(src_dir, [{"instruction": "a"}, {"output": "b"}, {"instruction": "c", "output": "d"}], "jsonl")
+    cfg = with_tokenizer(cfg_factory({"h": _local(src_dir, kind="instruct", converter="half")}))
+    m = download(cfg, "h", layout, rows_needed=3)
+    assert m.rows() == 1 and m.rows_fetched == 3 and m.skipped_malformed == 2 and m.exhausted is True
+    assert read_rows(layout.raw_dir("h")) == [{"instruction": "c", "input": "", "output": "d", "tokens": 2 + SPECIAL_TOKENS}]
 
 
 def test_download_instruct_filter_reads_the_source_once(
@@ -396,7 +444,7 @@ def test_download_instruct_filter_reads_the_source_once(
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
     # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
     assert m.rows() == 3 and m.rows_fetched == 6 and not m.exhausted
-    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.raw_dir("s")))
+    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2 + SPECIAL_TOKENS} for r in read_rows(layout.raw_dir("s")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
     assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.exhausted is True
 
@@ -431,7 +479,7 @@ def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenize
     rows = read_rows(layout.raw_dir("i"))
     assert rows == [{**synthetic_row("instruct", 2, i), "tokens": r["tokens"]} for i, r in enumerate(rows)]
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) for r in rows)
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + SPECIAL_TOKENS for r in rows)
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -506,7 +554,7 @@ def test_download_github_code_group_equals_separate_downloads(
         download(cfg, name, separate, rows_needed=rows_needed[name], shard_size=3)
     expected = _raw_state(separate, list(sources), read_rows)
     assert [r["text"] for r in expected["py"]["rows"]] == ["a code 0", "a code 3", "a code 6", "b code 0"]
-    assert expected["py"]["rows_fetched"] == 4 and set(expected["py"]["rows"][0]) == {"text", "language", "tokens"}
+    assert expected["py"]["rows_fetched"] == 4 and set(expected["py"]["rows"][0]) == {"text", "tokens"}  # `language` only routes the row
     assert expected["rust"]["rows"] == [] and expected["rust"]["exhausted"]
 
     hub.streams.clear()
@@ -555,8 +603,8 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
     """
-    Stored text is a prefix of the source text that re-tokenizes to <= the cap; `tokens` is the stored text's own
-    count; rows under the cap are stored unchanged; the manifest records the cap.
+    Stored text is a prefix of the source text; `tokens` is the stored text's own count plus the trainer's BOS and
+    EOS and is <= the cap; rows that fit with the specials are stored unchanged; the manifest records the cap.
     """
 
     cap = 100
@@ -568,8 +616,8 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     truncated = unchanged = 0
     for index, row in enumerate(rows):
         original = synthetic_row("pretrain", 3, index)["text"]
-        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) <= cap
-        if counter.count(original) <= cap:
+        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) + SPECIAL_TOKENS <= cap
+        if counter.count(original) + SPECIAL_TOKENS <= cap:
             assert row["text"] == original
             unchanged += 1
         else:
@@ -609,7 +657,8 @@ def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
     cfg = cfg_factory({"e": _local(src_dir)}, token_count="estimate", max_seq_length=10)
     m = download(cfg, "e", layout, rows_needed=2)  # no tokenizer stage needed
     rows = read_rows(layout.raw_dir("e"))
-    assert rows == [{"text": "x" * 40, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short")}]
+    text_cap = (10 - SPECIAL_TOKENS) * CHARS_PER_TOKEN_ESTIMATE  # the specials take 2 of the 10 tokens
+    assert rows == [{"text": "x" * text_cap, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short") + SPECIAL_TOKENS}]
     assert m.truncated_at_tokens == 10 and m.token_count == "estimate" and m.tokenizer is None
 
 
@@ -636,7 +685,8 @@ def test_download_github_code_group_truncates_like_separate_downloads(
     for name in ("py", "java"):
         rows = read_rows(grouped.raw_dir(name))
         assert rows == read_rows(separate.raw_dir(name)) and len(rows) == 3
-        assert all(r["tokens"] == cap == counter.count(r["text"]) and r["text"].count(" ") == cap for r in rows)  # cut where token 7 starts
+        words = cap - SPECIAL_TOKENS
+        assert all(r["tokens"] == cap == counter.count(r["text"]) + SPECIAL_TOKENS and r["text"].count(" ") == words for r in rows)  # cut where token 5 starts
         assert all(any(source["text"].startswith(r["text"]) for source in long_rows) for r in rows)
         assert manifests[name].truncated_at_tokens == cap and manifests[name].tokens() == 3 * cap
 
@@ -688,7 +738,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     assert m.truncated_at_tokens == 5
     rows = read_rows(layout.raw_dir("d"))
     assert [r["instruction"] for r in rows] == [f"i{i}" for i in range(30) if i % 3 == 2]
-    assert all(r["tokens"] == 2 and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
+    assert all(r["tokens"] == 2 + SPECIAL_TOKENS and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
 
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
@@ -707,8 +757,8 @@ def test_download_instruct_estimate_mode_drops_by_estimated_count(
     cfg = cfg_factory({"e": src}, token_count="estimate", max_seq_length=8)
     m = download(cfg, "e", layout, rows_needed=2)
     stored = read_rows(layout.raw_dir("e"))
-    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0]))}]
-    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20}))
+    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0])) + SPECIAL_TOKENS}]
+    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20})) + SPECIAL_TOKENS
     assert m.dropped_too_long == 1 and m.exhausted is True
 
 

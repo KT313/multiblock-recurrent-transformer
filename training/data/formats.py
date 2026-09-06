@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import torch
 
+from data_preparation.lib.stages.row_pipeline import instruct_text
 from training.data.tokenizer import Tokenizer
 
 Row = dict[str, Any]
@@ -34,7 +35,8 @@ def concatenate_instruction_input_output(
     row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    instruction [+ input] form the prompt (masked); only output is supervised.
+    instruction [+ input] form the prompt (masked); only output is supervised. The full text is
+    data_preparation's instruct_text, so the token counts stored at download time are the lengths seen here.
     """
 
     instruction = row.get("instruction")
@@ -45,7 +47,7 @@ def concatenate_instruction_input_output(
     prompt = instruction.strip()
     if input_text.strip():
         prompt = prompt + "\n\n" + input_text.strip()
-    full = prompt + "\n\n" + output.strip()
+    full = instruct_text(row)
 
     prompt_len = len(tokenizer.encode(prompt, bos=add_bos, eos=False))
     input_ids = torch.tensor(tokenizer.encode(full, bos=add_bos, eos=add_eos), dtype=torch.long)

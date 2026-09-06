@@ -111,7 +111,7 @@ def prepare(
 
     with build_lock(layout.root) if not dry_run else nullcontext():
         if "tokenizer" in active_steps and not dry_run:
-            prepare_tokenizer(config, layout)
+            prepare_tokenizer(config, layout, hf_token=hf_token)
         repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected)
         log_repair(repair_report)
         for round_number in range(1, MAX_ROUNDS + 1):
