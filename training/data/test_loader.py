@@ -1,14 +1,15 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import itertools
 import math
+import signal
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable, TypeVar, cast
+from typing import Any, Iterable, Iterator, TypeVar, cast
 
 import pyarrow.parquet as pq
 import pytest
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import IGNORE_INDEX, Batch, Sample, WorkerBatch, collate_samples
@@ -28,6 +29,7 @@ from training.data.loader import (
     dataloader_over,
     entry_dataset,
     sample_length,
+    worker_init_fn,
     world_batch_micro_batches,
 )
 from training.data.datasets import ParquetTextDataset, Row
@@ -251,6 +253,22 @@ def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: lis
     a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
     b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
     assert _same(a, b)
+
+
+class _SignalDispositions(IterableDataset[Any]):
+    def __iter__(self) -> Iterator[Any]:
+        yield signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
+
+
+def test_workers_ignore_sigint_and_sigterm(tokenizer: Tokenizer) -> None:
+    """
+    A Ctrl-C reaches the whole process group; a worker must leave it to the parent's handler.
+    """
+
+    assert dataloader_over(_SignalDispositions(), tokenizer, 64, 1).worker_init_fn is worker_init_fn
+    loader = DataLoader(_SignalDispositions(), batch_size=None, num_workers=1, worker_init_fn=worker_init_fn)
+    (sigint, sigterm), = list(loader)
+    assert sigint == signal.SIG_IGN and sigterm == signal.SIG_IGN
 
 
 def test_unusable_rows_are_dropped_without_ending_the_loader(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:

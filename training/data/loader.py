@@ -7,6 +7,7 @@ The stage structure never touches the train loaders: `training.step.BatchStream`
 the stage-interpolated weights, so a reader continues across stage boundaries and never re-reads rows.
 """
 
+import signal
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -103,6 +104,19 @@ def build_dataloader(
     )
 
 
+def worker_init_fn(worker_id: int) -> None:
+    """
+    A DataLoader worker ignores SIGINT and SIGTERM. A terminal Ctrl-C signals the whole process group; a worker that
+    took it would exit on the KeyboardInterrupt and the parent would fail with "DataLoader worker exited unexpectedly"
+    instead of finishing the step and checkpointing (`training.train.stop_on_interrupt`). Ignoring changes nothing
+    about a worker's lifetime: the parent ends it by message (a sentinel once its iterator is dropped) and torch's
+    watchdog ends it when the parent dies.
+    """
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 def dataloader_over(
     dataset: IterableDataset[Row],
     tokenizer: Tokenizer,
@@ -150,6 +164,7 @@ def dataloader_over(
         num_workers=num_workers,
         prefetch_factor=TRAIN_LOADER_PREFETCH_FACTOR if num_workers > 0 else None,
         generator=generator,
+        worker_init_fn=worker_init_fn,
     )
 
 

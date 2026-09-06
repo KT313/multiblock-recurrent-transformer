@@ -15,6 +15,12 @@ Dead terminal (`_terminal_lost`): on a failed frame write or SIGHUP the display 
 goes to `/dev/null`, one WARNING names the log file and the run continues headless. The SIGHUP handler only silences
 the streams and leaves a note for the refresh thread; a teardown inside the handler could deadlock on `_lock`.
 Ctrl-C and SIGTERM are unchanged.
+
+Fork (`_reset_in_child`): the training DataLoader forks its workers while the display is up. A forked child copies
+`_lock` with its owner, but threads do not survive a fork; a worker whose first log line reaches `write` while the
+render thread had the lock at the fork would block forever, and the parent with it. The hook gives every display a
+fresh lock in the child, disabled, its plain stream on /dev/null (the worker's lines must not land under the
+parent's dashboard; the log file still gets them through logging).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import logging
 import os
 import signal
 import threading
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -98,6 +105,29 @@ class ResizeAwareLive(Live):
         return renderables
 
 
+_displays: weakref.WeakSet[LiveDisplay] = weakref.WeakSet()
+_fork_hook_registered = False  # `register_at_fork` cannot be undone, so the hook is registered once
+
+
+def _reset_in_child() -> None:
+    """
+    In a forked child (a DataLoader worker): a fresh lock, no display, plain writes to /dev/null.
+    """
+
+    for display in _displays:
+        display._lock = threading.RLock()
+        display.enabled = False
+        display._live = None
+        display._plain_stream = open(os.devnull, "w")  # noqa: SIM115  # stays open for the rest of the child
+
+
+def _register_fork_hook() -> None:
+    global _fork_hook_registered
+    if not _fork_hook_registered and hasattr(os, "register_at_fork"):
+        _fork_hook_registered = True
+        os.register_at_fork(after_in_child=_reset_in_child)
+
+
 class LiveDisplay:
     """
     The live display, log panel and kept lines of a dashboard.
@@ -124,6 +154,8 @@ class LiveDisplay:
         self._headless = False  # set by `_terminal_lost`
         self._null_file: TextIO | None = None  # /dev/null once headless
         self._previous_sighup: Any = None  # SIGHUP handler replaced at start, restored at stop
+        _register_fork_hook()
+        _displays.add(self)
 
     # --- the display ------------------------------------------------------------------------------------------------
 
