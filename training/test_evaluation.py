@@ -42,7 +42,7 @@ def _batches(count: int) -> list[Batch]:
     `count` fixed validation micro-batches of two rows each.
     """
 
-    return [(torch.randint(1, 512, (2, 16)), torch.randint(1, 512, (2, 16)), ["v", "v"]) for _ in range(count)]
+    return [Batch(torch.randint(1, 512, (2, 16)), torch.randint(1, 512, (2, 16)), ["v", "v"]) for _ in range(count)]
 
 
 def test_evaluate_reports_every_depth(
@@ -201,7 +201,7 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
     settings.eval_iters = 2
     torch.manual_seed(0)
     batches = _batches(3)
-    batches = [(x, y, ["a", "b"]) for x, y, _ in batches]
+    batches = [Batch(x, y, ["a", "b"]) for x, y, _ in batches]
     batches[1][1][1, :6] = -100  # six ignored tokens in a row of source b
     torch.manual_seed(1)
     metrics = evaluate(settings, cpu_backend, tiny_model, batches)

@@ -251,3 +251,23 @@ def test_stage_summary_mentions_every_stage_and_step_counts() -> None:
     assert "Transition OUT: 2 steps (25.0% of current stage)" in summary
     assert "Main training: 6 steps" in summary
     assert summary.count("Transition OUT") == 2  # none after the last stage
+    assert "Tokens per optimizer step: 1,024 (world batch 4 x block 256)" in summary
+
+
+def test_tokens_per_step_replaces_the_sequence_product() -> None:
+    """
+    Sequence packing: a step is `tokens_per_step` tokens, whatever `world_batch_size` (the validation batches) says.
+    """
+
+    packed = StageManager(tiny_stages(), world_batch_size=4, block_size=256, tokens_per_step=2048)
+    assert packed.tokens_per_step == 2048 and packed.packed
+    # 8192 // 2048 = 4 steps per pretrain stage, transition int(8192 * 0.25) // 2048 = 1 step, 4096 // 2048 = 2
+    assert _bounds(packed) == [(0, 4, 3), (4, 8, 7), (8, 10, 10)]
+    assert packed.total_steps == 10
+    assert "Tokens per optimizer step: 2,048 (packed sequences)" in packed.get_stage_summary()
+    same = StageManager(tiny_stages(), world_batch_size=4, block_size=256, tokens_per_step=1024)
+    assert _bounds(same) == _bounds(StageManager(tiny_stages(), world_batch_size=4, block_size=256))
+    with pytest.raises(ValueError, match="tokens_per_step must be positive"):
+        StageManager(tiny_stages(), world_batch_size=4, block_size=256, tokens_per_step=0)
+    with pytest.raises(ValueError, match="shorter than one optimizer step.*lower tokens_per_step"):
+        StageManager(tiny_stages(), world_batch_size=4, block_size=256, tokens_per_step=5000)

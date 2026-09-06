@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from ..config import RecurrentConfig
-from ..layers.attention import CausalSelfAttention
+from ..layers.attention import AttentionMask, CausalSelfAttention
 from ..layers.mlp import GatedMLP
 from ..layers.norms import RMSNorm
 
@@ -30,7 +30,7 @@ class SandwichBlock(torch.nn.Module):
         self.norm_3 = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.norm_4 = RMSNorm(config.n_embd, eps=config.norm_eps)
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
         attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
         x = self.norm_2(attn_out + x)
         mlp_out = self.mlp(self.norm_3(x))

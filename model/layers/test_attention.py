@@ -10,10 +10,15 @@ import pytest
 import torch
 from torch import Tensor
 
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+
 from model.layers.attention import (
     CausalSelfAttention,
     apply_rotary_emb_complex_like,
+    attention,
+    attention_flex,
     attention_sdpa,
+    document_attention_mask,
     precompute_freqs_cis,
 )
 from model.config import RecurrentConfig
@@ -196,3 +201,115 @@ def test_various_sequence_lengths(S: int) -> None:
     attn, cfg, freqs = make_attn()
     x = torch.randn(2, S, cfg.n_embd)
     assert attn(x, freqs[:, :S]).shape == (2, S, cfg.n_embd)
+
+
+# --- packed sequences: the document mask -------------------------------------------------------------------------------
+
+# three documents of 90, 70 and 40 positions in one 200-token row (crossing the 128-wide sparse blocks of a BlockMask)
+DOCUMENT_SPANS = [(0, 90), (90, 160), (160, 200)]
+DOCUMENT_IDS = torch.tensor([[document for document, (start, end) in enumerate(DOCUMENT_SPANS) for _ in range(end - start)]])
+
+
+def _dense_mask(document_ids: Tensor) -> Tensor:
+    """
+    `document_attention_mask` on the CPU: the dense bool mask (narrowed for the type checkers).
+    """
+
+    mask = document_attention_mask(document_ids)
+    assert isinstance(mask, Tensor)
+    return mask
+
+
+def _block_mask(document_ids: Tensor) -> BlockMask:
+    """
+    The `BlockMask` `document_attention_mask` builds on CUDA, built on the CPU for the inference-only flex path.
+    """
+
+    def same_document_causal(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        return (q_idx >= kv_idx) & (document_ids[b, q_idx] == document_ids[b, kv_idx])
+
+    seq = document_ids.shape[1]
+    return create_block_mask(same_document_causal, document_ids.shape[0], None, seq, seq, device="cpu")
+
+
+def test_document_attention_mask_is_causal_within_and_blocked_across_documents() -> None:
+    """
+    On the CPU the mask is a dense `(B, 1, S, S)` bool tensor (FlexAttention has no CPU backward): the causal
+    triangle inside every document, nothing across, every query attending at least to itself.
+    """
+
+    document_ids = torch.tensor([[0, 0, 1, 1, 1, 2], [0, 1, 1, 1, 2, 2]])
+    mask = document_attention_mask(document_ids)
+    assert isinstance(mask, Tensor) and mask.dtype == torch.bool and mask.shape == (2, 1, 6, 6)
+    for row in range(2):
+        for q in range(6):
+            for kv in range(6):
+                expected = kv <= q and bool(document_ids[row, q] == document_ids[row, kv])
+                assert bool(mask[row, 0, q, kv]) is expected, (row, q, kv)
+    assert bool(mask.any(dim=-1).all()), "no row attends to nothing"
+    with pytest.raises(ValueError, match=r"document_ids must be \(B, S\)"):
+        document_attention_mask(torch.zeros(6, dtype=torch.int32))
+
+
+def test_packed_attention_equals_every_document_attended_alone() -> None:
+    """
+    With the document mask, a packed row gives each document the output it gets on its own (plain causal
+    attention over that document only): the mask hides the other documents completely.
+    """
+
+    torch.manual_seed(0)
+    B, S, nh, hd = 1, DOCUMENT_IDS.shape[1], 2, 8
+    q, k, v = (torch.randn(B, S, nh, hd) for _ in range(3))
+    packed = attention_sdpa(q, k, v, _dense_mask(DOCUMENT_IDS))
+    for start, end in DOCUMENT_SPANS:
+        alone = attention_sdpa(q[:, start:end], k[:, start:end], v[:, start:end])
+        torch.testing.assert_close(packed[:, start:end], alone, atol=1e-5, rtol=1e-5)
+
+
+def test_packed_attention_leaks_nothing_across_documents() -> None:
+    """
+    Perturbing every token of the second document leaves the first and the third unchanged.
+    """
+
+    torch.manual_seed(1)
+    B, S, nh, hd = 1, DOCUMENT_IDS.shape[1], 2, 8
+    q, k, v = (torch.randn(B, S, nh, hd) for _ in range(3))
+    mask = _dense_mask(DOCUMENT_IDS)
+    reference = attention_sdpa(q, k, v, mask)
+    start, end = DOCUMENT_SPANS[1]
+    q2, k2, v2 = (t.clone() for t in (q, k, v))
+    for t in (q2, k2, v2):
+        t[:, start:end] += torch.randn(B, end - start, nh, hd)
+    perturbed = attention_sdpa(q2, k2, v2, mask)
+    torch.testing.assert_close(perturbed[:, :start], reference[:, :start], atol=1e-6, rtol=0)
+    torch.testing.assert_close(perturbed[:, end:], reference[:, end:], atol=1e-6, rtol=0)
+    assert not torch.allclose(perturbed[:, start:end], reference[:, start:end], atol=1e-3)
+
+
+def test_flex_attention_matches_the_dense_document_mask() -> None:
+    """
+    The FlexAttention path (a `BlockMask`, the CUDA training path) computes the same attention as sdpa under the
+    dense mask; on the CPU FlexAttention runs inference only, hence `no_grad`.
+    """
+
+    torch.manual_seed(2)
+    B, S, nh, hd = 1, DOCUMENT_IDS.shape[1], 2, 8
+    with torch.no_grad():
+        q, k, v = (torch.randn(B, S, nh, hd) for _ in range(3))
+        dense = attention_sdpa(q, k, v, _dense_mask(DOCUMENT_IDS))
+        block_mask = _block_mask(DOCUMENT_IDS)
+        flex = attention_flex(q, k, v, block_mask)
+        torch.testing.assert_close(flex, dense, atol=1e-4, rtol=1e-4)
+        assert torch.equal(attention(q, k, v, block_mask), flex), "`attention` dispatches a BlockMask to flex"
+        assert torch.equal(attention(q, k, v, None), attention_sdpa(q, k, v)), "... and None to plain causal sdpa"
+
+
+def test_attention_layer_accepts_a_block_mask() -> None:
+    attn, cfg, _ = make_attn()
+    S = DOCUMENT_IDS.shape[1]
+    freqs = precompute_freqs_cis(cfg.head_size, S, cfg.rope_settings.rope_base)
+    x = torch.randn(1, S, cfg.n_embd)
+    with torch.no_grad():
+        dense = attn(x, freqs[:, :S], _dense_mask(DOCUMENT_IDS))
+        flex = attn(x, freqs[:, :S], _block_mask(DOCUMENT_IDS))
+    torch.testing.assert_close(flex, dense, atol=1e-4, rtol=1e-4)

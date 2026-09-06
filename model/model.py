@@ -14,6 +14,7 @@ from typing import cast
 
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
 from .blocks.recurrence import (
@@ -27,7 +28,7 @@ from .blocks.recurrence import (
 )
 from .blocks.sandwich import SandwichBlock
 from .config import RecurrentConfig
-from .layers.attention import precompute_freqs_cis
+from .layers.attention import AttentionMask, precompute_freqs_cis
 from .layers.init import Linear
 
 # The chunked loss (validation) splits the tokens into this many pieces: a fixed count, so the loop is static under
@@ -42,24 +43,32 @@ _checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False,
 def prepare_attention_inputs(
     freqs_cis: Tensor,
     input_ids: Tensor,
-    attention_mask: Tensor | None = None,
+    attention_mask: AttentionMask = None,
     position_ids: Tensor | None = None,
-) -> tuple[Tensor, Tensor | None]:
+) -> tuple[Tensor, AttentionMask]:
     """
-    The two per-batch inputs every attention layer needs, as `(rotary, mask)`: the RoPE rows and the sdpa mask.
+    The two per-batch inputs every attention layer needs, as `(rotary, mask)`: the RoPE rows and the attention mask.
 
     `rotary`: the rows of `freqs_cis` for this batch's positions. Without `position_ids` the first S rows, shape
-    `(1, S, 1, hd // 2, 2)` (the training path, an exact no-op); with 1-D positions those rows in that order; with the
-    `(B, S)` positions transformers passes for a left-padded batch, one row per sequence, shape `(B, S, 1, hd // 2, 2)`.
+    `(1, S, 1, hd // 2, 2)` (the padded training path, an exact no-op); with 1-D positions those rows in that order;
+    with `(B, S)` positions (transformers' left-padded batch, or packed sequences with positions restarting per
+    document) one row per token, shape `(B, S, 1, hd // 2, 2)`.
 
-    `mask`: None without an `attention_mask` (the caller then uses sdpa's `is_causal=True`). Otherwise the `(B, S)`
-    padding mask (1 = keep) becomes a `(B, 1, S, S)` bool mask that already contains the causal triangle, because
-    some sdpa backends reject an explicit mask together with `is_causal=True`. True means attend. Every query keeps
-    its own position (the diagonal): a row allowed to attend to nothing, a pad token at the start of a left-padded
-    sequence, would give a NaN softmax row that spreads through the next layer's value matmul.
+    `mask`: None without an `attention_mask` (the caller then uses sdpa's `is_causal=True`). A `(B, S)` padding mask
+    (1 = keep) becomes a `(B, 1, S, S)` bool mask that already contains the causal triangle, because some sdpa
+    backends reject an explicit mask together with `is_causal=True`. True means attend. Every query keeps its own
+    position (the diagonal): a row allowed to attend to nothing, a pad token at the start of a left-padded sequence,
+    would give a NaN softmax row that spreads through the next layer's value matmul.
+
+    A ready mask passes through unchanged: a FlexAttention `BlockMask` or a `(B, 1, S, S)` bool tensor, both what
+    `document_attention_mask` builds for packed sequences. Those need `(B, S)` `position_ids` (the per-document
+    positions); without them the documents of a pack would be rotated as one long sequence, so that is an error.
     """
 
     sequence_length = input_ids.shape[1]
+    ready_mask = isinstance(attention_mask, BlockMask) or (attention_mask is not None and attention_mask.dim() == 4)
+    if ready_mask and (position_ids is None or position_ids.dim() != 2):
+        raise ValueError("a ready attention mask (packed sequences) needs (B, S) position_ids restarting per document")
     if position_ids is None:
         rotary = freqs_cis[:, :sequence_length]
     elif position_ids.dim() == 1:
@@ -72,6 +81,9 @@ def prepare_attention_inputs(
 
     if attention_mask is None:
         return rotary, None
+    if ready_mask:
+        return rotary, attention_mask
+    assert isinstance(attention_mask, Tensor)  # `ready_mask` covered the BlockMask
     if attention_mask.dim() != 2 or attention_mask.shape[1] != sequence_length:
         raise ValueError(
             f"attention_mask must be (B, S) with S={sequence_length}, got shape {tuple(attention_mask.shape)}"
@@ -185,7 +197,7 @@ class RecurrentGPT(torch.nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        attention_mask: Tensor | None = None,
+        attention_mask: AttentionMask = None,
         position_ids: Tensor | None = None,
         labels: Tensor | None = None,
         return_logits: bool = False,
@@ -197,9 +209,11 @@ class RecurrentGPT(torch.nn.Module):
         `labels`, the loss.
 
         Inputs. `labels` must be pre-shifted (the trainer's collate shifts; the HuggingFace wrapper shifts
-        internally instead): the loss is `CE(logits[t], labels[t])`. `attention_mask` is a `(B, S)` padding mask
-        (1 = keep), `position_ids` 1-D or `(B, S)`; both are None on the training path. `num_steps`: None (sample
-        the depth per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair per core block.
+        internally instead): the loss is `CE(logits[t], labels[t])`. `attention_mask`: a `(B, S)` padding mask
+        (1 = keep) for left-padded generation, or the ready document mask of packed sequences
+        (`document_attention_mask`: a `BlockMask` on CUDA, a `(B, 1, S, S)` bool tensor elsewhere) together with the
+        `(B, S)` per-document `position_ids`; both None for padded training. `num_steps`: None (sample the depth
+        per block), one (n_no_grad, k_with_grad) pair for all blocks, or one pair per core block.
 
         Outputs. `loss`: the mean cross-entropy over the valid labels (0 without labels). `log_ppl`: its detached
         copy. `logits`: the full fp32 `(B, S, padded_vocab)` logits when `return_logits`, else None.
@@ -337,7 +351,7 @@ class RecurrentGPT(torch.nn.Module):
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
     def run_core_blocks(
-        self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None, per_block_steps: list[StepsPair | None]
+        self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask, per_block_steps: list[StepsPair | None]
     ) -> Tensor:
         """
         All core blocks in order: each is iterated on its input and added back onto it (residual around the whole
@@ -355,7 +369,7 @@ class RecurrentGPT(torch.nn.Module):
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
     def run_core_block(
-        self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None, num_steps: StepsPair | None, block_idx: int
+        self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask, num_steps: StepsPair | None, block_idx: int
     ) -> Tensor:
         """
         Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, project the

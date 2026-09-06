@@ -341,7 +341,7 @@ class RunLogger:
         self.samples_written: list[Path] = []
         self._last_benchmarks: dict[str, float] = {}
         self.resumed_from: Path | None = None
-        self.tokens_per_step = settings.world_batch_size * settings.block_size
+        self.tokens_per_step = settings.tokens_per_optimizer_step
         self._clock = clock
         now = clock()
         self.setup_seconds = now - setup_started if setup_started is not None else 0.0

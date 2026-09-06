@@ -55,12 +55,13 @@ class SingleDeviceBackend:
         self.pin_memory = self.device.type == "cuda"
         _set_torch_flags()
 
-    def setup_model(self, model: Module, compile_model: bool = False) -> Module:
+    def setup_model(self, model: Module, compile_model: bool = False, dynamic: bool = True) -> Module:
         model = model.to(self.device)
         if compile_model:
-            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles
+            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles; packed
+            # sequences have one shape and compile static (dynamic=False)
             # torch.compile is typed as returning a bare callable; at runtime it is an OptimizedModule (a Module)
-            model = cast(Module, torch.compile(model, dynamic=True))
+            model = cast(Module, torch.compile(model, dynamic=dynamic))
         return model
 
     def setup_optimizer(self, optimizer: Optimizer) -> Optimizer:

@@ -1,7 +1,8 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 """
-Causal self-attention (fused qkv projection, optional q/k bias, RoPE) on top of `scaled_dot_product_attention`.
+Causal self-attention (fused qkv projection, optional q/k bias, RoPE) on top of `scaled_dot_product_attention`, or
+of FlexAttention when the batch carries a document `BlockMask` (packed sequences).
 
 Tensor shape names used throughout: B = batch, S = sequence length, E = n_embd, nh = number of heads,
 hd = head dimension (E == nh * hd).
@@ -9,15 +10,22 @@ hd = head dimension (E == nh * hd).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Union, cast
 
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask, flex_attention
 
 from .init import Linear
 
 if TYPE_CHECKING:
     from ..config import RecurrentConfig
+
+# What an attention layer accepts as its mask: None (plain causal), a broadcastable bool tensor that already contains
+# the causal triangle (sdpa's explicit-mask path), or a FlexAttention `BlockMask` (packed sequences on CUDA).
+AttentionMask = Union[Tensor, BlockMask, None]
+
+_compiled_flex_attention: Callable[..., Tensor] | None = None
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> Tensor:
@@ -74,6 +82,76 @@ def attention_sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) 
     return y.transpose(1, 2)
 
 
+def _flex_attention_kernel(device: torch.device) -> Callable[..., Tensor]:
+    """
+    `flex_attention` as called from an uncompiled model: compiled once on CUDA (eager FlexAttention on CUDA runs a
+    slow fallback), plain on other devices. Inside a `torch.compile`d forward the call is traced either way.
+    """
+
+    global _compiled_flex_attention
+    if device.type != "cuda" or torch.compiler.is_dynamo_compiling():
+        return flex_attention
+    if _compiled_flex_attention is None:
+        # torch.compile is typed after the overloaded flex_attention; the call below uses the plain-Tensor overload
+        _compiled_flex_attention = cast(Callable[..., Tensor], torch.compile(flex_attention))
+    return _compiled_flex_attention
+
+
+def attention_flex(q: Tensor, k: Tensor, v: Tensor, block_mask: BlockMask) -> Tensor:
+    """
+    Attention under a FlexAttention `BlockMask`; inputs and output are (B, S, nh, hd) like `attention_sdpa`.
+
+    The block mask carries the whole pattern (causal within a document, nothing across documents, see
+    `document_attention_mask`); blocks that are fully masked are skipped, so a packed row costs about what its
+    documents would cost on their own.
+    """
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    y: Tensor = _flex_attention_kernel(q.device)(q, k, v, block_mask=block_mask)
+    return y.transpose(1, 2)
+
+
+def attention(q: Tensor, k: Tensor, v: Tensor, mask: AttentionMask = None) -> Tensor:
+    """
+    `attention_flex` for a `BlockMask`, `attention_sdpa` otherwise (a bool mask or None).
+    """
+
+    if isinstance(mask, BlockMask):
+        return attention_flex(q, k, v, mask)
+    return attention_sdpa(q, k, v, mask)
+
+
+@torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
+def document_attention_mask(document_ids: Tensor) -> Tensor | BlockMask:
+    """
+    The attention mask of packed sequences from their `(B, S)` document ids: causal within a document, blocked
+    across documents. True means attend; every query attends at least to itself, so no row is fully masked.
+
+    On CUDA a FlexAttention `BlockMask` (block-sparse, built here OUTSIDE the model's forward: `create_block_mask`
+    is data-dependent and must not sit inside a compiled or CUDA-graph-captured region). On other devices the same
+    pattern as a dense `(B, 1, S, S)` bool mask for sdpa's explicit-mask path, because FlexAttention has no backward
+    on the CPU; that dense path is O(S^2) memory and the correctness reference, not a training path.
+    """
+
+    if document_ids.dim() != 2:
+        raise ValueError(f"document_ids must be (B, S), got shape {tuple(document_ids.shape)}")
+    batch_size, sequence_length = document_ids.shape
+
+    def same_document_causal(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        return (q_idx >= kv_idx) & (document_ids[b, q_idx] == document_ids[b, kv_idx])
+
+    if document_ids.device.type == "cuda":
+        return create_block_mask(
+            same_document_causal, batch_size, None, sequence_length, sequence_length, device=document_ids.device
+        )
+    dense: Tensor = create_mask(
+        same_document_causal, batch_size, None, sequence_length, sequence_length, device=document_ids.device
+    )
+    return dense
+
+
 class CausalSelfAttention(torch.nn.Module):
     """
     Multi-head causal self-attention: fused qkv projection, optional q/k bias, RoPE, sdpa, output projection.
@@ -92,7 +170,7 @@ class CausalSelfAttention(torch.nn.Module):
             self.qk_bias = torch.nn.Parameter(torch.zeros(2, 1, self.n_head, self.head_dim))
         self.proj = Linear(config.n_embd, config.n_embd, bias=False, init_method=config.init.fn("out_attn"))
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
         B, S, E = x.shape
         q, k, v = self.Wqkv(x).split(E, dim=2)  # each (B, S, E)
         q = q.view(B, S, self.n_head, self.head_dim)
@@ -105,7 +183,7 @@ class CausalSelfAttention(torch.nn.Module):
             k = (k + k_bias).to(q.dtype)
         q, k = apply_rotary_emb_complex_like(q, k, freqs_cis=freqs_cis)
 
-        y = attention_sdpa(q, k, v, mask)
+        y = attention(q, k, v, mask)
         y = y.reshape(B, S, E).contiguous()
         out: Tensor = self.proj(y)
         return out

@@ -51,6 +51,8 @@ plus the realised data composition of the world batches since the last log step
 
 Steps are optimizer steps: `total steps = Σ stage.tokens / (world_batch_size ×
 block_size)`, independent of `micro_batch_size` and of the number of devices.
+With `pack_sequences: true` a step is `tokens_per_step` tokens instead, so
+`total steps = Σ stage.tokens / tokens_per_step`.
 The stage boundary summary is printed at startup; check it before long runs.
 
 ## Example configs

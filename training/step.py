@@ -6,8 +6,9 @@ One optimizer step of the training loop: the micro-batch stream, the scheduled l
 Everything here is numerics, bit-identical to the thesis loop; the golden tests in `test_step.py` and `test_run.py`
 fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
 run, per-SAMPLE source draws from a private `random.Random(seed + resume step)`, and the world batch assembled from
-unpadded samples and padded once per micro-batch. Steps are OPTIMIZER steps: one world batch of
-`gradient_accumulation_steps` micro-batches, one `optimizer.step()`.
+unpadded samples and padded once per micro-batch (or, with `pack_sequences`, packed into one row per micro-batch,
+see `training.data.packing`). Steps are OPTIMIZER steps: one world batch of `gradient_accumulation_steps`
+micro-batches, one `optimizer.step()`.
 """
 
 import random
@@ -22,14 +23,18 @@ from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from model.layers.attention import document_attention_mask
 from training.backend.base import Backend, plain_model
 from training.data.collate import IGNORE_INDEX, Batch, Sample
 from training.data.loader import RunDataloaders, world_batch_micro_batches
+from training.data.packing import PackedBatch, PackPool, pack_samples
 from training.logger import track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
 from training.optim import set_lr
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
+
+MicroBatch = Batch | PackedBatch  # what the stream yields: a padded micro-batch, or a packed one with `pack_sequences`
 
 
 @dataclass
@@ -65,7 +70,7 @@ class StepResult:
     grad_norm: Tensor  # pre-clip gradient norm
     stage: StageInfo  # stage info at `step` (what the step trained on)
     data_ids: list[str]  # one entry per sample of the world batch (data composition)
-    metrics: dict[str, Tensor] = field(default_factory=dict)  # `track_gradient_metrics` at log steps, else {}
+    metrics: dict[str, Tensor] = field(default_factory=dict)  # at log steps: `track_gradient_metrics`, `packing/*`; else {}
     validation: dict[str, Tensor] | None = None  # filled by `train()` when it is an evaluation step
 
 
@@ -77,13 +82,20 @@ class BatchStream:
     is never re-read. Each sample of a world batch comes from a source drawn with the current step's weights; the
     full world batch is then split and padded by `world_batch_micro_batches`.
 
-    Checkpointed (`state_dict`): the rows read per source (dropped rows included), the draw RNG state and the
-    samples still buffered per source.
+    With `settings.pack_sequences` the same draws feed a `PackPool` instead (`_packed_stream`): before every
+    micro-batch the pool is refilled to `POOL_TOKEN_FACTOR` pack lengths of tokens, then one pack of
+    `tokens_per_micro_batch` tokens is taken first-fit from its front. Documents are drawn in the same order and
+    counted the same way; only their grouping into micro-batches differs, and the weights of a draw are those of the
+    step at which the pool was refilled (about one micro-batch of tokens ahead of the step that trains on them).
+
+    Checkpointed (`state_dict`): the rows read per source (dropped rows included), the draw RNG state, the samples
+    still buffered per source and (packing) the pool.
 
     Reproducibility rules:
     - the draw RNG is `random.Random(seed + resume step)`, restored from a checkpoint when there is one; every
       sample draw consumes it
-    - `progress.step` is read once per world batch, when its first micro-batch is requested
+    - `progress.step` is read once per world batch, when its first micro-batch is requested (padded), or once per
+      micro-batch, before the pool is refilled (packed)
     - loader iterators are created at a source's first pull; their base seeds come from the loaders' private
       generator, never from the global torch RNG
     """
@@ -98,33 +110,44 @@ class BatchStream:
         self.rng = random.Random(settings.seed + progress.step)
         self.consumed_rows: dict[str, int] = {}  # source name -> rows read so far (dropped rows included)
         self._buffers: dict[str, deque[Sample]] = {source: deque() for source in loaders.train_sources}
-        self._micro_batches = self._stream()
+        self._pool: PackPool | None = None
+        if settings.pack_sequences:
+            assert settings.tokens_per_micro_batch is not None  # `Settings._check_packing`
+            self._pool = PackPool(settings.tokens_per_micro_batch)
+        # `is not None`: an empty pool is falsy (`PackPool.__len__`), and a fresh pool is always empty
+        self._micro_batches: Iterator[MicroBatch] = (
+            self._packed_stream() if self._pool is not None else self._stream()
+        )
 
-    def __iter__(self) -> Iterator[Batch]:
+    def __iter__(self) -> Iterator[MicroBatch]:
         return self
 
-    def __next__(self) -> Batch:
+    def __next__(self) -> MicroBatch:
         return next(self._micro_batches)
 
     def state_dict(self) -> dict[str, Any]:
         """
-        What a checkpoint stores: the rows read per source (dropped rows included), the draw RNG state and the
-        buffered samples per source. Old checkpoint schemas have no loader (repo policy).
+        What a checkpoint stores: the rows read per source (dropped rows included), the draw RNG state, the
+        buffered samples per source and the packing pool (empty without packing). Old checkpoint schemas have no
+        loader (repo policy).
         """
 
         return {
             "consumed_rows": dict(self.consumed_rows),
             "draw_rng": self.rng.getstate(),
             "buffers": {source: list(buffer) for source, buffer in self._buffers.items() if buffer},
+            "pool": self._pool.state() if self._pool is not None else [],
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
         Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it,
-        the draw RNG picks its state back up and the buffered samples are trained on first.
+        the draw RNG picks its state back up, the buffered samples are trained on first and the packing pool is
+        what it was (a checkpoint from before packing existed has no `pool` entry: an empty pool).
 
         Counters are rows READ (dropped rows included), the unit the offsets skip. Buffered samples of a source
-        that no longer exists are dropped.
+        that no longer exists are dropped, and so is a stored pool when the run does not pack (the settings
+        comparison of the resume refuses that switch unless `allow_settings_change`).
         """
 
         self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
@@ -133,6 +156,8 @@ class BatchStream:
         for source, samples in state["buffers"].items():
             if source in self._buffers:
                 self._buffers[source].extend(samples)
+        if self._pool is not None:
+            self._pool.restore(list(state.get("pool", [])))
 
     def _next_sample(self, source: str) -> Sample:
         """
@@ -147,15 +172,26 @@ class BatchStream:
             buffer.extend(batch.samples)
         return buffer.popleft()
 
+    def _draw_weights(self) -> list[float]:
+        """
+        The per-source draw weights of the current step, in `train_sources` order (0 for a source the stage does
+        not use).
+        """
+
+        weights_at_step = self.stage_manager.data_weights(self.progress.step)
+        return [weights_at_step.get(source, 0.0) for source in self.loaders.train_sources]
+
+    def _draw_sample(self, weights: list[float]) -> Sample:
+        """
+        One document from a source drawn with `weights` (one draw-RNG call).
+        """
+
+        return self._next_sample(self.rng.choices(self.loaders.train_sources, weights=weights, k=1)[0])
+
     def _stream(self) -> Iterator[Batch]:
-        sources = self.loaders.train_sources
         while True:
-            weights_at_step = self.stage_manager.data_weights(self.progress.step)
-            weights = [weights_at_step.get(source, 0.0) for source in sources]
-            samples = [
-                self._next_sample(self.rng.choices(sources, weights=weights, k=1)[0])
-                for _ in range(self.settings.world_batch_size)
-            ]
+            weights = self._draw_weights()
+            samples = [self._draw_sample(weights) for _ in range(self.settings.world_batch_size)]
             yield from world_batch_micro_batches(
                 samples,
                 self.settings.micro_batch_size,
@@ -165,6 +201,23 @@ class BatchStream:
                 padding_multiple=self.settings.sequence_padding_multiple,
                 ignore_index=IGNORE_INDEX,
             )
+
+    def _packed_stream(self) -> Iterator[PackedBatch]:
+        """
+        The packed micro-batches: refill the pool to its token target with the current step's weights, take one
+        pack first-fit from its front, pack it.
+        """
+
+        pool = self._pool
+        assert pool is not None
+        while True:
+            weights = self._draw_weights()
+            while pool.needs_refill():
+                pool.add(self._draw_sample(weights))
+            samples = pool.take_pack()
+            if not samples:  # unreachable: the pool holds two pack lengths of documents that each fit a pack
+                raise RuntimeError("the packing pool holds documents but none fits into an empty pack")
+            yield pack_samples(samples, pool.pack_length, self.loaders.tokenizer, IGNORE_INDEX)
 
 
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:
@@ -184,13 +237,42 @@ def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, pro
     )
 
 
+def as_micro_batch(batch: MicroBatch | tuple[Any, ...]) -> MicroBatch:
+    """
+    `batch` as a `Batch` or `PackedBatch`: a plain `(input_ids, labels, data_ids)` tuple (a test's scripted batch,
+    an older collate) becomes a `Batch`.
+    """
+
+    if isinstance(batch, (Batch, PackedBatch)):
+        return batch
+    return Batch(*batch)
+
+
+def model_inputs(batch: MicroBatch | tuple[Any, ...], backend: Backend) -> dict[str, Any]:
+    """
+    The keyword arguments of the model's forward for one micro-batch, on the device: `input_ids` and `labels` for
+    a padded `Batch`; for a `PackedBatch` also the per-document `position_ids` and the document attention mask
+    (`document_attention_mask`, built here, outside the model's forward and any compiled region).
+    """
+
+    batch = as_micro_batch(batch)
+    inputs: dict[str, Any] = {
+        "input_ids": backend.to_device(batch.input_ids),
+        "labels": backend.to_device(batch.labels),
+    }
+    if isinstance(batch, PackedBatch):
+        inputs["position_ids"] = backend.to_device(batch.position_ids)
+        inputs["attention_mask"] = document_attention_mask(backend.to_device(batch.document_ids))
+    return inputs
+
+
 def run_one_optimizer_step(
     settings: Settings,
     backend: Backend,
     model: Module,
     optimizer: Optimizer,
     stage_manager: StageManager,
-    batches: Iterator[Batch],
+    batches: Iterator[MicroBatch],
     progress: TrainingProgress,
 ) -> StepResult:
     """
@@ -199,7 +281,9 @@ def run_one_optimizer_step(
 
     Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
-    loss is all-reduced every step (a no-op on one device).
+    loss is all-reduced every step (a no-op on one device). Packed micro-batches (`PackedBatch`) go through the same
+    loop; the loss stays the mean over the valid tokens of each micro-batch, averaged over the micro-batches (with
+    full packs the valid-token counts are nearly equal, so this is close to token-weighted).
     """
 
     step = progress.step
@@ -212,14 +296,16 @@ def run_one_optimizer_step(
     loss_sum = torch.zeros((), device=backend.device)
     log_ppl_sum = torch.zeros((), device=backend.device)
     data_ids: list[str] = []
+    padding_tokens = 0  # packed micro-batches: the tail positions without a document
     for micro_batch_index in range(accumulation_steps):
-        input_ids, labels, micro_batch_data_ids = next(batches)
-        data_ids.extend(micro_batch_data_ids)
-        input_ids = backend.to_device(input_ids)
-        labels = backend.to_device(labels)
+        batch = as_micro_batch(next(batches))
+        data_ids.extend(batch.data_ids)
+        if isinstance(batch, PackedBatch):
+            padding_tokens += batch.padding_tokens
+        inputs = model_inputs(batch, backend)
         with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
             with backend.autocast():
-                outputs = model(input_ids, labels=labels)
+                outputs = model(**inputs)
             backend.backward(outputs["loss"] / accumulation_steps)
         loss_sum += outputs["loss"].detach()
         log_ppl_sum += outputs["log_ppl"].detach()
@@ -234,8 +320,11 @@ def run_one_optimizer_step(
     if step > 0:  # as in the thesis runs: the very first update is skipped (LR is 0 there anyway with warmup)
         optimizer.step()
     metrics: dict[str, Tensor] = {}
-    if settings.log_gradient_metrics and (step + 1) % settings.log_step_interval == 0:
-        metrics = track_gradient_metrics(model, optimizer)
+    if (step + 1) % settings.log_step_interval == 0:
+        if settings.log_gradient_metrics:
+            metrics = track_gradient_metrics(model, optimizer)
+        if settings.pack_sequences:  # packing efficiency: the share of the step's tokens that were pack tails
+            metrics["packing/padding_fraction"] = torch.tensor(padding_tokens / settings.tokens_per_optimizer_step)
     optimizer.zero_grad(set_to_none=True)
 
     return StepResult(

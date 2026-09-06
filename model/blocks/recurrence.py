@@ -17,6 +17,8 @@ import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+from ..layers.attention import AttentionMask
+
 # (num_steps_no_grad, num_steps_with_grad) for one core block.
 StepsPair = tuple[int, int]
 # What callers may pass for one block: a pair, a 1- or 2-element tensor, or a scalar n (meaning (n, 0)).
@@ -131,7 +133,7 @@ def core_block_forward(
     x_latent: Tensor,
     x_base: Tensor,
     freqs_cis: Tensor,
-    mask: Tensor | None,
+    mask: AttentionMask,
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
     base_proj: Tensor | None = None,
@@ -160,7 +162,7 @@ def iterate_core_block(
     x_latent: Tensor,
     x_base: Tensor,
     freqs_cis: Tensor,
-    mask: Tensor | None,
+    mask: AttentionMask,
     num_steps_no_grad: int | Tensor,
     num_steps_with_grad: int | Tensor,
     *,
@@ -175,6 +177,8 @@ def iterate_core_block(
 
     `base_proj` is the adapter's input half (`adapter_base_projection(x_base, adapter)`), shared by all iterations;
     computed here once when not given. It is an input of every checkpointed iteration, so the recomputation reuses it.
+    `mask` may be a FlexAttention `BlockMask` (packed sequences); the non-reentrant checkpoint passes it through as a
+    plain positional argument.
     """
 
     if base_proj is None:

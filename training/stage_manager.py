@@ -91,7 +91,14 @@ class StageManager:
         warmup_steps: int = 0,
         cooldown_steps: int = 0,
         micro_batch_size: Optional[int] = None,
+        tokens_per_step: Optional[int] = None,
     ) -> None:
+        """
+        `tokens_per_step` given (sequence packing: `Settings.tokens_per_optimizer_step`) replaces
+        `world_batch_size * block_size` as the size of one optimizer step; the sequence-based checks still run on
+        `world_batch_size` (the validation batches), the `micro_batch_size` check is the caller's to skip.
+        """
+
         if not stages:
             raise ValueError("stages must contain at least one stage")
         if world_batch_size % world_size != 0:
@@ -101,13 +108,16 @@ class StageManager:
                 f"world_batch_size ({world_batch_size}) must be a multiple of micro_batch_size * world_size "
                 f"({micro_batch_size} * {world_size})"
             )
+        if tokens_per_step is not None and tokens_per_step <= 0:
+            raise ValueError(f"tokens_per_step must be positive, got {tokens_per_step}")
         self.stages = stages
         self.world_batch_size = world_batch_size
         self.block_size = block_size
         self.world_size = world_size
         self.warmup_steps = warmup_steps
         self.cooldown_steps = cooldown_steps
-        self.tokens_per_step = world_batch_size * block_size
+        self.tokens_per_step = tokens_per_step if tokens_per_step is not None else world_batch_size * block_size
+        self.packed = tokens_per_step is not None  # how the summary describes a step
 
         self.boundaries = self._calculate_stage_boundaries()
         self.total_steps = self.boundaries[-1].end_step
@@ -152,7 +162,8 @@ class StageManager:
             if stage_steps < 1:
                 raise ValueError(
                     f"stage {stage.name!r} is shorter than one optimizer step ({stage.tokens} tokens < "
-                    f"{self.tokens_per_step} per step); increase its tokens or lower world_batch_size"
+                    f"{self.tokens_per_step} per step); increase its tokens or lower "
+                    f"{'tokens_per_step' if self.packed else 'world_batch_size'}"
                 )
             if boundary.end_step - boundary.transition_start_step >= stage_steps:
                 raise ValueError(f"stage {stage.name!r}: the transition must be shorter than the stage")
@@ -241,7 +252,8 @@ class StageManager:
         lines = ["Multi-Stage Training Configuration:"]
         lines.append(f"  Total stages: {len(self.stages)}")
         lines.append(f"  Total optimizer steps: {self.total_steps:,}")
-        lines.append(f"  Tokens per optimizer step: {self.tokens_per_step:,} (world batch {self.world_batch_size} x block {self.block_size})")
+        step_shape = "packed sequences" if self.packed else f"world batch {self.world_batch_size} x block {self.block_size}"
+        lines.append(f"  Tokens per optimizer step: {self.tokens_per_step:,} ({step_shape})")
         lines.append(f"  World size: {self.world_size}")
         lines.append("")
 
