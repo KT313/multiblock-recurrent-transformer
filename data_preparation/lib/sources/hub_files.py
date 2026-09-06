@@ -13,8 +13,8 @@ rows in file order. How a file is fetched depends on its size (known from the in
   top-up at a larger offset seeks straight to the right row group.
 * larger .jsonl / .jsonl.zst / .jsonl.gz / .json.gz / .json files are streamed from the
   start (a .json array incrementally with ijson, :func:`iter_json_array`; a .json.gz is an array or json lines,
-  told apart by its first byte) and dropped after exactly count rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
-  file re-streams that file's prefix.
+  told apart by its first byte) and dropped after exactly count rows. Their row count is only known once read
+  to the end, so a top-up inside a partially consumed file re-streams that file's prefix.
 
 A :class:`FileIndex` per (repo, revision, glob) remembers the file list and sizes (one batched
 HfApi.get_paths_info call), the row count of every file read so far and the row-group row counts of every
