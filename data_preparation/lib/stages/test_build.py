@@ -34,7 +34,7 @@ from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
-from data_preparation.lib.stages.truncation import SPECIAL_TOKENS
+from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import Manifest
 
 Row = dict[str, Any]
@@ -651,7 +651,7 @@ def test_instruct_inversions_are_seeded_per_row_and_survive_a_resume(
     inverted = [r for r in resumed if r["instruction"].startswith("Given this output")]
     assert 4 <= len(inverted) <= 20 and m.stats["inverted"] == len(inverted) and m.shuffled is False
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) + SPECIAL_TOKENS != 8 for r in inverted), "tokens recounted, specials included"
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + NUMBER_OF_SPECIAL_TOKENS != 8 for r in inverted), "tokens recounted, specials included"
     assert [r["instruction"] for r in resumed if not r["instruction"].startswith("Given")] == [
         r["instruction"] for i, r in enumerate(rows) if not resumed[i]["instruction"].startswith("Given")
     ], "raw order kept without shuffle"

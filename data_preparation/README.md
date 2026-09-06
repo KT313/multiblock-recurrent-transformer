@@ -197,7 +197,7 @@ a prefix. Pretrain rows keep every row as `{text_field, tokens}` (a string, what
 `text_field` **cut at a token boundary** (`lib/stages/truncation.py`: the stored text is a prefix of the document,
 so storage is bounded and no count is ever wrong; `token_count: estimate` cuts at 4 characters per token). `tokens`
 is the length the trainer sees: the true count of the stored text plus the BOS and EOS the trainer adds around
-every row (`SPECIAL_TOKENS`), and never exceeds `max_seq_length`. Instruct rows run through the converter and
+every row (`NUMBER_OF_SPECIAL_TOKENS`), and never exceeds `max_seq_length`. Instruct rows run through the converter and
 filter at download time and are stored as `{instruction, input, output, tokens}` with `tokens` counted the same way
 over the text the trainer formats from them (`instruct_text`); a row whose `tokens` exceeds `max_seq_length` is
 **dropped**, never cut (an answer missing its end would be worse than a missing row; `dropped_too_long` in the

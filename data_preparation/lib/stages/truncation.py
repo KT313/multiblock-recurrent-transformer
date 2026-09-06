@@ -5,8 +5,8 @@ Truncate document text at a token boundary so the stored text has at most max_to
 The download step cuts the text itself instead of storing the whole document with a capped count, so the stored
 count is the true count of the stored text and storage is bounded. Tokens are counted like TokenCounter in
 stages/download.py: the config tokenizer with add_special_tokens=False, or len(text) // 4 in
-token_count: estimate mode. The trainer adds :data:`SPECIAL_TOKENS` around every row, so the download asks for
-max_seq_length - SPECIAL_TOKENS here and stores count + SPECIAL_TOKENS as the row's tokens (the length the
+token_count: estimate mode. The trainer adds :data:`NUMBER_OF_SPECIAL_TOKENS` around every row, so the download asks for
+max_seq_length - NUMBER_OF_SPECIAL_TOKENS here and stores count + NUMBER_OF_SPECIAL_TOKENS as the row's tokens (the length the
 trainer sees, never above max_seq_length).
 
 Invariants of :func:`truncate_many` (tested): the returned text is a prefix of the input, its count is the
@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # transformers is imported lazily by the tokenizer stage (HF 
 
 CHARS_PER_TOKEN_ESTIMATE = 4  # token_count: estimate counts len(text) // CHARS_PER_TOKEN_ESTIMATE
 
-SPECIAL_TOKENS = 2  # BOS and EOS the trainer adds around every row (training/data/formats.py); part of every stored count
+NUMBER_OF_SPECIAL_TOKENS = 2  # BOS and EOS the trainer adds around every row (training/data/formats.py); part of every stored count
 TOKEN_RULE = "with_specials"  # names the counting rule in DatasetConfig.raw_hash, so raw folders counted otherwise are stale
 
 # A text is cut at PRE_CUT_CHARS_PER_TOKEN * max_tokens characters before tokenizing, so the tokenizer cost per

@@ -44,7 +44,7 @@ from data_preparation.lib.stages.download import (
     prepare_tokenizer,
     reopen_raw,
 )
-from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, SPECIAL_TOKENS, estimate_tokens
+from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, NUMBER_OF_SPECIAL_TOKENS, estimate_tokens
 
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
@@ -234,7 +234,7 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     m = download(cfg, "g", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 7 and m.rows_fetched == 7 and m.exhausted is True
     rows = read_rows(layout.raw_dir("g"))
-    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6 + SPECIAL_TOKENS}
+    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6 + NUMBER_OF_SPECIAL_TOKENS}
     assert m.token_count == "tokenizer" and m.tokenizer == "synthetic" and m.tokens() == sum(r["tokens"] for r in rows)
     # exhausted: a larger request is a no-op
     assert download(cfg, "g", layout, rows_needed=100, shard_size=4) == m
@@ -252,7 +252,7 @@ def test_download_projects_to_the_text_field_and_requires_it(
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
     download(cfg, "c", layout, rows_needed=1)
-    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40 + SPECIAL_TOKENS}]  # tokens of `code`; no `lang`
+    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40 + NUMBER_OF_SPECIAL_TOKENS}]  # tokens of `code`; no `lang`
     bad = cfg_factory({"c": _local(src_dir, text_field="text")})
     other = DatasetLayout(layout.root / "other")
     prepare_tokenizer(bad, other)
@@ -406,9 +406,9 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     m = download(cfg, "i", layout, rows_needed=3, shard_size=10)
     assert m.rows() == 3 and m.rows_fetched == 5 and m.skipped_malformed == 2
     assert read_rows(layout.raw_dir("i")) == [
-        {"instruction": "what", "input": "", "output": "that", "tokens": 2 + SPECIAL_TOKENS},
-        {"instruction": "how", "input": "background", "output": "so", "tokens": 3 + SPECIAL_TOKENS},
-        {"instruction": "why", "input": "", "output": "because", "tokens": 2 + SPECIAL_TOKENS},
+        {"instruction": "what", "input": "", "output": "that", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS},
+        {"instruction": "how", "input": "background", "output": "so", "tokens": 3 + NUMBER_OF_SPECIAL_TOKENS},
+        {"instruction": "why", "input": "", "output": "because", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS},
     ]  # tokens: instruction + input + output, plus the trainer's BOS and EOS
 
 
@@ -431,7 +431,7 @@ def test_download_instruct_skips_converter_results_without_instruction_or_output
     cfg = with_tokenizer(cfg_factory({"h": _local(src_dir, kind="instruct", converter="half")}))
     m = download(cfg, "h", layout, rows_needed=3)
     assert m.rows() == 1 and m.rows_fetched == 3 and m.skipped_malformed == 2 and m.exhausted is True
-    assert read_rows(layout.raw_dir("h")) == [{"instruction": "c", "input": "", "output": "d", "tokens": 2 + SPECIAL_TOKENS}]
+    assert read_rows(layout.raw_dir("h")) == [{"instruction": "c", "input": "", "output": "d", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS}]
 
 
 def test_download_instruct_filter_reads_the_source_once(
@@ -445,7 +445,7 @@ def test_download_instruct_filter_reads_the_source_once(
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
     # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
     assert m.rows() == 3 and m.rows_fetched == 6 and not m.exhausted
-    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2 + SPECIAL_TOKENS} for r in read_rows(layout.raw_dir("s")))
+    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS} for r in read_rows(layout.raw_dir("s")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
     assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.exhausted is True
 
@@ -480,7 +480,7 @@ def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenize
     rows = read_rows(layout.raw_dir("i"))
     assert rows == [{**synthetic_row("instruct", 2, i), "tokens": r["tokens"]} for i, r in enumerate(rows)]
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) + SPECIAL_TOKENS for r in rows)
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + NUMBER_OF_SPECIAL_TOKENS for r in rows)
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -617,8 +617,8 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     truncated = unchanged = 0
     for index, row in enumerate(rows):
         original = synthetic_row("pretrain", 3, index)["text"]
-        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) + SPECIAL_TOKENS <= cap
-        if counter.count(original) + SPECIAL_TOKENS <= cap:
+        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) + NUMBER_OF_SPECIAL_TOKENS <= cap
+        if counter.count(original) + NUMBER_OF_SPECIAL_TOKENS <= cap:
             assert row["text"] == original
             unchanged += 1
         else:
@@ -658,8 +658,8 @@ def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
     cfg = cfg_factory({"e": _local(src_dir)}, token_count="estimate", max_seq_length=10)
     m = download(cfg, "e", layout, rows_needed=2)  # no tokenizer stage needed
     rows = read_rows(layout.raw_dir("e"))
-    text_cap = (10 - SPECIAL_TOKENS) * CHARS_PER_TOKEN_ESTIMATE  # the specials take 2 of the 10 tokens
-    assert rows == [{"text": "x" * text_cap, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short") + SPECIAL_TOKENS}]
+    text_cap = (10 - NUMBER_OF_SPECIAL_TOKENS) * CHARS_PER_TOKEN_ESTIMATE  # the specials take 2 of the 10 tokens
+    assert rows == [{"text": "x" * text_cap, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short") + NUMBER_OF_SPECIAL_TOKENS}]
     assert m.truncated_at_tokens == 10 and m.token_count == "estimate" and m.tokenizer is None
 
 
@@ -686,8 +686,8 @@ def test_download_github_code_group_truncates_like_separate_downloads(
     for name in ("py", "java"):
         rows = read_rows(grouped.raw_dir(name))
         assert rows == read_rows(separate.raw_dir(name)) and len(rows) == 3
-        words = cap - SPECIAL_TOKENS
-        assert all(r["tokens"] == cap == counter.count(r["text"]) + SPECIAL_TOKENS and r["text"].count(" ") == words for r in rows)  # cut where token 5 starts
+        words = cap - NUMBER_OF_SPECIAL_TOKENS
+        assert all(r["tokens"] == cap == counter.count(r["text"]) + NUMBER_OF_SPECIAL_TOKENS and r["text"].count(" ") == words for r in rows)  # cut where token 5 starts
         assert all(any(source["text"].startswith(r["text"]) for source in long_rows) for r in rows)
         assert manifests[name].truncated_at_tokens == cap and manifests[name].tokens() == 3 * cap
 
@@ -739,7 +739,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     assert m.truncated_at_tokens == 5
     rows = read_rows(layout.raw_dir("d"))
     assert [r["instruction"] for r in rows] == [f"i{i}" for i in range(30) if i % 3 == 2]
-    assert all(r["tokens"] == 2 + SPECIAL_TOKENS and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
+    assert all(r["tokens"] == 2 + NUMBER_OF_SPECIAL_TOKENS and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
 
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
@@ -758,8 +758,8 @@ def test_download_instruct_estimate_mode_drops_by_estimated_count(
     cfg = cfg_factory({"e": src}, token_count="estimate", max_seq_length=8)
     m = download(cfg, "e", layout, rows_needed=2)
     stored = read_rows(layout.raw_dir("e"))
-    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0])) + SPECIAL_TOKENS}]
-    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20})) + SPECIAL_TOKENS
+    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0])) + NUMBER_OF_SPECIAL_TOKENS}]
+    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20})) + NUMBER_OF_SPECIAL_TOKENS
     assert m.dropped_too_long == 1 and m.exhausted is True
 
 

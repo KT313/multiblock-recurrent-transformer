@@ -13,7 +13,7 @@ the repair step (lib/build/repair.py) deletes such folders after the user confir
 
 What a raw row is: pretrain rows carry text_field only (a string, whatever the loader delivered) truncated at
 a token boundary so that tokens, the true count of the stored text plus the BOS and EOS the trainer adds
-(truncation.SPECIAL_TOKENS), is at most max_seq_length; instruct rows carry instruction / input / output with
+(truncation.NUMBER_OF_SPECIAL_TOKENS), is at most max_seq_length; instruct rows carry instruction / input / output with
 tokens = the count of the text the trainer formats from them (row_pipeline.instruct_text) plus the same two
 specials, uncapped. An instruct row whose tokens exceeds max_seq_length is not stored at all (dropped_too_long;
 cutting an answer would be worse than losing the row). So a stored tokens is the length the trainer sees and
@@ -59,7 +59,7 @@ from data_preparation.lib.sources.loaders import (
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.stages.row_pipeline import instruct_text
-from data_preparation.lib.stages.truncation import SPECIAL_TOKENS, estimate_tokens, truncate_many
+from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS, estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import RawFolder, RowProgress
@@ -76,7 +76,7 @@ class TokenCounter:
     """
     Token counts with the config's tokenizer (token_count: tokenizer, add_special_tokens=False) or
     len(text) // 4 (estimate): the text's own tokens, without the BOS and EOS the trainer adds (the token step adds
-    truncation.SPECIAL_TOKENS to what it stores). Counts are never capped here: the download truncates pretrain
+    truncation.NUMBER_OF_SPECIAL_TOKENS to what it stores). Counts are never capped here: the download truncates pretrain
     *text* at the cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
     """
 
@@ -463,7 +463,7 @@ class _TokenStep:
     buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls
     tokenize(batch) on those batches, in order, and gets the rows ready to store.
 
-    Every stored tokens counts the text plus :data:`SPECIAL_TOKENS` (the BOS and EOS the trainer adds), the one
+    Every stored tokens counts the text plus :data:`NUMBER_OF_SPECIAL_TOKENS` (the BOS and EOS the trainer adds), the one
     place the specials enter a count. Pretrain rows: text_field is truncated (truncation.py) so that this sum is at
     most max_tokens. Instruct rows: tokens counts the trainer's text (row_pipeline.instruct_text) uncapped; a row
     over max_tokens is dropped (counters.dropped_too_long), never cut, and every stored row's progress carries the
@@ -471,8 +471,8 @@ class _TokenStep:
     """
 
     def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _IncrementCounters) -> None:
-        if max_tokens < SPECIAL_TOKENS:
-            raise ValueError(f"max_seq_length {max_tokens} leaves no room for the {SPECIAL_TOKENS} special tokens of a row")
+        if max_tokens < NUMBER_OF_SPECIAL_TOKENS:
+            raise ValueError(f"max_seq_length {max_tokens} leaves no room for the {NUMBER_OF_SPECIAL_TOKENS} special tokens of a row")
         self._counter = counter
         self._max_tokens = max_tokens
         self._counters = counters
@@ -515,15 +515,15 @@ class _TokenStep:
 
     def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
         texts = [row[self._text_field] for row, _ in batch]
-        for (row, _), (cut, tokens) in zip(batch, self._counter.truncate_many(texts, self._max_tokens - SPECIAL_TOKENS), strict=True):
+        for (row, _), (cut, tokens) in zip(batch, self._counter.truncate_many(texts, self._max_tokens - NUMBER_OF_SPECIAL_TOKENS), strict=True):
             row[self._text_field] = cut
-            row["tokens"] = tokens + SPECIAL_TOKENS
+            row["tokens"] = tokens + NUMBER_OF_SPECIAL_TOKENS
         return batch
 
     def _drop_long_instruct_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
         stored: list[StoredRow] = []
         for (row, before), count in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
-            tokens = count + SPECIAL_TOKENS
+            tokens = count + NUMBER_OF_SPECIAL_TOKENS
             if tokens > self._max_tokens:
                 self._counters.dropped_too_long += 1
                 continue
