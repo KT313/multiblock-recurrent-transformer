@@ -15,7 +15,10 @@ prepare materialises a dataset config: tokenizer, repair, (download + build) rou
 manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
 and without a terminal the command prints the list and exits 2 with nothing changed. status prints what the
 repair step would do plus the status table and exits 0 iff the dataset is complete. describe renders the config
-as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches.
+as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches. prepare
+turns the tokenizer's thread pool on with TOKENIZER_POOL_THREADS threads (TOKENIZERS_PARALLELISM=true and
+RAYON_NUM_THREADS=8 unless set in the environment): this process never forks after loading the tokenizer, and
+downloads tokenize every row on that one pool, whatever their number.
 
 Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
 repair, 3 another data preparation is still running (lib/build/lock.py; the message names its pid and start
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -58,6 +62,7 @@ from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard  # n
 log = get_logger(__name__)
 
 TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
+TOKENIZER_POOL_THREADS = 8  # threads of the tokenizer's Rust pool (one per process, shared by every download job)
 DEFAULT_DATASET_DIR = Path("dataset")
 
 EXIT_CONFIRMATION_REQUIRED = 2
@@ -118,6 +123,14 @@ def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
 
 
 def run_prepare(args: argparse.Namespace) -> None:
+    # The tokenizer's Rust thread pool: on here, off by library default (`_auto_tokenizer` in lib/stages/download.py).
+    # The guard exists for a training run that prepares data in-process and then forks DataLoader workers; this
+    # process never forks after the tokenizer is loaded (the cleaning passes use spawn pools), and a download
+    # batch tokenizes several times faster on several cores. The pool is one per process, shared by every download
+    # job, and sized TOKENIZER_POOL_THREADS (Rayon's default is every core: measured, past 8 threads a 256-row
+    # batch barely gets faster while the CPU time keeps growing). Explicit values in the environment win.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+    os.environ.setdefault("RAYON_NUM_THREADS", str(TOKENIZER_POOL_THREADS))
     configure_hf_cache(args.cache_dir)
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing

@@ -10,6 +10,7 @@ import importlib
 import io
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -959,3 +960,112 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
     assert calls == [(0, 2**62)] and closed == [True], "one call, closed after the 20th kept row"
     m2 = download(cfg, "s", layout, rows_needed=25, shard_size=10)
     assert m2.rows() == 25 and calls[1] == (77, 2**62)
+
+
+# --- the token worker ----------------------------------------------------------------------------------------------
+
+
+class _FakeCounter:
+    """
+    A `TokenCounter` stand-in (estimate counts) whose `truncate_many` calls go through `on_batch(call number)` first.
+    """
+
+    on_batch: Callable[[int], None] = staticmethod(lambda call: None)
+    calls = 0
+
+    def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
+        pass
+
+    def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
+        type(self).calls += 1
+        type(self).on_batch(type(self).calls)
+        return [(text, estimate_tokens(text)) for text in texts]
+
+    def count_many(self, texts: list[str]) -> list[int]:
+        return [estimate_tokens(text) for text in texts]
+
+
+def _counting_loader(monkeypatch: pytest.MonkeyPatch, on_row: Callable[[int], None], total: int = 100) -> list[bool]:
+    """
+    Stub the synthetic loader with one that yields `total` rows and calls on_row(rows yielded so far) before
+    each; returns the list that records the loader's generator being closed.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    closed: list[bool] = []
+
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        try:
+            for i in range(offset, min(offset + count, total)):
+                on_row(i - offset + 1)
+                yield {"text": f"row {i}"}
+        finally:
+            closed.append(True)
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    return closed
+
+
+def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    The first tokenizer call blocks until the loader has yielded two more batches: only a fetch thread that runs
+    ahead of the token worker gets there (in one thread the tokenizer would wait for rows that are never pulled).
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    tokenizer_may_go = threading.Event()
+
+    def on_batch(call: int) -> None:
+        if call == 1:
+            assert tokenizer_may_go.wait(timeout=10), "the fetch thread did not run ahead of the tokenizer"
+
+    def on_row(yielded: int) -> None:
+        if yielded == 3 * download_module.TOKEN_BATCH:
+            tokenizer_may_go.set()
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
+    monkeypatch.setattr(_FakeCounter, "calls", 0)
+    monkeypatch.setattr(download_module, "TokenCounter", _FakeCounter)
+    closed = _counting_loader(monkeypatch, on_row, total=40)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    m = download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    assert tokenizer_may_go.is_set() and closed == [True]
+    assert m.rows() == 40 and m.rows_fetched == 40 and [(s.rows, s.offset) for s in m.shards] == [(10, 10 * (i + 1)) for i in range(4)]
+    assert [r["text"] for r in read_rows(layout.raw_dir("p"))] == [f"row {i}" for i in range(40)]  # in order, whatever the threads did
+
+
+def test_a_failure_on_the_token_worker_ends_the_download_like_a_loader_failure(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    The tokenizer raises on the fifth batch (rows 20-24, after two shards were published): the download raises
+    that error on its own thread, the loader's stream is closed, the published shards stay and the partial one is
+    discarded (the same outcome as the loader failing there), and the next call resumes at shard 2.
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+
+    def on_batch(call: int) -> None:
+        if call == 5:
+            raise RuntimeError("tokenizer exploded")
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
+    monkeypatch.setattr(_FakeCounter, "calls", 0)
+    monkeypatch.setattr(download_module, "TokenCounter", _FakeCounter)
+    closed = _counting_loader(monkeypatch, lambda yielded: None, total=100)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    threads_before = threading.active_count()
+    with pytest.raises(RuntimeError, match="tokenizer exploded"):
+        download(cfg, "p", layout, rows_needed=100, shard_size=10)
+    raw = layout.raw_dir("p")
+    m = Manifest.load(raw)
+    assert closed == [True] and threading.active_count() == threads_before, "the stream is closed and the worker joined"
+    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
+    assert not list(raw.glob("*.tmp")) and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(20)]
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(lambda call: None))
+    m2 = download(cfg, "p", layout, rows_needed=100, shard_size=10)
+    assert m2.rows() == 100 and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(100)]

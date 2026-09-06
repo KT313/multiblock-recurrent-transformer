@@ -209,3 +209,21 @@ def test_prepare_exits_3_while_another_run_holds_the_build_lock(tmp_path: Path, 
     err = capsys.readouterr().err
     assert "data preparation expects one run at a time on this system; one is already running (started " in err
     assert f"kill -INT {os.getpid()}" in err
+
+
+def test_prepare_turns_the_tokenizer_thread_pool_on_unless_the_environment_says_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The CLI never forks after loading the tokenizer, so it lifts the library's `TOKENIZERS_PARALLELISM=false`
+    guard; an explicit value in the environment is kept.
+    """
+
+    monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
+    monkeypatch.delenv("RAYON_NUM_THREADS", raising=False)
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "a"), "--dry_run"])
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true" and os.environ["RAYON_NUM_THREADS"] == str(prepare.TOKENIZER_POOL_THREADS)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.setenv("RAYON_NUM_THREADS", "3")
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "b"), "--dry_run"])
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "false" and os.environ["RAYON_NUM_THREADS"] == "3"

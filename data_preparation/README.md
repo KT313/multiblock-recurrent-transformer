@@ -168,7 +168,12 @@ defaults). Sources with nothing to download are built right away, every other so
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard. Because the two pools
 overlap, peak memory is the downloads *plus* `--num_workers` builds (each holding a `dedup.bloom_memory_mb` filter),
-not the larger of the two.
+not the larger of the two. Inside a download job, fetching the next row group and tokenizing the previous batches
+overlap too (a token worker thread per job; the rows are still written in order), and `prepare.py` turns the
+tokenizer's own thread pool on (`TOKENIZERS_PARALLELISM=true`, off by library default because a training run that
+prepares data in-process forks DataLoader workers afterwards) with 8 threads (`RAYON_NUM_THREADS`; the pool is one
+per process and shared by every download job, and past 8 threads a batch barely gets faster). A single download is
+therefore bound by its network fetch; `--max_parallel_downloads` scales from there.
 
 A round is normally enough. A second one happens when a loader returned fewer rows than asked without being
 exhausted, or when the length filter and the dedup dropped more than the 20 % safety margin covers, and it really

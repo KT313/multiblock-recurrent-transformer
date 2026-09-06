@@ -17,12 +17,19 @@ input / output with tokens = the count of their concatenation, uncapped. An inst
 max_seq_length is not stored at all (dropped_too_long; cutting an answer would be worse than losing the
 row). The raw manifest records truncated_at_tokens (the cap used, both kinds), token_count and the
 tokenizer name.
+
+A download pass (:func:`_fetch`) is a two-stage pipeline: the job's own thread pulls rows from the loader, converts
+them and buffers :data:`TOKEN_BATCH` rows per source, and a token worker thread (:class:`_TokenWorker`) tokenizes
+the batches and writes the shards, in order. Fetching the next row group (network, parquet decode) so overlaps
+tokenizing the previous batches, which took as long as the fetch itself in one thread. The tokenizer's own thread
+pool is a separate matter (`TOKENIZERS_PARALLELISM`, see :func:`_auto_tokenizer`).
 """
 
 from __future__ import annotations
 
 import functools
 import os
+import queue
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
@@ -121,7 +128,9 @@ def _auto_tokenizer() -> Any:
     with _IMPORT_LOCK:
         # the tokenizer's Rust thread pool + a later fork (torch DataLoader workers; the decontamination /
         # minhash pools are spawn and immune) is the well-known tokenizers deadlock; the library's own
-        # mitigation, set before the first load (spawn children inherit it through the environment)
+        # mitigation, set before the first load (spawn children inherit it through the environment). The
+        # prepare CLI, which never forks after this point, sets "true" before it gets here (prepare.py): a batch
+        # then tokenizes on every core instead of one, the biggest lever on the download rate.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from transformers import AutoTokenizer
 
@@ -285,6 +294,10 @@ def fetch_source(config: DatasetConfig, source: SourceConfig) -> SourceConfig:
 class _IncrementCounters:
     """
     What one download increment did so far (updated while :func:`_fetch` runs, read back at the end).
+
+    Two threads write here, each its own fields: the fetch thread `consumed` and `skipped_malformed`, the token
+    worker `kept` and `dropped_too_long` (they follow the tokenizer); either may read the other's. `exhausted` is
+    set after the worker joined.
     """
 
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
@@ -391,13 +404,15 @@ UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop 
 StoredRow = tuple[Row, RowProgress]  # a row ready to store, with where the fetch stood right after it
 
 TOKEN_BATCH = 256  # rows tokenized per tokenizer call while downloading
+TOKEN_QUEUE_DEPTH = 3  # batches the fetch thread may run ahead of the token worker (bounds the raw text alive per job)
 
 
 class _TokenStep:
     """
-    The token step of a download, fed row by row and batching :data:`TOKEN_BATCH` rows per tokenizer call:
-    add(row, progress) returns the rows ready to store once a batch is full (else []), flush() the rest;
-    every returned row comes with the :class:`RowProgress` right after it.
+    The token step of a download, in two halves used from two threads. The fetch thread feeds it row by row:
+    add(row, progress) returns a full batch of :data:`TOKEN_BATCH` rows (else []), take() whatever is
+    buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls
+    tokenize(batch) on those batches, in order, and gets the rows ready to store.
 
     Pretrain rows: text_field is truncated at token max_tokens (truncation.py) and tokens is the
     true count of the stored text. Instruct rows: tokens counts instruction + input + output uncapped; a row over
@@ -423,14 +438,25 @@ class _TokenStep:
 
     def add(self, row: Row, progress: RowProgress) -> list[StoredRow]:
         """
-        Buffer row; a full batch (:data:`TOKEN_BATCH` rows) is released.
+        Buffer row; a full batch (:data:`TOKEN_BATCH` rows) is released, untokenized.
         """
 
         self._batch.append((row, progress))
-        return self.flush() if len(self._batch) >= TOKEN_BATCH else []
+        return self.take() if len(self._batch) >= TOKEN_BATCH else []
 
-    def flush(self) -> list[StoredRow]:
+    def take(self) -> list[StoredRow]:
+        """
+        The buffered rows (possibly none), untokenized; the buffer is empty afterwards.
+        """
+
         batch, self._batch = self._batch, []
+        return batch
+
+    def tokenize(self, batch: list[StoredRow]) -> list[StoredRow]:
+        """
+        The rows of batch ready to store: pretrain rows truncated and counted, instruct rows counted or dropped.
+        """
+
         if not batch:
             return []
         return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
@@ -470,10 +496,20 @@ class _Increment:
     counters: _IncrementCounters
     converter: Callable[[Row], Row] | None  # instruct sources: the standardizing converter (None: rows are standard already)
     row_filter: Filter | None
+    submitted: int = 0  # rows handed to the token worker (fetch thread)
+    settled: int = 0  # rows the token worker stored or dropped (worker thread)
 
     @property
     def is_instruct(self) -> bool:
         return self.source.kind == "instruct"
+
+    @property
+    def in_flight(self) -> int:
+        """
+        Rows handed to the token worker whose fate (stored or dropped) is not settled yet.
+        """
+
+        return self.submitted - self.settled
 
     @property
     def loader_count(self) -> int:
@@ -566,15 +602,101 @@ def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
             close()
 
 
+class _TokenWorker:
+    """
+    The tokenizing half of a download pass on its own thread: batches submitted by the fetch thread are tokenized
+    (:meth:`_TokenStep.tokenize`) and stored (:func:`_store`) in submission order, so row order, the per-row
+    progress and the shard boundaries are exactly those of the same pass done in one thread. The queue holds
+    :data:`TOKEN_QUEUE_DEPTH` batches: submit blocks the fetch thread when the worker is that far behind.
+
+    A failure on the worker (a tokenizer error, a write error, :class:`BuildAborted` from the stop check after a
+    published shard) is kept and re-raised on the fetch thread by the next :meth:`submit`, :meth:`drain` or
+    :meth:`close` (:attr:`failed` tells earlier); from then on the worker only settles what is queued without
+    storing it. close is what leaving the with block does: it joins the thread whatever happened, so the shard
+    writers are closed after the worker is done with them.
+    """
+
+    def __init__(self, name: str, writers: dict[str, ShardWriter], bar: Progress) -> None:
+        self._queue: queue.Queue[tuple[_Increment, list[StoredRow]] | None] = queue.Queue(maxsize=TOKEN_QUEUE_DEPTH)
+        self._writers = writers
+        self._bar = bar
+        self._failure: BaseException | None = None
+        self._raised = False
+        self._thread = threading.Thread(target=self._run, name=f"tokenize:{name}")
+        self._thread.start()
+
+    @property
+    def failed(self) -> bool:
+        return self._failure is not None
+
+    def submit(self, increment: _Increment, batch: list[StoredRow]) -> None:
+        """
+        Queue batch (nothing for an empty one) for increment; raises the worker's failure instead if it has one.
+        """
+
+        self._raise_failure()
+        if not batch:
+            return
+        increment.submitted += len(batch)
+        self._queue.put((increment, batch))
+
+    def drain(self) -> None:
+        """
+        Wait until every submitted batch is stored (or dropped), then raise the worker's failure if it has one.
+        """
+
+        self._queue.join()
+        self._raise_failure()
+
+    def close(self) -> None:
+        """
+        End the worker after the queued batches (or after settling them, once failed) and join it; raises the
+        worker's failure if it was not raised before.
+        """
+
+        self._queue.put(None)
+        self._thread.join()
+        self._raise_failure()
+
+    def __enter__(self) -> _TokenWorker:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def _raise_failure(self) -> None:
+        if self._failure is not None and not self._raised:
+            self._raised = True
+            raise self._failure
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                increment, batch = item
+                if self._failure is None:
+                    try:
+                        _store(increment, self._writers[increment.name], increment.token_step.tokenize(batch), self._bar)
+                    except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
+                        self._failure = error
+                increment.settled += len(batch)  # after the store: `kept` is up to date before the rows leave `in_flight`
+            finally:
+                self._queue.task_done()
+
+
 def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: Progress, postfix: _DownloadPostfix, shard_size: int) -> None:
     """
     One download pass: every (name, row) of rows goes to its increment (counted as consumed, converted,
-    tokenized in batches and appended shard by shard to its raw directory, one shard writer per increment) until
-    every increment is :attr:`~_Increment.done` or the stream ends (the stream is closed either way); the token
-    batches are flushed and an increment that kept fewer rows than it wanted is exhausted. An instruct increment's
-    token step is flushed early when its buffered rows would meet the target, so it stops exactly there (a second
-    pass would re-stream the file prefix). bar tracks kept rows (postfix: source rows consumed, current repo
-    file; the bytes fetched are the counter the bar was created with).
+    batched for the token worker, which tokenizes the batches and appends them shard by shard to the raw
+    directory, one shard writer per increment) until every increment is :attr:`~_Increment.done` or the stream
+    ends (the stream is closed either way); the last batches are submitted, the worker joined, and an increment
+    that kept fewer rows than it wanted is exhausted. An instruct increment submits early and waits for the
+    worker when the rows in flight and buffered would meet the target, so it stops exactly there and never
+    reads on while the outcome is open (a second pass would re-stream the file prefix). bar tracks kept rows
+    (postfix: source rows consumed, current repo file; the bytes fetched are the counter the bar was created
+    with).
     """
 
     increments_by_name = {increment.name: increment for increment in increments}
@@ -586,8 +708,11 @@ def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: P
             )
             for increment in increments
         }
+        worker = stack.enter_context(_TokenWorker(",".join(increments_by_name), writers, bar))  # closed before the writers
         try:
             for name, raw in rows:
+                if worker.failed:
+                    worker.drain()  # raises: stop pulling rows for a worker that stores nothing anymore
                 increment = increments_by_name[name]
                 if increment.done:
                     if all(increment.done for increment in increments):
@@ -600,14 +725,15 @@ def _fetch(increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: P
                 row = increment.convert(name, raw)
                 if row is None:
                     continue
-                released = increment.token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0))
-                if increment.is_instruct and not released and counters.kept + increment.token_step.pending >= increment.rows_to_keep:
-                    released = increment.token_step.flush()  # the buffered rows would meet the target: stop exactly at it
-                _store(increment, writers[name], released, bar)
+                worker.submit(increment, increment.token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0)))
+                if increment.is_instruct and counters.kept + increment.in_flight + increment.token_step.pending >= increment.rows_to_keep:
+                    # the rows in flight and buffered would meet the target: settle them before reading on
+                    worker.submit(increment, increment.token_step.take())
+                    worker.drain()
                 if all(increment.done for increment in increments):
                     break  # enough: stop pulling (the finally closes the stream)
             for increment in increments:
-                _store(increment, writers[increment.name], increment.token_step.flush(), bar)
+                worker.submit(increment, increment.token_step.take())
         finally:
             close = getattr(rows, "close", None)
             if close is not None:
