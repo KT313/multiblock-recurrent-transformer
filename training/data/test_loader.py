@@ -1,11 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import itertools
+import logging
 import math
 import signal
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Iterator, TypeVar, cast
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
@@ -493,6 +495,118 @@ def test_resume_offset_is_dropped_when_the_loader_restarts(tokenizer: Tokenizer,
     assert first_epoch == ["pre", "pre"] and parquet.resume_offset == total - 2  # the offset holds for its epoch
     assert len([rd.next_train_batch("pre") for _ in range(total)]) == total  # the restart reads every row
     assert parquet.resume_offset == 0
+
+
+# --- dropped rows and the epoch check (item 2) -------------------------------------------------------------------
+
+DROPPING_SEQUENCE_LENGTH = 16  # rows are cut to 17 tokens, which the long prompt below fills on its own
+LONG_PROMPT = " ".join(f"tok_{i}" for i in range(40))  # masked and longer than the window: the row keeps no label
+SHORT_PROMPT = "tok_1 tok_2"
+
+
+def _instruct_source(
+    directory: Path, tokenizer: Tokenizer, prompts: list[str]
+) -> tuple[RunDataloaders, ParquetTextDataset]:
+    """
+    A one-source `RunDataloaders` over a fresh instruct parquet with one row per prompt, read one row per worker
+    batch at `DROPPING_SEQUENCE_LENGTH`: a row whose prompt is `LONG_PROMPT` is dropped, one with a short prompt
+    keeps its answer.
+    """
+
+    directory.mkdir(parents=True, exist_ok=True)
+    table = pa.table(
+        {
+            "instruction": prompts,
+            "input": [""] * len(prompts),
+            "output": [f"tok_{i} tok_{i + 1} tok_{i + 2}" for i in range(len(prompts))],
+        }
+    )
+    pq.write_table(table, directory / "data-00000.parquet")
+    parquet = entry_dataset(DataEntry("ft", str(directory), data_signature=INSTRUCT_SIGNATURE))
+    loader = dataloader_over(parquet, tokenizer, DROPPING_SEQUENCE_LENGTH, 1, padded=False)
+    return RunDataloaders({"ft": loader}, [], tokenizer, {"ft": parquet}, DROPPING_SEQUENCE_LENGTH), parquet
+
+
+@pytest.mark.timeout(60)
+def test_a_source_without_a_usable_row_raises_instead_of_restarting(tmp_path: Path, tokenizer: Tokenizer) -> None:
+    """
+    Item 2: every restart re-reads the same rows, so a source whose every row the collate drops used to spin
+    forever with a frozen step counter. The finished full epoch without a sample is an error naming the cause.
+    """
+
+    loaders, _ = _instruct_source(tmp_path / "unusable", tokenizer, [LONG_PROMPT, LONG_PROMPT])
+    with pytest.raises(RuntimeError, match="no usable sample in a full epoch") as raised:
+        for _ in range(10):  # bounded: the third pull ends the epoch, and before the fix every pull after it hung
+            loaders.next_train_batch("ft")
+    message = str(raised.value)
+    assert "'ft'" in message and "its 2 rows" in message
+    assert "training_max_sequence_length + 1 = 17" in message and "Raise training_max_sequence_length" in message
+    loaders.close()
+
+
+def test_dropped_rows_warn_once_and_the_epoch_reports_them(
+    tmp_path: Path, tokenizer: Tokenizer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A source that drops SOME rows trains on the rest: one WARNING for the whole run and one INFO line per epoch.
+    """
+
+    prompts = [LONG_PROMPT, SHORT_PROMPT, LONG_PROMPT, SHORT_PROMPT]
+    loaders, _ = _instruct_source(tmp_path / "some_dropped", tokenizer, prompts)
+    with caplog.at_level(logging.DEBUG, logger="training"):
+        batches = [loaders.next_train_batch("ft") for _ in range(8)]  # two epochs of four worker batches
+    assert sum(len(batch.samples) for batch in batches) == 4  # the two short-prompt rows of each epoch
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1 and warnings[0].startswith("ft: 1 of 1 rows dropped")
+    assert "training_max_sequence_length + 1 = 17" in warnings[0]
+    epochs = [(record.levelno, record.getMessage()) for record in caplog.records if "epoch done" in record.getMessage()]
+    assert epochs == [(logging.INFO, "ft: epoch done, 4 rows read, 2 samples, 2 dropped")]
+    loaders.close()
+
+
+def test_an_epoch_without_a_dropped_row_reports_at_debug(
+    tokenizer: Tokenizer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The common case is silent at INFO: a small source finishes an epoch every few pulls and has nothing to report.
+    """
+
+    loaders = RunDataloaders({"a": _tagged("a", 2)}, [], tokenizer, {})
+    with caplog.at_level(logging.DEBUG, logger="training"):
+        [loaders.next_train_batch("a") for _ in range(3)]
+    epochs = [(record.levelno, record.getMessage()) for record in caplog.records if "epoch done" in record.getMessage()]
+    assert epochs == [(logging.DEBUG, "a: epoch done, 2 rows read, 2 samples, 0 dropped")]
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+@pytest.mark.timeout(60)
+def test_a_resumed_epoch_without_a_sample_restarts_instead_of_raising(tmp_path: Path, tokenizer: Tokenizer) -> None:
+    """
+    Only a FULL epoch must yield a sample: the first epoch after a resume starts at an offset and may hold nothing
+    but dropped rows, which the next epoch over the whole range fixes on its own.
+    """
+
+    loaders, parquet = _instruct_source(tmp_path / "resumed", tokenizer, [SHORT_PROMPT, LONG_PROMPT])
+    loaders.set_resume_offsets({"ft": 1})  # the resumed epoch holds the long-prompt row alone, and it is dropped
+    assert loaders.next_train_batch("ft").samples == []
+    assert len(loaders.next_train_batch("ft").samples) == 1  # the restart reads the whole range and yields
+    assert parquet.resume_offset == 0
+    loaders.close()
+
+
+@pytest.mark.timeout(60)
+def test_an_offset_of_a_whole_range_is_a_full_epoch(tmp_path: Path, tokenizer: Tokenizer) -> None:
+    """
+    `set_resume_offset` takes the offset modulo the range, so an offset of exactly the range starts at row 0:
+    that epoch is full and owes a sample.
+    """
+
+    loaders, _ = _instruct_source(tmp_path / "wrapped", tokenizer, [LONG_PROMPT, LONG_PROMPT])
+    loaders.set_resume_offsets({"ft": 2})
+    with pytest.raises(RuntimeError, match="no usable sample in a full epoch"):
+        for _ in range(10):
+            loaders.next_train_batch("ft")
+    loaders.close()
 
 
 def test_close_shuts_down_the_worker_iterators(tokenizer: Tokenizer, tiny_pretrain_dir: Path) -> None:
