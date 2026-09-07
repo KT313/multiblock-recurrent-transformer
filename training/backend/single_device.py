@@ -60,8 +60,9 @@ class SingleDeviceBackend:
         model = model.to(self.device)
         if compile_model:
             # The recurrence iteration is compiled as one frame with several legitimate variants (no-grad and grad
-            # iterations, a checkpointed one, the latent with and without gradient); past dynamo's default limit of
-            # 8 recompiles it silently runs the frame eagerly (a warning in the log, a 10 percent slower step).
+            # iterations, the latent with and without gradient), the checkpointed iteration (`checkpointed_iteration`,
+            # its own frame holding the checkpoint call) likewise; past dynamo's default limit of 8 recompiles it
+            # silently runs the frame eagerly (a warning in the log, a 10 percent slower step).
             torch._dynamo.config.recompile_limit = DYNAMO_RECOMPILE_LIMIT
             # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles. Packed
             # training has one shape, but its validation is still padded: a static compile recompiled the forward for

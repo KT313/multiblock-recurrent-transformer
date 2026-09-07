@@ -133,8 +133,8 @@ def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
 
 
 def test_build_model_kwargs_routing() -> None:
-    m = seeded_tiny(ignore_index=-1, gradient_checkpointing=True, n_layers_in_coda=3)
-    assert m.ignore_index == -1 and m.gradient_checkpointing is True
+    m = seeded_tiny(ignore_index=-1, gradient_checkpointing="full", n_layers_in_coda=3)
+    assert m.ignore_index == -1 and m.gradient_checkpointing == "full"
     assert len(m.transformer.coda) == 3
     cfg = tiny_config()
     with pytest.raises(ValueError, match="overrides"):
@@ -521,17 +521,20 @@ def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
 # --- gradient checkpointing -------------------------------------------------------------------------------------------
 
 
-def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", ["selective", "full"])
+def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     plain = seeded_tiny()
-    ckpt = seeded_tiny(gradient_checkpointing=True)
+    ckpt = seeded_tiny(gradient_checkpointing=mode)
+    assert ckpt.gradient_checkpointing == mode
     calls: list[int] = []
-    orig_checkpoint = recurrence._checkpoint
+    wrapper_name = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}[mode]
+    orig_checkpoint = getattr(recurrence, wrapper_name)
 
     def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
         calls.append(1)
         return cast(Tensor, orig_checkpoint(*args, **kwargs))
 
-    monkeypatch.setattr(recurrence, "_checkpoint", counting_checkpoint)
+    monkeypatch.setattr(recurrence, wrapper_name, counting_checkpoint)
     x = ids()
     torch.manual_seed(11)
     out_a = plain(x, labels=x, return_logits=True)
@@ -546,6 +549,13 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
     for (na, pa), (nb, pb) in zip(plain.named_parameters(), ckpt.named_parameters()):
         assert na == nb
         torch.testing.assert_close(pa.grad, pb.grad, atol=1e-6, rtol=1e-5, msg=na)
+
+
+def test_gradient_checkpointing_mode_is_checked_at_construction() -> None:
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not 'bogus'"):
+        seeded_tiny(gradient_checkpointing="bogus")
+    with pytest.raises(ValueError, match="not False"):
+        seeded_tiny(gradient_checkpointing=False)
 
 
 # --- sampler (the scheme itself is tested in blocks/test_recurrence.py) ----------------------------------------------

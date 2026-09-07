@@ -47,7 +47,9 @@ training_max_sequence_length: 2048   # documents are cut to this many tokens at 
 backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
 precision: bf16-mixed                # autocast precision of the forward/backward pass
 compile_model: true                  # torch.compile the model
-gradient_checkpointing: false        # recompute activations per recurrence iteration in the backward pass
+gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.
+                                     # selective keeps the GEMM and FlexAttention outputs and recomputes only the cheap ops (v2_small, 8192-token packs:
+                                     # ~6 % slower than none, 75 % of the peak memory); full recomputes the whole iteration (~22 % slower, 35 % of the memory)
 
 # --- Sequence packing (the training batches; validation runs on padded rows, see below) -----------------------
 # Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention

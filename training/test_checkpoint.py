@@ -222,7 +222,7 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "backend": "future_ddp",
     "precision": "32",
     "compile_model": True,
-    "gradient_checkpointing": True,
+    "gradient_checkpointing": "full",
     "validation_batch_size": 2,
     "tokens_per_micro_batch": 16384,
     "micro_batches_per_step": 128,

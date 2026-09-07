@@ -11,7 +11,9 @@ from typing import Any
 import pytest
 import yaml
 
+from model.blocks.recurrence import CHECKPOINT_MODES as MODEL_CHECKPOINT_MODES
 from training.settings import (
+    CHECKPOINT_MODES,
     DEFAULT_BENCHMARK_TASKS,
     NON_NEGATIVE_SETTINGS,
     POSITIVE_SETTINGS,
@@ -43,7 +45,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "backend": "single_device",
     "precision": "bf16-mixed",
     "compile_model": True,
-    "gradient_checkpointing": False,
+    "gradient_checkpointing": "none",
     "validation_batch_size": 4,
     "validation_padding_multiple": 128,
     "tokens_per_micro_batch": 8192,
@@ -167,6 +169,20 @@ def test_parse_without_model_architecture_config_is_rejected() -> None:
 def test_validation_empty_model_architecture_config() -> None:
     with pytest.raises(ValueError, match="model_architecture_config is required"):
         _settings(model_architecture_config="")
+
+
+def test_gradient_checkpointing_is_a_mode() -> None:
+    assert CHECKPOINT_MODES == MODEL_CHECKPOINT_MODES  # the torch-free copy in the settings and the model's own
+    assert _settings().gradient_checkpointing == "none"
+    for mode in ("selective", "full"):
+        assert _settings(gradient_checkpointing=mode).gradient_checkpointing == mode
+        parsed = parse_settings(["--config", str(TINY_YAML), "--gradient_checkpointing", mode])
+        assert parsed.gradient_checkpointing == mode
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not 'bogus'"):
+        _settings(gradient_checkpointing="bogus")
+    for value in ("true", "false", "bogus"):  # the former bool and an unknown mode: rejected at parse time
+        with pytest.raises(SystemExit):
+            parse_settings(["--config", str(TINY_YAML), "--gradient_checkpointing", value])
 
 
 def test_cli_overrides_win_over_yaml() -> None:

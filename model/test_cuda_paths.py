@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
 The packed path on CUDA: the FlexAttention kernel under a `BlockMask`, that mask through the non-reentrant
-checkpoint, and the compiled forward over it. `training/data/test_packing_parity.py` runs on the CPU, where
+checkpoint (both modes, eager and compiled), and the compiled forward over it. `training/data/test_packing_parity.py` runs on the CPU, where
 `document_attention_mask` returns a dense bool mask and sdpa does the math, so it covers none of these three.
 """
 
@@ -102,15 +102,48 @@ def test_flex_attention_backward_matches_dense_on_cuda(tiny_tokenizer_dir: Path)
     assert_same_grads(packed_grads, padded_grads, atol=1e-6, rtol=1e-5)
 
 
-def test_block_mask_through_non_reentrant_checkpoint_on_cuda(tiny_tokenizer_dir: Path) -> None:
+@pytest.mark.parametrize("mode", ["selective", "full"])
+def test_block_mask_through_non_reentrant_checkpoint_on_cuda(tiny_tokenizer_dir: Path, mode: str) -> None:
     inputs = packed_inputs(Tokenizer(tiny_tokenizer_dir), LENGTHS)
     model = tiny_cuda_model()
     plain_loss, plain_grads = loss_and_grads(model, model, **inputs)
-    model.gradient_checkpointing = True
+    model.gradient_checkpointing = mode  # type: ignore[assignment]  # the test string is one of the modes
     ckpt_loss, ckpt_grads = loss_and_grads(model, model, **inputs)
 
     assert torch.equal(ckpt_loss, plain_loss)
     assert_same_grads(ckpt_grads, plain_grads, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("mode", ["selective", "full"])
+def test_compiled_checkpointing_matches_compiled_plain_on_cuda(tiny_tokenizer_dir: Path, mode: str) -> None:
+    """
+    The checkpoint call sits in a frame dynamo compiles (`checkpointed_iteration`): the compiled model with
+    checkpointing must match the compiled model without it, and the checkpointed frames must compile rather than
+    fall back to eager (no graph break inside them).
+    """
+
+    torch._dynamo.reset()
+    counters.clear()
+    inputs = packed_inputs(Tokenizer(tiny_tokenizer_dir), LENGTHS)
+    model = tiny_cuda_model()
+    compiled = torch.compile(model, dynamic=True)
+    plain_loss, plain_grads = loss_and_grads(compiled, model, **inputs)
+    graphs = counters["stats"]["unique_graphs"]
+    model.gradient_checkpointing = mode  # type: ignore[assignment]  # the test string is one of the modes
+    ckpt_loss, ckpt_grads = loss_and_grads(compiled, model, **inputs)
+
+    torch.testing.assert_close(ckpt_loss, plain_loss, atol=1e-4, rtol=1e-4)
+    assert_same_grads(ckpt_grads, plain_grads, atol=1e-4, rtol=1e-4)
+    # the only graph breaks are the intentional ones at the dynamo-disabled core-block loop (`run_core_block`,
+    # `iterate_core_block`); the checkpointed iteration compiled as a graph of its own instead of running the
+    # checkpoint eagerly (a disabled `checkpointed_iteration` would show up as a skip of it here)
+    unexpected = [
+        reason
+        for reason in counters["graph_break"]
+        if "torch.compiler.disable()" not in reason or "checkpointed_iteration" in reason
+    ]
+    assert not unexpected, unexpected
+    assert counters["stats"]["unique_graphs"] > graphs
 
 
 def test_compiled_forward_with_packing_matches_eager_on_cuda(tiny_tokenizer_dir: Path) -> None:

@@ -8,10 +8,14 @@ local GPU work out of the box.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
+
+# The activation-checkpointing modes of the recurrence iterations, `model.blocks.recurrence.CHECKPOINT_MODES` (which
+# imports torch; this module stays framework-neutral, a settings test keeps the two equal).
+CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
 
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
 # relating two fields stay explicit below the loops.
@@ -104,7 +108,7 @@ class Settings:
     backend: str = "single_device"
     precision: str = "bf16-mixed"
     compile_model: bool = False
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: Literal["none", "selective", "full"] = "none"  # recompute the recurrence iterations' activations in the backward: selective keeps the GEMM/FlexAttention outputs (memory 75 %, ~6 % slower), full recomputes everything (35 %, ~22 % slower); model/blocks/recurrence.py
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
@@ -170,6 +174,10 @@ class Settings:
                 raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
+        if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
+            raise ValueError(
+                f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {self.gradient_checkpointing!r}"
+            )
         if self.tokens_per_micro_batch < self.training_max_sequence_length:
             raise ValueError(
                 f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= training_max_sequence_length "

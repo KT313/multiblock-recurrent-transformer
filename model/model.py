@@ -18,9 +18,11 @@ from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
 from .blocks.recurrence import (
+    CheckpointMode,
     NumSteps,
     StepsPair,
     adapter_base_projection,
+    check_checkpoint_mode,
     initialize_state,
     iterate_core_block,
     normalize_num_steps,
@@ -117,12 +119,13 @@ class RecurrentGPT(torch.nn.Module):
     freqs_cis: Tensor  # registered buffer (declared here for the type checkers only)
 
     def __init__(
-        self, config: RecurrentConfig, *, ignore_index: int = -100, gradient_checkpointing: bool = False
+        self, config: RecurrentConfig, *, ignore_index: int = -100, gradient_checkpointing: CheckpointMode = "none"
     ) -> None:
         super().__init__()
         self.config = config
         self.ignore_index = ignore_index
-        self.gradient_checkpointing = gradient_checkpointing
+        # activation checkpointing of the backprop iterations: none | selective | full (model/blocks/recurrence.py)
+        self.gradient_checkpointing: CheckpointMode = check_checkpoint_mode(gradient_checkpointing)
 
         # Normalized to lists / filled in by RecurrentConfig.__post_init__ (asserts only narrow the static types).
         n_layers_per_block = config.n_layers_in_recurrent_block

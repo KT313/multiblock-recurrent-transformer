@@ -7,15 +7,25 @@ checkpointing. `RecurrentGPT` (`model/model.py`) binds these to a model's `step`
 
 The adapter is one `Linear` (2E -> E) over `[latent, input]`; its input half does not change over the iterations of a
 block, so `adapter_base_projection` computes it once and the iteration only runs the latent half.
+
+Activation checkpointing (`CheckpointMode`): every backprop iteration of a block is one checkpointed region. `full`
+recomputes the whole iteration in the backward pass (v2_small, 8192-token packs: about 22 percent slower than `none`,
+35 percent of the peak memory); `selective` keeps the outputs of the GEMMs and of FlexAttention and recomputes only
+the cheap ops, RMSNorms, RoPE, the SiLU gate and the residual adds (about 6 percent slower, 75 percent of the memory).
+The checkpoint call lives in `checkpointed_iteration`, a frame of its own that dynamo compiles when the model is
+compiled: torch.compile then traces the checkpoint and its partitioner fuses the recompute into the backward graph.
+Calling `torch.utils.checkpoint` from the eager loop *around* the compiled iteration instead (the code before
+2026-09-07) launched the compiled forward a second time per iteration under eager saved-tensor hooks and ran
+FlexAttention's forward again: 2.1 times the step time of `none` for the same memory as `full`.
 """
 
 import math
 from functools import partial
-from typing import cast
+from typing import Any, Callable, Literal, cast
 
 import torch
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
 from ..layers.attention import AttentionMask
 
@@ -26,9 +36,33 @@ StepsSpec = StepsPair | Tensor | int
 # What `RecurrentGPT.forward` accepts: nothing (sample), one spec for all blocks, or one spec per block.
 NumSteps = StepsSpec | list[StepsSpec] | None
 
-# Activation checkpointing of one recurrence iteration. The RNG state is not saved/restored per checkpoint (the
-# iteration draws no random numbers) and the recomputation is not checked for determinism.
-_checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False, determinism_check="none")
+# Activation checkpointing of the backprop iterations of a block, see the module docstring.
+CheckpointMode = Literal["none", "selective", "full"]
+CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
+
+# Ops whose outputs `selective` keeps: the GEMMs (adapter, attention projections, MLP) and FlexAttention; everything
+# else in an iteration is recomputed. The list form of the policy saves exactly these and recomputes the rest.
+_SAVED_OPS = [torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.higher_order.flex_attention]
+_selective_contexts = partial(create_selective_checkpoint_contexts, _SAVED_OPS)
+# The AOT autograd cache cannot hash an arbitrary context_fn; without this attribute it is bypassed (a recompile per
+# process start).
+_selective_contexts.cache_hash = "recurrence-save-mm-addmm-flex"  # type: ignore[attr-defined]
+
+# Non-reentrant checkpoints. The RNG state is not saved/restored per checkpoint (the iteration draws no random
+# numbers; under torch.compile the flag has no effect anyway) and the recomputation is not checked for determinism.
+_full_checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False, determinism_check="none")
+_selective_checkpoint = partial(_full_checkpoint, context_fn=_selective_contexts)
+CheckpointFn = Callable[..., Any]
+
+
+def check_checkpoint_mode(mode: str) -> CheckpointMode:
+    """
+    `mode` if it is one of `CHECKPOINT_MODES`, else a ValueError naming them.
+    """
+
+    if mode not in CHECKPOINT_MODES:
+        raise ValueError(f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {mode!r}")
+    return cast(CheckpointMode, mode)
 
 
 def canon_steps(steps: StepsSpec) -> StepsPair:
@@ -159,6 +193,27 @@ def core_block_forward(
     return x_latent
 
 
+def checkpointed_iteration(
+    checkpoint_fn: CheckpointFn,
+    x_latent: Tensor,
+    x_base: Tensor,
+    freqs_cis: Tensor,
+    mask: AttentionMask,
+    adapter: torch.nn.Module,
+    layers: torch.nn.ModuleList,
+    base_proj: Tensor,
+) -> Tensor:
+    """
+    One checkpointed recurrence iteration (`checkpoint_fn` is `_full_checkpoint` or `_selective_checkpoint`) as a
+    frame of its own: called from the dynamo-disabled loop, this frame compiles, so the checkpoint is traced as part of
+    the compiled graph and the recompute is fused into the compiled backward (module docstring). `mask` may be a
+    FlexAttention `BlockMask` (packed sequences); the non-reentrant checkpoint passes it through as a plain positional
+    argument.
+    """
+
+    return cast(Tensor, checkpoint_fn(core_block_forward, x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj))
+
+
 @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
 def iterate_core_block(
     x_latent: Tensor,
@@ -170,19 +225,19 @@ def iterate_core_block(
     *,
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
-    gradient_checkpointing: bool,
+    gradient_checkpointing: CheckpointMode,
     base_proj: Tensor | None = None,
 ) -> Tensor:
     """
     Iterate `core_block_forward` first `num_steps_no_grad` times under `torch.no_grad`, then `num_steps_with_grad`
-    times with gradient (each of those activation-checkpointed when `gradient_checkpointing`).
+    times with gradient, each of those activation-checkpointed in the `gradient_checkpointing` mode (`none`,
+    `selective`, `full`; module docstring).
 
     `base_proj` is the adapter's input half (`adapter_base_projection(x_base, adapter)`), shared by all iterations;
     computed here once when not given. It is an input of every checkpointed iteration, so the recomputation reuses it.
-    `mask` may be a FlexAttention `BlockMask` (packed sequences); the non-reentrant checkpoint passes it through as a
-    plain positional argument.
     """
 
+    mode = check_checkpoint_mode(gradient_checkpointing)
     if base_proj is None:
         base_proj = adapter_base_projection(x_base, adapter)
 
@@ -190,9 +245,11 @@ def iterate_core_block(
         for _ in range(num_steps_no_grad):
             x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
 
+    # resolved here, not at import: tests swap the module-level wrappers to count the calls
+    checkpoint_fn = _selective_checkpoint if mode == "selective" else _full_checkpoint
     for _ in range(num_steps_with_grad):
-        if gradient_checkpointing:
-            x_latent = _checkpoint(core_block_forward, x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
-        else:
+        if mode == "none":
             x_latent = core_block_forward(x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
+        else:
+            x_latent = checkpointed_iteration(checkpoint_fn, x_latent, x_base, freqs_cis, mask, adapter, layers, base_proj)
     return x_latent

@@ -197,7 +197,7 @@ def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: Resolve
     assert isinstance(model, RecurrentGPT)
     assert model.config.n_embd == 32 and model.config.model_max_sequence_length == 256
     assert model.ignore_index == IGNORE_INDEX
-    assert model.gradient_checkpointing is tiny_settings.gradient_checkpointing
+    assert model.gradient_checkpointing == tiny_settings.gradient_checkpointing
     assert all(p.device == cpu_backend.device for p in model.parameters())
     written = json.loads((run_directory / "model_config.json").read_text())
     assert written == model.config.to_dict() and written["n_embd"] == 32

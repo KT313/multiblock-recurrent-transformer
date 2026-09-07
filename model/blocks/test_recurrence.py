@@ -180,7 +180,7 @@ def test_iterate_core_block_matches_manual_loop(tiny_model: RecurrentGPT) -> Non
     x_latent, x_base = torch.randn(1, 6, 64), torch.randn(1, 6, 64)
     adapter, layers = block_parts(tiny_model, 1)
     got = iterate_core_block(
-        x_latent, x_base, freqs, None, 2, 1, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, 2, 1, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     expected = x_latent
     for _ in range(3):
@@ -190,11 +190,11 @@ def test_iterate_core_block_matches_manual_loop(tiny_model: RecurrentGPT) -> Non
     # tensor step counts (the sampler's output) work like ints
     two, one = torch.tensor(2), torch.tensor(1)
     same = iterate_core_block(
-        x_latent, x_base, freqs, None, two, one, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, two, one, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     torch.testing.assert_close(same, expected)
     no_grad = iterate_core_block(
-        x_latent, x_base, freqs, None, 2, 0, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, 2, 0, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     assert not no_grad.requires_grad  # all steps under no_grad
 
@@ -218,27 +218,56 @@ def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
     adapter, layers = block_parts(tiny_model, 0)
     x = torch.randn(1, 4, 64)
     iterate_core_block(
-        x, x, tiny_model.freqs_cis[:, :4], None, n, k, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x, x, tiny_model.freqs_cis[:, :4], None, n, k, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     assert grad_modes == [False] * n + [True] * k
 
 
+CHECKPOINT_WRAPPERS = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}
+
+
+def count_checkpoint_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """
+    Swap both module-level checkpoint wrappers for counting ones; the returned dict holds the calls per mode.
+    """
+
+    calls = dict.fromkeys(CHECKPOINT_WRAPPERS, 0)
+
+    def counting(mode: str, orig: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Tensor:
+            calls[mode] += 1
+            return orig(*args, **kwargs)  # type: ignore[no-any-return]  # functools.partial of an untyped checkpoint
+
+        return wrapper
+
+    for mode, name in CHECKPOINT_WRAPPERS.items():
+        monkeypatch.setattr(recurrence, name, counting(mode, getattr(recurrence, name)))
+    return calls
+
+
+@pytest.mark.parametrize("mode", ["selective", "full"])
 def test_gradient_checkpointing_wraps_each_backprop_iteration(
-    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    calls: list[int] = []
-    orig_checkpoint = recurrence._checkpoint
+    calls = count_checkpoint_calls(monkeypatch)
+    adapter, layers = block_parts(tiny_model, 0)
+    x = torch.randn(1, 4, 64, requires_grad=True)
+    freqs = tiny_model.freqs_cis[:, :4]
+    plain = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing="none")
+    assert calls == {"selective": 0, "full": 0}
+    ckpt = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=mode)
+    assert calls == {mode: 3, **{other: 0 for other in CHECKPOINT_WRAPPERS if other != mode}}
+    torch.testing.assert_close(plain, ckpt)
+    # the recompute in the backward gives the same gradient
+    (plain_grad,) = torch.autograd.grad(plain.sum(), x)
+    (ckpt_grad,) = torch.autograd.grad(ckpt.sum(), x)
+    torch.testing.assert_close(ckpt_grad, plain_grad)
 
-    def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
-        calls.append(1)
-        return orig_checkpoint(*args, **kwargs)  # type: ignore[no-any-return]  # functools.partial of an untyped checkpoint
 
-    monkeypatch.setattr(recurrence, "_checkpoint", counting_checkpoint)
+def test_gradient_checkpointing_mode_is_checked(tiny_model: RecurrentGPT) -> None:
     adapter, layers = block_parts(tiny_model, 0)
     x = torch.randn(1, 4, 64)
-    freqs = tiny_model.freqs_cis[:, :4]
-    plain = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=False)
-    assert calls == []
-    ckpt = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=True)
-    assert len(calls) == 3
-    torch.testing.assert_close(plain, ckpt)
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not True"):
+        iterate_core_block(
+            x, x, tiny_model.freqs_cis[:, :4], None, 1, 1, adapter=adapter, layers=layers, gradient_checkpointing=True
+        )

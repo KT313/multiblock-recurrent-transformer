@@ -24,7 +24,7 @@ stage_base_lrs: [3e-4, 1e-4, 5e-5]   # one per stage of the dataset config: pret
 backend: single_device
 precision: bf16-mixed
 compile_model: false
-gradient_checkpointing: false
+gradient_checkpointing: none
 
 tokens_per_micro_batch: 512     # pack length; one packed row per micro-batch
 micro_batches_per_step: 2       # packs per optimizer step: 2 x 512 = 1024 tokens
