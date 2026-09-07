@@ -105,6 +105,28 @@ def test_task_counts_and_renders_in_its_panel(dashboard: DataDashboard) -> None:
     assert "src" in downloads and "4/10" in downloads and "file=a.parquet, consumed=7" in downloads
 
 
+def test_task_opened_with_initial_counts_from_there_and_its_speed_counts_the_updates_only() -> None:
+    """
+    A resumed download opens at the rows already on disk: the row and the summary read 6/10 before any update, the
+    rate only sees the rows added since.
+    """
+
+    clock = FakeClock()
+    console = Console(file=io.StringIO(), force_terminal=True, width=120)
+    with DataDashboard(enabled=True, console=console, refresh_per_second=50, clock=clock) as board:
+        bar = board.task("src", total=10, unit="row", panel="downloads", initial=6)
+        assert isinstance(bar, Task) and bar.n == 6
+        clock.advance(2.0)
+        text = render_text(board)
+        downloads = text[text.index("downloads") : text.index("builds")]
+        assert downloads.count("6/10") == 2 and "? row/s" in downloads, "the row and the summary line; no rate before the first update"
+        bar.update(4)
+        text = render_text(board)
+        downloads = text[text.index("downloads") : text.index("builds")]
+        assert downloads.count("10/10") == 2 and "2 row/s" in downloads, "4 rows in 2 s, the 6 initial rows not counted"
+        bar.close()
+
+
 def test_panels_keep_their_order_and_unknown_panels_appear_on_demand(dashboard: DataDashboard) -> None:
     dashboard.task("b", total=1, panel="builds")
     dashboard.task("d", total=1, panel="downloads")

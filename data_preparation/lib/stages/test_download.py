@@ -33,6 +33,7 @@ from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.ui.dashboard import DataDashboard
 from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
+from data_preparation.lib.progress import NoProgress
 from data_preparation.lib.stages.download import (
     _load_tokenizer,
     MALFORMED_WARNINGS_PER_INCREMENT,
@@ -1399,3 +1400,88 @@ def test_download_github_code_group_skips_extras_it_cannot_store(
     assert stale is not None and stale.source_hash == "0000000000000000" and not list(stale_dir.glob("*.parquet"))
     assert not layout.raw_dir("name_go").exists()
     assert [r["text"] for r in read_rows(layout.raw_dir("py"))] == [f"a code {i}" for i in range(0, 12, 3)]
+
+
+# --- the download bar ------------------------------------------------------------------------------------------------
+
+
+class _RecordingBar(NoProgress):
+    """
+    The bar the stage opens, remembered by the `bars` fixture: total, initial (n before any update), n at the end.
+    """
+
+    def __init__(self, total: int | None = None, initial: int = 0, **_: Any) -> None:
+        super().__init__(total, initial)
+        self.initial = initial
+
+
+@pytest.fixture
+def bars(monkeypatch: pytest.MonkeyPatch) -> list[_RecordingBar]:
+    """
+    Every bar the download stage opens, in order.
+    """
+
+    opened: list[_RecordingBar] = []
+
+    def fake_progress(**kwargs: Any) -> _RecordingBar:
+        bar = _RecordingBar(**kwargs)
+        opened.append(bar)
+        return bar
+
+    monkeypatch.setattr(download_module, "progress", fake_progress)
+    return opened
+
+
+def test_download_bar_opens_at_the_rows_on_disk_and_counts_to_the_target(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, bars: list[_RecordingBar]
+) -> None:
+    """
+    The bar reads rows on disk / target: a resumed source starts where it stood, not at 0 of the remaining rows.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=512))
+    download(cfg, "p", layout, rows_needed=25, shard_size=10)
+    download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 25, 25), (25, 40, 40)]
+
+
+def test_download_bar_stops_at_the_target_when_the_loader_finishes_its_row_group(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, bars: list[_RecordingBar]
+) -> None:
+    """
+    The rows a loader yields past the target are stored (test_download_keeps_every_row_a_loader_yields_beyond_rows_needed)
+    but not counted by the bar: it ends at 100 %, and a folder holding more than the next target opens above it.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    def group_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        return iter([{"text": f"row {i}"} for i in range(offset, offset + max(count, 20))])  # a 20-row "row group"
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", group_loader)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    m = download(cfg, "p", layout, rows_needed=11, shard_size=8)
+    assert m.rows() == 20
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 11, 11)]
+
+
+def test_download_github_code_group_bar_counts_only_rows_towards_a_target(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader, bars: list[_RecordingBar]
+) -> None:
+    """
+    The group bar covers the active members only (their rows on disk / their targets); a passive member's rows,
+    an extra language's rows and the rows an active member stores past its target move the folders, not the bar.
+    """
+
+    hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
+    hub.add("data/b.parquet", _code_rows("b", 8))
+    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "java": _github("Java")}))
+    first = download_github_code_group(cfg, ["py", "java"], layout, rows_needed={"py": 1, "java": 1}, shard_size=3)
+    assert first["py"].rows() == 1 and first["java"].rows() == 1  # the first row group holds a0 (Python) and a1 (Java)
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 2, 2)]
+
+    second = download_github_code_group(cfg, ["py", "java"], layout, rows_needed={"py": 4, "java": 1}, shard_size=3)
+    assert [r["text"] for r in read_rows(layout.raw_dir("py"))] == ["a code 0", "a code 3", "a code 6", "b code 0"]
+    assert second["java"].rows() > 1, "the passive member stored what the pass read on"
+    assert layout.raw_dir("name_go").exists(), "the extra language got a folder"
+    assert [(bar.initial, bar.total, bar.n) for bar in bars][1] == (1, 4, 4), "java (passive) and Go count for neither total nor n"

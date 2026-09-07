@@ -35,3 +35,9 @@ def test_no_progress_counts_updates() -> None:
         b.update(3)
         b.set_postfix(tokens=1)
     assert bar.n == 3 and bar.total == 10 and NoProgress().total is None
+
+
+def test_no_progress_counts_from_initial() -> None:
+    bar = NoProgress(total=10, initial=6)
+    bar.update(2)
+    assert bar.n == 8 and bar.total == 10

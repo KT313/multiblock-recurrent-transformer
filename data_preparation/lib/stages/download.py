@@ -513,8 +513,12 @@ def download(
     log.info("%s: fetching %d rows from offset %d -> %s", name, increment.rows_to_keep, folder.rows_fetched, folder.directory)
     loader = get_loader(increment.source.loader)
     fetch_stats = FetchStats()
-    # the bar's total is the minimum; it overshoots (e.g. 1000/11) when the loader finishes a remote row group
-    with progress(total=increment.rows_to_keep, desc=name, unit="row", panel="downloads", bytes_fetched=lambda: fetch_stats.bytes_fetched) as bar:
+    # the bar reads rows on disk / target and credits only rows up to the target (a loader finishing a remote row
+    # group past it, e.g. 1000 rows for 11 wanted, shows in the postfix as consumed / surplus, not in the count)
+    with progress(
+        total=folder.rows + increment.rows_to_keep, initial=folder.rows, desc=name, unit="row", panel="downloads",
+        bytes_fetched=lambda: fetch_stats.bytes_fetched,
+    ) as bar:
         postfix = _DownloadPostfix(bar)
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
@@ -773,6 +777,18 @@ class _Increment:
             return UNBOUNDED_COUNT if self.max_consume is None else self.max_consume
         return self.rows_to_keep if self.max_consume is None else min(self.rows_to_keep, self.max_consume)
 
+    def credit(self, stored: int) -> int:
+        """
+        How many of stored rows just appended (counters.kept already advanced) the bar counts: the ones up to
+        :attr:`rows_to_keep`. None for a passive increment, none past the target (a member reading on for the
+        other languages, a loader finishing a remote row group).
+        """
+
+        if self.passive:
+            return 0
+        kept = self.counters.kept
+        return min(kept, self.rows_to_keep) - min(kept - stored, self.rows_to_keep)
+
     @property
     def done(self) -> bool:
         """
@@ -974,9 +990,10 @@ def _fetch(
     ends (the stream is closed either way); the last batches are submitted, the worker joined, and an active
     increment that kept fewer rows than it wanted is exhausted. An instruct increment submits early and waits for
     the worker when the rows in flight and buffered would meet the target, so it stops exactly there and never
-    reads on while the outcome is open (a second pass would re-stream the file prefix). bar tracks kept rows
-    (postfix: source rows consumed, rows of passive increments, current repo file; the bytes fetched are the
-    counter the bar was created with).
+    reads on while the outcome is open (a second pass would re-stream the file prefix). bar tracks the rows kept up
+    to each active increment's target (:meth:`_Increment.credit`; postfix: source rows consumed towards a target,
+    surplus rows, i.e. rows of passive increments and rows an active increment consumes past its target, and the
+    current repo file; the bytes fetched are the counter the bar was created with).
 
     increments may grow while the pass runs (a group pass discovers languages): a row of a name not seen before
     finds its increment in the list and gets a shard writer then. On a stop or a failure everything consumed so far
@@ -1013,7 +1030,7 @@ def _fetch(
                 continue  # this source is done, the others read on
             counters = increment.counters
             counters.consumed += 1
-            if increment.passive:
+            if increment.passive or counters.consumed > increment.rows_to_keep:
                 surplus_total += 1
                 postfix.surplus(surplus_total)
             else:
@@ -1089,7 +1106,9 @@ def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], 
             stop = error
             gate.suspend()
         increment.counters.kept += 1
-    bar.update(len(stored))  # once per batch: the dashboard bar takes a lock per update
+    credit = increment.credit(len(stored))
+    if credit:
+        bar.update(credit)  # once per batch: the dashboard bar takes a lock per update
     if stop is not None:
         raise stop
 
@@ -1164,9 +1183,10 @@ def download_github_code_group(
         increments.append(extra)
         return language_request(extra.name, language, extra.folder.rows_fetched, 0, passive=True)
 
+    active = [increment for increment in increments if not increment.passive]  # the bar: their rows on disk / their targets
     with progress(
-        total=sum(increment.rows_to_keep for increment in increments), desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads",
-        bytes_fetched=lambda: fetch_stats.bytes_fetched,
+        total=sum(increment.folder.rows + increment.rows_to_keep for increment in active), initial=sum(increment.folder.rows for increment in active),
+        desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads", bytes_fetched=lambda: fetch_stats.bytes_fetched,
     ) as bar:
         postfix = _DownloadPostfix(bar)
         shared_parameters = SharedLoaderParameters(
@@ -1272,7 +1292,8 @@ def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
 
 class _DownloadPostfix:
     """
-    The download bar's postfix: source rows consumed, current repo file (refreshed sparsely).
+    The download bar's postfix: source rows consumed towards a target, surplus rows (stored, but not counted by
+    the bar: passive increments' rows and rows past a target), current repo file (refreshed sparsely).
     """
 
     def __init__(self, bar: Progress) -> None:
@@ -1281,7 +1302,8 @@ class _DownloadPostfix:
 
     def surplus(self, total: int) -> None:
         """
-        Record the running count of rows stored by passive increments; the bar is refreshed every 100 rows.
+        Record the running count of surplus rows (passive increments' rows and rows consumed past a target); the
+        bar is refreshed every 100 rows.
         """
 
         self._values["surplus"] = total
@@ -1298,7 +1320,7 @@ class _DownloadPostfix:
 
     def consumed(self, total: int) -> None:
         """
-        Record the running count of consumed source rows; the bar is refreshed every 100 rows.
+        Record the running count of source rows consumed towards a target; the bar is refreshed every 100 rows.
         """
 
         self._values["consumed"] = total

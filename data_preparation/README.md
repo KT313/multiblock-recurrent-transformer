@@ -431,12 +431,15 @@ Two caches, with different lifetimes:
 ## Progress display and logs
 
 On a terminal `prepare` runs inside a live dashboard (`lib/ui/dashboard.py`, `rich`): a header (config, round,
-step, elapsed), a **downloads** panel (one row per running download: rows kept / wanted, rate, current download
-speed and bytes fetched, elapsed, source rows consumed, current repo file; plus a summary line: jobs done, rows of
-the round, bytes fetched, elapsed), a **builds** panel (one row per running build: raw rows processed, current raw
+step, elapsed), a **downloads** panel (one row per running download: rows on disk / target, rate, current download
+speed and bytes fetched, elapsed, source rows consumed, surplus rows, current repo file; plus a summary line: jobs
+done, rows of the round, bytes fetched, elapsed), a **builds** panel (one row per running build: raw rows processed, current raw
 shard; plus its summary line), the **log**
 panel with the latest lines, and a footer naming `dataset/build.log` (every log line goes there). Finished rows
-disappear into the summary; at most eight rows are shown per panel ("… and k more"). Resizing the terminal redraws
+disappear into the summary; at most eight rows are shown per panel ("… and k more"). A download row opens at the
+rows the source already has on disk (a resumed source starts where it stood) and counts only rows up to its target;
+rows fetched past it (a loader finishing a remote row group, a github_code member reading on for the other languages,
+a language without a source) are stored and show as `surplus` in the postfix, not in the count. Resizing the terminal redraws
 the frame from a cleared screen (both dashboards; `ui/display.py`). Nothing else reaches the
 terminal while the display is up: every `logging` record (the HuggingFace libraries' included), `warnings` and
 stray prints land in the log panel, the libraries' own bars are silenced. Warnings and the tables (plan, repair,

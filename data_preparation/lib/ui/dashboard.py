@@ -123,11 +123,13 @@ class Task:
     """
     One row of a dashboard panel; the lib.progress.Progress interface.
 
-    n counts the updates. The row is shown while the task is open and disappears on close; its counts then
-    live on in the panel's summary line until the next summary task (round) starts. The bar may overshoot its
-    total like the download bar does (a loader finishing a remote row group); it renders full, the count shows
-    completed/total past 100 %. bytes_fetched is a download task's live byte counter: the row shows its
-    value and the speed over the last frames, the summary line adds it up, close freezes it.
+    n counts the updates from initial (the download bar opens at the rows a source already has on disk and its
+    total is the target, so a resumed source starts where it stood; rows fetched past the target show in the
+    postfix, not the count). The row is shown while the task is open and disappears on close; its counts then
+    live on in the panel's summary line until the next summary task (round) starts. A bar opened above its total
+    (a folder holding more rows than the target) renders full, the count shows completed/total past 100 %.
+    bytes_fetched is a download task's live byte counter: the row shows its value and the speed over the last
+    frames, the summary line adds it up, close freezes it.
     """
 
     def __init__(
@@ -140,6 +142,7 @@ class Task:
         unit: str,
         summary: bool,
         bytes_fetched: Callable[[], int] | None = None,
+        initial: int = 0,
     ) -> None:
         self._dashboard = dashboard
         self._panel = panel
@@ -147,7 +150,8 @@ class Task:
         self.total = total
         self.unit = unit
         self.summary = summary
-        self.completed = 0
+        self.initial = initial
+        self.completed = initial
         self.postfix: dict[str, Any] = {}
         self.started = dashboard._clock()
         self.finished: float | None = None
@@ -218,13 +222,15 @@ class Task:
 
     def speed(self, now: float) -> float | None:
         """
-        Units per second over the task's lifetime; None before the first update.
+        Units per second over the task's lifetime, counting the updates only (not initial); None before the
+        first update.
         """
 
         elapsed = self.elapsed(now)
-        if self.completed <= 0 or elapsed <= 0:
+        done = self.completed - self.initial
+        if done <= 0 or elapsed <= 0:
             return None
-        return self.completed / elapsed
+        return done / elapsed
 
     def __enter__(self) -> Task:
         return self
@@ -484,18 +490,20 @@ class DataDashboard(LiveDisplay):
         panel: str | None = None,
         summary: bool = False,
         bytes_fetched: Callable[[], int] | None = None,
+        initial: int = 0,
     ) -> Progress:
         """
-        A new row in panel (a no-op bar when the dashboard is disabled). summary makes it the panel's
-        summary task (the pool's jobs) and starts a new round of the panel's counts; bytes_fetched is a download
-        task's live byte counter (the row shows its bytes and current speed, the summary line adds it up).
+        A new row in panel (a no-op bar when the dashboard is disabled), its count starting at initial. summary
+        makes it the panel's summary task (the pool's jobs) and starts a new round of the panel's counts;
+        bytes_fetched is a download task's live byte counter (the row shows its bytes and current speed, the
+        summary line adds it up).
         """
 
         if not self.enabled:
-            return NoProgress(total)
+            return NoProgress(total, initial)
         with self._lock:
             state = self._panels.setdefault(panel or DEFAULT_PANEL, _PanelState(panel or DEFAULT_PANEL, self._max_rows))
-            task = Task(self, state, desc, total=total, unit=unit, summary=summary, bytes_fetched=bytes_fetched)
+            task = Task(self, state, desc, total=total, unit=unit, summary=summary, bytes_fetched=bytes_fetched, initial=initial)
             state.add(task)
         return task
 
@@ -565,16 +573,17 @@ def progress(
     panel: str | None = None,
     summary: bool = False,
     bytes_fetched: Callable[[], int] | None = None,
+    initial: int = 0,
 ) -> Progress:
     """
     A task in panel of the active dashboard (see :meth:`DataDashboard.task`), else a :class:`NoProgress`
-    (which counts, shows nothing).
+    (which counts, shows nothing); its count starts at initial.
     """
 
     dashboard = active_dashboard()
     if dashboard is None:
-        return NoProgress(total)
-    return dashboard.task(desc, total=total, unit=unit, panel=panel, summary=summary, bytes_fetched=bytes_fetched)
+        return NoProgress(total, initial)
+    return dashboard.task(desc, total=total, unit=unit, panel=panel, summary=summary, bytes_fetched=bytes_fetched, initial=initial)
 
 
 def set_status(**fields: object) -> None:
