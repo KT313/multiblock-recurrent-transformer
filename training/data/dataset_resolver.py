@@ -318,8 +318,9 @@ def check_entries(
 def check_entry_rows(what: str, part: Part, entry: DataEntry, total: int) -> None:
     """
     The entry's row range (clipped to the `total` rows on disk as `ParquetTextDataset` clips it) holds at least
-    one row. For a train source this is what makes the stream's restart-on-exhaustion safe: a restart on an empty
-    range would spin forever.
+    one row. That guarantees rows ON DISK, not usable samples: a row the collate drops for lack of a supervised
+    label is read and yields nothing. `RunDataloaders.next_train_batch` checks the samples per epoch and refuses
+    to restart a train source whose full epoch produced none, which is what keeps the restart from spinning.
     """
 
     if entry_rows_in_range(entry, total) <= 0:

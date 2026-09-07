@@ -7,6 +7,7 @@ The stage structure never touches the train loaders: `training.step.BatchStream`
 the stage-interpolated weights, so a reader continues across stage boundaries and never re-reads rows.
 """
 
+import logging
 import signal
 from dataclasses import dataclass, field
 from functools import partial
@@ -32,6 +33,8 @@ from training.settings import Settings
 # Fixed here, not settings: a `Settings` field is compared on resume, and this one may differ freely.
 TRAIN_LOADER_BATCH_ROWS = 64
 TRAIN_LOADER_PREFETCH_FACTOR = 4
+
+log = logging.getLogger(__name__)
 
 
 def entry_dataset(entry: DataEntry, shard: tuple[int, int] = (0, 1)) -> ParquetTextDataset:
@@ -154,25 +157,55 @@ def dataloader_over(
 
 
 @dataclass
+class EpochCounters:
+    """
+    What one source has read since its current iterator was started: rows read, samples that survived the collate
+    and the dropped rows between them, plus whether the epoch began at the start of the range.
+
+    full_epoch is False only for the first epoch after a resume, which starts at an offset and may legitimately
+    end without a sample; `next_train_batch` refuses a FULL epoch without one. warned is the run-wide flag of the
+    single drop warning a source gets and is the one field an epoch reset leaves alone.
+    """
+
+    full_epoch: bool = True
+    rows_read: int = 0
+    samples: int = 0
+    dropped_rows: int = 0
+    warned: bool = False
+
+    def start_epoch(self, full_epoch: bool) -> None:
+        """
+        Begin counting a new epoch; `warned` survives, so a source warns about dropped rows once per run.
+        """
+
+        self.full_epoch = full_epoch
+        self.rows_read = self.samples = self.dropped_rows = 0
+
+
+@dataclass
 class RunDataloaders:
     """
     One train loader per SOURCE for the whole run and one validation loader per stage, with lazily created and
-    cycled train iterators and the resume offsets they start at.
+    cycled train iterators, the resume offsets they start at and the per-source counters of the running epoch.
 
     train_loaders maps source name to loader in dataset-config order (`train_sources`). datasets are the
     parquet datasets behind the train loaders (a test fake passes {}): the offset of `set_resume_offsets` is
     applied to a dataset right before its first iterator after a resume and reset to 0 for every later epoch.
+    training_max_sequence_length is only quoted in the messages about dropped rows; a fake may leave it out.
     """
 
     train_loaders: dict[str, Iterable[WorkerBatch]]
     val_loaders: Sequence[Iterable[Batch]]
     tokenizer: Tokenizer
     datasets: dict[str, ParquetTextDataset]
+    training_max_sequence_length: int | None = None
     pending_offsets: dict[str, int] = field(default_factory=dict, init=False)  # source -> rows its next epoch skips
     _train_iterators: dict[str, Iterator[WorkerBatch] | None] = field(init=False)
+    epochs: dict[str, EpochCounters] = field(init=False)  # source -> what its running epoch has read
 
     def __post_init__(self) -> None:
         self._train_iterators = dict.fromkeys(self.train_loaders)
+        self.epochs = {source: EpochCounters() for source in self.train_loaders}
 
     @property
     def train_sources(self) -> list[str]:
@@ -182,34 +215,99 @@ class RunDataloaders:
 
         return list(self.train_loaders)
 
+    def _drop_cause(self) -> str:
+        """
+        Why the collate drops a row (`collate_samples`), for the warning and the error below.
+        """
+
+        window = "training_max_sequence_length + 1"
+        if self.training_max_sequence_length is not None:
+            window = f"{window} = {self.training_max_sequence_length + 1}"
+        return (
+            "the collate drops every row that keeps no supervised label: a row of a single token, or an instruct "
+            f"row whose masked prompt alone fills the {window} tokens a row is cut to"
+        )
+
     def _start_train_iterator(self, source: str) -> Iterator[WorkerBatch]:
         """
         A fresh iterator over source's loader, its dataset set to start at the pending resume offset (0 when
-        none is pending).
+        none is pending), with the epoch counters reset to what that offset makes of the epoch.
         """
 
         offset = self.pending_offsets.pop(source, 0)
         dataset = self.datasets.get(source)
-        if dataset is not None:
+        if dataset is None:
+            offset = 0  # no dataset to skip on (a test fake): the iterator reads its loader from the start
+        else:
             dataset.set_resume_offset(offset)
+            offset = dataset.resume_offset  # taken modulo the range, so a whole epoch of rows starts at 0 again
+        self.epochs[source].start_epoch(full_epoch=offset == 0)
         iterator = self._train_iterators[source] = iter(self.train_loaders[source])
         return iterator
+
+    def _count_batch(self, source: str, batch: WorkerBatch) -> None:
+        """
+        Book one worker batch on source's epoch counters, with one WARNING the first time the source drops a row:
+        a run that trains on far fewer rows than the source holds is otherwise invisible.
+        """
+
+        counters = self.epochs[source]
+        dropped = batch.rows_read - len(batch.samples)
+        counters.rows_read += batch.rows_read
+        counters.samples += len(batch.samples)
+        counters.dropped_rows += dropped
+        if dropped and not counters.warned:
+            counters.warned = True
+            log.warning(
+                "%s: %d of %d rows dropped without reaching training; %s",
+                source,
+                dropped,
+                batch.rows_read,
+                self._drop_cause(),
+            )
+
+    def _end_of_epoch(self, source: str) -> None:
+        """
+        Close the finished epoch of source: refuse a full epoch that yielded no sample, log what it read otherwise.
+
+        A restart re-reads the same rows, so a source whose every row the collate drops would restart forever with
+        a frozen step counter. `train()` calls `close()` on every way out, so the raise shuts the worker down.
+        """
+
+        counters = self.epochs[source]
+        if counters.full_epoch and counters.samples == 0:
+            raise RuntimeError(
+                f"train source {source!r} yielded no usable sample in a full epoch over its {counters.rows_read} "
+                f"rows: {self._drop_cause()}. Raise training_max_sequence_length or fix the source; reading the "
+                "same rows again is all a restart could do and the run would never take a step"
+            )
+        finished = "%s: epoch done, %d rows read, %d samples, %d dropped"
+        counts = (source, counters.rows_read, counters.samples, counters.dropped_rows)
+        if counters.dropped_rows:
+            log.info(finished, *counts)
+        else:
+            log.debug(finished, *counts)  # a small source finishes an epoch every few pulls, with nothing to report
 
     def next_train_batch(self, source: str) -> WorkerBatch:
         """
         Next worker batch of source's loader; restarts the loader when its epoch is over.
 
-        The restart never spins on an empty range: setup guarantees at least one training row per source
-        (`check_entry_rows`). The iterator is created lazily at the first pull and anew on every restart.
+        Setup guarantees rows on disk (`check_entry_rows`), never usable samples: rows the collate drops are read
+        but yield nothing, so `_end_of_epoch` raises on a full epoch without a sample instead of restarting. The
+        iterator is created lazily at the first pull and anew on every restart.
         """
 
         iterator = self._train_iterators[source]
         if iterator is None:
             iterator = self._start_train_iterator(source)
-        try:
-            return next(iterator)
-        except StopIteration:
-            return next(self._start_train_iterator(source))  # the epoch is over; the next one reads the whole range
+        while True:
+            batch = next(iterator, None)  # a sentinel, so the error below is not chained onto a StopIteration
+            if batch is not None:
+                self._count_batch(source, batch)
+                return batch
+            # the epoch is over and the next one starts at row 0, so the second round either yields or raises
+            self._end_of_epoch(source)
+            iterator = self._start_train_iterator(source)
 
     def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
         """
@@ -284,4 +382,4 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
         )
         for stage in dataset.stages
     ]
-    return RunDataloaders(train_loaders, val_loaders, tokenizer, train_datasets)
+    return RunDataloaders(train_loaders, val_loaders, tokenizer, train_datasets, settings.training_max_sequence_length)

@@ -942,16 +942,17 @@ DROP_PACK_LENGTH = 32  # a few such documents per pack, so the fixture lasts man
 DROP_WORKER_ROWS = 2  # rows per worker batch of the drop loaders unless a test says otherwise
 
 
-def _write_drop_parquet(directory: Path, rows: int = DROP_ROWS) -> None:
+def _write_drop_parquet(directory: Path, rows: int = DROP_ROWS, drop_every: int = DROP_EVERY) -> None:
     """
-    `rows` unique instruct rows of which every `DROP_EVERY`-th tokenizes to nothing at `DROP_BLOCK_SIZE`.
+    `rows` unique instruct rows of which every `drop_every`-th tokenizes to nothing at `DROP_BLOCK_SIZE`
+    (`drop_every=1`: a source without a single usable row).
     """
 
     long_prompt = " ".join(f"tok_{i}" for i in range(30))
     table = pa.table(
         {
             "instruction": [
-                long_prompt if i % DROP_EVERY == 0 else f"tok_{i % 256} tok_{(i // 256) % 256}" for i in range(rows)
+                long_prompt if i % drop_every == 0 else f"tok_{i % 256} tok_{(i // 256) % 256}" for i in range(rows)
             ],
             "input": [""] * rows,
             "output": [f"tok_{i % 256} tok_{(i // 256) % 256} tok_{(i * 11) % 256}" for i in range(rows)],
@@ -1038,7 +1039,7 @@ def _drop_stream(
     parquet = entry_dataset(DataEntry("drop", str(data_dir), data_signature=DROP_SIGNATURE))
     loader = dataloader_over(parquet, tokenizer, DROP_BLOCK_SIZE, worker_batch_rows, padded=False)
     recording = _RecordingLoader(loader)
-    loaders = RunDataloaders({"drop": recording}, [], tokenizer, {"drop": parquet})
+    loaders = RunDataloaders({"drop": recording}, [], tokenizer, {"drop": parquet}, DROP_BLOCK_SIZE)
     return BatchStream(settings, loaders, _drop_stage_manager(settings), TrainingProgress()), recording
 
 
@@ -1055,6 +1056,25 @@ def _sample_ids(samples: list[Sample]) -> list[tuple[int, ...]]:
     """
 
     return [tuple(input_ids.tolist()) for input_ids, _, _ in samples]
+
+
+@pytest.mark.timeout(120)
+def test_a_source_without_a_usable_row_stops_the_stream(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Item 2: `_next_sample` pulls until a sample arrives, and a source whose every row is dropped never delivered
+    one. The loader's epoch check turns the spin (a frozen step counter, one worker per restart) into an error.
+    """
+
+    settings = _drop_settings(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    _write_drop_parquet(tmp_path / "all_dropped", rows=8, drop_every=1)
+    stream, recording = _drop_stream(settings, tmp_path / "all_dropped", stream_tokenizer)
+    with pytest.raises(RuntimeError, match="no usable sample in a full epoch") as raised:
+        next(stream)
+    message = str(raised.value)
+    assert "'drop'" in message and f"training_max_sequence_length + 1 = {DROP_BLOCK_SIZE + 1}" in message
+    assert recording.rows_read == 8 and recording.seen == []  # the whole epoch was read, nothing survived it
 
 
 def test_batch_stream_counts_rows_read_not_surviving_samples(
