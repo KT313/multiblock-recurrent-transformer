@@ -192,8 +192,7 @@ class Manifest:
         """
 
         kwargs = _known_fields_only(payload, cls)
-        raw_shards: list[dict[str, Any]] = kwargs.get("shards", [])
-        kwargs["shards"] = [ShardInfo(**_known_fields_only(shard, ShardInfo)) for shard in raw_shards]
+        kwargs["shards"] = _shard_infos(kwargs.get("shards", []))
         extra = dict(kwargs.get("extra", {}))
         for key, name in {**_PROCESSED_KEYS, **_RAW_KEYS, **_SHARED_KEYS}.items():
             if key in extra:
@@ -252,6 +251,35 @@ _RAW_FIELDS = tuple(_RAW_KEYS.values())
 _SHARED_FIELDS = tuple(_SHARED_KEYS.values())
 
 
+def _shard_infos(raw_shards: Any) -> list[ShardInfo]:
+    """
+    The `shards` of a manifest dict as :class:`ShardInfo`\\s.
+
+    Everything that is not a list of objects with a string name and integer counts is rejected here with a
+    TypeError/ValueError, so :meth:`Manifest.load` can apply its contract (warn without shards, refuse next to
+    them) instead of letting an AttributeError from `shards: [1]`, or a `rows: "3"` that only fails much later in
+    :meth:`Manifest.rows`, escape.
+    """
+
+    if not isinstance(raw_shards, list):
+        raise TypeError(f"shards must be a list, got {type(raw_shards).__name__}")
+    shards: list[ShardInfo] = []
+    for entry in raw_shards:
+        if not isinstance(entry, dict):
+            raise TypeError(f"shard entry must be an object, got {entry!r}")
+        shard = ShardInfo(**_known_fields_only(entry, ShardInfo))
+        if not isinstance(shard.name, str):
+            raise TypeError(f"shard name must be a string, got {shard.name!r}")
+        for count in ("rows", "tokens", "offset", "skipped_malformed", "dropped_too_long"):
+            value = getattr(shard, count)
+            if value is None and count != "rows":
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"shard {shard.name}: {count} must be an integer, got {value!r}")
+        shards.append(shard)
+    return shards
+
+
 def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:
     """
     [[name, rows], ...] of shards, the shape a processed manifest's input_shards records.
@@ -293,7 +321,18 @@ def shard_tokens(path: Path, cap: int | None = None) -> int:
     Sum of a shard's tokens column (one column read), every value capped at cap when given.
     """
 
-    column = pq.read_table(path, columns=["tokens"]).column("tokens")
+    return _sum_tokens(pq.read_table(path, columns=["tokens"]).column("tokens"), cap)
+
+
+def table_tokens(table: pa.Table, cap: int | None = None) -> int:
+    """
+    :func:`shard_tokens` of a table still in memory (the shard writer's, before it is read back).
+    """
+
+    return _sum_tokens(table.column("tokens"), cap)
+
+
+def _sum_tokens(column: pa.ChunkedArray[Any], cap: int | None) -> int:
     if cap is not None:
         column = pc.min_element_wise(column, cap)
     total = pc.sum(column).as_py()

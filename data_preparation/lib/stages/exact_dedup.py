@@ -120,12 +120,13 @@ class SeenDocuments:
 
         self._bloom.update(hashes)
 
-    def describe(self, rows_needed: int) -> str:
+    def describe(self, rows_on_disk: int) -> str:
         """
-        The one-line log message printed once per source: dedup filter: 1024 MB, ~2,600,000 rows.
+        The one-line log message printed once per source: dedup filter: 1024 MB, 2,600,000 rows on disk (the raw
+        rows going through it, not a capacity of the filter).
         """
 
-        return f"dedup filter: {self.memory_mb} MB, ~{rows_needed:,} rows"
+        return f"dedup filter: {self.memory_mb} MB, {rows_on_disk:,} rows on disk"
 
 
 def stored_hashes(parquet_files: Iterable[Path]) -> Iterator[int]:

@@ -76,8 +76,8 @@ def get_ngrams(text: str, n: int = 5) -> list[str]:
 
 def check_quality(text: str) -> tuple[bool, str]:
     """
-    Heuristic prose quality check (>= 3 sentences, <= 30% ALL-CAPS words, >= 25% alphanumeric, <= 30% duplicate
-    2-grams, <= 20% duplicate 3-grams); returns (passes, reason).
+    Heuristic prose quality check (>= 3 sentences, <= 30% ALL-CAPS words, >= 25% alphanumeric *or whitespace*
+    characters, <= 30% duplicate 2-grams, <= 20% duplicate 3-grams); returns (passes, reason).
     """
 
     if len(text) < 10:
@@ -91,9 +91,9 @@ def check_quality(text: str) -> tuple[bool, str]:
     caps_words = [word for word in words if word.isupper() and len(word) > 1]
     if len(caps_words) / len(words) > 0.3:
         return False, "too_many_caps"
-    alphanumeric = sum(1 for char in text if char.isalnum() or char.isspace())
+    alphanumeric = sum(1 for char in text if char.isalnum() or char.isspace())  # whitespace counts: prose is mostly spaces
     if alphanumeric / len(text) < 0.25:
-        return False, "too_few_alphanumeric"
+        return False, "too_few_alphanumeric_or_space"
     if len(words) > 10 and _unique_ratio(get_ngrams(text, 2)) < 0.7:
         return False, "too_repetitive_bigrams"
     if len(words) > 20 and _unique_ratio(get_ngrams(text, 3)) < 0.8:

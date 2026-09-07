@@ -190,7 +190,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     cfg = _prepare(cfg_factory, layout, local_dir, first, with_tokenizer, write=write_local, shard_size=3)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         m1 = build_source(cfg, "s", layout, shard_size=4)
-    assert "s: dedup filter: 1 MB, ~7 rows" in caplog.text, "the test config's 1 MB budget, sized for the raw rows"
+    assert "s: dedup filter: 1 MB, 7 rows on disk" in caplog.text, "the test config's 1 MB budget, and the raw rows it is fed"
     processed = layout.processed_dir("s")
     old_rows = read_rows(processed)
     assert len(old_rows) == 6 and m1.stats["input_rows"] == 7 and m1.columns == ["text", "source", "tokens", "hash"]

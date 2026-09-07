@@ -677,6 +677,8 @@ def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactor
     cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "s": _synthetic()}))
     with pytest.raises(ValueError, match="needs github_code sources"):
         download_github_code_group(cfg, ["py", "s"], layout, rows_needed={"py": 1, "s": 1})
+    with pytest.raises(ValueError, match="at least one source"):  # names[0] was read before the list was checked
+        download_github_code_group(cfg, [], layout, rows_needed={})
 
 
 # --- truncation at the token cap, dropped instruct rows, raw manifest state ---------------------------------------------

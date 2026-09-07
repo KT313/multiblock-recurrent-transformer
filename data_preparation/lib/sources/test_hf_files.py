@@ -408,7 +408,8 @@ def test_small_files_use_the_hub_cache_and_threshold_is_per_source(hub: FakeHub)
     remote = _src(load_kwargs={"data_files": "data/*.parquet", **REMOTE})
     assert _ids(LOADERS["hf_files"](remote, 0, 2)) == ["a0", "a1"]
     assert hub.downloads == [] and hub.streams == ["data/a.parquet"]
-    assert LOADERS["hf_files"] is not None and hub.size_lookups == 2  # in-memory indexes look sizes up each time
+    assert LOADERS["hf_files"] is not None, "the loader stays registered under its config name"
+    assert hub.size_lookups == 2  # in-memory indexes look sizes up each time: no index_dir was given
 
 
 def test_fetcher_seams_and_stats(hub: FakeHub) -> None:
@@ -953,7 +954,36 @@ def test_group_rejects_mixed_repos_and_duplicate_languages(hub: FakeHub) -> None
         list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("j", other_repo, 0, 1)]))
     with pytest.raises(ValueError, match="distinct languages"):
         list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("q", python, 0, 1)]))
+    java = _src(loader="github_code", language="Java", load_kwargs={})
+    with pytest.raises(ValueError, match="distinct names"):  # read_rows_multi keys its per-file counts by name
+        list(read_github_code_group([GithubCodeRequest("p", python, 0, 1), GithubCodeRequest("p", java, 0, 1)]))
     assert list(read_github_code_group([])) == []
+
+
+def test_read_rows_multi_rejects_duplicate_request_names(hub: FakeHub) -> None:
+    """
+    The per-request counts are kept in a dict keyed by name: two requests sharing one would record each other's
+    rows, so the pass refuses before it reads anything.
+    """
+
+    hub.add("data/a.parquet", _rows("a", 3, _three_languages))
+    index = hub_file_index(_src(load_kwargs={"data_files": "data/*.parquet", **REMOTE}), None, SharedLoaderParameters())
+    requests = [language_request("py", "Python", 0, 1), language_request("py", "Java", 0, 1)]
+    with pytest.raises(ValueError, match="distinct request names"):
+        list(read_rows_multi(index, requests, key_of=lambda row, file: f"language={row['language']}"))
+    assert hub.streams == [] and hub.downloads == []
+
+
+def test_a_github_code_file_without_the_language_column_names_it(hub: FakeHub, tmp_path: Path) -> None:
+    """
+    `github_code` sorts rows by their `language`; a file that does not carry the column used to fail with a bare
+    KeyError that named neither the file nor the column.
+    """
+
+    hub.add("data/a.parquet", [{"id": "a0", "text": "no language here"}])
+    python = _src(loader="github_code", language="Python", load_kwargs={"data_files": "data/*.parquet"})
+    with pytest.raises(ValueError, match="data/a.parquet: no 'language' column"):
+        list(read_github_code_group([GithubCodeRequest("py", python, 0, 1)], SharedLoaderParameters(index_dir=tmp_path / "index")))
 
 
 def test_glob_regex_does_not_cross_directories() -> None:
@@ -1076,7 +1106,7 @@ def test_discover_needs_key_of_and_a_passive_keyed_request(hub: FakeHub, tmp_pat
     with pytest.raises(ValueError, match="discover needs key_of"):
         list(read_rows_multi(index, [language_request("py", "Python", 0, 1)], discover=lambda key: None))
     bad = read_rows_multi(
-        index, [language_request("py", "Python", 0, 2)], key_of=lambda row: f"language={row['language']}",
+        index, [language_request("py", "Python", 0, 2)], key_of=lambda row, file: f"language={row['language']}",
         discover=lambda key: language_request("x", "Java", 0, 1),  # active, not passive
     )
     with pytest.raises(ValueError, match="must return a passive request"):
@@ -1087,7 +1117,7 @@ def test_passive_requests_take_nothing_from_streamed_files(hub: FakeHub, tmp_pat
     hub.add("data/a.jsonl", _rows("a", 6, _three_languages))
     index = hub_file_index(_src(load_kwargs={"data_files": "data/*.jsonl", **REMOTE}), None, SharedLoaderParameters())
     requests = [language_request("py", "Python", 0, 2), language_request("java", "Java", 0, 0, passive=True)]
-    pairs = list(read_rows_multi(index, requests, key_of=lambda row: f"language={row['language']}"))
+    pairs = list(read_rows_multi(index, requests, key_of=lambda row, file: f"language={row['language']}"))
     assert [(name, row["id"]) for name, row in pairs] == [("py", "a0"), ("py", "a3")]
 
 

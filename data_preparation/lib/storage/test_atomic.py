@@ -1,11 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for `write_atomically`: the rename on success, the cleanup on failure, files and directories.
+Tests for `write_atomically`: the rename on success, the cleanup on failure, files and directories, the fsyncs
+that make both durable.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -95,3 +97,61 @@ def test_the_suffix_can_be_chosen(tmp_path: Path) -> None:
         assert temporary.name == "MANIFEST.json.partial"
         temporary.write_text("payload", encoding="utf-8")
     assert target.is_file()
+
+
+def _fsynced_kinds(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """
+    Record "file" / "dir" per `os.fsync` call, in order, in the returned list.
+    """
+
+    kinds: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        kinds.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    return kinds
+
+
+def test_the_bytes_and_then_the_rename_are_made_durable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The rename is a write of the parent directory of its own: fsyncing only the file leaves a power loss free to
+    lose the directory entry that names the new bytes.
+    """
+
+    kinds = _fsynced_kinds(monkeypatch)
+    target = tmp_path / "MANIFEST.json"
+    with write_atomically(target) as temporary:
+        temporary.write_text("payload", encoding="utf-8")
+    assert kinds == ["file", "dir"] and target.read_text(encoding="utf-8") == "payload"
+
+
+def test_a_filesystem_that_refuses_the_directory_fsync_still_publishes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Some network mounts refuse to open or fsync a directory; the rename is atomic there anyway, so the write must
+    not fail over it.
+    """
+
+    real_open, real_fsync = os.open, os.fsync
+
+    def refusing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if Path(str(path)).is_dir():
+            raise OSError(13, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    def refusing_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(22, "Invalid argument")
+        real_fsync(fd)
+
+    target = tmp_path / "MANIFEST.json"
+    monkeypatch.setattr(os, "fsync", refusing_fsync)
+    with write_atomically(target) as temporary:
+        temporary.write_text("one", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "one"
+    monkeypatch.setattr(os, "open", refusing_open)
+    with write_atomically(target) as temporary:
+        temporary.write_text("two", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "two" and list(tmp_path.iterdir()) == [target]

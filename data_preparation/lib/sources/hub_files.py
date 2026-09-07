@@ -928,7 +928,7 @@ class ReadRequest:
     passive: bool = False
 
 
-KeyOf = Callable[[Row], str]  # the key of any row (`language=<value>`), for the all-key counts and discovery
+KeyOf = Callable[[Row, str], str]  # the key of a row of a file (`language=<value>`), for the all-key counts and discovery (row, file)
 Discover = Callable[[str], "ReadRequest | None"]  # a passive request for a key no request matches, or None to ignore the key
 
 
@@ -1108,16 +1108,21 @@ def read_rows_multi(
     request passive from the start, keeps taking the rows it matches from the row groups the pass still reads,
     while aligned (module docstring; a passive request that would have to skip an unread row group or file is
     detached for the rest of the pass, and a file that is not parquet detaches every passive request). key_of
-    gives the key of any row: every fully decoded row group then records the rows of every key
+    gives the key of any row (called with the row and the file it came from): every fully decoded row group then
+    records the rows of every key
     (:meth:`FileIndex.record_group_keys`), and a row whose key no request carries is offered to discover once,
     which may answer with a passive request for that key (its offset is the caller's business); the new
-    request joins the pass at that row group if it is aligned there, else it is detached at once.
+    request joins the pass at that row group if it is aligned there, else it is detached at once. The requests
+    must have distinct names (the counts recorded per file are keyed by them).
     """
 
     if fetcher is None:
         fetcher = HubFetcher(token=token)
     if discover is not None and key_of is None:
         raise ValueError("discover needs key_of")
+    names = [request.name for request in requests]
+    if len(set(names)) != len(names):  # the per-request counts are keyed by name: a shared name records a wrong count
+        raise ValueError(f"read_rows_multi needs distinct request names, got {names}")
     state = _Pass([_cursor(request) for request in requests if request.passive or request.count > 0], key_of, discover)
 
     try:
@@ -1273,7 +1278,7 @@ def _parquet_rows(
         complete = True
         for row in read_row_group(parquet, group, columns):
             if state.key_of is not None:
-                key = state.key_of(row)
+                key = state.key_of(row, file)
                 counts[key] = counts.get(key, 0) + 1
                 if key not in state.known_keys:
                     discovered = _discover(state, key, index, position, file, group, run_start)

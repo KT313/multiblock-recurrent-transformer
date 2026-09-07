@@ -22,7 +22,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.planner import DatasetReport, SourceLedger
 from data_preparation.lib.build.runner import STEPS
-from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairReport
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairError, RepairReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
@@ -164,6 +164,35 @@ def test_prepare_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1 and "stage exploded" in caplog.text and "prepare failed" in caplog.text
+    assert "Traceback" in caplog.text, "an unexpected error keeps the traceback a bug report needs"
+
+
+def test_a_broken_config_and_a_repair_error_are_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A config the user has to fix and a repair that cannot decide safely are messages, not stack traces: the
+    traceback of a `ValueError` from the config parser buried the sentence naming the offending key.
+    """
+
+    broken = tmp_path / "broken.yaml"
+    broken.write_text(TINY.read_text() + "\nnot_a_config_field: 3\n")
+    with caplog.at_level(logging.ERROR, logger="data_preparation"), pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(broken), "--dataset_dir", str(tmp_path / "d")])
+    assert exc.value.code == 1 and "Traceback" not in caplog.text
+    assert "prepare failed: dataset config" in caplog.text and "not_a_config_field" in caplog.text
+    assert len([line for line in caplog.text.splitlines() if line.strip()]) == 1
+
+    caplog.clear()
+
+    def unrepairable(*args: object, **kwargs: object) -> None:
+        raise RepairError("raw shards without a manifest")
+
+    monkeypatch.setattr(prepare, "prepare", unrepairable)
+    with caplog.at_level(logging.ERROR, logger="data_preparation"), pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "d")])
+    assert exc.value.code == 1 and "Traceback" not in caplog.text
+    assert "prepare failed: raw shards without a manifest" in caplog.text
 
 
 def test_prepare_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
