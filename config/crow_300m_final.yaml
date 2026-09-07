@@ -106,6 +106,6 @@ benchmark_step_interval: 0           # run the benchmarks every this many steps 
 benchmark_at_training_progress: []   # ... and at these percentages of the run, like sample_at_training_progress
 benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
 benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
-benchmark_num_fewshot: 0
+benchmark_num_fewshot: -1         # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
 benchmark_batch_size: 8              # sequences per lm-eval forward
 benchmark_recurrences: []            # like sample_recurrences, for the benchmarks

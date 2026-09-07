@@ -413,6 +413,9 @@ def test_sample_and_benchmark_settings() -> None:
         _settings(sample_temperature=-0.1)
     with pytest.raises(ValueError, match="benchmark_limit"):
         _settings(benchmark_limit=0)
+    assert settings.benchmark_num_fewshot == -1  # each task's own default; 0 means "no examples in the context"
+    with pytest.raises(ValueError, match="benchmark_num_fewshot"):
+        _settings(benchmark_num_fewshot=-2)
     with pytest.raises(ValueError, match="benchmark_tasks is empty"):
         _settings(benchmark_at_training_progress=[100], benchmark_tasks=[])
     with pytest.raises(ValueError, match="benchmark_tasks is empty"):

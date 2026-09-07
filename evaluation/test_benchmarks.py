@@ -13,7 +13,14 @@ from typing import Any
 
 import pytest
 
-from evaluation.benchmarks import EVAL_EXTRA_HINT, benchmarks_path, evaluate_on_benchmarks, flatten_results
+from evaluation.benchmarks import (
+    BOOTSTRAP_ITERS,
+    DEFAULT_TASKS,
+    EVAL_EXTRA_HINT,
+    benchmarks_path,
+    evaluate_on_benchmarks,
+    flatten_results,
+)
 from model.hf.modeling import RecurrentGPTForCausalLM
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
@@ -75,7 +82,7 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     path = benchmarks_path(tmp_path, 7)
     metrics = evaluate_on_benchmarks(
         tiny_model, tokenizer, ["arc_easy", "hellaswag"], num_fewshot=2, limit=40, batch_size=4, out_path=path, step=7,
-        recurrences=[None, [2, 2]],
+        recurrences=[None, [2, 2]], seed=5,
     )
     assert metrics == flatten_results(RESULTS, "mean") | flatten_results(RESULTS, "2-2") and tiny_model.training
     wrapper = calls["hflm"]["pretrained"]
@@ -87,11 +94,44 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"]
     assert (calls["evaluate"]["num_fewshot"], calls["evaluate"]["limit"]) == (2, 40)
     assert calls["evaluate"]["model"].__class__.__name__ == "HFLM"
+    # lm-eval reseeds torch on every call, so the seed of the isolated inference only reaches it as an argument
+    assert calls["evaluate"]["torch_random_seed"] == 5
+    assert calls["evaluate"]["log_samples"] is False and calls["evaluate"]["bootstrap_iters"] == BOOTSTRAP_ITERS
     record = json.loads(path.read_text(encoding="utf-8"))
     assert path == tmp_path / "benchmarks" / "step-00000007.json"
     assert (record["step"], record["tasks"], record["limit"], record["num_fewshot"]) == (7, ["arc_easy", "hellaswag"], 40, 2)
+    assert record["seed"] == 5
     assert record["recurrences"] == [None, [2, 2]] and record["metrics"] == metrics
     assert record["results"] == {"mean": RESULTS, "2-2": RESULTS} and record["versions"] == {"arc_easy": 1, "hellaswag": 1}
+
+
+def test_num_fewshot_default_leaves_every_task_at_its_own(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The default -1 becomes lm-eval's `num_fewshot=None` (gsm8k stays 5-shot); 0 is passed as the 0 it is.
+    """
+
+    calls = stub_lm_eval(monkeypatch)
+    tokenizer = Tokenizer(tiny_tokenizer_dir)
+    evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"])
+    assert calls["evaluate"]["num_fewshot"] is None
+    evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=0)
+    assert calls["evaluate"]["num_fewshot"] == 0
+    with pytest.raises(ValueError, match="num_fewshot must be >= -1"):
+        evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=-2)
+
+
+def test_default_tasks_are_the_settings_default() -> None:
+    """
+    One tuple, not two that drift apart (`training.settings` names it; importing it here keeps that module free of
+    torch, which an import the other way round would pull in).
+    """
+
+    from training.settings import DEFAULT_BENCHMARK_TASKS, Settings
+
+    assert DEFAULT_TASKS is DEFAULT_BENCHMARK_TASKS
+    assert list(DEFAULT_TASKS) == Settings.__dataclass_fields__["benchmark_tasks"].default_factory()
 
 
 def test_evaluate_on_benchmarks_errors(

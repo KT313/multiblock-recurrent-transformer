@@ -20,9 +20,11 @@ from typing import Any
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python evaluation/evaluate.py` from the repo root
+
 from data_preparation.dataset_config import load_dataset_config
 from data_preparation.layout import DatasetLayout
-from evaluation.benchmarks import benchmarks_path, evaluate_on_benchmarks
+from evaluation.benchmarks import TASK_DEFAULT_FEWSHOT, benchmarks_path, evaluate_on_benchmarks
 from evaluation.prompts import load_prompts
 from evaluation.samples import generate_and_save_samples, samples_path
 from model.config import RecurrentConfig
@@ -42,8 +44,12 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0, help="0: greedy")
     parser.add_argument("--tasks", default="", help="comma-separated lm-eval tasks; empty: no benchmarks")
     parser.add_argument("--limit", type=int, default=None, help="examples per task")
-    parser.add_argument("--num_fewshot", type=int, default=0)
+    parser.add_argument(
+        "--num_fewshot", type=int, default=TASK_DEFAULT_FEWSHOT,
+        help="examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0, help="seeds the isolated RNG of both entry points")
     parser.add_argument(
         "--recurrence",
         action="append",
@@ -108,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             temperature=arguments.temperature,
             recurrences=recurrences,
             batch_size=arguments.batch_size,
+            seed=arguments.seed,
         )
         print(f"{len(samples)} samples written to {path}")
         for sample in samples:
@@ -126,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             recurrences=recurrences,
             out_path=path,
             step=step,
+            seed=arguments.seed,
         )
         print(f"benchmark results written to {path}")
         for name, value in metrics.items():

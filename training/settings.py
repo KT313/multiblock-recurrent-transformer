@@ -152,7 +152,7 @@ class Settings:
     benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress (needs the eval extra: uv sync --extra eval)
     benchmark_tasks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARK_TASKS))  # lm-eval task names
     benchmark_limit: Optional[int] = None  # examples per task (None: all); a few hundred keeps in-training runs short
-    benchmark_num_fewshot: int = 0
+    benchmark_num_fewshot: int = -1  # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
     benchmark_batch_size: int = 8
     benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
@@ -195,6 +195,8 @@ class Settings:
             raise ValueError("sample_temperature must be >= 0 (0: greedy)")
         if self.benchmark_limit is not None and self.benchmark_limit <= 0:
             raise ValueError("benchmark_limit must be positive or null (all examples)")
+        if self.benchmark_num_fewshot < -1:
+            raise ValueError("benchmark_num_fewshot must be >= -1 (-1: each task's own default, 0: no examples)")
         for name in ("sample_at_training_progress", "benchmark_at_training_progress"):
             if any(not 0 <= percentage <= 100 for percentage in getattr(self, name)):
                 raise ValueError(f"{name} must list percentages between 0 and 100, got {getattr(self, name)}")

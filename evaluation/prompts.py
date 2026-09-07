@@ -15,6 +15,9 @@ CONTINUATION = "continuation"
 INSTRUCTION = "instruction"
 PROMPT_KINDS = (CONTINUATION, INSTRUCTION)
 FILE_SEPARATOR = "---"  # a line of its own between the prompts of a prompts file
+# The kind markers of a prompts file, matched on the whole first line (case and surrounding whitespace ignored):
+# anything else starting with `#` is content, a Python comment or a Markdown heading of the prompt itself.
+KIND_MARKERS: dict[str, str] = {f"# {kind}": kind for kind in PROMPT_KINDS}
 
 
 @dataclass(frozen=True)
@@ -52,7 +55,8 @@ DEFAULT_PROMPTS: tuple[Prompt, ...] = (
 def load_prompts_file(path: str | Path) -> list[Prompt]:
     """
     Prompts separated by `---` lines; a first line `# instruction` makes the prompt an instruction prompt (its
-    first paragraph the instruction, the rest the input), `# continuation` is the default.
+    first paragraph the instruction, the rest the input), `# continuation` is the default. Only those two exact
+    lines are markers: a prompt may start with any other `#` line (a comment, a heading) and keeps it as content.
     """
 
     text = Path(path).read_text(encoding="utf-8")
@@ -61,15 +65,15 @@ def load_prompts_file(path: str | Path) -> list[Prompt]:
         block = block.strip("\n")
         if not block.strip():
             continue
-        kind = CONTINUATION
         first_line, _, rest = block.partition("\n")
-        if first_line.strip().startswith("#"):
-            kind = first_line.strip("# ").strip().lower()
-            if kind not in PROMPT_KINDS:
-                raise ValueError(f"{path}: unknown prompt kind {kind!r}; use one of {PROMPT_KINDS}")
+        marker = KIND_MARKERS.get(first_line.strip().lower())
+        kind = marker or CONTINUATION
+        if marker is not None:
             block = rest
         if kind == INSTRUCTION:
             instruction, _, input_text = block.partition("\n\n")
+            if not instruction.strip():
+                raise ValueError(f"{path}: a `# instruction` prompt needs an instruction on the lines below the marker")
             prompts.append(instruction_prompt(instruction, input_text))
         else:
             prompts.append(Prompt(block))

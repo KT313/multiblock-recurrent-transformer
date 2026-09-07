@@ -16,12 +16,15 @@ from typing import Any, cast
 
 import torch
 
+from data_preparation.lib.log import get_logger
 from evaluation.prompts import DEFAULT_PROMPTS, Prompt
 from evaluation.wrapper import Recurrence, check_recurrence, hf_wrapper_around, isolated_inference
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 
 SAMPLES_DIR = "samples"  # under the run directory
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -53,22 +56,23 @@ def generate_samples(
     One completion per prompt: greedy when temperature is 0, sampled at that temperature otherwise; at most
     max_new_tokens tokens, cut at the first EOS. recurrence (steps per core block, e.g. [4, 4, 4]) overrides the
     model's mean recurrence. seed seeds the isolated RNG (the initial latent state, and the sampling), so the
-    output is reproducible whatever the global RNG state.
+    output is reproducible whatever the global RNG state. A prompt whose tokens plus max_new_tokens do not fit the
+    model's position table is skipped with a warning (`_fitting_prompts`) instead of crashing the run.
     """
 
     check_recurrence(recurrence, model)
+    fitting = _fitting_prompts(prompts, tokenizer, max_new_tokens, model.config.model_max_sequence_length)
     samples: list[GeneratedSample] = []
     with isolated_inference(model, recurrence, seed=seed):
         wrapper = hf_wrapper_around(model, tokenizer)
         generate = cast(Any, wrapper).generate  # set dynamically by transformers, invisible to the type checkers
         device = next(model.parameters()).device
-        for start in range(0, len(prompts), batch_size):
-            batch = prompts[start : start + batch_size]
-            encoded = [tokenizer.encode(prompt.text, bos=True) for prompt in batch]
-            width = max(len(ids) for ids in encoded)
+        for start in range(0, len(fitting), batch_size):
+            batch = fitting[start : start + batch_size]
+            width = max(len(ids) for _, ids in batch)
             input_ids = torch.full((len(batch), width), tokenizer.pad_id, dtype=torch.long)
             attention_mask = torch.zeros((len(batch), width), dtype=torch.long)
-            for row, ids in enumerate(encoded):  # left-padded: the wrapper derives the positions from the mask
+            for row, (_, ids) in enumerate(batch):  # left-padded: the wrapper derives the positions from the mask
                 input_ids[row, width - len(ids) :] = torch.tensor(ids, dtype=torch.long)
                 attention_mask[row, width - len(ids) :] = 1
             sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
@@ -80,9 +84,32 @@ def generate_samples(
                 eos_token_id=tokenizer.eos_id,
                 **sampling,
             )
-            for row, prompt in enumerate(batch):
+            for row, (prompt, _) in enumerate(batch):
                 samples.append(_sample_from(prompt, output[row, width:].tolist(), tokenizer, recurrence))
     return samples
+
+
+def _fitting_prompts(
+    prompts: Sequence[Prompt], tokenizer: Tokenizer, max_new_tokens: int, model_max_sequence_length: int
+) -> list[tuple[Prompt, list[int]]]:
+    """
+    The prompts that can be generated from, with their token ids: prompt tokens plus max_new_tokens must fit the
+    model's position table (`model_max_sequence_length`), because the whole sequence is recomputed per token and a
+    position beyond the RoPE table raises an `IndexError` deep in the model. A longer prompt is left out with a
+    warning naming it (a training run must not die on one entry of a prompts file).
+    """
+
+    fitting: list[tuple[Prompt, list[int]]] = []
+    for prompt in prompts:
+        ids = tokenizer.encode(prompt.text, bos=True)
+        if len(ids) + max_new_tokens > model_max_sequence_length:
+            log.warning(
+                "prompt %r skipped: its %d tokens plus max_new_tokens %d exceed the model's %d positions",
+                prompt.text[:60], len(ids), max_new_tokens, model_max_sequence_length
+            )
+            continue
+        fitting.append((prompt, ids))
+    return fitting
 
 
 def _sample_from(

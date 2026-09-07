@@ -425,22 +425,27 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
 def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> list[GeneratedSample]:
     """
     Sample generations of the model as it is now, written to `samples/step-XXXXXXXX.jsonl` of the run directory
-    and noted by the logger. RNG-isolated: the training numerics do not change.
+    and noted by the logger. RNG-isolated: the training numerics do not change. An empty list when generation
+    failed (a warning, the run goes on), the policy `run_benchmarks` has: neither is worth a run.
     """
 
     settings, step = state.settings, state.progress.step
     path = samples_path(state.run_directory, step)
-    with logger.working("generating samples"):
-        samples = generate_and_save_samples(
-            plain_model(state.model),
-            tokenizer,
-            path,
-            step=step,
-            prompts=load_prompts(),
-            max_new_tokens=settings.sample_max_new_tokens,
-            temperature=settings.sample_temperature,
-            recurrences=settings.sample_recurrences or [None],
-        )
+    try:
+        with logger.working("generating samples"):
+            samples = generate_and_save_samples(
+                plain_model(state.model),
+                tokenizer,
+                path,
+                step=step,
+                prompts=load_prompts(),
+                max_new_tokens=settings.sample_max_new_tokens,
+                temperature=settings.sample_temperature,
+                recurrences=settings.sample_recurrences or [None],
+            )
+    except Exception as error:  # a prompt the model cannot take, an OOM in generation: the run must not end on it
+        log.warning("sample generation failed, the run continues: %s", error)
+        return []
     logger.log_samples(path, samples)
     return samples
 
