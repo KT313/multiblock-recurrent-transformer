@@ -50,7 +50,7 @@ from data_preparation.lib.sources.synthetic import VOCAB_SIZE, synthetic_row, wr
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
-CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config" / "datasets" / "tiny.yaml"]
+CONFIGS = sorted((REPO / "config" / "datasets").glob("*.yaml"))  # every shipped dataset config
 
 
 # --- stub `datasets` module -------------------------------------------------------------------------------------------

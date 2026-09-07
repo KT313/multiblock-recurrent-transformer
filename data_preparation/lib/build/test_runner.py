@@ -34,7 +34,7 @@ from data_preparation.lib.build.lock import RunLocked, build_lock
 from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
-from data_preparation.lib.stages.download import download as real_download
+from data_preparation.lib.stages.download import MalformedSourceError, download as real_download
 from data_preparation.lib.stages.download import download_github_code_group as real_group
 from data_preparation.lib.storage.manifest import Manifest
 
@@ -225,10 +225,11 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
-    with an empty processed folder. That used to count as satisfied: `prepare` and `status` said "dataset complete",
-    exit 0, and the training run failed much later (open finding H2). A failed source is a failed build, so it
-    is now unsatisfied with a reason that names the likely mistake.
+    A `fields` mapping naming columns the rows do not have rejects every row as malformed. That used to run the
+    source dry with an empty folder that counted as satisfied: `prepare` and `status` said "dataset complete", exit
+    0, and the training run failed much later (open finding H2). The download now fails at the tenth malformed
+    row in a row (`MalformedSourceError`, lib/stages/download.py) with the expected and the found formats, so
+    `prepare` raises, `status` reports the source incomplete and the CLI exits 1.
     """
 
     src_dir = layout.root.parent / "wrong_fields"
@@ -236,14 +237,16 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     source = SourceConfig(kind="instruct", loader="local", path=str(src_dir), fields={"instruction": "prompt", "output": "completion"})
     cfg = cfg_factory({"i": source}, tokens=100)
     path = config_file(cfg)
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pytest.raises(MalformedSourceError) as failure:
+        prepare(path, layout.root, assume_yes=False)
+    message = str(failure.value)
+    assert message.startswith("i: 10 consecutive rows could not be converted; expected format: columns instruction=prompt, output=completion")
+    assert "{'question': 'str', 'answer': 'str'}" in message and "missing column(s) ['prompt', 'completion']" in message
+    assert "i: malformed row skipped" in caplog.text and "source i failed" in caplog.text
+    report = status(path, layout.root)
     (i,) = report.sources
-    assert not report.complete and not i.satisfaction()[0] and i.exhausted and (i.raw_rows, i.processed_rows) == (0, 0)
-    assert "NOT ONE" in i.satisfaction()[1] and "20 malformed" in i.satisfaction()[1]
-    assert "check the source's fields / converter / filter / language" in i.satisfaction()[1]
-    assert report.missing() == ["i"] and f"i: {i.satisfaction()[1]}" in caplog.text
-    assert status(path, layout.root).describe().endswith("dataset INCOMPLETE"), "`status` says the same"
+    assert not report.complete and not i.satisfaction()[0] and (i.raw_rows, i.processed_rows) == (0, 0)
+    assert report.describe().endswith("dataset INCOMPLETE"), "`status` says the same"
     with pytest.raises(SystemExit) as exit_code:
         prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root)])
     assert exit_code.value.code == 1
