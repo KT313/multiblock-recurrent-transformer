@@ -189,9 +189,9 @@ def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: Res
 
 def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
     """
-    Every id the tokenizer produces must address a row of the embedding table (`padded_vocab_size`), or the first
-    batch holding a high id fails on an index error; a declared `vocab_size` that differs from the tokenizer is
-    embedding rows that never occur, which is a warning.
+    Every id the tokenizer produces must be below `vocab_size`, or the first batch holding a high id fails on an
+    index error (beyond the padded table) or trains nothing (a padding row); a declared `vocab_size` above the
+    tokenizer is embedding rows that never occur, which is a warning.
     """
 
     tokenizer = Tokenizer(tiny_tokenizer_dir)
@@ -204,8 +204,15 @@ def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir:
         check_tokenizer_vocabulary(tokenizer, larger)  # more rows than tokens: trained but never addressed
         assert f"declares vocab_size {tokens + 1} but the dataset's tokenizer has {tokens} tokens" in caplog.text
     smaller = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, vocab_size=tokens - 1, padded_vocab_size=tokens - 1)
-    with pytest.raises(ValueError, match=f"tokenizer of the dataset has {tokens} tokens but the model's embedding table holds {tokens - 1} rows"):
+    message = f"tokenizer of the dataset has {tokens} tokens but the model's vocabulary holds {tokens - 1} ids"
+    with pytest.raises(ValueError, match=message):
         check_tokenizer_vocabulary(tokenizer, smaller)
+    # the padding rows of the table do not count: they are trained on no target, and the loss masks such labels
+    into_the_padding = RecurrentConfig.from_yaml(
+        tiny_settings.model_architecture_config, vocab_size=tokens - 1, padded_vocab_size=tokens + 10
+    )
+    with pytest.raises(ValueError, match=message):
+        check_tokenizer_vocabulary(tokenizer, into_the_padding)
 
 
 def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:

@@ -172,6 +172,7 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         # buffer would stay uninitialised (in the training model it is not persistent, so the config always wins)
         self.model.register_buffer("freqs_cis", self.model.freqs_cis, persistent=True)
         self.num_recurrent_blocks = len(self.model.transformer.core_blocks)
+        self._training_forwards = 0  # the inner model's sampler step, see `forward`
         self.post_init()  # type: ignore[no-untyped-call]  # untyped in transformers
 
     def _init_weights(self, module: torch.nn.Module) -> None:
@@ -201,10 +202,23 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The inner `RecurrentGPT` expects pre-shifted
         labels, so it gets `labels=None`. `attention_mask` `(B, S)` (1 = keep) and `position_ids` (1-D or `(B, S)`)
         are forwarded to the inner model.
+
+        Every sampled training forward counts as one sampler step: the inner model's `step` (which seeds the
+        recurrence depths, `model/blocks/recurrence.py`) is set to `self._training_forwards` here, so a HF Trainer
+        or PEFT run draws a new depth per forward instead of the fixed depth of step 0, and the micro-batches of
+        one accumulated optimizer step draw independently. The value stays until the next forward, so an
+        activation-checkpoint recompute in the backward draws the same depth. The counter is a plain attribute,
+        not a buffer: `save_pretrained` does not store it and a resumed Trainer restarts the depth sequence at 0
+        (the depths are a distribution, not a schedule). The native training loop writes `step` itself
+        (`training/step.py`) and never goes through this wrapper.
         """
 
         if return_dict is None:
             return_dict = self.config.return_dict
+
+        sampler_step = num_steps is None and self.training
+        if sampler_step:
+            self.model.step = self._training_forwards
 
         if num_steps is None and not self.training:
             env_steps = os.environ.get("EVAL_RECURRENCE_STEPS", "").strip()
@@ -224,6 +238,8 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
             return_logits=True,
             num_steps=num_steps,
         )
+        if sampler_step:
+            self._training_forwards += 1
         logits = outputs["logits"]
         assert logits is not None  # `return_logits=True`
         logits = mask_padded_vocabulary(logits, int(self.config.vocab_size), int(self.config.padded_vocab_size))
