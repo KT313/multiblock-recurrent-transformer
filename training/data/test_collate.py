@@ -119,7 +119,7 @@ def test_padding_multiple(tokenizer: Tokenizer, n_words: int, multiple: int | No
     assert input_ids.shape == labels.shape == (1, expected_len - 1)
 
 
-def test_padding_multiple_capped_at_block_size_plus_one(tokenizer: Tokenizer) -> None:
+def test_padding_multiple_capped_at_sequence_length_plus_one(tokenizer: Tokenizer) -> None:
     input_ids, labels, _ = collate_fn([_row(_words(20))], tokenizer, training_max_sequence_length=16, padding_multiple=64)
     assert input_ids.shape == labels.shape == (1, 16)
 
@@ -131,22 +131,22 @@ def test_padding_multiple_not_dividing_cap_still_capped(tokenizer: Tokenizer) ->
     assert (labels == -100).sum() == 0
 
 
-def test_truncation_at_block_size_plus_one(tokenizer: Tokenizer) -> None:
-    block = 16
-    input_ids, labels, _ = collate_fn([_row(_words(100))], tokenizer, training_max_sequence_length=block)
-    assert input_ids.shape == (1, block)
-    assert labels.shape == (1, block)
+def test_truncation_at_sequence_length_plus_one(tokenizer: Tokenizer) -> None:
+    length = 16
+    input_ids, labels, _ = collate_fn([_row(_words(100))], tokenizer, training_max_sequence_length=length)
+    assert input_ids.shape == (1, length)
+    assert labels.shape == (1, length)
     full = tokenizer.encode(_words(100), bos=True, eos=True)
-    assert input_ids[0].tolist() == full[:block]
-    assert labels[0].tolist() == full[1 : block + 1]
+    assert input_ids[0].tolist() == full[:length]
+    assert labels[0].tolist() == full[1 : length + 1]
     assert (labels == -100).sum() == 0
 
 
 def test_short_and_long_rows_mixed(tokenizer: Tokenizer) -> None:
-    block = 16
-    input_ids, labels, _ = collate_fn([_row(_words(2)), _row(_words(100))], tokenizer, training_max_sequence_length=block)
-    assert input_ids.shape == (2, block)
-    assert (labels[0] == -100).sum() == block - 3  # 2 words + eos supervised
+    length = 16
+    input_ids, labels, _ = collate_fn([_row(_words(2)), _row(_words(100))], tokenizer, training_max_sequence_length=length)
+    assert input_ids.shape == (2, length)
+    assert (labels[0] == -100).sum() == length - 3  # 2 words + eos supervised
     assert (labels[1] == -100).sum() == 0
 
 

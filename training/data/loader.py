@@ -16,13 +16,11 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.base import Backend
-from training.data.collate import Batch, Sample, WorkerBatch, collate_fn, collate_worker_batch
+from training.data.collate import Batch, WorkerBatch, collate_fn, collate_worker_batch
 from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 from training.settings import Settings
-
-SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (the `samples` half of a WorkerBatch)
 
 # The worker batch of the unpadded train loaders: rows tokenized per worker batch and worker batches kept ready ahead
 # (torch's `prefetch_factor`). Their product is how many tokenized rows a source has waiting when `BatchStream`

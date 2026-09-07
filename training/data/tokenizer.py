@@ -29,7 +29,8 @@ class Tokenizer:
     Loads a saved tokenizer directory and encodes text without automatic special tokens.
 
     BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them. Both must exist: the
-    formats prepend BOS, every document ends in EOS, and pack tails are EOS.
+    formats prepend BOS, every document ends in EOS, and pack tails are EOS. Both must also be base-vocabulary
+    tokens, because labels are masked against `vocab_size` (see :meth:`__init__`).
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -41,8 +42,18 @@ class Tokenizer:
         bos_id, eos_id = self._backend.bos_id, self._backend.eos_id
         if bos_id is None or eos_id is None:
             raise ValueError(f"Tokenizer at {self.path} must define a BOS and an EOS token")
+        outside = [f"{name} {token_id}" for name, token_id in (("BOS", bos_id), ("EOS", eos_id)) if token_id >= self.vocab_size]
+        if outside:
+            raise ValueError(
+                f"Tokenizer at {self.path}: {' and '.join(outside)} lie(s) outside its base vocabulary of "
+                f"{self.vocab_size} tokens (they are added tokens). Labels are bounded by the base vocabulary "
+                "(`training.data.collate` masks every id >= vocab_size to IGNORE_INDEX), so such an EOS would be "
+                "masked out of every document and the model would never learn to stop. Rebuild the tokenizer "
+                "directory with its specials in the base vocabulary."
+            )
         self.bos_id: int = bos_id
         self.eos_id: int = eos_id
+        # pad_id is never a label (generation pads with it, training pads inputs with EOS), so it is not bounded here
         self.pad_id: int = resolve_pad_id(self._backend, self.eos_id)
 
     @property

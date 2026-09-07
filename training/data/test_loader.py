@@ -88,6 +88,8 @@ def _rows_in(directory: Path) -> int:
 
 
 def _same(a: list[Batch], b: list[Batch]) -> bool:
+    if len(a) != len(b):  # zip alone would call two runs of different length equal on their common prefix
+        return False
     return all(torch.equal(x[0], y[0]) and torch.equal(x[1], y[1]) and x[2] == y[2] for x, y in zip(a, b))
 
 
@@ -164,9 +166,9 @@ def test_single_spec_batches(tokenizer: Tokenizer, entries: list[DataEntry], tin
     assert len(list(loader)) == math.ceil(_rows_in(tiny_pretrain_dir) / 4)
 
 
-# Mixtures with the instruct folder use a block size no instruct prompt can fill, so no row is dropped for lack of a
+# Mixtures with the instruct folder use a sequence length no instruct prompt can fill, so no row is dropped for lack of a
 # supervised label; the processed instruct rows are only bounded by dataset_max_sequence_length (256).
-MIXTURE_BLOCK_SIZE = 128
+MIXTURE_SEQUENCE_LENGTH = 128
 
 
 def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
@@ -176,7 +178,7 @@ def test_mixture_loader_mixes_by_weight_and_reads_every_member_once(
     The draws follow the weights while every member has rows; the loader ends once each member was read once.
     """
 
-    loader = _loader(entries, tokenizer, 2, seed=0, training_max_sequence_length=MIXTURE_BLOCK_SIZE)
+    loader = _loader(entries, tokenizer, 2, seed=0, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH)
     batches = list(loader)
     pre_rows, ft_rows = _rows_in(tiny_pretrain_dir), _rows_in(tiny_instruct_dir)
     assert len(batches) == math.ceil((pre_rows + ft_rows) / 2)
@@ -199,7 +201,7 @@ def test_validation_mixture_is_finite_and_matches_the_batch_count(
         DataEntry("s-ft", str(tiny_instruct_dir), weight=0.3, data_signature=INSTRUCT_SIGNATURE, max_rows=3),
     ]
     rows = {str(tiny_pretrain_dir): _rows_in(tiny_pretrain_dir), str(tiny_instruct_dir): _rows_in(tiny_instruct_dir)}
-    loader = _loader(stage_entries, tokenizer, 4, seed=0, training_max_sequence_length=MIXTURE_BLOCK_SIZE)
+    loader = _loader(stage_entries, tokenizer, 4, seed=0, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH)
     batches = list(loader)
     assert len(batches) == validation_batches_available(stage_entries, rows, validation_batch_size=4, world_size=1) == 4
     ids = Counter(itertools.chain.from_iterable(b[2] for b in batches))
@@ -207,9 +209,9 @@ def test_validation_mixture_is_finite_and_matches_the_batch_count(
 
 
 def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    a = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
-    b = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
-    c = _batches(_loader(entries, tokenizer, 2, seed=6, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 10)
+    a = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH), 10)
+    b = _batches(_loader(entries, tokenizer, 2, seed=5, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH), 10)
+    c = _batches(_loader(entries, tokenizer, 2, seed=6, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH), 10)
     assert _same(a, b)
     assert not _same(a, c)
 
@@ -249,8 +251,8 @@ def test_workers_two_micro_batch_gt_one_regroups_rows(
 
 
 def test_workers_two_mixture_is_deterministic(tokenizer: Tokenizer, entries: list[DataEntry]) -> None:
-    a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
-    b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_BLOCK_SIZE), 12)
+    a = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH), 12)
+    b = _batches(_loader(entries, tokenizer, 2, seed=1, num_workers=2, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH), 12)
     assert _same(a, b)
 
 

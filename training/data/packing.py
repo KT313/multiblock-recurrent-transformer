@@ -102,7 +102,7 @@ class PackPool:
         if length > self.pack_length:
             log.warning(
                 "Dropping a %d-token document of %r: longer than the pack length %d, it can never be packed. "
-                "tokens_per_micro_batch must be >= training_max_sequence_length + 1 tokens per document.",
+                "tokens_per_micro_batch must be >= training_max_sequence_length (what `Settings` enforces).",
                 length + 1,
                 sample[2],
                 self.pack_length,

@@ -16,7 +16,7 @@ from training.data.datasets import DEFAULT_DATA_SIGNATURE, ParquetTextDataset, W
 
 def _expected_rows(data_dir: Path) -> list[str]:
     rows: list[str] = []
-    for f in sorted(data_dir.glob("*.parquet")):
+    for f in sorted(data_dir.glob("data-*.parquet")):
         rows.extend(str(x) for x in pq.read_table(f).column("text").to_pylist())
     return rows
 
@@ -34,7 +34,7 @@ def small_dir(tmp_path: Path) -> Path:
 
     d = tmp_path / "small"
     d.mkdir()
-    for name, rows in [("b.parquet", range(10, 20)), ("a.parquet", range(10)), ("c.parquet", range(20, 23))]:
+    for name, rows in [("data-00001.parquet", range(10, 20)), ("data-00000.parquet", range(10)), ("data-00002.parquet", range(20, 23))]:
         pq.write_table(pa.table({"text": [f"row {i}" for i in rows], "junk": list(rows)}), d / name)
     return d
 
@@ -385,15 +385,27 @@ def test_missing_signature_column_raises(small_dir: Path) -> None:
 def test_missing_text_column_raises(tmp_path: Path) -> None:
     d = tmp_path / "notext"
     d.mkdir()
-    pq.write_table(pa.table({"content": ["a", "b"]}), d / "a.parquet")
+    pq.write_table(pa.table({"content": ["a", "b"]}), d / "data-00000.parquet")
     with pytest.raises(ValueError, match=r"lack the column\(s\) \['text'\].*found \['content'\]"):
         ParquetTextDataset(d, "p")
 
 
 def test_empty_directory_raises(tmp_path: Path) -> None:
     (tmp_path / "empty").mkdir()
-    with pytest.raises(FileNotFoundError, match="No parquet files"):
+    with pytest.raises(FileNotFoundError, match="No data-NNNNN.parquet shard"):
         ParquetTextDataset(tmp_path / "empty", "p")
+
+
+def test_only_the_build_shards_are_read(small_dir: Path) -> None:
+    """
+    A stray parquet file next to the shards is ignored, the same way `dataset_resolver` counts only
+    `data-*.parquet` rows: the two must see one file set or the row indices behind the split drift apart.
+    """
+
+    pq.write_table(pa.table({"text": ["stray"]}), small_dir / "extra.parquet")
+    ds = ParquetTextDataset(small_dir, "small")
+    assert [f.name for f in ds.files] == ["data-00000.parquet", "data-00001.parquet", "data-00002.parquet"]
+    assert len(ds) == 23
 
 
 # --- resume offsets ------------------------------------------------------------------------------------------------
