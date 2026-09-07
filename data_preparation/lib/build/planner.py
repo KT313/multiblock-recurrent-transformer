@@ -258,7 +258,7 @@ class SourceLedger:
     rows_sufficient: int  # processed rows that serve the budget (:meth:`DatasetConfig.rows_sufficient`)
     rows_budget: int  # rows the whole run draws (token budget ÷ tokens_per_row; 0 when the source is not trained on)
     tokens_per_row: float  # the rate the three numbers above were planned with (measured mean of the capped row lengths, else the estimate)
-    raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated" | "unreadable"
+    raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated" | "tokenizer_changed" | "unreadable"
     raw_reason: str  # the state's reason line (:func:`inspect_raw`): what the plan and the status table say about it
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
     exhausted: bool  # the loader has nothing more to give (:func:`raw_is_exhausted`)
@@ -330,6 +330,8 @@ class SourceLedger:
 
         if self.raw_state in ("stale", "outdated"):
             return 0, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
+        if self.raw_state == "tokenizer_changed":
+            return 0, f"raw {self.raw_reason}; the repair step asks whether to keep it"
         if self.raw_state == "missing":
             return self.rows_needed, f"raw {self.raw_reason}"
         if self.raw_state == "unreadable":
@@ -379,12 +381,14 @@ class SourceLedger:
         validation holdout (:attr:`training_rows`; the sampler cycles what is there). A source that ran dry with
         nothing is not satisfied (its rows were all rejected: a wrong fields / converter / filter /
         language), nor is one whose few rows all go to the validation holdout: a failed source is a failed
-        build, never a silently smaller dataset. A stale / outdated / unreadable raw folder is reported, never
-        counted. The reason is the status table's last column: "ok", or what is missing.
+        build, never a silently smaller dataset. A stale / outdated / tokenizer_changed / unreadable raw folder is
+        reported, never counted. The reason is the status table's last column: "ok", or what is missing.
         """
 
         if self.raw_state in ("stale", "outdated"):
             return False, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
+        if self.raw_state == "tokenizer_changed":
+            return False, f"raw {self.raw_reason}; the repair step asks whether to keep it"
         if self.raw_state != "current":  # missing, or a manifest nobody can parse
             return False, f"raw {self.raw_reason}"
         if self.serves_budget:

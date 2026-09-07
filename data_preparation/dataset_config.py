@@ -61,27 +61,37 @@ MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, p
 
 # --- hash annotations --------------------------------------------------------------------------------------------------
 #
-# Every field of every config dataclass declares which of the three manifest hashes it belongs to, once, right where
-# it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `config_hash` assemble
-# their payloads from it, so no hash keeps a list of field names of its own.
+# Every field of every config dataclass declares which of the four manifest hashes it belongs to, once, right where
+# it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `tokenizer_hash` /
+# `config_hash` assemble their payloads from it, so no hash keeps a list of field names of its own.
 #
-#   raw       identity of the downloaded rows: which rows a loader yields, in what order, and how their stored token
-#             counts are made. Keys `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so
-#             it is deleted (after confirmation) and downloaded again.
-#   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder, nothing is downloaded.
+# The rule for a folder's hash: it contains exactly the settings that change what that folder stores, nothing
+# that merely changes how the rows are fetched, counted, described or used later.
+#
+#   raw       identity of the downloaded rows: which rows a loader yields, in what order, with which columns. Keys
+#             `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so it is deleted (after
+#             confirmation) and downloaded again. The tokenizer and `token_count` are NOT in it: they only make the
+#             stored token counts and the truncation of pretrain texts, which the raw manifest records
+#             (`tokenizer_hash`, `token_count`) so that a later change is offered as a choice instead of a re-download.
+#   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder (after confirmation),
+#             nothing is downloaded. The tokenizer and `token_count` enter here.
+#   tokenizer the tokenizer definition, keys `tokenizers/<name>/`.
 #   config    everything else that defines the training data; only `config_hash` (recorded in checkpoints so a resume
 #             against different data is detected) counts it.
 #   none      not hashed at all: how rows are fetched or described, resource knobs; nothing that changes the data.
 #
 # Each name selects exactly the fields annotated with it; the hashes nest instead of re-walking fields:
 # `processed_hash` folds the raw hash in as one value and `config_hash` is composed of every source's processed hash,
-# the tokenizer hash and the `config` fields. Every selected field enters with its value, default or not.
-HashName = Literal["raw", "processed", "config"]
-HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "none")
+# the tokenizer hash and the `config` fields. Every selected field enters with its value, default or not. The
+# manifests record the exact payload each hash was computed from (`Manifest.hash_payload`), so a mismatch can be
+# explained field by field (:func:`describe_hash_change`).
+HashName = Literal["raw", "processed", "config", "tokenizer"]
+HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "tokenizer", "none")
 
 _RAW: dict[str, Any] = {"hash": "raw"}
 _PROCESSED: dict[str, Any] = {"hash": "processed"}
 _CONFIG: dict[str, Any] = {"hash": "config"}
+_TOKENIZER: dict[str, Any] = {"hash": "tokenizer"}
 _UNHASHED: dict[str, Any] = {"hash": "none"}
 # `max_cached_file_mb` says whether a Hub file is cached whole or read remotely by piece: traffic, not rows.
 _LOAD_KWARGS: dict[str, Any] = {**_RAW, "hash_drop": ("max_cached_file_mb",)}
@@ -94,6 +104,24 @@ def _seed_hash(source: SourceConfig) -> str:
     """
 
     return "raw" if source.loader == "synthetic" else "processed"
+
+
+def _split_hash(source: SourceConfig) -> str:
+    """
+    `split` selects the rows only for the loaders that read a Hub split (`hf_split`, `hf_stream`); `hf_files`,
+    `github_code`, `local` and `synthetic` never look at it, so there it must not re-label a raw folder.
+    """
+
+    return "raw" if source.loader in ("hf_split", "hf_stream") else "none"
+
+
+def _text_field_hash(source: SourceConfig) -> str:
+    """
+    `text_field` names the column a pretrain row is stored from; an instruct row is built from `fields` /
+    `converter` and never reads it.
+    """
+
+    return "raw" if source.kind == "pretrain" else "none"
 
 
 def _normalize_hash(dedup: DedupConfig) -> str:
@@ -119,10 +147,10 @@ class TokenizerConfig:
     Which tokenizer defines "a token" for this dataset; saved to `dataset/tokenizers/<name>/`.
     """
 
-    name: str = field(metadata=_RAW)  # directory name under `dataset/tokenizers/`
-    kind: Literal["hf", "synthetic"] = field(default="hf", metadata=_RAW)  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
-    hf_id: Optional[str] = field(default=None, metadata=_RAW)  # required for kind=hf
-    revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it
+    name: str = field(metadata=_TOKENIZER)  # directory name under `dataset/tokenizers/`
+    kind: Literal["hf", "synthetic"] = field(default="hf", metadata=_TOKENIZER)  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
+    hf_id: Optional[str] = field(default=None, metadata=_TOKENIZER)  # required for kind=hf
+    revision: Optional[str] = field(default=None, metadata=_TOKENIZER)  # Hub commit sha; pin it
 
     def __post_init__(self) -> None:
         if self.kind == "hf" and not self.hf_id:
@@ -223,7 +251,7 @@ SOURCE_FIELD_SCOPES: dict[str, FieldScope] = {
     "shuffle": FieldScope(),
     "validation_fraction": FieldScope(),
     "describe_tokens_per_row": FieldScope(),
-    "split": FieldScope(),  # only hf_split / hf_stream read it, but it is part of every source's raw hash
+    "split": FieldScope(),  # only hf_split / hf_stream read it (and only there it is raw identity, `_split_hash`)
     # one kind only
     "text_field": FieldScope(kinds=frozenset({"pretrain"})),
     "processing": FieldScope(kinds=frozenset({"pretrain"})),
@@ -279,8 +307,8 @@ class SourceConfig:
     hf_id: Optional[str] = field(default=None, metadata=_RAW)  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
     revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it so row order is stable across increments
     load_kwargs: dict[str, Any] = field(default_factory=dict, metadata=_LOAD_KWARGS)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
-    split: str = field(default="train", metadata=_RAW)  # Hub split to read (hf_split / hf_stream)
-    text_field: str = field(default="text", metadata=_RAW)  # pretrain: column holding the document
+    split: str = field(default="train", metadata={"hash": _split_hash})  # Hub split to read (hf_split / hf_stream)
+    text_field: str = field(default="text", metadata={"hash": _text_field_hash})  # pretrain: column holding the document
     language: Optional[str] = field(default=None, metadata=_RAW)  # github_code: language label of codeparrot/github-code-clean
     path: Optional[str] = field(default=None, metadata=_RAW)  # local: directory of parquet/jsonl files
     converter: Optional[str] = field(default=None, metadata=_RAW)  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
@@ -401,7 +429,7 @@ class DatasetConfig:
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
     # whole into the Hub cache instead of being read remotely by piece.
     always_range_requests: bool = field(default=True, metadata=_UNHASHED)  # read every Hub file remotely by piece (row groups / stream prefix)
-    token_count: TokenCountMode = field(default="tokenizer", metadata=_RAW)  # "estimate" = chars / 4
+    token_count: TokenCountMode = field(default="tokenizer", metadata=_PROCESSED)  # "estimate" = chars / 4; the raw manifest records it, see "hash annotations"
     # hashed through every source's *effective* processing block, not as a field of its own
     processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
 
@@ -625,17 +653,18 @@ class DatasetConfig:
     def raw_hash(self, source_name: str) -> str:
         """
         Hash of a source's raw/ folder: every field annotated raw, i.e. the loader identity (kind, loader,
-        repo, revision, files, split, text field, language, path, converter/fields/filter; seed only for
-        loader: synthetic, where it generates the rows) plus token_count, the tokenizer and the counting rule
-        (truncation.TOKEN_RULE), on which the stored tokens column and the token-boundary truncation depend.
+        repo, revision, files, language, path, converter/fields/filter; split only for the loaders that read a Hub
+        split, text_field only for pretrain rows, seed only for loader: synthetic, where it generates the rows).
 
-        Everything else is annotated processed, config or none and stays out: dataset_max_sequence_length (the raw
-        manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
-        rows / check_limit (how many rows are needed or read, not what is read), validation_fraction,
-        input_inversions, shuffle, the non-synthetic seed (inversions and shuffle order are build-time),
-        describe_tokens_per_row (how many rows the first download plans, not what is read),
-        load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the
-        bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
+        Everything else is annotated processed, config, tokenizer or none and stays out: the tokenizer and
+        token_count (they make the stored token counts and the truncation, which the raw manifest records itself
+        so that a change is a choice, not a re-download: `lib/stages/download.py:inspect_raw`),
+        dataset_max_sequence_length (the raw manifest records what the rows were truncated at; only a raise
+        re-downloads), processing options, budgets / rows / check_limit (how many rows are needed or read, not what
+        is read), validation_fraction, input_inversions, shuffle, the non-synthetic seed (inversions and shuffle
+        order are build-time), describe_tokens_per_row (how many rows the first download plans, not what is read),
+        load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the bandwidth-expensive part of a
+        dataset; nothing but a real change of the source may invalidate them.
         """
 
         return self.raw_hash_of(self.sources[source_name])
@@ -646,54 +675,75 @@ class DatasetConfig:
         source of its own): the same payload, so a later config entry with the same raw fields adopts its folder.
         """
 
-        payload = {
-            "source": hash_payload(source, "raw"),
-            "token_count": self.token_count,
-            "token_rule": TOKEN_RULE,
-            "tokenizer": hash_payload(self.tokenizer, "raw"),
-        }
-        return _stable_hash(payload)
+        return _stable_hash(self.raw_hash_payload_of(source))
+
+    def raw_hash_payload(self, source_name: str) -> dict[str, Any]:
+        """
+        The dict :meth:`raw_hash` hashes; the raw manifest records it so a mismatch can be explained field by field.
+        """
+
+        return self.raw_hash_payload_of(self.sources[source_name])
+
+    def raw_hash_payload_of(self, source: SourceConfig) -> dict[str, Any]:
+        return {"source": hash_payload(source, "raw")}
 
     def processed_hash(self, source_name: str) -> str:
         """
-        Hash of a source's processed/ folder: the raw hash, plus the processed fields as the build
-        resolves them: dataset_max_sequence_length (stored counts are clamped to it), the *effective* processing block (only
-        the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
-        input_inversions, the resolved shuffle and the seed behind both. These four are written out
-        rather than taken from :func:`hash_payload`, because the build uses their resolved values (shuffle_of,
-        source_processing) whether or not they were spelled in the YAML. With decontamination on, the pinned
-        Hub revisions of the benchmarks it checks against (`lib/stages/benchmarks.py`) enter too: a re-pin changes
-        what the build filtered out. A change rebuilds processed/ from the raw shards (no download).
+        Hash of a source's processed/ folder: the raw hash, plus everything the build resolves the rows with:
+        the tokenizer definition, token_count and the counting rule (truncation.TOKEN_RULE) behind the tokens
+        column, dataset_max_sequence_length (stored counts are clamped to it), the *effective* processing block as
+        the build applies it (pretrain: only the dedup fields of the active mode, a minhash threshold does not
+        change an exact-dedup result; instruct: the dedup block alone, since min_chars, the quality filter and the
+        decontamination run in the pretrain branch only), the input_inversions (instruct only), the resolved
+        shuffle and the seed behind both. These are written out rather than taken from :func:`hash_payload`,
+        because the build uses their resolved values (shuffle_of, source_processing) whether or not they were
+        spelled in the YAML. With decontamination on, the pinned Hub revisions of the benchmarks it checks against
+        (`lib/stages/benchmarks.py`) enter too: a re-pin changes what the build filtered out. A change rebuilds
+        processed/ from the raw shards after confirmation (no download).
+        """
+
+        return _stable_hash(self.processed_hash_payload(source_name))
+
+    def processed_hash_payload(self, source_name: str) -> dict[str, Any]:
+        """
+        The dict :meth:`processed_hash` hashes; the processed manifest records it.
         """
 
         source = self.sources[source_name]
         processing = self.source_processing(source_name)
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
-            "max_seq_length": self.dataset_max_sequence_length,  # the key keeps the field's old name: a renamed key would rebuild every folder
-            "processing": hash_payload(processing, "processed"),
-            "input_inversions": source.input_inversions,
+            "max_seq_length": self.dataset_max_sequence_length,  # the key keeps the field's old name
+            "tokenizer": hash_payload(self.tokenizer, "tokenizer"),
+            "token_count": self.token_count,
+            "token_rule": TOKEN_RULE,
             "shuffle": self.shuffle_of(source_name),
             "seed": source.seed,
         }
+        if source.kind == "instruct":
+            payload["processing"] = {"dedup": hash_payload(processing.dedup, "processed")}
+            payload["input_inversions"] = source.input_inversions
+            return payload
+        payload["processing"] = hash_payload(processing, "processed")
         if processing.decontamination.enabled:
             payload["benchmark_revisions"] = benchmark_revisions(list(processing.decontamination.benchmarks))
-        return _stable_hash(payload)
+        return payload
 
     def tokenizer_hash(self) -> str:
         """
-        Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`).
+        Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`; a raw manifest
+        records it next to the rows it counted).
         """
 
-        return _stable_hash(hash_payload(self.tokenizer, "raw"))
+        return _stable_hash(hash_payload(self.tokenizer, "tokenizer"))
 
     def config_hash(self) -> str:
         """
         Hash of everything that defines the training data (recorded in checkpoints so a resume with different
         data is detected), composed of the hashes below it: every source's processed_hash (which folds in its
-        raw hash and the *effective* processing block, so a Bloom budget change does not count here either) next
-        to the source's own config fields, the tokenizer hash, and the config fields of the dataset (stages,
-        block size, validation fraction). The knobs that only change how (or how far ahead) data are fetched or
+        raw hash, the tokenizer and the *effective* processing block, so a Bloom budget change does not count here
+        either) next to the source's own config fields, the tokenizer hash, and the config fields of the dataset
+        (stages, validation fraction). The knobs that only change how (or how far ahead) data are fetched or
         described (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
         """
 
@@ -781,9 +831,48 @@ def _stable_hash(payload: Any) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def describe_hash_change(stored: dict[str, Any] | None, current: dict[str, Any]) -> list[str]:
+    """
+    Why a folder's hash differs from the config's, one short line per field: `a.b.c: old -> new` for every
+    changed, added ((absent) -> new) or removed (old -> (absent)) key of the flattened payloads, keys sorted.
+    stored is the payload the manifest recorded (`Manifest.hash_payload`, JSON on disk; current is compared after
+    the same JSON round trip); None (a manifest from before payloads were recorded) gives the single line
+    "(no field detail recorded)". Two equal payloads under different hashes (the hash rule itself changed, or a
+    manifest was edited) give "(no recorded field differs: the hash rule changed)".
+    """
+
+    if stored is None:
+        return ["(no field detail recorded)"]
+    old, new = _flatten(stored), _flatten(json.loads(json.dumps(current, default=str)))
+    lines = []
+    for key in sorted(old.keys() | new.keys()):
+        if key not in new:
+            lines.append(f"{key}: {json.dumps(old[key])} -> (absent)")
+        elif key not in old:
+            lines.append(f"{key}: (absent) -> {json.dumps(new[key])}")
+        elif old[key] != new[key]:
+            lines.append(f"{key}: {json.dumps(old[key])} -> {json.dumps(new[key])}")
+    return lines or ["(no recorded field differs: the hash rule changed)"]
+
+
+def _flatten(payload: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """
+    {dotted key: leaf value} of a nested dict; lists are leaves (a data_files glob, a benchmark list).
+    """
+
+    flat: dict[str, Any] = {}
+    for key, value in payload.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict) and value:
+            flat.update(_flatten(value, name + "."))
+        else:
+            flat[name] = value
+    return flat
+
+
 def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
     """
-    The fields of obj annotated hash_name, as a JSON-ready dict; the input of the three hashes.
+    The fields of obj annotated hash_name, as a JSON-ready dict; the input of the four hashes.
 
     A field is counted when its metadata["hash"] annotation names hash_name (see "hash annotations" at the
     top of this file), and it enters with its value whether or not that value is the default: a changed default
@@ -806,7 +895,7 @@ def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
 def field_hash_annotation(f: Field[Any], obj: Any) -> str:
     """
     Which hash f of obj belongs to: its metadata["hash"], or what the callable there answers for
-    obj (the two conditional fields: SourceConfig.seed and the dedup fields of an inactive mode).
+    obj (the conditional fields: SourceConfig.seed / split / text_field and the dedup fields of an inactive mode).
     """
 
     annotation = f.metadata.get("hash")

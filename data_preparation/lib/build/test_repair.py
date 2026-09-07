@@ -16,7 +16,9 @@ from typing import Any
 
 import pytest
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
+from dataclasses import replace
+
+from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.repair import (
     CONFIRMATION_HEADER,
@@ -172,7 +174,7 @@ def test_stale_raw_is_deleted_with_its_processed_folder_after_confirmation(
     _edit_manifest(layout.raw_dir("a"), source_hash="somebody-else")
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: True)
     assert _kinds(report) == [("a", "raw", "delete"), ("a", "processed", "delete")]
-    assert report.actions[0].reason == "stale: source identity or tokenizer changed"
+    assert report.actions[0].reason == "stale: (no recorded field differs: the hash rule changed)"
     assert report.actions[1].reason == "built from a raw folder that is being deleted"
     assert not layout.raw_dir("a").exists() and not layout.processed_dir("a").exists()
     assert [action.source for action in raw_deleted(report)] == ["a"] and [action.folder for action in processed_deleted(report)] == [layout.processed_dir("a")]
@@ -283,7 +285,7 @@ def test_one_prompt_covers_deletions_and_confirmable_truncations(
     prompts: list[str] = []
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(prompts, True))
     assert len(prompts) == 1, "one question per run, deletions and truncations together"
-    assert "a: stale: source identity or tokenizer changed" in prompts[0]
+    assert "a: stale: (no recorded field differs: the hash rule changed)" in prompts[0]
     assert "b: broken: unreadable shard data-00001.parquet" in prompts[0] and "re-downloaded next run" in prompts[0]
     assert not layout.raw_dir("a").exists()
     manifest = Manifest.load(layout.raw_dir("b"))
@@ -322,6 +324,76 @@ def test_raw_without_a_resume_offset_cannot_be_truncated(cfg_factory: CfgFactory
     assert _kinds(report)[0] == ("a", "raw", "delete") and report.actions[0].reason.startswith("broken: unreadable shard data-00001.parquet")
 
 
+# --- a raw folder counted with another tokenizer -------------------------------------------------------------------------
+
+
+def _other_tokenizer(cfg_factory: CfgFactory, with_tokenizer: Prep, names: tuple[str, ...] = ("a",)) -> DatasetConfig:
+    """
+    The config of :func:`_prepared` with the tokenizer renamed: the same rows, counted differently.
+    """
+
+    return with_tokenizer(cfg_factory({name: _synthetic(seed=index) for index, name in enumerate(names)}, tokenizer=TokenizerConfig(name="other", kind="synthetic")))
+
+
+def test_tokenizer_change_asks_and_changes_nothing_on_no(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """
+    A tokenizer change is not a reason to re-download: the repair step offers to keep the raw folder under the new
+    tokenizer (adopt) and rebuild processed (whose fingerprint carries the tokenizer). Both wait for the one answer.
+    """
+
+    _prepared(cfg_factory, with_tokenizer, layout)
+    changed = _other_tokenizer(cfg_factory, with_tokenizer)
+    before = _snapshot(layout.root)
+    dry = repair_broken_and_stale_folders(changed, layout, assume_yes=False, dry_run=True)
+    assert _kinds(dry) == [("a", "raw", "adopt"), ("a", "processed", "delete")] and all(action.needs_confirmation for action in dry.actions)
+    assert dry.actions[0].reason == (
+        "tokenizer changed: synthetic (synthetic) -> other (synthetic); 8 rows were counted and truncated under the old one, "
+        "their token counts and truncation will not match the new tokenizer"
+    )
+    assert dry.actions[0].adopt == {"token_count": "tokenizer", "tokenizer": "other", "tokenizer_hash": changed.tokenizer_hash()}
+    assert dry.actions[1].reason == 'stale: tokenizer.name: "synthetic" -> "other"'
+    assert dry.describe().splitlines()[0] == f"would adopt raw {layout.raw_dir('a')} (a): {dry.actions[0].reason}"
+    assert dry.confirmations_planned() == dry.actions and raw_deletions_planned(dry) == []
+    with pytest.raises(ConfirmationRequired) as info:
+        repair_broken_and_stale_folders(changed, layout, assume_yes=False, confirm=lambda message: False)
+    assert f"  a: {dry.actions[0].reason}\n  a: {dry.actions[1].reason}\n" in info.value.message
+    assert _snapshot(layout.root) == before, "declined: the manifest was not re-labelled, processed not deleted"
+
+
+def test_tokenizer_change_adopts_the_raw_folder_on_yes(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Callable[[Path], list[dict[str, Any]]]
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    changed = _other_tokenizer(cfg_factory, with_tokenizer)
+    raw = layout.raw_dir("a")
+    rows_before = read_rows(raw)
+    prompts: list[str] = []
+    report = repair_broken_and_stale_folders(changed, layout, assume_yes=False, confirm=_recording_confirm(prompts, True))
+    assert len(prompts) == 1 and prompts[0].startswith(CONFIRMATION_HEADER) and "re-labelled" in CONFIRMATION_HEADER
+    assert _kinds(report) == [("a", "raw", "adopt"), ("a", "processed", "delete")] and report.performed
+    assert raw_deleted(report) == [] and read_rows(raw) == rows_before and not layout.processed_dir("a").exists()
+    manifest = Manifest.load(raw)
+    assert manifest is not None and (manifest.tokenizer, manifest.tokenizer_hash, manifest.token_count) == ("other", changed.tokenizer_hash(), "tokenizer")
+    assert manifest.source_hash == cfg.raw_hash("a") == changed.raw_hash("a") and manifest.extra["tokenizer_changes"] == [
+        {
+            "from": {"token_count": "tokenizer", "tokenizer": "synthetic", "tokenizer_hash": cfg.tokenizer_hash()},
+            "to": {"token_count": "tokenizer", "tokenizer": "other", "tokenizer_hash": changed.tokenizer_hash()},
+            "at_rows": 8,
+        }
+    ]
+    # adopted: current for the new config, the download appends and the build reads it
+    assert repair_broken_and_stale_folders(changed, layout, assume_yes=False, dry_run=True).actions == []
+    assert download(changed, "a", layout, rows_needed=12, shard_size=4).rows() == 12
+    assert build_source(changed, "a", layout, shard_size=4).rows() > 0
+    # `--yes` adopts without asking, and a folder with a broken shard is adopted and truncated in the same run
+    _edit_manifest(raw, tokenizer_hash="old-definition")
+    (raw / "data-00002.parquet").write_bytes(b"corrupt")
+    report = repair_broken_and_stale_folders(changed, layout, assume_yes=True)
+    assert _kinds(report) == [("a", "raw", "adopt"), ("a", "raw", "truncate"), ("a", "processed", "delete")]
+    manifest = Manifest.load(raw)
+    assert manifest is not None and manifest.tokenizer_hash == changed.tokenizer_hash() and len(manifest.shards) == 2 and len(manifest.extra["tokenizer_changes"]) == 2
+
+
 # --- raw folders of another dataset config -------------------------------------------------------------------------------
 
 
@@ -339,7 +411,7 @@ def test_a_stale_raw_folder_of_another_config_is_deleted_only_with_allow_foreign
     build_source(cfg, "a", layout, shard_size=4)
     _edit_manifest(layout.raw_dir("a"), source_hash="changed")
     before = _snapshot(layout.root)
-    reason = "stale: source identity or tokenizer changed; downloaded under dataset config other.yaml, deleting it needs --allow_foreign_raw"
+    reason = "stale: (no recorded field differs: the hash rule changed); downloaded under dataset config other.yaml, deleting it needs --allow_foreign_raw"
 
     dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, config_name="mine.yaml")
     assert _kinds(dry) == [("a", "raw", "delete"), ("a", "processed", "delete")]
@@ -370,7 +442,7 @@ def test_a_raw_folder_of_this_or_of_an_unknown_config_is_not_foreign(cfg_factory
     for config_name in (None, "mine.yaml"):  # a caller without a name (None) never marks anything foreign either
         dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True, config_name=config_name)
         assert _kinds(dry) == [("a", "raw", "delete"), ("b", "raw", "delete")] and dry.foreign_deletions_planned() == []
-        assert all(action.reason == "stale: source identity or tokenizer changed" for action in dry.actions)
+        assert all(action.reason == "stale: (no recorded field differs: the hash rule changed)" for action in dry.actions)
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True, config_name="mine.yaml")
     assert [action.source for action in raw_deleted(report)] == ["a", "b"]
 
@@ -378,15 +450,25 @@ def test_a_raw_folder_of_this_or_of_an_unknown_config_is_not_foreign(cfg_factory
 # --- processed folder branches -----------------------------------------------------------------------------------------
 
 
-def test_stale_processed_is_deleted_without_confirmation(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+def test_stale_processed_asks_naming_the_changed_field_and_deletes_nothing_on_no(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """
+    A fingerprint change that invalidates data is the user's to confirm, processed folders included: the prompt
+    lists the changed field, "no" leaves everything in place, "yes" rebuilds and leaves raw alone.
+    """
+
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
-    _edit_manifest(layout.processed_dir("a"), source_hash="old-processing")
-    raw_before = _snapshot(layout.raw_dir("a"))
+    changed = replace(cfg, processing=replace(cfg.processing, dedup=replace(cfg.processing.dedup, normalize=False)))
+    before = _snapshot(layout.root)
+    with pytest.raises(ConfirmationRequired) as info:
+        repair_broken_and_stale_folders(changed, layout, assume_yes=False, confirm=lambda message: False)
+    assert info.value.message == f"{CONFIRMATION_HEADER}\n  a: stale: processing.dedup.normalize: true -> false\n{CONFIRMATION_QUESTION}"
+    assert _kinds(info.value.report) == [("a", "processed", "delete")] and info.value.report.actions[0].needs_confirmation
+    assert _snapshot(layout.root) == before, "declined: nothing was touched"
     calls: list[str] = []
-    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
-    assert calls == [] and _kinds(report) == [("a", "processed", "delete")]
-    assert report.actions[0].reason.startswith("stale:") and not layout.processed_dir("a").exists()
-    assert _snapshot(layout.raw_dir("a")) == raw_before
+    report = repair_broken_and_stale_folders(changed, layout, assume_yes=False, confirm=_recording_confirm(calls, True))
+    assert len(calls) == 1 and _kinds(report) == [("a", "processed", "delete")]
+    assert not layout.processed_dir("a").exists()
+    assert {k: v for k, v in _snapshot(layout.root).items() if k.startswith("sources/")} == {k: v for k, v in before.items() if k.startswith("sources/")}, "raw untouched"
 
 
 def test_broken_processed_shard_deletes_the_folder(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -629,7 +711,7 @@ def test_one_prompt_for_two_queued_raw_folders(cfg_factory: CfgFactory, with_tok
 
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=confirm)
     assert prompts == [
-        f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n  c: outdated: dataset_max_sequence_length 16 -> 64\n{CONFIRMATION_QUESTION}"
+        f"{CONFIRMATION_HEADER}\n  a: stale: (no recorded field differs: the hash rule changed)\n  c: outdated: dataset_max_sequence_length 16 -> 64\n{CONFIRMATION_QUESTION}"
     ]
     assert prompts[0].endswith("Continue? [y/N] ")
     assert [action.source for action in raw_deleted(report)] == ["a", "c"] and [action.source for action in processed_deleted(report)] == ["a", "c"]
@@ -661,7 +743,10 @@ def test_non_interactive_run_without_assume_yes_aborts_with_the_list_and_deletes
     assert _snapshot(layout.root) == before
     err = info.value
     assert isinstance(err, RepairError) and not err.interactive
-    assert err.message == f"{CONFIRMATION_HEADER}\n  a: stale: source identity or tokenizer changed\n{CONFIRMATION_QUESTION}"
+    assert err.message == (
+        f"{CONFIRMATION_HEADER}\n  a: stale: (no recorded field differs: the hash rule changed)"
+        f"\n  b: stale: (no recorded field differs: the hash rule changed)\n{CONFIRMATION_QUESTION}"
+    )
     assert str(err).startswith(err.message.rstrip()) and "--yes" in str(err)
     assert _kinds(err.report) == [("a", "raw", "delete"), ("a", "processed", "delete"), ("b", "processed", "delete")]
     assert raw_deleted(err.report) == [] and [action.source for action in raw_deletions_planned(err.report)] == ["a"]
@@ -730,13 +815,13 @@ def test_dry_run_reports_everything_and_touches_nothing(
     ]
     assert raw_deleted(report) == [] and processed_deleted(report) == [] and [action.source for action in raw_deletions_planned(report)] == ["a"]
     lines = report.describe().splitlines()
-    assert lines[0] == f"would delete raw {layout.raw_dir('a')} (a): stale: source identity or tokenizer changed"
+    assert lines[0] == f"would delete raw {layout.raw_dir('a')} (a): stale: (no recorded field differs: the hash rule changed)"
     assert lines[2].startswith(f"would truncate raw {layout.raw_dir('b')} (b): broken: unreadable shard data-00002.parquet")
     assert lines[5] == f"would delete processed {leftover} (c): leftover of an interrupted all-at-once build"
     # the real run afterwards performs exactly the planned actions
     performed = repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
     assert _kinds(performed) == _kinds(report) and performed.performed and not report.performed
-    assert performed.describe().splitlines()[0] == f"delete raw {layout.raw_dir('a')} (a): stale: source identity or tokenizer changed"
+    assert performed.describe().splitlines()[0] == f"delete raw {layout.raw_dir('a')} (a): stale: (no recorded field differs: the hash rule changed)"
     assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True).actions == []
 
 

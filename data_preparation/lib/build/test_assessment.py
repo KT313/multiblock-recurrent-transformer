@@ -99,7 +99,10 @@ def test_wrong_hash_is_stale(cfg_factory: CfgFactory, with_tokenizer: Prep, layo
     manifest.save(layout.processed_dir("a"))
     assessment = _assess(cfg, layout, _raw_shards(layout))
     assert (assessment.problem, assessment.repair) == ("stale", "rebuild")
-    assert assessment.reason == "stale: processing settings, dataset_max_sequence_length or the source changed"
+    assert assessment.reason == "stale: (no recorded field differs: the hash rule changed)", "the recorded payload still matches: only the hash was edited"
+    manifest.hash_payload = {**manifest.hash_payload, "max_seq_length": 32} if manifest.hash_payload else None
+    manifest.save(layout.processed_dir("a"))
+    assert _assess(cfg, layout, _raw_shards(layout)).reason == f"stale: max_seq_length: 32 -> {cfg.dataset_max_sequence_length}"
 
 
 def test_missing_listed_shard_is_broken_only_when_files_are_checked(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:

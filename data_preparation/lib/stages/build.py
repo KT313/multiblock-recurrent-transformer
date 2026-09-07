@@ -323,7 +323,7 @@ class ProcessedOutput:
 def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manifest:
     source = config.sources[name]
     processing = config.source_processing(name)
-    manifest = new_manifest(config, name, source_hash, "processed", tokens=True)
+    manifest = new_manifest(config, name, source_hash, "processed", tokens=True, hash_payload=config.processed_hash_payload(name))
     stats: dict[str, Any] = {
         "input_rows": 0,
         "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
