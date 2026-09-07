@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import json
 import pickle
+import re
 import shutil
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 
 from data_preparation.lib.sources.synthetic import N_WORD_TOKENS, SPECIALS
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import BOS_PROBE, Tokenizer
 
 
 def test_special_ids_and_sizes(tokenizer: Tokenizer) -> None:
@@ -138,3 +139,51 @@ def test_specials_outside_the_base_vocabulary_are_refused_at_load(tmp_path: Path
     assert (backend.eos_id, backend.vocab_size, len(backend)) == (3, 3, 4)
     with pytest.raises(ValueError, match="EOS 3 lie.*outside its base vocabulary of 3 tokens"):
         Tokenizer(path)
+
+
+def test_processor_prepends_bos_when_asked_for_special_tokens(tokenizer: Tokenizer) -> None:
+    """
+    lm-eval encodes through `processor` with `add_special_tokens=True` (`add_bos_token=True` on its `HFLM`), so a
+    benchmark context has to come out shaped like a training row: BOS once, at the front, and no EOS.
+    """
+
+    processor = tokenizer.processor
+    with_specials = processor.encode("tok_3 tok_4", add_special_tokens=True)
+    assert with_specials == tokenizer.encode("tok_3 tok_4", bos=True)
+    assert with_specials[0] == tokenizer.bos_id and tokenizer.bos_id not in with_specials[1:]
+    assert tokenizer.eos_id not in with_specials
+    assert processor.encode("tok_3 tok_4", add_special_tokens=False) == tokenizer.encode("tok_3 tok_4")
+
+
+def test_processor_batch_call_gives_every_row_a_bos(tokenizer: Tokenizer) -> None:
+    """
+    lm-eval's `tok_batch_encode` pads a batch of contexts to the longest, on the left; every row still has to start
+    at its BOS.
+    """
+
+    batch = tokenizer.processor(
+        ["tok_3", "tok_3 tok_4 tok_5"], padding="longest", padding_side="left", return_tensors="pt"
+    )
+    ids, mask = batch["input_ids"], batch["attention_mask"]
+    assert ids.shape == (2, 4) and mask.tolist() == [[0, 0, 1, 1], [1, 1, 1, 1]]
+    for row, row_mask in zip(ids.tolist(), mask.tolist(), strict=True):
+        first_real = row[row_mask.index(1)]
+        assert first_real == tokenizer.bos_id
+        assert tokenizer.eos_id not in row
+
+
+def test_processor_refuses_a_transformers_that_ignores_add_bos_token(
+    tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The flag's effect is a transformers implementation detail; a version that drops it must fail loudly at setup
+    rather than score every benchmark on contexts without BOS.
+    """
+
+    import transformers
+
+    plain = transformers.AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir), add_bos_token=False)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: plain))
+    with pytest.raises(RuntimeError, match=re.escape(transformers.__version__)) as raised:
+        _ = Tokenizer(tiny_tokenizer_dir).processor
+    assert "does not prepend BOS" in str(raised.value) and repr(BOS_PROBE) in str(raised.value)

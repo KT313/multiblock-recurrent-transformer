@@ -55,9 +55,15 @@ def generate_samples(
     """
     One completion per prompt: greedy when temperature is 0, sampled at that temperature otherwise; at most
     max_new_tokens tokens, cut at the first EOS. recurrence (steps per core block, e.g. [4, 4, 4]) overrides the
-    model's mean recurrence. seed seeds the isolated RNG (the initial latent state, and the sampling), so the
-    output is reproducible whatever the global RNG state. A prompt whose tokens plus max_new_tokens do not fit the
-    model's position table is skipped with a warning (`_fitting_prompts`) instead of crashing the run.
+    model's mean recurrence. A prompt whose tokens plus max_new_tokens do not fit the model's position table is
+    skipped with a warning (`_fitting_prompts`) instead of crashing the run.
+
+    seed seeds the isolated RNG, which is reseeded to `seed + <index of the batch's first prompt>` before each
+    batch (the initial latent state and the sampling are drawn from it). So: the same prompts in the same order,
+    with the same batch size, model and recurrence, give the same samples, whatever the global RNG state; and a
+    prompt appended to the list leaves the batches before it unchanged. Inside a batch the latent state is drawn
+    for all rows at once, so a row's noise depends on its neighbours and on the padded width: the same prompt under
+    a different batch size, or twice in one batch, may complete differently.
     """
 
     check_recurrence(recurrence, model)
@@ -76,6 +82,9 @@ def generate_samples(
                 input_ids[row, width - len(ids) :] = torch.tensor(ids, dtype=torch.long)
                 attention_mask[row, width - len(ids) :] = 1
             sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
+            # Reseed per batch (the RNG is the forked one of `isolated_inference`): every forward draws a fresh
+            # latent state, so without this a batch would depend on how many tokens the batches before it generated.
+            torch.manual_seed(seed + start)
             output = generate(
                 input_ids.to(device),
                 attention_mask=attention_mask.to(device),

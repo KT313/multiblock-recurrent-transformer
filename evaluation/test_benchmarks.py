@@ -1,6 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests of the lm-eval integration with a stubbed `lm_eval` (the real harness needs the `eval` extra and network).
+Tests of the lm-eval integration with a stubbed `lm_eval`; scoring a task needs the `eval` extra and network, but
+the encoding of a context is checked through the real `HFLM` where the extra is installed.
 """
 
 import json
@@ -21,6 +22,7 @@ from evaluation.benchmarks import (
     evaluate_on_benchmarks,
     flatten_results,
 )
+from evaluation.wrapper import hf_wrapper_around
 from model.hf.modeling import RecurrentGPTForCausalLM
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
@@ -89,7 +91,9 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     assert isinstance(wrapper, RecurrentGPTForCausalLM) and not wrapper.training
     assert wrapper.model.transformer.wte.weight.data_ptr() == tiny_model.transformer.wte.weight.data_ptr()
     assert calls["hflm"]["tokenizer"] is tokenizer.processor and calls["hflm"]["batch_size"] == 4
-    assert calls["hflm"]["add_bos_token"] is True  # scored on inputs shaped like the training rows
+    # `add_bos_token=True` only asks the tokenizer for special tokens: what makes a context start like a training
+    # row is the tokenizer prepending BOS itself, so check the object that was handed over, not the flag
+    assert calls["hflm"]["tokenizer"].encode("x", add_special_tokens=True)[0] == tokenizer.bos_id
     assert calls["hflm"]["max_length"] == tiny_model.config.model_max_sequence_length
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"]
     assert (calls["evaluate"]["num_fewshot"], calls["evaluate"]["limit"]) == (2, 40)
@@ -152,6 +156,30 @@ def test_evaluate_on_benchmarks_errors(
     with pytest.raises(RuntimeError, match="no network"):
         evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"])
     assert tiny_model.training  # the model is restored on the error path too
+
+
+def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path) -> None:
+    """
+    The same check through the real `HFLM`, no stub and no network: the BOS has to survive lm-eval's own routing of
+    `add_bos_token` as well as transformers' `add_bos_token` flag. A bump of either package that drops it fails
+    here, instead of quietly costing every benchmark the few points a missing BOS costs.
+    """
+
+    pytest.importorskip("lm_eval", reason="needs the eval extra (uv sync --extra eval)")
+    # Not an importorskip: with lm_eval installed, an `lm_eval.models.huggingface` that will not import (a missing
+    # accelerate) is the state this test is here to catch, because a benchmark run dies on the same import.
+    import lm_eval.models.huggingface as huggingface
+
+    tokenizer = Tokenizer(tiny_tokenizer_dir)
+    language_model = huggingface.HFLM(
+        pretrained=hf_wrapper_around(tiny_model, tokenizer), tokenizer=tokenizer.processor, batch_size=2,
+        add_bos_token=True, device="cpu",
+    )
+    assert language_model.tok_encode("tok_3 tok_4") == tokenizer.encode("tok_3 tok_4", bos=True)
+    ids, mask = language_model.tok_batch_encode(["tok_3", "tok_3 tok_4 tok_5"])
+    assert mask.tolist() == [[0, 0, 1, 1], [1, 1, 1, 1]]  # left-padded to the longest context
+    for row, row_mask in zip(ids.tolist(), mask.tolist(), strict=True):
+        assert row[row_mask.index(1)] == tokenizer.bos_id
 
 
 @pytest.mark.slow
