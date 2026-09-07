@@ -575,7 +575,7 @@ def test_resolve_dataset_warns_about_the_short_tiny_validation_splits(
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, validation_batch_size=2, eval_iters=2))
-    assert "micro-batch(es)" not in caplog.text  # two batches of two rows fit every split
+    assert "batch(es)" not in caplog.text  # two batches of two rows fit every split, so no stage is warned about
 
 
 def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

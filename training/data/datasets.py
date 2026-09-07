@@ -13,6 +13,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from torch.utils.data import IterableDataset, get_worker_info
 
+from data_preparation.lib.storage.parquet import SHARD_PATTERN
+
 logger = logging.getLogger(__name__)
 
 Row = dict[str, Any]
@@ -24,7 +26,7 @@ PARQUET_READ_BATCH_ROWS = 1024
 
 class ParquetTextDataset(IterableDataset[Row]):
     """
-    One directory of parquet files, streamed in sorted file order without shuffling.
+    One directory of build shards (data-NNNNN.parquet), streamed in sorted file order without shuffling.
 
     Each row is a dict with the data_signature["keys"] columns plus data_signature and data_id.
     skip_rows / max_rows restrict the dataset to the row range [skip_rows, skip_rows + max_rows), clipped
@@ -48,9 +50,11 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.prefix = prefix
         self.data_signature = data_signature or DEFAULT_DATA_SIGNATURE
         self.rank, self.world_size = shard
-        self.files = sorted(self.data_dir.glob("*.parquet"))
+        # the build's shards only (`SHARD_PATTERN`, data-NNNNN.parquet), the same set `dataset_resolver` counts the
+        # rows of: a stray parquet file would shift every row index behind the validation split
+        self.files = sorted(path for path in self.data_dir.glob("*.parquet") if SHARD_PATTERN.match(path.name))
         if not self.files:
-            raise FileNotFoundError(f"No parquet files in {self.data_dir}")
+            raise FileNotFoundError(f"No data-NNNNN.parquet shard in {self.data_dir}")
         columns = set(pq.ParquetFile(self.files[0]).schema_arrow.names)  # metadata only, no row is read
         missing = [key for key in self.data_signature["keys"] if key not in columns]
         if missing:

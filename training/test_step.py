@@ -26,7 +26,7 @@ from training.data.collate import Sample, WorkerBatch
 from training.data.tokenizer import IGNORE_INDEX
 from training.data.packing import POOL_TOKEN_FACTOR, PackedBatch, shifted_length
 import training.data.loader as loader_module
-from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
+from training.data.loader import RunDataloaders, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
 from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
@@ -351,6 +351,8 @@ def test_non_finite_grad_norm_raises_with_the_exact_message(
 # --------------------------------------------------------------------------------------------------------------
 # micro-batch stream (per-document source picks by token deficit over the run-wide readers; fake loaders, hand-made
 # stage managers)
+
+SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (the `samples` half of a WorkerBatch)
 
 
 def _fake_samples(tag: str, lengths: list[int]) -> SampleBatch:

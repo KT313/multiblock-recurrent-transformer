@@ -35,6 +35,7 @@ from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dat
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
+from data_preparation.lib.storage.parquet import SHARD_PATTERN
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 from training.settings import Settings
 
@@ -144,7 +145,7 @@ def _rows_on_disk(directory: Path, what: str) -> int:
 
     if not directory.is_dir():
         raise FileNotFoundError(f"{what}: processed folder {directory} does not exist")
-    shards = sorted(directory.glob("data-*.parquet"))
+    shards = sorted(path for path in directory.glob("*.parquet") if SHARD_PATTERN.match(path.name))  # what `ParquetTextDataset` reads
     if not shards:
         raise FileNotFoundError(f"{what}: processed folder {directory} holds no data-*.parquet shard")
     return sum(shard_rows(shard) for shard in shards)

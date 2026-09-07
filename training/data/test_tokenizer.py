@@ -95,3 +95,46 @@ def test_resolve_pad_id_prefers_the_pad_token() -> None:
 
     assert resolve_pad_id(SimpleNamespace(pad_id=5), eos_id=2) == 5
     assert resolve_pad_id(SimpleNamespace(pad_id=None), eos_id=2) == 2
+
+
+def _tokenizer_dir_with_an_added_token_eos(tmp_path: Path) -> Path:
+    """
+    A hand-written tokenizer directory (never the Hub) whose EOS is an added token, not a base-vocabulary one:
+    base vocab <pad>=0, <bos>=1, tok_0=2, and <eos>=3 in `added_tokens`. That is the shape of most modern HF
+    tokenizers (Llama-3, SmolLM2, Qwen), where `get_vocab_size(with_added_tokens=False)` excludes the specials.
+    """
+
+    path = tmp_path / "added_token_eos"
+    path.mkdir()
+    tokenizer_json = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {"id": 3, "content": "<eos>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True}
+        ],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": {"<pad>": 0, "<bos>": 1, "tok_0": 2}, "unk_token": "<pad>"},
+    }
+    special_tokens_map = {"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>"}
+    (path / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+    (path / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "PreTrainedTokenizerFast", **special_tokens_map}))
+    (path / "special_tokens_map.json").write_text(json.dumps(special_tokens_map))
+    return path
+
+
+def test_specials_outside_the_base_vocabulary_are_refused_at_load(tmp_path: Path) -> None:
+    """
+    `collate.mask_label_ids` masks every id >= vocab_size, so an added-token EOS would silently erase the EOS
+    label of every document: the load must fail instead.
+    """
+
+    path = _tokenizer_dir_with_an_added_token_eos(tmp_path)
+    backend = SavedTokenizer(path)
+    # EOS 3 sits past the base vocabulary (3 tokens) and only `with_added_tokens=True` counts it: the guard's case
+    assert (backend.eos_id, backend.vocab_size, len(backend)) == (3, 3, 4)
+    with pytest.raises(ValueError, match="EOS 3 lie.*outside its base vocabulary of 3 tokens"):
+        Tokenizer(path)

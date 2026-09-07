@@ -24,7 +24,7 @@ from model import RecurrentConfig, RecurrentGPT
 from training.backend.base import plain_model
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.data.tokenizer import IGNORE_INDEX
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.packing import POOL_TOKEN_FACTOR
 from training.data.loader import TRAIN_LOADER_BATCH_ROWS
@@ -48,6 +48,7 @@ from training.run import (
     build_run_optimizer,
     build_stage_manager,
     check_sequence_lengths,
+    check_tokenizer_vocabulary,
     create_backend,
     prepare_run_directory,
     record_run_config,
@@ -184,6 +185,27 @@ def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: Res
     tiny_settings.training_max_sequence_length = 512
     with pytest.raises(ValueError, match="training_max_sequence_length 512 .* dataset_max_sequence_length 256"):
         check_sequence_lengths(tiny_settings, tiny_resolved.config, model_config)
+
+
+def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Every id the tokenizer produces must address a row of the embedding table (`padded_vocab_size`), or the first
+    batch holding a high id fails on an index error; a declared `vocab_size` that differs from the tokenizer is
+    embedding rows that never occur, which is a warning.
+    """
+
+    tokenizer = Tokenizer(tiny_tokenizer_dir)
+    tokens = len(tokenizer)  # the synthetic tokenizer: 259
+    exact = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, vocab_size=tokens, padded_vocab_size=tokens)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_tokenizer_vocabulary(tokenizer, exact)  # the tokenizer the architecture was sized for
+        assert caplog.text == ""
+        larger = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, vocab_size=tokens + 1, padded_vocab_size=tokens + 1)
+        check_tokenizer_vocabulary(tokenizer, larger)  # more rows than tokens: trained but never addressed
+        assert f"declares vocab_size {tokens + 1} but the dataset's tokenizer has {tokens} tokens" in caplog.text
+    smaller = RecurrentConfig.from_yaml(tiny_settings.model_architecture_config, vocab_size=tokens - 1, padded_vocab_size=tokens - 1)
+    with pytest.raises(ValueError, match=f"tokenizer of the dataset has {tokens} tokens but the model's embedding table holds {tokens - 1} rows"):
+        check_tokenizer_vocabulary(tokenizer, smaller)
 
 
 def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:

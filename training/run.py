@@ -146,6 +146,7 @@ def train(
         loaders = build_run_dataloaders(settings, dataset, backend)
         try:
             model = build_run_model(settings, dataset, backend, run_directory)
+            check_tokenizer_vocabulary(loaders.tokenizer, plain_model(model).config)
             optimizer = build_run_optimizer(settings, model, backend)
             state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
             resume = restore_checkpoint_if_resuming(state)
@@ -308,6 +309,33 @@ def check_sequence_lengths(settings: Settings, dataset_config: DatasetConfig, mo
         log.warning(
             "training_max_sequence_length %d differs from training_target_sequence_length %d of %s: the downloads were sized "
             "for rows cut at %d tokens", training, target, settings.dataset_config, target
+        )
+
+
+def check_tokenizer_vocabulary(tokenizer: Tokenizer, model_config: RecurrentConfig) -> None:
+    """
+    The dataset's tokenizer and the model's embedding table must agree: every id the tokenizer produces (added
+    tokens included, `len(tokenizer)`) has to address a row of the `padded_vocab_size` table. A dataset config
+    that swaps in a larger tokenizer would otherwise fail on an index error at the first batch holding a high id,
+    or, for labels, have it silently masked (`model.mask_labels`).
+
+    A tokenizer smaller than the architecture's declared `vocab_size` only trains rows that never occur, so it is
+    a warning: the number is worth seeing when a run reports its parameter count.
+    """
+
+    tokens, table = len(tokenizer), cast(int, model_config.padded_vocab_size)  # padded_vocab_size is set in __post_init__
+    if tokens > table:
+        raise ValueError(
+            f"The tokenizer of the dataset has {tokens} tokens but the model's embedding table holds "
+            f"{table} rows (padded_vocab_size of the model architecture config, vocab_size {model_config.vocab_size}): "
+            "ids beyond the table cannot be embedded. Raise vocab_size / padded_vocab_size or use the tokenizer the "
+            "architecture was sized for."
+        )
+    if model_config.vocab_size != tokens:
+        log.warning(
+            "The model architecture declares vocab_size %d but the dataset's tokenizer has %d tokens: the "
+            "difference is embedding rows that never occur in the data",
+            model_config.vocab_size, tokens
         )
 
 
