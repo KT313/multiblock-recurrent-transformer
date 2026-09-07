@@ -51,7 +51,7 @@ def test_pool_first_fit_from_the_front_follows_the_worked_example() -> None:
     slots = {"A": 80, "B": 20, "C": 160, "D": 4, "E": 40, "F": 120, "G": 12, "H": 100, "I": 2, "J": 68, "K": 120}
     for tag, n in slots.items():
         assert pool.add(_sample(n, tag))
-    assert pool.tokens == sum(slots.values()) == 726 and not pool.needs_refill()
+    assert pool.tokens == sum(slots.values()) == 726  # the refill target is not this test's concern
 
     taken = pool.take_pack()
     assert [tag for _, _, tag in taken] == ["A", "B", "C", "D", "E", "G", "I"]
@@ -64,15 +64,21 @@ def test_pool_first_fit_from_the_front_follows_the_worked_example() -> None:
     assert [tag for _, _, tag in pool.state()] == ["K"]
 
 
-def test_pool_refill_target_is_two_pack_lengths() -> None:
+def test_pool_refill_target_is_sixteen_pack_lengths() -> None:
+    """
+    The pool is refilled until it holds sixteen pack lengths: the lookahead of the first-fit scan and the window the
+    stream balances the sources' token shares over.
+    """
+
     pool = PackPool(pack_length=10)
-    assert POOL_TOKEN_FACTOR == 2 and pool.needs_refill()
-    pool.add(_sample(10))
-    assert pool.needs_refill()  # 10 < 20
+    assert POOL_TOKEN_FACTOR == 16 and pool.needs_refill()
+    for _ in range(15):
+        pool.add(_sample(10))
+    assert pool.tokens == 150 and pool.needs_refill()  # 150 < 160
     pool.add(_sample(9))
-    assert pool.needs_refill()  # 19 < 20
+    assert pool.needs_refill()  # 159 < 160
     pool.add(_sample(1))
-    assert not pool.needs_refill()  # 20
+    assert not pool.needs_refill()  # 160
 
 
 def test_a_leftover_always_fits_the_next_pack() -> None:
@@ -137,6 +143,8 @@ def test_pack_layout(tokenizer: Tokenizer) -> None:
     assert pack.position_ids[0].tolist() == [0, 1, 2, 3, 0, 1, 2, 0, 1, 2]
     assert pack.document_ids[0].tolist() == [0, 0, 0, 0, 1, 1, 1, 2, 2, 2]
     assert pack.data_ids == ["a", "b"] and pack.padding_tokens == 3
+    assert pack.data_tokens == [4, 3] == [shifted_length(a), shifted_length(b)]  # the slots per document, no tail
+    assert pack.data_tokens == torch.bincount(pack.document_ids[0].long(), minlength=3)[:2].tolist()
     input_ids, labels, data_ids, *_ = pack  # the first three fields unpack like a padded `Batch`
     assert torch.equal(input_ids, pack.input_ids) and torch.equal(labels, pack.labels) and data_ids == ["a", "b"]
 
@@ -144,6 +152,7 @@ def test_pack_layout(tokenizer: Tokenizer) -> None:
 def test_a_full_pack_has_no_tail(tokenizer: Tokenizer) -> None:
     pack = pack_samples([_sample(6, "a"), _sample(4, "b")], 10, tokenizer)
     assert pack.padding_tokens == 0 and pack.document_ids[0].tolist() == [0] * 6 + [1] * 4
+    assert pack.data_tokens == [6, 4]
     assert (pack.labels != IGNORE_INDEX).all()
 
 

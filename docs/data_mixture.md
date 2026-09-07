@@ -8,7 +8,9 @@ uv run python data_preparation/prepare.py describe --dataset_config config/datas
 
 Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the
 config times the stage weights; the training loader packs rows end to end, so a
-source is consumed by the token length of its rows. The rows columns estimate how many rows that is from
+source is consumed by the token length of its rows. The training stream realises the weights as token shares by
+filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/step.py`).
+The rows columns estimate how many rows that is from
 `describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at the training length; the
 downloaded shards then measure the real one).
 

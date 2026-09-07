@@ -38,7 +38,7 @@ class CheckpointMetadata:
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
     source_rows: dict[str, int]  # `ResolvedDataset.source_rows`, {source: processed rows}; a resume refuses a changed count
-    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read per source + the draw RNG
+    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
 
     def to_state(self) -> dict[str, Any]:
         """

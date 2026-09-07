@@ -348,13 +348,20 @@ def fake_result(
     *,
     loss: float = 2.0,
     data_ids: list[str] | None = None,
+    data_tokens: dict[str, int] | None = None,
     metrics: dict[str, torch.Tensor] | None = None,
     validation: dict[str, torch.Tensor] | None = None,
 ) -> StepResult:
     """
-    A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors.
+    A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors. Without
+    `data_tokens` every document counts 64 tokens, so the token composition equals the document composition.
     """
 
+    ids = data_ids if data_ids is not None else ["source_a"] * 4
+    if data_tokens is None:
+        data_tokens = {}
+        for data_id in ids:
+            data_tokens[data_id] = data_tokens.get(data_id, 0) + 64
     return StepResult(
         step=step,
         learning_rate=1e-4 * step,
@@ -362,7 +369,8 @@ def fake_result(
         log_ppl=torch.tensor(loss),
         grad_norm=torch.tensor(0.5),
         stage=stage_manager.get_stage_info(step),
-        data_ids=data_ids if data_ids is not None else ["source_a"] * 4,
+        data_ids=ids,
+        data_tokens=data_tokens,
         metrics=metrics or {},
         validation=validation,
     )
@@ -592,8 +600,10 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     """
     `log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
     dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
-    counts every world batch since the last log step and starts over afterwards. The final step is logged whatever
-    the interval (with `log_step_interval: 3` it would otherwise be dropped, its validation with it).
+    counts the document TOKENS of every step since the last log step (pack tails excluded, `result.data_tokens`;
+    the document counts play no part: step 1 has as many `a` as `b` documents but three times the `b` tokens) and
+    starts over afterwards. The final step is logged whatever the interval (with `log_step_interval: 3` it would
+    otherwise be dropped, its validation with it).
     """
 
     recorded = _record_wandb_logs(monkeypatch)
@@ -602,9 +612,14 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     clock = FakeClock()
     run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
     progress = TrainingProgress()
-    batches = [["a", "a", "b", "b"], ["b", "b", "b", "b"], ["a"] * 4, ["a"] * 4]
-    for data_ids in batches:
-        result = fake_result(stage_manager, progress.step, data_ids=data_ids)
+    batches = [
+        (["a", "a", "b", "b"], {"a": 100, "b": 300}),  # 2 + 2 documents, 1 : 3 in tokens
+        (["b", "b", "b", "b"], {"b": 400}),
+        (["a"] * 4, {"a": 500}),
+        (["a"] * 4, {"a": 300}),
+    ]
+    for data_ids, data_tokens in batches:
+        result = fake_result(stage_manager, progress.step, data_ids=data_ids, data_tokens=data_tokens)
         progress.advance()
         clock.advance(1.0)
         run_logger.log_step(result, progress)
@@ -622,7 +637,7 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     assert shown[1][3]["loss"] == 2.0 and shown[3][3]["step"] == 4
     second, fourth = run_logger.history[2], run_logger.history[4]
     assert second["seconds/step"] == 1.0 and second["tokens/second"] == TOKENS_PER_STEP
-    assert second["data_composition/a"] == 0.25 and second["data_composition/b"] == 0.75
+    assert second["data_composition/a"] == 0.125 and second["data_composition/b"] == 0.875  # 100 : 700 tokens
     assert fourth["data_composition/a"] == 1.0 and "data_composition/b" not in fourth
     for metrics in (second, fourth):
         assert sum(v for k, v in metrics.items() if k.startswith("data_composition/")) == pytest.approx(1.0)

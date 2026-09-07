@@ -17,7 +17,6 @@ import json
 import logging
 import sys
 import time
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from contextlib import AbstractContextManager, ExitStack, contextmanager
@@ -348,7 +347,7 @@ class RunLogger:
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._interval_step = start_step  # the step the interval timer started at
-        self._sample_counter: Counter[str] = Counter()  # data ids of the world batches since the last log step
+        self._token_counter: dict[str, int] = {}  # document tokens trained per data id since the last log step
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
         self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
         self._last_loss: float | None = None
@@ -563,7 +562,8 @@ class RunLogger:
         """
         Account one completed optimizer step (`progress.step`, after `progress.advance()`).
 
-        Every step: the data ids join the composition counter, a transition starting or ending becomes an event, a
+        Every step: the document tokens per data id join the composition counter, a transition starting or ending
+        becomes an event, a
         set `result.validation` becomes the dashboard's validation row, the bars move (with an empty metric dict, so
         no tensor is read). At log steps (`step % log_step_interval == 0`, and the final step whatever the interval)
         the metric dict goes to wandb, to `history` with `keep_history`, and to the dashboard:
@@ -573,12 +573,15 @@ class RunLogger:
           `remaining_time`;
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
-        * `data_composition/<data id>`: the fraction of world-batch samples per data id since the last log step;
+        * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
+          step (`result.data_tokens`: document slots, pack tails excluded), the realised token share the stage
+          weights promise;
         * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`,
           `val_loss/<data id>` per validation source, `val_time`).
         """
 
-        self._sample_counter.update(result.data_ids)
+        for data_id, tokens in result.data_tokens.items():
+            self._token_counter[data_id] = self._token_counter.get(data_id, 0) + tokens
         stage_at_done = self.stage_manager.get_stage_info(progress.step)
         self._note_transition(result.stage, stage_at_done)
         validation = self._log_validation(result, progress)
@@ -641,7 +644,7 @@ class RunLogger:
         steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
         seconds_per_step = (now - self._interval_started) / steps_in_interval
         self._interval_started, self._interval_step = now, progress.step
-        total_samples = sum(self._sample_counter.values())
+        total_tokens = sum(self._token_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
         metrics |= {
@@ -661,8 +664,8 @@ class RunLogger:
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }
-        metrics |= {f"data_composition/{name}": count / total_samples for name, count in self._sample_counter.items()}
-        self._sample_counter.clear()
+        metrics |= {f"data_composition/{name}": count / total_tokens for name, count in self._token_counter.items()}
+        self._token_counter.clear()
         return metrics
 
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:

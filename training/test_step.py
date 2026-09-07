@@ -24,7 +24,7 @@ from model import RecurrentGPT, build_model
 from training.backend.single_device import SingleDeviceBackend
 from training.data.collate import Sample, WorkerBatch
 from training.data.tokenizer import IGNORE_INDEX
-from training.data.packing import PackedBatch, shifted_length
+from training.data.packing import POOL_TOKEN_FACTOR, PackedBatch, shifted_length
 import training.data.loader as loader_module
 from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
 from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
@@ -131,7 +131,7 @@ def scripted_batches(settings: Settings, seed: int = 0) -> Iterator[PackedBatch]
             document_ids[0, offset : offset + length] = document
             offset += length
         position_ids[0, offset:] = torch.arange(tail)
-        yield PackedBatch(input_ids, labels, ["scripted"] * len(lengths), position_ids, document_ids, tail)
+        yield PackedBatch(input_ids, labels, ["scripted"] * len(lengths), position_ids, document_ids, tail, lengths)
 
 
 def fresh_tiny_model(backend: SingleDeviceBackend, seed: int = 0) -> torch.nn.Module:
@@ -349,7 +349,8 @@ def test_non_finite_grad_norm_raises_with_the_exact_message(
 
 
 # --------------------------------------------------------------------------------------------------------------
-# micro-batch stream (per-SAMPLE source draws over the run-wide readers; fake loaders, hand-made stage managers)
+# micro-batch stream (per-document source picks by token deficit over the run-wide readers; fake loaders, hand-made
+# stage managers)
 
 
 def _fake_samples(tag: str, lengths: list[int]) -> SampleBatch:
@@ -373,6 +374,21 @@ class _Repeat:
             self.count += 1
             samples = _fake_samples(self.tag, [1 + (self.count + i) % 7 for i in range(self.batch_size)])
             yield WorkerBatch(samples, len(samples))
+
+
+class _Fixed:
+    """
+    Endless iterable of one-sample worker batches of `tag` whose documents all occupy `slots` positions (`slots + 1`
+    tokens): the fake for the token-share tests, where the document lengths must be known.
+    """
+
+    def __init__(self, tag: str, slots: int) -> None:
+        self.tag, self.slots, self.count = tag, slots, 0
+
+    def __iter__(self) -> Iterator[WorkerBatch]:
+        while True:
+            self.count += 1
+            yield WorkerBatch(_fake_samples(self.tag, [self.slots + 1]), 1)
 
 
 class _ShortBatches:
@@ -430,6 +446,31 @@ def _stream_setup(
     return settings, loaders, _abc_stage_manager(settings)
 
 
+def _weighted_stage_manager(settings: Settings, *stage_weights: dict[str, float]) -> StageManager:
+    """
+    One stage of 8 optimizer steps per entry of `stage_weights` (its train weights), no transition windows: the
+    weights switch at the stage boundary, the case the no-burst rule is easiest to read on.
+    """
+
+    stages = [
+        resolved_stage(f"s{i}", tokens=8 * settings.tokens_per_optimizer_step, base_lr=1e-4, transition_pct=0.0, train_weights=weights)
+        for i, weights in enumerate(stage_weights)
+    ]
+    return StageManager(stages, settings.tokens_per_optimizer_step)
+
+
+def _loaded_tokens(packs: list[PackedBatch]) -> dict[str, int]:
+    """
+    The document slots per source over `packs` (`data_tokens`, so pack tails are left out).
+    """
+
+    out: dict[str, int] = {}
+    for pack in packs:
+        for data_id, tokens in zip(pack.data_ids, pack.data_tokens):
+            out[data_id] = out.get(data_id, 0) + tokens
+    return out
+
+
 def _next_pack(stream: Iterator[PackedBatch]) -> PackedBatch:
     batch = next(stream)
     assert isinstance(batch, PackedBatch)
@@ -438,9 +479,9 @@ def _next_pack(stream: Iterator[PackedBatch]) -> PackedBatch:
 
 def _packs(stream: Iterator[PackedBatch], n: int, skip: int = 0) -> list[PackedBatch]:
     """
-    The next `n` packs, after `skip` packs left to the pool's lag: documents are drawn about one pack length ahead
-    of the pack they land in (`BatchStream`), so the first packs after a step change still hold documents drawn
-    under the previous step's weights.
+    The next `n` packs, after `skip` packs left to the pool's lag: a document is put into the pool up to
+    `POOL_TOKEN_FACTOR` pack lengths ahead of the pack it lands in (`BatchStream`), so the first packs after a step
+    change still hold documents picked under the previous step's weights.
     """
 
     for _ in range(skip):
@@ -505,8 +546,9 @@ def test_batch_stream_samples_by_transition_progress(
 ) -> None:
     """
     The step is read at every pull, not when the stream is created, and the documents of a pack come from the
-    sources weighted at the step of their draw (one pack length ahead, `_packs`): a plain step draws from its
-    stage's source only, the start of a transition still from the old stage, its middle from both.
+    sources weighted at the step of their pick (up to sixteen packs ahead, `_packs`): a plain step pulls from its
+    stage's source only, the start of a transition still from the old stage, its middle from both, at equal TOKEN
+    shares (deterministic: the deficit rule alternates the sources within one document length).
     """
 
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
@@ -517,33 +559,97 @@ def test_batch_stream_samples_by_transition_progress(
     progress.step = 6  # transition 0 -> 1, progress 0: everything still from stage 0
     assert _sources(_packs(stream, 4)) == [{"a"}] * 4
     progress.step = 8  # fully in stage 1
-    assert _sources(_packs(stream, 4, skip=2)) == [{"b"}] * 4
-    progress.step = 15  # transition 1 -> 2 at progress 0.5: a mix, driven by the rng
-    mixed = [tag for pack in _packs(stream, 8, skip=2) for tag in pack.data_ids]
-    assert set(mixed) == {"b", "c"} and 0.3 < mixed.count("c") / len(mixed) < 0.7
+    assert _sources(_packs(stream, 4, skip=POOL_TOKEN_FACTOR)) == [{"b"}] * 4
+    progress.step = 15  # transition 1 -> 2 at progress 0.5: half the tokens from each
+    mixed = _loaded_tokens(_packs(stream, 8, skip=POOL_TOKEN_FACTOR))
+    assert set(mixed) == {"b", "c"} and 0.4 < mixed["c"] / (mixed["b"] + mixed["c"]) < 0.6
     progress.step = 19
-    assert _sources(_packs(stream, 4, skip=2)) == [{"c"}] * 4
+    assert _sources(_packs(stream, 4, skip=POOL_TOKEN_FACTOR)) == [{"c"}] * 4
 
 
-def test_batch_stream_draw_rng_is_seeded_with_the_start_step(
-    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
-) -> None:
+def test_batch_stream_is_deterministic(tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer) -> None:
     """
-    Two streams created at the same `seed + step` draw the same source sequence; a different start step draws
-    another (a resume without a stored data-stream state seeds the draw RNG with `seed + resume step`).
+    Two streams built the same way yield identical packs: the source of every document is a function of the two
+    per-source numbers, no RNG is involved (so the start step plays no part either).
     """
 
     settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
 
-    def mix(start_step: int) -> list[list[str]]:
+    def packs(start_step: int) -> list[PackedBatch]:
         loaders = RunDataloaders({tag: _Repeat(tag) for tag in "abc"}, [], stream_tokenizer, {})
         progress = TrainingProgress(step=start_step)
         stream = BatchStream(settings, loaders, stage_manager, progress)
         progress.step = 15
-        return [pack.data_ids for pack in _packs(stream, 4)]
+        return _packs(stream, 4)
 
-    assert mix(0) == mix(0)
-    assert mix(0) != mix(14)
+    assert _same_batches(packs(0), packs(0))
+    assert _same_batches(packs(0), packs(14))
+
+
+def test_batch_stream_balances_the_token_shares_within_one_document(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    The rule the weights are token shares by: two sources at 0.5 / 0.5 whose documents are 2000 and 300 slots long
+    have loaded the same number of tokens to within one document (the longest) after 50 packs, and the packs
+    trained on hold the same share; a per-document draw would give `a` about 6.7 times the tokens of `b`.
+    """
+
+    settings, _, _ = _stream_setup(
+        tmp_path, tiny_dataset_dir, stream_tokenizer, tokens_per_micro_batch=4096, micro_batches_per_step=1
+    )
+    stage_manager = _weighted_stage_manager(settings, {"a": 0.5, "b": 0.5})
+    loaders = RunDataloaders({"a": _Fixed("a", 2000), "b": _Fixed("b", 300)}, [], stream_tokenizer, {})
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    packs = _packs(stream, 50)
+    loaded = stream.state_dict()["pool_loaded"]
+    assert loaded["a"] > 20 * 4096 and abs(loaded["a"] - loaded["b"]) <= 2000
+    trained = _loaded_tokens(packs)
+    assert 0.45 < trained["b"] / (trained["a"] + trained["b"]) < 0.55
+
+
+def test_batch_stream_gives_a_source_entering_at_a_transition_its_share_without_a_burst(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Targets accumulate with the CURRENT weights: a source whose weight goes from 0 to 0.3 at a stage boundary earns
+    30 % of the tokens loaded from then on, not 30 % of everything loaded before (which would fill the pool with it
+    alone for many packs). Measured on the loaded numbers over the first 20 packs after the switch, while the
+    trained packs still show the old stage (the pool's lag).
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stage_manager = _weighted_stage_manager(settings, {"a": 1.0}, {"a": 0.7, "b": 0.3})
+    loaders = RunDataloaders({"a": _Fixed("a", 60), "b": _Fixed("b", 30)}, [], stream_tokenizer, {})
+    progress = TrainingProgress()
+    stream = BatchStream(settings, loaders, stage_manager, progress)
+    assert _sources(_packs(stream, 30)) == [{"a"}] * 30
+    before = stream.state_dict()["pool_loaded"]
+    assert before["b"] == 0 and before["a"] > 40 * PACK_LENGTH
+    progress.step = 8  # stage 1: b enters at 0.3
+    after_switch = _packs(stream, 20)
+    after = stream.state_dict()["pool_loaded"]
+    loaded_a, loaded_b = after["a"] - before["a"], after["b"] - before["b"]
+    assert 0.2 < loaded_b / (loaded_a + loaded_b) < 0.4
+    assert _sources(after_switch[: POOL_TOKEN_FACTOR - 1]) == [{"a"}] * (POOL_TOKEN_FACTOR - 1), "the lag"
+    assert "b" in _loaded_tokens(after_switch)
+
+
+def test_batch_stream_ties_go_to_the_first_source_in_config_order(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Equal deficits (the start of a run, and after every pair of equal documents at 0.5 / 0.5) pick the first source
+    in `train_sources` order, which is the dataset config's order, not alphabetical: with the loaders ordered
+    `b, a` the pool alternates b, a, b, a.
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stage_manager = _weighted_stage_manager(settings, {"a": 0.5, "b": 0.5})
+    loaders = RunDataloaders({"b": _Fixed("b", 32), "a": _Fixed("a", 32)}, [], stream_tokenizer, {})
+    assert loaders.train_sources == ["b", "a"]
+    pack = _next_pack(BatchStream(settings, loaders, stage_manager, TrainingProgress()))
+    assert pack.data_ids == ["b", "a"] * 4 and pack.data_tokens == [32] * 8
 
 
 def test_batch_stream_fills_every_pack_from_short_worker_batches(
@@ -635,7 +741,13 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     with _run_loaders(settings, dataset, cpu_backend) as loaders:
         stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
         parquet = loaders.datasets["synthetic_pretrain"]
-        state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate(), "buffers": {}}
+        state = {
+            "consumed_rows": {parquet.prefix: parquet.num_rows + 5},
+            "pool_loaded": {},
+            "pool_target": {},
+            "buffers": {},
+            "pool": [],
+        }
         stream.load_state_dict(state)
         assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
         next(stream)  # stage 0 draws from the pretrain source only: its reader starts now
@@ -690,8 +802,14 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    stage_manager = StageManager(dataset.stages, settings.tokens_per_optimizer_step)
-    steps = 13  # well into stage 1 (the boundary is step 8), before the transition into finetune (step 14)
+    # two stages of two steps each on the pretrain source, no transition: the boundary at step 2 is crossed well
+    # before the 82 pretrain rows wrap (the pool alone reads sixteen pack lengths, about 56 rows, ahead)
+    stages = [
+        resolved_stage(name, tokens=2 * settings.tokens_per_optimizer_step, base_lr=1e-4, transition_pct=0.0, train_weights={"synthetic_pretrain": 1.0})
+        for name in ("first", "second")
+    ]
+    stage_manager = StageManager(stages, settings.tokens_per_optimizer_step)
+    steps = 4  # both stages
     seen: list[tuple[int, ...]] = []
     with _run_loaders(settings, dataset, cpu_backend) as loaders:
         stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
@@ -700,7 +818,7 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
             assert set(pack.data_ids) == {"synthetic_pretrain"}  # both stages train on the same source
             seen += _documents(pack)
         assert stream.consumed_rows["synthetic_pretrain"] <= pretrain.num_rows, "fixture too small to distinguish from a wrap"
-    assert len(set(seen)) == len(seen)  # crossing the stage boundary at step 8 repeated nothing
+    assert len(set(seen)) == len(seen)  # crossing the stage boundary at step 2 repeated nothing
 
 
 def test_batch_stream_same_seed_yields_the_same_stream(
@@ -708,7 +826,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
 ) -> None:
     """
     Determinism of the whole stream: two fresh streams over the same dataset and settings yield identical packs:
-    same source draws, same rows, same layout (the draw RNG is private and seeded from `settings.seed`, and each
+    same source picks, same rows, same layout (the picks are a function of the loaded and target numbers, and each
     source's reader walks its range in order).
     """
 
@@ -734,7 +852,7 @@ DROP_SIGNATURE: dict[str, Any] = {
 }
 DROP_BLOCK_SIZE = 16  # cap 17 tokens: a 30-word prompt alone fills the window, its row keeps no supervised label
 DROP_EVERY = 3  # every third row of the fixture is such a prompt-only row and is dropped in the worker
-DROP_ROWS = 200  # rows of the fixture, 133 of them surviving
+DROP_ROWS = 300  # rows of the fixture, 200 of them surviving; the pool reads about 96 rows ahead (`_drop_settings`)
 DROP_PACK_LENGTH = 32  # a few such documents per pack, so the fixture lasts many steps (`_drop_settings`)
 DROP_WORKER_ROWS = 2  # rows per worker batch of the drop loaders unless a test says otherwise
 
@@ -795,7 +913,8 @@ class _RecordingLoader:
 def _drop_settings(tmp_path: Path, tiny_dataset_dir: Path, tokenizer: Tokenizer) -> Settings:
     """
     `_stream_setup` settings for the drop fixture: documents of up to `DROP_BLOCK_SIZE` positions in packs of
-    `DROP_PACK_LENGTH`, four per step, so a step takes about 16 of the 133 surviving rows.
+    `DROP_PACK_LENGTH`, four per step, so a step takes about 16 of the 200 surviving rows and the pool of sixteen
+    pack lengths holds about 64 more.
     """
 
     settings, _, _ = _stream_setup(
@@ -943,8 +1062,8 @@ def test_batch_stream_is_the_same_for_any_worker_batch_size(
     The worker batch size of the train loaders (`TRAIN_LOADER_BATCH_ROWS`, raised so a world batch is tokenized
     ahead of its pull) is invisible to the model: the one reader per source walks its range in order and the stream
     buffers its batches per source, so the micro-batches are identical to those of loaders with worker batches
-    of `DROP_WORKER_ROWS` rows, across dropped rows and the wrap into the next epoch (10 steps of 4 packs
-    over 133 surviving rows), with the row counters agreeing at the end of every epoch.
+    of `DROP_WORKER_ROWS` rows, across dropped rows and the wrap into the next epoch (10 steps of 4 packs plus
+    the pool's lookahead over 200 surviving rows), with the row counters agreeing at the end of every epoch.
     """
 
     settings = _drop_settings(tmp_path, tiny_dataset_dir, stream_tokenizer)
@@ -994,16 +1113,16 @@ def test_mid_run_resume_with_wide_worker_batches_reproduces_the_stream(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """
-    With worker batches wider than the pool's refill (64 rows against a pack length of short documents) part of a
-    checkpoint's rows sit in the stream's buffer, the rest in the pool: both travel in the state, so a stream
-    resumed from a mid-run checkpoint continues with exactly the packs the uninterrupted stream produces, across
-    dropped rows and the epoch wrap.
+    With worker batches wider than a pack's worth of documents (64 rows against a pack length of short documents)
+    part of a checkpoint's rows sit in the stream's buffer, the rest in the pool: both travel in the state, so a
+    stream resumed from a mid-run checkpoint continues with exactly the packs the uninterrupted stream produces,
+    across dropped rows and the epoch wrap.
     """
 
     settings = _drop_settings(tmp_path, tiny_dataset_dir, stream_tokenizer)
     data_dir = tmp_path / "drop_data"
     _write_drop_parquet(data_dir)
-    k = 5  # world batches before the checkpoint: inside the third worker batch, the epoch wraps after
+    k = 5  # world batches before the checkpoint: the whole first epoch read (four 64-row batches and the 44-row tail), the wrap after
 
     full, _ = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
     uninterrupted = _micro_batches(settings, full, 2 * k)
@@ -1011,13 +1130,13 @@ def test_mid_run_resume_with_wide_worker_batches_reproduces_the_stream(
     first, _ = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
     before = _micro_batches(settings, first, k)
     state = first.state_dict()
-    assert state["consumed_rows"] == {"drop": 192} and len(state["buffers"]["drop"]) > 0 and state["pool"]
+    assert state["consumed_rows"] == {"drop": DROP_ROWS} and len(state["buffers"]["drop"]) > 0 and state["pool"]
 
     resumed, resumed_recording = _drop_stream(settings, data_dir, stream_tokenizer, worker_batch_rows=64)
     resumed.load_state_dict(state)
     resumed.progress.step = k
     after = _micro_batches(settings, resumed, k)
-    assert resumed_recording.rows_read > 0  # the resumed reader started at row 128 and wrapped into epoch two
+    assert resumed_recording.rows_read > 0  # the resumed reader started epoch two at row 0
     assert _same_batches(before + after, uninterrupted)
 
 
@@ -1123,16 +1242,17 @@ def test_packed_stream_draws_exactly_the_documents_the_padded_stream_would(
     in_packs = [slots for pack in packs for slots in _document_slots(pack)]
     in_pool = [shifted_length(sample) for sample in state["pool"]]
     assert sorted(in_packs + in_pool) == sorted((1 + (i + 1) % 7) - 1 for i in range(drawn))
-    # refilled to two pack lengths before the last pack was taken, which removed at most one pack length
-    assert sum(in_pool) >= PACK_LENGTH
+    # refilled to sixteen pack lengths before the last pack was taken, which removed at most one pack length
+    assert sum(in_pool) >= (POOL_TOKEN_FACTOR - 1) * PACK_LENGTH
 
 
 def test_packed_stream_state_round_trip_carries_the_pool(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """
-    A resumed packed stream continues with the same packs: the draw RNG, the row counters (the fakes are set to
-    the consumed rows, what `set_resume_offset` does for a real dataset) and the pooled documents come back.
+    A resumed packed stream continues with the same packs: the loaded and target slots per source (the next pick
+    depends on them: at step 15 `b` and `c` alternate by deficit), the row counters (the fakes are set to the
+    consumed rows, what `set_resume_offset` does for a real dataset) and the pooled documents come back.
     """
 
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
@@ -1141,6 +1261,10 @@ def test_packed_stream_state_round_trip_carries_the_pool(
         next(stream)
     state = stream.state_dict()
     assert state["pool"] and set(state["consumed_rows"]) == {"b", "c"}
+    assert set(state) == {"consumed_rows", "pool_loaded", "pool_target", "buffers", "pool"}
+    assert state["pool_loaded"]["a"] == 0 and state["pool_loaded"]["b"] > 0 and state["pool_loaded"]["c"] > 0
+    assert state["pool_target"]["b"] == pytest.approx(state["pool_target"]["c"])  # 0.5 / 0.5 since the start
+    assert abs(state["pool_loaded"]["b"] - state["pool_loaded"]["c"]) <= 6  # within the longest `_Repeat` document
     continued = [_next_pack(stream) for _ in range(6)]
 
     fresh = {t: _Repeat(t) for t in "abc"}
@@ -1152,6 +1276,7 @@ def test_packed_stream_state_round_trip_carries_the_pool(
     resumed.load_state_dict(state)
     restored = resumed.state_dict()
     assert restored["consumed_rows"] == state["consumed_rows"]
+    assert restored["pool_loaded"] == state["pool_loaded"] and restored["pool_target"] == state["pool_target"]
     assert [(s[0].tolist(), s[2]) for s in restored["pool"]] == [(s[0].tolist(), s[2]) for s in state["pool"]]
     for expected in continued:
         got = _next_pack(resumed)
@@ -1159,19 +1284,6 @@ def test_packed_stream_state_round_trip_carries_the_pool(
         assert torch.equal(got.input_ids, expected.input_ids) and torch.equal(got.labels, expected.labels)
         assert torch.equal(got.position_ids, expected.position_ids)
         assert torch.equal(got.document_ids, expected.document_ids)
-
-
-def test_packed_stream_loads_a_checkpoint_from_before_packing(
-    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
-) -> None:
-    """
-    A data-stream state without a `pool` entry (written before packing existed) means an empty pool.
-    """
-
-    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
-    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    stream.load_state_dict({"consumed_rows": {"a": 3}, "draw_rng": stream.rng.getstate(), "buffers": {}})
-    assert stream.state_dict()["pool"] == [] and stream.state_dict()["consumed_rows"] == {"a": 3}
 
 
 def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> None:
@@ -1209,6 +1321,7 @@ def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> N
         assert torch.isfinite(result.loss) and result.loss > 0
         assert torch.isfinite(result.grad_norm) and result.grad_norm > 0
         assert result.data_ids == ["scripted"] * 6 and result.validation is None
+        assert result.data_tokens == {"scripted": 2 * (128 + 64 + 32)}  # the two tails of 32 are not counted
         assert float(result.metrics["packing/padding_fraction"]) == pytest.approx(2 * 32 / 512)
         assert len(result.metrics) > 1, "the gradient metrics of a log step are there too"
 

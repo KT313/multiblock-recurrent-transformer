@@ -5,12 +5,12 @@ One optimizer step of the training loop: the micro-batch stream, the scheduled l
 
 Everything here is numerics, bit-identical to the thesis loop; the golden tests in `test_step.py` and `test_run.py`
 fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
-run, per-SAMPLE source draws from a private `random.Random(seed + resume step)`, and the drawn documents packed
-into one row per micro-batch (`training.data.packing`). Steps are OPTIMIZER steps: `gradient_accumulation_steps`
-packed micro-batches, one `optimizer.step()`.
+run, the source of every document chosen deterministically so that the sources' TOKEN shares follow the stage
+weights (`BatchStream._pick_source`), and the documents packed into one row per micro-batch
+(`training.data.packing`). Steps are OPTIMIZER steps: `gradient_accumulation_steps` packed micro-batches, one
+`optimizer.step()`.
 """
 
-import random
 from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
@@ -26,7 +26,7 @@ from model.layers.attention import document_attention_mask
 from training.backend.base import Backend, plain_model
 from training.data.collate import Sample
 from training.data.loader import RunDataloaders
-from training.data.packing import PackedBatch, PackPool, pack_samples
+from training.data.packing import PackedBatch, PackPool, pack_samples, shifted_length
 from training.data.tokenizer import IGNORE_INDEX
 from training.logger import track_gradient_metrics
 from training.lr_schedule import get_lr_multistage
@@ -74,7 +74,8 @@ class StepResult:
     log_ppl: Tensor  # mean of the micro-batch log-perplexities
     grad_norm: Tensor  # pre-clip gradient norm
     stage: StageInfo  # stage info at `step` (what the step trained on)
-    data_ids: list[str]  # one entry per sample of the world batch (data composition)
+    data_ids: list[str]  # one entry per document of the step's packs (document count per source)
+    data_tokens: dict[str, int]  # document slots trained per data id, pack tails excluded (data composition)
     metrics: dict[str, Tensor] = field(default_factory=dict)  # at log steps: `track_gradient_metrics`, `packing/padding_fraction`; else {}
     validation: dict[str, Tensor] | None = None  # filled by `train()` when it is an evaluation step
 
@@ -83,19 +84,28 @@ class BatchStream:
     """
     Endless stream of packed micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
 
-    One reader per source for the whole run; stages only change the draw weights, so a source shared by two stages
-    is never re-read. Every document comes from a source drawn with the current step's weights and goes into a
-    `PackPool`: before every micro-batch the pool is refilled to `POOL_TOKEN_FACTOR` pack lengths of tokens, then
-    one pack of `tokens_per_micro_batch` tokens is taken first-fit from its front (`_packs`). The weights of a draw
-    are those of the step at which the pool was refilled, about one micro-batch of tokens ahead of the step that
-    trains on the document.
+    One reader per source for the whole run; stages only change the weights, so a source shared by two stages is
+    never re-read. Every document goes into a `PackPool`: before every micro-batch the pool is refilled to
+    `POOL_TOKEN_FACTOR` pack lengths of tokens, then one pack of `tokens_per_micro_batch` tokens is taken first-fit
+    from its front (`_packs`). The weights of a pick are those of the step at which the pool was refilled, up to
+    sixteen packs ahead of the step that trains on the document.
 
-    Checkpointed (`state_dict`): the rows read per source (dropped rows included), the draw RNG state, the samples
-    still buffered per source and the pool.
+    Stage weights are TOKEN shares, realised by filling the pool by deficit instead of drawing sources at random.
+    Every train source keeps two numbers, both 0 at the start of a run: `_loaded`, the slots (`shifted_length`) of
+    its documents put into the pool so far, and `_target`, the slots it should have had. When a document of `n`
+    slots enters the pool, its source's `_loaded` grows by `n` and EVERY source's `_target` grows by its current
+    weight times `n`; the next document comes from the source with the largest `_target - _loaded` among those with
+    a weight > 0 (`_pick_source`). With constant weights the deficit is `weight x total - loaded`, so every source's
+    share stays within one document of its weight; when a transition blends the weights per step, a source that
+    gains weight earns its share from then on, no catch-up burst for the tokens before. Pack tails never enter
+    either number, nor does a document the pool rejects as oversized.
+
+    Checkpointed (`state_dict`): the rows read per source (dropped rows included), the two numbers per source, the
+    samples still buffered per source and the pool.
 
     Reproducibility rules:
-    - the draw RNG is `random.Random(seed + resume step)`, restored from a checkpoint when there is one; every
-      sample draw consumes it
+    - no RNG anywhere: the pick is a deterministic function of the two numbers, ties go to the first source in
+      `train_sources` (config) order
     - `progress.step` is read once per micro-batch, before the pool is refilled
     - loader iterators are created at a source's first pull; their base seeds come from the loaders' private
       generator, never from the global torch RNG
@@ -108,8 +118,9 @@ class BatchStream:
         self.loaders = loaders
         self.stage_manager = stage_manager
         self.progress = progress
-        self.rng = random.Random(settings.seed + progress.step)
         self.consumed_rows: dict[str, int] = {}  # source name -> rows read so far (dropped rows included)
+        self._loaded: dict[str, int] = {source: 0 for source in loaders.train_sources}  # slots put into the pool
+        self._target: dict[str, float] = {source: 0.0 for source in loaders.train_sources}  # slots it should have
         self._buffers: dict[str, deque[Sample]] = {source: deque() for source in loaders.train_sources}
         self._pool = PackPool(settings.tokens_per_micro_batch)
         self._micro_batches: Iterator[PackedBatch] = self._packs()
@@ -122,13 +133,15 @@ class BatchStream:
 
     def state_dict(self) -> dict[str, Any]:
         """
-        What a checkpoint stores: the rows read per source (dropped rows included), the draw RNG state, the
-        buffered samples per source and the packing pool. Old checkpoint schemas have no loader (repo policy).
+        What a checkpoint stores: the rows read per source (dropped rows included), the loaded and target slots
+        per source, the buffered samples per source and the packing pool. Old checkpoint schemas (the `draw_rng`
+        of the random-draw stream) have no loader (repo policy).
         """
 
         return {
             "consumed_rows": dict(self.consumed_rows),
-            "draw_rng": self.rng.getstate(),
+            "pool_loaded": dict(self._loaded),
+            "pool_target": dict(self._target),
             "buffers": {source: list(buffer) for source, buffer in self._buffers.items() if buffer},
             "pool": self._pool.state(),
         }
@@ -136,20 +149,21 @@ class BatchStream:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
         Continue where the checkpointed run stood: every train dataset skips the rows already consumed from it,
-        the draw RNG picks its state back up, the buffered samples are trained on first and the packing pool is
-        what it was (a checkpoint from before packing existed has no `pool` entry: an empty pool).
+        the loaded and target slots per source are what they were (so the next pick is the one the interrupted run
+        would have made), the buffered samples are trained on first and the packing pool is what it was.
 
-        Counters are rows READ (dropped rows included), the unit the offsets skip. Buffered samples of a source
-        that no longer exists are dropped.
+        Counters are rows READ (dropped rows included), the unit the offsets skip. Buffered samples and the two
+        numbers of a source that no longer exists are dropped; a source the state does not know starts at 0.
         """
 
         self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
-        self.rng.setstate(state["draw_rng"])
+        self._loaded = {source: int(state["pool_loaded"].get(source, 0)) for source in self.loaders.train_sources}
+        self._target = {source: float(state["pool_target"].get(source, 0.0)) for source in self.loaders.train_sources}
         self.loaders.set_resume_offsets(self.consumed_rows)
         for source, samples in state["buffers"].items():
             if source in self._buffers:
                 self._buffers[source].extend(samples)
-        self._pool.restore(list(state.get("pool", [])))
+        self._pool.restore(list(state["pool"]))
 
     def _next_sample(self, source: str) -> Sample:
         """
@@ -168,35 +182,62 @@ class BatchStream:
             buffer.extend(batch.samples)
         return buffer.popleft()
 
-    def _draw_weights(self) -> list[float]:
+    def _weights(self) -> dict[str, float]:
         """
-        The per-source draw weights of the current step, in `train_sources` order (0 for a source the stage does
-        not use).
+        The per-source token-share weights of the current step, in `train_sources` order (0 for a source the stage
+        does not use).
         """
 
         weights_at_step = self.stage_manager.data_weights(self.progress.step)
-        return [weights_at_step.get(source, 0.0) for source in self.loaders.train_sources]
+        return {source: weights_at_step.get(source, 0.0) for source in self.loaders.train_sources}
 
-    def _draw_sample(self, weights: list[float]) -> Sample:
+    def _pick_source(self, weights: dict[str, float]) -> str:
         """
-        One document from a source drawn with `weights` (one draw-RNG call).
+        The source the next document comes from: the largest deficit `_target - _loaded` among the sources with a
+        weight > 0; a tie goes to the first in `train_sources` order (strict `>` while iterating in order).
         """
 
-        return self._next_sample(self.rng.choices(self.loaders.train_sources, weights=weights, k=1)[0])
+        best: str | None = None
+        best_deficit = 0.0
+        for source, weight in weights.items():
+            if weight <= 0.0:
+                continue
+            deficit = self._target[source] - self._loaded[source]
+            if best is None or deficit > best_deficit:
+                best, best_deficit = source, deficit
+        if best is None:
+            raise RuntimeError(f"no train source has a weight > 0 at step {self.progress.step}: {weights}")
+        return best
+
+    def _add_to_pool(self, source: str, sample: Sample, weights: dict[str, float]) -> None:
+        """
+        Put `sample` (from `source`) into the pool and account it: `source` has `n` more slots loaded and every
+        source's target grows by its weight times `n`. A document the pool rejects as oversized (dropped with a
+        warning) touches neither number: it will never be trained on.
+        """
+
+        if not self._pool.add(sample):
+            return
+        length = shifted_length(sample)
+        self._loaded[source] += length
+        for other, weight in weights.items():
+            if weight > 0.0:
+                self._target[other] += weight * length
 
     def _packs(self) -> Iterator[PackedBatch]:
         """
-        The packed micro-batches: refill the pool to its token target with the current step's weights, take one
-        pack first-fit from its front, pack it.
+        The packed micro-batches: refill the pool to its token target with the current step's weights (picking the
+        source of every document by deficit), take one pack first-fit from its front, pack it.
         """
 
         pool = self._pool
         while True:
-            weights = self._draw_weights()
+            weights = self._weights()
             while pool.needs_refill():
-                pool.add(self._draw_sample(weights))
+                source = self._pick_source(weights)
+                self._add_to_pool(source, self._next_sample(source), weights)
             samples = pool.take_pack()
-            if not samples:  # unreachable: the pool holds two pack lengths of documents that each fit a pack
+            if not samples:  # unreachable: the pool holds many pack lengths of documents that each fit a pack
                 raise RuntimeError("the packing pool holds documents but none fits into an empty pack")
             yield pack_samples(samples, pool.pack_length, self.loaders.tokenizer, IGNORE_INDEX)
 
@@ -264,10 +305,13 @@ def run_one_optimizer_step(
     loss_sum = torch.zeros((), device=backend.device)
     log_ppl_sum = torch.zeros((), device=backend.device)
     data_ids: list[str] = []
+    data_tokens: dict[str, int] = {}  # document slots per data id, the pack tails left out
     padding_tokens = 0  # the tail positions without a document, over the step's packs
     for micro_batch_index in range(accumulation_steps):
         batch = next(batches)
         data_ids.extend(batch.data_ids)
+        for data_id, tokens in zip(batch.data_ids, batch.data_tokens):
+            data_tokens[data_id] = data_tokens.get(data_id, 0) + tokens
         padding_tokens += batch.padding_tokens
         inputs = model_inputs(batch, backend)
         with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
@@ -302,5 +346,6 @@ def run_one_optimizer_step(
         grad_norm=grad_norm,
         stage=stage,
         data_ids=data_ids,
+        data_tokens=data_tokens,
         metrics=metrics,
     )
