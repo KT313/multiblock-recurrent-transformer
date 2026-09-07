@@ -306,7 +306,7 @@ def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(
     before, rows_before = mtimes(raw), read_rows(raw)
 
     stale = cfg_factory({"p": _synthetic(seed=9)})  # a different seed -> different raw hash
-    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: source identity or tokenizer changed") as info:
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: source.seed: 0 -> 9; it must be deleted and downloaded again") as info:
         download(stale, "p", layout, rows_needed=7, shard_size=5)
     assert isinstance(info.value, RuntimeError) and info.value.directory == raw
     outdated = replace(cfg, dataset_max_sequence_length=cfg.dataset_max_sequence_length * 2)
@@ -786,15 +786,70 @@ def test_inspect_raw_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layou
     lowered = replace(cfg, dataset_max_sequence_length=16, training_target_sequence_length=16)
     assert inspect_raw(lowered, "p", layout).state == "current" and inspect_raw(lowered, "p", layout).current_manifest == m
 
-    other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic"))
-    assert inspect_raw(other_tokenizer, "p", layout).state == "stale" and inspect_raw(other_tokenizer, "p", layout).current_manifest is None
-    assert inspect_raw(other_tokenizer, "p", layout).reason == "stale: source identity or tokenizer changed"
-    assert inspect_raw(cfg_factory({"p": _synthetic(seed=1)}), "p", layout).state == "stale"
+    other_seed = cfg_factory({"p": _synthetic(seed=1)}, dataset_max_sequence_length=64)
+    assert inspect_raw(other_seed, "p", layout).state == "stale" and inspect_raw(other_seed, "p", layout).current_manifest is None
+    assert inspect_raw(other_seed, "p", layout).reason == "stale: source.seed: 0 -> 1", "the changed fields, from the recorded payload"
     # stale wins over outdated (the folder holds other rows altogether)
-    assert inspect_raw(replace(other_tokenizer, dataset_max_sequence_length=4096), "p", layout).state == "stale"
+    assert inspect_raw(replace(other_seed, dataset_max_sequence_length=4096), "p", layout).state == "stale"
+
+    # the tokenizer is not raw identity: the same rows, counted differently, are a choice for the repair step
+    other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, dataset_max_sequence_length=64, tokenizer=TokenizerConfig(name="other", kind="synthetic"))
+    inspection = inspect_raw(other_tokenizer, "p", layout)
+    assert (inspection.state, inspection.current_manifest, inspection.manifest) == ("tokenizer_changed", None, m)
+    assert inspection.reason == (
+        "tokenizer changed: synthetic (synthetic) -> other (synthetic); 5 rows were counted and truncated under the old one, "
+        "their token counts and truncation will not match the new tokenizer"
+    )
+    estimate = cfg_factory({"p": _synthetic(seed=0)}, dataset_max_sequence_length=64, token_count="estimate")
+    assert inspect_raw(estimate, "p", layout).state == "tokenizer_changed"
+    assert inspect_raw(estimate, "p", layout).reason == "token_count changed: tokenizer -> estimate; 5 rows were counted the old way, their stored token counts will not match the new one"
+    # outdated wins over tokenizer_changed (the folder is re-downloaded with the new tokenizer anyway)
+    assert inspect_raw(replace(other_tokenizer, dataset_max_sequence_length=4096), "p", layout).state == "outdated"
+    # a same-named tokenizer whose definition changed: the tokenizer step already replaced tokenizers/<name>, so only the hash names the old one
+    _edit_raw_manifest(layout, "p", tokenizer_hash="0123456789abcdef")
+    assert inspect_raw(cfg, "p", layout).reason.startswith("tokenizer changed: synthetic (definition 0123456789abcdef, no longer under tokenizers/) -> synthetic (synthetic); 5 rows")
+    # a manifest from before the tokenizer hash was recorded: unknown is not a change
+    _edit_raw_manifest(layout, "p", tokenizer_hash=None)
+    assert inspect_raw(other_tokenizer, "p", layout).state == "current" and inspect_raw(estimate, "p", layout).state == "tokenizer_changed"
+    # a manifest from before the payload was recorded says so instead of listing fields
+    _edit_raw_manifest(layout, "p", hash_payload=None)
+    assert inspect_raw(other_seed, "p", layout).reason == "stale: (no field detail recorded)"
     # a manifest of another stage in the raw folder is stale too
     Manifest(source="p", source_hash=cfg.raw_hash("p"), stage="processed").save(layout.raw_dir("p"))
-    assert inspect_raw(cfg, "p", layout).state == "stale"
+    assert inspect_raw(cfg, "p", layout).state == "stale" and inspect_raw(cfg, "p", layout).reason == "stale: a processed manifest where a raw one belongs"
+
+
+def _edit_raw_manifest(layout: DatasetLayout, name: str, **changes: Any) -> None:
+    manifest = Manifest.load(layout.raw_dir(name))
+    assert manifest is not None
+    for key, value in changes.items():
+        setattr(manifest, key, value)
+    manifest.save(layout.raw_dir(name))
+
+
+def test_download_refuses_a_folder_counted_with_another_tokenizer(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, mtimes: Mtimes
+) -> None:
+    """
+    Appending rows counted with the new tokenizer to rows counted with the old one is the repair step's adopt
+    decision, not the download's: it refuses like for a stale folder, names the remedy, and rewrites nothing.
+    The raw manifest records how the counts were made so the repair step can re-label it.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
+    m = download(cfg, "p", layout, rows_needed=5)
+    assert (m.tokenizer, m.tokenizer_hash, m.token_count, m.hash_payload) == ("synthetic", cfg.tokenizer_hash(), "tokenizer", cfg.raw_hash_payload("p"))
+    before = mtimes(layout.raw_dir("p"))
+    other = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic")))
+    with pytest.raises(RawFolderError, match=r"is tokenizer changed: synthetic \(synthetic\) -> other \(synthetic\); 5 rows .*; the download never deletes raw data; the repair step asks whether to keep the folder and go on with the new tokenizer$"):
+        download(other, "p", layout, rows_needed=10)
+    assert mtimes(layout.raw_dir("p")) == before and Manifest.load(layout.raw_dir("p")) == m
+    estimate = cfg_factory({"p": _synthetic(seed=0)}, token_count="estimate")
+    with pytest.raises(RawFolderError, match="is token_count changed: tokenizer -> estimate"):
+        download(estimate, "p", layout, rows_needed=10)
+    estimate_only = cfg_factory({"e": _synthetic(seed=0)}, token_count="estimate")
+    e = download(estimate_only, "e", layout, rows_needed=5)
+    assert (e.tokenizer, e.tokenizer_hash, e.token_count) == (None, None, "estimate"), "an estimate needs no tokenizer"
 
 
 def test_an_unreadable_raw_manifest_is_a_state_the_download_refuses(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:

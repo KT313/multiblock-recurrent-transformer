@@ -79,26 +79,37 @@ dataset/
 
 Both trees are shared by every dataset config (stages 1 and 2 of the thesis config draw from the same
 `processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
-(`lib/storage/manifest.py`): the hash of the settings that produced it, rows and tokens per shard, the loader
-offset and the rejected-row totals after each raw shard, how tokens were counted and, for raw, `truncated_at_tokens`,
-the cap the rows were cut or dropped at. The stage-specific fields are typed on `Manifest`: a raw manifest carries
-`exhausted`, `check_limit_reached`, `skipped_malformed` and `dropped_too_long`, a processed one `input_shards`,
+(`lib/storage/manifest.py`): the hash of the settings that produced it and the exact dict it was computed from
+(`hash_payload`), rows and tokens per shard, the loader offset and the rejected-row totals after each raw shard, how
+tokens were counted (`token_count`, `tokenizer`, and for raw the tokenizer's definition hash `tokenizer_hash`) and,
+for raw, `truncated_at_tokens`, the cap the rows were cut or dropped at. The stage-specific fields are typed on
+`Manifest`: a raw manifest carries `exhausted`, `check_limit_reached`, `skipped_malformed` and `dropped_too_long`, a processed one `input_shards`,
 `columns`, `shuffled`, `shuffle_seed` and `stats`. One object owns a raw folder's bookkeeping (`lib/storage/raw_folder.py`:
 `RawFolder`: the cap, the loader offset, the `skipped_malformed` / `dropped_too_long` counters, the exhaustion flag
 and the truncation to a good prefix); the per-source download, the `github_code` group pass and the repair step all
 go through it, so a repair followed by a resume restores every counter instead of only the offset.
 
-- `raw/` is keyed on `DatasetConfig.raw_hash`: the loader identity (repo, revision, files, split, converter, fields,
-  filter, seed, ...) plus `token_count` and the tokenizer. Processing options, `dataset_max_sequence_length`, budgets, weights,
-  `rows`, `check_limit`, `validation_fraction`, `input_inversions` and `shuffle` are *not* part of it.
-- `processed/` is keyed on `processed_hash`: the raw hash, `dataset_max_sequence_length`, the processing block reduced to the
-  fields of the active dedup mode, `input_inversions` and the resolved `shuffle`. A change rebuilds `processed/`
-  from the raw shards; nothing is downloaded.
+- `raw/` is keyed on `DatasetConfig.raw_hash`: exactly the settings that change which rows the loader stores (kind,
+  loader, repo, revision, files, language, path, converter, fields, filter; `split` only for `hf_split` / `hf_stream`,
+  `text_field` only for pretrain rows, `seed` only for `loader: synthetic`). The tokenizer and `token_count` are
+  *not* part of it: they only make the stored token counts and the truncation, so the raw manifest records them
+  (`tokenizer`, `tokenizer_hash`, `token_count`) and a later change is offered as a choice (see the repair section)
+  instead of costing a re-download. Processing options, `dataset_max_sequence_length`, budgets, weights, `rows`,
+  `check_limit`, `validation_fraction`, `input_inversions` and `shuffle` are not part of it either.
+- `processed/` is keyed on `processed_hash`: the raw hash, the tokenizer definition, `token_count` and the counting
+  rule, `dataset_max_sequence_length`, the processing block as the build applies it (pretrain: reduced to the fields
+  of the active dedup mode; instruct: the dedup block alone, the other passes run for pretrain rows only),
+  `input_inversions` (instruct) and the resolved `shuffle` and `seed`. A change rebuilds `processed/` from the raw
+  shards after confirmation; nothing is downloaded.
+
+Both manifests store `hash_payload`, the exact dict the hash was computed from, so a mismatch is explained field by
+field (`processing.dedup.normalize: true -> false`) in the confirmation prompt and the status table
+(`DatasetConfig.describe_hash_change`).
 
 Which hash a setting belongs to is declared once, on the field itself: every field of `dataset_config.py` carries a
-`field(metadata={"hash": "raw" | "processed" | "config" | "none"})` annotation (a callable for the two conditional
-cases: `seed` is raw identity only for `loader: synthetic`, and a dedup field only counts for the modes that use
-it). `hash_payload` walks those annotations and the three hash methods assemble their payload from it; a new field
+`field(metadata={"hash": "raw" | "processed" | "tokenizer" | "config" | "none"})` annotation (a callable for the
+conditional cases: `seed`, `split` and `text_field` are raw identity only where a loader reads them, and a dedup
+field only counts for the modes that use it). `hash_payload` walks those annotations and the hash methods assemble their payload from it; a new field
 without an annotation makes hashing raise. Every counted field enters with its resolved value, default or not: a
 changed default invalidates the data built under the old one, and adding a field to the schema changes the hashes
 once (one rebuild). `config_hash` nests the others: every source's `processed_hash` (which folds in its `raw_hash`)
@@ -288,23 +299,32 @@ Before anything is downloaded or built, one pass over every source folder decide
 report (`RepairReport`) lists every action with whether it was carried out (`performed`; False for `status` /
 `--dry_run` and for the report a refused confirmation carries):
 
-- **raw** (downloaded, expensive): a *stale* folder (identity or tokenizer changed) or an *outdated* one
-  (`dataset_max_sequence_length` raised above `truncated_at_tokens`) is deleted and downloaded again, **only after the user
-  confirmed**. A folder with a *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
+- **raw** (downloaded, expensive): a *stale* folder (the loader identity changed; the prompt lists the fields, e.g.
+  `source.revision: "abc" -> "def"`) or an *outdated* one (`dataset_max_sequence_length` raised above
+  `truncated_at_tokens`) is deleted and downloaded again, **only after the user confirmed**. A folder whose rows were
+  counted with another tokenizer or `token_count` than the config's (*tokenizer_changed*; the raw manifest records
+  `tokenizer_hash`) is not re-downloaded: the prompt names the old and the new tokenizer and the rows counted under
+  the old one, and on yes the folder is *adopted*: its manifest is re-labelled with the new tokenizer (the switch is
+  logged under `tokenizer_changes` in the manifest) and the rows stay, at the cost that their stored token counts
+  and the truncation of pretrain texts do not match the new tokenizer; later downloads count with the new one. A
+  folder with a *broken* shard (missing, unreadable, wrong row count) is truncated to its good prefix
   and the next download resumes there (when no prefix can be kept, it is queued for the same confirmed deletion).
   Shards without a manifest are an error (nothing says where those rows came from). Raw folders are shared by
   source name across dataset configs and their manifest records the config file they were downloaded under, so a
   deletion that another config's folder would suffer needs `--allow_foreign_raw` on top of the confirmation.
-- **processed** (derived, cheap): deleted without confirmation when stale, broken, without a manifest, built from
-  raw shards that no longer exist, or when its raw folder is being deleted; a leftover `.tmp` folder goes too. The
-  one processed deletion that asks is a manifest that cannot be parsed: it joins the confirmation below, and the
-  build refuses such a folder until then.
+- **processed** (derived, cheap): a *stale* folder (the processed fingerprint changed: a processing option, the
+  tokenizer, `dataset_max_sequence_length`, ...; the prompt lists the fields) joins the confirmation like a raw
+  deletion, as does a manifest that cannot be parsed (the build refuses such a folder until then). Broken shards,
+  unlisted shards, a missing manifest, a folder built from raw shards that no longer exist or whose raw folder is
+  being deleted, and a leftover `.tmp` folder are deleted without asking.
 
 Nothing is touched until every folder was inspected; the queued confirmations are answered **once**, with one
-list ("The following folders will be deleted or truncated (...): fineweb_edu: outdated: dataset_max_sequence_length 2048
--> 4096 ... Continue? [y/N]"). `--yes` answers it; without a terminal and without `--yes` the command prints the
-list and exits 2 with nothing changed. `train.py`'s auto-prepare never prompts and **never deletes raw**: it fails
-with the same list and the `prepare.py prepare --yes` command. Lowering `dataset_max_sequence_length` never touches raw (rows are
+list ("The following folders will be deleted, truncated or re-labelled (...): fineweb_edu: outdated:
+dataset_max_sequence_length 2048 -> 4096 / flan: stale: processing.dedup.normalize: true -> false ... Continue?
+[y/N]"), default no. `--yes` answers it; without a terminal and without `--yes` the command prints the list and
+exits 2 with nothing changed. `train.py`'s auto-prepare never prompts, so it **never deletes raw and never rebuilds
+a stale processed folder on its own**: it fails with the same list and the `prepare.py prepare --yes` command.
+Lowering `dataset_max_sequence_length` never touches raw (rows are
 at most `truncated_at_tokens` long; the build clamps the stored counts, training cuts rows at its own length anyway).
 
 ### Tokens, not sequences (`lib/build/planner.py`)

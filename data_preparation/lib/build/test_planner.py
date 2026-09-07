@@ -216,15 +216,21 @@ def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layou
 
     cfg = two_stage_cfg()
     prepare(config_file(cfg), layout.root, assume_yes=False)
-    cfg.token_count = "estimate"  # part of the raw hash: every raw folder is stale
+    cfg.sources["a"].seed = 9  # the synthetic seed is raw identity: the raw folder is stale
     stale_entry = next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
-    assert stale_entry.rows_to_fetch == (0, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
+    assert stale_entry.rows_to_fetch == (0, "raw stale: source.seed: 0 -> 9; the repair step deletes it after confirmation")
     outdated = two_stage_cfg()
     outdated.dataset_max_sequence_length = 4096  # raised above the stored cap
     outdated_entry = next(s for s in plan_downloads(outdated, layout).sources if s.name == "a")
     assert outdated_entry.rows_to_fetch[0] == 0 and outdated_entry.rows_to_fetch[1].startswith("raw outdated")
     a = source_ledger(cfg, "a", layout)  # the status table only reports it
-    assert a.satisfaction() == (False, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
+    assert a.satisfaction() == (False, "raw stale: source.seed: 0 -> 9; the repair step deletes it after confirmation")
+    relabelled = two_stage_cfg()
+    relabelled.token_count = "estimate"  # not raw identity: the same rows, counted differently, a choice for the repair step
+    b = next(s for s in plan_downloads(relabelled, layout).sources if s.name == "b")
+    assert b.raw_state == "tokenizer_changed" and b.raw_reason.startswith("token_count changed: tokenizer -> estimate; 60 rows")
+    assert b.rows_to_fetch == (0, f"raw {b.raw_reason}; the repair step asks whether to keep it")
+    assert b.satisfaction() == (False, f"raw {b.raw_reason}; the repair step asks whether to keep it") and b.raw_rows == 0
 
 
 def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: DatasetLayout, config_file: ConfigFile) -> None:
@@ -293,6 +299,8 @@ def test_the_satisfaction_cases() -> None:
     outdated = _ledger(raw_state="outdated", raw_reason="outdated: dataset_max_sequence_length 64 -> 128")
     assert outdated.satisfaction() == (False, "raw outdated: dataset_max_sequence_length 64 -> 128; the repair step deletes it after confirmation")
     assert _ledger(raw_state="missing", raw_reason="missing", raw_rows=0).satisfaction() == (False, "raw missing")
+    relabelled = _ledger(raw_state="tokenizer_changed", raw_reason="tokenizer changed: a (synthetic) -> b (synthetic); 5 rows ...")
+    assert relabelled.satisfaction() == (False, f"raw {relabelled.raw_reason}; the repair step asks whether to keep it")
     for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, dataset_max_sequence_length or the source changed")):
         assert _ledger(processed_problem=problem, processed_reason=reason).satisfaction() == (False, f"processed {reason}")
         assert _ledger(processed_problem=problem, processed_reason=reason).build_pending
@@ -417,7 +425,7 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
     stale = two_stage_cfg(min_chars=2)  # changes every processed hash, no raw hash
     a = source_ledger(stale, "a", layout)
-    assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed stale: processing settings, dataset_max_sequence_length or the source changed" and a.raw_rows == 127
+    assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed stale: processing.min_chars: 1 -> 2" and a.raw_rows == 127
 
     bigger = two_stage_cfg(tokens_b=12800)
     prepare(config_file(bigger), layout.root, assume_yes=False, steps=["download"])  # raw topped up, processed not

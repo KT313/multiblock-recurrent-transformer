@@ -150,6 +150,31 @@ def test_a_raw_manifest_records_the_dataset_config_it_was_downloaded_under(tmp_p
     assert "dataset_config" not in Manifest(source="s", source_hash="h", stage="raw").to_dict()["extra"], "unknown: not written"
 
 
+def test_raw_manifests_record_the_tokenizer_hash_and_both_record_the_hash_payload(tmp_path: Path) -> None:
+    """
+    The dict a hash was computed from is stored next to the hash (raw and processed) so a mismatch can be
+    explained field by field; the tokenizer's hash is raw-only (it decides the tokenizer_changed state) and the
+    adoptions of a new tokenizer accumulate under `tokenizer_changes` like any other untyped extra. Manifests from
+    before these were recorded have None and write nothing.
+    """
+
+    payload = {"source": {"kind": "pretrain", "revision": "abc"}}
+    changes = [{"from": {"token_count": "tokenizer", "tokenizer": "old", "tokenizer_hash": "h0"}, "to": {"token_count": "tokenizer", "tokenizer": "t", "tokenizer_hash": "h1"}, "at_rows": 30}]
+    m = Manifest(source="s", source_hash="h", stage="raw", tokenizer="t", tokenizer_hash="h1", hash_payload=payload, extra={"tokenizer_changes": changes})
+    on_disk = m.to_dict()["extra"]
+    assert on_disk["tokenizer_hash"] == "h1" and on_disk["hash_payload"] == payload and on_disk["tokenizer_changes"] == changes
+    m.save(tmp_path)
+    loaded = Manifest.load(tmp_path)
+    assert loaded == m and loaded.hash_payload == payload and loaded.tokenizer_hash == "h1" and loaded.extra == {"tokenizer_changes": changes}
+    processed = Manifest(source="s", source_hash="h", stage="processed", hash_payload=payload).to_dict()["extra"]
+    assert processed["hash_payload"] == payload and "tokenizer_hash" not in processed
+    legacy = Manifest(source="s", source_hash="h", stage="raw").to_dict()["extra"]
+    assert "tokenizer_hash" not in legacy and "hash_payload" not in legacy
+    loaded_legacy = Manifest.from_dict({"source": "s", "source_hash": "h", "stage": "raw", "extra": legacy})
+    assert loaded_legacy.tokenizer_hash is None and loaded_legacy.hash_payload is None and loaded_legacy.extra == {}
+    assert "hash_payload" not in Manifest(source="t", source_hash="h", stage="tokenizer", hash_payload=payload).to_dict()["extra"]
+
+
 def test_shard_rows_and_verify(tmp_path: Path) -> None:
     pq.write_table(pa.table({"x": list(range(10))}), tmp_path / "data-00000.parquet")
     pq.write_table(pa.table({"x": list(range(20))}), tmp_path / "data-00001.parquet")

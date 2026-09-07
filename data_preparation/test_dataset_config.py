@@ -34,6 +34,7 @@ REPO = Path(__file__).resolve().parents[1]
 CROW = REPO / "config" / "datasets" / "crow_300m_final.yaml"
 TINY = REPO / "config" / "datasets" / "tiny.yaml"
 MINI = REPO / "config" / "datasets" / "crow_300m_mini.yaml"
+V2 = REPO / "config" / "datasets" / "v2_50M_tokens.yaml"
 
 FINETUNE_SHARES = {"flan": 0.40, "metamath": 0.15, "orca_math": 0.10, "evol_code": 0.125, "code_alpaca": 0.025, "slimorca": 0.10, "sharegpt": 0.05, "wizardlm": 0.05}
 
@@ -100,7 +101,7 @@ def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
 # --- shipped files ----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", [CROW, TINY, MINI])
+@pytest.mark.parametrize("path", [CROW, TINY, MINI, V2])
 def test_shipped_configs_load(path: Path) -> None:
     cfg = load_dataset_config(path)
     assert cfg.stages and cfg.sources
@@ -523,88 +524,60 @@ def test_source_processing_override() -> None:
 
 # --- hashes -----------------------------------------------------------------------------------------------------------
 
-# The hashes of the shipped configs, recorded 2026-09-02 (every value hashed, `config_hash` composed). They key data on disk: every folder under `dataset/`
-# carries the `raw_hash` / `processed_hash` of the source that produced it (raw folders are the bandwidth-expensive
-# part, terabytes on the author's machine, and a mismatch makes one stale, i.e. re-downloaded after confirmation),
-# and `config_hash` is what a training checkpoint stores to detect a resume against different data. Refactoring *how*
-# the hashes are derived must keep every value below byte-identical; only a deliberate change of *what* a hash counts
-# may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
+# The hashes of the shipped configs, re-recorded 2026-09-07 (the tokenizer and token_count moved from the raw hash
+# to the processed hash, split / text_field count only where a loader reads them, instruct sources hash the dedup
+# block alone). They key data on disk: every folder under `dataset/` carries the `raw_hash` / `processed_hash` of
+# the source that produced it (raw folders are the bandwidth-expensive part, terabytes on the author's machine, and
+# a mismatch makes one stale, i.e. re-downloaded after confirmation), and `config_hash` is what a training checkpoint
+# stores to detect a resume against different data. Refactoring *how* the hashes are derived must keep every value
+# below byte-identical; only a deliberate change of *what* a hash counts may re-record them, in a commit that says so
+# and accepts that the data on disk are invalidated.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "53727ae9777ebba0",
+        "config": "086e3cbcd55d23a5",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
-            "synthetic_pretrain": ("d64ba322292f4287", "06f171b42f4b7c27"),
-            "synthetic_instruct": ("d6d060712024c078", "23c4bb9a3d2fdd27"),
+            "synthetic_pretrain": ("17d1b52ca471d587", "7eeb11a1b3e52a08"),
+            "synthetic_instruct": ("56011107fbf9f026", "b9ea28f7af1497fe"),
         },
     },
     "crow_300m_final": {
-        "config": "5a11953ee64621d3",
+        "config": "35de247a7878e845",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("17794de97d8b0fce", "3b9b506e826d613c"),
-            "wikipedia": ("2ca305f74e65e12a", "b6f2752e7bb4873c"),
-            "books_gutenberg": ("11e00170dde63b0b", "b3e1a761f0bb6f07"),
-            "peso": ("3997909d5e2d7f53", "d716d92733b9d645"),
-            "arxiv": ("75aee996414124d4", "a802bf58301fce8a"),
-            "openwebmath": ("736958cbfe170c76", "0686cc9af9379689"),
-            "tinygsm": ("6b5f7acc71352a57", "a31236e854567da4"),
-            "algebraic_stack": ("7f22542f9f87a9a4", "3a310194423b4c4a"),
-            "gsm8k": ("b3e9dae4b724c271", "a11f58d8399c9fcc"),
-            "github_code_clean_python": ("507791dfee4f610b", "bf59de06cb9a80ee"),
-            "github_code_clean_javascript": ("8c59dd2f3159ab41", "1509fe1edf4ccff6"),
-            "github_code_clean_typescript": ("b318812e0e06b87b", "02f9cda97f613703"),
-            "github_code_clean_java": ("2e72d5bd9469f912", "3fb9660a70e276f0"),
-            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "c80468011690957a"),
-            "github_code_clean_go": ("8728ef09468e485a", "02d7084319234c2b"),
-            "github_code_clean_rust": ("12522dcb55267020", "fc435087534e2f85"),
-            "github_code_clean_shell": ("a9d0b21b03b7b449", "6df53df8d803bf90"),
-            "github_code_clean_sql": ("714cc7959ba71640", "ba7c877384efada2"),
-            "github_code_clean_html": ("480f5c19f4cc3c0e", "e82c1dbc226562f1"),
-            "flan": ("737c93fe1aeab170", "440644b3180c6784"),
-            "metamath": ("1aa94ecfdbb971bb", "a4203d539f6dcbec"),
-            "orca_math": ("44e9a10238afbd47", "7692b2f3865e84b1"),
-            "evol_code": ("31f340ec3aef2ecc", "73e2a85d7ddaa80a"),
-            "code_alpaca": ("8ed84d3abe147bd3", "ab6fdd8296697f09"),
-            "slimorca": ("99bef8724af3b10c", "2ad0ad87478339d1"),
-            "sharegpt": ("38fa47e292e58c37", "8a712dd35fd26693"),
-            "wizardlm": ("9fe90a1ff6009cd5", "4380151d22b17321"),
-        },
-    },
-    "crow_300m_mini": {
-        "config": "00f204c9fdc87e0b",
-        "tokenizer": "568e606fb9a422a5",
-        "sources": {
-            "fineweb_edu": ("17794de97d8b0fce", "3b9b506e826d613c"),
-            "wikipedia": ("2ca305f74e65e12a", "b6f2752e7bb4873c"),
-            "books_gutenberg": ("11e00170dde63b0b", "b3e1a761f0bb6f07"),
-            "peso": ("3997909d5e2d7f53", "d716d92733b9d645"),
-            "arxiv": ("75aee996414124d4", "a802bf58301fce8a"),
-            "openwebmath": ("736958cbfe170c76", "0686cc9af9379689"),
-            "tinygsm": ("6b5f7acc71352a57", "a31236e854567da4"),
-            "algebraic_stack": ("7f22542f9f87a9a4", "3a310194423b4c4a"),
-            "gsm8k": ("b3e9dae4b724c271", "a11f58d8399c9fcc"),
-            "github_code_clean_python": ("507791dfee4f610b", "bf59de06cb9a80ee"),
-            "github_code_clean_javascript": ("8c59dd2f3159ab41", "1509fe1edf4ccff6"),
-            "github_code_clean_typescript": ("b318812e0e06b87b", "02f9cda97f613703"),
-            "github_code_clean_java": ("2e72d5bd9469f912", "3fb9660a70e276f0"),
-            "github_code_clean_cpp": ("2e0de6b11a5dd87f", "c80468011690957a"),
-            "github_code_clean_go": ("8728ef09468e485a", "02d7084319234c2b"),
-            "github_code_clean_rust": ("12522dcb55267020", "fc435087534e2f85"),
-            "github_code_clean_shell": ("a9d0b21b03b7b449", "6df53df8d803bf90"),
-            "github_code_clean_sql": ("714cc7959ba71640", "ba7c877384efada2"),
-            "github_code_clean_html": ("480f5c19f4cc3c0e", "e82c1dbc226562f1"),
-            "flan": ("737c93fe1aeab170", "440644b3180c6784"),
-            "metamath": ("1aa94ecfdbb971bb", "a4203d539f6dcbec"),
-            "orca_math": ("44e9a10238afbd47", "7692b2f3865e84b1"),
-            "evol_code": ("31f340ec3aef2ecc", "73e2a85d7ddaa80a"),
-            "code_alpaca": ("8ed84d3abe147bd3", "ab6fdd8296697f09"),
-            "slimorca": ("99bef8724af3b10c", "2ad0ad87478339d1"),
-            "sharegpt": ("38fa47e292e58c37", "8a712dd35fd26693"),
-            "wizardlm": ("9fe90a1ff6009cd5", "4380151d22b17321"),
+            "fineweb_edu": ("9ff1cc2140a2b822", "ca1ab0beb98b43f7"),
+            "wikipedia": ("61e02e58f73be556", "cd387115bdf571c1"),
+            "books_gutenberg": ("74752e56358338db", "38c0da7d2237c732"),
+            "peso": ("027b6b0e07453405", "14615651c954450c"),
+            "arxiv": ("fdc556e8e7691bc1", "020ba0f1aeb71a55"),
+            "openwebmath": ("5bf655cea455bd69", "f7cafb657abd82c9"),
+            "tinygsm": ("13b313346343ec80", "59df3ce1090be4b7"),
+            "algebraic_stack": ("2b6cb00c561aef48", "3ee15d1db880b1b9"),
+            "gsm8k": ("968ddd882174e779", "03dd0e63dd5e1d45"),
+            "github_code_clean_python": ("8b2f34fa8f8fd6c1", "aacda6eb3eac10b5"),
+            "github_code_clean_javascript": ("fa1709c52ddffabe", "6716d51439cf0451"),
+            "github_code_clean_typescript": ("56211d7ec191935b", "58e95f0dc34b7ea3"),
+            "github_code_clean_java": ("d0287981275b84de", "fe416a2f8b88fd57"),
+            "github_code_clean_cpp": ("e6f44b73060bc948", "c54fbdc26d497826"),
+            "github_code_clean_go": ("957869561c65f50c", "fb5bfaa4a1741797"),
+            "github_code_clean_rust": ("d655b756494e1295", "0aa715b1b3dd1418"),
+            "github_code_clean_shell": ("06c3e2f62b5481c7", "d19072a55c1b70e9"),
+            "github_code_clean_sql": ("890f39eabba63e8a", "3785a8bae1fa1922"),
+            "github_code_clean_html": ("00e33acbdcfd3f11", "3978d8f25cd4261d"),
+            "flan": ("6d7a9f3f3bc1b8bc", "e74eddc0a7c705b9"),
+            "metamath": ("30b30fcdd9878afb", "4a3fc55288cfdde9"),
+            "orca_math": ("381878828be6e63e", "b96faabbf8e755a2"),
+            "evol_code": ("cb646fa51c648585", "d39756fbe8890177"),
+            "code_alpaca": ("ab159c3c08e77fd9", "382c34ee68619be9"),
+            "slimorca": ("b18dbd772a5a446e", "9f81da060897f48f"),
+            "sharegpt": ("da3c0a21cdeef944", "f504645e2fbb2aa5"),
+            "wizardlm": ("2350f2ca1c56dce9", "25d3f26f05f3359f"),
         },
     },
 }
+# The mini and the v2 config are the final config's sources with other budgets: the same raw and processed hashes.
+PINNED_HASHES["crow_300m_mini"] = {"config": "ad36dd19cd915340", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["v2_50M_tokens"] = {"config": "ef5b0671149a5938", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
 
 
 @pytest.mark.parametrize("name", list(PINNED_HASHES))
@@ -692,8 +665,9 @@ def test_hash_payload_hashes_every_counted_value_recursively() -> None:
     src = SourceConfig(kind="pretrain", loader="hf_files", hf_id="x/y", load_kwargs={"data_files": "*.parquet"})
     assert dc.hash_payload(src, "raw") == {
         "kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "revision": None, "load_kwargs": {"data_files": "*.parquet"},
-        "split": "train", "text_field": "text", "language": None, "path": None, "converter": None, "fields": None, "filter": None,
-    }  # fmt: skip
+        "text_field": "text", "language": None, "path": None, "converter": None, "fields": None, "filter": None,
+    }, "no split: hf_files never reads it"  # fmt: skip
+    assert dc.hash_payload(TokenizerConfig(name="t", kind="synthetic"), "tokenizer") == {"name": "t", "kind": "synthetic", "hf_id": None, "revision": None}
 
 
 def test_changing_a_default_changes_the_processed_hash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -718,8 +692,8 @@ def test_hash_payload_selects_by_annotation() -> None:
     src = SourceConfig(kind="instruct", loader="hf_stream", hf_id="x/y", fields={"instruction": "a", "output": "b"},
                        check_limit=5, rows=None, seed=7, input_inversions=0.5, describe_tokens_per_row=9)  # fmt: skip
     assert set(dc.hash_payload(src, "raw")) == {
-        "kind", "loader", "hf_id", "revision", "load_kwargs", "split", "text_field", "language", "path", "converter", "fields", "filter",
-    }  # fmt: skip
+        "kind", "loader", "hf_id", "revision", "load_kwargs", "split", "language", "path", "converter", "fields", "filter",
+    }, "split: hf_stream reads it; text_field: an instruct row never does"  # fmt: skip
     assert dc.hash_payload(src, "processed") == {"processing": None, "seed": 7, "input_inversions": 0.5, "shuffle": None}  # seed: not the synthetic loader
     assert dc.hash_payload(src, "config") == {"check_limit": 5, "rows": None, "validation_fraction": None}, "never `describe_tokens_per_row`"
 
@@ -798,10 +772,11 @@ def test_the_processing_payload_keeps_only_the_active_dedup_mode() -> None:
     assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", normalize=False)))["dedup"] == {"mode": "none"}  # nothing is hashed
 
 
-def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
+def test_raw_hash_only_tracks_the_loader_identity() -> None:
     """
-    The raw shards are the bandwidth-expensive part: nothing but a real change of the source, or of how its
-    stored token counts are made, may invalidate them.
+    The raw shards are the bandwidth-expensive part: nothing but a real change of which rows the loader yields
+    may invalidate them. The tokenizer and token_count only make the stored counts; the raw manifest records them
+    itself and a change is offered as a choice (`inspect_raw`: tokenizer_changed), never a re-download.
     """
 
     base = _build(_minimal())
@@ -818,6 +793,9 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
         lambda d: d["sources"]["pre"].__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),  # processed order only
         lambda d: d["sources"]["pre"].__setitem__("check_limit", 5),  # bounds how far to read, not what is read
+        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # counts, not rows
+        lambda d: d.__setitem__("token_count", "estimate"),
+        lambda d: d["sources"]["pre"].__setitem__("split", "test"),  # the synthetic loader never reads it
     ]
     for change in unchanged:
         d = _minimal()
@@ -828,9 +806,6 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
         lambda d: d["sources"]["pre"].__setitem__("seed", 5),
         lambda d: d["sources"]["pre"].__setitem__("text_field", "body"),
         lambda d: d["sources"]["pre"].__setitem__("converter", "gsm8k_question_answer"),
-        lambda d: d["sources"]["pre"].__setitem__("split", "test"),
-        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # stored counts
-        lambda d: d.__setitem__("token_count", "estimate"),
     ]
     for change in invalidating:
         d = _minimal()
@@ -843,6 +818,17 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
     d = _minimal()
     d["sources"]["ins"]["input_inversions"] = 0.5  # applied by the build
     assert _build(d).raw_hash("ins") == base.raw_hash("ins")
+    d["sources"]["ins"]["split"] = "test"  # hf_stream reads the split
+    assert _build(d).raw_hash("ins") != base.raw_hash("ins")
+
+    # split counts exactly for the loaders that read a Hub split
+    d = _minimal()
+    d["sources"]["files"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
+    d["sources"]["rows"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "x/y"}
+    d["stages"][0]["train"] = {"pre": 0.5, "files": 0.25, "rows": 0.25}
+    files, rows = _build(d).raw_hash("files"), _build(d).raw_hash("rows")
+    d["sources"]["files"]["split"] = d["sources"]["rows"]["split"] = "test"
+    assert _build(d).raw_hash("files") == files and _build(d).raw_hash("rows") != rows
 
 
 def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() -> None:
@@ -874,13 +860,29 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         lambda d: d.__setitem__("processing", {"quality_filter": True}),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),
         lambda d: d["sources"]["pre"].__setitem__("seed", 5),  # through raw_hash
-        lambda d: d.__setitem__("token_count", "estimate"),  # through raw_hash
-        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # through raw_hash
+        lambda d: d.__setitem__("token_count", "estimate"),  # the tokens column the build clamps and training reads
+        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),
+        lambda d: d.__setitem__("tokenizer", {"name": "synthetic", "kind": "synthetic", "revision": "x"}),  # the definition, not the name
     ]
     for change in invalidating:
         d = _minimal()
         change(d)
         assert _build(d).processed_hash("pre") != h, change
+
+    # instruct sources run exact dedup only: the pretrain-only passes never change their hash
+    ins = base.processed_hash("ins")
+    for change in (
+        lambda d: d.__setitem__("processing", {"min_chars": 99}),
+        lambda d: d.__setitem__("processing", {"quality_filter": True}),
+        lambda d: d.__setitem__("processing", {"decontamination": {"enabled": True}}),
+    ):
+        d = _minimal()
+        change(d)
+        assert _build(d).processed_hash("ins") == ins, change
+    d = _minimal()
+    d["processing"] = {"dedup": {"normalize": False}}
+    assert _build(d).processed_hash("ins") != ins
+    assert "benchmark_revisions" not in _build({**_minimal(), "processing": {"decontamination": {"enabled": True}}}).processed_hash_payload("ins")
 
     # minhash fields count once minhash is the active mode (set per pretrain source: instruct sources reject it)
     d = _minimal()
@@ -951,6 +953,48 @@ def test_tokenizer_hash() -> None:
     d = _minimal()
     d["tokenizer"] = {"name": "other", "kind": "hf", "hf_id": "a/b"}
     assert a.tokenizer_hash() != _build(d).tokenizer_hash() and len(a.tokenizer_hash()) == 16
+
+
+def test_hash_payloads_are_exactly_what_the_hashes_hash() -> None:
+    """
+    The manifests record the payload next to the hash so a mismatch can be explained; the two must not drift.
+    """
+
+    cfg = _build(_minimal())
+    for name in cfg.sources:
+        assert dc._stable_hash(cfg.raw_hash_payload(name)) == cfg.raw_hash(name)
+        assert dc._stable_hash(cfg.processed_hash_payload(name)) == cfg.processed_hash(name)
+        assert cfg.raw_hash_payload_of(cfg.sources[name]) == cfg.raw_hash_payload(name)
+    assert set(cfg.raw_hash_payload("pre")) == {"source"}
+    assert set(cfg.processed_hash_payload("pre")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing"}
+    assert set(cfg.processed_hash_payload("ins")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing", "input_inversions"}
+    assert cfg.processed_hash_payload("ins")["processing"] == {"dedup": {"mode": "exact", "normalize": True}}
+
+
+def test_describe_hash_change() -> None:
+    """
+    One short line per changed field, flattened dotted keys, JSON values; the two no-detail cases have one line.
+    """
+
+    stored = {"source": {"kind": "pretrain", "revision": "a", "load_kwargs": {"data_files": "x/*.parquet"}, "path": None}, "seed": 1}
+    current = {"source": {"kind": "pretrain", "revision": "b", "load_kwargs": {"data_files": "y/*.parquet"}, "fields": {"a": "b"}}, "seed": 1}
+    assert dc.describe_hash_change(stored, current) == [
+        'source.fields.a: (absent) -> "b"',
+        'source.load_kwargs.data_files: "x/*.parquet" -> "y/*.parquet"',
+        "source.path: null -> (absent)",
+        'source.revision: "a" -> "b"',
+    ]
+    assert dc.describe_hash_change(None, current) == ["(no field detail recorded)"]
+    assert dc.describe_hash_change(stored, stored) == ["(no recorded field differs: the hash rule changed)"]
+    # a payload from disk went through JSON: tuples, and a dedup block that shrank to its active fields
+    assert dc.describe_hash_change({"benchmarks": ["a", "b"]}, {"benchmarks": ("a", "b")}) == ["(no recorded field differs: the hash rule changed)"]
+    assert dc.describe_hash_change({"processing": {"dedup": {"mode": "exact", "normalize": True}}}, {"processing": {"dedup": {"mode": "none"}}}) == [
+        'processing.dedup.mode: "exact" -> "none"', "processing.dedup.normalize: true -> (absent)",
+    ]  # fmt: skip
+    cfg = _build(_minimal())
+    d = _minimal()
+    d["processing"] = {"dedup": {"normalize": False}}
+    assert dc.describe_hash_change(cfg.processed_hash_payload("ins"), _build(d).processed_hash_payload("ins")) == ["processing.dedup.normalize: true -> false"]
 
 
 def test_config_hash_changes_on_any_field() -> None:

@@ -786,7 +786,7 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
     raw_dir = layout.raw_dir("p")
     before = all_mtimes(raw_dir)
 
-    cfg.token_count = "estimate"  # part of the raw hash: the raw folder is stale
+    cfg.sources["p"].seed = 1  # the synthetic seed is raw identity: the raw folder is stale
     path = config_file(cfg)
     asked: list[str] = []
 
@@ -805,7 +805,7 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
         report = prepare(path, layout.root, assume_yes=True)
     assert report.complete and "without asking" in caplog.text
     raw = Manifest.load(raw_dir)
-    assert raw is not None and raw.token_count == "estimate" and raw.is_current(cfg.raw_hash("p"))
+    assert raw is not None and raw.hash_payload["source"]["seed"] == 1 and raw.is_current(cfg.raw_hash("p")), "downloaded again under the new identity"
 
 
 def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(
@@ -969,7 +969,14 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
     assert processed_before is not None
 
     cfg.processing = ProcessingConfig(min_chars=2)
-    report = prepare(config_file(cfg), layout.root, assume_yes=False)
+    asked: list[str] = []
+
+    def confirm(message: str) -> bool:
+        asked.append(message)
+        return True
+
+    report = prepare(config_file(cfg), layout.root, assume_yes=False, confirm=confirm)  # the rebuild asks, like a raw deletion
+    assert len(asked) == 1 and "  p: stale: processing.min_chars: 1 -> 2\n" in asked[0]
     assert report.complete and all_mtimes(raw_dir) == raw_before
     processed = Manifest.load(processed_dir)
     assert processed is not None and processed.is_current(cfg.processed_hash("p")) and not processed.is_current(processed_before.source_hash)

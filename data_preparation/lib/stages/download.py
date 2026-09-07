@@ -7,9 +7,11 @@ Every step is a function (config, name, layout, *options) -> Manifest that is id
 second call with nothing new returns the stored manifest without touching the shards) and incremental where the
 data allow it. Raw folders are append-only and precious (bandwidth): :func:`download` appends to a *current* raw
 manifest, starts a fresh folder when there is none, and never deletes one. A folder whose manifest is *stale*
-(DatasetConfig.raw_hash: loader identity, token_count or tokenizer changed) or *outdated* (stored with a
-smaller dataset_max_sequence_length than the config asks for, :meth:`Manifest.is_outdated`) raises :class:`RawFolderError`;
-the repair step (lib/build/repair.py) deletes such folders after the user confirmed, nothing else does.
+(DatasetConfig.raw_hash: the loader identity changed), *outdated* (stored with a smaller dataset_max_sequence_length
+than the config asks for, :meth:`Manifest.is_outdated`) or *tokenizer_changed* (its token counts were made with
+another tokenizer or token_count than the config's) raises :class:`RawFolderError`; the repair step
+(lib/build/repair.py) deletes stale and outdated folders after the user confirmed, and asks whether to keep a
+tokenizer_changed one under the new tokenizer; nothing else touches a raw folder.
 
 What a raw row is: pretrain rows carry text_field only (a string, whatever the loader delivered) truncated at
 a token boundary so that tokens, the true count of the stored text plus the BOS and EOS the trainer adds
@@ -49,7 +51,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck
 from data_preparation.lib.log import get_logger
@@ -184,6 +186,21 @@ def current_manifest(directory: Path, source_hash: str, stage: str) -> Manifest 
     return manifest
 
 
+def token_measure(config: DatasetConfig) -> dict[str, Any]:
+    """
+    The manifest fields that say how a folder's token counts are made: token_count, and with token_count
+    tokenizer the tokenizer's name and definition hash (None otherwise: an estimate needs no tokenizer). What
+    :func:`new_manifest` records and what the repair step's adopt action rewrites (lib/build/repair.py).
+    """
+
+    with_tokenizer = config.token_count == "tokenizer"
+    return {
+        "token_count": config.token_count,
+        "tokenizer": config.tokenizer.name if with_tokenizer else None,
+        "tokenizer_hash": config.tokenizer_hash() if with_tokenizer else None,
+    }
+
+
 def new_manifest(
     config: DatasetConfig,
     source: str,
@@ -193,19 +210,26 @@ def new_manifest(
     tokens: bool = False,
     truncated_at_tokens: int | None = None,
     dataset_config: str | None = None,
+    hash_payload: dict[str, Any] | None = None,
 ) -> Manifest:
     """
-    An empty manifest for stage; with tokens it records how token counts are measured, raw manifests
-    record truncated_at_tokens (the dataset_max_sequence_length their rows were cut / dropped at) and dataset_config
-    (the file name of the config the folder is downloaded under, when the caller knows it).
+    An empty manifest for stage; with tokens it records how token counts are measured (:func:`token_measure`;
+    the tokenizer's hash on raw manifests only, where it decides the tokenizer_changed state). hash_payload is
+    the dict source_hash was computed from (raw and processed manifests record it, so a later mismatch is
+    explained field by field). Raw manifests record truncated_at_tokens (the dataset_max_sequence_length their
+    rows were cut / dropped at) and dataset_config (the file name of the config the folder is downloaded under,
+    when the caller knows it).
     """
 
+    measure = token_measure(config) if tokens else {"token_count": None, "tokenizer": None, "tokenizer_hash": None}
     return Manifest(
         source=source,
         source_hash=source_hash,
         stage=stage,
-        token_count=config.token_count if tokens else None,
-        tokenizer=config.tokenizer.name if tokens and config.token_count == "tokenizer" else None,
+        token_count=measure["token_count"],
+        tokenizer=measure["tokenizer"],
+        tokenizer_hash=measure["tokenizer_hash"] if stage == "raw" else None,
+        hash_payload=hash_payload,
         truncated_at_tokens=truncated_at_tokens,
         versions=library_versions(),
         dataset_config=dataset_config,
@@ -230,7 +254,7 @@ def text_row(source: SourceConfig, row: Row, name: str) -> Row:
 
 # --- raw manifest state ------------------------------------------------------------------------------------------------
 
-RawManifestState = Literal["missing", "current", "stale", "outdated", "unreadable"]
+RawManifestState = Literal["missing", "current", "stale", "outdated", "tokenizer_changed", "unreadable"]
 
 
 class RawInspection(NamedTuple):
@@ -241,7 +265,7 @@ class RawInspection(NamedTuple):
 
     state: RawManifestState
     manifest: Manifest | None
-    reason: str  # "missing" | "current" | "stale: source identity or tokenizer changed" | "outdated: dataset_max_sequence_length 2048 -> 4096" | "unreadable manifest ..."
+    reason: str  # "missing" | "current" | "stale: source.revision: "a" -> "b"" | "outdated: dataset_max_sequence_length 2048 -> 4096" | "tokenizer changed: ..." | "unreadable manifest ..."
 
     @property
     def current_manifest(self) -> Manifest | None:
@@ -255,19 +279,24 @@ class RawInspection(NamedTuple):
 def inspect_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> RawInspection:
     """
     missing (no manifest; the folder may still hold shards, which :func:`download` refuses to start over),
-    stale (the manifest's hash differs from config.raw_hash(name): loader identity, token_count or
-    tokenizer changed, or it is another stage's manifest), outdated (config.dataset_max_sequence_length was raised above
-    the cap the rows were truncated / dropped at), unreadable (a manifest next to shards that does not parse:
-    a state every caller reports and nobody repairs, the rows may have been expensive) or current.
+    stale (the manifest's hash differs from config.raw_hash(name): the loader identity changed, the reason lists
+    the changed fields; or it is another stage's manifest), outdated (config.dataset_max_sequence_length was
+    raised above the cap the rows were truncated / dropped at), tokenizer_changed (the same rows, but their token
+    counts were made with another tokenizer or token_count than the config's: the download refuses to append rows
+    counted differently, the repair step asks whether to keep the folder under the new tokenizer,
+    :func:`token_measure_change`), unreadable (a manifest next to shards that does not parse: a state every caller
+    reports and nobody repairs, the rows may have been expensive) or current.
     """
 
-    return inspect_raw_folder(layout.raw_dir(name), config.raw_hash(name), config.dataset_max_sequence_length)
+    return inspect_raw_folder(config, config.sources[name], layout.raw_dir(name), layout)
 
 
-def inspect_raw_folder(raw_dir: Path, source_hash: str, cap: int) -> RawInspection:
+def inspect_raw_folder(config: DatasetConfig, source: SourceConfig, raw_dir: Path, layout: DatasetLayout) -> RawInspection:
     """
-    :func:`inspect_raw` for a folder given its expected raw hash and the config's dataset_max_sequence_length
-    (a github_code language stored without a source of its own has no config entry to look those up by).
+    :func:`inspect_raw` for a folder of any source config (a github_code language stored without a source of its
+    own has no config entry to look it up by); layout locates the tokenizer manifests the reason line names.
+    Stale wins over outdated (the folder holds other rows altogether), outdated over tokenizer_changed (the
+    folder is re-downloaded with the new tokenizer anyway).
     """
 
     try:
@@ -276,23 +305,81 @@ def inspect_raw_folder(raw_dir: Path, source_hash: str, cap: int) -> RawInspecti
         return RawInspection("unreadable", None, "unreadable manifest next to shards; fix or delete the directory by hand")
     if manifest is None:
         return RawInspection("missing", None, "missing")
-    if manifest.stage != "raw" or not manifest.is_current(source_hash):
-        return RawInspection("stale", manifest, "stale: source identity or tokenizer changed")
+    if manifest.stage != "raw":
+        return RawInspection("stale", manifest, f"stale: a {manifest.stage} manifest where a raw one belongs")
+    if not manifest.is_current(config.raw_hash_of(source)):
+        changes = describe_hash_change(manifest.hash_payload, config.raw_hash_payload_of(source))
+        return RawInspection("stale", manifest, "stale: " + "; ".join(changes))
+    cap = config.dataset_max_sequence_length
     if manifest.is_outdated(cap):
         return RawInspection("outdated", manifest, f"outdated: dataset_max_sequence_length {manifest.truncated_at_tokens} -> {cap}")
+    change = token_measure_change(config, manifest, layout)
+    if change is not None:
+        return RawInspection("tokenizer_changed", manifest, change)
     return RawInspection("current", manifest, "current")
+
+
+def token_measure_change(config: DatasetConfig, manifest: Manifest, layout: DatasetLayout) -> str | None:
+    """
+    Why the config would count tokens differently from how the rows of a raw manifest were counted, or None:
+    token_count changed, or (with token_count tokenizer) the tokenizer definition did. A manifest without
+    tokenizer_hash (written before it was recorded) counts as made with the current tokenizer: unknown is not a
+    change. The line names the old and the new tokenizer and the rows measured under the old one; the stored
+    token counts of those rows (and the truncation of pretrain texts) will not match the new tokenizer, which is
+    the cost of keeping them (the repair step's adopt action, lib/build/repair.py).
+    """
+
+    rows = f"{manifest.rows():,} rows were counted"
+    if manifest.token_count is not None and manifest.token_count != config.token_count:
+        return f"token_count changed: {manifest.token_count} -> {config.token_count}; {rows} the old way, their stored token counts will not match the new one"
+    if config.token_count != "tokenizer" or manifest.tokenizer_hash in (None, config.tokenizer_hash()):
+        return None
+    old = _stored_tokenizer_label(manifest.tokenizer, manifest.tokenizer_hash, layout)
+    new = _tokenizer_label(config.tokenizer.name, config.tokenizer.kind, config.tokenizer.hf_id, config.tokenizer.revision)
+    return (
+        f"tokenizer changed: {old} -> {new}; {rows} and truncated under the old one, "
+        "their token counts and truncation will not match the new tokenizer"
+    )
+
+
+def _tokenizer_label(name: str, kind: str | None, hf_id: str | None, revision: str | None) -> str:
+    """
+    A tokenizer as the reason lines name it: the directory name, and for a Hub tokenizer its repo and revision.
+    """
+
+    if kind == "hf":
+        return f"{name} ({hf_id} @ {revision or 'unpinned'})"
+    return f"{name} ({kind})" if kind else name
+
+
+def _stored_tokenizer_label(name: str | None, tokenizer_hash: str | None, layout: DatasetLayout) -> str:
+    """
+    The tokenizer a raw folder was counted with, as the manifest under tokenizers/<name> describes it, when that
+    manifest still is the one the rows were counted with: a same-named definition overwrites the folder in the
+    tokenizer step, which runs before the raw folders are inspected, so the hash decides.
+    """
+
+    if name is None:
+        return "unknown tokenizer"
+    stored = Manifest.load(layout.tokenizer_dir(name))
+    if stored is None or stored.source_hash != tokenizer_hash:
+        return f"{name} (definition {tokenizer_hash}, no longer under tokenizers/)"
+    return _tokenizer_label(name, stored.extra.get("kind"), stored.extra.get("hf_id"), stored.extra.get("revision"))
 
 
 class RawFolderError(RuntimeError):
     """
-    A raw folder that :func:`download` may not append to (stale, outdated or unreadable; problem is the
-    :func:`inspect_raw` reason). The download never deletes raw data; the repair step does, after the user
-    confirmed (lib/build/repair.py), and an unreadable manifest is the user's to fix or delete.
+    A raw folder that :func:`download` may not append to (stale, outdated, tokenizer_changed or unreadable;
+    problem is the :func:`inspect_raw` reason). The download never deletes raw data; the repair step does, after
+    the user confirmed (lib/build/repair.py), and it asks whether to keep a tokenizer_changed folder; an
+    unreadable manifest is the user's to fix or delete.
     """
 
     def __init__(self, name: str, directory: Path, problem: str) -> None:
         remedy = "the download never deletes raw data"
-        if not problem.startswith("unreadable"):
+        if problem.startswith(("tokenizer changed", "token_count changed")):
+            remedy = f"{remedy}; the repair step asks whether to keep the folder and go on with the new tokenizer"
+        elif not problem.startswith("unreadable"):
             remedy = f"it must be deleted and downloaded again; {remedy}, run the repair step (it asks for confirmation)"
         super().__init__(f"{name}: raw folder {directory} is {problem}; {remedy}")
         self.name = name
@@ -467,18 +554,19 @@ def _raw_folder_to_append_to(
     nothing would say where those rows came from, and starting over would delete them.
     """
 
-    return _raw_folder_for(config, name, config.raw_hash(name), layout, should_stop=should_stop, config_name=config_name)
+    return _raw_folder_for(config, name, config.sources[name], layout, should_stop=should_stop, config_name=config_name)
 
 
 def _raw_folder_for(
-    config: DatasetConfig, name: str, source_hash: str, layout: DatasetLayout, *, should_stop: StopCheck | None, config_name: str | None
+    config: DatasetConfig, name: str, source: SourceConfig, layout: DatasetLayout, *, should_stop: StopCheck | None, config_name: str | None
 ) -> RawFolder:
     """
-    :func:`_raw_folder_to_append_to` for a folder of any raw hash (a language stored without a source of its own).
+    :func:`_raw_folder_to_append_to` for a folder of any source config (a language stored without a source of
+    its own): keyed by that source's raw hash.
     """
 
     raw_dir = layout.raw_dir(name)
-    inspection = inspect_raw_folder(raw_dir, source_hash, config.dataset_max_sequence_length)
+    inspection = inspect_raw_folder(config, source, raw_dir, layout)
     if inspection.state not in ("missing", "current"):
         raise RawFolderError(name, raw_dir, inspection.reason)
     manifest = inspection.manifest
@@ -486,7 +574,8 @@ def _raw_folder_for(
         if has_shards(raw_dir):
             raise RuntimeError(f"{name}: {raw_dir} holds shards but no manifest; delete the directory to download the source again")
         manifest = new_manifest(
-            config, name, source_hash, "raw", tokens=True, truncated_at_tokens=config.dataset_max_sequence_length, dataset_config=config_name
+            config, name, config.raw_hash_of(source), "raw", tokens=True, truncated_at_tokens=config.dataset_max_sequence_length,
+            dataset_config=config_name, hash_payload=config.raw_hash_payload_of(source),
         )
     return RawFolder(raw_dir, manifest, config_cap=config.dataset_max_sequence_length, should_stop=should_stop)
 
@@ -1063,7 +1152,7 @@ def _extra_increment(
         return None
     source = fetch_source(config, github_code_extra_source(template, language))
     try:
-        folder = _raw_folder_for(config, name, config.raw_hash_of(source), layout, should_stop=should_stop, config_name=config_name)
+        folder = _raw_folder_for(config, name, source, layout, should_stop=should_stop, config_name=config_name)
     except (RawFolderError, RuntimeError) as error:
         log.warning("%s: not storing rows of %s: %s", template.hf_id, language, error)
         return None
