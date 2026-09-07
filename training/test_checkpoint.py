@@ -134,6 +134,30 @@ def test_checkpoint_path_names(tmp_path: Path) -> None:
     assert _step_from_name(checkpoint_path(tmp_path, "my-run", 14, stage_end=1)) == 14
 
 
+def test_failed_checkpoints_are_named_apart_and_never_win_a_plain_resume(tmp_path: Path) -> None:
+    """
+    The checkpoint a non-finite step leaves behind gets `-failed` appended, so it cannot overwrite the regular
+    checkpoint of the same step, and `find_latest_checkpoint` does not see it however new it is: its data stream is
+    already past the failed step's documents, so continuing from it is a decision made with
+    `resume_checkpoint_path`, not one a plain `resume: true` makes silently.
+    """
+
+    assert checkpoint_name(6, "tiny", failed=True) == "step-00000006-tiny-failed.pth"
+    assert checkpoint_name(6, "tiny", stage_end=0, failed=True) == "step-00000006-tiny-stage-0_end-failed.pth"
+    assert checkpoint_path(tmp_path, "tiny", 6, failed=True) == tmp_path / "checkpoints" / "step-00000006-tiny-failed.pth"
+
+    d = checkpoint_dir(tmp_path)
+    d.mkdir()
+    (d / checkpoint_name(6, "tiny")).touch()
+    os.utime(d / checkpoint_name(6, "tiny"), (1_000_000, 1_000_000))
+    failed = d / checkpoint_name(6, "tiny", failed=True)
+    failed.touch()  # written after the regular one, and of a higher step below
+    (d / checkpoint_name(9, "tiny", failed=True)).touch()
+    found = find_latest_checkpoint(tmp_path, "tiny")
+    assert found is not None and found.name == "step-00000006-tiny.pth"
+    assert failed.exists(), "the regular checkpoint of the same step is a different file"
+
+
 def test_step_from_name() -> None:
     assert _step_from_name(Path("/x/step-00000014-tiny-stage-1_end.pth")) == 14
     assert _step_from_name(Path("step-00000020-my-run.pth")) == 20

@@ -66,23 +66,33 @@ def checkpoint_dir(out_dir: str | Path) -> Path:
     return Path(out_dir) / CHECKPOINT_SUBDIR
 
 
-def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None) -> str:
+FAILED_SUFFIX = "-failed"  # the non-finite-loss checkpoint; `find_latest_checkpoint` never returns one
+
+
+def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None, failed: bool = False) -> str:
     """
     `step-{step:08d}-{run_name}` plus `-stage-{i}_end` for the checkpoint written before a stage transition.
+
+    `failed` appends `-failed`: the checkpoint a non-finite step leaves behind, under a name of its own so it never
+    overwrites the regular checkpoint of the same step and no plain resume picks it up (`find_latest_checkpoint`).
     """
 
     name = f"step-{step:08d}-{run_name}"
     if stage_end is not None:
         name += f"-stage-{stage_end}_end"
+    if failed:
+        name += FAILED_SUFFIX
     return name + CHECKPOINT_SUFFIX
 
 
-def checkpoint_path(run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None) -> Path:
+def checkpoint_path(
+    run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None, failed: bool = False
+) -> Path:
     """
     `run_directory/checkpoints/<checkpoint_name>`; `stage_end` is `StageManager.stage_ending_at(step - 1)`.
     """
 
-    return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end)
+    return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end, failed)
 
 
 def _step_from_name(path: Path) -> int:
@@ -92,6 +102,10 @@ def _step_from_name(path: Path) -> int:
 def find_latest_checkpoint(run_directory: str | Path, run_name: str) -> Optional[Path]:
     """
     Most recently written checkpoint of `run_name` under `run_directory/checkpoints` (the step breaks ties), or None.
+
+    `-failed` checkpoints are not candidates: the run they belong to ended on a non-finite step and their data
+    stream is already past that step's documents, so continuing from one is a decision the user makes explicitly
+    with `resume_checkpoint_path`, never what a plain `resume: true` picks up.
     """
 
     directory = checkpoint_dir(run_directory)

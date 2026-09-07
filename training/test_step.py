@@ -7,6 +7,7 @@ reference `training/golden_tiny_steps.json` (five steps of scripted packs throug
 
 import copy
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,7 @@ from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 from training.step import (
     BatchStream,
+    MAX_CONSECUTIVE_REJECTS,
     StepResult,
     TrainingProgress,
     model_inputs,
@@ -636,13 +638,14 @@ def test_batch_stream_gives_a_source_entering_at_a_transition_its_share_without_
     assert "b" in _loaded_tokens(after_switch)
 
 
-def test_batch_stream_ties_go_to_the_first_source_in_config_order(
+def test_batch_stream_ties_go_to_the_alphabetically_first_source(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """
-    Equal deficits (the start of a run, and after every pair of equal documents at 0.5 / 0.5) pick the first source
-    in `train_sources` order, which is the dataset config's order, not alphabetical: with the loaders ordered
-    `b, a` the pool alternates b, a, b, a.
+    Equal deficits (the start of a run, and after every pair of equal documents at 0.5 / 0.5) pick the
+    alphabetically smallest source name, NOT the first in `train_sources` (config) order: with the loaders
+    deliberately ordered `b, a` the pool still alternates a, b, a, b, so the order the dataset config lists its
+    sources in cannot change the stream.
     """
 
     settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
@@ -650,7 +653,88 @@ def test_batch_stream_ties_go_to_the_first_source_in_config_order(
     loaders = RunDataloaders({"b": _Fixed("b", 32), "a": _Fixed("a", 32)}, [], stream_tokenizer, {})
     assert loaders.train_sources == ["b", "a"]
     pack = _next_pack(BatchStream(settings, loaders, stage_manager, TrainingProgress()))
-    assert pack.data_ids == ["b", "a"] * 4 and pack.data_tokens == [32] * 8
+    assert pack.data_ids == ["a", "b"] * 4 and pack.data_tokens == [32] * 8
+
+
+def test_batch_stream_is_the_same_for_any_order_of_the_sources(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Two configs listing the same sources in a different order yield the same stream. `b` and `c` tie after every
+    `a` document here (equal weights, equal lengths), so under the old config-order tie-break the two streams
+    differ in the first pack; the resume contract (`check_dataset_unchanged` hashes the config with sorted keys,
+    so it cannot see a reordered `sources:` block) needs them not to.
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    weights = {"a": 0.5, "b": 0.25, "c": 0.25}
+
+    def packs(order: str) -> list[PackedBatch]:
+        loaders = RunDataloaders({tag: _Fixed(tag, 32) for tag in order}, [], stream_tokenizer, {})
+        assert loaders.train_sources == list(order)
+        return _packs(BatchStream(settings, loaders, _weighted_stage_manager(settings, weights), TrainingProgress()), 4)
+
+    forward, backward = packs("abc"), packs("cba")
+    assert [pack.data_ids for pack in forward] == [pack.data_ids for pack in backward]
+    assert _same_batches(forward, backward)
+    assert forward[0].data_ids[:3] == ["a", "b", "c"], "the tie between b and c goes to b, the smaller name"
+
+
+def test_token_shares_of_three_sources_follow_the_weights(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    The rule with more than two sources, where the wrong rules stop coinciding: three sources at 0.5 / 0.3 / 0.2
+    whose documents are 2000, 300 and 50 slots long load their configured share to within 2 % over 200 packs.
+
+    Two sources whose weights sum to 1 are the degenerate case - growing only the PICKED source's target balances
+    `n_s (1 - w_s) len_s`, which for k = 2 is the right answer and for k = 3 gives .428 / .305 / .267. Picking the
+    SMALLEST deficit instead of the largest lets one source take almost everything. Both need k >= 3 and unequal
+    document lengths to be visible, which is what this test is.
+    """
+
+    weights = {"a": 0.5, "b": 0.3, "c": 0.2}
+    settings, _, _ = _stream_setup(
+        tmp_path, tiny_dataset_dir, stream_tokenizer, tokens_per_micro_batch=4096, micro_batches_per_step=1
+    )
+    lengths = {"a": 2000, "b": 300, "c": 50}
+    loaders = RunDataloaders({tag: _Fixed(tag, n) for tag, n in lengths.items()}, [], stream_tokenizer, {})
+    stream = BatchStream(settings, loaders, _weighted_stage_manager(settings, weights), TrainingProgress())
+    trained = _loaded_tokens(_packs(stream, 200))
+
+    loaded = stream.state_dict()["pool_loaded"]
+    total = sum(loaded.values())
+    assert total > 200 * 4000
+    for source, weight in weights.items():
+        assert loaded[source] / total == pytest.approx(weight, abs=0.02), source
+        assert trained[source] / sum(trained.values()) == pytest.approx(weight, abs=0.02), source
+
+
+@pytest.mark.timeout(60)  # the bug this pins is a hang: without the guard the refill loop never returns
+def test_batch_stream_fails_loudly_on_documents_that_never_fit(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A rejected document moves neither number, so the next pick is the same source again: a source whose documents
+    are all longer than the pack used to spin the refill loop forever (a million rows in five seconds, no error, no
+    step). After `MAX_CONSECUTIVE_REJECTS` in a row the run fails, naming the source and both lengths. The settings
+    make this unreachable (`tokens_per_micro_batch >= training_max_sequence_length`); a hang would not be.
+    """
+
+    settings, _, _ = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stage_manager = _weighted_stage_manager(settings, {"big": 0.5, "ok": 0.5})
+    loaders = RunDataloaders(
+        {"big": _Fixed("big", PACK_LENGTH + 1), "ok": _Fixed("ok", 32)}, [], stream_tokenizer, {}
+    )
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    with caplog.at_level(logging.WARNING, logger="training.data.packing"), pytest.raises(
+        RuntimeError, match=rf"rejected {MAX_CONSECUTIVE_REJECTS} documents in a row"
+    ) as info:
+        next(stream)
+    message = str(info.value)
+    assert "'big'" in message and f"{PACK_LENGTH + 1} slots" in message and f"pack holds {PACK_LENGTH}" in message
+    assert stream.state_dict()["pool_loaded"] == {"big": 0, "ok": 0}, "a rejected document is never accounted"
+    assert caplog.text.count("Dropping a") == MAX_CONSECUTIVE_REJECTS
 
 
 def test_batch_stream_fills_every_pack_from_short_worker_batches(
@@ -1286,6 +1370,67 @@ def test_packed_stream_state_round_trip_carries_the_pool(
         assert torch.equal(got.input_ids, expected.input_ids) and torch.equal(got.labels, expected.labels)
         assert torch.equal(got.position_ids, expected.position_ids)
         assert torch.equal(got.document_ids, expected.document_ids)
+
+
+def test_resumed_three_source_stream_picks_what_the_uninterrupted_one_would(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    The loaded and target slots are restored as state, not as a dict: with three sources at unequal weights and
+    unequal document lengths the deficits are asymmetric, so a resume that dropped or zeroed them would pick a
+    different source on its very first document. Twenty packs after the resume are compared document for document
+    against the uninterrupted stream (more than the pool's `POOL_TOKEN_FACTOR` lag: the first packs come out of the
+    restored pool, so a wrong pick only shows up in a pack after it), and the shares still follow the weights.
+
+    (At 0.5 / 0.5 with equal lengths - what the other resume tests use - zeroing both numbers is a no-op: the
+    deficits are symmetric, so the pick order survives it and only a dict comparison notices.)
+    """
+
+    weights = {"a": 0.5, "b": 0.3, "c": 0.2}
+    settings, _, _ = _stream_setup(
+        tmp_path, tiny_dataset_dir, stream_tokenizer, tokens_per_micro_batch=4096, micro_batches_per_step=1
+    )
+    lengths = {"a": 700, "b": 130, "c": 41}
+    stage_manager = _weighted_stage_manager(settings, weights)
+
+    def stream() -> BatchStream:
+        loaders = RunDataloaders({tag: _Fixed(tag, n) for tag, n in lengths.items()}, [], stream_tokenizer, {})
+        return BatchStream(settings, loaders, stage_manager, TrainingProgress())
+
+    uninterrupted = stream()
+    _packs(uninterrupted, 30)
+    state = uninterrupted.state_dict()
+    continued = _packs(uninterrupted, 20)
+
+    resumed = stream()
+    resumed.load_state_dict(state)
+    after_resume = _packs(resumed, 20)
+    assert [pack.data_ids for pack in after_resume] == [pack.data_ids for pack in continued]
+    assert _same_batches(after_resume, continued)
+    assert resumed.state_dict()["pool_loaded"] == uninterrupted.state_dict()["pool_loaded"]
+
+    trained = _loaded_tokens(after_resume)
+    for source, weight in weights.items():
+        assert trained[source] / sum(trained.values()) == pytest.approx(weight, abs=0.05), source
+
+
+def test_batch_stream_drops_the_row_counter_of_a_source_that_is_gone(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    A checkpoint of a run whose config has since dropped a source must not carry its row counter along: it would be
+    written into every later checkpoint and, if the source is ever added back under the same name, silently skip
+    that many rows of its first epoch. The buffers and the two numbers are already filtered this way.
+    """
+
+    settings, _, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    stream = BatchStream(
+        settings, RunDataloaders({"a": _Fixed("a", 32)}, [], stream_tokenizer, {}), stage_manager, TrainingProgress()
+    )
+    stream.load_state_dict(
+        {"consumed_rows": {"a": 7, "gone": 11}, "pool_loaded": {"a": 3}, "pool_target": {"a": 3.0}, "buffers": {}, "pool": []}
+    )
+    assert stream.state_dict()["consumed_rows"] == {"a": 7}
 
 
 def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> None:

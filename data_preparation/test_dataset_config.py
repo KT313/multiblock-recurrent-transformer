@@ -332,6 +332,20 @@ def test_weights_tolerate_float_noise() -> None:
     _build(d)
 
 
+@pytest.mark.parametrize("weight", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_weights_are_refused(weight: float) -> None:
+    """
+    A NaN weight used to pass both remaining checks - every comparison against NaN is False, so neither `> 0` nor
+    the sum fires - and then dropped its source out of the training mixture silently (`_pick_source` compares
+    deficits, and a NaN deficit is never the largest). YAML spells it `.nan`, so it is one typo away.
+    """
+
+    d = _minimal()
+    d["stages"][0]["train"] = {"pre": weight, "ins": 1.0}
+    with pytest.raises(ValueError, match=r"weights must be finite numbers, got \['pre'\]"):
+        _build(d)
+
+
 # --- source usage, split, budgets -------------------------------------------------------------------------------------
 
 

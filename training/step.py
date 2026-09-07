@@ -11,6 +11,7 @@ weights (`BatchStream._pick_source`), and the documents packed into one row per 
 `optimizer.step()`.
 """
 
+import logging
 from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
@@ -33,6 +34,15 @@ from training.lr_schedule import get_lr_multistage
 from training.optim import set_lr
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
+
+log = logging.getLogger(__name__)
+
+# How many documents the pool may reject in a row before a refill gives up. A rejected document (longer than the
+# pack) moves neither `_loaded` nor `_target`, so `_pick_source` returns the SAME source again: a source whose
+# documents never fit would spin the refill loop forever, reading rows and warning per row without ever filling a
+# pack. Settings make this unreachable (`tokens_per_micro_batch >= training_max_sequence_length`, and rows are
+# truncated to that); if it happens anyway the run must fail loudly rather than hang.
+MAX_CONSECUTIVE_REJECTS = 100
 
 
 class NonFiniteLossError(RuntimeError):
@@ -94,17 +104,21 @@ class BatchStream:
     its documents put into the pool so far, and `_target`, the slots it should have had. When a document of `n`
     slots enters the pool, its source's `_loaded` grows by `n` and EVERY source's `_target` grows by its current
     weight times `n`; the next document comes from the source with the largest `_target - _loaded` among those with
-    a weight > 0 (`_pick_source`). With constant weights the deficit is `weight x total - loaded`, so every source's
-    share stays within one document of its weight; when a transition blends the weights per step, a source that
-    gains weight earns its share from then on, no catch-up burst for the tokens before. Pack tails never enter
-    either number, nor does a document the pool rejects as oversized.
+    a weight > 0 (`_pick_source`). With constant weights the deficit is `weight x total - loaded`: a source is
+    over-served by at most ONE OF ITS OWN documents and under-served by at most the SUM of the other active
+    sources' document lengths (it is picked as soon as it leads, but every other source may take one document
+    first), so the lag is a constant and every share converges to its weight as O(1/L). When a transition blends
+    the weights per step, a source that gains weight earns its share from then on, no catch-up burst for the
+    tokens before. Pack tails never enter either number, nor does a document the pool rejects as oversized
+    (`MAX_CONSECUTIVE_REJECTS` rejected in a row end the run instead of spinning the refill).
 
     Checkpointed (`state_dict`): the rows read per source (dropped rows included), the two numbers per source, the
     samples still buffered per source and the pool.
 
     Reproducibility rules:
-    - no RNG anywhere: the pick is a deterministic function of the two numbers, ties go to the first source in
-      `train_sources` (config) order
+    - no RNG anywhere: the pick is a deterministic function of the two numbers, ties go to the alphabetically
+      smallest source name (the sources are iterated sorted by name), so reordering the dataset config's
+      `sources:` block cannot change the stream
     - `progress.step` is read once per micro-batch, before the pool is refilled
     - loader iterators are created at a source's first pull; their base seeds come from the loaders' private
       generator, never from the global torch RNG
@@ -151,11 +165,18 @@ class BatchStream:
         the loaded and target slots per source are what they were (so the next pick is the one the interrupted run
         would have made), the buffered samples are trained on first and the packing pool is what it was.
 
-        Counters are rows READ (dropped rows included), the unit the offsets skip. Buffered samples and the two
-        numbers of a source that no longer exists are dropped; a source the state does not know starts at 0.
+        Counters are rows READ (dropped rows included), the unit the offsets skip. The row counter, the buffered
+        samples and the two numbers of a source that no longer exists are dropped (a re-added source would
+        otherwise silently skip that many rows on its first epoch); a source the state does not know starts at 0.
         """
 
-        self.consumed_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
+        stored_rows = {str(source): int(rows) for source, rows in state["consumed_rows"].items()}
+        self.consumed_rows = {
+            source: rows for source, rows in stored_rows.items() if source in self.loaders.train_sources
+        }
+        dropped = sorted(set(stored_rows) - set(self.consumed_rows))
+        if dropped:
+            log.info("Dropping the checkpoint's row counters of %s: no longer a train source of this run", dropped)
         self._loaded = {source: int(state["pool_loaded"].get(source, 0)) for source in self.loaders.train_sources}
         self._target = {source: float(state["pool_target"].get(source, 0.0)) for source in self.loaders.train_sources}
         self.loaders.set_resume_offsets(self.consumed_rows)
@@ -193,13 +214,17 @@ class BatchStream:
     def _pick_source(self, weights: dict[str, float]) -> str:
         """
         The source the next document comes from: the largest deficit `_target - _loaded` among the sources with a
-        weight > 0; a tie goes to the first in `train_sources` order (strict `>` while iterating in order).
+        weight > 0; a tie goes to the alphabetically smallest source name (strict `>` while iterating the sources
+        sorted by name), so the order the dataset config lists its sources in never changes the stream.
         """
 
         best: str | None = None
+        # the seed is not a threshold: EVERY active deficit is negative for long stretches (a source leaving the
+        # mixture freezes its positive deficit, so the sum over the sources still active stays short by that much).
+        # `best is None` is what makes the pick correct - it takes the first eligible source whatever the seed.
         best_deficit = 0.0
-        for source, weight in weights.items():
-            if weight <= 0.0:
+        for source in sorted(weights):
+            if weights[source] <= 0.0:
                 continue
             deficit = self._target[source] - self._loaded[source]
             if best is None or deficit > best_deficit:
@@ -208,20 +233,21 @@ class BatchStream:
             raise RuntimeError(f"no train source has a weight > 0 at step {self.progress.step}: {weights}")
         return best
 
-    def _add_to_pool(self, source: str, sample: Sample, weights: dict[str, float]) -> None:
+    def _add_to_pool(self, source: str, sample: Sample, weights: dict[str, float]) -> bool:
         """
         Put `sample` (from `source`) into the pool and account it: `source` has `n` more slots loaded and every
-        source's target grows by its weight times `n`. A document the pool rejects as oversized (dropped with a
-        warning) touches neither number: it will never be trained on.
+        source's target grows by its weight times `n`. Returns whether the pool took it: a document it rejects as
+        oversized (dropped with a warning) touches neither number, it will never be trained on.
         """
 
         if not self._pool.add(sample):
-            return
+            return False
         length = shifted_length(sample)
         self._loaded[source] += length
         for other, weight in weights.items():
             if weight > 0.0:
                 self._target[other] += weight * length
+        return True
 
     def _packs(self) -> Iterator[PackedBatch]:
         """
@@ -232,11 +258,27 @@ class BatchStream:
         pool = self._pool
         while True:
             weights = self._weights()
+            rejected = 0
             while pool.needs_refill():
                 source = self._pick_source(weights)
-                self._add_to_pool(source, self._next_sample(source), weights)
+                sample = self._next_sample(source)
+                if self._add_to_pool(source, sample, weights):
+                    rejected = 0
+                    continue
+                # a rejected document leaves the deficits where they were, so the next pick is the same source
+                rejected += 1
+                if rejected >= MAX_CONSECUTIVE_REJECTS:
+                    raise RuntimeError(
+                        f"the packing pool rejected {rejected} documents in a row while refilling at step "
+                        f"{self.progress.step}: the last came from {source!r} and occupies "
+                        f"{shifted_length(sample)} slots, the pack holds {pool.pack_length}. Every document of a "
+                        "source must fit into one pack; raise tokens_per_micro_batch or lower "
+                        "training_max_sequence_length"
+                    )
             samples = pool.take_pack()
-            if not samples:  # unreachable: the pool holds many pack lengths of documents that each fit a pack
+            # unreachable: the pool holds many pack lengths of documents, and both `add` and `restore` refuse
+            # a document longer than one pack, so the front document always fits an empty pack
+            if not samples:
                 raise RuntimeError("the packing pool holds documents but none fits into an empty pack")
             yield pack_samples(samples, pool.pack_length, self.loaders.tokenizer, IGNORE_INDEX)
 

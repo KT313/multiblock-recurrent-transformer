@@ -29,7 +29,9 @@ Instead of switching datasets abruptly at a stage boundary, the last
 by one continuous reader for the whole run, the weights are token shares that the
 stream realises by filling its packing pool from the source with the largest
 token deficit under the current step's weights (`BatchStream` in
-`training/step.py`), and inside the window those weights are interpolated
+`training/step.py`; equal deficits go to the alphabetically smallest source
+name, so reordering the dataset config's `sources:` block never changes the
+stream), and inside the window those weights are interpolated
 linearly between the two stages' (a source leaving ramps to 0, one entering
 ramps from 0 and earns its share from then on, without a catch-up burst; the
 transition progress runs 0→1). The learning rate

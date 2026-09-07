@@ -244,6 +244,22 @@ def test_collate_samples_are_unpadded_and_truncated(tokenizer: Tokenizer) -> Non
         assert input_ids.shape == labels.shape and torch.equal(input_ids, labels)
 
 
+def test_truncated_samples_carry_no_storage_of_the_untruncated_row(tokenizer: Tokenizer) -> None:
+    """
+    A truncated sample must be a copy, not a slice: a view keeps the whole stored row alive, and `torch.save`
+    writes a view's entire storage. Rows are stored cut at `dataset_max_sequence_length` and trained cut at
+    `training_max_sequence_length` (16384 vs 2048 for the shipped run), so views would carry 8x the bytes through
+    the worker queue, the buffers, the packing pool and every checkpoint.
+    """
+
+    (input_ids, labels, _), = collate_samples([_row(_words(400), "long")], tokenizer, training_max_sequence_length=16)
+    assert input_ids.shape == labels.shape == (17,)
+    for tensor in (input_ids, labels):
+        assert tensor.untyped_storage().nbytes() == 17 * tensor.element_size()
+    short = collate_samples([_row(_words(5), "short")], tokenizer, training_max_sequence_length=16)
+    assert short[0][0].shape == (7,), "a row that was not truncated is untouched"
+
+
 def test_collate_fn_is_collate_samples_then_pad_and_shift(tokenizer: Tokenizer) -> None:
     rows = [_row(_words(5), "a"), _row(_words(9, 40), "b")]
     samples = collate_samples(rows, tokenizer, training_max_sequence_length=128)
