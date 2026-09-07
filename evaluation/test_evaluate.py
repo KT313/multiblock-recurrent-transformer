@@ -4,6 +4,9 @@ Tests of the checkpoint CLI on a hand-made tiny checkpoint.
 """
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,6 +37,23 @@ def checkpoint(tiny_model: RecurrentGPT, tiny_dataset_dir: Path, tmp_path: Path)
     }
     torch.save(state, path)
     return path
+
+
+@pytest.mark.slow
+def test_cli_starts_as_a_process() -> None:
+    """
+    `python evaluation/evaluate.py --help` exits 0: the module puts the repo root on `sys.path` itself, as
+    `training/train.py` does. In-process calls of `main()` cannot see this (pytest's `pythonpath = ["."]`), so the
+    child runs without an inherited PYTHONPATH.
+    """
+
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    finished = subprocess.run(
+        [sys.executable, "evaluation/evaluate.py", "--help"], cwd=REPO_ROOT, env=environment,
+        capture_output=True, text=True, timeout=300,
+    )
+    assert finished.returncode == 0, finished.stderr
+    assert "--checkpoint" in finished.stdout
 
 
 def test_parse_recurrences() -> None:

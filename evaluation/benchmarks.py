@@ -17,11 +17,14 @@ from typing import Any
 from evaluation.wrapper import Recurrence, check_recurrence, hf_wrapper_around, isolated_inference, recurrence_label
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
+from training.settings import DEFAULT_BENCHMARK_TASKS
 
-DEFAULT_TASKS: tuple[str, ...] = ("arc_challenge", "hellaswag", "mmlu", "winogrande")  # the thesis benchmarks
+DEFAULT_TASKS: tuple[str, ...] = DEFAULT_BENCHMARK_TASKS  # one tuple, defined with the run setting that names it
 BENCHMARKS_DIR = "benchmarks"  # under the run directory
 METRIC_PREFIX = "benchmark"  # wandb keys: benchmark/<recurrence label>/<task>/<metric>
 EVAL_EXTRA_HINT = "lm_eval is not installed: install the eval extra (uv sync --extra eval) to run benchmarks"
+TASK_DEFAULT_FEWSHOT = -1  # num_fewshot: each task's own default (gsm8k is 5-shot), lm-eval's `num_fewshot=None`
+BOOTSTRAP_ITERS = 100  # lm-eval's stderr resampling; its default of 100000 is the slowest part of a small run
 
 
 def benchmarks_path(run_directory: Path, step: int) -> Path:
@@ -33,17 +36,20 @@ def evaluate_on_benchmarks(
     tokenizer: Tokenizer,
     tasks: Sequence[str] = DEFAULT_TASKS,
     *,
-    num_fewshot: int = 0,
+    num_fewshot: int = TASK_DEFAULT_FEWSHOT,
     limit: int | None = None,
     batch_size: int = 8,
     recurrences: Sequence[Recurrence] = (None,),
     out_path: Path | None = None,
     step: int | None = None,
+    seed: int = 0,
 ) -> dict[str, float]:
     """
     Score the model on tasks with lm-eval-harness, once per recurrence setting (steps per core block, None: the
     mean recurrence), and return `benchmark/<recurrence label>/<task>/<metric>` floats (stderr entries left out).
-    limit caps the examples per task. With out_path the full lm-eval results per setting (plus step and the
+    limit caps the examples per task, num_fewshot -1 leaves every task at its own default (`TASK_DEFAULT_FEWSHOT`).
+    seed seeds the isolated RNG and lm-eval's own seeding of torch (it reseeds on every call, so passing it is the
+    only way the seed reaches the scoring). With out_path the full lm-eval results per setting (plus step and the
     settings used) are written as JSON.
     """
 
@@ -51,6 +57,8 @@ def evaluate_on_benchmarks(
         raise ValueError("no benchmark tasks given")
     if not recurrences:
         raise ValueError("no recurrence setting given (None stands for the mean recurrence)")
+    if num_fewshot < TASK_DEFAULT_FEWSHOT:
+        raise ValueError(f"num_fewshot must be >= {TASK_DEFAULT_FEWSHOT} ({TASK_DEFAULT_FEWSHOT}: each task's own default), got {num_fewshot}")
     for recurrence in recurrences:
         check_recurrence(recurrence, model)
     lm_eval, hf_models = _import_lm_eval()
@@ -59,14 +67,16 @@ def evaluate_on_benchmarks(
     versions: dict[str, Any] = {}
     n_shot: dict[str, Any] = {}
     for recurrence in recurrences:
-        with isolated_inference(model, recurrence):
+        with isolated_inference(model, recurrence, seed=seed):
             wrapper = hf_wrapper_around(model, tokenizer)
             language_model = hf_models.HFLM(  # BOS as in training and sampling; the table length caps the few-shot prompts
                 pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size, add_bos_token=True,
                 max_length=model.config.model_max_sequence_length,
             )
-            results: dict[str, Any] = lm_eval.simple_evaluate(
-                model=language_model, tasks=list(tasks), num_fewshot=num_fewshot, limit=limit
+            results: dict[str, Any] = lm_eval.simple_evaluate(  # log_samples: the per-sample logs are held in memory and never read
+                model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
+                num_fewshot=None if num_fewshot == TASK_DEFAULT_FEWSHOT else num_fewshot,
+                torch_random_seed=seed, bootstrap_iters=BOOTSTRAP_ITERS,
             )
         label = recurrence_label(recurrence)
         metrics |= flatten_results(results["results"], label)
@@ -79,6 +89,7 @@ def evaluate_on_benchmarks(
             "tasks": list(tasks),
             "num_fewshot": num_fewshot,
             "limit": limit,
+            "seed": seed,
             "recurrences": [None if recurrence is None else list(recurrence) for recurrence in recurrences],
             "metrics": metrics,
             "results": raw_results,

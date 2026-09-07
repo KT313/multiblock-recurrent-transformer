@@ -92,11 +92,26 @@ def test_prompts_file(tmp_path: Path) -> None:
         Prompt("def f():"),
     ]
     assert load_prompts(path) == prompts
-    path.write_text("# poem\nRoses")
-    with pytest.raises(ValueError, match="unknown prompt kind"):
-        load_prompts_file(path)
     path.write_text("\n---\n")
     with pytest.raises(ValueError, match="no prompts"):
+        load_prompts_file(path)
+
+
+def test_prompts_file_markers_are_matched_exactly(tmp_path: Path) -> None:
+    """
+    Only `# instruction` / `# continuation` on a line of their own are markers (case and outer whitespace do not
+    matter); any other `#` line is content, e.g. a Python comment or a Markdown heading of a code prompt.
+    """
+
+    path = tmp_path / "prompts.txt"
+    path.write_text("# Compute the primes up to n\ndef primes(n):\n---\n  # Instruction \nSummarize.\n---\n#poem\nRoses")
+    assert load_prompts_file(path) == [
+        Prompt("# Compute the primes up to n\ndef primes(n):"),
+        Prompt("Summarize.\n\n", INSTRUCTION),
+        Prompt("#poem\nRoses"),  # not `# instruction` or `# continuation`: content
+    ]
+    path.write_text("# instruction\n\n")
+    with pytest.raises(ValueError, match="needs an instruction"):
         load_prompts_file(path)
 
 
@@ -123,6 +138,23 @@ def test_generate_samples_greedy_is_deterministic_and_bounded(tiny_model: Recurr
     sampled_a = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
     sampled_b = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5, seed=1)
     assert sampled_a != sampled_b and sampled_a == generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
+
+
+def test_generate_samples_skips_a_prompt_that_does_not_fit_the_position_table(
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A prompt longer than the model's RoPE table would raise an `IndexError` deep in the model: it is left out
+    with a warning naming it, and the prompts that fit are still generated for.
+    """
+
+    limit = tiny_model.config.model_max_sequence_length
+    long_prompt = Prompt(" ".join(["word"] * (limit + 10)))
+    with caplog.at_level("WARNING"):
+        samples = generate_samples(tiny_model, tokenizer, [Prompt("hello"), long_prompt], max_new_tokens=3)
+    assert [sample.prompt for sample in samples] == ["hello"]
+    assert "skipped" in caplog.text and str(limit) in caplog.text and "word word" in caplog.text
+    assert generate_samples(tiny_model, tokenizer, [long_prompt], max_new_tokens=3) == []
 
 
 def test_generate_and_save_samples_writes_jsonl(tiny_model: RecurrentGPT, tokenizer: Tokenizer, tmp_path: Path) -> None:
