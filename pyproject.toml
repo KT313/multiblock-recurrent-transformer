@@ -50,7 +50,7 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-addopts = "-q -n 4 --dist loadgroup"  # four workers: each imports torch and builds its own tiny dataset; -n 0 runs serially
+addopts = "-q -n 8 --dist loadgroup"  # eight workers (about 3 GB each at peak, 3 cores each); -n 0 runs serially
 testpaths = ["model", "training", "data_preparation", "ui", "evaluation"]
 pythonpath = ["."]
 markers = [

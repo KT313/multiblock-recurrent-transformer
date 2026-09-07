@@ -30,10 +30,11 @@ from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
     TINY_DATASET_YAML,
+    ReferenceRun,
     golden_exact_requested,
     golden_mismatches,
     golden_run_json,
-    golden_run_metrics,
+    reference_metrics,
     single_thread_deterministic,
     write_tiny_yaml,
 )
@@ -618,21 +619,47 @@ def _no_transition_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, *
     )
 
 
+NO_TRANSITION_OPTIONS: dict[str, Any] = {"save_step_interval": 4, "export_to_hf": False}
+
+
+@pytest.fixture(scope="module")
+def no_transition_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -> dict[str, Any]:
+    """
+    One uninterrupted no-transition run on the fp32 CPU backend with a checkpoint every 4 steps (4, the stage-0 end
+    at 8, 12, the stage-1 end at 16, 20), shared by the two data-stream continuation tests below, which only read
+    its checkpoints and resume into their own directories (module-scoped: its consumers share one xdist worker).
+    """
+
+    tmp = tmp_path_factory.mktemp("no_transition_run")
+    out_dir = tmp / "out"
+    yaml_path = _no_transition_yaml(tmp, tiny_dataset_dir, out_dir, **NO_TRANSITION_OPTIONS)
+    report = _run(yaml_path, SingleDeviceBackend(device="cpu", precision="32"))
+    return {"run_dir": out_dir / "tiny", "history": report.history}
+
+
 @pytest.mark.slow
-def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_stage_boundary_resume_continues_schedule_and_stream(
+    no_transition_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
     """
     Resuming from the stage-0_end checkpoint continues the run: the same remaining steps, the exact LR schedule,
     the evaluation cadence, and the data stream picks up where the checkpoint stood. The resumed run ends with
     exactly the uninterrupted run's per-source consumed-row counters, having repeated no row.
 
-    Losses are not compared here (settings' backend, possibly a GPU); `test_resume_reproduces_the_uninterrupted_run`
-    does that on the CPU.
+    Losses are not compared here (fp32 on the CPU but not single-threaded);
+    `test_resume_chain_reproduces_the_uninterrupted_run` does that.
     """
 
-    full_dir = tmp_path / "full" / "out"
-    history_full = _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir)).history
-    names = sorted(p.name for p in checkpoint_dir(full_dir / "tiny").glob("*.pth"))
-    assert names == ["step-00000008-tiny-stage-0_end.pth", "step-00000016-tiny-stage-1_end.pth", "step-00000020-tiny.pth"]
+    full_dir = no_transition_run["run_dir"]
+    history_full: History = no_transition_run["history"]
+    names = sorted(p.name for p in checkpoint_dir(full_dir).glob("*.pth"))
+    assert names == [  # the stage ends plus the interval's files
+        "step-00000004-tiny.pth",
+        "step-00000008-tiny-stage-0_end.pth",
+        "step-00000012-tiny.pth",
+        "step-00000016-tiny-stage-1_end.pth",
+        "step-00000020-tiny.pth",
+    ]
 
     resumed_dir = tmp_path / "resumed" / "out"
     yaml_path = _no_transition_yaml(
@@ -640,9 +667,10 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
         tiny_dataset_dir,
         resumed_dir,
         resume=True,
-        resume_checkpoint_path=str(checkpoint_dir(full_dir / "tiny") / "step-00000008-tiny-stage-0_end.pth"),
+        resume_checkpoint_path=str(checkpoint_dir(full_dir) / "step-00000008-tiny-stage-0_end.pth"),
+        **NO_TRANSITION_OPTIONS,
     )
-    history = _run(yaml_path).history
+    history = _run(yaml_path, cpu_backend).history
     assert sorted(history) == list(range(9, 21))
     for done in range(9, 21):
         assert history[done]["lr"] == history_full[done]["lr"]
@@ -650,7 +678,7 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
         assert torch.isfinite(torch.tensor(history[done]["loss"]))
     assert "val_loss" in history[16] and "val_loss" in history[20]
 
-    final_full = torch.load(checkpoint_dir(full_dir / "tiny") / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
+    final_full = torch.load(checkpoint_dir(full_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     final_res = torch.load(checkpoint_dir(resumed_dir / "tiny") / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final_res["step"] == 20
     # the data stream continued: rows consumed per source add up to the uninterrupted run's counters exactly
@@ -660,7 +688,9 @@ def test_stage_boundary_resume_continues_schedule_and_stream(tmp_path: Path, tin
 
 
 @pytest.mark.slow
-def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_mid_stage_resume_continues_the_data_stream(
+    no_transition_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+) -> None:
     """
     A resume in the middle of a stage picks the data stream up where the checkpoint left it: the per-source row
     counters continue instead of restarting at row 0, so the resumed run trains on rows the interrupted run had not
@@ -668,15 +698,13 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     """
 
     def data_stream(directory: Path, name: str) -> dict[str, Any]:
-        state = torch.load(checkpoint_dir(directory / "tiny") / name, map_location="cpu", weights_only=False)
+        state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
         return cast(dict[str, Any], state["data_stream"])
 
     def consumed(directory: Path, name: str) -> dict[str, int]:
         return dict(data_stream(directory, name)["consumed_rows"])
 
-    full_dir = tmp_path / "full" / "out"
-    options: dict[str, Any] = {"save_step_interval": 4, "export_to_hf": False}
-    _run(_no_transition_yaml(tmp_path / "full", tiny_dataset_dir, full_dir, **options))
+    full_dir = no_transition_run["run_dir"]
     # 12 steps of 1024 packed tokens, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the
     # source and only change its weight, so the counter keeps counting across the stage boundary at step 8). The
     # counter is rows READ: the one worker batch of `TRAIN_LOADER_BATCH_ROWS` rows that covers the documents of the
@@ -687,14 +715,15 @@ def test_mid_stage_resume_continues_the_data_stream(tmp_path: Path, tiny_dataset
     assert 0 < unconsumed < TRAIN_LOADER_BATCH_ROWS
 
     resumed_dir = tmp_path / "resumed" / "out"
-    mid = checkpoint_dir(full_dir / "tiny") / "step-00000012-tiny.pth"
+    mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
     _run(
         _no_transition_yaml(
-            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid), **options
-        )
+            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid), **NO_TRANSITION_OPTIONS
+        ),
+        cpu_backend,
     )
     # the resumed run added its 8 steps on top of the stored counters instead of counting from zero
-    assert consumed(resumed_dir, "step-00000020-tiny.pth") == consumed(full_dir, "step-00000020-tiny.pth")
+    assert consumed(resumed_dir / "tiny", "step-00000020-tiny.pth") == consumed(full_dir, "step-00000020-tiny.pth")
 
 
 @pytest.mark.slow
@@ -781,6 +810,25 @@ def test_resume_with_changed_validation_split_raises_unless_allowed(
 # the stop request (the CLI's Ctrl-C)
 
 
+def _short_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
+    """
+    tiny.yaml on a 13-step version of the tiny dataset config (stage budgets 5120 / 5120 / 3072 tokens: steps
+    0-4, 5-9 and 10-12, the transition being the last step of each pretrain stage, so the stage-end checkpoints
+    come after steps 3 and 8, at completed steps 4 and 9), on the same built data. For tests whose assertions are
+    about checkpoints and reports, not the golden's 20-step schedule; the smallest budgets the warmup, cooldown and
+    transition rules allow. fp32 because bf16 autocast is very slow on the CPU.
+    """
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    dataset_yaml = tmp_path / "tiny_dataset_short.yaml"
+    text = TINY_DATASET_YAML.read_text().replace("tokens: 8192", "tokens: 5120").replace("tokens: 4096", "tokens: 3072")
+    assert text.count("tokens: 5120") == 2 and text.count("tokens: 3072") == 1
+    dataset_yaml.write_text(text)
+    return write_tiny_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, precision="32", dataset_config=str(dataset_yaml), **overrides
+    )
+
+
 class StopAfterPolls:
     """
     A `StopCheck` that says stop from its n-th poll on; `train()` polls once per completed optimizer step, so
@@ -801,36 +849,36 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    A stop request after step 5 (inside stage 0): the loop saves `step-00000005-tiny.pth`, skips the export and
-    returns a stopped report of 5 steps; `resume: true` then continues from that checkpoint to the end and exports.
+    A stop request after step 2 (inside stage 0 of the 13-step config): the loop saves `step-00000002-tiny.pth`,
+    skips the export and returns a stopped report of 2 steps; `resume: true` then continues from that checkpoint to
+    the end and exports.
     """
 
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=True)
-    should_stop = StopAfterPolls(5)
+    yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir, export_to_hf=True)
+    should_stop = StopAfterPolls(2)
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
-    assert should_stop.count == 5  # polled once per completed step, nothing before the loop
+    assert should_stop.count == 2  # polled once per completed step, nothing before the loop
     assert report.stopped is True
-    assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (5, 5, None)
-    assert sorted(report.history) == [1, 2, 3, 4, 5]
-    assert [p.name for p in report.checkpoints_written] == ["step-00000005-tiny.pth"]
-    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000005-tiny.pth"]
+    assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (2, 2, None)
+    assert sorted(report.history) == [1, 2]
+    assert [p.name for p in report.checkpoints_written] == ["step-00000002-tiny.pth"]
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000002-tiny.pth"]
     assert report.export_dir is None and not (run_dir / "hf_export").exists()
-    assert "stopped on request after step 5; rerun with resume: true to continue" in report.summary()
-    stored = torch.load(checkpoint_dir(run_dir) / "step-00000005-tiny.pth", map_location="cpu", weights_only=False)
-    assert (stored["step"], stored["stage"]) == (5, 0)
+    assert "stopped on request after step 2; rerun with resume: true to continue" in report.summary()
+    stored = torch.load(checkpoint_dir(run_dir) / "step-00000002-tiny.pth", map_location="cpu", weights_only=False)
+    assert (stored["step"], stored["stage"]) == (2, 0)
 
-    (tmp_path / "resumed").mkdir()
-    resumed_yaml = write_tiny_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, precision="32", export_to_hf=True, resume=True)
+    resumed_yaml = _short_yaml(tmp_path / "resumed", tiny_dataset_dir, out_dir, export_to_hf=True, resume=True)
     resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
-    assert resumed.resumed_from == checkpoint_dir(run_dir) / "step-00000005-tiny.pth"
-    assert (resumed.steps_this_process, resumed.completed_steps, resumed.stopped) == (15, 20, False)
-    assert sorted(resumed.history) == list(range(6, 21))
+    assert resumed.resumed_from == checkpoint_dir(run_dir) / "step-00000002-tiny.pth"
+    assert (resumed.steps_this_process, resumed.completed_steps, resumed.stopped) == (11, 13, False)
+    assert sorted(resumed.history) == list(range(3, 14))
     assert [p.name for p in resumed.checkpoints_written] == [
-        "step-00000006-tiny-stage-0_end.pth",
-        "step-00000014-tiny-stage-1_end.pth",
-        "step-00000020-tiny.pth",
+        "step-00000004-tiny-stage-0_end.pth",
+        "step-00000009-tiny-stage-1_end.pth",
+        "step-00000013-tiny.pth",
     ]
     assert resumed.export_dir == run_dir / "hf_export" and (run_dir / "hf_export" / "config.json").exists()
 
@@ -840,17 +888,17 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    A stop request after step 6, the last plain step of stage 0: the stage-end checkpoint is the one written,
-    not a second file.
+    A stop request after step 4 of the 13-step config, the step the stage-0 end checkpoint is written at: that
+    checkpoint is the one written, not a second file.
     """
 
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, precision="32")
-    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(6))
-    assert report.stopped and report.completed_steps == 6
-    assert [p.name for p in report.checkpoints_written] == ["step-00000006-tiny-stage-0_end.pth"]
-    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000006-tiny-stage-0_end.pth"]
+    yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir)
+    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(4))
+    assert report.stopped and report.completed_steps == 4
+    assert [p.name for p in report.checkpoints_written] == ["step-00000004-tiny-stage-0_end.pth"]
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000004-tiny-stage-0_end.pth"]
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -858,9 +906,10 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
 
 
 @pytest.mark.slow
-def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
+def test_golden_tiny_run(reference_run: ReferenceRun) -> None:
     """
-    Numerics regression guard for the training loop: the 20-step tiny run reproduces `golden_tiny_run.json`.
+    Numerics regression guard for the training loop: the 20-step tiny run (the session's shared `reference_run`,
+    which is the golden configuration) reproduces `golden_tiny_run.json`.
 
     The golden is a refactor guard, not a promise about CPU training: it was recorded in fp32 on the CPU with one
     thread and deterministic algorithms (torch 2.14.0+cu130, see `training.testing.golden.record_golden_run`), so it catches
@@ -874,7 +923,7 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
 
     assert GOLDEN_RUN_PATH.exists(), "golden run missing; record it with record_golden_run() in a numerics commit"
     expected = json.loads(GOLDEN_RUN_PATH.read_text())
-    actual = golden_run_metrics(tiny_dataset_dir)
+    actual = reference_metrics(reference_run)
     assert sorted(actual["steps"], key=int) == [str(s) for s in range(1, 21)]
     assert actual["optimizer_steps"] == 19  # the very first update (step 0) is skipped
     assert all("val_loss_1" in actual["steps"][str(s)] for s in (8, 16, 20))
@@ -887,43 +936,50 @@ def test_golden_tiny_run(tiny_dataset_dir: Path) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("stop_after", [5, 7, 14])  # a plain step, inside the 0 -> 1 transition, the stage-1 end
-def test_resume_reproduces_the_uninterrupted_run(
-    stop_after: int, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+def test_resume_chain_reproduces_the_uninterrupted_run(
+    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    A run stopped after `stop_after` steps and resumed from that checkpoint logs, from the first resumed step on,
-    exactly the losses, gradient norms and validation losses of the uninterrupted run: the checkpoint restores the
-    model, the optimizer, every RNG and the data stream including its buffered samples, and the loaders draw their
-    iterator seeds from a private generator instead of the global RNG.
+    One run stopped after step 5 (a plain step of stage 0), resumed and stopped after step 7 (inside the 0 -> 1
+    transition), resumed and stopped after step 14 (the stage-1 end: its stage-end checkpoint is the one written,
+    not a second file) and resumed to the end. From the first resumed step on, every segment logs exactly the
+    losses, gradient norms and validation losses of the uninterrupted run (the session's `reference_run`, the same
+    configuration): a checkpoint restores the model, the optimizer, every RNG and the data stream including its
+    buffered samples, the loaders draw their iterator seeds from a private generator instead of the global RNG, and
+    a checkpoint written by a resumed run restores just as well (the second and third resumes are resumes of a
+    resume). One chain instead of three stopped-and-resumed pairs: 20 optimizer steps in place of 60.
     """
 
+    stops = [5, 7, 14, 20]  # the last segment runs to the end
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False)
     with single_thread_deterministic():
-        full_dir = tmp_path / "full"
-        full_dir.mkdir()
-        yaml_path = write_tiny_yaml(full_dir, tiny_dataset_dir, full_dir / "out", precision="32", export_to_hf=False)
-        full = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True).history
-        stopped_dir = tmp_path / "stopped"
-        stopped_dir.mkdir()
-        yaml_path = write_tiny_yaml(stopped_dir, tiny_dataset_dir, stopped_dir / "out", precision="32", export_to_hf=False)
-        settings = parse_settings(["--config", str(yaml_path)])
-        stopped = train(settings, backend=cpu_backend, should_stop=StopAfterPolls(stop_after), keep_history=True)
-        assert stopped.stopped and stopped.completed_steps == stop_after
-        resumed_yaml = write_tiny_yaml(
-            stopped_dir, tiny_dataset_dir, stopped_dir / "out", precision="32", export_to_hf=False, resume=True
-        )
-        resumed = train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, keep_history=True)
+        segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(5), keep_history=True)]
+        resumed_yaml = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False, resume=True)
+        for previous, stop in zip(stops, stops[1:]):
+            should_stop = StopAfterPolls(stop - previous) if stop < 20 else None
+            segments.append(train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, should_stop=should_stop, keep_history=True))
 
-    assert resumed.resumed_from == stopped.checkpoints_written[-1]
-    assert sorted(resumed.history) == list(range(stop_after + 1, 21))
-    for done in range(1, stop_after + 1):  # the stopped run itself matches the uninterrupted one
-        assert stopped.history[done]["loss"] == full[done]["loss"], done
-    for done in range(stop_after + 1, 21):
-        assert resumed.history[done]["loss"] == full[done]["loss"], done
-        assert resumed.history[done]["grad_norm"] == full[done]["grad_norm"], done
-        assert resumed.history[done]["lr"] == full[done]["lr"], done
-        for key in (k for k in full[done] if k.startswith("val_loss")):
-            assert resumed.history[done][key] == full[done][key], (done, key)
+    assert [segment.completed_steps for segment in segments] == stops
+    assert [segment.stopped for segment in segments] == [True, True, True, False]
+    assert [sorted(segment.history) for segment in segments] == [[1, 2, 3, 4, 5], [6, 7], list(range(8, 15)), list(range(15, 21))]
+    assert [[p.name for p in segment.checkpoints_written] for segment in segments] == [
+        ["step-00000005-tiny.pth"],
+        ["step-00000006-tiny-stage-0_end.pth", "step-00000007-tiny.pth"],
+        ["step-00000014-tiny-stage-1_end.pth"],
+        ["step-00000020-tiny.pth"],
+    ]
+    for earlier, later in zip(segments, segments[1:]):
+        assert later.resumed_from == earlier.checkpoints_written[-1]
+    full = reference_run.history
+    for done in range(1, 6):  # the stopped run itself matches the uninterrupted one
+        assert segments[0].history[done]["loss"] == full[done]["loss"], done
+    for segment in segments[1:]:
+        for done, metrics in segment.history.items():
+            assert metrics["loss"] == full[done]["loss"], done
+            assert metrics["grad_norm"] == full[done]["grad_norm"], done
+            assert metrics["lr"] == full[done]["lr"], done
+            for key in (k for k in full[done] if k.startswith("val_loss")):
+                assert metrics[key] == full[done][key], (done, key)
 
 
 @pytest.mark.slow
@@ -1058,18 +1114,26 @@ def test_resume_from_the_final_checkpoint_runs_no_step_and_exports_again(
 
 
 @pytest.mark.slow
+# A plain skip, not `@pytest.mark.gpu`, on purpose: the marker would put this test into the `gpu` xdist group, whose
+# worker is already the longest; the tiny model leaves the device room to share (about 300 MiB at peak).
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_path: Path, tiny_dataset_dir: Path) -> None:
     """
     The real run path (settings backend on CUDA, bf16 autocast, `compile_model`): a run stopped after step 5 leaves
     a checkpoint whose model and optimizer tensors are what a fresh setup restores from it, and the resumed run
-    finishes with finite losses. Losses are not compared: cudnn benchmark and TF32 make the GPU path nondeterministic.
+    finishes with finite losses, its validation included (the only evaluation on a compiled model). Losses are not
+    compared: cudnn benchmark and TF32 make the GPU path nondeterministic.
+
+    The tiny architecture with one prelude block and one iteration per core block: the compile time (most of this
+    test) grows with the unrolled graph, and the run path is what is verified here; the recurrence under compile is
+    the model tests' business.
     """
 
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
     yaml_path = write_tiny_yaml(
-        tmp_path, tiny_dataset_dir, out_dir, precision="bf16-mixed", compile_model=True, export_to_hf=False
+        tmp_path, tiny_dataset_dir, out_dir, precision="bf16-mixed", compile_model=True, export_to_hf=False,
+        model_overwrite={"n_layers_in_prelude": 1, "n_layers_in_recurrent_block": [1, 1], "mean_recurrence": [1, 1], "mean_backprop_depth": [1, 1]},
     )
     stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterPolls(5), keep_history=True)
     assert stopped.stopped and stopped.completed_steps == 5
@@ -1111,29 +1175,27 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
 
 @pytest.mark.slow
 def test_samples_during_and_after_training_leave_the_numerics_unchanged(
-    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
     Sampling every 10 steps and at 0, 50 and 100 percent of the 20-step run writes `samples/step-00000001.jsonl`,
     `step-00000010.jsonl` (50 % and the interval coincide: once) and `step-00000020.jsonl`, and every training loss
-    equals the run without sampling: the generations run RNG-isolated.
+    equals the run without sampling (the session's `reference_run`, the same configuration without the sampling
+    settings): the generations run RNG-isolated.
     """
 
-    for name in ("plain", "sampling"):
-        (tmp_path / name).mkdir()
-    plain_yaml = write_tiny_yaml(tmp_path / "plain", tiny_dataset_dir, tmp_path / "plain" / "out", precision="32", export_to_hf=False)
     sampling_yaml = write_tiny_yaml(
-        tmp_path / "sampling", tiny_dataset_dir, tmp_path / "sampling" / "out", precision="32", export_to_hf=False,
+        tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False,
         sample_step_interval=10, sample_at_training_progress=[0, 50, 100], sample_max_new_tokens=4,
         sample_recurrences=[[1, 1], [2, 2]],
     )
     with single_thread_deterministic():
-        plain = train(parse_settings(["--config", str(plain_yaml)]), backend=cpu_backend, keep_history=True)
         sampling = train(parse_settings(["--config", str(sampling_yaml)]), backend=cpu_backend, keep_history=True)
-    assert sorted(plain.history) == sorted(sampling.history) == list(range(1, 21))
-    for done in plain.history:
-        assert sampling.history[done]["loss"] == plain.history[done]["loss"], done
-    run_dir = tmp_path / "sampling" / "out" / "tiny"
+    plain = reference_run.history
+    assert sorted(plain) == sorted(sampling.history) == list(range(1, 21))
+    for done in plain:
+        assert sampling.history[done]["loss"] == plain[done]["loss"], done
+    run_dir = tmp_path / "out" / "tiny"
     expected = ["step-00000001.jsonl", "step-00000010.jsonl", "step-00000020.jsonl"]
     assert [p.name for p in sampling.samples_written] == expected
     assert sorted(p.name for p in (run_dir / "samples").glob("*.jsonl")) == expected
@@ -1142,7 +1204,7 @@ def test_samples_during_and_after_training_leave_the_numerics_unchanged(
     assert [line["prompt"] for line in lines] == prompts + prompts
     assert [line["recurrence"] for line in lines] == len(prompts) * [[1, 1]] + len(prompts) * [[2, 2]]
     assert all(line["step"] == 10 and line["new_tokens"] <= 4 for line in lines)
-    assert plain.samples_written == [] and not (tmp_path / "plain" / "out" / "tiny" / "samples").exists()
+    assert not (reference_run.run_directory / "samples").exists()  # the plain run wrote none
     log_text = (run_dir / TRAIN_LOG_NAME).read_text()
     assert f"event: wrote {2 * len(prompts)} samples to" in log_text and "event: sample: 'The Eiffel Tower" in log_text
     assert "3 samples files written, last:" in sampling.summary()
@@ -1156,9 +1218,10 @@ def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    With a stubbed lm_eval: benchmarks every 10 steps and at the end write `benchmarks/step-XXXXXXXX.json`, the
-    scores reach the report, the JSON report and the log; a harness that raises leaves the run finishing with a
-    warning and no scores.
+    With a stubbed lm_eval, on the 13-step config: benchmarks every 10 steps and at the end write
+    `benchmarks/step-XXXXXXXX.json`, the scores reach the report, the JSON report and the log; a harness that raises
+    at every step leaves the run going on with a warning and no scores (three steps, then a stop request: the
+    failure at steps 1 and 2 did not end the run).
     """
 
     from evaluation.benchmarks import flatten_results
@@ -1166,31 +1229,31 @@ def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
 
     calls = stub_lm_eval(monkeypatch)
     out_dir = tmp_path / "out"
-    yaml_path = write_tiny_yaml(
-        tmp_path, tiny_dataset_dir, out_dir, precision="32", export_to_hf=False, sample_at_training_progress=[],
+    yaml_path = _short_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, export_to_hf=False, sample_at_training_progress=[],
         benchmark_step_interval=10, benchmark_at_training_progress=[100], benchmark_tasks=["arc_easy", "hellaswag"], benchmark_limit=5,
     )
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, keep_history=True)
     run_dir = out_dir / "tiny"
-    assert sorted(p.name for p in (run_dir / "benchmarks").glob("*.json")) == ["step-00000010.json", "step-00000020.json"]
-    assert report.last_benchmarks == flatten_results(RESULTS, "mean") and report.completed_steps == 20
+    assert sorted(p.name for p in (run_dir / "benchmarks").glob("*.json")) == ["step-00000010.json", "step-00000013.json"]
+    assert report.last_benchmarks == flatten_results(RESULTS, "mean") and report.completed_steps == 13
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"] and calls["evaluate"]["limit"] == 5
-    assert json.loads((run_dir / "benchmarks" / "step-00000020.json").read_text())["step"] == 20
+    assert json.loads((run_dir / "benchmarks" / "step-00000013.json").read_text())["step"] == 13
     assert json.loads((run_dir / TRAIN_REPORT_NAME).read_text())["last_benchmarks"] == report.last_benchmarks
     log_text = (run_dir / TRAIN_LOG_NAME).read_text()
     assert "event: benchmark arc_easy (recurrence mean) at step 10: acc 0.2500, acc_norm 0.3000" in log_text
     assert "benchmarks: mean/arc_easy/acc 0.2500" in report.summary()
 
     stub_lm_eval(monkeypatch, error=RuntimeError("no network"))
-    (tmp_path / "failing").mkdir()
-    failing_yaml = write_tiny_yaml(
-        tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", precision="32", export_to_hf=False,
-        sample_at_training_progress=[], benchmark_at_training_progress=[100], benchmark_tasks=["arc_easy"],
+    failing_yaml = _short_yaml(
+        tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", export_to_hf=False,
+        sample_at_training_progress=[], benchmark_step_interval=1, benchmark_at_training_progress=[], benchmark_tasks=["arc_easy"],
     )
-    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, keep_history=True)
-    assert failing.completed_steps == 20 and failing.last_benchmarks == {} and not failing.stopped
+    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, should_stop=StopAfterPolls(3), keep_history=True)
+    assert failing.completed_steps == 3 and failing.last_benchmarks == {} and failing.stopped
     assert not (tmp_path / "failing" / "out" / "tiny" / "benchmarks").exists()
-    assert "benchmark evaluation failed: no network" in (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
+    log_text = (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
+    assert log_text.count("benchmark evaluation failed: no network") == 2  # steps 1 and 2; the stop skips step 3's
 
 
 def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs(tmp_path: Path, tiny_dataset_dir: Path) -> None:

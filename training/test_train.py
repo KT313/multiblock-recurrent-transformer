@@ -414,7 +414,8 @@ def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(t
 @pytest.mark.slow
 def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_screen(tiny_dataset_dir: Path, tmp_path: Path) -> None:
     """
-    Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
+    Ctrl-C once while the live dashboard is up (the 20 packed steps of `config/tiny.yaml`; the batch-size overrides
+    only size the validation batches, the signal lands after a few steps): the run
     finishes its step, saves a checkpoint, exits 130; the screen shows the signal's kept warning, the "stopped on
     request" line, the static summary and the report once, no frame remnants.
     """

@@ -44,6 +44,10 @@ Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
+# The per-stage budget of the tests that assert nothing about row counts: 190 rows of a single synthetic source, 64
+# per source of `_three_sources` (at 500 to 600 tokens the rows were most of a test's time). The tests that assert
+# counts, or download a 100-row partial shard first, keep their own budgets.
+TOKENS = 150
 
 
 def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
@@ -60,7 +64,7 @@ def _state(report: DatasetReport, name: str) -> SourceLedger:
 
 def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
     sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i) for i in range(3)}
-    return cfg_factory(sources, tokens=600)
+    return cfg_factory(sources, tokens=TOKENS)
 
 
 # --- end to end ------------------------------------------------------------------------------------------------------
@@ -263,7 +267,7 @@ def test_exhausted_source_is_complete_with_a_warning(
 
 
 def test_steps_download_then_build(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4)}, tokens=TOKENS)
     path = config_file(cfg)
     report = prepare(path, layout.root, assume_yes=False, steps=["tokenizer", "download"])
     assert not report.complete and report.tokenizer_complete and report.missing() == ["p", "h"]
@@ -278,7 +282,7 @@ def test_steps_download_then_build(cfg_factory: CfgFactory, layout: DatasetLayou
 
 def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
-    path = config_file(cfg_factory(sources, tokens=500))
+    path = config_file(cfg_factory(sources, tokens=TOKENS))
     report = prepare(path, layout.root, assume_yes=False, sources=["a"])
     assert not report.complete and report.missing() == ["b"] and (layout.processed_dir("a") / "MANIFEST.json").is_file()
     assert not layout.raw_dir("b").exists()
@@ -298,11 +302,11 @@ def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: Dat
     """
 
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
-    cfg = cfg_factory(sources, tokens=500)
+    cfg = cfg_factory(sources, tokens=TOKENS)
     assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["a", "b"] and runner.checked_sources(cfg, None) is None
     path = config_file(cfg)
     assert prepare(path, layout.root, assume_yes=False, sources=["a", "a"]).missing() == ["b"]
-    stale = cfg_factory(sources, tokens=500, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
+    stale = cfg_factory(sources, tokens=TOKENS, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
     assert prepare(config_file(stale), layout.root, assume_yes=True, sources=["a", "a"]).missing() == ["b"]
     prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root), "--sources", "a", "a"])  # the CLI too
 
@@ -762,7 +766,7 @@ def test_prepare_fails_fast_while_another_build_holds_the_lock(layout: DatasetLa
 
 
 def test_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture) -> None:
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=TOKENS))
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(path, layout.root, assume_yes=False, dry_run=True)
     assert not report.complete and not layout.root.exists()
@@ -777,7 +781,7 @@ def test_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, 
 def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
 ) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS)
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw_dir = layout.raw_dir("p")
     before = all_mtimes(raw_dir)
@@ -814,7 +818,7 @@ def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(
     """
 
     def config(path: Path, seed: int) -> Path:
-        cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=seed)}, tokens=500)
+        cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=seed)}, tokens=TOKENS)
         path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
         return path
 
@@ -841,7 +845,7 @@ def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
     assessment, counting the repairs the run left undone (all of them in a dry run) as incomplete.
     """
 
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS))
     assert prepare(path, layout.root, assume_yes=False).complete
     next(layout.processed_dir("p").glob("data-*.parquet")).unlink()  # broken: the repair step would delete the folder
     before = all_mtimes(layout.root, include_lock=True)
@@ -856,7 +860,7 @@ def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
 
 
 def test_status_is_read_only_and_reports_would_repair(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture) -> None:
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS))
     prepare(path, layout.root, assume_yes=False)
     victim = next(layout.processed_dir("p").glob("data-*.parquet"))
     victim.unlink()
@@ -957,7 +961,7 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
     The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS)
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw_dir, processed_dir = layout.raw_dir("p"), layout.processed_dir("p")
     raw_before = all_mtimes(raw_dir)
@@ -977,7 +981,7 @@ def test_missing_processed_shards_are_repaired(cfg_factory: CfgFactory, layout: 
         "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
-    path = config_file(cfg_factory(sources, tokens=500))
+    path = config_file(cfg_factory(sources, tokens=TOKENS))
     prepare(path, layout.root, assume_yes=False)
     victims = [next(layout.processed_dir(name).glob("data-*.parquet")) for name in ("p", "h", "i")]
     for victim in victims:

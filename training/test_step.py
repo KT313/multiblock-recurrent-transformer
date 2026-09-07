@@ -8,6 +8,7 @@ reference `training/golden_tiny_steps.json` (five steps of scripted packs throug
 import copy
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,7 +27,7 @@ from training.data.tokenizer import IGNORE_INDEX
 from training.data.packing import PackedBatch, shifted_length
 import training.data.loader as loader_module
 from training.data.loader import RunDataloaders, SampleBatch, build_run_dataloaders, dataloader_over, entry_dataset
-from training.data.dataset_resolver import DataEntry, resolve_dataset
+from training.data.dataset_resolver import DataEntry, ResolvedDataset, resolve_dataset
 from training.data.datasets import Row
 from training.data.tokenizer import Tokenizer
 from training.testing.golden import (
@@ -617,6 +618,20 @@ def test_batch_stream_state_carries_the_buffered_samples(
     assert _drawn(after, [next_pack], "a") == len(state["pool"]) + len(buffered) + pulled
 
 
+@contextmanager
+def _run_loaders(settings: Settings, dataset: ResolvedDataset, backend: SingleDeviceBackend) -> Iterator[RunDataloaders]:
+    """
+    The run's real loaders (one worker process per source), shut down on exit: a leaked iterator keeps its worker
+    alive, at hundreds of MiB, until the GC finds the reference cycle, long after the test.
+    """
+
+    loaders = build_run_dataloaders(settings, dataset, backend)
+    try:
+        yield loaders
+    finally:
+        loaders.close()
+
+
 def test_batch_stream_load_state_dict_sets_the_loader_offsets(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
@@ -627,16 +642,16 @@ def test_batch_stream_load_state_dict_sets_the_loader_offsets(
 
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
-    loaders = build_run_dataloaders(settings, dataset, cpu_backend)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
-    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    parquet = loaders.datasets["synthetic_pretrain"]
-    state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate(), "buffers": {}}
-    stream.load_state_dict(state)
-    assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
-    next(stream)  # stage 0 draws from the pretrain source only: its reader starts now
-    assert parquet.resume_offset == 5 and loaders.pending_offsets == {}  # wrapped around one epoch
-    assert loaders.datasets["synthetic_instruct"].resume_offset == 0  # untouched sources stay at the start
+    with _run_loaders(settings, dataset, cpu_backend) as loaders:
+        stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+        parquet = loaders.datasets["synthetic_pretrain"]
+        state = {"consumed_rows": {parquet.prefix: parquet.num_rows + 5}, "draw_rng": stream.rng.getstate(), "buffers": {}}
+        stream.load_state_dict(state)
+        assert loaders.pending_offsets == {"synthetic_pretrain": parquet.num_rows + 5}
+        next(stream)  # stage 0 draws from the pretrain source only: its reader starts now
+        assert parquet.resume_offset == 5 and loaders.pending_offsets == {}  # wrapped around one epoch
+        assert loaders.datasets["synthetic_instruct"].resume_offset == 0  # untouched sources stay at the start
 
 
 def test_batch_stream_resume_does_not_repeat_rows(
@@ -652,10 +667,6 @@ def test_batch_stream_resume_does_not_repeat_rows(
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
 
-    def fresh_stream() -> BatchStream:
-        loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-        return BatchStream(settings, loaders, stage_manager, TrainingProgress())
-
     def documents(stream: BatchStream, world_batches: int) -> list[tuple[int, ...]]:
         """
         The documents of the packs of `world_batches` steps (`_documents`); only plain stage-0 steps, so no
@@ -664,15 +675,19 @@ def test_batch_stream_resume_does_not_repeat_rows(
 
         return [document for pack in _micro_batches(settings, stream, world_batches) for document in _documents(pack)]
 
-    stream = fresh_stream()
-    before = documents(stream, 3)
-    state = stream.state_dict()
+    # one stream (and its worker processes) at a time
+    with _run_loaders(settings, dataset, cpu_backend) as loaders:
+        stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+        before = documents(stream, 3)
+        state = stream.state_dict()
     assert len(set(before)) == len(before) > 3 * settings.gradient_accumulation_steps
 
-    resumed = fresh_stream()
-    resumed.load_state_dict(state)
-    assert not set(before) & set(documents(resumed, 3))
-    assert documents(fresh_stream(), 3) == before  # without the state the rows are read from the top again
+    with _run_loaders(settings, dataset, cpu_backend) as loaders:
+        resumed = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+        resumed.load_state_dict(state)
+        assert not set(before) & set(documents(resumed, 3))
+    with _run_loaders(settings, dataset, cpu_backend) as loaders:  # without the state the rows are read from the top again
+        assert documents(BatchStream(settings, loaders, stage_manager, TrainingProgress()), 3) == before
 
 
 def test_stages_sharing_a_source_do_not_re_read_rows(
@@ -687,15 +702,15 @@ def test_stages_sharing_a_source_do_not_re_read_rows(
     settings = parse_settings(["--config", str(write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out"))])
     dataset = resolve_dataset(settings)
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
-    loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    pretrain = loaders.datasets["synthetic_pretrain"]
     steps = 13  # well into stage 1 (the boundary is step 8), before the transition into finetune (step 14)
     seen: list[tuple[int, ...]] = []
-    for pack in _micro_batches(settings, stream, steps):
-        assert set(pack.data_ids) == {"synthetic_pretrain"}  # both stages train on the same source
-        seen += _documents(pack)
-    assert stream.consumed_rows["synthetic_pretrain"] <= pretrain.num_rows, "fixture too small to distinguish from a wrap"
+    with _run_loaders(settings, dataset, cpu_backend) as loaders:
+        stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+        pretrain = loaders.datasets["synthetic_pretrain"]
+        for pack in _micro_batches(settings, stream, steps):
+            assert set(pack.data_ids) == {"synthetic_pretrain"}  # both stages train on the same source
+            seen += _documents(pack)
+        assert stream.consumed_rows["synthetic_pretrain"] <= pretrain.num_rows, "fixture too small to distinguish from a wrap"
     assert len(set(seen)) == len(seen)  # crossing the stage boundary at step 8 repeated nothing
 
 
@@ -713,8 +728,8 @@ def test_batch_stream_same_seed_yields_the_same_stream(
     stage_manager = StageManager(dataset.stages, settings.world_batch_size, settings.training_max_sequence_length)
 
     def packs(world_batches: int) -> list[PackedBatch]:
-        loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-        return _micro_batches(settings, BatchStream(settings, loaders, stage_manager, TrainingProgress()), world_batches)
+        with _run_loaders(settings, dataset, cpu_backend) as loaders:
+            return _micro_batches(settings, BatchStream(settings, loaders, stage_manager, TrainingProgress()), world_batches)
 
     first, second = packs(3), packs(3)
     assert len(first) == len(second) == 3 * settings.gradient_accumulation_steps
@@ -982,16 +997,13 @@ def test_batch_stream_with_worker_processes_is_the_same_for_any_worker_batch_siz
 
     def batches(worker_batch_rows: int) -> list[PackedBatch]:
         monkeypatch.setattr(loader_module, "TRAIN_LOADER_BATCH_ROWS", worker_batch_rows)
-        loaders = build_run_dataloaders(settings, dataset, cpu_backend)
-        assert all(
-            cast(DataLoader[Row], loader).batch_size == worker_batch_rows for loader in loaders.train_loaders.values()
-        )
-        try:
+        with _run_loaders(settings, dataset, cpu_backend) as loaders:
+            assert all(
+                cast(DataLoader[Row], loader).batch_size == worker_batch_rows for loader in loaders.train_loaders.values()
+            )
             return _micro_batches(
                 settings, BatchStream(settings, loaders, stage_manager, TrainingProgress()), world_batches
             )
-        finally:
-            loaders.close()
 
     assert _same_batches(batches(loader_module.TRAIN_LOADER_BATCH_ROWS), batches(settings.micro_batch_size))
 

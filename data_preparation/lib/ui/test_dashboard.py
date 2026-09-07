@@ -633,12 +633,20 @@ prepare.main(["prepare", "--dataset_config", "config/datasets/tiny.yaml", "--dat
 
 
 def _run_in_pty(
-    script: str, *, width: int, height: int, timeout: float = 120.0, terminate_after: float | None = None, close_after: float | None = None
+    script: str,
+    *,
+    width: int,
+    height: int,
+    timeout: float = 120.0,
+    terminate_after: float | None = None,
+    close_after: float | None = None,
+    trigger: bytes = b"downloads",
 ) -> tuple[int, bytes]:
     """
     Run python -c script on a pseudo-terminal of the given size; the exit code and everything it wrote.
-    terminate_after sends SIGTERM that many seconds after the first dashboard frame (what a job scheduler sends);
-    close_after closes the terminal instead (the window closed: SIGHUP and EIO for the child).
+    terminate_after sends SIGTERM that many seconds after `trigger` first appeared in the output (by default the
+    first dashboard frame; what a job scheduler sends); close_after closes the terminal instead (the window closed:
+    SIGHUP and EIO for the child).
     """
 
     pid, fd = pty.fork()
@@ -673,9 +681,9 @@ def _run_in_pty(
             if not chunk:
                 break
             output += chunk
-            if terminate_after is not None and terminate_at is None and b"downloads" in output:  # the first frame is up
+            if terminate_after is not None and terminate_at is None and trigger in output:
                 terminate_at = time.monotonic() + terminate_after
-            if close_after is not None and close_at is None and b"downloads" in output:
+            if close_after is not None and close_at is None and trigger in output:
                 close_at = time.monotonic() + close_after
         if terminate_at is not None and time.monotonic() > terminate_at:
             os.kill(pid, 15)
@@ -688,14 +696,14 @@ def _run_in_pty(
     return os.waitstatus_to_exitcode(status), bytes(output)
 
 
-@pytest.mark.slow
 def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_table(short_tmp_path: Path) -> None:
     """
-    (`short_tmp_path`: the final `done: <dataset dir>` line must fit one 140-column screen line.)
+    (`short_tmp_path`: the final `done: <dataset dir>` line must fit one 140-column screen line. The row delay keeps
+    the downloads on the screen for a few frames.)
     """
 
     dataset_dir = short_tmp_path / "dataset"
-    code, raw = _run_in_pty(_PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.03), width=140, height=45)
+    code, raw = _run_in_pty(_PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.01), width=140, height=45)
     text = raw.decode("utf-8", "replace")
     assert code == 0, text[-3000:]
     plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
@@ -712,10 +720,9 @@ def test_prepare_tiny_in_a_pseudo_terminal_leaves_only_the_kept_lines_and_the_ta
     assert "round 1:" in build_log and "synthetic_pretrain: kept 87 of 87 fetched rows" in build_log
 
 
-@pytest.mark.slow
 def test_a_closed_terminal_does_not_end_the_run(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
-    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.03)
+    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.01)
     code, _raw = _run_in_pty(script, width=140, height=45, close_after=0.5)
     assert code == 0, "the run finished on its own after its terminal closed"
     build_log = (dataset_dir / "build.log").read_text()
@@ -723,11 +730,16 @@ def test_a_closed_terminal_does_not_end_the_run(tmp_path: Path) -> None:
     assert f"done: {dataset_dir}" in build_log, build_log[-500:]
 
 
-@pytest.mark.slow
 def test_sigterm_in_a_pseudo_terminal_clears_the_display_and_exits_130(tmp_path: Path) -> None:
+    """
+    The SIGTERM lands while the downloads run (0.2 s after the first download row is on the screen; about 1 s of
+    downloading at this row delay). The running downloads stop at their next shard, which for the tiny sources is
+    their end: every row reaches the shard writer in one token batch.
+    """
+
     dataset_dir = tmp_path / "dataset"
-    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.1)  # ~4 s of downloading
-    code, raw = _run_in_pty(script, width=140, height=45, terminate_after=0.5)
+    script = _PTY_CHILD.format(root=str(REPO_ROOT), dataset_dir=str(dataset_dir), row_delay=0.01)
+    code, raw = _run_in_pty(script, width=140, height=45, terminate_after=0.2, trigger=b"row/s")
     text = raw.decode("utf-8", "replace")
     assert code == 130, text[-3000:]
     screen = Screen(140)
