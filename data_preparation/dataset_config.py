@@ -106,13 +106,22 @@ def _seed_hash(source: SourceConfig) -> str:
     return "raw" if source.loader == "synthetic" else "processed"
 
 
-def _split_hash(source: SourceConfig) -> str:
+def _reads_split(source: SourceConfig) -> bool:
     """
-    `split` selects the rows only for the loaders that read a Hub split (`hf_split`, `hf_stream`); `hf_files`,
-    `github_code`, `local` and `synthetic` never look at it, so there it must not re-label a raw folder.
+    Whether `split` selects the source's rows: only `hf_split` and `hf_stream` read it; `hf_files`,
+    `github_code`, `local` and `synthetic` never look at it (they carry the default "train" unread).
     """
 
-    return "raw" if source.loader in ("hf_split", "hf_stream") else "none"
+    return source.loader in ("hf_split", "hf_stream")
+
+
+def _split_hash(source: SourceConfig) -> str:
+    """
+    `split` selects the rows only for the loaders that read a Hub split (:func:`_reads_split`); elsewhere it must
+    not re-label a raw folder.
+    """
+
+    return "raw" if _reads_split(source) else "none"
 
 
 def _text_field_hash(source: SourceConfig) -> str:
@@ -757,8 +766,10 @@ class DatasetConfig:
     def overlap_warnings(self) -> list[str]:
         """
         Sources used only for validation that read the same Hub repo as a training source with the same or a
-        nested data_files glob prefix: such a held-out set is likely not disjoint from the training data
-        (prefer listing the training source in val too: its validation_fraction split never overlaps).
+        nested data_files glob prefix: such a held-out set is likely not disjoint from the training data (prefer
+        listing the training source in val too: its validation_fraction split never overlaps). Two sources that
+        both read a Hub split (:func:`_reads_split`) and name different ones are disjoint by construction and
+        never warn; a `split` no loader reads says nothing about the rows.
         """
 
         warnings: list[str] = []
@@ -772,6 +783,8 @@ class DatasetConfig:
                 train = self.sources[train_name]
                 if train.hf_id != val.hf_id:
                     continue
+                if _reads_split(train) and _reads_split(val) and train.split != val.split:
+                    continue  # two splits of one repo (train vs test) are disjoint by construction
                 val_prefix = _glob_prefix(val.load_kwargs.get("data_files"))
                 train_prefix = _glob_prefix(train.load_kwargs.get("data_files"))
                 if val_prefix.startswith(train_prefix) or train_prefix.startswith(val_prefix):

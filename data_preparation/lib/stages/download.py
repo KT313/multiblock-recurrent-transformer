@@ -1118,6 +1118,8 @@ def download_github_code_group(
     of every source in names and of every extra language the pass stored.
     """
 
+    if not names:
+        raise ValueError("download_github_code_group needs at least one source")
     for name in names:
         source = config.sources[name]
         if source.loader != "github_code":

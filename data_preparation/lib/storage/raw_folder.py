@@ -20,9 +20,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import pyarrow as pa
+
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.storage.manifest import Manifest, ShardInfo, shard_problem, shard_rows, shard_tokens
+from data_preparation.lib.storage.manifest import Manifest, ShardInfo, shard_problem, table_tokens
 from data_preparation.lib.storage.parquet import ShardWriter, list_parquet_files, shard_index
 
 log = get_logger(__name__)
@@ -178,16 +180,17 @@ class RawFolder:
         self._last = progress
         writer.add(row)
 
-    def record_shard(self, path: Path) -> None:
+    def record_shard(self, path: Path, table: pa.Table) -> None:
         """
         ShardWriter callback: record the published shard with the offset and the reject totals as of its last
-        row, save the manifest and check the stop request.
+        row, save the manifest and check the stop request. The counts come from the table that was just written,
+        so the shard is not read back.
         """
 
         self.manifest.add_shard(
             path.name,
-            shard_rows(path),
-            shard_tokens(path),
+            table.num_rows,
+            table_tokens(table),
             offset=self.start_offset + self._last.consumed,
             skipped_malformed=self._skipped_before + self._last.skipped_malformed,
             dropped_too_long=self._dropped_before + self._last.dropped_too_long,

@@ -323,7 +323,7 @@ def read_github_code_group(
     discover (once per language, the label as argument), which may answer with a passive `ReadRequest` for it
     (name, offset, `key=language_key(label)`, a match on the label; :func:`language_request` builds one). The
     sources must agree on `hf_id`, `revision` and `data_files` (:func:`github_code_repo_key`) and have distinct
-    languages; the first request's `max_cached_file_mb` decides cache vs. remote reading for all of them.
+    languages and names; the first request's `max_cached_file_mb` decides cache vs. remote reading for all of them.
     """
 
     if not requests:
@@ -338,6 +338,9 @@ def read_github_code_group(
     languages = [str(request.source.language) for request in requests]
     if len(set(languages)) != len(languages):
         raise ValueError(f"github_code group members must have distinct languages, got {languages}")
+    names = [request.name for request in requests]
+    if len(set(names)) != len(names):  # `read_rows_multi` keys its per-file counts by name
+        raise ValueError(f"github_code group members must have distinct names, got {names}")
 
     index = hub_file_index(first, GITHUB_CODE_DATA_FILES, shared_parameters)
     columns = shared_parameters.columns
@@ -355,7 +358,14 @@ def read_github_code_group(
     )
 
 
-def _language_of_row(row: Row) -> str:
+def _language_of_row(row: Row, file: str) -> str:
+    """
+    The key of a row of a `github_code` file. A file without the column cannot be sorted into languages at all
+    (it used to raise a bare KeyError naming nothing), so say which file is missing it.
+    """
+
+    if "language" not in row:
+        raise ValueError(f"{file}: no 'language' column (columns: {', '.join(map(str, row))}); it is what github_code sorts rows by")
     return language_key(str(row["language"]))
 
 

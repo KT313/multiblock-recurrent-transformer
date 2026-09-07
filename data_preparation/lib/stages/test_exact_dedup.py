@@ -108,7 +108,7 @@ def test_bits_for_budget_and_expected_items() -> None:
 
 
 def test_describe_names_the_budget_and_the_rows() -> None:
-    assert SeenDocuments(memory_mb=1).describe(2_600_000) == "dedup filter: 1 MB, ~2,600,000 rows"
+    assert SeenDocuments(memory_mb=1).describe(2_600_000) == "dedup filter: 1 MB, 2,600,000 rows on disk"
 
 
 def test_size_in_bits_is_the_budget_within_a_byte() -> None:

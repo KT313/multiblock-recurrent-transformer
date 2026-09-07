@@ -101,14 +101,23 @@ def test_rows_needed_sums_the_stages_and_scales_with_the_training_length() -> No
     assert wide.rows_needed("b") == 30
 
 
-def test_rows_needed_is_the_schema_formula() -> None:
+def test_rows_needed_is_the_schema_formula(layout: DatasetLayout) -> None:
     """
     The planner delegates to `DatasetConfig.rows_needed`, the number the shuffled-build cap checks at config
-    load, so the two views of the requirement cannot drift.
+    load, so the two views of the requirement cannot drift: the ledgers of an empty dataset (no measured rate
+    yet) carry exactly the documented formula, budget × margin ÷ the training share, or rows × margin for a
+    source used only for validation.
     """
 
     cfg = two_stage_cfg()
-    assert [cfg.rows_needed(name) for name in cfg.sources] == [cfg.rows_needed(name) for name in cfg.sources]
+    formula = {
+        name: ceil((source.rows or 0) * Fraction("1.2"))
+        if not cfg.used_in_train(name)
+        else ceil(cfg.rows_budget(name) * Fraction("1.2") / (1 - Fraction(str(cfg.validation_fraction_of(name)))))
+        for name, source in cfg.sources.items()
+    }
+    assert formula == {"a": 127, "b": 60, "h": 10, "i": 26}, "the formula spelled out, not read from the config"
+    assert {led.name: led.rows_needed for led in read_ledgers(cfg, layout)} == formula
 
 
 def test_rows_needed_of_a_validation_only_source_is_its_rows_plus_the_margin() -> None:

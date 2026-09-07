@@ -27,7 +27,8 @@ turns the tokenizer's thread pool on with TOKENIZER_POOL_THREADS threads (TOKENI
 RAYON_NUM_THREADS=8 unless set in the environment): this process never forks after loading the tokenizer, and
 downloads tokenize every row on that one pool, whatever their number.
 
-Exit codes: 0 ok, 1 failure (logged with its traceback; a failed source is a failed build), 2 an unconfirmed
+Exit codes: 0 ok, 1 failure (a broken config or a repair that cannot decide safely is logged as one line,
+anything else with its traceback; a failed source is a failed build), 2 an unconfirmed
 repair, 3 another data preparation is still running (lib/build/lock.py; the message names its pid and start
 time), 130 interrupted (Ctrl-C or SIGTERM: every running step stops at its next shard, everything published is
 kept; a second Ctrl-C ends the process without waiting for the running transfer). On a terminal the run shows the
@@ -56,7 +57,7 @@ from data_preparation.lib.abort import BuildAborted  # noqa: E402
 from data_preparation.lib.build.describe import describe, leading_comment  # noqa: E402
 from data_preparation.lib.build.lock import RunLocked  # noqa: E402
 from data_preparation.lib.build.planner import DatasetReport  # noqa: E402
-from data_preparation.lib.build.repair import ConfirmationRequired  # noqa: E402
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairError  # noqa: E402
 from data_preparation.lib.build.runner import (  # noqa: E402
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
     DEFAULT_NUM_WORKERS,
@@ -256,6 +257,9 @@ def main(argv: list[str] | None = None) -> None:
     except RunLocked as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(EXIT_ALREADY_RUNNING) from None
+    except (ValueError, RepairError) as exc:  # a config or repair problem is a message, not a stack trace
+        log.error("%s failed: %s", args.command, exc)
+        raise SystemExit(1) from None
     except Exception:
         log.exception("%s failed", args.command)
         raise SystemExit(1) from None

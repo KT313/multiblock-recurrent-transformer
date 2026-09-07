@@ -46,7 +46,7 @@ def _write_rows(rows: Iterable[dict[str, Any]], out_dir: Path, shard_size: int, 
     """
 
     published: list[Path] = []
-    with ShardWriter(out_dir, shard_size, start_shard=start_shard, on_shard=published.append) as writer:
+    with ShardWriter(out_dir, shard_size, start_shard=start_shard, on_shard=lambda path, table: published.append(path)) as writer:
         for row in rows:
             writer.add(row)
     return [path.name for path in published]
@@ -72,9 +72,9 @@ def test_shard_writer_empty_input_writes_nothing_but_creates_dir(tmp_path: Path)
 
 def test_shard_writer_rejects_bad_arguments(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="shard_size"):
-        ShardWriter(tmp_path / "out", shard_size=0, on_shard=lambda path: None)
+        ShardWriter(tmp_path / "out", shard_size=0, on_shard=lambda path, table: None)
     with pytest.raises(ValueError, match="start_shard"):
-        ShardWriter(tmp_path / "out", shard_size=1, start_shard=-1, on_shard=lambda path: None)
+        ShardWriter(tmp_path / "out", shard_size=1, start_shard=-1, on_shard=lambda path, table: None)
 
 
 def test_shard_writer_publishes_each_shard_and_keeps_them_on_failure(tmp_path: Path) -> None:
@@ -83,9 +83,10 @@ def test_shard_writer_publishes_each_shard_and_keeps_them_on_failure(tmp_path: P
     _write_rows(({"n": i} for i in range(7)), out, shard_size=2)  # 4 shards; the writer appends at 2
     (out / "data-00003.parquet.tmp").write_bytes(b"leftover")
 
-    def on_shard(path: Path) -> None:
+    def on_shard(path: Path, table: pa.Table) -> None:
         published.append(path.name)
         assert path.is_file() and 1 <= pq.read_table(path).num_rows <= 2
+        assert table.num_rows == pq.read_table(path).num_rows, "the callback gets the table that was written"
 
     with pytest.raises(RuntimeError, match="boom"), ShardWriter(out, shard_size=2, start_shard=2, on_shard=on_shard) as writer:
         for i in range(5):

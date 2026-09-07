@@ -1049,6 +1049,26 @@ def test_overlap_warnings_for_validation_only_sources() -> None:
     assert dc._glob_prefix("data/CC-MAIN-2013-20/*.parquet") == "data/CC-MAIN-2013-20/" and dc._glob_prefix(None) == ""
 
 
+def test_overlap_warnings_only_for_sources_that_read_the_same_split() -> None:
+    """
+    A held-out `test` split of a repo trained on through its `train` split is disjoint by construction: the two
+    used to warn because only `hf_id` was compared. A `split` the loader never reads (`hf_files` and friends,
+    default "train") says nothing about the rows, so there it must not silence the warning either.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "org/repo", "split": "train"}
+    d["sources"]["hold"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "org/repo", "split": "test", "rows": 5}
+    assert _build(d).overlap_warnings() == []
+    d["sources"]["hold"]["split"] = "train"
+    (warning,) = _build(d).overlap_warnings()
+    assert "'hold'" in warning and "'pre'" in warning
+    d["sources"]["hold"]["split"] = "test"  # hf_files never looks at `split`: differing values are not a reason
+    for source in ("pre", "hold"):
+        d["sources"][source].update(loader="hf_files", load_kwargs={"data_files": "data/*.parquet"})
+    assert len(_build(d).overlap_warnings()) == 1
+
+
 def test_raw_hash_of_a_source_outside_the_config_matches_raw_hash() -> None:
     cfg = load_dataset_config(TINY)
     name = "synthetic_pretrain"

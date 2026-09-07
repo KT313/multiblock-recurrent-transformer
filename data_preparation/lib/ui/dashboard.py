@@ -409,7 +409,7 @@ class DataDashboard(LiveDisplay):
             self._release_streams()
             self._release_logging()
             self._restore_third_party_bars()
-        self._print_kept()
+            self._print_kept()  # in the finally: a failing _stop_live must not swallow the run's kept lines
 
     @property
     def is_active(self) -> bool:

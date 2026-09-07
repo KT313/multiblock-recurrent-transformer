@@ -112,6 +112,31 @@ def test_load_absent_or_unparsable(tmp_path: Path, caplog: pytest.LogCaptureFixt
         Manifest.load(tmp_path)
 
 
+def test_load_rejects_malformed_shard_entries(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A `shards` list that is not a list of shard objects follows the same contract as any other unreadable
+    manifest (warn without shards, raise next to them); the entries used to reach `ShardInfo(**entry)` and die
+    with an AttributeError past both branches, and a `rows: "3"` only much later in :meth:`Manifest.rows`.
+    """
+
+    payloads = [
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [1]},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": "x"},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [{"name": "data-00000.parquet", "rows": "3"}]},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [{"name": 7, "rows": 3}]},
+    ]
+    for payload in payloads:
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(payload))
+        assert Manifest.load(tmp_path) is None
+    assert sum("unparsable manifest" in r.message for r in caplog.records) == len(payloads)
+
+    pq.write_table(pa.table({"text": ["a"]}), tmp_path / "data-00000.parquet")
+    for payload in payloads:
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(payload))
+        with pytest.raises(RuntimeError, match="unreadable manifest .* next to shards"):
+            Manifest.load(tmp_path)
+
+
 def test_stage_validated() -> None:
     assert STAGES == ("raw", "processed", "tokenizer")
     for stage in STAGES:

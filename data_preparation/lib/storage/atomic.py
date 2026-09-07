@@ -4,7 +4,9 @@ The write-a-sibling-then-rename helper every published file goes through: :func:
 
 A manifest, a shard directory or a checkpoint must appear under its final name complete or not at all, because the
 next run reads whatever is there. os.replace is atomic within one filesystem, so the write goes to a sibling of
-the target (same directory, same filesystem) and is renamed over it once complete. Stdlib only.
+the target (same directory, same filesystem) and is renamed over it once complete. A file target and the parent
+directory are fsynced (the bytes, then the rename), so a power loss leaves the previous file or the new one, never
+an empty one. Stdlib only.
 """
 
 from __future__ import annotations
@@ -16,6 +18,27 @@ from contextlib import contextmanager
 from pathlib import Path
 
 TEMP_SUFFIX = ".tmp"
+
+
+def _fsync_directory(directory: Path) -> None:
+    """
+    Persist the rename itself: the new file's bytes are on disk after its own fsync, but the directory entry that
+    names them is a separate write, and without this a power loss can leave the entry pointing at the old inode.
+
+    Some filesystems refuse to open or fsync a directory (network mounts); the rename is still atomic there, so an
+    OSError is ignored.
+    """
+
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _remove(path: Path) -> None:
@@ -59,6 +82,7 @@ def write_atomically(path: Path | str, *, suffix: str = TEMP_SUFFIX) -> Iterator
             finally:
                 os.close(fd)
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     except BaseException:
         _remove(temporary)
         raise
