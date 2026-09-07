@@ -31,7 +31,7 @@ data = [
 ]
 # benchmark evaluation (evaluation/benchmarks.py)
 eval = [
-  "lm_eval>=0.4.8",
+  "lm_eval[hf]>=0.4.8",  # [hf]: accelerate, which lm_eval.models.huggingface imports (the HFLM the benchmarks run on)
 ]
 
 [dependency-groups]
