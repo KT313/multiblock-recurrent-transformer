@@ -499,6 +499,7 @@ def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> 
                 recurrences=settings.benchmark_recurrences or [None],
                 out_path=path,
                 step=step,
+                seed=settings.seed,
             )
     except Exception as error:  # the harness needs the extra and the network; the run must not end on it
         logger.log_benchmark_failure(error)
