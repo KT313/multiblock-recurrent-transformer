@@ -22,7 +22,8 @@ Records of WARNING and above, and records logged with extra={"keep": True}, are 
 after the display closed. When the block ends (normally, by an exception or by Ctrl-C) the frame is erased, streams
 and handlers are restored, the kept lines and one static summary are printed (final_frame=False turns the
 summary off). suspended clears the display around a terminal prompt. A terminal that dies mid-run closes the
-display and the run continues headless with train.log as its output (:mod:`ui.display`).
+display and the run continues headless with train.log as its output; a frame that fails to render demotes the
+board to its console fallback and leaves the terminal alone (:mod:`ui.display`).
 
 Usage (RunLogger opens it through training.logger.open_dashboard)::
 

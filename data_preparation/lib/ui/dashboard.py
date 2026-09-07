@@ -34,7 +34,8 @@ a terminal prompt.
 
 Disabled (DATA_PREP_PROGRESS=0 or stderr not a terminal, the rule of lib.progress): no live display, no
 capture, tasks are no-ops and the log handler writes plain lines to stderr. A terminal that dies mid-run closes the
-display and the run continues headless with build.log as its output (:mod:`ui.display`).
+display and the run continues headless with build.log as its output; a frame that fails to render closes the
+display too, but leaves the terminal alone and keeps printing there (:mod:`ui.display`).
 """
 
 from __future__ import annotations
@@ -397,10 +398,14 @@ class DataDashboard(LiveDisplay):
         if self.enabled:
             self._opened = True
             self._started_at = self._clock()
-            self._silence_third_party_bars()
-            self._capture_logging()
-            self._redirect_streams()
-            self._start_live()
+            try:
+                self._silence_third_party_bars()
+                self._capture_logging()
+                self._redirect_streams()
+                self._start_live()
+            except BaseException:  # half of the setup would keep sys.stdout, the root handler and `_active` for good
+                self.__exit__(None, None, None)
+                raise
         return self
 
     def __exit__(
@@ -478,6 +483,10 @@ class DataDashboard(LiveDisplay):
 
     def _release_streams(self) -> None:
         self._stream_capture.release()
+
+    @property
+    def _streams_captured(self) -> bool:
+        return self._stream_capture.redirected
 
     # --- tasks, status and log lines ------------------------------------------------------------------------------------
 

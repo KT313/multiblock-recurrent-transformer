@@ -553,6 +553,30 @@ def test_a_dead_terminal_closes_the_display_and_the_build_continues(tmp_path: Pa
     assert "a kept line" not in file.getvalue() and file.refused >= 1, "nothing reached the dead terminal"
 
 
+def _no_display(_board: DataDashboard) -> None:
+    raise RuntimeError("the display did not open")
+
+
+def test_a_failure_while_opening_unwinds_what_was_already_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    U-H2: an exception out of `__enter__` means the `with` never calls `__exit__`, so a half-installed capture
+    kept sys.stdout, the root handler and the environment for the rest of the process, and every later dashboard
+    raised "already active".
+    """
+
+    console = Console(file=io.StringIO(), force_terminal=True, width=80)
+    real_out, real_err = sys.stdout, sys.stderr
+    root_handlers = list(logging.getLogger().handlers)
+    bars = {name: os.environ.get(name) for name in DataDashboard._THIRD_PARTY_BAR_ENV}
+    monkeypatch.setattr(DataDashboard, "_start_live", _no_display)
+    with pytest.raises(RuntimeError, match="the display did not open"), DataDashboard(enabled=True, console=console):
+        pass  # pragma: no cover - `__enter__` raises
+    assert sys.stdout is real_out and sys.stderr is real_err
+    assert logging.getLogger().handlers == root_handlers, "the dashboard's root handler is gone"
+    assert {name: os.environ.get(name) for name in DataDashboard._THIRD_PARTY_BAR_ENV} == bars
+    assert active_dashboard() is None, "the next dashboard can open"
+
+
 def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen() -> None:
     console = Console(file=io.StringIO(), force_terminal=True, width=120, height=40)
     with DataDashboard(title="prepare tiny", enabled=True, console=console, refresh_per_second=50) as board:

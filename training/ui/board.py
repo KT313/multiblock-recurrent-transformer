@@ -208,6 +208,22 @@ class TrainingDashboard(LiveDisplay):
     def _redirect_streams(self) -> None:
         self._capture.redirect_streams()
 
+    @property
+    def _streams_captured(self) -> bool:
+        return self._capture.streams_redirected
+
+    def _display_failed(self, error: BaseException) -> None:
+        """
+        A frame that did not render, instead of the base class's teardown: the board's own demotion, which also
+        gives the step lines a console handler. `_disable` is the once-only guard (it returns as soon as the
+        display is off), so the extra frame `Live.stop` draws does not come back around.
+
+        Errors from `__rich_console__` itself never arrive here; the board catches those and hands them to the
+        caller's thread (:meth:`_check_render_error`). This covers what rich raises around it.
+        """
+
+        self._disable(error)
+
     def _disable(self, error: BaseException) -> None:
         """
         Close the display after an internal error and behave like the console fallback from now on. Logs one
