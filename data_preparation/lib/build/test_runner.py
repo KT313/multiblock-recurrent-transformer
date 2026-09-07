@@ -31,7 +31,7 @@ from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import RunLocked, build_lock
-from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads
+from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.download import download as real_download
@@ -943,14 +943,14 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
         raw = Manifest.load(layout.raw_dir(name))
         assert raw is not None and raw.rows() >= 6  # 5 sequences each × 1.2
 
-    # `--sources` with one language uses the ordinary per-source path
+    # `--sources` with one language is a group of one: the group pass is what keeps the other languages' rows
     hub.streams.clear()
     bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"], training_target_sequence_length=1)
     bigger.stages[0].tokens = 30
     jobs = runner.download_jobs(plan_downloads(bigger, layout, sources=["code_python"]), bigger, layout, None)
-    assert [(job.what, job.name) for job in jobs] == [("source", "code_python")]
+    assert [(job.what, job.name, job.sources) for job in jobs] == [("github_code group", "code_python", ("code_python",))]
     prepare(config_file(bigger), layout.root, assume_yes=False, sources=["code_python"])
-    assert single == ["code_python"]
+    assert single == []
 
 
 # --- repairs on the way -----------------------------------------------------------------------------------------------
@@ -1004,8 +1004,11 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     raw = layout.raw_dir("p")
     manifest = Manifest.load(raw)
     assert manifest is not None and len(manifest.shards) >= 3, "the test needs several raw shards"
-    last = manifest.shards[-1]
-    (raw / last.name).write_bytes(b"corrupt")
+    # a shard the capped build covered (the last one is past the budget and unbuilt: losing it changes nothing)
+    processed = Manifest.load(layout.processed_dir("p"))
+    assert processed is not None and len(processed.input_shards) == len(manifest.shards) - 1
+    broken = manifest.shards[-2]
+    (raw / broken.name).write_bytes(b"corrupt")
     offsets: list[int] = []
     original = loaders_mod.LOADERS["synthetic"]
 
@@ -1015,9 +1018,9 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False)
+        report = prepare(path, layout.root, assume_yes=True)  # a healthy shard after the broken one is dropped too: asks
     assert report.complete and "truncating" in caplog.text
-    assert offsets == [manifest.shards[-2].offset], "resumed behind the last good shard instead of from 0"
+    assert offsets == [manifest.shards[-3].offset], "resumed behind the last good shard instead of from 0"
     repaired = Manifest.load(raw)
     assert repaired is not None and repaired.rows() == manifest.rows() and [s.rows for s in repaired.shards] == [s.rows for s in manifest.shards]
 
@@ -1054,3 +1057,41 @@ def test_prepare_logs_the_stop_reason_of_a_slow_build(
         prepare(path, layout.root, assume_yes=False, num_workers=3, max_parallel_downloads=3)
     assert 0 < ticks["s0"] < 100 and 0 < ticks["s2"] < 100
     assert "source s0 stopped: source s1 failed" in caplog.text
+
+
+def test_github_code_group_job_includes_satisfied_members_and_the_build_is_capped(
+    hub: FakeHub, cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A member with nothing to fetch still joins the group job (passively: it stores what the pass reads on for
+    the others), and every build job carries the planner's rows_sufficient as its cap.
+    """
+
+    languages = ("Python", "Python", "Go", "Python", "Go", "Java")  # Java is rare: its download reads past Python's target
+    for prefix in "ab":
+        hub.add(f"data/{prefix}.parquet", [{"id": f"{prefix}{i}", "text": f"{prefix} code {i}", "language": languages[i % 6]} for i in range(60)])
+    targets: dict[str, int] = {}
+
+    def spy_build(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        targets[name] = kwargs["rows_target"]
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "build_source", spy_build)
+    python_only = _github_cfg(cfg_factory, ["Python"], training_target_sequence_length=1)
+    assert prepare(config_file(python_only), layout.root, assume_yes=False).complete
+    python_ledger = source_ledger(python_only, "code_python", layout)
+    assert python_ledger.raw_rows >= python_ledger.rows_needed and targets == {"code_python": python_ledger.rows_sufficient}
+
+    both = _github_cfg(cfg_factory, ["Python", "Java"], training_target_sequence_length=1)
+    plan = plan_downloads(both, layout)
+    assert [source.name for source in plan.to_fetch()] == ["code_java"]  # Python serves its budget
+    jobs = runner.download_jobs(plan, both, layout, None)
+    assert [(job.what, job.sources) for job in jobs] == [("github_code group", ("code_python", "code_java"))]
+    targets.clear()
+    report = prepare(config_file(both), layout.root, assume_yes=False)
+    java_ledger = source_ledger(both, "code_java", layout)
+    assert report.complete and targets == {"code_java": java_ledger.rows_sufficient}  # Python's processed folder serves the budget: no build
+    grown = Manifest.load(layout.raw_dir("code_python"))
+    assert grown is not None and grown.rows() > python_ledger.raw_rows  # Python stored the rows read for Java past its own target
+    python_state = next(source for source in report.sources if source.name == "code_python")
+    assert python_state.satisfaction()[0] and not python_state.build_pending and python_state.unbuilt_shards >= 1

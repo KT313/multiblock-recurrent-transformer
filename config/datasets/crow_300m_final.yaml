@@ -108,7 +108,11 @@ sources:
   # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). All
   # language sources of the repo are downloaded in one pass over its 880 `data/*.parquet` files (every row group is
   # fetched once and its rows go to the language that wants them); the shared file index (`dataset/hub_index/`)
-  # remembers per-language row counts so a top-up skips files and row groups it has already consumed.
+  # remembers per-language row counts so a top-up skips files and row groups it has already consumed. The pass keeps
+  # every row it decodes: a language past its target stores on while the pass reads for the others, and the ~20
+  # languages without a source below land in `sources/github_code_clean_<slug>/raw` (C# -> csharp, Objective-C ->
+  # objective_c); to train on one later, add it under that name with the same fields (e.g.
+  # `github_code_clean_csharp: {..., language: C#, text_field: code}`) and its folder is adopted as is.
   github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, describe_tokens_per_row: 500}
   github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, describe_tokens_per_row: 500}
   github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, describe_tokens_per_row: 500}

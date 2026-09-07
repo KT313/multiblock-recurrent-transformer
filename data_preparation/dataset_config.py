@@ -49,6 +49,7 @@ DEFAULT_BENCHMARKS = [
     "mmlu_test",
     "winogrande_test",
 ]
+DEFAULT_TOKENS_PER_ROW_ESTIMATE = 500  # `describe_tokens_per_row` until a source's first raw shard measures the real rate
 SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers filter / dedup losses and a tokens-per-row estimate that ran high); a Fraction so 50 × 1.2 is exactly 60
 
 SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
@@ -293,7 +294,7 @@ class SourceConfig:
     input_inversions: float = field(default=0.0, metadata=_PROCESSED)  # instruct: share of rows turned into "given the output, what was the instruction?"
     shuffle: Optional[bool] = field(default=None, metadata=_PROCESSED)  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
     validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
-    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at the training length) and the row columns of `describe`
+    describe_tokens_per_row: int = field(default=DEFAULT_TOKENS_PER_ROW_ESTIMATE, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at the training length) and the row columns of `describe`
 
     def __post_init__(self) -> None:
         self._check_field_scopes()
@@ -637,8 +638,16 @@ class DatasetConfig:
         bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
         """
 
+        return self.raw_hash_of(self.sources[source_name])
+
+    def raw_hash_of(self, source: SourceConfig) -> str:
+        """
+        :meth:`raw_hash` of a source that need not be in the config (a github_code language stored without a
+        source of its own): the same payload, so a later config entry with the same raw fields adopts its folder.
+        """
+
         payload = {
-            "source": hash_payload(self.sources[source_name], "raw"),
+            "source": hash_payload(source, "raw"),
             "token_count": self.token_count,
             "token_rule": TOKEN_RULE,
             "tokenizer": hash_payload(self.tokenizer, "raw"),

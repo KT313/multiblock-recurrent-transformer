@@ -17,13 +17,14 @@ configured before import.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+import re
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
-from data_preparation.dataset_config import SourceConfig
+from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE, SourceConfig
 from data_preparation.lib.sources.hub_files import (
     DEFAULT_MAX_CACHED_FILE_MB,
     FORMATS,
@@ -211,7 +212,8 @@ def load_github_code(
     files) are stored in the shared file index, so all language sources read the same cached files and skip files
     and row groups they have already consumed. A remote row group is kept whole like in `hf_files`, so the
     language offset it leaves behind is a row-group boundary in source rows. `columns` always includes `language`.
-    Several languages of one repo are read together by :func:`read_github_code_group`.
+    Several languages of one repo are read together by :func:`read_github_code_group`; a single language read this
+    way stops at its count (nothing else is reading on).
     """
 
     _check_offset_count(offset, count)
@@ -226,13 +228,75 @@ def load_github_code(
 class GithubCodeRequest:
     """
     One member of :func:`read_github_code_group`: rows of source.language from offset (in rows of that
-    language) on, at least count of them.
+    language) on, at least count of them; a passive member (count 0) takes its language's rows from the row
+    groups the others read, while aligned (`hub_files`).
     """
 
     name: str
     source: SourceConfig
     offset: int
     count: int
+    passive: bool = False
+
+
+LANGUAGE_KEY_PREFIX = "language="  # the index key of a language: `language=<label>` (`language_key`, `language_of_key`)
+DiscoverLanguage = Callable[[str], ReadRequest | None]  # a passive request for a language no member carries, or None
+
+
+def language_key(language: str) -> str:
+    """
+    The file-index key under which a language's per-file / per-row-group counts are recorded.
+    """
+
+    return f"{LANGUAGE_KEY_PREFIX}{language}"
+
+
+def language_of_key(key: str) -> str:
+    """
+    The language label of a :func:`language_key`.
+    """
+
+    if not key.startswith(LANGUAGE_KEY_PREFIX):
+        raise ValueError(f"not a language key: {key!r}")
+    return key[len(LANGUAGE_KEY_PREFIX) :]
+
+
+def language_slug(language: str) -> str:
+    """
+    A language label as a source-name suffix: lower case, `#` -> `sharp`, `+` -> `p`, any other run of
+    characters outside [a-z0-9] -> `_` (`C#` -> `csharp`, `C++` -> `cpp`, `Objective-C` -> `objective_c`,
+    `Jupyter Notebook` -> `jupyter_notebook`, `GO` -> `go`).
+    """
+
+    slug = language.lower().replace("#", "sharp").replace("+", "p")
+    slug = re.sub(r"[^a-z0-9]+", "_", slug).strip("_")
+    if not slug:
+        raise ValueError(f"language {language!r} leaves no slug")
+    return slug
+
+
+def github_code_extra_name(template: SourceConfig, language: str) -> str:
+    """
+    The source name a language without a source of its own is stored under: the repo id's tail with every run
+    of characters outside [a-z0-9] as `_`, then `_<language_slug>` (`codeparrot/github-code-clean` + `C#` ->
+    `github_code_clean_csharp`). A config entry of that name (same repo, revision, data_files and text_field,
+    the `language`) adopts the folder.
+    """
+
+    if not template.hf_id:  # validated by SourceConfig; repeated for the type checker
+        raise ValueError("github_code_extra_name needs a template with hf_id")
+    repo = re.sub(r"[^a-z0-9]+", "_", template.hf_id.rsplit("/", 1)[-1].lower()).strip("_")
+    return f"{repo}_{language_slug(language)}"
+
+
+def github_code_extra_source(template: SourceConfig, language: str) -> SourceConfig:
+    """
+    The source a language without a source of its own is downloaded as: template (a member of the group: same
+    repo, revision, data_files, text_field, ...) with `language` replaced and the row estimate at its default.
+    Its raw hash is what the extra folder's manifest records.
+    """
+
+    return replace(template, language=language, describe_tokens_per_row=DEFAULT_TOKENS_PER_ROW_ESTIMATE)
 
 
 def github_code_repo_key(source: SourceConfig) -> tuple[str | None, str | None, str]:
@@ -244,14 +308,22 @@ def github_code_repo_key(source: SourceConfig) -> tuple[str | None, str | None, 
 
 
 def read_github_code_group(
-    requests: list[GithubCodeRequest], shared_parameters: SharedLoaderParameters = SharedLoaderParameters()
+    requests: list[GithubCodeRequest],
+    shared_parameters: SharedLoaderParameters = SharedLoaderParameters(),
+    *,
+    discover: DiscoverLanguage | None = None,
 ) -> Iterator[tuple[str, Row]]:
     """
     Serve several `github_code` sources of one repo in a single pass over its files (every row group read
-    at most once), yielding (request.name, row); per source exactly what `load_github_code` yields for the same
-    offset / count, including the shared index bookkeeping. The sources must agree on `hf_id`, `revision`
-    and `data_files` (:func:`github_code_repo_key`) and have distinct languages; the first request's
-    `max_cached_file_mb` decides cache vs. remote reading for all of them.
+    at most once), yielding (request.name, row). Every member gets at least its count from its offset, exactly
+    what `load_github_code` yields; a member that reached its count (or is passive from the start) keeps taking
+    its language's rows from the row groups the pass still reads for the others, while aligned (`hub_files`), so
+    its rows are always a contiguous prefix of the language's order. Every fully decoded row group records the
+    rows of every language in the shared index, and a row of a language no member carries is offered to
+    discover (once per language, the label as argument), which may answer with a passive `ReadRequest` for it
+    (name, offset, `key=language_key(label)`, a match on the label; :func:`language_request` builds one). The
+    sources must agree on `hf_id`, `revision` and `data_files` (:func:`github_code_repo_key`) and have distinct
+    languages; the first request's `max_cached_file_mb` decides cache vs. remote reading for all of them.
     """
 
     if not requests:
@@ -273,22 +345,32 @@ def read_github_code_group(
         columns = [*columns, "language"]
     yield from read_rows_multi(
         index,
-        [_language_request(request) for request in requests],
+        [language_request(request.name, str(request.source.language), request.offset, request.count, passive=request.passive) for request in requests],
         on_file=shared_parameters.on_file,
         fetcher=hub_fetcher(first, shared_parameters),
         columns=columns,
         align_to_row_group=shared_parameters.align_to_row_group,
+        key_of=_language_of_row,
+        discover=None if discover is None else (lambda key: discover(language_of_key(key))),
     )
 
 
-def _language_request(request: GithubCodeRequest) -> ReadRequest:
-    language = str(request.source.language)
+def _language_of_row(row: Row) -> str:
+    return language_key(str(row["language"]))
+
+
+def language_request(name: str, language: str, offset: int, count: int, *, passive: bool = False) -> ReadRequest:
+    """
+    The `hub_files` request for the rows of one language: keyed :func:`language_key`, matched on the label.
+    """
+
     return ReadRequest(
-        name=request.name,
-        offset=request.offset,
-        count=request.count,
-        key=f"language={language}",
+        name=name,
+        offset=offset,
+        count=count,
+        key=language_key(language),
         match=lambda row: bool(row["language"] == language),
+        passive=passive,
     )
 
 

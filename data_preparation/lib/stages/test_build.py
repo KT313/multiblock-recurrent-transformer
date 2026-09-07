@@ -765,3 +765,31 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     assert len(read_rows(processed)) == 8, "the new folder is in place"
     assert len(read_rows(old)) == 4, "the replaced folder survived the crash aside"
     assert not processed.with_name("i.tmp").exists()
+
+
+# --- the build cap ------------------------------------------------------------------------------------------------------
+
+
+def test_build_stops_at_rows_target_and_resumes_to_a_larger_one(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    texts = [_words(6, i) for i in range(10)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=3)  # raw shards of 3, 3, 3, 1
+    processed = layout.processed_dir("s")
+    m = build_source(cfg, "s", layout, rows_target=4)  # the second raw shard brings the processed rows to 6 >= 4
+    assert m.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]] and m.rows() == 6
+    assert build_source(cfg, "s", layout, rows_target=6).input_shards == m.input_shards  # served already: nothing built
+    m2 = build_source(cfg, "s", layout, rows_target=8)  # a larger target builds on from the covered shards
+    assert m2.input_shards == [[f"data-{i:05d}.parquet", 3] for i in range(3)] and m2.rows() == 9
+    m3 = build_source(cfg, "s", layout)  # no target: everything
+    assert m3.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])] and m3.rows() == 10
+    assert [r["text"] for r in read_rows(processed)] == texts
+
+
+def test_an_all_at_once_build_ignores_rows_target(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep
+) -> None:
+    texts = [_words(6, i) for i in range(12)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=4, source={"shuffle": True, "seed": 5})
+    m = build_source(cfg, "s", layout, shard_size=5, rows_target=2)
+    assert m.rows() == 12 and m.input_shards == [[f"data-{i:05d}.parquet", 4] for i in range(3)]

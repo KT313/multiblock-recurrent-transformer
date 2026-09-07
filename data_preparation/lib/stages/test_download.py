@@ -537,8 +537,9 @@ def test_download_github_code_group_equals_separate_downloads(
     hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader
 ) -> None:
     """
-    Golden: one group pass leaves exactly the raw shards / offsets / exhausted flags of three separate downloads,
-    while opening every repo file once.
+    Golden: one group pass gives every member the rows, offsets and exhausted flag of its separate download as a
+    prefix, while opening every repo file once; what the pass reads on for Rust (never satisfied: the whole repo)
+    is kept as well: Python's and Java's rows past their targets, and Go's rows in a folder of their own.
     """
 
     hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
@@ -560,19 +561,28 @@ def test_download_github_code_group_equals_separate_downloads(
     grouped = DatasetLayout(tmp_path / "grouped")
     prepare_tokenizer(cfg, grouped)
     manifests = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
-    assert set(manifests) == set(sources)
-    assert _raw_state(grouped, list(sources), read_rows) == expected
-    assert hub.streams == ["data/a.parquet", "data/b.parquet"]  # each file opened once for all three languages
+    assert set(manifests) == {*sources, "name_go"}  # REPO is org/name: Go's folder is sources/name_go
+    state = _raw_state(grouped, [*sources, "name_go"], read_rows)
+    assert state["rust"] == expected["rust"]
+    for name in ("py", "java"):
+        assert state[name]["rows"][: rows_needed[name]] == expected[name]["rows"] and not state[name]["exhausted"]
+    assert [r["text"] for r in state["py"]["rows"]] == ["a code 0", "a code 3", "a code 6", "b code 0", "b code 3", "b code 6"]
+    assert [r["text"] for r in state["java"]["rows"]] == ["a code 1", "a code 4", "a code 7", "b code 1", "b code 4", "b code 7"]
+    assert [r["text"] for r in state["name_go"]["rows"]] == ["a code 2", "a code 5", "b code 2", "b code 5"]
+    assert {name: state[name]["rows_fetched"] for name in state} == {"py": 6, "java": 6, "rust": 0, "name_go": 4}
+    assert set(state["name_go"]["rows"][0]) == {"text", "tokens"} and all(r["tokens"] == 5 for r in state["name_go"]["rows"])
+    go = Manifest.load(grouped.raw_dir("name_go"))
+    assert go is not None and go.extra == {"github_code_group": ["py", "java", "rust"], "surplus": True} and not go.exhausted
+    assert go.source_hash == cfg.raw_hash_of(replace(sources["py"], language="Go"))  # a config entry `name_go: {..., language: Go}` adopts it
+    assert hub.streams == ["data/a.parquet", "data/b.parquet"]  # each file opened once for all languages
 
-    # a second call with the same needs is a no-op; a larger need for one language tops up only that one
+    # a second call with the same needs reads nothing (no member has rows to fetch); a member asked for more than
+    # the repo holds is exhausted without a read: its rows in both files are known
     hub.streams.clear()
     again = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
-    assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 4, "java": 2, "rust": 0}
-    topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "java": 4}, shard_size=3)
-    assert [r["text"] for r in read_rows(grouped.raw_dir("java"))] == ["a code 1", "a code 4", "a code 7", "b code 1"]
-    assert topped["java"].rows_fetched == 4 and topped["py"].rows() == 4
-    download(cfg, "java", separate, rows_needed=4, shard_size=3)
-    assert _raw_state(grouped, ["java"], read_rows) == _raw_state(separate, ["java"], read_rows)
+    assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 6, "java": 6, "rust": 0}
+    topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "py": 8}, shard_size=3)
+    assert hub.streams == [] and topped["py"].rows() == 6 and topped["py"].exhausted
 
 
 def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -729,8 +739,10 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     with pytest.raises(BuildAborted):
         download(cfg, "d", layout, rows_needed=10, shard_size=4, should_stop=lambda: True)  # checked after each shard
     partial = Manifest.load(layout.raw_dir("d"))
-    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12)]  # kept rows i = 2, 5, 8, 11
-    assert partial.rows_fetched == 12 and (partial.skipped_malformed, partial.dropped_too_long) == (4, 4)
+    # kept rows i = 2, 5, 8, 11 in the shard that tripped the stop, then the row consumed before the stop was seen
+    # (i = 14, published as a short shard): everything consumed is stored, the offset is where the fetch stood
+    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12), (1, 15)]
+    assert partial.rows_fetched == 15 and (partial.skipped_malformed, partial.dropped_too_long) == (5, 5)
 
     m = download(cfg, "d", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 10 and m.rows_fetched == 30 and m.skipped_malformed == 10 and m.dropped_too_long == 10
@@ -743,8 +755,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "d", other, rows_needed=10, shard_size=4)
     assert (reference.skipped_malformed, reference.dropped_too_long) == (m.skipped_malformed, m.dropped_too_long) and reference.rows_fetched == m.rows_fetched
-    assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m.shards]
-    assert read_rows(other.raw_dir("d")) == rows
+    assert (reference.rows(), reference.tokens()) == (m.rows(), m.tokens()) and read_rows(other.raw_dir("d")) == rows  # only the shard boundaries differ
 
 
 def test_download_instruct_estimate_mode_drops_by_estimated_count(
@@ -874,21 +885,25 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
         download(cfg, "p", layout, rows_needed=40, shard_size=10)
     raw = layout.raw_dir("p")
     m = Manifest.load(raw)
-    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
-    assert m.rows() == 20 and not m.exhausted and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
+    # the two full shards, plus every row consumed when the loader failed (20..26: tokenized and buffered, or still
+    # waiting for the tokenizer), published as a short shard so the offset is where the download really stood
+    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20), (7, 27)] and m.rows_fetched == 27
+    assert m.rows() == 27 and not m.exhausted and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
 
-    # the next call resumes at the last complete shard; the loader is asked from offset 20 and nothing is lost
+    # the next call resumes behind the last published shard; the loader is asked from offset 27 and nothing is lost
     _failing_loader(monkeypatch, fail_at=None)
     m2 = download(cfg, "p", layout, rows_needed=40, shard_size=10)
     assert offsets == [0] and m2.rows() == 40 and m2.rows_fetched == 40
-    assert [(s.name, s.rows, s.offset) for s in m2.shards] == [(f"data-{i:05d}.parquet", 10, 10 * (i + 1)) for i in range(4)]
+    assert [(s.name, s.rows, s.offset) for s in m2.shards] == [
+        ("data-00000.parquet", 10, 10), ("data-00001.parquet", 10, 20), ("data-00002.parquet", 7, 27), ("data-00003.parquet", 10, 37), ("data-00004.parquet", 3, 40),
+    ]
     assert [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(40)]
 
-    # golden: identical to one uninterrupted download
+    # golden: the same rows and counts as one uninterrupted download (only the shard boundaries differ)
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
-    assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m2.shards]
+    assert (reference.rows(), reference.tokens(), reference.rows_fetched) == (m2.rows(), m2.tokens(), m2.rows_fetched)
     assert read_rows(other.raw_dir("p")) == read_rows(raw)
 
 
@@ -925,7 +940,10 @@ def test_download_stops_within_one_shard_when_asked(
     with pytest.raises(BuildAborted):
         download(cfg, "p", layout, rows_needed=100, shard_size=10, should_stop=should_stop)
     m = Manifest.load(layout.raw_dir("p"))
-    assert m is not None and m.rows() == 20 and m.rows_fetched == 20 and calls["n"] == 2
+    # the stop is seen at the second shard and asked no more (the check is suspended from then on); the rows the
+    # fetch thread had consumed meanwhile (an instant loader runs ahead by a few batches) are stored, not dropped
+    assert m is not None and 20 <= m.rows() == m.rows_fetched <= 100 and calls["n"] == 2
+    assert [shard.rows for shard in m.shards[:2]] == [10, 10]
     assert download(cfg, "p", layout, rows_needed=100, shard_size=10).rows() == 100  # resumes to completion
 
 
@@ -1159,3 +1177,80 @@ def test_a_failure_on_the_token_worker_ends_the_download_like_a_loader_failure(
     monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(lambda call: None))
     m2 = download(cfg, "p", layout, rows_needed=100, shard_size=10)
     assert m2.rows() == 100 and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(100)]
+
+
+# --- the group pass keeps every language it decodes ----------------------------------------------------------------------
+
+
+def test_download_github_code_group_resumes_every_folder_aligned_after_a_stop(
+    hub: FakeHub, cfg_factory: CfgFactory, tmp_path: Path, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A stop publishes the buffered rows of every folder (members and extras) as short shards, so each folder's
+    offset is where it really stood; the next pass realigns every one of them and the end state equals an
+    uninterrupted pass. Rows reach the writers in small batches so the stop lands mid-pass.
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 2)
+    for prefix in "abcd":
+        hub.add(f"data/{prefix}.parquet", _code_rows(prefix, 12))  # row groups of 2; Python, Java, Go in turns
+    sources = {"py": _github("Python"), "rust": _github("Rust")}
+    cfg = cfg_factory(sources)
+    rows_needed = {"py": 2, "rust": 3}  # Rust never appears: the whole repo is read; Python turns passive early
+
+    reference = DatasetLayout(tmp_path / "reference")
+    prepare_tokenizer(cfg, reference)
+    download_github_code_group(cfg, list(sources), reference, rows_needed=rows_needed, shard_size=4)
+    names = ["py", "rust", "name_java", "name_go"]
+    expected = _raw_state(reference, names, read_rows)
+    assert [len(expected[name]["rows"]) for name in names] == [16, 0, 16, 16]
+
+    stopped = DatasetLayout(tmp_path / "stopped")
+    prepare_tokenizer(cfg, stopped)
+    published = {"n": 0}
+
+    def stop_after_first_shard() -> bool:
+        published["n"] += 1
+        return published["n"] >= 1
+
+    with pytest.raises(BuildAborted):
+        download_github_code_group(cfg, list(sources), stopped, rows_needed=rows_needed, shard_size=4, should_stop=stop_after_first_shard)
+    partial = {name: Manifest.load(stopped.raw_dir(name)) for name in names}
+    assert partial["py"] is not None and any(partial[name] is not None for name in ("name_java", "name_go"))
+    for name in ("py", "name_java", "name_go"):
+        manifest = partial[name]
+        if manifest is None:  # no row of that language reached its writer before the stop: no manifest yet, next pass from 0
+            assert not list(stopped.raw_dir(name).glob("*.parquet"))
+            continue
+        assert manifest.rows() == manifest.rows_fetched < 16  # the flushed short shard moved the offset to the last stored row
+        assert [r["text"] for r in read_rows(stopped.raw_dir(name))] == [r["text"] for r in expected[name]["rows"][: manifest.rows()]]
+    resumed = download_github_code_group(cfg, list(sources), stopped, rows_needed=rows_needed, shard_size=4)
+    assert resumed["rust"].exhausted
+    state = _raw_state(stopped, names, read_rows)
+    for name in names:
+        assert state[name]["rows"] == expected[name]["rows"] and state[name]["rows_fetched"] == expected[name]["rows_fetched"], name
+    assert state["rust"]["exhausted"] and not state["py"]["exhausted"]
+
+
+def test_download_github_code_group_skips_extras_it_cannot_store(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A language whose derived name is a configured source outside the group, or whose folder is stale, is left
+    alone (warned about, nothing deleted); the others are stored.
+    """
+
+    hub.add("data/a.parquet", _code_rows("a", 12))
+    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "rust": _github("Rust"), "name_go": _synthetic()}))
+    stale_dir = layout.raw_dir("name_java")
+    stale_dir.mkdir(parents=True)
+    Manifest(source="name_java", source_hash="0000000000000000", stage="raw").save(stale_dir)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifests = download_github_code_group(cfg, ["py", "rust"], layout, rows_needed={"py": 1, "rust": 1}, shard_size=4)
+    assert set(manifests) == {"py", "rust"}
+    assert "name_go is a configured source outside this github_code group" in caplog.text
+    assert "not storing rows of Java" in caplog.text and "stale" in caplog.text
+    stale = Manifest.load(stale_dir)
+    assert stale is not None and stale.source_hash == "0000000000000000" and not list(stale_dir.glob("*.parquet"))
+    assert not layout.raw_dir("name_go").exists()
+    assert [r["text"] for r in read_rows(layout.raw_dir("py"))] == [f"a code {i}" for i in range(0, 12, 3)]

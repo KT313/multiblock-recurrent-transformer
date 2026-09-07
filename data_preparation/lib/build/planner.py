@@ -22,6 +22,11 @@ budget. An exhausted source with no rows, or whose few rows all go to the traini
 (:func:`training_rows_after_split`), is a failure: a failed source is a failed build, never a silently smaller
 dataset.
 
+The build is capped at the budget: a processed folder that serves `rows_sufficient` rows is satisfied and not a
+pending build even while raw shards remain unbuilt (`behind_raw` is the folder's health, the budget decides whether
+it is work; :attr:`SourceLedger.build_pending`). Raw rows past the budget (a github_code member fed on after its
+target, see stages/download.py) therefore cost raw disk only; a larger budget builds the next shards.
+
 Everything here reads manifests, plus the tokens column of current raw shards for the rate (no other shard data):
 a processed folder's health is the shared verdict of lib/build/assessment.py with check_files=False; broken or stray
 shard files are the repair step's business. A raw manifest that cannot be parsed next to shards is a reported state
@@ -101,12 +106,12 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
     """
-    Whether name has raw shards its processed folder does not cover yet (or no healthy processed folder);
-    False without a current raw manifest: there is nothing to build from.
+    Whether name has a build to run (:attr:`SourceLedger.build_pending`): no healthy processed folder, or
+    raw shards it does not cover while it is short of the budget. False without a current raw manifest: there is
+    nothing to build from.
     """
 
-    raw = inspect_raw(config, name, layout).current_manifest
-    return raw is not None and assess_processed(config, name, layout, raw).problem != "none"
+    return source_ledger(config, name, layout).build_pending
 
 
 def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
@@ -263,6 +268,7 @@ class SourceLedger:
     processed_reason: str  # its reason line
     processed_rows: int  # rows in the processed manifest (0 unless it is built or behind raw)
     training_rows: int  # processed rows left after the training-time validation split
+    unbuilt_shards: int = 0  # raw shards the processed folder does not cover (a healthy folder behind raw)
 
     # --- what to download ------------------------------------------------------------------------------------------
 
@@ -273,6 +279,33 @@ class SourceLedger:
         """
 
         return self.processed_problem == "none"
+
+    @property
+    def healthy(self) -> bool:
+        """
+        The processed folder is current and intact: built, or behind raw (raw shards it does not cover yet).
+        """
+
+        return self.processed_problem in ("none", "behind_raw")
+
+    @property
+    def serves_budget(self) -> bool:
+        """
+        A healthy processed folder with at least :attr:`rows_sufficient` rows (built or not: the cap).
+        """
+
+        return self.healthy and self.processed_rows >= self.rows_sufficient
+
+    @property
+    def build_pending(self) -> bool:
+        """
+        The build has work: a current raw folder whose processed folder is missing, to be rebuilt, or behind
+        raw while short of the budget. A folder behind raw that serves the budget is the cap, not pending work.
+        """
+
+        if self.raw_state != "current" or self.built:
+            return False
+        return not self.serves_budget
 
     @property
     def rows_target(self) -> int:
@@ -303,7 +336,7 @@ class SourceLedger:
             return 0, f"raw {self.raw_reason}"
         if self.exhausted:
             return 0, "exhausted"
-        if self.built and self.processed_rows >= self.rows_sufficient:
+        if self.serves_budget:
             return 0, "budget served"
         if self.raw_rows < self.rows_needed:
             return self.rows_needed - self.raw_rows, f"rows {self.raw_rows:,} < {self.rows_needed:,}"
@@ -354,10 +387,12 @@ class SourceLedger:
             return False, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
         if self.raw_state != "current":  # missing, or a manifest nobody can parse
             return False, f"raw {self.raw_reason}"
+        if self.serves_budget:
+            if self.unbuilt_shards:
+                return True, f"ok, {self.unbuilt_shards:,} raw shard(s) past the budget unbuilt"
+            return True, "ok"
         if not self.built:
             return False, f"processed {self.processed_reason}"
-        if self.processed_rows >= self.rows_sufficient:
-            return True, "ok"
         if self.exhausted:
             if self.processed_rows == 0:
                 return False, (
@@ -411,6 +446,7 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     if processed.problem == "unreadable_manifest":
         log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, layout.processed_dir(name))
     processed_rows = processed.manifest.rows() if processed.manifest is not None and processed.problem in ("none", "behind_raw") else 0
+    unbuilt = len(raw.shards) - len(processed.manifest.input_shards) if raw is not None and processed.manifest is not None and processed.problem == "behind_raw" else 0
     measured = measured_tokens_per_row(config, name, layout, raw)
     return SourceLedger(
         name=name,
@@ -429,6 +465,7 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
         processed_reason=processed.reason,
         processed_rows=processed_rows,
         training_rows=training_rows_after_split(config, name, processed_rows),
+        unbuilt_shards=unbuilt,
     )
 
 

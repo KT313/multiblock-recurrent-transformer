@@ -293,8 +293,14 @@ def test_the_satisfaction_cases() -> None:
     outdated = _ledger(raw_state="outdated", raw_reason="outdated: dataset_max_sequence_length 64 -> 128")
     assert outdated.satisfaction() == (False, "raw outdated: dataset_max_sequence_length 64 -> 128; the repair step deletes it after confirmation")
     assert _ledger(raw_state="missing", raw_reason="missing", raw_rows=0).satisfaction() == (False, "raw missing")
-    for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, dataset_max_sequence_length or the source changed"), ("behind_raw", "behind raw")):
+    for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, dataset_max_sequence_length or the source changed")):
         assert _ledger(processed_problem=problem, processed_reason=reason).satisfaction() == (False, f"processed {reason}")
+        assert _ledger(processed_problem=problem, processed_reason=reason).build_pending
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw", processed_rows=10).satisfaction() == (False, "processed behind raw")
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw", processed_rows=10).build_pending
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw").satisfaction() == (True, "ok")  # served: the cap
+    assert not _ledger(processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=2).build_pending
+    assert not _ledger(raw_state="missing", raw_reason="missing", raw_rows=0, processed_problem="absent", processed_reason="missing").build_pending
     assert _ledger(processed_rows=10).satisfaction() == (False, "processed rows 10 < 84")
     dry_small = _ledger(processed_rows=10, training_rows=9, exhausted=True)
     assert dry_small.satisfaction() == (True, "exhausted at 10 of 84 rows")
@@ -356,8 +362,11 @@ def test_a_served_budget_is_never_re_downloaded() -> None:
     assert served.satisfaction() == (True, "ok") and served.rows_to_fetch == (0, "budget served")
     unbuilt = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=0, processed_problem="absent", processed_reason="missing")
     assert unbuilt.rows_to_fetch == (150_000, "rows 1,050,000 < 1,200,000")  # nothing built yet: raw is what counts
-    behind = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=1_040_000, processed_problem="behind_raw", processed_reason="behind raw")
-    assert behind.rows_to_fetch[0] == 150_000  # the rows on disk are not the verdict until the build covers every shard
+    # the build is capped at the budget: a folder behind raw that serves it is served, one short of it builds first
+    behind = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=1_040_000, processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=5)
+    assert behind.rows_to_fetch == (0, "budget served") and behind.satisfaction() == (True, "ok, 5 raw shard(s) past the budget unbuilt") and not behind.build_pending
+    short = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=500_000, processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=50)
+    assert short.rows_to_fetch == (150_000, "rows 1,050,000 < 1,200,000") and short.build_pending  # raw short and the build has work
 
 
 def test_the_top_up_is_capped_at_the_full_requirement(caplog: pytest.LogCaptureFixture) -> None:

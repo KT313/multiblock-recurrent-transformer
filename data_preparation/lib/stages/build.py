@@ -90,12 +90,15 @@ def build_source(
     pass_workers: int = 1,
     shard_size: int = DEFAULT_SHARD_SIZE,
     should_stop: StopCheck | None = None,
+    rows_target: int | None = None,
 ) -> Manifest:
     """
     Turn the raw shards of source name into processed/<name> (see the module docstring) and return the
     processed manifest. pass_workers sizes the spawn process pool of the optional cleaning passes
-    (decontamination / minhash; 1 = in-process). Raises FileNotFoundError without a current raw manifest (run
-    the download first).
+    (decontamination / minhash; 1 = in-process). rows_target caps a per-raw-shard build: it stops after the raw
+    shard that brings the processed rows to that many (the planner's rows_sufficient; raw rows past the budget
+    stay unbuilt until a larger target asks for them); an all-at-once build ignores it. Raises FileNotFoundError
+    without a current raw manifest (run the download first).
     """
 
     source = config.sources[name]
@@ -145,7 +148,7 @@ def build_source(
         if all_at_once:
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
         else:
-            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop)
+            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
     log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
     return output.manifest
 
@@ -158,14 +161,22 @@ def _build_per_raw_shard(
     output: ProcessedOutput,
     shard_size: int,
     should_stop: StopCheck | None,
+    rows_target: int | None = None,
 ) -> None:
     """
     One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
-    raw shard as covered) before the next raw shard starts; the stop request is checked in between.
+    raw shard as covered) before the next raw shard starts; the stop request is checked in between. With
+    rows_target the loop ends once the processed rows reach it (checked before every raw shard).
     """
 
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
     for index, shard in enumerate(pending, start=1):
+        if rows_target is not None and output.manifest.rows() >= rows_target:
+            log.info(
+                "%s: %d processed rows serve the budget of %d; %d raw shard(s) left unbuilt",
+                raw.source, output.manifest.rows(), rows_target, len(pending) - index + 1,
+            )
+            return
         if pipeline.bar is not None:
             pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows

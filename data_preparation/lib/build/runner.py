@@ -57,6 +57,7 @@ from data_preparation.lib.build.planner import (
     every_source_satisfies_its_budget,
     plan_downloads,
     selected_sources,
+    source_ledger,
     sources_with_pending_raw_shards,
     summarize_dataset_state,
 )
@@ -240,29 +241,33 @@ def download_jobs(
     download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None, config_name: str | None = None
 ) -> list[Job]:
     """
-    One job per source with rows to fetch; the github_code sources of one repo are grouped into one. The
-    download takes a target (rows_needed=), so every job is asked for :attr:`SourceLedger.rows_target`: the
-    rows already on disk plus the ones the plan wants added (more than the budget in a top-up round).
+    One job per source with rows to fetch; the github_code sources of one repo are one job as soon as any of
+    them has rows to fetch, every member included (a member that has its rows joins passively and stores what
+    the pass reads on for the others; the languages without a source get folders of their own, see
+    stages/download.py). The download takes a target (rows_needed=), so every job is asked for
+    :attr:`SourceLedger.rows_target`: the rows already on disk plus the ones the plan wants added (more than the
+    budget in a top-up round; just the rows on disk for a member with nothing to fetch).
     """
 
-    to_fetch = download_plan.to_fetch()
-    rows_needed = {source.name: source.rows_target for source in to_fetch}
+    targets = {source.name: source.rows_target for source in download_plan.sources}
+    to_fetch = [source.name for source in download_plan.to_fetch()]
     jobs: list[Job] = []
     grouped: set[str] = set()
-    for names in github_code_groups(config, list(rows_needed)):
-        jobs.append(github_code_group_job(config, names, layout, {name: rows_needed[name] for name in names}, hf_token, config_name))
+    for names in github_code_groups(config, [source.name for source in download_plan.sources]):
+        if not set(to_fetch).intersection(names):
+            continue
+        jobs.append(github_code_group_job(config, names, layout, {name: targets[name] for name in names}, hf_token, config_name))
         grouped.update(names)
-    for name, needed in rows_needed.items():
+    for name in to_fetch:
         if name not in grouped:
-            jobs.append(download_source_job(config, name, layout, needed, hf_token, config_name))
+            jobs.append(download_source_job(config, name, layout, targets[name], hf_token, config_name))
     return jobs
 
 
 def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str]]:
     """
-    The github_code sources among names that share a repo (:func:`github_code_repo_key`), two or more
-    per group, in config order; a single source of a repo goes through the ordinary per-source download (the same
-    pass over its own loader).
+    The github_code sources among names grouped by repo (:func:`github_code_repo_key`), in config order; a
+    single source of a repo is a group of its own (the group pass is what keeps the other languages).
     """
 
     groups: dict[tuple[str | None, str | None, str], list[str]] = {}
@@ -270,7 +275,7 @@ def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str
         source = config.sources[name]
         if source.loader == "github_code":
             groups.setdefault(github_code_repo_key(source), []).append(name)
-    return [group for group in groups.values() if len(group) >= 2]
+    return list(groups.values())
 
 
 def download_source_job(
@@ -294,8 +299,15 @@ def github_code_group_job(
 
 
 def build_source_job(config: DatasetConfig, name: str, layout: DatasetLayout, pass_workers: int) -> Job:
+    """
+    The build of name, capped at the budget: the planner's rows_sufficient, read when the job is made (after
+    the source's download finished), is the build's rows_target.
+    """
+
+    rows_target = source_ledger(config, name, layout).rows_sufficient
+
     def action(should_stop: StopCheck) -> object:
-        return build_source(config, name, layout, pass_workers=pass_workers, should_stop=should_stop)
+        return build_source(config, name, layout, pass_workers=pass_workers, should_stop=should_stop, rows_target=rows_target)
 
     return Job("source", name, (name,), action)
 

@@ -164,8 +164,8 @@ def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel
 ```
 
 `download_and_build_missing` is the only place with thread-pool code: a pool of `--max_parallel_downloads` download
-jobs (the `github_code` sources of one repo form one job and are read in a single pass over the repo's files) and a
-pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
+jobs (the `github_code` sources of one repo form one job, every member of the repo included, and are read in a single
+pass over the repo's files) and a pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
 spawn process pool of `--pass_workers` for its optional cleaning passes (decontamination / minhash, off in the
 shipped configs), so those toggles cost up to `num_workers × pass_workers` worker processes (2 × 4 = 8 with the
 defaults). Sources with nothing to download are built right away, every other source the
@@ -215,6 +215,27 @@ The download **never deletes** a raw folder. A folder whose manifest is *stale* 
 *outdated* (stored with a smaller `dataset_max_sequence_length` than the config asks for now) is an error at this point; only the
 repair step removes it, and only after confirmation.
 
+**The `github_code` pass keeps every row it decodes.** The repo's parquet files mix all ~30 languages, and a row group
+(the unit a range request fetches) is read whole for whichever language still needs rows, so the pass decodes far
+more rows than any one language asks for (a rare language decides how deep the pass reads). Nothing decoded is
+thrown away: a member that has its rows (from the start, or once it reached its target) stays in the pass
+*passively* and stores every further row of its language the pass reads for the others, and a language no source
+names gets a raw folder of its own, `sources/<repo tail>_<language slug>/raw` (`codeparrot/github-code-clean` +
+`C#` -> `github_code_clean_csharp`; `lib/sources/loaders.py: github_code_extra_name`), downloaded as the group's
+first member with the language replaced, truncated and counted like every other pretrain row. Such a folder is
+adopted by a config entry of that name with the same repo, revision, `data_files` and `text_field` and the
+language (its raw hash is the folder's); until then nothing builds or trains on it and the repair step leaves it
+alone. A passively fed folder is only as long as the pass was: its rows end where the last active language was
+satisfied, and an entry added later downloads on from that offset. Passive rows are stored only while their offset
+is *aligned* with the pass (carried through every earlier row group by a recorded count or by reading it); a pass
+that seeks past a passive folder's position (a top-up resuming deeper in the repo) stores nothing for it rather
+than a gap. For that the shared file index counts *every* language of every fully decoded row group
+(`full_counts` in `dataset/hub_index/`), and a stop or a failure publishes each folder's buffered rows as a short
+final shard first, so every folder's offset is the frontier the pass reached and the next pass resumes them all
+aligned. The cost is disk (the whole decoded volume, zstd, instead of the wanted languages), the tokenizer running
+over every row (the 8-thread pool keeps up with a row group's fetch), and one shard buffer per language (passive
+shards are a quarter of `shard_size`). `build.log` lists the rows stored past each target and per extra language.
+
 ### Build (`lib/stages/build.py`)
 
 Turns the raw shards of a source into `processed/<source>/`, in this order. **Pretrain**: length filter
@@ -226,7 +247,12 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
 
 - **per raw shard, resumable** (pretrain sources): the survivors of one raw shard are published before the next raw
   shard is read and the manifest records the raw shard as covered, so a stop loses at most one raw shard of work
-  and the next build continues behind the last covered one; a top-up only builds the new raw shards.
+  and the next build continues behind the last covered one; a top-up only builds the new raw shards. **The build
+  is capped at the budget**: it stops after the raw shard that brings the processed rows to `rows_sufficient`
+  (`lib/build/planner.py`; `build_source(rows_target=)`), so raw rows past the budget (a `github_code` member fed
+  on after its target, above) cost raw disk only. A processed folder behind raw that serves the budget is healthy,
+  satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
+  budget, or a lower measured tokens-per-row rate, builds the next shards.
 - **all at once** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw shard is read,
   the survivors are shuffled with `random.Random(seed)`, written into `processed/<source>.tmp` and renamed into
   place; a top-up rebuilds the folder whole. Why shuffle at all: the training loader reads a source's shards **in
@@ -319,11 +345,12 @@ status table's last column. The plan, the round loop and the status table all re
 | reason | when | satisfied |
 |---|---|---|
 | `ok` | processed rows ≥ `rows_sufficient` | yes |
+| `ok, N raw shard(s) past the budget unbuilt` | the same, with raw shards the capped build did not need | yes |
 | `exhausted at N of M rows` | the loader yielded fewer rows than asked, some of them training rows | yes, state `exhausted` (the sampler cycles them; `--reopen` if the source has more) |
 | `exhausted and NOT ONE of N raw rows survived the build` | the loader ran dry and every row was rejected | **no**: a wrong `fields` / `converter` / `filter` / `language`, and a failed source is a failed build |
 | `exhausted, and … leaves 0 training rows` | the few rows all go to the validation holdout | **no**: lower the source's `validation_fraction` or give it more rows |
 | `processed rows N < M` | too few processed rows, the loader has more | no: the next round tops it up |
-| `processed <reason>` | `processed/` missing, stale or behind the raw shards | no: build it |
+| `processed <reason>` | `processed/` missing, stale, or behind the raw shards while short of the budget | no: build it |
 | `raw <reason>` | nothing downloaded / stale or outdated raw, or a raw manifest nobody can parse | no: download, let the repair step delete it, or fix the manifest by hand |
 
 The consequence to keep in mind: **the weights mix rows, not tokens.** The realised token share of a source in a
@@ -370,7 +397,9 @@ Two caches, with different lifetimes:
   `.json` array files are streamed from the start until enough rows were read (`.json` arrays incrementally with
   `ijson`; a top-up inside a partially consumed file re-streams that one file's prefix).
 * **`dataset/sources/<source>/raw/`**: the rows this pipeline kept: the append-only cache that `processed/` is
-  built from, deleted only by the confirmed repair above. `dataset/hub_index/` holds the small JSON file indexes
+  built from, deleted only by the confirmed repair above. For a `github_code` repo that is every language the pass
+  decoded (members past their target, and `sources/<repo tail>_<slug>/raw` folders for the languages without a
+  source), roughly the fetched volume in zstd; the build turns only the budgeted part into `processed/`. `dataset/hub_index/` holds the small JSON file indexes
   (file list per glob, rows per file, row-group layout, per-language rows per row group) that let `hf_files` fetch
   at an offset without opening earlier files; it is safe to delete (rebuilt on demand).
 

@@ -1003,3 +1003,12 @@ def test_overlap_warnings_for_validation_only_sources() -> None:
     d["sources"]["hold"].pop("rows")
     assert _build(d).overlap_warnings() == []
     assert dc._glob_prefix("data/CC-MAIN-2013-20/*.parquet") == "data/CC-MAIN-2013-20/" and dc._glob_prefix(None) == ""
+
+
+def test_raw_hash_of_a_source_outside_the_config_matches_raw_hash() -> None:
+    cfg = load_dataset_config(TINY)
+    name = "synthetic_pretrain"
+    source = cfg.sources[name]
+    assert cfg.raw_hash_of(source) == cfg.raw_hash(name)
+    assert cfg.raw_hash_of(dataclasses.replace(source, seed=source.seed + 1)) != cfg.raw_hash(name)  # synthetic: seed is raw identity
+    assert cfg.raw_hash_of(dataclasses.replace(source, describe_tokens_per_row=7)) == cfg.raw_hash(name)  # not hashed

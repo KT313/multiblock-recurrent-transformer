@@ -81,15 +81,26 @@ class ShardWriter:
         if exc_type is not None:
             self._buffer = []
             return
-        if self._buffer:
-            self.write_shard(pa.Table.from_pylist(self._buffer))
-            self._buffer = []
+        self.flush()
 
     def add(self, row: dict[str, Any]) -> None:
         self._buffer.append(row)
         if len(self._buffer) >= self.shard_size:
-            self.write_shard(pa.Table.from_pylist(self._buffer))
-            self._buffer = []
+            self.flush()
+
+    def flush(self) -> None:
+        """
+        Publish the buffered rows now as a shard, if there are any (short when called before the buffer is
+        full: what leaving the with block does without an exception, or what a caller does that wants the rows
+        kept although an exception is propagating; the rows are valid and in order). The buffer is emptied
+        *before* the publish, so a callback that raises after recording the shard (the stop check) never leaves
+        the rows to be published twice.
+        """
+
+        if not self._buffer:
+            return
+        rows, self._buffer = self._buffer, []
+        self.write_shard(pa.Table.from_pylist(rows))
 
     def write_shard(self, table: pa.Table) -> None:
         """

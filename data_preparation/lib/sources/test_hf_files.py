@@ -36,6 +36,7 @@ from data_preparation.lib.sources.hub_files import (
     iter_row_batches,
     parquet_row_groups,
     read_rows,
+    read_rows_multi,
     repo_listing,
 )
 from data_preparation.lib.sources.loaders import (
@@ -44,6 +45,7 @@ from data_preparation.lib.sources.loaders import (
     Row,
     SharedLoaderParameters,
     hub_file_index,
+    language_request,
     read_github_code_group,
 )
 
@@ -276,8 +278,10 @@ def test_github_code_offsets_count_language_rows_and_share_files(hub: FakeHub, t
     assert _ids(load(python, 5, 1, SharedLoaderParameters(index_dir=index_dir))) == ["c3"]
     assert hub.downloads == ["data/c.parquet"]  # a and b: 2 Python rows each, known from the index
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
-    assert saved["counts"]["language=Python"] == {"data/a.parquet": 2, "data/b.parquet": 2}
+    # every language of a fully decoded file is counted: Java's read through c recorded Python's rows there too
+    assert saved["counts"]["language=Python"] == {"data/a.parquet": 2, "data/b.parquet": 2, "data/c.parquet": 2}
     assert saved["counts"]["language=Java"]["data/a.parquet"] == 4
+    assert saved["full_counts"] == {"data/a.parquet": 3, "data/b.parquet": 3, "data/c.parquet": 3}  # row groups of 2
     assert saved["rows"] == {"data/a.parquet": 6, "data/b.parquet": 6, "data/c.parquet": 6}
     assert hub.listings == 1
 
@@ -855,7 +859,8 @@ def test_github_code_keeps_matching_rows_of_the_row_group_and_seeks_by_group_cou
     assert [r["id"] for r in load(src, 0, 2, SharedLoaderParameters(index_dir=index_dir, columns=["id"]))] == ["a0", "a3"]
     assert calls == [(0, ["id", "language"]), (1, ["id", "language"])]  # `language` is added for the match
     saved = json.loads(index_path(index_dir, REPO, REV, "data/*.parquet").read_text())
-    assert saved["group_counts"] == {"language=Python": {"data/a.parquet": [1, 1]}}
+    assert saved["group_counts"] == {"language=Python": {"data/a.parquet": [1, 1]}, "language=Java": {"data/a.parquet": [1, 1]}}
+    assert saved["full_counts"] == {"data/a.parquet": 2}  # both groups decoded whole: every language counted
     assert "language=Python" not in saved["counts"]  # the file is not finished
     calls.clear()
     assert _ids(load(src, 2, 1, SharedLoaderParameters(index_dir=index_dir))) == ["a6"]  # offset 2 = the two finished groups: seek to group 2
@@ -897,15 +902,19 @@ def test_group_read_reads_every_row_group_once_and_matches_separate_loads(
     hub.streams.clear()
     requests = [GithubCodeRequest(lang, sources[lang], *wanted[lang]) for lang in sources]
     got = _group_ids(read_github_code_group(requests, SharedLoaderParameters(index_dir=tmp_path / "group", columns=["id"])))
-    assert got == expected
-    # each file opened once, each of its four row groups read once (Go wants more than the repo has: read to the end)
+    # every member gets its separate read as a prefix and reads on while the pass runs for Go (which wants more
+    # than the repo has: read to the end), so Python and Java collect their surplus rows of every later group
+    assert {lang: rows[: wanted[lang][1]] for lang, rows in got.items()} == expected
+    assert got == {"Python": ["a0", "a3", "a6", "b0", "b3", "b6"], "Java": ["a4", "a7", "b1", "b4", "b7"], "Go": expected["Go"]}
+    # each file opened once, each of its four row groups read once
     assert hub.streams == ["data/a.parquet", "data/b.parquet"]
     assert calls == [(g, ["id", "language"]) for g in range(4)] * 2
-    # the shared index recorded every language's counts as a separate read would
+    # the shared index recorded every language's counts, per row group and per file
     saved = json.loads(index_path(tmp_path / "group", REPO, REV, "data/*.parquet").read_text())
-    assert saved["counts"]["language=Python"] == {"data/a.parquet": 3}
+    assert saved["counts"]["language=Python"] == {"data/a.parquet": 3, "data/b.parquet": 3}
     assert saved["group_counts"]["language=Java"]["data/a.parquet"] == [1, 0, 1, 1]
     assert saved["counts"]["language=Go"] == {"data/a.parquet": 2, "data/b.parquet": 2}
+    assert saved["full_counts"] == {"data/a.parquet": 4, "data/b.parquet": 4}
 
 
 def test_group_top_up_reads_only_the_row_groups_still_needed(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -958,3 +967,148 @@ def test_glob_regex_does_not_cross_directories() -> None:
     assert glob_regex("MetaMathQA-395K.json").fullmatch("MetaMathQA-395K.json") and not glob_regex("a.json").fullmatch("a_json")
     assert glob_regex("data/[ab]*.parquet").fullmatch("data/b1.parquet") and not glob_regex("data/[ab]*.parquet").fullmatch("data/c1.parquet")
     assert glob_regex("[!a]*").fullmatch("b.txt") and not glob_regex("[!a]*").fullmatch("a.txt"), "a negated class, not a literal !"
+
+
+# --- passive members, discovery and the all-language counts -------------------------------------------------------------
+
+
+def _github_sources(*languages: str) -> dict[str, SourceConfig]:
+    return {lang: _src(loader="github_code", language=lang, load_kwargs=REMOTE) for lang in languages}
+
+
+def test_group_passive_member_collects_only_from_groups_read_for_others(hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A passive member takes its language's rows from every row group the active members read and never makes one
+    be read; on a later pass it aligns by the recorded counts and collects on from where it stopped.
+    """
+
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))  # groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
+    sources = _github_sources("Python", "Java")
+    index_dir = tmp_path / "index"
+    calls = _spy_read_row_group(monkeypatch)
+    first = [GithubCodeRequest("py", sources["Python"], 0, 2), GithubCodeRequest("java", sources["Java"], 0, 0, passive=True)]
+    got = _group_ids(read_github_code_group(first, SharedLoaderParameters(index_dir=index_dir, columns=["id"])))
+    assert got == {"py": ["a0", "a3"], "java": ["a1"]}  # Python is satisfied at the end of group 1: the pass ends there
+    assert [g for g, _ in calls] == [0, 1]  # Java's rows in groups 2 and 3 caused no read
+    calls.clear()
+    second = [GithubCodeRequest("py", sources["Python"], 2, 1), GithubCodeRequest("java", sources["Java"], 1, 0, passive=True)]
+    got = _group_ids(read_github_code_group(second, SharedLoaderParameters(index_dir=index_dir, columns=["id"])))
+    assert got == {"py": ["a6"], "java": ["a4", "a7"]}  # Java's offset 1 lies at the start of group 2: aligned
+    assert [g for g, _ in calls] == [2, 3]
+
+
+def test_group_passive_member_is_detached_when_a_group_it_needs_is_skipped(hub: FakeHub, tmp_path: Path) -> None:
+    """
+    A passive member whose position lies in a row group the pass does not decode takes nothing (its rows must
+    stay a contiguous prefix of the language's order), even from the groups decoded later.
+    """
+
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))
+    sources = _github_sources("Python", "Java", "Go")
+    index_dir = tmp_path / "index"
+    first = [GithubCodeRequest("py", sources["Python"], 0, 1), GithubCodeRequest("java", sources["Java"], 0, 0, passive=True)]
+    assert _group_ids(read_github_code_group(first, SharedLoaderParameters(index_dir=index_dir, columns=["id"]))) == {"py": ["a0"], "java": ["a1"]}
+    # Go seeks past group 0 (its recorded count there is 0); Java at offset 0 would need group 0 again: detached
+    second = [GithubCodeRequest("go", sources["Go"], 0, 2), GithubCodeRequest("java", sources["Java"], 0, 0, passive=True)]
+    assert _group_ids(read_github_code_group(second, SharedLoaderParameters(index_dir=index_dir, columns=["id"]))) == {"go": ["a2", "a5"]}
+    # at offset 1 (its position after group 0) Java is aligned with the seek and collects a4 from group 2
+    third = [GithubCodeRequest("go", sources["Go"], 0, 2), GithubCodeRequest("java", sources["Java"], 1, 0, passive=True)]
+    assert _group_ids(read_github_code_group(third, SharedLoaderParameters(index_dir=index_dir, columns=["id"]))) == {"go": ["a2", "a5"], "java": ["a4"]}
+
+
+def test_group_discovers_languages_without_a_request(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))
+    hub.add("data/b.parquet", _rows("b", 8, _three_languages))
+    sources = _github_sources("Python")
+    offered: list[str] = []
+
+    def discover(language: str) -> Any:
+        offered.append(language)
+        return None if language == "Go" else language_request(f"extra:{language}", language, 0, 0, passive=True)
+
+    requests = [GithubCodeRequest("py", sources["Python"], 0, 4)]
+    got = _group_ids(read_github_code_group(requests, SharedLoaderParameters(index_dir=tmp_path / "index", columns=["id"]), discover=discover))
+    # Python reads a whole and b's first group; Java is collected from every one of those groups, Go was declined
+    assert got == {"py": ["a0", "a3", "a6", "b0"], "extra:Java": ["a1", "a4", "a7", "b1"]}
+    assert offered == ["Java", "Go"]  # once per language
+
+
+def test_group_discovered_language_aligns_on_a_later_pass_or_is_detached(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 8, _three_languages))
+    hub.add("data/b.parquet", _rows("b", 8, _three_languages))
+    sources = _github_sources("Python")
+    index_dir = tmp_path / "index"
+
+    def discover_at(offset: int) -> Any:
+        return lambda language: language_request(f"extra:{language}", language, offset, 0, passive=True) if language == "Java" else None
+
+    first = [GithubCodeRequest("py", sources["Python"], 0, 2)]
+    assert _group_ids(read_github_code_group(first, SharedLoaderParameters(index_dir=index_dir, columns=["id"]), discover=discover_at(0))) == {
+        "py": ["a0", "a3"], "extra:Java": ["a1"],
+    }
+    # Python seeks to group 2 of file a; Java at offset 1 (its count in groups 0 and 1 is recorded: 1, 0) is aligned
+    second = [GithubCodeRequest("py", sources["Python"], 2, 2)]
+    assert _group_ids(read_github_code_group(second, SharedLoaderParameters(index_dir=index_dir, columns=["id"]), discover=discover_at(1))) == {
+        "py": ["a6", "b0"], "extra:Java": ["a4", "a7", "b1"],
+    }
+    # Python seeks into file b; Java at offset 0 would need file a again: detached at discovery, nothing collected
+    third = [GithubCodeRequest("py", sources["Python"], 4, 1)]
+    assert _group_ids(read_github_code_group(third, SharedLoaderParameters(index_dir=index_dir, columns=["id"]), discover=discover_at(0))) == {
+        "py": ["b3"],
+    }
+    # at its recorded position (4 Java rows: the next one, b4, lies in b's third group) it waits: that pass only
+    # decodes b's second group; the pass that reads the third group collects it
+    fourth = [GithubCodeRequest("py", sources["Python"], 4, 1)]
+    assert _group_ids(read_github_code_group(fourth, SharedLoaderParameters(index_dir=index_dir, columns=["id"]), discover=discover_at(4))) == {
+        "py": ["b3"],
+    }
+    fifth = [GithubCodeRequest("py", sources["Python"], 5, 1)]  # b6 lies in the last group: the third and fourth are read
+    assert _group_ids(read_github_code_group(fifth, SharedLoaderParameters(index_dir=index_dir, columns=["id"]), discover=discover_at(4))) == {
+        "py": ["b6"], "extra:Java": ["b4", "b7"],
+    }
+
+
+def test_discover_needs_key_of_and_a_passive_keyed_request(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.parquet", _rows("a", 4, _three_languages))
+    index = hub_file_index(_src(load_kwargs={"data_files": "data/*.parquet", **REMOTE}), None, SharedLoaderParameters())
+    with pytest.raises(ValueError, match="discover needs key_of"):
+        list(read_rows_multi(index, [language_request("py", "Python", 0, 1)], discover=lambda key: None))
+    bad = read_rows_multi(
+        index, [language_request("py", "Python", 0, 2)], key_of=lambda row: f"language={row['language']}",
+        discover=lambda key: language_request("x", "Java", 0, 1),  # active, not passive
+    )
+    with pytest.raises(ValueError, match="must return a passive request"):
+        list(bad)
+
+
+def test_passive_requests_take_nothing_from_streamed_files(hub: FakeHub, tmp_path: Path) -> None:
+    hub.add("data/a.jsonl", _rows("a", 6, _three_languages))
+    index = hub_file_index(_src(load_kwargs={"data_files": "data/*.jsonl", **REMOTE}), None, SharedLoaderParameters())
+    requests = [language_request("py", "Python", 0, 2), language_request("java", "Java", 0, 0, passive=True)]
+    pairs = list(read_rows_multi(index, requests, key_of=lambda row: f"language={row['language']}"))
+    assert [(name, row["id"]) for name, row in pairs] == [("py", "a0"), ("py", "a3")]
+
+
+def test_index_records_every_key_of_a_classified_group_and_synthesises_zeros(tmp_path: Path) -> None:
+    index = FileIndex(REPO, REV, "data/*.parquet", files=["f"], row_groups={"f": [2, 2, 2]}, path=tmp_path / "index.json")
+    index.record_group_keys("f", 0, {"k": 1})
+    index.record_group_keys("f", 1, {})
+    index.record_group_keys("f", 2, {"k": 2, "z": 1})
+    assert index.group_counts == {"k": {"f": [1, 0, 2]}, "z": {"f": [0, 0, 1]}} and index.full_counts == {"f": 3}
+    assert index.known_group_counts("never", "f") == [0, 0, 0] and index.count("never", "f") == 0 and index.count("k", "f") == 3
+    index.record_complete_file_counts("f", ["never"])
+    assert index.keyed_counts == {"k": {"f": 3}, "z": {"f": 1}, "never": {"f": 0}}
+    # a group that does not continue the classified prefix records only keys whose own prefix ends right before it
+    other = FileIndex(REPO, REV, "data/*.parquet", files=["g"], row_groups={"g": [2, 2, 2]})
+    other.record_group_keys("g", 2, {"k": 1})
+    assert other.group_counts == {} and other.full_counts == {} and other.count("k", "g") is None
+    other.record_group_keys("g", 0, {"k": 1})
+    assert other.known_group_counts("k", "g") == [1] and other.count("k", "g") is None  # groups 1 and 2 unknown
+    # persisted and loaded; an index file written before the section existed loads with none
+    index.save()
+    loaded = FileIndex._load(REPO, REV, "data/*.parquet", tmp_path / "index.json")
+    assert loaded.full_counts == {"f": 3} and loaded.known_group_counts("never", "f") == [0, 0, 0]
+    without = json.loads((tmp_path / "index.json").read_text())
+    del without["full_counts"]
+    (tmp_path / "old.json").write_text(json.dumps(without))
+    assert FileIndex._load(REPO, REV, "data/*.parquet", tmp_path / "old.json").full_counts == {}
