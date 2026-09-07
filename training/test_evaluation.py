@@ -4,6 +4,7 @@ Tests for `training.evaluation`: the per-depth validation loss (batch-major, ave
 delivered), the empty-loader error and the evaluation-step rule.
 """
 
+import random
 from typing import Any
 
 import pytest
@@ -63,18 +64,18 @@ def test_evaluate_reports_every_depth(
     monkeypatch.setattr(RecurrentGPT, "forward", spy)
     torch.manual_seed(1)  # the latent state is drawn from the global RNG; batch 1 is scored at every depth first
     metrics = evaluate(settings, cpu_backend, tiny_model, batches)
-    expected = {"val_loss", "val_ppl", "val_loss/v"} | {f"val_{k}_{d}" for k in ("loss", "ppl") for d in (1, 3, "[2, 2]")}
+    expected = {"val_loss", "val_ppl", "val_loss/v"} | {f"val_{k}_{d}" for k in ("loss", "ppl") for d in (1, 3, "2-2")}
     assert set(metrics) == expected
     assert all(torch.isfinite(v) for v in metrics.values())
-    assert metrics["val_loss"] == metrics["val_loss_[2, 2]"]
+    assert metrics["val_loss"] == metrics["val_loss_2-2"]
     assert torch.allclose(metrics["val_ppl_1"], metrics["val_loss_1"].exp())
     assert tiny_model.training  # restored to train mode
-    # CHANGED (was depth-major, `eval_iters` forwards per depth in a row): the loop is now batch-major, every depth
-    # scoring the batch in hand before the next batch is fetched, still one (depth, 0) pair per core block
+    # the loop is batch-major: every depth scores the batch in hand before the next batch is fetched, with one
+    # (depth, 0) pair per core block
     per_batch = [(False, [(1, 0), (1, 0)]), (False, [(3, 0), (3, 0)]), (False, [(2, 0), (2, 0)])]
     assert seen == per_batch * 2  # `eval_iters` = 2 batches
     # the depth actually changes the computation
-    assert metrics["val_loss_1"] != metrics["val_loss_3"] != metrics["val_loss_[2, 2]"]
+    assert metrics["val_loss_1"] != metrics["val_loss_3"] != metrics["val_loss_2-2"]
     # each depth is the mean over the eval_iters batches (replaying the same RNG stream batch by batch)
     with torch.no_grad():
         torch.manual_seed(1)
@@ -82,9 +83,57 @@ def test_evaluate_reports_every_depth(
         replay = [
             [tiny_model(x, labels=y, num_steps=steps)["loss"] for _, steps in per_batch] for x, y, _ in batches[:2]
         ]
-    for depth_idx, depth in enumerate((1, 3, "[2, 2]")):
+    for depth_idx, depth in enumerate((1, 3, "2-2")):
         expected_loss = torch.stack([losses[depth_idx] for losses in replay]).mean().item()
         assert metrics[f"val_loss_{depth}"].item() == pytest.approx(expected_loss, rel=1e-6)
+
+
+def test_evaluate_leaves_the_global_rng_where_it_found_it(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    `evaluate` runs under `torch.random.fork_rng`, so the training stream continues as if no validation had run:
+    the global torch generator (and python's `random`, which validation never touches) is unchanged afterwards.
+    That is what makes the evaluation knobs resumable (`SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME`).
+    """
+
+    settings.partial_depth_eval = [1]
+    settings.eval_iters = 2
+    batches = _batches(3)
+    torch.manual_seed(5)
+    random.seed(5)
+    torch_state, python_state = torch.get_rng_state(), random.getstate()
+
+    metrics = evaluate(settings, cpu_backend, tiny_model, batches)
+
+    assert torch.equal(torch.get_rng_state(), torch_state) and random.getstate() == python_state
+    assert torch.isfinite(metrics["val_loss"])
+    # not vacuous: the same forwards outside the fork DO advance the global generator (the latent state is drawn
+    # from it), so an evaluation without the fork would shift the training draws
+    with torch.no_grad():
+        tiny_model.eval()
+        tiny_model(batches[0].input_ids, labels=batches[0].labels, num_steps=[(1, 0), (1, 0)])
+    tiny_model.train()
+    assert not torch.equal(torch.get_rng_state(), torch_state)
+
+
+def test_evaluate_restores_train_mode_when_a_forward_raises(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The model is left as it was found on every path out of `_evaluate`, an exception in a validation forward
+    included (today it ends the run, but nothing about eval mode should depend on that).
+    """
+
+    settings.partial_depth_eval = []
+
+    def boom(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("forward failed")
+
+    monkeypatch.setattr(RecurrentGPT, "forward", boom)
+    with pytest.raises(RuntimeError, match="forward failed"):
+        evaluate(settings, cpu_backend, tiny_model, _batches(1))
+    assert tiny_model.training
 
 
 def test_evaluate_averages_the_batches_actually_delivered(
@@ -109,7 +158,7 @@ def test_evaluate_averages_the_batches_actually_delivered(
             [tiny_model(x, labels=y, num_steps=[(d, 0), (d, 0)])["loss"] for d in (1, 2)] for x, y, _ in batches
         ]
     tiny_model.train()
-    for depth_idx, depth in enumerate((1, "[2, 2]")):
+    for depth_idx, depth in enumerate((1, "2-2")):
         total = sum(losses[depth_idx].item() for losses in replay)
         assert metrics[f"val_loss_{depth}"].item() == pytest.approx(total / len(batches), rel=1e-6)
         assert metrics[f"val_loss_{depth}"].item() != pytest.approx(total / settings.eval_iters, rel=1e-3)  # the bug
@@ -169,9 +218,8 @@ def test_evaluate_iterates_the_loader_once(
     tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    CHANGED (was one `iter()` per depth): the batch-major loop creates exactly ONE iterator per evaluation.
-    Each `iter()` of a DataLoader draws a base seed from the loaders' private generator, so the number of
-    iterations decides how far that generator advances.
+    The batch-major loop creates exactly ONE iterator per evaluation. Each `iter()` of a DataLoader draws a base
+    seed from the loaders' private generator, so the number of iterations decides how far that generator advances.
     """
 
     settings.partial_depth_eval = [1]

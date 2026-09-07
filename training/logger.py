@@ -649,7 +649,7 @@ class RunLogger:
         metrics |= validation or {}
         metrics |= {
             "loss": _to_scalar(result.loss),
-            "ppl": _to_scalar(result.log_ppl.exp()),
+            "ppl": _to_scalar(result.loss.exp()),  # StepResult has no log_ppl any more: it was the same tensor
             "lr": result.learning_rate,
             "grad_norm": _to_scalar(result.grad_norm),
             "step": progress.step,

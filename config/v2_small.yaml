@@ -1,18 +1,23 @@
-# Final thesis run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
+# Small v2 run (v2_small): a 39M-parameter recurrent model on the 50M-token v2 dataset, expressed for one local GPU.
 #
 # This file lists EVERY run setting (`training/settings.py:Settings`) with its value, so the available knobs are
 # visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
-# command line: `python training/train.py --config config/crow_300m_final.yaml --run_name my-run`.
+# command line: `python training/train.py --config config/v2_small.yaml --run_name my-run`.
 #
-# All step values are OPTIMIZER steps. One step = micro_batches_per_step × tokens_per_micro_batch = 64 × 8192 ≈ 0.5M
-# tokens; the stage boundary summary at startup lists the resulting step counts.
-# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64, save 8192 → 128, eval 1024 → 16.)
+# All step values are OPTIMIZER steps. One step = micro_batches_per_step x tokens_per_micro_batch = 64 x 8192 =
+# 524,288 tokens; the stage boundary summary at startup lists the resulting step counts. With the budgets of
+# config/datasets/v2_50M_tokens.yaml (30M + 15M + 5M tokens) the run is 57 + 28 + 9 = 94 steps, the transition
+# windows at the stage ends 5 and 2 steps. Consequences of the values below at that length: warmup_steps 8 ramps the
+# LR up over the first 8 of the 57 pretrain_phase1 steps, cooldown_steps 8 ramps it down over 8 of the 9 finetune
+# steps, so that stage is essentially the ramp-down; eval_step_interval 16 validates at steps 16, 32, 48, 64, 80 and
+# at the last step (94), so the finetune stage is validated once, at its end; save_step_interval 128 never fires,
+# checkpoints are written at steps 52 and 83 (before the two stage transitions) and at step 94 (save_last_step).
 #
-# Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/crow_300m_final.yaml;
-# `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets/weights (3.3B + 1.5B + 0.15B
-# tokens) and the tokenizer are defined in config/datasets/crow_300m_final.yaml. Training verifies the prepared data
-# under dataset_dir and builds what is missing (`auto_prepare`);
-# `python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_final.yaml` does the same up
+# Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/v2_small.yaml;
+# `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets and weights and the tokenizer
+# are defined in config/datasets/v2_50M_tokens.yaml. Training verifies the prepared data under dataset_dir and
+# builds what is missing (`auto_prepare`);
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/v2_50M_tokens.yaml` does the same up
 # front (export HF_TOKEN for the gated peS2o source). The only per-stage value that stays here is the base learning
 # rate (`stage_base_lrs`, positional, one per dataset-config stage).
 

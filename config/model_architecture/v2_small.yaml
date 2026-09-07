@@ -1,7 +1,8 @@
-# Model architecture of the final thesis run: crow-300m-final (308M parameters, three recurrent core blocks).
+# Model architecture of the v2_small run: 39.4M parameters (22.6M of them outside the tied 32768 x 512 embedding
+# table), three recurrent core blocks of two SandwichBlocks each.
 #
 # This file is the single definition of a `RecurrentConfig` (model/config.py). A run config (config/<run>.yaml)
-# references it as `model_architecture_config: config/model_architecture/crow_300m_final.yaml`, next to its
+# references it as `model_architecture_config: config/model_architecture/v2_small.yaml`, next to its
 # `dataset_config`, and may override single keys with `model_overwrite: {key: value}` (from the CLI:
 # `--model_overwrite '{"n_embd": 512}'`). Every key below is a tunable field; unknown keys are rejected on load.
 #

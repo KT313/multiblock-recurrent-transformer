@@ -366,7 +366,6 @@ def fake_result(
         step=step,
         learning_rate=1e-4 * step,
         loss=torch.tensor(loss),
-        log_ppl=torch.tensor(loss),
         grad_norm=torch.tensor(0.5),
         stage=stage_manager.get_stage_info(step),
         data_ids=ids,

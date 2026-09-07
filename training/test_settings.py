@@ -12,10 +12,14 @@ import pytest
 import yaml
 
 from model.blocks.recurrence import CHECKPOINT_MODES as MODEL_CHECKPOINT_MODES
+from training.lr_schedule import SCHEDULES as IMPLEMENTED_SCHEDULES
+from training.optim import OPTIMIZERS as BUILDABLE_OPTIMIZERS
 from training.settings import (
     CHECKPOINT_MODES,
     DEFAULT_BENCHMARK_TASKS,
+    LR_SCHEDULES,
     NON_NEGATIVE_SETTINGS,
+    OPTIMIZERS,
     POSITIVE_SETTINGS,
     REQUIRED_SETTINGS,
     OptimizerConfig,
@@ -26,6 +30,8 @@ from training.settings import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
 CROW_YAML = REPO_ROOT / "config" / "crow_300m_final.yaml"
+V2_SMALL_YAML = REPO_ROOT / "config" / "v2_small.yaml"
+SHIPPED_RUN_CONFIGS = (TINY_YAML, CROW_YAML, V2_SMALL_YAML)
 TINY_DATASET_CONFIG = "config/datasets/tiny.yaml"
 TINY_MODEL_ARCHITECTURE = "config/model_architecture/tiny.yaml"
 
@@ -153,12 +159,12 @@ def test_crow_yaml_effective_values_are_unchanged() -> None:
     assert cfg.resume_checkpoint_path is None and cfg.export_hf_path is None
 
 
-def test_run_configs_reference_existing_architecture_and_dataset_configs() -> None:
-    for path in (TINY_YAML, CROW_YAML):
-        cfg = parse_settings(["--config", str(path)])
-        assert (REPO_ROOT / cfg.model_architecture_config).is_file(), cfg.model_architecture_config
-        assert (REPO_ROOT / cfg.dataset_config).is_file(), cfg.dataset_config
-        assert cfg.model_architecture_config.startswith("config/model_architecture/")
+@pytest.mark.parametrize("path", SHIPPED_RUN_CONFIGS, ids=lambda path: path.stem)
+def test_run_configs_reference_existing_architecture_and_dataset_configs(path: Path) -> None:
+    cfg = parse_settings(["--config", str(path)])
+    assert (REPO_ROOT / cfg.model_architecture_config).is_file(), cfg.model_architecture_config
+    assert (REPO_ROOT / cfg.dataset_config).is_file(), cfg.dataset_config
+    assert cfg.model_architecture_config.startswith("config/model_architecture/")
 
 
 def test_parse_without_model_architecture_config_is_rejected() -> None:
@@ -437,6 +443,48 @@ def test_required_settings_are_rejected_when_empty(name: str) -> None:
     empty: Any = [] if name == "stage_base_lrs" else ""
     with pytest.raises(ValueError, match=f"{name} is required"):
         _settings(**{name: empty})
+
+
+def test_the_optimizer_and_schedule_names_are_checked_at_construction() -> None:
+    """
+    A typo in `optimizer` or `lr_schedule` used to surface after `resolve_dataset` (which may build the dataset for
+    hours) or at the first optimizer step; both are plan-level names, checked here from the YAML alone.
+    """
+
+    assert OPTIMIZERS == BUILDABLE_OPTIMIZERS and LR_SCHEDULES == IMPLEMENTED_SCHEDULES  # torch-free copies
+    for name in OPTIMIZERS:
+        assert _settings(optimizer=name).optimizer == name
+    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, not 'Adam'"):
+        _settings(optimizer="Adam")
+    with pytest.raises(ValueError, match="optimizer must be one of"):  # no dataset is read to get here
+        _settings(optimizer="Adam", dataset_config="config/datasets/does_not_exist.yaml")
+    for schedule in LR_SCHEDULES:
+        assert _settings(lr_schedule=schedule).lr_schedule == schedule
+    with pytest.raises(ValueError, match="lr_schedule must be one of trapezoid, not 'cosine'"):
+        _settings(lr_schedule="cosine")
+
+
+def test_partial_depth_eval_entries_must_be_positive() -> None:
+    """
+    A non-positive depth used to raise inside `canon_steps` at the first evaluation, an hour into a run.
+    """
+
+    assert _settings(partial_depth_eval=[1, 4]).partial_depth_eval == [1, 4]
+    for depths in ([0], [4, -1]):
+        with pytest.raises(ValueError, match="partial_depth_eval must list positive recurrence depths"):
+            _settings(partial_depth_eval=depths)
+
+
+def test_optim_config_lr_must_be_positive() -> None:
+    """
+    `optim_config.lr` is not the schedule's LR, but ELLISAdam divides by it (the decoupled weight decay is
+    `lr / init_lr x weight_decay`), so 0 or a negative value is a config mistake, not a disabled optimizer.
+    """
+
+    for lr in (0.0, -1e-4):
+        with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+            _settings(optim_config=OptimizerConfig(lr=lr))
+    assert _settings(optim_config=OptimizerConfig(lr=1e-4)).optim_config.lr == 1e-4
 
 
 # --- sequence packing --------------------------------------------------------------------------------------------

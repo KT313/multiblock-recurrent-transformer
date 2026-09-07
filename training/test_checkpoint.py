@@ -213,7 +213,9 @@ def test_is_checkpoint_step_table() -> None:
 # --- the resume compatibility check ------------------------------------------------------------------------------------
 
 # One differing value per compared setting, i.e. per Settings field NOT in the exemption tuple (the defaults are in
-# `training/settings.py`); `test_every_settings_field_is_classified` keeps this table complete.
+# `training/settings.py`); `test_every_settings_field_is_classified` keeps this table complete. The values are set on
+# a constructed `Settings`, not passed to it: `lr_schedule` has exactly one legal value, so no differing schedule
+# survives `Settings.__post_init__`, and what is under test here is the resume comparison, not the value rules.
 CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "stage_base_lrs": [2e-3],
     "seed": 7,
@@ -230,13 +232,10 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
     "grad_clip": 0.5,
-    "lr_schedule": "cosine",
+    "lr_schedule": "cosine",  # not constructible: one schedule is implemented (training/lr_schedule.py)
     "warmup_steps": 5,
     "cooldown_steps": 5,
     "min_lr": 1e-6,
-    "eval_step_interval": 7,
-    "eval_iters": 3,
-    "partial_depth_eval": [2],
 }
 
 
@@ -257,17 +256,17 @@ def test_check_settings_unchanged_catches_every_compared_setting(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    Each compared field fails a resume on its own, the eval knobs included: every forward draws from the global
-    torch RNG, so how often and how widely validation runs changes the training stream itself. The weight-decay
-    grouping flag is refused even under `allow_settings_change`: the restored optimizer keeps the checkpoint's
-    parameter groups, so the new value could never take effect.
+    Each compared field fails a resume on its own. The weight-decay grouping flag is refused even under
+    `allow_settings_change`: the restored optimizer keeps the checkpoint's parameter groups, so the new value could
+    never take effect.
     """
 
     metadata = _metadata(backend, tiny_model)
     config = tiny_model.config.to_dict()
     check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), config, False)  # nothing changed
     for key, value in CHANGED_COMPARED_VALUES.items():
-        changed = _settings(**({"run_name": "tiny", "seed": 42} | {key: value}))
+        changed = _settings(run_name="tiny", seed=42)
+        setattr(changed, key, value)  # set after construction, see the table's comment
         if key == PARAM_GROUPING_SETTING:
             for allow in (False, True):  # non-overridable
                 with pytest.raises(ValueError, match="parameter groups are restored from the checkpoint"):
@@ -282,12 +281,14 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    Paths, run bookkeeping, logging and the resume features themselves may differ from the checkpoint.
+    Paths, run bookkeeping, logging, the validation cadence and the resume features themselves may differ from the
+    checkpoint; validation runs under `torch.random.fork_rng`, so denser validation changes no training number.
     """
 
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
+        eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
         wandb_enabled=False, export_to_hf=True, auto_prepare=False,
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )

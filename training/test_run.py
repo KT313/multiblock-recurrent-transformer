@@ -479,10 +479,10 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
     assert eval_steps == [8, 16, 20]
     for s in eval_steps:
         m = history[s]
-        for depth in (1, "[2, 2]"):  # partial_depth_eval [1] plus the model's mean recurrence
+        for depth in (1, "2-2"):  # partial_depth_eval [1] plus the model's mean recurrence
             assert f"val_loss_{depth}" in m and f"val_ppl_{depth}" in m, (s, depth)
             assert torch.isfinite(torch.tensor(m[f"val_loss_{depth}"]))
-        assert m["val_loss"] == pytest.approx(m["val_loss_[2, 2]"])
+        assert m["val_loss"] == pytest.approx(m["val_loss_2-2"])
         assert m["val_ppl"] == pytest.approx(torch.tensor(m["val_loss"]).exp().item(), rel=1e-4)
 
 

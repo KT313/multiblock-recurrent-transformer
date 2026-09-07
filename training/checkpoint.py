@@ -106,8 +106,6 @@ def find_latest_checkpoint(run_directory: str | Path, run_name: str) -> Optional
 
 # `restore_checkpoint_if_resuming` compares EVERY `Settings` field against the checkpoint (`allow_settings_change`
 # overrides), so a new field is checked until it is exempted here. Each group says why differing is harmless.
-# Not exempt on purpose: the evaluation settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`). Every
-# forward consumes the global torch RNG, so how often and how much validation runs changes the training stream.
 SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # run identity and output location: where results go, not what is computed
     "run_name",
@@ -134,6 +132,11 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",
     "log_gradient_metrics",
+    # validation cadence and width: `evaluate` runs under `torch.random.fork_rng` (training/evaluation.py), so how
+    # often and how much validation runs leaves the training stream untouched; only the reported numbers change
+    "eval_step_interval",
+    "eval_iters",
+    "partial_depth_eval",
     # checkpoint cadence: when state is saved, not what it is
     "save_step_interval",
     "save_last_step",

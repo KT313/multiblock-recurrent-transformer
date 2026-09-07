@@ -71,7 +71,6 @@ class StepResult:
     step: int  # the optimizer step that was run
     learning_rate: float  # scheduled LR of that step
     loss: Tensor  # mean of the micro-batch losses, all-reduced (identity on one device)
-    log_ppl: Tensor  # mean of the micro-batch log-perplexities
     grad_norm: Tensor  # pre-clip gradient norm
     stage: StageInfo  # stage info at `step` (what the step trained on)
     data_ids: list[str]  # one entry per document of the step's packs (document count per source)
@@ -303,7 +302,6 @@ def run_one_optimizer_step(
     set_lr(optimizer, learning_rate)
 
     loss_sum = torch.zeros((), device=backend.device)
-    log_ppl_sum = torch.zeros((), device=backend.device)
     data_ids: list[str] = []
     data_tokens: dict[str, int] = {}  # document slots per data id, the pack tails left out
     padding_tokens = 0  # the tail positions without a document, over the step's packs
@@ -319,16 +317,17 @@ def run_one_optimizer_step(
                 outputs = model(**inputs)
             backend.backward(outputs["loss"] / accumulation_steps)
         loss_sum += outputs["loss"].detach()
-        log_ppl_sum += outputs["log_ppl"].detach()
     loss = loss_sum / accumulation_steps
-    log_ppl = log_ppl_sum / accumulation_steps
     if not torch.isfinite(loss):
         raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")
 
     grad_norm = backend.clip_grad_norm(model, settings.grad_clip)
     if not torch.isfinite(grad_norm):
         raise NonFiniteLossError(f"Gradient norm is non-finite at step {step}")
-    if step > 0:  # as in the thesis runs: the very first update is skipped (LR is 0 there anyway with warmup)
+    # thesis parity: the very first update is skipped, so step 0 costs a full forward+backward (and its gradient
+    # metrics) without changing a parameter. It is not a warmup effect (`warmup_steps` defaults to 0, i.e. step 0
+    # is scheduled at the full base LR); `test_step_zero_performs_no_update_step_one_does` pins it.
+    if step > 0:
         optimizer.step()
     metrics: dict[str, Tensor] = {}
     if (step + 1) % settings.log_step_interval == 0:
@@ -342,7 +341,6 @@ def run_one_optimizer_step(
         step=step,
         learning_rate=learning_rate,
         loss=backend.all_reduce(loss),
-        log_ppl=log_ppl,
         grad_norm=grad_norm,
         stage=stage,
         data_ids=data_ids,
