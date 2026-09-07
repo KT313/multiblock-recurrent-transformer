@@ -108,7 +108,12 @@ def collate_samples(
     samples: list[Sample] = []
     for row in batch:
         input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
-        input_ids, labels = input_ids[:max_tokens], labels[:max_tokens]
+        if input_ids.shape[0] > max_tokens or labels.shape[0] > max_tokens:
+            # cloned, not sliced: a slice is a view that keeps the WHOLE stored row alive (rows are stored cut at
+            # dataset_max_sequence_length, trained cut at training_max_sequence_length), and `torch.save` writes a
+            # view's whole storage - up to 8x the RAM of the pool and the buffers, the bytes the worker pickles
+            # through its queue and the bytes of every checkpoint. The copy is free next to the tokenization above.
+            input_ids, labels = input_ids[:max_tokens].clone(), labels[:max_tokens].clone()
         if has_supervised_label(labels, tokenizer):
             samples.append((input_ids, labels, row["data_id"]))
     return samples

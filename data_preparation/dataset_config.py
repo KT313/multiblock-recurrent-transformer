@@ -23,7 +23,7 @@ import hashlib
 import json
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from fractions import Fraction
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -799,11 +799,17 @@ def _is_non_negative_number(value: Any) -> bool:
 
 def _check_weights(what: str, weights: dict[str, float]) -> None:
     """
-    Non-empty, every weight > 0 (a zero weight would list a source a stage never draws from), sum 1.
+    Non-empty, every weight a finite number > 0 (a zero weight would list a source a stage never draws from), sum 1.
+
+    Finiteness first: every comparison against NaN is False, so a NaN weight would pass both checks below and then
+    drop its source out of the training mixture without a word (`BatchStream._pick_source` compares deficits).
     """
 
     if not weights:
         raise ValueError(f"{what}: must not be empty")
+    unusable = sorted(name for name, weight in weights.items() if not isfinite(weight))
+    if unusable:
+        raise ValueError(f"{what}: weights must be finite numbers, got {unusable} with a nan or inf weight")
     if any(weight <= 0 for weight in weights.values()):
         raise ValueError(f"{what}: weights must be > 0 (drop the key instead of a zero weight)")
     total = sum(weights.values())

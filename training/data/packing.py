@@ -140,11 +140,15 @@ class PackPool:
 
     def restore(self, samples: list[Sample]) -> None:
         """
-        Replace the pool's contents with `samples` (what `state` returned).
+        Replace the pool's contents with `samples` (what `state` returned), through `add`: a resume with a smaller
+        `tokens_per_micro_batch` (`allow_settings_change`) restores documents that no longer fit into a pack, and
+        they would sit in front of every pack forever - dropped here with the same warning `add` gives.
         """
 
-        self._samples = list(samples)
-        self.tokens = sum(shifted_length(sample) for sample in samples)
+        self._samples = []
+        self.tokens = 0
+        for sample in samples:
+            self.add(sample)
 
 
 def pack_samples(

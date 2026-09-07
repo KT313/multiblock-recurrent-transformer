@@ -385,26 +385,37 @@ def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: 
     A step that produced a non-finite loss or gradient norm did not update the model (`optimizer.step` never ran),
     so the model and optimizer state are those of the completed steps: save them, unless no step completed yet.
     Returns the note for the error message.
+
+    Written as `...-failed.pth`, beside (never over) the regular checkpoint of the same step, and skipped by
+    `find_latest_checkpoint` so a plain `resume: true` continues from the last regular checkpoint. The data stream
+    is the one AFTER the failed step: the step read all its micro-batches before the loss was checked, so a resume
+    from this file re-runs the step on the NEXT documents and the failed step's documents are skipped. To train
+    them, resume from a regular checkpoint instead.
     """
 
     if state.progress.step == 0:
         return "no checkpoint written (the first step failed)"
     state.optimizer.zero_grad(set_to_none=True)
-    return f"the model before this step is checkpointed as {save_run_checkpoint(state, logger, batches)}"
+    path = save_run_checkpoint(state, logger, batches, failed=True)
+    return (
+        f"the model before this step is checkpointed as {path} (resuming from it continues AFTER this step's "
+        "documents, which are skipped; the regular checkpoints are untouched)"
+    )
 
 
-def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> Path:
+def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream, failed: bool = False) -> Path:
     """
     Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
     Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
     the stage the run is heading for (`StageManager.entering_stage_at`). Numerics: called after evaluation and
-    logging, so the stored RNG state includes the evaluation draws.
+    logging, so the stored RNG state includes the evaluation draws. `failed` appends `-failed` to the name, for the
+    checkpoint of a step that ended the run on a non-finite loss (`_checkpoint_before_failed_step`).
     """
 
     settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
     stage_end = stage_manager.stage_ending_at(progress.step - 1)
-    path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end)
+    path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end, failed=failed)
     metadata = CheckpointMetadata(
         step=progress.step,
         stage=stage_manager.entering_stage_at(progress.step),

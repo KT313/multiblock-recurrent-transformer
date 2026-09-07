@@ -118,6 +118,26 @@ def test_pool_state_round_trip() -> None:
     assert len(pool) == 3
 
 
+def test_restore_drops_documents_the_new_pack_cannot_hold(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    `restore` applies `add`'s size check: resuming with a smaller `tokens_per_micro_batch` (allowed by
+    `allow_settings_change`) would otherwise put documents into the pool that no pack can ever take. They would
+    sit in front of every pack forever, count towards `tokens` (so the pool under-refills) and, once they filled
+    it, hit `BatchStream`'s "unreachable" empty-pack error.
+    """
+
+    wide = PackPool(pack_length=50)
+    for tag, n in (("fits", 8), ("too-long", 30), ("also-fits", 5)):
+        assert wide.add(_sample(n, tag))
+
+    narrow = PackPool(pack_length=10)
+    with caplog.at_level(logging.WARNING, logger="training.data.packing"):
+        narrow.restore(wide.state())
+    assert [tag for _, _, tag in narrow.state()] == ["fits", "also-fits"] and narrow.tokens == 13
+    assert "Dropping a 31-token document of 'too-long'" in caplog.text
+    assert narrow.take_pack(), "the pool is packable again"
+
+
 def test_pool_rejects_a_non_positive_pack_length() -> None:
     with pytest.raises(ValueError, match="pack_length must be positive"):
         PackPool(0)

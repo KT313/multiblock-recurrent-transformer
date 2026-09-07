@@ -313,7 +313,85 @@ def test_non_finite_loss_after_the_first_step_checkpoints_the_model_before_it(
     with pytest.raises(RuntimeError, match=r"Loss is nan at step 3. Terminating; the model before this step is checkpointed as .*step-00000003") as info:
         _run(yaml_path, cpu_backend)
     checkpoints = list((tmp_path / "out").rglob("*.pth"))
-    assert len(checkpoints) == 1 and checkpoints[0].name.startswith("step-00000003") and str(checkpoints[0]) in str(info.value)
+    assert len(checkpoints) == 1 and checkpoints[0].name == "step-00000003-tiny-failed.pth"
+    assert str(checkpoints[0]) in str(info.value)
+
+
+def test_non_finite_loss_writes_a_failed_checkpoint_beside_the_regular_one(
+    tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    The recovery checkpoint of a failed step never overwrites the regular checkpoint of the same step (it used to:
+    same path, `torch.save` truncates, the last good checkpoint was gone), and a plain resume does not pick it up.
+
+    Its data stream is the one AFTER the failed step: the step read all its micro-batches before the loss was
+    checked. So resuming from the REGULAR checkpoint re-runs the failed step on its own documents and ends with
+    exactly the stream the failed file stored, while resuming from the FAILED file runs the step on the documents
+    after them - which the error message says, because those documents are then never trained on.
+    """
+
+    out_dir = tmp_path / "out"
+    yaml_path = write_tiny_yaml(
+        tmp_path, tiny_dataset_dir, out_dir, precision="32", save_step_interval=3, export_to_hf=False
+    )
+    forward = RecurrentGPT.forward
+
+    def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
+        out = forward(self, *args, **kwargs)
+        if self.step == 3:
+            assert out["loss"] is not None
+            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        return out
+
+    monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
+    with pytest.raises(RuntimeError, match="continues AFTER this step's documents, which are skipped") as info:
+        _run(yaml_path, cpu_backend)
+    monkeypatch.undo()  # the resumed runs below must reach step 3 without a NaN
+
+    run_dir = out_dir / "tiny"
+    assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == [
+        "step-00000003-tiny-failed.pth",  # the failed step, written beside the regular checkpoint of step 3
+        "step-00000003-tiny.pth",  # save_step_interval=3: written when step 2 completed, still intact
+    ]
+    assert "step-00000003-tiny-failed.pth" in str(info.value)
+    latest = find_latest_checkpoint(run_dir, "tiny")
+    assert latest is not None and latest.name == "step-00000003-tiny.pth", "a plain resume skips the failed file"
+
+    def stream_of(path: Path) -> dict[str, Any]:
+        return cast(dict[str, Any], torch.load(path, map_location="cpu", weights_only=False)["data_stream"])
+
+    regular, failed = stream_of(latest), stream_of(checkpoint_dir(run_dir) / "step-00000003-tiny-failed.pth")
+    # the slots loaded per source, not the rows read: a step's documents come out of the 64-row worker buffer, so
+    # the row counters can stand still over a step while the pool moves by a step's worth of documents
+    assert failed["pool_loaded"]["synthetic_pretrain"] > regular["pool_loaded"]["synthetic_pretrain"]
+
+    def resume_one_step(name: str, checkpoint: Path) -> dict[str, Any]:
+        directory = tmp_path / name
+        directory.mkdir(parents=True, exist_ok=True)
+        resumed_out = directory / "out"
+        resumed_yaml = write_tiny_yaml(
+            directory,
+            tiny_dataset_dir,
+            resumed_out,
+            precision="32",
+            save_step_interval=3,
+            export_to_hf=False,
+            resume=True,
+            resume_checkpoint_path=str(checkpoint),
+        )
+        report = _run(resumed_yaml, cpu_backend, should_stop=lambda: True)  # one step, then the stop checkpoint
+        assert report.resumed_from == checkpoint and report.completed_steps == 4
+        return stream_of(checkpoint_dir(resumed_out / "tiny") / "step-00000004-tiny.pth")
+
+    from_regular = resume_one_step("from_regular", latest)
+    # replaying the failed step from the regular checkpoint ends exactly where the failed file already stood
+    assert from_regular["pool_loaded"] == failed["pool_loaded"]
+    assert from_regular["consumed_rows"] == failed["consumed_rows"]
+
+    from_failed = resume_one_step("from_failed", checkpoint_dir(run_dir) / "step-00000003-tiny-failed.pth")
+    assert from_failed["pool_loaded"]["synthetic_pretrain"] > failed["pool_loaded"]["synthetic_pretrain"], (
+        "resuming from the failed file runs the step on the documents AFTER the ones it stored"
+    )
 
 
 def test_non_finite_grad_norm_terminates(
