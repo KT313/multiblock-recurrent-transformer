@@ -10,7 +10,7 @@ module assembles them into `RecurrentGPT` and binds the recurrence to the model'
 """
 
 from functools import partial
-from typing import cast
+from typing import Callable, cast
 
 import torch
 from torch import Tensor
@@ -187,6 +187,22 @@ class RecurrentGPT(torch.nn.Module):
         self.step: int = 0
         self.reset_parameters()
 
+    def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> "RecurrentGPT":
+        """
+        `torch.nn.Module._apply` (`.to`, `.cuda`, `.float`, ...) with the RoPE table kept in float32.
+
+        `freqs_cis` is an ordinary buffer, so `model.to(torch.bfloat16)` would round its cos/sin (2e-3 for the
+        thesis table) and every rotation after that would use the rounded angles; the table is not a parameter and
+        costs nothing in fp32. The pre-cast values are put back rather than widened again (widening a rounded table
+        keeps the rounding), on whatever device the move landed on. Device moves apply as usual.
+        """
+
+        table_before = self.freqs_cis
+        module = cast("RecurrentGPT", super()._apply(fn, recurse))  # type: ignore[no-untyped-call]  # torch stub gap
+        if module.freqs_cis.dtype != table_before.dtype:
+            module.freqs_cis = table_before.to(device=module.freqs_cis.device)
+        return module
+
     def _precompute_freqs_cis(self) -> Tensor:
         """
         The RoPE table for every position up to `model_max_sequence_length`.
@@ -218,7 +234,10 @@ class RecurrentGPT(torch.nn.Module):
         One forward pass: embedding, prelude, the recurrent core blocks, coda, final norm, LM head and, given
         `labels`, the loss.
 
-        Inputs. `labels` must be pre-shifted (the trainer's collate shifts; the HuggingFace wrapper shifts
+        Inputs. `input_ids` `(B, S)`; without `position_ids` S must be at most `model_max_sequence_length` (a longer
+        batch raises, because the RoPE rows are then the table's first S). With `position_ids` it is the positions
+        that must stay inside the table, not S: a pack of several documents is longer than any of them.
+        `labels` must be pre-shifted (the trainer's collate shifts; the HuggingFace wrapper shifts
         internally instead): the loss is `CE(logits[t], labels[t])`. `attention_mask`: a `(B, S)` padding mask
         (1 = keep) for left-padded generation, or the ready document mask of packed sequences
         (`document_attention_mask`: a `BlockMask` on CUDA, a `(B, 1, S, S)` bool tensor elsewhere) together with the
@@ -240,6 +259,18 @@ class RecurrentGPT(torch.nn.Module):
         `run_core_blocks` call (embedding and prelude; coda, final norm, LM head and loss). The core-block loop
         itself is eager by design, see `run_core_blocks`.
         """
+
+        # On `shape[1]`, not on a tensor value: a static guard under `torch.compile(dynamic=True)`. Without it the
+        # failure is a shape mismatch inside RoPE. Only for the path that takes the table's first S rows: with
+        # `position_ids` (packed training, left-padded generation) the length says nothing about the positions, and
+        # the bound that does hold there (`position_ids.max()`) is a tensor value, so checking it would break the
+        # graph; an out-of-range position still fails in the gather.
+        sequence_length = input_ids.shape[1]
+        if position_ids is None and sequence_length > self.config.model_max_sequence_length:
+            raise ValueError(
+                f"sequence length {sequence_length} is longer than model_max_sequence_length "
+                f"{self.config.model_max_sequence_length} (the RoPE table covers that many positions)"
+            )
 
         freqs_cis, mask = prepare_attention_inputs(self.freqs_cis, input_ids, attention_mask, position_ids)
 

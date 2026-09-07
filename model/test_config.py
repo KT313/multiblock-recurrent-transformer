@@ -4,6 +4,7 @@ Tests for `model.config`: per-block broadcasting, derived sizes, the shipped arc
 round trip. `tiny_config` / `TINY_ARCHITECTURE` are the shared helpers of the other `model/test_*.py` files.
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -112,7 +113,7 @@ def test_depth_arithmetic() -> None:
         mean_backprop_depth=[2, 1],
     )
     assert cfg.effective_expected_depth == 2 + 1 + (1 * 3 + 2 * 4)
-    assert cfg.mean_backprop_layers == 1 * 2 + 2 * 1
+    assert cfg.max_backprop_layers == 1 * 2 + 2 * 1
     assert cfg.init.num_layers == cfg.effective_expected_depth
 
 
@@ -124,7 +125,7 @@ def test_crow_architecture_yaml() -> None:
     assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
     assert cfg.mean_recurrence == [12, 12, 12] and cfg.mean_backprop_depth == [8, 8, 8]
     assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
-    assert cfg.mean_backprop_layers == 3 * 4 * 8
+    assert cfg.max_backprop_layers == 3 * 4 * 8
     assert cfg.padded_vocab_size == 32768
     assert cfg.head_size == 64
     assert cfg.intermediate_size == 4096 and cfg.model_max_sequence_length == 2048 and cfg.vocab_size == 32000
@@ -237,7 +238,7 @@ def test_rope_settings_accepts_dict() -> None:
 
 def test_to_dict_contains_only_dataclass_fields() -> None:
     d = tiny().to_dict()
-    assert "init" not in d and "head_size" not in d and "mean_backprop_layers" not in d
+    assert "init" not in d and "head_size" not in d and "max_backprop_layers" not in d
     assert d["rope_settings"] == {"rope_base": 50_000}
 
 
@@ -276,6 +277,47 @@ def test_degenerate_recurrence_values_are_rejected_at_config_time(overrides: dic
 
     with pytest.raises(ValueError, match=match):
         tiny(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"num_attention_heads": 0}, "num_attention_heads must be >= 1"),
+        ({"n_embd": 0}, "n_embd must be >= 1"),
+        ({"padding_multiple": 0}, "padding_multiple must be >= 1"),
+        ({"vocab_size": 0}, "vocab_size must be >= 1"),
+        ({"model_max_sequence_length": 0}, "model_max_sequence_length must be >= 1"),
+        ({"intermediate_size": 0}, "intermediate_size must be >= 1"),
+        ({"norm_eps": 0.0}, "norm_eps must be > 0"),
+        ({"norm_eps": -1e-6}, "norm_eps must be > 0"),
+        ({"rope_settings": {"rope_base": 0}}, "rope_base must be > 0"),
+    ],
+)
+def test_degenerate_sizes_are_rejected_at_config_time(overrides: dict[str, object], match: str) -> None:
+    """
+    These used to reach a ZeroDivisionError in `find_multiple`, an empty embedding table or a division by zero
+    head count instead.
+    """
+
+    with pytest.raises(ValueError, match=match):
+        tiny(**overrides)
+
+
+def test_intermediate_size_none_still_defaults_to_four_times_n_embd() -> None:
+    assert tiny(intermediate_size=None).intermediate_size == 4 * tiny().n_embd
+
+
+def test_from_json_rejects_unknown_keys(tmp_path: Path) -> None:
+    """
+    Like `from_yaml`: a field renamed since the file was written must not be dropped silently.
+    """
+
+    path = tmp_path / "cfg.json"
+    written = tiny().to_dict()
+    written["block_size"] = 128
+    path.write_text(json.dumps(written), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown RecurrentConfig key"):
+        RecurrentConfig.from_json(path)
 
 
 @pytest.mark.parametrize("value", ["none", "core", "all"])

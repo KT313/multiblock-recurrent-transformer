@@ -147,7 +147,24 @@ def test_config_round_trip() -> None:
     assert hf_cfg.tie_word_embeddings is True
     back = hf_cfg.to_recurrent_config()
     assert back.to_dict() == cfg.to_dict()
-    assert back.head_size == cfg.head_size and back.mean_backprop_layers == cfg.mean_backprop_layers
+    assert back.head_size == cfg.head_size and back.max_backprop_layers == cfg.max_backprop_layers
+
+
+def test_hf_config_from_a_recurrent_config_dict_keeps_the_rope_base() -> None:
+    """
+    `RecurrentConfig.to_dict()` emits the nested `rope_settings`, not `rope_base`; it used to fall through to
+    `PretrainedConfig` as an opaque attribute while `rope_base` stayed at its default.
+    """
+
+    cfg = tiny_config(rope_settings=RoPESettings(rope_base=777))
+    hf_cfg = RecurrentGPTConfig(**cfg.to_dict())
+    assert hf_cfg.rope_base == 777
+    assert hf_cfg.to_recurrent_config().to_dict() == cfg.to_dict()
+
+
+def test_hf_config_rejects_a_rope_base_disagreeing_with_rope_settings() -> None:
+    with pytest.raises(ValueError, match="disagree"):
+        RecurrentGPTConfig(rope_base=1, rope_settings={"rope_base": 2})
 
 
 def test_hf_config_defaults_are_the_dataclass_defaults() -> None:

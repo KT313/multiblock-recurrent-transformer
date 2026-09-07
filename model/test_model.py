@@ -17,7 +17,7 @@ import model.model as model_module
 from model.blocks import recurrence
 from model.blocks.recurrence import sample_recurrence_steps
 from model.blocks.sandwich import SandwichBlock
-from model.layers.attention import document_attention_mask, precompute_freqs_cis
+from model.layers.attention import apply_rotary_emb_complex_like, document_attention_mask, precompute_freqs_cis
 from model.layers.norms import RMSNorm
 from model.model import RecurrentGPT, TransformerModules
 
@@ -157,6 +157,30 @@ def test_precompute_freqs_cis_method_matches_function() -> None:
     expected = precompute_freqs_cis(cfg.head_size, cfg.model_max_sequence_length, cfg.rope_settings.rope_base)
     assert torch.equal(m._precompute_freqs_cis(), expected)
     assert torch.equal(m.freqs_cis, expected)
+
+
+def test_rope_table_stays_fp32_when_the_model_is_cast_to_bfloat16() -> None:
+    """
+    `.to(torch.bfloat16)` (what a third-party user of the exported model may do) must leave the RoPE table alone:
+    a bf16 table rounds every cos/sin by about 2e-3 and every rotation after that uses the rounded angles.
+    """
+
+    fp32_model = seeded_tiny()
+    bf16_model = seeded_tiny().to(torch.bfloat16)
+    assert bf16_model.freqs_cis.dtype == torch.float32
+    assert bf16_model.transformer.wte.weight.dtype == torch.bfloat16  # the parameters were cast
+
+    torch.manual_seed(0)
+    S, hd = 8, fp32_model.config.head_size
+    q, k = torch.randn(2, S, 3, hd), torch.randn(2, S, 3, hd)
+    expected_q, expected_k = apply_rotary_emb_complex_like(q, k, fp32_model.freqs_cis[:, :S])
+    got_q, got_k = apply_rotary_emb_complex_like(q, k, bf16_model.freqs_cis[:, :S])
+    torch.testing.assert_close(got_q, expected_q, atol=1e-7, rtol=0)
+    torch.testing.assert_close(got_k, expected_k, atol=1e-7, rtol=0)
+
+    # the test has teeth: rotating by a rounded table is off by far more than that tolerance
+    rounded_q, _ = apply_rotary_emb_complex_like(q, k, fp32_model.freqs_cis[:, :S].to(torch.bfloat16))
+    assert (rounded_q - expected_q).abs().max().item() > 1e-4
 
 
 def test_reset_parameters_reinitializes_embedding_and_norms_only() -> None:
@@ -428,6 +452,39 @@ def test_position_ids_select_rope_rows(tiny_model: RecurrentGPT) -> None:
     torch.manual_seed(1)
     d = tiny_model(x, position_ids=torch.tensor([0, 1, 2, 30, 31, 32]), return_logits=True)["logits"]
     assert not torch.allclose(a, d)
+
+
+def test_a_sequence_longer_than_the_model_maximum_raises(tiny_model: RecurrentGPT) -> None:
+    """
+    The failure used to be a shape mismatch inside RoPE. Only for the path that takes the table's first S rows.
+    """
+
+    max_length = tiny_model.config.model_max_sequence_length
+    with pytest.raises(ValueError, match=f"{max_length + 1} is longer than model_max_sequence_length"):
+        tiny_model(ids(1, max_length + 1))
+    tiny_model(ids(1, max_length))  # the maximum itself is accepted
+
+
+def test_a_pack_longer_than_the_model_maximum_is_accepted_with_per_document_positions(
+    tiny_model: RecurrentGPT,
+) -> None:
+    """
+    Packed training feeds packs of several documents: the pack is longer than `model_max_sequence_length` while
+    every document, and so every position, fits. The length guard must not fire on that.
+    """
+
+    max_length = tiny_model.config.model_max_sequence_length
+    sequence_length = 2 * max_length
+    document_ids = torch.arange(sequence_length) // max_length
+    position_ids = torch.arange(sequence_length) % max_length
+    outputs = tiny_model(
+        ids(1, sequence_length),
+        attention_mask=document_attention_mask(document_ids[None]),
+        position_ids=position_ids[None],
+        return_logits=True,
+    )
+    logits = outputs["logits"]
+    assert logits is not None and logits.shape[:2] == (1, sequence_length)
 
 
 # --- prepare_attention_inputs -----------------------------------------------------------------------------------------

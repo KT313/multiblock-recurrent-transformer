@@ -100,6 +100,9 @@ class RecurrentConfig:
     state_init: Literal["normal"] = "normal"
     sampling_scheme: Literal["poisson-lognormal-filling"] = "poisson-lognormal-filling"
     mean_recurrence: int | list[int] = 12
+    # A cap, not a mean, despite the inherited name (kept: it is in the shipped YAMLs and in every checkpoint's
+    # config.json): the last `min(sampled total depth, mean_backprop_depth)` iterations of a block get gradient, so
+    # the average number of backprop iterations is below this whenever the sampler can draw a shorter total.
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
@@ -116,6 +119,8 @@ class RecurrentConfig:
                 f"bf16_residual_stream={self.bf16_residual_stream!r} is not supported, only one of "
                 f"{BF16_RESIDUAL_STREAM_VALUES}"
             )
+
+        self._validate_sizes()
 
         # Vocabulary: pad the embedding table up to a multiple of `padding_multiple`, unless the padded size is given
         # explicitly, in which case the vocabulary must fit into it.
@@ -149,19 +154,44 @@ class RecurrentConfig:
             recurrent_depth += n_layers * mean_recurrence
         self.effective_expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
 
-        # Mean number of core-block layers the gradient flows through (layers times backprop depth, summed).
-        self.mean_backprop_layers = 0
+        # Largest number of core-block layers the gradient can flow through (layers times the backprop cap, summed);
+        # the actual number is lower whenever a block draws fewer than `mean_backprop_depth` iterations.
+        self.max_backprop_layers = 0
         for n_layers, mean_backprop_depth in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth):
-            self.mean_backprop_layers += n_layers * mean_backprop_depth
+            self.max_backprop_layers += n_layers * mean_backprop_depth
 
         self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
+
+    def _validate_sizes(self) -> None:
+        """
+        Reject degenerate sizes before they turn into a `ZeroDivisionError` in `find_multiple`, an empty embedding
+        table or a silently useless RoPE table. Runs before the derived sizes are computed.
+        """
+
+        positive_ints = (
+            ("model_max_sequence_length", self.model_max_sequence_length),
+            ("n_embd", self.n_embd),
+            ("num_attention_heads", self.num_attention_heads),
+            ("vocab_size", self.vocab_size),
+            ("padding_multiple", self.padding_multiple),
+        )
+        for field_name, value in positive_ints:
+            if value < 1:
+                raise ValueError(f"{field_name} must be >= 1, got {value}")
+        # None means "4 * n_embd", filled in below.
+        if self.intermediate_size is not None and self.intermediate_size < 1:
+            raise ValueError(f"intermediate_size must be >= 1, got {self.intermediate_size}")
+        if self.norm_eps <= 0:
+            raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
+        if self.rope_settings.rope_base <= 0:
+            raise ValueError(f"rope_base must be > 0, got {self.rope_settings.rope_base}")
 
     def _validate_recurrence(self) -> None:
         """
         Reject values the sampler and the model would accept silently: a block without layers, a block that never
-        gets gradient (`mean_backprop_depth` 0), or a backprop depth above the mean recurrence (training would target
-        `mean_backprop_depth` while eval and the init scaling use `mean_recurrence`). A mean recurrence of 1 is fine
-        (the sampler then always draws a single pass).
+        gets gradient (`mean_backprop_depth` 0), or a backprop cap above the mean recurrence (training would then
+        backprop through every iteration it draws while eval and the init scaling use `mean_recurrence`). A mean
+        recurrence of 1 is fine (the sampler then always draws a single pass).
         """
 
         if self.n_layers_in_prelude < 0 or self.n_layers_in_coda < 0:
@@ -177,7 +207,8 @@ class RecurrentConfig:
                 raise ValueError(f"core block {block}: mean_backprop_depth must be >= 1, got {mean_backprop_depth} (no gradient would reach the block)")
             if mean_recurrence < mean_backprop_depth:
                 raise ValueError(
-                    f"core block {block}: mean_recurrence ({mean_recurrence}) must be >= mean_backprop_depth ({mean_backprop_depth})"
+                    f"core block {block}: mean_recurrence ({mean_recurrence}) must be >= mean_backprop_depth "
+                    f"({mean_backprop_depth}, the cap on the iterations that get gradient)"
                 )
 
     @classmethod
@@ -192,6 +223,33 @@ class RecurrentConfig:
         if not isinstance(loaded, dict):
             raise ValueError(f"{path}: expected a mapping of RecurrentConfig fields, got {type(loaded).__name__}")
 
+        cls._reject_unknown_keys(path, loaded)
+        kwargs: dict[str, Any] = dict(loaded)
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
+    @classmethod
+    def from_json(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
+        """
+        A config from a JSON file of the dataclass fields (what `to_json` writes). Unknown keys are rejected like
+        `from_yaml` does: a field renamed since the file was written must not be dropped silently.
+        """
+
+        with open(path, encoding="utf-8") as json_file:
+            loaded = json.load(json_file)
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{path}: expected a mapping of RecurrentConfig fields, got {type(loaded).__name__}")
+        cls._reject_unknown_keys(path, loaded)
+        kwargs = dict(loaded)
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
+    @classmethod
+    def _reject_unknown_keys(cls, path: str | Path, loaded: dict[str, Any]) -> None:
+        """
+        Raise unless every key of `loaded` names a dataclass field (`path` only for the message).
+        """
+
         known_field_names: set[str] = set()
         for dataclass_field in fields(cls):
             known_field_names.add(dataclass_field.name)
@@ -201,17 +259,6 @@ class RecurrentConfig:
                 unknown_keys.append(key)
         if unknown_keys:
             raise ValueError(f"{path}: unknown RecurrentConfig key(s) {sorted(unknown_keys)}")
-
-        kwargs: dict[str, Any] = dict(loaded)
-        kwargs.update(overrides)
-        return cls(**kwargs)
-
-    @classmethod
-    def from_json(cls, path: str | Path, **overrides: Any) -> "RecurrentConfig":
-        with open(path, encoding="utf-8") as json_file:
-            kwargs = json.load(json_file)
-        kwargs.update(overrides)
-        return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
         """

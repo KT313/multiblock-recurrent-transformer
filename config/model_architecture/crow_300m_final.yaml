@@ -20,7 +20,7 @@ num_attention_heads: 16        # attention heads; n_embd must be divisible by it
 # Vocabulary
 vocab_size: 32000              # size of the tokenizer vocabulary
 padding_multiple: 2048         # the embedding table is padded to a multiple of this
-padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (32768); an explicit value also caps vocab_size
+padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (32768); an explicit value must be >= vocab_size (a smaller one is rejected)
 tie_embeddings: true           # lm_head shares the token-embedding weights
 
 # Block details
@@ -35,4 +35,4 @@ n_layers_in_prelude: 2         # SandwichBlocks before the recurrent core (run o
 n_layers_in_coda: 2            # SandwichBlocks after the recurrent core (run once, before the output norm and lm_head)
 n_layers_in_recurrent_block: [4, 4, 4]   # SandwichBlocks per recurrent core block; one entry per core block (here 3 blocks)
 mean_recurrence: [12, 12, 12]  # mean number of iterations per block (training sampler mean and eval depth); one entry per core block
-mean_backprop_depth: [8, 8, 8] # mean number of iterations with gradients (truncated backprop); one entry per core block
+mean_backprop_depth: [8, 8, 8] # cap on the iterations with gradients per block (truncated backprop: the last min(sampled depth, this) iterations, so the average is lower); one entry per core block

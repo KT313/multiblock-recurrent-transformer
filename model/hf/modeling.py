@@ -88,11 +88,32 @@ def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_s
 class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # transformers' __init_subclass__ is untyped
     """
     `RecurrentConfig` fields as a `PretrainedConfig` (RoPE settings flattened to `rope_base`).
+
+    The nested `rope_settings` of `RecurrentConfig.to_dict()` is accepted as well, so
+    `RecurrentGPTConfig(**recurrent_config.to_dict())` keeps the RoPE base.
     """
 
     model_type = "recurrent_gpt"
 
-    def __init__(self, rope_base: int = 50_000, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        rope_base: int | None = None,
+        rope_settings: dict[str, Any] | RoPESettings | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # `rope_settings` is the nested form of the same field: `RecurrentGPTConfig(**recurrent_config.to_dict())`
+        # passes it instead of `rope_base`, and dropping it silently would leave the RoPE base at its default.
+        if rope_settings is not None:
+            if isinstance(rope_settings, RoPESettings):
+                nested_rope_base = rope_settings.rope_base
+            else:
+                nested_rope_base = RoPESettings(**rope_settings).rope_base
+            if rope_base is not None and int(rope_base) != int(nested_rope_base):
+                raise ValueError(f"rope_base ({rope_base}) and rope_settings ({nested_rope_base}) disagree")
+            rope_base = nested_rope_base
+        if rope_base is None:
+            rope_base = RoPESettings().rope_base
+
         # Defaults fill keys missing from a config.json (export_to_hf writes every field); the exported folder has no
         # access to config/model_architecture/, so the dataclass defaults apply.
         defaults = RecurrentConfig()
@@ -142,7 +163,6 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
     config_class = RecurrentGPTConfig
     base_model_prefix = "model"
     _no_split_modules = ["SandwichBlock"]
-    _supports_cache_class = False
     _tied_weights_keys = {"model.lm_head.weight": "model.transformer.wte.weight"}
 
     def __init__(self, config: RecurrentGPTConfig) -> None:
