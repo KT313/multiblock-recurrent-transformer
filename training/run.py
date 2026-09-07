@@ -413,6 +413,7 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
         model_config=plain_model(state.model).config.to_dict(),
         dataset_config_hash=state.dataset.config_hash,
         validation_rows=state.dataset.validation_rows,
+        source_rows=state.dataset.source_rows,
         data_stream=batches.state_dict(),
     )
     with logger.saving_checkpoint():

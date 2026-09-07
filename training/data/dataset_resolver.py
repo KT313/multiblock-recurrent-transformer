@@ -7,9 +7,10 @@ and the stage token budgets.
 The validation split is decided here, once per source and run: a source used only for training is read whole, one
 used only for validation is read whole as validation, one used for both holds out its first
 `ceil(validation_fraction × rows)` processed rows. Rows are counted once per source from the parquet footers and
-cross-checked against the manifest. The chosen `validation_rows` travel with every checkpoint and are verified on
-resume (`check_dataset_unchanged`). Every entry is checked at setup (`check_entries`, `check_validation_batches`)
-instead of mid-run.
+cross-checked against the manifest. The chosen `validation_rows` and the row count per source (`source_rows`)
+travel with every checkpoint and are verified on resume (`check_dataset_unchanged`): the stream resumes by row
+offset, so a source re-prepared in between would continue from other rows. Every entry is checked at setup
+(`check_entries`, `check_validation_batches`) instead of mid-run.
 
 Framework-neutral apart from `data_preparation.*`; no torch. The only cross-over between the run config and the
 dataset config happens here.
@@ -105,6 +106,7 @@ class ResolvedDataset:
     stages: list[ResolvedStage]
     train_sources: list[DataEntry]  # one per source any stage trains on, in config order; read by ONE loader all run
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
+    source_rows: dict[str, int]  # per source: the rows of processed/<source> (what a checkpoint stores and a resume verifies)
     rows_on_disk: dict[str, int]  # per processed directory (`DataEntry.data_dir`): its rows, counted once at setup
 
 
@@ -536,6 +538,7 @@ def resolve_dataset(
         stages=stages,
         train_sources=train_sources,
         validation_rows=validation_rows,
+        source_rows={name: rows_on_disk[str(layout.processed_dir(name))] for name in dataset_config.sources},
         rows_on_disk=rows_on_disk,
     )
 
@@ -547,9 +550,11 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
     """
     Verify that a checkpoint was written against the dataset the run now resolves to.
 
-    Compared: the dataset-config hash and the validation split (`{source: validation_rows}`, which only differs
-    when the data on disk changed; a resumed run would then validate on rows it trained on). A mismatch raises
-    `RuntimeError` naming every difference, unless `allow_change` (`allow_dataset_change`), which only warns.
+    Compared: the dataset-config hash, the rows per source (`{source: rows}`: the stream resumes by row offset
+    into each source, so a source re-prepared to another row count would continue from other rows) and the
+    validation split (`{source: validation_rows}`: a resumed run would otherwise validate on rows it trained on).
+    A mismatch raises `RuntimeError` naming every difference, unless `allow_change` (`allow_dataset_change`), which
+    only warns.
     """
 
     problems: list[str] = []
@@ -558,18 +563,17 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
             f"checkpoint was written with dataset config hash {metadata.dataset_config_hash}, the current dataset "
             f"config hashes to {dataset.config_hash}"
         )
-    stored, expected = metadata.validation_rows, dataset.validation_rows
-    mismatches = [
-        f"{name!r}: checkpoint {stored.get(name, 'absent')}, now {expected.get(name, 'absent')}"
-        for name in sorted(set(stored) | set(expected))
-        if stored.get(name) != expected.get(name)
-    ]
-    if mismatches:
-        problems.append(
-            "the validation split differs from the checkpoint's (validation rows per source: "
-            + "; ".join(mismatches)
-            + ")"
-        )
+    for what, stored, expected in (
+        ("the rows per source differ from the checkpoint's (processed rows per source: ", metadata.source_rows, dataset.source_rows),
+        ("the validation split differs from the checkpoint's (validation rows per source: ", metadata.validation_rows, dataset.validation_rows),
+    ):
+        mismatches = [
+            f"{name!r}: checkpoint {stored.get(name, 'absent')}, now {expected.get(name, 'absent')}"
+            for name in sorted(set(stored) | set(expected))
+            if stored.get(name) != expected.get(name)
+        ]
+        if mismatches:
+            problems.append(what + "; ".join(mismatches) + ")")
     if not problems:
         return
     message = "; ".join(problems)

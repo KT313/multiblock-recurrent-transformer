@@ -631,6 +631,9 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_instruct"))
     assert resolved.validation_rows == resolve_splits(resolved.config, tiny_layout, resolved.rows_on_disk)
     assert resolved.rows_on_disk == processed_row_counts(resolved.config, tiny_layout)
+    assert resolved.source_rows == {
+        name: resolved.rows_on_disk[str(tiny_layout.processed_dir(name))] for name in ("synthetic_pretrain", "synthetic_instruct")
+    }
     for entry in resolved.train_sources + [e for stage in resolved.stages for e in stage.val_data]:
         assert list(Path(entry.data_dir).glob("*.parquet")), entry
 
@@ -791,7 +794,10 @@ def test_training_longer_than_the_dataset_rows_is_refused_at_load(tmp_path: Path
 # --- resume checks --------------------------------------------------------------------------------------------------
 
 
-def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedDataset:
+SOURCE_ROWS = {"a": 40, "b": 10}  # the row counts the resume checks share unless a test changes them
+
+
+def _resolved(config_hash: str, validation_rows: dict[str, int], source_rows: dict[str, int] = SOURCE_ROWS) -> ResolvedDataset:
     return ResolvedDataset(
         config=load_dataset_config(TINY_DATASET_YAML),
         config_hash=config_hash,
@@ -799,11 +805,12 @@ def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedData
         stages=[],
         train_sources=[],
         validation_rows=validation_rows,
+        source_rows=source_rows,
         rows_on_disk={},
     )
 
 
-def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMetadata:
+def _metadata(config_hash: str, validation_rows: dict[str, int], source_rows: dict[str, int] = SOURCE_ROWS) -> CheckpointMetadata:
     return CheckpointMetadata(
         step=3,
         stage=0,
@@ -812,6 +819,7 @@ def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMe
         model_config={},
         dataset_config_hash=config_hash,
         validation_rows=validation_rows,
+        source_rows=source_rows,
         data_stream={},
     )
 
@@ -843,9 +851,28 @@ def test_check_dataset_unchanged_validation_rows_mismatch(caplog: pytest.LogCapt
     assert "'a': checkpoint 4, now 3" in caplog.text and "allow_dataset_change" in caplog.text
 
 
-def test_check_dataset_unchanged_reports_both_differences_at_once() -> None:
-    with pytest.raises(RuntimeError) as excinfo:
-        check_dataset_unchanged(_metadata("abc", {"a": 4}), _resolved("xyz", {"a": 3}), allow_change=False)
+def test_check_dataset_unchanged_source_rows_mismatch(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A source re-prepared to another row count is refused even when the validation split cannot see it (a
+    train-only source holds out 0 rows whatever its size): the stream resumes by row offset into the source.
+    """
+
+    split = {"a": 0, "b": 10}  # `a` is train-only: its validation rows are 0 at any size
+    with pytest.raises(RuntimeError, match=r"processed rows per source: 'a': checkpoint 40, now 55\)") as excinfo:
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 55, "b": 10}), allow_change=False)
     message = str(excinfo.value)
-    assert "hash abc, the current dataset config hashes to xyz; the validation split differs" in message
+    assert "'b'" not in message and "validation split" not in message and "allow_dataset_change: true" in message
+    with pytest.raises(RuntimeError, match="'b': checkpoint 10, now absent; 'c': checkpoint absent, now 3"):
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 40, "c": 3}), allow_change=False)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 55, "b": 10}), allow_change=True)
+    assert "'a': checkpoint 40, now 55" in caplog.text and "allow_dataset_change" in caplog.text
+
+
+def test_check_dataset_unchanged_reports_every_difference_at_once() -> None:
+    with pytest.raises(RuntimeError) as excinfo:
+        check_dataset_unchanged(_metadata("abc", {"a": 4}), _resolved("xyz", {"a": 3}, {"a": 30, "b": 10}), allow_change=False)
+    message = str(excinfo.value)
+    assert "hash abc, the current dataset config hashes to xyz; the rows per source differ" in message
+    assert "'a': checkpoint 40, now 30); the validation split differs" in message
     assert "'a': checkpoint 4, now 3" in message
