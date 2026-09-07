@@ -239,18 +239,48 @@ def test_wrapper_loss_is_the_next_token_loss_shifted_internally() -> None:
 def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None:
     hf_model = tiny_hf_model().train(True)
     x = ids()
-    hf_model.model.step = 3
     torch.manual_seed(1)
     out = hf_model(x, labels=x, return_dict=False)
     assert isinstance(out, tuple) and len(out) == 2
     torch.manual_seed(1)
-    ref = hf_model.model(x, return_logits=True)  # num_steps=None -> sampled at step 3
+    ref = hf_model.model(x, return_logits=True)  # num_steps=None -> sampled at the step the wrapper wrote
     assert torch.equal(out[1], ref["logits"])
     assert torch.equal(out[0], hf_model.model.loss(out[1][:, :-1].contiguous(), x[:, 1:].contiguous()))
     # ... which is not the eval path
     torch.manual_seed(1)
     eval_ref = hf_model.model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
     assert not torch.equal(out[1], eval_ref)
+
+
+def test_training_forwards_count_the_samplers_steps() -> None:
+    """
+    Nothing outside sets the inner model's `step` in a HF Trainer or PEFT run, so the wrapper counts its own
+    sampled training forwards; otherwise every forward would draw the depths of step 0 forever.
+    """
+
+    hf_model = tiny_hf_model().train(True)
+    x = ids()
+    assert hf_model._training_forwards == 0
+    torch.manual_seed(1)
+    first = hf_model(x).logits
+    assert hf_model.model.step == 0 and hf_model._training_forwards == 1
+    torch.manual_seed(1)
+    second = hf_model(x).logits  # the value written for the backward stays until the next forward
+    assert hf_model.model.step == 1 and hf_model._training_forwards == 2
+    assert not torch.equal(first, second), "the same seed and input, so only the drawn depths can differ"
+
+    # the forward at counter value s is the native forward at `step = s`
+    native = tiny_hf_model().train(True).model
+    for step, wrapped in enumerate((first, second)):
+        native.step = step
+        torch.manual_seed(1)
+        assert torch.equal(native(x, return_logits=True)["logits"], wrapped)
+
+    # an explicit `num_steps` (and eval mode) leaves the counter alone: only sampled forwards are sampler steps
+    hf_model(x, num_steps=[(2, 0), (2, 0)])
+    hf_model.train(False)
+    hf_model(x)
+    assert hf_model._training_forwards == 2
 
 
 def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,12 +305,11 @@ def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.Mo
 
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,1")
     hf_model = tiny_hf_model().train(True)
-    hf_model.model.step = 3
     x = ids()
     torch.manual_seed(1)
     out = hf_model(x).logits
     torch.manual_seed(1)
-    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps=None -> sampled at step 3
+    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps=None -> sampled at the wrapper's step
     assert torch.equal(out, sampled)
     torch.manual_seed(1)
     fixed = hf_model.model(x, return_logits=True, num_steps=[(1, 0), (1, 0)])["logits"]
@@ -334,6 +363,36 @@ def test_padded_vocabulary_columns_are_masked_and_never_generated() -> None:
     generated = generate(x[:, :4], max_new_tokens=6, do_sample=True)
     assert isinstance(generated, torch.Tensor) and (generated < 500).all()
     assert torch.isfinite(tiny_hf_model().train(False)(x).logits).all(), "an unpadded table is not masked"
+
+
+def test_a_label_in_the_padding_columns_is_ignored_instead_of_infinite() -> None:
+    """
+    A label in `[vocab_size, padded_vocab_size)` used to be a valid target for the loss while its logit column is
+    -inf here, which gave an infinite loss through the wrapper and a finite one natively. Both mask at
+    `vocab_size` now, so the label is ignored on either side.
+    """
+
+    cfg = tiny_config(vocab_size=500, padding_multiple=512)
+    torch.manual_seed(0)
+    hf_model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(cfg)).train(False)
+    x = ids() % 500
+    labels = x.clone()
+    labels[0, 5] = 505  # a padding row: inside the table, outside the vocabulary
+    ignored = x.clone()
+    ignored[0, 5] = -100
+
+    torch.manual_seed(1)  # the latent state is drawn per forward
+    loss = hf_model(x, labels=labels).loss
+    assert torch.isfinite(loss)
+    torch.manual_seed(1)
+    assert torch.equal(loss, hf_model(x, labels=ignored).loss)
+    inner = hf_model.model
+    torch.manual_seed(1)
+    logits = inner(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
+    assert logits is not None
+    shifted = logits[:, :-1, :].contiguous()
+    native = inner.loss(shifted, labels[:, 1:].contiguous())
+    assert torch.equal(native, inner.loss(shifted, ignored[:, 1:].contiguous()))
 
 
 @pytest.fixture

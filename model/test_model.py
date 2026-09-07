@@ -658,17 +658,32 @@ def test_loss_ignores_ignore_index_labels(tiny_model: RecurrentGPT) -> None:
     assert not torch.allclose(out["loss"], torch.nn.functional.cross_entropy(logits.view(-1, VOCAB), x.view(-1)))
 
 
-def test_out_of_range_labels_are_masked_too(tiny_model: RecurrentGPT) -> None:
-    x = ids()
+def test_out_of_range_labels_are_masked_too() -> None:
+    """
+    Labels are masked at `vocab_size`, not at the padded embedding table. The tiny architecture pads 512 to 512,
+    so this variant declares 500 real ids in the same 512 rows: a label of 505 addresses a padding row, which is
+    trained on no target and whose logit the HF wrapper sets to -inf, so both loss paths have to ignore it.
+    """
+
+    model = seeded_tiny(vocab_size=500)
+    assert model.config.padded_vocab_size == VOCAB
+    x = ids() % 500
     labels = x.clone()
-    labels[0, :10] = VOCAB + 5
+    labels[0, :10] = 505  # inside the embedding table, outside the vocabulary
+    labels[1, :5] = VOCAB + 5  # beyond the table
     ref = x.clone()
     ref[0, :10] = -100
+    ref[1, :5] = -100
+    assert torch.equal(model.mask_labels(labels), ref)
+
     torch.manual_seed(2)
-    a = tiny_model(x, labels=labels, num_steps=(1, 1))["loss"]
+    a = model(x, labels=labels, num_steps=(1, 1))["loss"]
     torch.manual_seed(2)
-    b = tiny_model(x, labels=ref, num_steps=(1, 1))["loss"]
+    b = model(x, labels=ref, num_steps=(1, 1))["loss"]
     assert torch.equal(a, b)
+    torch.manual_seed(2)  # the chunked path masks with the same bound
+    chunked = model(x, labels=labels, num_steps=(1, 1), return_token_losses_chunked_nograd=True)["loss"]
+    torch.testing.assert_close(chunked, a)
 
 
 # --- packed sequences ---------------------------------------------------------------------------------------------------

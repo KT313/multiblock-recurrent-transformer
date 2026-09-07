@@ -312,25 +312,28 @@ class RecurrentGPT(torch.nn.Module):
             logits = logits * self.config.init.logit_scale
         return logits
 
-    def mask_labels(self, labels: Tensor, n_classes: int | None = None) -> Tensor:
+    def mask_labels(self, labels: Tensor) -> Tensor:
         """
-        `labels` as the loss sees them: long, with every label outside `[0, n_classes)` (default: the padded
-        vocabulary) replaced by `ignore_index`.
+        `labels` as the loss sees them: long, with every label outside `[0, vocab_size)` replaced by `ignore_index`.
+
+        The bound is the real vocabulary, not the padded embedding table: the padding rows are trained on no target
+        and the HF wrapper sets their logits to -inf (`model/hf/modeling.py`), so a label pointing into them would
+        be an infinite loss there and a finite one here. `config.vocab_size` is a Python int, so the comparison is
+        no graph break under `torch.compile`; refusing such a label outright would be one, and the data pipeline
+        rejects ids the tokenizer cannot produce anyway.
         """
 
-        if n_classes is None:
-            n_classes = self.lm_head.weight.shape[0]
         labels = labels.to(torch.long)
-        invalid = (labels < 0) | (labels >= n_classes)
+        invalid = (labels < 0) | (labels >= self.config.vocab_size)
         return labels.masked_fill(invalid, self.ignore_index)
 
     def loss(self, logits: Tensor, labels: Tensor) -> Tensor:
         """
-        Mean cross-entropy over the vocabulary; labels outside `[0, vocab)` count as `ignore_index`.
+        Mean cross-entropy over the vocabulary; labels outside `[0, vocab_size)` count as `ignore_index`.
         """
 
-        n_classes = logits.shape[-1]
-        labels = self.mask_labels(labels, n_classes)
+        n_classes = logits.shape[-1]  # the padded table: every logit column is a class of the cross-entropy
+        labels = self.mask_labels(labels)
         return torch.nn.functional.cross_entropy(
             logits.view(-1, n_classes), labels.view(-1), ignore_index=self.ignore_index
         )
@@ -341,7 +344,7 @@ class RecurrentGPT(torch.nn.Module):
         """
 
         n_classes = logits.shape[-1]
-        labels = self.mask_labels(labels, n_classes)
+        labels = self.mask_labels(labels)
         losses = torch.nn.functional.cross_entropy(
             logits.view(-1, n_classes), labels.view(-1), ignore_index=self.ignore_index, reduction="none"
         )
