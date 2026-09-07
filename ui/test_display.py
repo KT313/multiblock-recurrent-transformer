@@ -6,6 +6,7 @@ suspension, and the one-row text.
 
 from __future__ import annotations
 
+import errno
 import io
 import logging
 import multiprocessing
@@ -32,12 +33,17 @@ class MinimalDisplay(LiveDisplay):
         super().__init__(stream=stream or io.StringIO(), console=console, refresh_per_second=50, log_lines=3)
         self.released = 0
         self.redirected = 0
+        self.captured = False  # what a subclass's capture would answer: set by the tests that need it
 
     def _release_streams(self) -> None:
         self.released += 1
 
     def _redirect_streams(self) -> None:
         self.redirected += 1
+
+    @property
+    def _streams_captured(self) -> bool:
+        return self.captured or self._live is not None
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         with self._lock:
@@ -115,8 +121,23 @@ def test_suspended_stops_the_display_and_hands_the_streams_back(display: Minimal
     assert _live_of(display) is not None and display.redirected == 1
     assert len(console_output(console)) > len(before), "the display came back"
     idle = MinimalDisplay(string_console())
-    with idle.suspended():  # without a display: a no-op
+    with idle.suspended():  # without a display and without a capture: a no-op
         assert idle.released == 0
+    assert idle.redirected == 0 and _live_of(idle) is None
+
+
+def test_suspended_hands_the_streams_back_while_the_display_is_off() -> None:
+    """
+    U-M1: a display closed by a render failure still has the capture on sys.stdout / sys.stderr; a prompt written
+    into a line sink would become a log record and the run would wait for an answer nobody was asked for.
+    """
+
+    display = MinimalDisplay(string_console())
+    display.captured = True
+    display.enabled = False
+    with display.suspended():
+        assert display.released == 1 and display.redirected == 0, "the real streams are back for the prompt"
+    assert display.redirected == 1 and _live_of(display) is None, "the capture is back, the closed display is not"
 
 
 def test_is_attached_covers_the_logger_and_its_children(display: MinimalDisplay) -> None:
@@ -249,17 +270,33 @@ def test_a_first_frame_that_fails_leaves_no_refresh_thread_behind() -> None:
     assert not set(threading.enumerate()) - threads, "no refresh thread was started for the closed display"
 
 
+class _FdStream(io.StringIO):
+    """
+    A stream with a descriptor, like the real stderr the data dashboard draws on.
+    """
+
+    def fileno(self) -> int:
+        return 2
+
+
+def _display_on_a_descriptor() -> tuple[MinimalDisplay, _FdStream]:
+    """
+    A display whose plain stream has a descriptor, drawing on a console of its own (so nothing here can dup2 the
+    test session's stderr away: `_silence_terminal` only touches the descriptor it also draws on).
+    """
+
+    stream = _FdStream()
+    display = MinimalDisplay(Console(file=io.StringIO(), force_terminal=True, width=80, height=24), stream=stream)
+    return display, stream
+
+
 def test_silencing_the_terminal_redirects_only_the_display_s_own_descriptor(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     `prepare.py > report.txt`: the data dashboard draws on stderr; stdout is the report and must survive the
     terminal's death.
     """
 
-    class Stderr(io.StringIO):
-        def fileno(self) -> int:
-            return 2
-
-    stream = Stderr()
+    stream = _FdStream()
     redirected: list[int] = []
     monkeypatch.setattr(os, "dup2", lambda _null, fd: redirected.append(fd))
     display = MinimalDisplay(Console(file=stream, force_terminal=True, width=80), stream=stream)
@@ -268,19 +305,61 @@ def test_silencing_the_terminal_redirects_only_the_display_s_own_descriptor(monk
     assert redirected == [2], "once, and stdout is left alone"
 
 
-def test_a_frame_that_fails_to_render_closes_the_display_and_the_run_goes_on(caplog: pytest.LogCaptureFixture) -> None:
-    display, _ = _dying_display()
+def test_a_frame_that_fails_to_render_closes_the_display_and_leaves_the_terminal_alone(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    U-H1: a layout bug is not a dead terminal. Silencing one for the other cost the run every line it had left:
+    the log lines, the kept lines, the traceback of a later failure and the interpreter's own exit message.
+    """
+
+    redirected: list[int] = []
+    monkeypatch.setattr(os, "dup2", lambda _null, fd: redirected.append(fd))
+    display, stream = _display_on_a_descriptor()
+    display._start_live()
     live = _live_of(display)
     assert live is not None
-    display._console.file = _RaisingFile()  # not an OSError: a rich layout error looks the same to the refresh thread
+    display._console.file = _RaisingFile()  # not an OSError: a rich layout error looks like this to the refresh thread
     with caplog.at_level(logging.WARNING, logger="ui.display"):
         live.refresh()
-    assert display.headless and not display.enabled and "render failed: RuntimeError('boom')" in caplog.text
+        live.refresh()  # the display is closed; a second failure is a no-op
+    assert not display.enabled and not display.headless and _live_of(display) is None
+    assert redirected == [] and display._console.file is not display._null_file, "the descriptor was not touched"
+    assert display._plain_stream is stream, "plain writes go to the real stream"
+    display.write("a line after the failure", keep=True)
+    assert stream.getvalue() == "a line after the failure\n"
+    assert [record.getMessage() for record in caplog.records] == [
+        "display failed (RuntimeError('boom')): the run continues with plain output"
+    ], "one warning, the second failure is silent"
+
+
+def test_a_first_frame_that_does_not_render_closes_the_display_instead_of_escaping(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    U-H2: `_start_live` runs half-way through `DataDashboard.__enter__`'s capture setup and from `suspended()`'s
+    finally; an escaping layout error left the process with hijacked streams and a root handler for good.
+    """
+
+    threads = set(threading.enumerate())
+    display = _BrokenFrameDisplay(string_console())
+    with caplog.at_level(logging.WARNING, logger="ui.display"):
+        display._start_live()  # does not raise
+    assert _live_of(display) is None and not display.enabled and not display.headless
+    assert "display failed (ValueError('layout bug'))" in caplog.text
+    assert not set(threading.enumerate()) - threads, "no refresh thread was left behind"
 
 
 class _RaisingFile(io.StringIO):
     def write(self, text: str) -> int:
         raise RuntimeError("boom")
+
+
+class _BrokenFrameDisplay(MinimalDisplay):
+    """
+    A display whose frame never renders (a layout bug, not a dead terminal).
+    """
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        raise ValueError("layout bug")
 
 
 def test_a_pending_loss_left_by_a_signal_handler_is_acted_on_at_the_next_refresh(caplog: pytest.LogCaptureFixture) -> None:
@@ -293,21 +372,86 @@ def test_a_pending_loss_left_by_a_signal_handler_is_acted_on_at_the_next_refresh
     assert display.headless and "terminal gone (SIGHUP: the terminal closed)" in caplog.text
 
 
-def test_sighup_marks_the_terminal_lost_instead_of_ending_the_process() -> None:
+def _probe_fails(_fd: int) -> os.terminal_size:
+    raise OSError(errno.EIO, "Input/output error")
+
+
+def _skip_off_the_main_thread() -> None:
     if threading.current_thread() is not threading.main_thread():
         pytest.skip("signal handlers are installed on the main thread only")
+
+
+def test_sighup_whose_terminal_answers_changes_nothing(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    U-M2: `kill -HUP` is a widespread "reload / notify" convention; taking it for a closed window blinded a
+    terminal that was right there.
+    """
+
+    _skip_off_the_main_thread()
+    monkeypatch.setattr(os, "dup2", lambda _null, _fd: None)
+    monkeypatch.setattr(os, "get_terminal_size", lambda _fd: os.terminal_size((80, 24)))
     previous = signal.getsignal(signal.SIGHUP)
-    display, file = _dying_display()
+    display, stream = _display_on_a_descriptor()
+    display._start_live()
+    try:
+        assert signal.getsignal(signal.SIGHUP) is not previous, "the display's handler is installed"
+        with caplog.at_level(logging.INFO, logger="ui.display"):
+            os.kill(os.getpid(), signal.SIGHUP)
+        assert [record.getMessage() for record in caplog.records] == ["SIGHUP received, terminal still open"]
+        assert not display.headless and display.enabled and display._plain_stream is stream
+        assert _live_of(display) is not None and display._null_file is None, "no /dev/null was even opened"
+    finally:
+        display._stop_live()
+    assert signal.getsignal(signal.SIGHUP) is previous, "the previous handler is back once the display stopped"
+
+
+def test_sighup_whose_probe_fails_silences_the_terminal_and_closes_the_display(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _skip_off_the_main_thread()
+    monkeypatch.setattr(os, "dup2", lambda _null, _fd: None)
+    monkeypatch.setattr(os, "get_terminal_size", _probe_fails)
+    display, stream = _display_on_a_descriptor()
+    display._start_live()
     live = _live_of(display)
     assert live is not None
-    assert signal.getsignal(signal.SIGHUP) is not previous, "the display's handler is installed"
-    os.kill(os.getpid(), signal.SIGHUP)
-    assert live.terminal_lost_pending == "SIGHUP: the terminal closed"
-    assert display._console.file is not file, "the handler already silenced the terminal"
-    live.refresh()
-    assert display.headless
-    display._stop_live()
-    assert signal.getsignal(signal.SIGHUP) is previous, "the previous handler is back once the display stopped"
+    try:
+        with caplog.at_level(logging.WARNING, logger="ui.display"):
+            os.kill(os.getpid(), signal.SIGHUP)
+            assert display._plain_stream is not stream, "the terminal is silenced right away"
+            assert live.terminal_lost_pending == "SIGHUP: the terminal closed", "the teardown is the refresh thread's"
+            live.refresh()  # what the refresh thread does 4-8 times a second
+        assert display.headless and not display.enabled and _live_of(display) is None
+        assert "terminal gone (SIGHUP: the terminal closed)" in caplog.text
+    finally:
+        display._stop_live()
+
+
+def test_sighup_after_the_display_closed_is_confirmed_and_handled_by_the_handler_itself(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A render failure on the refresh thread leaves the handler installed (it is restored from the main thread only)
+    and no Live to leave a note for. A real hangup afterwards must still be noticed here, not as an EIO deep in
+    the run.
+    """
+
+    _skip_off_the_main_thread()
+    monkeypatch.setattr(os, "dup2", lambda _null, _fd: None)
+    previous = signal.getsignal(signal.SIGHUP)
+    display, stream = _display_on_a_descriptor()
+    display._start_live()
+    closing = threading.Thread(target=display._display_failed, args=(ValueError("layout bug"),))  # the refresh thread's way
+    closing.start()
+    closing.join()
+    assert _live_of(display) is None and display._plain_stream is stream
+    assert signal.getsignal(signal.SIGHUP) is not previous, "the handler stays until the main thread stops the display"
+    monkeypatch.setattr(os, "get_terminal_size", _probe_fails)
+    with caplog.at_level(logging.WARNING, logger="ui.display"):
+        os.kill(os.getpid(), signal.SIGHUP)
+    assert display.headless and display._plain_stream is not stream
+    assert "terminal gone (SIGHUP: the terminal closed)" in caplog.text
+    assert signal.getsignal(signal.SIGHUP) is previous, "the handler restored itself on the main thread"
 
 
 @pytest.mark.timeout(10)

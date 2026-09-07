@@ -448,7 +448,9 @@ and the final table, no frame. Ctrl-C and SIGTERM leave the same way. When stder
 not a terminal (`nohup`, redirects) or `DATA_PREP_PROGRESS=0` is set, there is no dashboard and plain timestamped
 log lines are written instead. A terminal that dies mid-run (closed window, dropped SSH session) does not end the
 run: the display closes itself and the run continues headless. `tail -f dataset/build.log` shows it; start long
-runs under tmux to come back to a live display.
+runs under tmux to come back to a live display. A `SIGHUP` whose terminal is still there (`kill -HUP`, a
+supervisor's reload) is one log line and nothing else, and a frame that fails to draw closes only the display: the
+terminal keeps the log lines, the kept lines and any traceback that follows.
 
 ## Training auto-prepares
 
