@@ -156,6 +156,23 @@ def test_rope_keeps_input_dtype() -> None:
     assert qr.dtype == torch.bfloat16 and kr.dtype == torch.bfloat16
 
 
+def test_rope_rotates_in_fp32_with_a_bfloat16_table() -> None:
+    """
+    A cast table (`model.to(torch.bfloat16)` casts the buffer) must not drag the rotation into bf16: the result is
+    the fp32 rotation by the table's (rounded) angles, not a bf16 product of them.
+    """
+
+    torch.manual_seed(0)
+    hd, S = 16, 8
+    freqs = precompute_freqs_cis(hd, S, 50_000)
+    q, k = torch.randn(2, S, 3, hd), torch.randn(2, S, 3, hd)
+    qr, kr = apply_rotary_emb_complex_like(q, k, freqs.to(torch.bfloat16))
+    expected_q, expected_k = apply_rotary_emb_complex_like(q, k, freqs.to(torch.bfloat16).float())
+    assert qr.dtype == torch.float32 and kr.dtype == torch.float32
+    torch.testing.assert_close(qr, expected_q, atol=1e-7, rtol=0)
+    torch.testing.assert_close(kr, expected_k, atol=1e-7, rtol=0)
+
+
 def test_position_ids_select_freqs() -> None:
     """
     Using rows 4.. of the table for a sequence must equal computing at those positions directly.

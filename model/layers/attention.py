@@ -51,12 +51,18 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tu
 
     Adjacent feature pairs `(x[2j], x[2j+1])` are treated as complex numbers and multiplied by `e^(i * m * theta_j)`
     (https://github.com/t-vi/lit-llama/blob/9e5eb8b1b376d8ae24e79278008b7190961062e3/lit_llama/model.py).
+
+    `freqs_cis` is cast as well, so the rotation is fp32 whatever dtype the table arrives in (a no-op for the fp32
+    table `RecurrentGPT` keeps: torch would promote a bf16 table in the multiply anyway, but nothing here then
+    depends on that promotion). What a bf16 table costs is its own rounding, which no cast can undo; `RecurrentGPT`
+    keeps the buffer fp32 across `.to(dtype)` for that reason.
     """
 
     with torch.autocast("cuda", enabled=False):
         # q and k are rotated in one go: concatenated along the head axis, features split into pairs.
         qk_pairs = torch.cat([q, k], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()  # type: ignore[no-untyped-call]  # torch stub gap
         real, imag = qk_pairs[..., 0], qk_pairs[..., 1]  # (B, S, 2 * nh, hd // 2)
+        freqs_cis = freqs_cis.float()
         cos, sin = freqs_cis[..., 0], freqs_cis[..., 1]  # (1, S, 1, hd // 2)
         rotated = torch.stack([real * cos - imag * sin, imag * cos + real * sin], -1)
         rotated = rotated.flatten(3).type_as(q)  # pairs back to (B, S, 2 * nh, hd)
@@ -163,8 +169,6 @@ class CausalSelfAttention(torch.nn.Module):
     """
     Multi-head causal self-attention: fused qkv projection, optional q/k bias, RoPE, sdpa, output projection.
     """
-
-    __constants__ = ("n_head", "head_dim")
 
     def __init__(self, config: RecurrentConfig) -> None:
         super().__init__()
