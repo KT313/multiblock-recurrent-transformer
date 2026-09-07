@@ -25,6 +25,16 @@ from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 
 
+# The synthetic tokenizer knows tok_0..tok_255 and maps every other word to <pad>: prompts of real words would
+# encode to padding and complete to the empty string, which no assertion about generation could tell from a bug.
+IN_VOCAB_PROMPTS = [
+    Prompt("tok_3 tok_4 tok_5"),
+    instruction_prompt("tok_6 tok_7", "tok_8"),
+    Prompt("tok_9 tok_10 tok_11 tok_12 tok_13 tok_14"),
+    Prompt("tok_15 tok_16"),
+]
+
+
 @pytest.fixture
 def tokenizer(tiny_tokenizer_dir: Path) -> Tokenizer:
     return Tokenizer(tiny_tokenizer_dir)
@@ -126,18 +136,48 @@ def test_sample_from_cuts_at_eos_and_keeps_generated_pad_ids(tokenizer: Tokenize
 
 
 def test_generate_samples_greedy_is_deterministic_and_bounded(tiny_model: RecurrentGPT, tokenizer: Tokenizer) -> None:
-    prompts = [Prompt("hello world"), instruction_prompt("say hi"), Prompt("a much longer prompt with more tokens in it")]
+    prompts = IN_VOCAB_PROMPTS[:3]
     tiny_model.train()
     torch.manual_seed(0)
     first = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=5, batch_size=2)
     torch.manual_seed(1)  # the isolated RNG is seeded inside: the global state does not reach the initial latent draw
-    second = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=5, batch_size=3)
-    assert first == second and len(first) == 3 and tiny_model.training  # neither batching nor the global RNG changes greedy output
+    second = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=5, batch_size=2)
+    assert first == second and len(first) == 3 and tiny_model.training  # the global RNG does not change the output
     assert [sample.kind for sample in first] == [CONTINUATION, INSTRUCTION, CONTINUATION]
-    assert all(0 <= sample.new_tokens <= 5 for sample in first)  # an untrained model may emit EOS at once
+    assert all(0 < sample.new_tokens <= 5 for sample in first)
+    assert all(sample.completion for sample in first)  # in-vocab prompts, so a completion is words, not empty
     sampled_a = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
     sampled_b = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5, seed=1)
     assert sampled_a != sampled_b and sampled_a == generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=12, temperature=1.5)
+
+
+def test_generate_samples_reseeds_per_batch(tiny_model: RecurrentGPT, tokenizer: Tokenizer) -> None:
+    """
+    Every batch is generated under `seed + <its first prompt's index>`, so the batches before an added prompt are
+    the samples they were: a prompts file that grows keeps its history comparable.
+    """
+
+    base = generate_samples(tiny_model, tokenizer, IN_VOCAB_PROMPTS, max_new_tokens=6, batch_size=2)
+    extended = generate_samples(
+        tiny_model, tokenizer, [*IN_VOCAB_PROMPTS, Prompt("tok_20 tok_21 tok_22")], max_new_tokens=6, batch_size=2
+    )
+    assert len(extended) == 5 and extended[: len(base)] == base
+
+
+def test_generate_samples_depend_on_their_batch(tiny_model: RecurrentGPT, tokenizer: Tokenizer) -> None:
+    """
+    The documented limit of the per-batch seeding: a batch is one `generate` call over its rows, so a prompt's
+    output depends on the neighbours it is padded and drawn alongside. Only visible while sampling; greedy output
+    of the untrained model is one repeated token whatever the noise.
+    """
+
+    two = generate_samples(tiny_model, tokenizer, IN_VOCAB_PROMPTS, max_new_tokens=8, temperature=1.5, batch_size=2)
+    four = generate_samples(tiny_model, tokenizer, IN_VOCAB_PROMPTS, max_new_tokens=8, temperature=1.5, batch_size=4)
+    assert two != four
+    twice = generate_samples(
+        tiny_model, tokenizer, [IN_VOCAB_PROMPTS[0], IN_VOCAB_PROMPTS[0]], max_new_tokens=8, temperature=1.5
+    )
+    assert twice[0].completion != twice[1].completion  # one prompt, one batch, two completions
 
 
 def test_generate_samples_skips_a_prompt_that_does_not_fit_the_position_table(

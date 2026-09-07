@@ -13,6 +13,9 @@ from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 # Never a token id: a real `<unk>` or `<pad>` token in a document is a supervised label like any other.
 IGNORE_INDEX = -100
 
+# Text the automatic-BOS self-check encodes; any text does, the check only compares its two encodings.
+BOS_PROBE = "a b"
+
 
 def resolve_pad_id(processor: object, eos_id: int) -> int:
     """
@@ -24,11 +27,36 @@ def resolve_pad_id(processor: object, eos_id: int) -> int:
     return eos_id if pad_id is None else pad_id
 
 
+def check_automatic_bos(processor: Any, bos_id: int, path: Path) -> None:
+    """
+    Verify that `add_bos_token=True` really makes `add_special_tokens=True` prepend BOS.
+
+    That the flag's setter installs a `bos $A` post-processor is a transformers implementation detail. If a later
+    version drops it, lm-eval would keep asking for special tokens and keep getting none, and every benchmark would
+    be scored on contexts no training row looks like: a few points lower, with nothing in the logs. Checked once per
+    load instead, so a benchmark run on such a version dies at setup.
+    """
+
+    import transformers
+
+    with_specials = processor.encode(BOS_PROBE, add_special_tokens=True)
+    without = processor.encode(BOS_PROBE, add_special_tokens=False)
+    if with_specials == [bos_id] + without and not (without and without[0] == bos_id):
+        return
+    raise RuntimeError(
+        f"The tokenizer at {path}, loaded with add_bos_token=True, does not prepend BOS ({bos_id}) when asked for "
+        f"special tokens: transformers {transformers.__version__} encodes {BOS_PROBE!r} as {with_specials} with "
+        f"special tokens and as {without} without them. Benchmarks would be scored on contexts that start unlike "
+        "every training row; pin transformers to a version whose add_bos_token installs the BOS template."
+    )
+
+
 class Tokenizer:
     """
     Loads a saved tokenizer directory and encodes text without automatic special tokens.
 
-    BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them. Both must exist: the
+    BOS/EOS are added explicitly by :meth:`encode` so that formatting functions control them (:attr:`processor`, the
+    transformers object lm-eval encodes through, is the exception: it prepends BOS itself). Both must exist: the
     formats prepend BOS, every document ends in EOS, and pack tails are EOS. Both must also be base-vocabulary
     tokens, because labels are masked against `vocab_size` (see :meth:`__init__`).
     """
@@ -60,14 +88,19 @@ class Tokenizer:
     def processor(self) -> Any:
         """
         The transformers tokenizer over the same directory, which lm-eval (`evaluation.benchmarks`) needs: built on
-        first use, because transformers imports torch and scikit-learn, with automatic BOS and EOS off, the object
-        the benchmarks were scored with when this wrapper still loaded through transformers.
+        first use, because transformers imports torch and scikit-learn.
+
+        Automatic BOS is on, so a context lm-eval encodes starts with BOS as every training row does; automatic EOS
+        is off, because a context is a prefix the model continues. `check_automatic_bos` confirms the flag took
+        effect before the object is handed out.
         """
 
         if self._processor is None:
             from transformers import AutoTokenizer
 
-            self._processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=False, add_eos_token=False)
+            processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=True, add_eos_token=False)
+            check_automatic_bos(processor, self.bos_id, self.path)
+            self._processor = processor
         return self._processor
 
     @property

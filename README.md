@@ -108,6 +108,11 @@ The percentages become step numbers once the stage plan is known; `train.log` li
 steps per block to run with, e.g. `[[4, 4, 4], [12, 12, 12]]` (empty: the mean recurrence once); the CLI takes
 `--recurrence 4,4,4` repeatedly. Both run RNG-isolated, so they do not change the training.
 
+Every scored context starts with a BOS token, as every training row does; scores recorded before this was fixed
+(September 2026) were measured without it and are not comparable. Both samples and scores also shift slightly with
+`batch_size`: each recurrent forward draws its initial latent state for the whole batch at once, so a row's noise
+depends on the rows it is batched with and on how far they are padded.
+
 ## Architecture
 
 ### Overview
