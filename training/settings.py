@@ -17,6 +17,12 @@ from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-d
 # imports torch; this module stays framework-neutral, a settings test keeps the two equal).
 CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
 
+# The optimizers `training.optim.build_optimizer` builds and the schedules `training.lr_schedule` implements. Both
+# modules import torch (directly or through the stage manager); this module stays framework-neutral, so the names
+# are copied here to be checked at construction time, and settings tests keep the copies equal to the originals.
+OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam")
+LR_SCHEDULES: tuple[str, ...] = ("trapezoid",)
+
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
 # relating two fields stay explicit below the loops.
 REQUIRED_SETTINGS: dict[str, str] = {
@@ -174,6 +180,22 @@ class Settings:
                 raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
+        # the plan-level names, checked here so a typo fails before the dataset is verified or built (an unknown
+        # optimizer used to fail after the build, an unknown schedule at the first optimizer step)
+        if self.optimizer not in OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {', '.join(OPTIMIZERS)}, not {self.optimizer!r}")
+        if self.lr_schedule not in LR_SCHEDULES:
+            raise ValueError(f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, not {self.lr_schedule!r}")
+        if any(depth <= 0 for depth in self.partial_depth_eval):
+            raise ValueError(
+                f"partial_depth_eval must list positive recurrence depths, got {self.partial_depth_eval}"
+            )
+        if self.optim_config.lr <= 0:  # ELLISAdam divides by it (the decoupled-decay reference init_lr)
+            raise ValueError(
+                f"optim_config.lr must be positive, got {self.optim_config.lr}: it is the optimizer's constructor "
+                "LR and, for ELLISAdam, the reference of the decoupled weight decay (decay = lr / init_lr x "
+                "weight_decay). The schedule's learning rate is stage_base_lrs"
+            )
         if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
             raise ValueError(
                 f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {self.gradient_checkpointing!r}"

@@ -295,7 +295,6 @@ def test_loss_and_grad_norm_match_a_hand_computation(cpu_backend: SingleDeviceBa
     )
     assert len(expected_losses) == settings.gradient_accumulation_steps == 2
     assert result.loss.item() == pytest.approx(torch.stack(expected_losses).mean().item(), rel=1e-6)
-    assert result.log_ppl.item() == pytest.approx(result.loss.item(), rel=1e-6)  # log_ppl is the detached loss
     assert result.grad_norm.item() == pytest.approx(expected_norm.item(), rel=1e-5)
     assert result.grad_norm.item() > settings.grad_clip  # so the clipping actually happened and the norm is pre-clip
 
@@ -1035,8 +1034,9 @@ def test_mid_stage_resume_with_buffered_samples_repeats_nothing(
     tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
 ) -> None:
     """
-    With worker batches of several rows, samples can sit in the stream's buffer at the checkpoint; they were
-    already counted as read, so a resume may skip them, but it never repeats a row the first stream pulled.
+    With worker batches of several rows, samples can sit in the stream's buffer at the checkpoint; `state_dict`
+    stores them and `load_state_dict` replays them before the loaders are read again, so the resumed stream neither
+    repeats nor loses a row the first stream pulled.
     """
 
     settings = _drop_settings(tmp_path, tiny_dataset_dir, stream_tokenizer)

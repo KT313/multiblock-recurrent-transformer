@@ -52,6 +52,10 @@ def get_param_groups(
 # optimizer is a config mistake and fails loudly instead of being dropped.
 ELLIS_ONLY_OPTIONS = ("update_clipping", "atan_adam", "running_init", "decouple_wd")
 
+# The `optimizer:` values `build_optimizer` knows; `Settings.__post_init__` keeps a torch-free copy (OPTIMIZERS in
+# training/settings.py, a settings test keeps the two equal) so an unknown name fails before the dataset is touched.
+OPTIMIZERS = ("AdamW", "ELLISAdam")
+
 
 def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig) -> Optimizer:
     """
@@ -79,7 +83,7 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
         raise ValueError(f"optim_config option(s) {ellis_only_set} apply only to 'ELLISAdam', not {name!r}")
     if name == "AdamW":
         return torch.optim.AdamW(params, **common)
-    raise ValueError(f"Invalid optimizer {name!r} requested (use 'AdamW' or 'ELLISAdam').")
+    raise ValueError(f"Invalid optimizer {name!r} requested (use one of {', '.join(map(repr, OPTIMIZERS))}).")
 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:

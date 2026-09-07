@@ -119,8 +119,9 @@ def train(
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
     `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
 
-    Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint, so the
-    stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
+    Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint) are the
+    thesis loop's; `test_golden_tiny_run` fails on any change. Evaluation runs under `torch.random.fork_rng`
+    (`training/evaluation.py`), so it draws nothing the training stream would miss.
     """
 
     check_evaluation_recurrences(settings)  # before anything is created or built
@@ -426,8 +427,8 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
     Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
     Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
-    the stage the run is heading for (`StageManager.entering_stage_at`). Numerics: called after evaluation and
-    logging, so the stored RNG state includes the evaluation draws.
+    the stage the run is heading for (`StageManager.entering_stage_at`). Called after evaluation and logging; the
+    stored RNG state is the one after the step, evaluation having drawn under `torch.random.fork_rng`.
     """
 
     settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
