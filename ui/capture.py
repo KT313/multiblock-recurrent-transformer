@@ -38,7 +38,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, TextIO, TypeGuard
 
-from data_preparation.lib.log import LOG_FORMAT
+from ui.log_format import LOG_FORMAT
 
 
 class LogSink(Protocol):
@@ -63,18 +63,26 @@ def existing_loggers() -> list[logging.Logger]:
 
     The dict is copied under the logging module's own lock: wandb's background threads create loggers while a
     run is up, and iterating it directly can raise "dictionary changed size during iteration".
+
+    The lock is private to `logging` and named differently across versions: `logging._lock` (a context manager,
+    3.13 dropped the helpers around it), else the `_acquireLock` / `_releaseLock` pair of 3.11 and 3.12. Without
+    either the copy is taken unguarded, which is what iterating would do anyway.
     """
 
+    lock = getattr(logging, "_lock", None)
     acquire: Callable[[], None] | None = getattr(logging, "_acquireLock", None)
     release: Callable[[], None] | None = getattr(logging, "_releaseLock", None)
-    if acquire is None or release is None:  # pragma: no cover - the private lock helpers exist in every CPython 3.x
-        entries = list(logging.root.manager.loggerDict.values())
-    else:
+    if lock is not None:
+        with lock:
+            entries = list(logging.root.manager.loggerDict.values())
+    elif acquire is not None and release is not None:
         acquire()
         try:
             entries = list(logging.root.manager.loggerDict.values())
         finally:
             release()
+    else:  # no CPython release so far is without both
+        entries = list(logging.root.manager.loggerDict.values())
     loggers: list[logging.Logger] = [logging.getLogger()]
     loggers.extend(entry for entry in entries if isinstance(entry, logging.Logger))
     return loggers
@@ -163,7 +171,7 @@ class LineSink(io.TextIOBase):
 
     def fileno(self) -> int:
         """
-        The descriptor of the replaced stream, so a library asking sys.stdout for one gets the terminal'text.
+        The descriptor of the replaced stream, so a library asking sys.stdout for one gets the terminal's.
         """
 
         stream = self.real_stream
@@ -351,8 +359,9 @@ class LoggingCapture:
 class StreamCapture:
     """
     sys.stdout / sys.stderr replaced by :class:`LineSink`\\ s that log what is written (INFO / WARNING) on
-    the two given loggers, so stray prints and tqdm's final line reach the log panel. :meth:`redirect` and
-    :meth:`release` are idempotent; :meth:`release` logs what a sink still holds without a newline.
+    the two given loggers, so stray prints and tqdm's final line reach the log panel. :meth:`redirect` lowers the
+    two loggers to INFO for the block and :meth:`release` puts their levels back. Both are idempotent;
+    :meth:`release` logs what a sink still holds without a newline.
     """
 
     def __init__(self, stdout_logger_name: str, stderr_logger_name: str) -> None:
@@ -360,6 +369,7 @@ class StreamCapture:
         self._stderr_logger_name = stderr_logger_name
         self._real_streams: tuple[TextIO, TextIO] | None = None
         self._sinks: tuple[LineSink, LineSink] | None = None
+        self._levels: tuple[int, int] | None = None  # the two stream loggers' levels before `redirect` lowered them
 
     @property
     def redirected(self) -> bool:
@@ -372,6 +382,7 @@ class StreamCapture:
         self._real_streams = (real_out, real_err)
         stdout_logger = logging.getLogger(self._stdout_logger_name)
         stderr_logger = logging.getLogger(self._stderr_logger_name)
+        self._levels = (stdout_logger.level, stderr_logger.level)  # put back by `release`
         stdout_logger.setLevel(logging.INFO)  # whatever the package logger is set to, a stray line is never dropped
         stderr_logger.setLevel(logging.INFO)
         self._sinks = (
@@ -388,6 +399,11 @@ class StreamCapture:
             sinks, self._sinks = self._sinks, None
             for sink in sinks:
                 sink.close_flush()
+        if self._levels is not None:  # after the flush above: its records are the ones the low level exists for
+            stdout_level, stderr_level = self._levels
+            self._levels = None
+            logging.getLogger(self._stdout_logger_name).setLevel(stdout_level)
+            logging.getLogger(self._stderr_logger_name).setLevel(stderr_level)
 
     def __enter__(self) -> StreamCapture:
         self.redirect()

@@ -88,6 +88,24 @@ def test_write_goes_to_the_plain_stream_while_disabled() -> None:
     assert stream.getvalue() == "late line\n" and display.lines() == [] and display.kept() == []
 
 
+def test_write_strips_terminal_control_sequences(display: MinimalDisplay) -> None:
+    """
+    U-M8: a library logging colours, or a stderr write carrying a title sequence, must not reach the frame: the
+    terminal would act on the escapes and they would count as printable columns (misaligned borders).
+    """
+
+    display.write("\x1b[31mred\x1b[0m line")
+    display.write("\x1b]0;a title\x07kept \x1b[1mline\x1b[0m", keep=True)
+    assert display.lines() == ["red line", "kept line"]
+    assert display.kept() == ["kept line"]
+    assert "\x1b" not in display.render_text(width=60)
+    stream = io.StringIO()
+    disabled = MinimalDisplay(string_console(), stream=stream)
+    disabled.enabled = False
+    disabled.write("\x1b[2mdim\x1b[0m line")
+    assert stream.getvalue() == "dim line\n", "the plain stream gets them stripped too"
+
+
 def test_suspended_stops_the_display_and_hands_the_streams_back(display: MinimalDisplay) -> None:
     console = display._console
     before = console_output(console)

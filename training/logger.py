@@ -173,7 +173,8 @@ class TrainingReport:
     stopped: bool = False  # the run stopped on request (the CLI's Ctrl-C) before its last step
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step, only with `keep_history`
     samples_written: list[Path] = field(default_factory=list)  # every samples file written by this process, in order
-    last_benchmarks: dict[str, float] = field(default_factory=dict)  # `benchmark/<task>/<metric>` of the last run, {} if none
+    # `benchmark/<recurrence>/<task>/<metric>` (`evaluation.benchmarks.flatten_results`) of the last run, {} if none
+    last_benchmarks: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -233,7 +234,7 @@ class TrainingReport:
 
 class Dashboard(Protocol):
     """
-    The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    The five calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake.
     """
 
@@ -246,6 +247,8 @@ class Dashboard(Protocol):
     def note_event(self, text: str) -> None: ...
 
     def set_status(self, text: str) -> None: ...
+
+    def discount_time(self, seconds: float) -> None: ...
 
 
 @contextmanager
@@ -315,7 +318,8 @@ class RunLogger:
         start_step: int,
         device: str,
         dashboard: Dashboard | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
         keep_history: bool = False,
     ) -> None:
@@ -341,17 +345,20 @@ class RunLogger:
         self._last_benchmarks: dict[str, float] = {}
         self.resumed_from: Path | None = None
         self.tokens_per_step = settings.tokens_per_optimizer_step
-        self._clock = clock
+        self._clock = clock  # monotonic: every duration here is an interval, and an NTP step must not move one
         now = clock()
-        self.setup_seconds = now - setup_started if setup_started is not None else 0.0
+        # `setup_started` is the CLI's wall-clock reading (`train.py`), from before this object and its clock existed
+        self.setup_seconds = wall_clock() - setup_started if setup_started is not None else 0.0
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._interval_step = start_step  # the step the interval timer started at
+        self._side_seconds = 0.0  # seconds spent outside the training loop since the last log step (`_timed_status`)
         self._token_counter: dict[str, int] = {}  # document tokens trained per data id since the last log step
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
         self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
         self._last_loss: float | None = None
         self._last_validation: dict[str, float] = {}
+        self._report: TrainingReport | None = None  # written by the first `close()`, returned by every later one
 
     @classmethod
     def open(
@@ -365,15 +372,17 @@ class RunLogger:
         backend: Backend,
         *,
         dashboard: Dashboard | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
         keep_history: bool = False,
     ) -> RunLogger:
         """
         Open the run's logging once the setup is done: the wandb run (hyperparameters, `num_parameters`), the
         dashboard (unless `dashboard` is given), then the console header lines. The setup timer ends and the train
-        timer starts here. `progress.step` is the resume step; `setup_started` the clock reading at the start of the
-        run; `clock` and `keep_history` are test knobs.
+        timer starts here. `progress.step` is the resume step; `setup_started` the *wall-clock* reading at the start
+        of the run (`train.py`), measured against `wall_clock`, while `clock` (monotonic) times everything the run
+        itself measures; `clock`, `wall_clock` and `keep_history` are test knobs.
         """
 
         wandb = Logger(
@@ -395,6 +404,7 @@ class RunLogger:
             device=str(backend.device),
             dashboard=dashboard,
             clock=clock,
+            wall_clock=wall_clock,
             setup_started=setup_started,
             keep_history=keep_history,
         )
@@ -420,8 +430,16 @@ class RunLogger:
         """
         Release wandb and the dashboard, so the terminal is restored on an exception and on Ctrl-C too; idempotent.
         Every resource is released even when an earlier release raises; the first failure is the one re-raised.
+
+        A run that leaves the block by raising, without having reached `close()`, first logs one kept ERROR record
+        with the traceback and sets the status to `failed`: the record still goes through the dashboard's handlers,
+        so it reaches `train.log` and the terminal, which the exit stack below takes away. A failed run gets no
+        report - `train_report.json` would then read as the run's result.
         """
 
+        if exc is not None and self._report is None:
+            console.error("Training failed: %s", exc, exc_info=exc, extra=KEEP)
+            self.status("failed")
         failures: list[BaseException] = []
         for release in (self.wandb.finish, self._exit_stack.close):
             try:
@@ -456,32 +474,52 @@ class RunLogger:
             self.status(previous)
 
     @contextmanager
-    def evaluating(self) -> Iterator[None]:
+    def _timed_status(self, text: str) -> Iterator[None]:
         """
-        Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
-        next to the validation metrics of that step in `log_step`.
+        Around a block that is not a training step (evaluation, checkpoint, samples, benchmarks): `text` is the
+        status for it, and its duration is kept out of every throughput number - out of the interval behind
+        `seconds/step`, `tokens/second` and `remaining_time` here, and out of the dashboard's own estimate through
+        `discount_time`. Without that, one 30 s evaluation between two 0.5 s steps reads as a 60x slowdown.
         """
 
         started = self._clock()
-        with self._status_during("evaluating"):
+        with self._status_during(text):
             try:
                 yield
             finally:
-                self._evaluation_seconds = self._clock() - started
+                seconds = self._clock() - started
+                self._side_seconds += seconds
+                self.dashboard.discount_time(seconds)
+
+    @contextmanager
+    def evaluating(self) -> Iterator[None]:
+        """
+        Around one `evaluate` call: the status reads `evaluating`, the duration becomes `val_time` (seconds) next
+        to the validation metrics of that step in `log_step`, and it does not count as training time.
+        """
+
+        started = self._clock()
+        try:
+            with self._timed_status("evaluating"):
+                yield
+        finally:
+            self._evaluation_seconds = self._clock() - started
 
     def working(self, text: str) -> AbstractContextManager[None]:
         """
-        Around a block that is neither a step nor an evaluation (sampling, benchmarking): the status reads text.
+        Around a block that is neither a step nor an evaluation (sampling, benchmarking): the status reads text
+        and the block does not count as training time.
         """
 
-        return self._status_during(text)
+        return self._timed_status(text)
 
     def saving_checkpoint(self) -> AbstractContextManager[None]:
         """
-        Around one checkpoint write: the status reads `saving checkpoint`.
+        Around one checkpoint write: the status reads `saving checkpoint`, and the write does not count as
+        training time.
         """
 
-        return self._status_during("saving checkpoint")
+        return self._timed_status("saving checkpoint")
 
     def log_resume(self, path: Path, step: int) -> None:
         """
@@ -569,8 +607,9 @@ class RunLogger:
         the metric dict goes to wandb, to `history` with `keep_history`, and to the dashboard:
 
         * `loss`, `ppl`, `lr`, `grad_norm` (pre-clip), `step`;
-        * `seconds/step`, `tokens/second`, `total_tokens` (from step 0, also after a resume), `total_time`,
-          `remaining_time`;
+        * `seconds/step`, `tokens/second`, `remaining_time`: training only, the timed blocks that are not steps
+          (evaluation, checkpoints, samples, benchmarks) subtracted; `total_tokens` (from step 0, also after a
+          resume) and `total_time` (wall time since `open`, everything included);
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
         * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
@@ -642,8 +681,11 @@ class RunLogger:
 
         now = self._clock()
         steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
-        seconds_per_step = (now - self._interval_started) / steps_in_interval
+        # training only: evaluation, checkpoints, samples and benchmarks were timed by `_timed_status` and come off
+        training_seconds = max(now - self._interval_started - self._side_seconds, 0.0)
+        seconds_per_step = training_seconds / steps_in_interval
         self._interval_started, self._interval_step = now, progress.step
+        self._side_seconds = 0.0
         total_tokens = sum(self._token_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
@@ -673,8 +715,11 @@ class RunLogger:
         End the run's logging: `train_time` into the wandb summary, the final console line and status, the
         dashboard closed; returns the report, also written to `train_report.json` in the run directory (the last
         process's report; a resume overwrites it). `stopped` says the run ended on request before its last step.
+        A second call logs nothing, sets no status and rewrites nothing: it returns the report of the first.
         """
 
+        if self._report is not None:
+            return self._report
         train_seconds = self._clock() - self._train_started
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
@@ -699,6 +744,7 @@ class RunLogger:
             last_benchmarks=dict(self._last_benchmarks),
         )
         report.write_json(self.run_directory / TRAIN_REPORT_NAME)
+        self._report = report
         return report
 
 

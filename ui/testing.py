@@ -13,7 +13,9 @@ import re
 
 from rich.console import Console
 
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# the stripper is production code (the display strips what it shows); re-exported here for the tests that
+# assert on captured terminal output
+from ui.display import strip_ansi as strip_ansi  # noqa: PLC0414 - re-exported, not used here
 
 
 class FakeClock:
@@ -71,14 +73,6 @@ def console_output(console: Console) -> str:
     file = console.file
     assert isinstance(file, io.StringIO)
     return file.getvalue()
-
-
-def strip_ansi(text: str) -> str:
-    """
-    Terminal output without its control sequences (colours split the box titles: ╭─ + reset +  log ).
-    """
-
-    return _ANSI.sub("", text)
 
 
 class Screen:

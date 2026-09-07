@@ -3,7 +3,8 @@
 Logging for the data preparation package.
 
 Every module logs under the data_preparation hierarchy (get_logger(__name__)); configure_logging attaches
-one stream handler to that root, so prepare.py and training/train.py share the same configuration.
+one stream handler to that root, so prepare.py and training/train.py share the same configuration. The record
+format lives in `ui.log_format` (both dashboards write it too) and is re-exported here.
 """
 
 from __future__ import annotations
@@ -11,9 +12,11 @@ from __future__ import annotations
 import logging
 import sys
 
+from ui.log_format import LOG_FORMAT
 
 ROOT_LOGGER_NAME = "data_preparation"
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+__all__ = ["LOG_FORMAT", "ROOT_LOGGER_NAME", "ProgressStreamHandler", "configure_logging", "get_logger"]
 
 
 def get_logger(name: str) -> logging.Logger:

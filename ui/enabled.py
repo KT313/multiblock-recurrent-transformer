@@ -1,9 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
 When a live display opens: its environment variable is not set to a disabling value, its stream is a
-terminal, and rich agrees it can draw on it (TTY_COMPATIBLE, FORCE_COLOR, a dumb TERM). progress_enabled
-(data preparation: DATA_PREP_PROGRESS, stderr) and dashboard_enabled (training: TRAINING_DASHBOARD, stdout)
-are this rule with their names filled in.
+terminal, and rich agrees it can draw on it (TTY_COMPATIBLE, FORCE_COLOR, a dumb TERM). The rule lives here;
+its two callers fill the names in: `data_preparation.lib.progress.progress_enabled` (DATA_PREP_PROGRESS,
+stderr) and `training.ui.common.dashboard_enabled` (TRAINING_DASHBOARD, stdout).
 """
 
 from __future__ import annotations

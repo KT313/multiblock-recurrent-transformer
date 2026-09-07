@@ -404,6 +404,7 @@ class RecordingDashboard:
         self.validations: list[tuple[int, dict[str, object]]] = []
         self.events: list[str] = []
         self.statuses: list[str] = []
+        self.discounted: list[float] = []  # the seconds of every block that was not a training step
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -418,6 +419,9 @@ class RecordingDashboard:
 
     def set_status(self, text: str) -> None:
         self.statuses.append(text)
+
+    def discount_time(self, seconds: float) -> None:
+        self.discounted.append(seconds)
 
 
 def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
@@ -466,6 +470,7 @@ def open_run_logger(
         backend,
         dashboard=dashboard if dashboard is not None else RecordingDashboard(),
         clock=clock,
+        wall_clock=clock,  # the fake timeline stands in for the CLI's wall clock too (`setup_started`)
         setup_started=setup_started,
         keep_history=True,
     )
@@ -717,6 +722,88 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
     assert all(isinstance(v, float) for v in report.last_validation.values())
 
 
+def test_side_blocks_are_kept_out_of_the_throughput_metrics(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    """
+    L-H1: `seconds/step`, `tokens/second` and `remaining_time` are training only. A 30 s evaluation between two
+    0.5 s steps used to read as a 60x slowdown; every block timed by the logger (evaluation, checkpoint, samples,
+    benchmarks) comes off the interval and off the dashboard's own estimate (`discount_time`). `total_time` stays
+    wall time.
+    """
+
+    settings = reference_settings()  # log_step_interval 1: every step carries a metric dict
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    with run_logger.evaluating():
+        clock.advance(30.0)
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    assert run_logger.history[2]["seconds/step"] == 0.5
+    assert run_logger.history[2]["tokens/second"] == TOKENS_PER_STEP / 0.5
+    assert run_logger.history[2]["remaining_time"] == 0.5 * (stage_manager.total_steps - 2)
+    assert run_logger.history[2]["total_time"] == 31.0, "total_time is the wall time since `open`, evaluation included"
+
+    with run_logger.saving_checkpoint():
+        clock.advance(20.0)
+    with run_logger.working("sampling"):
+        clock.advance(4.0)
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
+    assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
+
+
+def test_a_failing_run_logs_its_traceback_and_leaves_no_report(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    L-H2: leaving the `with` by raising, without having reached `close()`, writes one kept ERROR record with the
+    traceback into `train.log` - while the dashboard's file handler is still attached - and sets the status to
+    `failed`. No `train_report.json`: it would read as the result of a run that has none.
+    """
+
+    settings = reference_settings()
+    stage_manager = two_stage_manager(settings)
+    progress = TrainingProgress()
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    statuses: list[str] = []
+    opened = RunLogger.open(settings, tmp_path, resolved, tiny_model, stage_manager, progress, backend, clock=FakeClock())
+    with pytest.raises(RuntimeError, match="the step exploded"), opened as run_logger:
+        monkeypatch.setattr(run_logger.dashboard, "set_status", statuses.append)
+        run_fake_steps(run_logger, stage_manager, progress, FakeClock(), 2, 1.0)
+        raise RuntimeError("the step exploded")
+    assert statuses == ["failed"]
+    log_text = (tmp_path / TRAIN_LOG_NAME).read_text()
+    assert "ERROR training.logger: Training failed: the step exploded" in log_text
+    assert "Traceback (most recent call last)" in log_text and "RuntimeError: the step exploded" in log_text
+    assert "step 2/12" in log_text, "the record is written before `__exit__` takes the file handler away"
+    assert not (tmp_path / TRAIN_REPORT_NAME).exists(), "a failed run has no report"
+
+
+def test_close_after_a_failure_is_still_the_run_that_reports(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
+) -> None:
+    """
+    L-H2: a run that handled its exception and closed on its own (`close()` inside the block) is finished, not
+    failed - `__exit__` adds nothing.
+    """
+
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    progress = TrainingProgress()
+    opened = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    with pytest.raises(RuntimeError, match="handled"), opened as run_logger:
+        run_logger.close(progress, None)
+        raise RuntimeError("handled")
+    assert recording(run_logger).statuses == ["finished"], "the status of the run that closed itself stands"
+    assert not any("Training failed" in r.getMessage() for r in console_records.records)
+    assert (tmp_path / TRAIN_REPORT_NAME).exists(), "the report `close()` wrote is the run's result"
+
+
 def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
@@ -743,7 +830,7 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
         run_logger.log_export(export_dir)
         report = run_logger.close(progress, export_dir)
         assert released == ["released"]
-        run_logger.close(progress, export_dir)  # a second close changes nothing
+        assert run_logger.close(progress, export_dir) is report  # a second close changes nothing
     assert released == ["released"]  # `__exit__` after `close()` is a no-op
     with run_logger:
         pass
@@ -788,9 +875,9 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
         f"saved checkpoint {second}",
         f"exported HuggingFace model to {export_dir}",
     ]
-    assert recording(run_logger).statuses == ["finished", "finished"]  # once per `close()`
+    assert recording(run_logger).statuses == ["finished"]  # only the first `close()` sets it
     kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
-    assert kept.count("Training finished after 7 steps in 6.0s.") == 2 and not any("checkpoint" in k for k in kept)
+    assert kept.count("Training finished after 7 steps in 6.0s.") == 1 and not any("checkpoint" in k for k in kept)
 
 
 def test_log_samples_and_benchmarks_reach_the_dashboard_wandb_and_report(

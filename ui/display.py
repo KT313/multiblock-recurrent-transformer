@@ -18,7 +18,8 @@ Ctrl-C and SIGTERM are unchanged.
 
 Fork (`_reset_in_child`): the training DataLoader forks its workers while the display is up. A forked child copies
 `_lock` with its owner, but threads do not survive a fork; a worker whose first log line reaches `write` while the
-render thread had the lock at the fork would block forever, and the parent with it. The hook gives every display a
+render thread had the lock at the fork would block forever - and the training loop stalls as soon as it waits for
+that worker's batch. The hook gives every display a
 fresh lock in the child, disabled, its plain stream on /dev/null (the worker's lines must not land under the
 parent's dashboard; the log file still gets them through logging).
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import threading
 import weakref
@@ -50,6 +52,22 @@ def _fileno(stream: TextIO) -> int | None:
         return stream.fileno()
     except (OSError, ValueError, AttributeError):  # a StringIO, a closed file, a sink without one
         return None
+
+
+# an escape sequence: OSC (up to its terminator), CSI (parameters, intermediates, final byte), or a two-byte ESC
+_ANSI_SEQUENCE = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)?|\[[0-9;:<=>?]*[ -/]*[@-~]|[ -/]*[0-~])")
+
+
+def strip_ansi(text: str) -> str:
+    """
+    text without its terminal control sequences.
+
+    rich strips only BEL / BS / VT / FF / CR from a :class:`Text`, so a coloured library line or a half-written
+    progress bar would put its escapes into the frame: the terminal reads them (colour bleed, cursor moves) and
+    they count as printable columns (misaligned borders). Everything the display shows goes through here.
+    """
+
+    return _ANSI_SEQUENCE.sub("", text)
 
 
 def line(text: str, style: str = "") -> Text:
@@ -287,9 +305,10 @@ class LiveDisplay:
     def write(self, text: str, *, keep: bool = False) -> None:
         """
         Append text to the log panel, one entry per line; to the plain stream when disabled. With keep it
-        is also printed once the display closed.
+        is also printed once the display closed. Terminal control sequences are stripped (:func:`strip_ansi`).
         """
 
+        text = strip_ansi(text)
         if not self.enabled:
             self._plain_stream.write(text + "\n")
             self._plain_stream.flush()

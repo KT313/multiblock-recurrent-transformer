@@ -10,14 +10,17 @@ from __future__ import annotations
 import io
 import logging
 import multiprocessing
+import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from ui import capture as capture_module
 from ui.capture import (
     DashboardLogHandler,
     LineSink,
@@ -313,35 +316,96 @@ def test_existing_loggers_lists_the_root_logger_and_every_named_one() -> None:
     assert all(isinstance(logger, logging.Logger) for logger in loggers), "placeholders are not loggers"
 
 
+class _WatchedDict(dict[str, Any]):
+    """
+    A loggerDict that notes whether the lock was held when it was copied.
+    """
+
+    def __init__(self, entries: dict[str, Any], locked: list[bool], held: list[bool]) -> None:
+        super().__init__(entries)
+        self._locked, self._held = locked, held
+
+    def values(self) -> Any:
+        self._held.append(self._locked[0])
+        return super().values()
+
+
+def _fake_logging(monkeypatch: pytest.MonkeyPatch, held: list[bool], locked: list[bool], **lock: Any) -> None:
+    """
+    Replace the `logging` module *as `ui.capture` sees it* by one whose lock attributes are `lock` and whose
+    loggerDict watches the copy. The real module is left alone on purpose: its `_lock` is what `_acquireLock`
+    uses, so a fake one there breaks every logging call of the rest of the session (pytest's own included).
+    """
+
+    entries = _WatchedDict(dict(logging.root.manager.loggerDict), locked, held)
+    module = SimpleNamespace(
+        getLogger=logging.getLogger,
+        Logger=logging.Logger,
+        root=SimpleNamespace(manager=SimpleNamespace(loggerDict=entries)),
+        **lock,
+    )
+    monkeypatch.setattr(capture_module, "logging", module)
+
+
 def test_existing_loggers_copies_the_dict_while_holding_the_logging_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     T-M16: wandb's background threads create loggers, so an unguarded walk can raise "dictionary changed size".
+    U-M7: the module lock is `logging._lock`, entered as a context manager when it is there (3.13 dropped the
+    helpers around it).
     """
 
-    locked = [False]
+    locked: list[bool] = [False]
     held: list[bool] = []
-    # the module lock helpers are private, so typeshed does not declare them; `existing_loggers` looks them up the same way
-    real_acquire: Callable[[], None] = getattr(logging, "_acquireLock")  # noqa: B009
-    real_release: Callable[[], None] = getattr(logging, "_releaseLock")  # noqa: B009
+
+    class WatchedLock:
+        def __enter__(self) -> None:
+            locked[0] = True
+
+        def __exit__(self, *_: object) -> None:
+            locked[0] = False
+
+    _fake_logging(monkeypatch, held, locked, _lock=WatchedLock())
+    assert logging.getLogger() in existing_loggers()
+    assert held == [True] and not locked[0], "copied once, under the lock, and the lock is released again"
+
+
+def test_existing_loggers_falls_back_to_the_private_lock_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    U-M7: without `logging._lock` the `_acquireLock` / `_releaseLock` pair of 3.11 and 3.12 guards the copy.
+    """
+
+    locked: list[bool] = [False]
+    held: list[bool] = []
 
     def acquire() -> None:
-        real_acquire()
         locked[0] = True
 
     def release() -> None:
         locked[0] = False
-        real_release()
 
-    class Watched(dict[str, Any]):
-        def values(self) -> Any:
-            held.append(locked[0])
-            return super().values()
-
-    monkeypatch.setattr(logging, "_acquireLock", acquire)
-    monkeypatch.setattr(logging, "_releaseLock", release)
-    monkeypatch.setattr(logging.root.manager, "loggerDict", Watched(logging.root.manager.loggerDict))
+    _fake_logging(monkeypatch, held, locked, _acquireLock=acquire, _releaseLock=release)
     assert logging.getLogger() in existing_loggers()
     assert held == [True] and not locked[0], "copied once, under the lock, and the lock is released again"
+
+
+def test_existing_loggers_copies_unguarded_when_the_module_has_neither(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    U-M7: a CPython without both is the last resort - the copy is taken as an unguarded walk would take it.
+    """
+
+    locked: list[bool] = [False]
+    held: list[bool] = []
+    _fake_logging(monkeypatch, held, locked)
+    assert logging.getLogger() in existing_loggers()
+    assert held == [False], "copied once, without a lock to hold"
+
+
+def test_the_real_logging_module_offers_one_of_the_two_locks() -> None:
+    """
+    U-M7: the branches above are faked, so this is the one assertion about the interpreter running the tests.
+    """
+
+    assert hasattr(logging, "_lock") or (hasattr(logging, "_acquireLock") and hasattr(logging, "_releaseLock"))
 
 
 # --- attaching a logger ---------------------------------------------------------------------------------------------------
@@ -473,3 +537,40 @@ def test_stream_capture_redirects_releases_and_is_idempotent() -> None:
         root.removeHandler(handler)
     messages = [record.getMessage() for record in lines if record.name == STDOUT_LOGGER]
     assert messages == ["stray print", "partial"], "the pending line is flushed when the streams are released"
+
+
+def test_stream_capture_puts_the_stream_loggers_levels_back() -> None:
+    """
+    U-L2: `redirect` lowers both stream loggers to INFO so a stray line is never dropped, and `release` restores
+    the levels they had (the capture leaves no configuration behind in a long-lived process).
+    """
+
+    stdout_logger, stderr_logger = logging.getLogger(STDOUT_LOGGER), logging.getLogger(STDERR_LOGGER)
+    try:
+        stdout_logger.setLevel(logging.CRITICAL)
+        stderr_logger.setLevel(logging.NOTSET)
+        with StreamCapture(STDOUT_LOGGER, STDERR_LOGGER):
+            assert stdout_logger.level == logging.INFO and stderr_logger.level == logging.INFO
+        assert stdout_logger.level == logging.CRITICAL and stderr_logger.level == logging.NOTSET
+    finally:
+        stdout_logger.setLevel(logging.NOTSET)
+        stderr_logger.setLevel(logging.NOTSET)
+
+
+def test_importing_ui_does_not_import_data_preparation() -> None:
+    """
+    U-M5: `ui` is the layer both dashboards build on, so it must not pull one of its consumers in (the record
+    format lives in `ui.log_format` and `data_preparation.lib.log` re-exports it).
+    """
+
+    code = "import sys, ui, ui.capture, ui.display, ui.enabled, ui.log_format, ui.testing; print([m for m in sys.modules if m.split('.')[0] == 'data_preparation'])"
+    repository_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=repository_root, check=True)
+    assert result.stdout.strip() == "[]", result.stdout
+
+
+def test_the_log_format_is_the_one_data_preparation_configures() -> None:
+    from data_preparation.lib.log import LOG_FORMAT as re_exported
+    from ui.log_format import LOG_FORMAT
+
+    assert re_exported is LOG_FORMAT
