@@ -289,11 +289,16 @@ class FileIndex:
             self.resolved_revision = current  # one-time upgrade of a pre-recording index; persisted by open()'s save
             return
         if self.resolved_revision != current:
+            # Both ways out re-download the source: `revision` is part of the raw fingerprint, so pinning it marks
+            # the raw folder stale (the repair step deletes and downloads it again after confirmation); re-listing
+            # at the new head needs the raw folder deleted as well, its offsets were counted against the old listing.
             raise RuntimeError(
                 f"{self.repo_id}: the file index was built at revision {self.resolved_revision} but the repo now "
-                f"resolves to {current}. Pin `revision: {self.resolved_revision}` in the source config to keep "
-                f"going reproducibly (the raw data downloaded so far stays valid), or delete {self.path} (and "
-                f"consider the source's raw folder, its offsets were counted against the old listing) to re-sync."
+                f"resolves to {current}. Either way the source's raw folder is downloaded again: pin "
+                f"`revision: {self.resolved_revision}` in the source config to keep the listed commit (revision is "
+                f"part of the raw fingerprint, so raw/<source> becomes stale and the repair step re-downloads it "
+                f"after confirmation), or delete {self.path} together with the source's raw folder to re-list at "
+                f"{current} (the raw offsets were counted against the old listing)."
             )
 
     @classmethod

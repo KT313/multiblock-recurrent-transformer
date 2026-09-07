@@ -1,5 +1,5 @@
 # Development entry points. Everything runs through uv (no manual venvs).
-.PHONY: setup test typecheck lint download status training evaluate
+.PHONY: setup test typecheck lint download prepare status training evaluate
 
 setup:  ## create/update the uv environment (incl. data-prep extras and dev tools)
 	uv sync --all-extras
@@ -22,7 +22,11 @@ CHECKPOINT = $(filter %.pth,$(MAKECMDGOALS))
 require_config = $(if $(CONFIG),,$(error usage: make $@ <path to a .yaml config>))
 require_checkpoint = $(if $(CHECKPOINT),,$(error usage: make $@ <path to a .pth checkpoint>))
 
-download:  ## download and build a dataset: make download config/datasets/<name>.yaml
+download:  ## download only (tokenizer + raw shards): make download config/datasets/<name>.yaml
+	$(require_config)
+	uv run python data_preparation/prepare.py download --dataset_config $(CONFIG)
+
+prepare:  ## download and build a dataset: make prepare config/datasets/<name>.yaml
 	$(require_config)
 	uv run python data_preparation/prepare.py prepare --dataset_config $(CONFIG)
 
