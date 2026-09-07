@@ -100,6 +100,14 @@ class ConsoleFallbackDashboard:
         if text is not None:
             lines_log.info(text)
 
+    def discount_time(self, seconds: float) -> None:
+        """
+        `seconds` since the last step were spent outside the training loop; the throughput estimate behind the
+        ETA of the step lines leaves them out.
+        """
+
+        self.throughput.discount(seconds)
+
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         lines_log.info(validation_line(step, losses))
 

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
 
-from data_preparation.lib.log import LOG_FORMAT
+from ui.log_format import LOG_FORMAT
 from ui.capture import LoggingCapture, LogSink, StreamCapture  # generic, shared with the data-prep dashboard
 from training.ui.common import TRAINING_LOGGER_NAME, lines_log
 

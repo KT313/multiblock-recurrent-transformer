@@ -284,6 +284,15 @@ class TrainingDashboard(LiveDisplay):
         if text is not None:
             lines_log.info(text)
 
+    def discount_time(self, seconds: float) -> None:
+        """
+        `seconds` since the last step were spent outside the training loop (evaluation, checkpoint, samples,
+        benchmarks); the throughput estimate behind the ETA leaves them out.
+        """
+
+        with self._lock:
+            self._throughput.discount(seconds)
+
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """
         The validation losses measured after step (per recurrence depth, e.g. val_loss_4, and per source,
