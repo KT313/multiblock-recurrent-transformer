@@ -17,7 +17,7 @@
 # rate (`stage_base_lrs`, positional, one per dataset-config stage).
 
 # --- Config references (both required) --------------------------------------------------------------------------
-dataset_config: config/datasets/v2_20M_tokens.yaml                    # sources, stages, budgets, weights, tokenizer
+dataset_config: config/datasets/v2_50M_tokens.yaml                    # sources, stages, budgets, weights, tokenizer
 model_architecture_config: config/model_architecture/v2_small.yaml   # RecurrentConfig: sizes, depth, recurrence
 
 # --- Data -------------------------------------------------------------------------------------------------------
