@@ -66,7 +66,7 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
         "dataset_config_hash": "abc123",
         "validation_rows": {"synthetic_pretrain": 3, "synthetic_instruct": 1},
         "source_rows": {"synthetic_pretrain": 87, "synthetic_instruct": 102},
-        "data_stream": {"consumed_rows": {"synthetic_pretrain": 12}, "draw_rng": (3, (1, 2), None)},
+        "data_stream": {"consumed_rows": {"synthetic_pretrain": 12}, "pool_loaded": {"synthetic_pretrain": 700}},
     }
     return CheckpointMetadata(**(values | overrides))
 

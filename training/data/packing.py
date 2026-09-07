@@ -25,9 +25,10 @@ from training.data.tokenizer import Tokenizer
 log = logging.getLogger(__name__)
 
 # The pool holds at least this many pack lengths of tokens before a pack is filled: the lookahead of the first-fit
-# scan. It decides which documents share a pack, so it is a fixed constant like `TRAIN_LOADER_BATCH_ROWS`, not a
-# setting (a setting would have to be compared on resume).
-POOL_TOKEN_FACTOR = 2
+# scan, and the window over which `BatchStream` balances the sources' token shares (a document waits up to sixteen
+# packs between entering the pool and its pack). It decides which documents share a pack, so it is a fixed constant like
+# `TRAIN_LOADER_BATCH_ROWS`, not a setting (a setting would have to be compared on resume).
+POOL_TOKEN_FACTOR = 16
 
 
 class PackedBatch(NamedTuple):
@@ -38,7 +39,8 @@ class PackedBatch(NamedTuple):
     `IGNORE_INDEX` in the labels. `position_ids` `(1, L)`: `0, 1, ...` restarting at every document and at the tail.
     `document_ids` `(1, L)` int32: `0, 1, ...` per document, the tail its own id (a self-attending "pad document",
     so no attention row is ever fully masked). `data_ids`: one per document in pack order (the tail has none).
-    `padding_tokens`: the tail length, for the packing-efficiency metric.
+    `padding_tokens`: the tail length, for the packing-efficiency metric. `data_tokens`: the slots each document
+    occupies (`shifted_length`), parallel to `data_ids`; the composition metric counts these, never the tail.
     """
 
     input_ids: torch.Tensor
@@ -47,6 +49,7 @@ class PackedBatch(NamedTuple):
     position_ids: torch.Tensor
     document_ids: torch.Tensor
     padding_tokens: int
+    data_tokens: list[int]
 
 
 def shifted_length(sample: Sample) -> int:
@@ -61,10 +64,11 @@ class PackPool:
     """
     The rolling pool of drawn documents a pack is filled from.
 
-    `BatchStream` adds documents (in draw order) until the pool holds `POOL_TOKEN_FACTOR` pack lengths of tokens
-    (`needs_refill`), then `take_pack` walks the pool front to back and takes every document that still fits into
-    the pack; the rest stay in the pool, in order, and lead the next pack. A leftover always fits an empty pack, so
-    no document waits longer than one pack. A document longer than the pack can never be placed: `add` drops it
+    `BatchStream` adds documents (in the order it picks their sources) until the pool holds `POOL_TOKEN_FACTOR`
+    pack lengths of tokens (`needs_refill`), then `take_pack` walks the pool front to back and takes every document
+    that still fits into the pack; the rest stay in the pool, in order, and lead the next pack. A leftover always
+    fits an empty pack, so no document waits longer than one pack beyond the pool's lookahead of up to sixteen
+    packs. A document longer than the pack can never be placed: `add` drops it
     with a warning (settings make this unreachable: `tokens_per_micro_batch >= training_max_sequence_length`, and documents are
     truncated to `training_max_sequence_length + 1` tokens, i.e. `training_max_sequence_length` slots).
 
@@ -183,4 +187,5 @@ def pack_samples(
         position_ids,
         document_ids,
         pack_length - offset,
+        [shifted_length(sample) for sample in samples],
     )

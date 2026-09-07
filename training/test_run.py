@@ -26,6 +26,7 @@ from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
 from training.data.tokenizer import IGNORE_INDEX
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
+from training.data.packing import POOL_TOKEN_FACTOR
 from training.data.loader import TRAIN_LOADER_BATCH_ROWS
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
@@ -488,14 +489,21 @@ def test_evaluates_at_every_partial_depth(full_run: dict[str, Any]) -> None:
 @pytest.mark.slow
 def test_data_composition_follows_the_stages(full_run: dict[str, Any]) -> None:
     """
-    Data ids are plain SOURCE names (the run-wide readers): all pretrain until the transition into finetune, all
-    instruct after it, a per-sample mix inside the window.
+    Data ids are plain SOURCE names (the run-wide readers) and the composition is in tokens: nothing but pretrain
+    is trained on before the transition into finetune gives the instruct source a weight (step 15), and the
+    fractions always sum to one. The tiny run has two packs per step, so the pool's sixteen pack lengths are eight
+    steps of lag: the bulk of the documents picked from step 15 on would reach the packs after the 20-step run ends;
+    only short instruct documents that first-fit pulls forward into pack tails appear before. The full switch is
+    asserted on the stream itself (`test_batch_stream_samples_by_transition_progress`).
     """
 
     history: History = full_run["history"]
-    assert history[3]["data_composition/synthetic_pretrain"] == pytest.approx(1.0)
-    assert history[18]["data_composition/synthetic_instruct"] == pytest.approx(1.0)
-    for done in range(15, 17):  # inside the 1 -> 2 transition both sources may appear, weights sum to 1
+    settings = parse_settings(["--config", str(full_run["yaml"])])
+    assert POOL_TOKEN_FACTOR // settings.micro_batches_per_step == 8  # the lag in steps this test is written for
+    for done in range(1, 16):  # steps 0..14 trained: instruct had no weight when any of their documents was picked
+        assert history[done]["data_composition/synthetic_pretrain"] == pytest.approx(1.0), done
+    assert any("data_composition/synthetic_instruct" in history[done] for done in range(16, 21))
+    for done in history:
         total = sum(v for k, v in history[done].items() if k.startswith("data_composition/"))
         assert total == pytest.approx(1.0)
 
@@ -600,7 +608,9 @@ def test_resume_picks_latest_checkpoint_and_restores_the_schedule(
         assert history[done]["stage/in_transition"] == full[done]["stage/in_transition"]
         assert history[done]["total_tokens"] == full[done]["total_tokens"]
     assert [s for s, m in history.items() if "val_loss" in m] == [16, 20]
-    assert history[16]["data_composition/synthetic_instruct"] == pytest.approx(0.5, abs=0.5)  # transition mix
+    for done in range(15, 21):  # the restored data stream (row counters, pool, loaded / target slots) yields the same packs
+        composition = {k: v for k, v in history[done].items() if k.startswith("data_composition/")}
+        assert composition == {k: v for k, v in full[done].items() if k.startswith("data_composition/")}, done
     final = torch.load(checkpoint_dir(run_dir) / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final["validation_rows"] == full_run["validation_rows"]  # the resumed run kept the split
 
@@ -697,22 +707,24 @@ def test_mid_stage_resume_continues_the_data_stream(
     reached (`BatchStream.load_state_dict` says exactly what that does and does not promise).
     """
 
-    def data_stream(directory: Path, name: str) -> dict[str, Any]:
-        state = torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False)
-        return cast(dict[str, Any], state["data_stream"])
+    def checkpoint(directory: Path, name: str) -> dict[str, Any]:
+        return cast(dict[str, Any], torch.load(checkpoint_dir(directory) / name, map_location="cpu", weights_only=False))
 
     def consumed(directory: Path, name: str) -> dict[str, int]:
-        return dict(data_stream(directory, name)["consumed_rows"])
+        return dict(checkpoint(directory, name)["data_stream"]["consumed_rows"])
 
     full_dir = no_transition_run["run_dir"]
     # 12 steps of 1024 packed tokens, all from the ONE run-wide synthetic_pretrain reader (stages 0 and 1 share the
     # source and only change its weight, so the counter keeps counting across the stage boundary at step 8). The
-    # counter is rows READ: the one worker batch of `TRAIN_LOADER_BATCH_ROWS` rows that covers the documents of the
-    # 12 steps, the rest of it sitting in the checkpoint's packing pool and buffers
-    mid_state = data_stream(full_dir, "step-00000012-tiny.pth")
-    assert mid_state["consumed_rows"] == {"synthetic_pretrain": TRAIN_LOADER_BATCH_ROWS}
+    # counter is rows READ: the 12 steps plus the pool's sixteen pack lengths need more documents than the train
+    # range holds, so the reader read the whole range once (its last worker batch is the range's tail) and the first
+    # `TRAIN_LOADER_BATCH_ROWS` rows of epoch two, the documents not trained on yet sitting in the pool and buffers
+    mid = checkpoint(full_dir, "step-00000012-tiny.pth")
+    mid_state = mid["data_stream"]
+    train_rows = mid["source_rows"]["synthetic_pretrain"] - mid["validation_rows"]["synthetic_pretrain"]
+    assert mid_state["consumed_rows"] == {"synthetic_pretrain": train_rows + TRAIN_LOADER_BATCH_ROWS}
     unconsumed = len(mid_state["buffers"]["synthetic_pretrain"]) + len(mid_state["pool"])
-    assert 0 < unconsumed < TRAIN_LOADER_BATCH_ROWS
+    assert 0 < unconsumed < train_rows + TRAIN_LOADER_BATCH_ROWS
 
     resumed_dir = tmp_path / "resumed" / "out"
     mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
