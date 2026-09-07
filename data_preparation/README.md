@@ -127,6 +127,7 @@ or dropped source row twice. All-at-once builds (shuffled sources, minhash) writ
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
         [--sources NAME ...] [--steps tokenizer download build] [--reopen NAME ...] [--yes] [--dry_run]
         [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
+uv run python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
 uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
@@ -135,6 +136,10 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
 - `prepare` materialises the config (missing parts only; a second run is a no-op). `--sources` / `--steps` restrict
   it, `--reopen` clears the exhausted flag of the named sources first (below), `--dry_run` prints what the repair
   step and the first round would do and writes nothing (not even the lock).
+- `download` (`make download`) is `prepare` without the build step: tokenizer and raw shards only, for the long
+  download on a machine that builds later. Its verdict is about the raw side (exit 0 with "download complete" iff
+  every source has its raw rows, else 1 naming the sources); no processed folder is expected after it, `prepare`
+  (`make prepare`) builds them from the raw shards without downloading again.
   Exit codes: 0 ok, 1 a failed source (logged with its traceback; the other jobs stop at their next shard: a
   failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 3
   another data preparation still running, 130 Ctrl-C (every running step stops at its next shard, everything

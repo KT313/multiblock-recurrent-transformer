@@ -292,6 +292,27 @@ def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, 
     assert [led.name for led in read_ledgers(cfg, layout, sources=["i", "a"])] == ["a", "i"]  # config order
 
 
+def test_missing_raw_rows_is_the_download_verdict() -> None:
+    """
+    The `download` command's completeness check: raw side only, so a source without a processed folder passes,
+    while a raw folder not current, short of rows, or exhausted with nothing stored fails; the tokenizer counts.
+    """
+
+    unbuilt = dict(processed_problem="absent", processed_reason="missing", processed_rows=0, training_rows=0)
+    report = DatasetReport(sources=[_ledger(**unbuilt)], tokenizer_complete=True)
+    assert report.missing_raw_rows() == [] and not report.complete
+    report.sources = [
+        _ledger(name="short", raw_rows=40, **unbuilt),
+        _ledger(name="stale", raw_state="stale", raw_reason="stale: x", raw_rows=0, **unbuilt),
+        _ledger(name="dry_ok", exhausted=True, raw_rows=30, **unbuilt),
+        _ledger(name="dry_empty", exhausted=True, raw_rows=0, skipped_malformed=30, **unbuilt),
+        _ledger(name="built"),
+    ]
+    assert report.missing_raw_rows() == ["short", "stale", "dry_empty"]
+    report.tokenizer_complete = False
+    assert report.missing_raw_rows() == ["short", "stale", "dry_empty", "tokenizer"]
+
+
 def test_the_satisfaction_cases() -> None:
     assert _ledger().satisfaction() == (True, "ok")
     stale = _ledger(raw_state="stale", raw_reason="stale: source identity or tokenizer changed")

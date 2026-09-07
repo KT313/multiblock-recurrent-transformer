@@ -7,12 +7,15 @@ Entry point for dataset preparation.
                                                 [--allow_foreign_raw]
                                                 [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
+    python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
     python data_preparation/prepare.py tiny     # = prepare --dataset_config config/datasets/tiny.yaml
 
 prepare materialises a dataset config: tokenizer, repair, (download + build) rounds, status table
-(lib/build/runner.py). Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
+(lib/build/runner.py). download is prepare without the build step (tokenizer + raw shards), complete when every
+source has its raw rows (no processed folder is expected after it; `make prepare` builds them later).
+Stale or outdated raw folders (deleted and downloaded again) and processed folders whose
 manifest cannot be parsed (deleted and rebuilt) go only after a confirmation on the terminal; --yes answers it,
 and without a terminal the command prints the list and exits 2 with nothing changed. A raw folder downloaded under
 another dataset config (raw folders are shared by source name) goes only with --allow_foreign_raw on top. --reopen
@@ -40,6 +43,7 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
 
@@ -51,6 +55,7 @@ from data_preparation.layout import DatasetLayout  # noqa: E402
 from data_preparation.lib.abort import BuildAborted  # noqa: E402
 from data_preparation.lib.build.describe import describe, leading_comment  # noqa: E402
 from data_preparation.lib.build.lock import RunLocked  # noqa: E402
+from data_preparation.lib.build.planner import DatasetReport  # noqa: E402
 from data_preparation.lib.build.repair import ConfirmationRequired  # noqa: E402
 from data_preparation.lib.build.runner import (  # noqa: E402
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
@@ -67,6 +72,7 @@ from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard  # n
 log = get_logger(__name__)
 
 TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
+DOWNLOAD_STEPS = ("tokenizer", "download")  # what the download command runs: STEPS without the build
 TOKENIZER_POOL_THREADS = 8  # threads of the tokenizer's Rust pool (one per process, shared by every download job)
 DEFAULT_DATASET_DIR = Path("dataset")
 
@@ -86,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dataset_options(prepare_cmd, config_default=None)
     _add_prepare_options(prepare_cmd)
     prepare_cmd.set_defaults(run=run_prepare)
+
+    download_cmd = subparsers.add_parser("download", help="download only (tokenizer + raw shards): prepare without the build step")
+    _add_dataset_options(download_cmd, config_default=None)
+    _add_prepare_options(download_cmd, steps=DOWNLOAD_STEPS)
+    download_cmd.set_defaults(run=run_download)
 
     status_cmd = subparsers.add_parser("status", help="print the status table; exit 0 iff the dataset is complete")
     _add_dataset_options(status_cmd, config_default=None)
@@ -113,9 +124,13 @@ def _add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path |
     sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
 
 
-def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
+def _add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] = STEPS) -> None:
+    """
+    The options prepare and download share; steps are the ones the command runs (all of them by default).
+    """
+
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
-    sub.add_argument("--steps", nargs="+", default=None, choices=STEPS, metavar="STEP", help=f"only these steps of {STEPS}")
+    sub.add_argument("--steps", nargs="+", default=None, choices=steps, metavar="STEP", help=f"only these steps of {steps}")
     sub.add_argument("--reopen", nargs="+", default=None, metavar="NAME", help="clear the exhausted flag of these sources before planning (their loader has more rows now)")
     sub.add_argument("--yes", "-y", action="store_true", help="answer the repair confirmation (stale / outdated raw folders, unparsable processed manifests) without asking")
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
@@ -130,6 +145,37 @@ def _add_prepare_options(sub: argparse.ArgumentParser) -> None:
 
 
 def run_prepare(args: argparse.Namespace) -> None:
+    _materialise(args, STEPS, _dataset_complete)
+
+
+def run_download(args: argparse.Namespace) -> None:
+    _materialise(args, DOWNLOAD_STEPS, _download_complete)
+
+
+def _dataset_complete(args: argparse.Namespace, report: DatasetReport, layout: DatasetLayout) -> None:
+    if not report.complete:
+        raise RuntimeError(f"dataset {args.dataset_config} still incomplete after preparing: {report.missing()}")
+    log.info("done: %s", layout.root, extra={"keep": True})
+
+
+def _download_complete(args: argparse.Namespace, report: DatasetReport, layout: DatasetLayout) -> None:
+    """
+    The download command's verdict is about the raw side only: no processed folder exists after it.
+    """
+
+    missing = report.missing_raw_rows()
+    if missing:
+        raise RuntimeError(f"download incomplete: {', '.join(missing)} (the status table above says why)")
+    log.info("download complete: %s", layout.root, extra={"keep": True})
+
+
+def _materialise(args: argparse.Namespace, all_steps: tuple[str, ...], completeness: Callable[[argparse.Namespace, DatasetReport, DatasetLayout], None]) -> None:
+    """
+    Run prepare with the command's steps (all_steps, or the --steps subset of them) and, unless the run was
+    partial (--dry_run, --sources or a strict --steps subset: the tree is not expected to be complete then),
+    apply the command's completeness check to the report (a RuntimeError there is exit 1).
+    """
+
     # The tokenizer's Rust thread pool: on here, off by library default (`_auto_tokenizer` in lib/stages/download.py).
     # The guard exists for a training run that prepares data in-process and then forks DataLoader workers; this
     # process never forks after the tokenizer is loaded (the cleaning passes use spawn pools), and a download
@@ -142,7 +188,8 @@ def run_prepare(args: argparse.Namespace) -> None:
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
 
-    with DataDashboard(title=f"prepare {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
+    steps = all_steps if args.steps is None else tuple(args.steps)
+    with DataDashboard(title=f"{args.command} {args.dataset_config}") as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=log_file):
         log.info("preparing dataset config %s under %s", args.dataset_config, layout.root)
         report = prepare(
             args.dataset_config,
@@ -153,18 +200,16 @@ def run_prepare(args: argparse.Namespace) -> None:
             assume_yes=args.yes,
             dry_run=args.dry_run,
             allow_foreign_raw=args.allow_foreign_raw,
-            steps=STEPS if args.steps is None else args.steps,
+            steps=steps,
             sources=args.sources,
             reopen=args.reopen,
             hf_token=args.hf_token,
         )
 
-        partial = args.dry_run or args.sources is not None or args.steps is not None
+        partial = args.dry_run or args.sources is not None or set(steps) != set(all_steps)
         if partial:
-            return  # the dataset is not expected to be complete after a partial run
-        if not report.complete:
-            raise RuntimeError(f"dataset {args.dataset_config} still incomplete after preparing: {report.missing()}")
-        log.info("done: %s", layout.root, extra={"keep": True})
+            return  # the tree is not expected to be complete after a partial run
+        completeness(args, report, layout)
 
 
 def run_status(args: argparse.Namespace) -> None:

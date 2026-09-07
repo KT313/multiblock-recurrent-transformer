@@ -577,7 +577,9 @@ def test_moved_repo_fails_the_loaded_index_with_the_pin_hint(hub: FakeHub, tmp_p
         list(load(_src(), 2, 1, SharedLoaderParameters(index_dir=index_dir)))
     message = str(error.value)
     assert built_at in message and "commit-2" in message
-    assert f"revision: {built_at}" in message  # the pin that keeps the downloaded raw data valid
+    assert f"revision: {built_at}" in message  # the pin that keeps the listed commit
+    assert "downloaded again" in message and "raw fingerprint" in message  # honest: both ways out re-download the raw folder
+    assert "stays valid" not in message  # the old text promised the raw data survives the pin; the fingerprint says otherwise
     assert str(index_path(index_dir, REPO, REV, "data/*.parquet")) in message
     assert hub.listings == 1  # a mismatch never re-lists
     # github_code shares the machinery (and here the very index): same error

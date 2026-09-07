@@ -42,12 +42,14 @@ the file index only records row groups the pass consumed whole, and a passive fo
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import queue
 import shutil
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -56,7 +58,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources.converters import Filter, get_converter, get_filter, text_or_empty
+from data_preparation.lib.sources.converters import Filter, expected_format, get_converter, get_filter, text_or_empty
 from data_preparation.lib.sources.hub_files import FetchStats, ReadRequest
 from data_preparation.lib.sources.loaders import (
     MAX_CACHED_FILE_KEY,
@@ -485,7 +487,9 @@ def download(
     truncated so that tokens, its count with the trainer's specials, is at most dataset_max_sequence_length). Instruct sources
     run the converter and filter at download time and store only standardized {instruction, input, output} rows
     of at most dataset_max_sequence_length tokens; malformed rows (the converter raises ValueError or yields no instruction /
-    output) are counted in skipped_malformed, longer rows in dropped_too_long. check_limit bounds the source rows
+    output) are logged at WARNING and counted in skipped_malformed, longer rows in dropped_too_long;
+    :data:`MAX_CONSECUTIVE_MALFORMED` malformed rows in a row fail the download with :class:`MalformedSourceError`
+    (a wrong fields / converter is found within the first rows, not after a night of skipping). check_limit bounds the source rows
     inspected in total. A loader that yields fewer rows than requested sets exhausted (the training sampler cycles
     a source smaller than its budget).
 
@@ -687,11 +691,45 @@ class _TokenStep:
         return stored
 
 
+MAX_CONSECUTIVE_MALFORMED = 10  # malformed instruct rows in a row that fail the download (a wrong fields / converter, not a bad row)
+MALFORMED_WARNINGS_PER_INCREMENT = 100  # WARNING lines per increment; the rest go to DEBUG, the final "kept N of M" line carries the total
+
+
+class MalformedSourceError(RuntimeError):
+    """
+    :data:`MAX_CONSECUTIVE_MALFORMED` source rows in a row came out malformed: the source's `fields` / `converter`
+    does not fit the rows, so the download fails with what the converter expects and what the rows looked like
+    (column name -> value type name, and the converter's reason). It propagates like any download failure: the
+    shards published so far stay on disk, the runner reports the job failed.
+    """
+
+    def __init__(self, name: str, *, expected: str, samples: list[tuple[dict[str, str], str]]) -> None:
+        found = " | ".join(f"{columns} ({reason})" for columns, reason in samples)
+        super().__init__(
+            f"{name}: {len(samples)} consecutive rows could not be converted; expected format: {expected}; "
+            f"formats of the last {len(samples)} rows: {found}"
+        )
+        self.name = name
+        self.expected = expected
+        self.samples = samples
+
+
+def _row_format(raw: Row) -> dict[str, str]:
+    """
+    The shape of a source row for the malformed-row error: column name -> type name of its value.
+    """
+
+    return {str(column): type(value).__name__ for column, value in raw.items()}
+
+
 @dataclass
 class _Increment:
     """
     One source's part of a download pass: what it still wants, how a source row becomes a stored row, and what
     the pass did for it so far (:attr:`counters`).
+
+    :attr:`consecutive_malformed` and :attr:`last_malformed` (the shapes and reasons of the last
+    :data:`MAX_CONSECUTIVE_MALFORMED` malformed rows) belong to the fetch thread, like :meth:`convert`.
     """
 
     name: str
@@ -706,6 +744,8 @@ class _Increment:
     passive: bool = False  # stores whatever rows the pass hands it (a group member past its target, or a language without a source); never bounds the pass
     submitted: int = 0  # rows handed to the token worker (fetch thread)
     settled: int = 0  # rows the token worker stored or dropped (worker thread)
+    consecutive_malformed: int = 0  # malformed rows since the last converted one (a filter rejection is neither)
+    last_malformed: deque[tuple[dict[str, str], str]] = field(default_factory=lambda: deque(maxlen=MAX_CONSECUTIVE_MALFORMED))
 
     @property
     def is_instruct(self) -> bool:
@@ -749,7 +789,9 @@ class _Increment:
     def convert(self, name: str, raw: Row) -> Row | None:
         """
         The row to store for source row raw, or None when the filter rejects it or the converter finds it
-        malformed (ValueError, counted in skipped_malformed).
+        malformed (ValueError: logged at WARNING, counted in skipped_malformed). A converted row ends a run of
+        malformed ones; a filter rejection neither extends nor ends it. The :data:`MAX_CONSECUTIVE_MALFORMED`-th
+        malformed row in a row raises :class:`MalformedSourceError`.
         """
 
         if not self.is_instruct:
@@ -757,11 +799,26 @@ class _Increment:
         if self.row_filter is not None and not self.row_filter(raw):
             return None
         try:
-            return _instruct_row(raw, self.converter)
+            row = _instruct_row(raw, self.converter)
         except ValueError as err:
-            self.counters.skipped_malformed += 1
-            log.debug("%s: skipping malformed row: %s", name, err)
+            self._malformed(name, raw, str(err))
             return None
+        self.consecutive_malformed = 0
+        self.last_malformed.clear()
+        return row
+
+    def _malformed(self, name: str, raw: Row, reason: str) -> None:
+        """
+        Count, log and remember a malformed row; fail the download once :data:`MAX_CONSECUTIVE_MALFORMED` came in a row.
+        """
+
+        self.counters.skipped_malformed += 1
+        self.consecutive_malformed += 1
+        self.last_malformed.append((_row_format(raw), reason))
+        level = logging.WARNING if self.counters.skipped_malformed <= MALFORMED_WARNINGS_PER_INCREMENT else logging.DEBUG
+        log.log(level, "%s: malformed row skipped (%s)", name, reason)
+        if self.consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED:
+            raise MalformedSourceError(name, expected=expected_format(self.source), samples=list(self.last_malformed))
 
 
 def _plan_increment(

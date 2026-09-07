@@ -35,6 +35,9 @@ from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefi
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages.download import (
     _load_tokenizer,
+    MALFORMED_WARNINGS_PER_INCREMENT,
+    MAX_CONSECUTIVE_MALFORMED,
+    MalformedSourceError,
     RawFolderError,
     TokenCounter,
     current_manifest,
@@ -432,6 +435,91 @@ def test_download_instruct_skips_converter_results_without_instruction_or_output
     m = download(cfg, "h", layout, rows_needed=3)
     assert m.rows() == 1 and m.rows_fetched == 3 and m.skipped_malformed == 2 and m.exhausted is True
     assert read_rows(layout.raw_dir("h")) == [{"instruction": "c", "input": "", "output": "d", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS}]
+
+
+def _good(i: int) -> Row:
+    return {"q": f"q{i}", "a": f"a{i}"}
+
+
+def test_ten_consecutive_malformed_rows_fail_the_download_with_both_formats(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A wrong `fields` mapping is found within the first rows, not after a night of skipping: the error states what
+    the converter expected and the shapes (column -> type) and reasons of the rows it got; the shards published
+    before it stay on disk like after any other download failure.
+    """
+
+    good = [_good(i) for i in range(3)]
+    wrong = [{"question": f"q{i}", "answer": f"a{i}", "n": i} for i in range(MAX_CONSECUTIVE_MALFORMED + 5)]
+    src_dir = layout.root.parent / "wrong"
+    write_local(src_dir, good + wrong, "jsonl")
+    src = _local(src_dir, kind="instruct", fields={"instruction": "q", "output": "a"})
+    cfg = with_tokenizer(cfg_factory({"w": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pytest.raises(MalformedSourceError) as error:
+        download(cfg, "w", layout, rows_needed=50, shard_size=2)
+    message = str(error.value)
+    assert message.startswith("w: 10 consecutive rows could not be converted; expected format: columns instruction=q, output=a; ")
+    assert "formats of the last 10 rows: " in message
+    assert message.count("{'question': 'str', 'answer': 'str', 'n': 'int'} (row is missing column(s) ['q', 'a']; available columns: ['answer', 'n', 'question'])") == 10
+    assert error.value.expected == "columns instruction=q, output=a" and len(error.value.samples) == 10
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "malformed row skipped" in r.getMessage()]
+    assert len(warnings) == 10 and all(r.getMessage().startswith("w: malformed row skipped (row is missing column(s) ['q', 'a']") for r in warnings)
+    # the good rows before the failure were published: a full shard when it filled, the rest when the failure hit.
+    # A shard's offset is the source row after its last kept row, so the malformed run behind it is not committed:
+    # a resume re-reads those rows (and fails again until the fields are fixed)
+    m = Manifest.load(layout.raw_dir("w"))
+    assert m is not None and m.rows() == 3 and m.rows_fetched == 3 and m.skipped_malformed == 0 and not m.exhausted
+    assert [(s.rows, s.offset) for s in m.shards] == [(2, 2), (1, 3)]
+
+
+def test_a_converted_row_ends_a_run_of_malformed_ones_but_a_filter_rejection_does_not(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    9 malformed, 1 good, 9 malformed downloads through (18 skipped); a filter rejection between two runs of
+    5 is not a converted row, so the run reaches 10 and fails.
+    """
+
+    from data_preparation.lib.sources import converters as converters_mod
+
+    monkeypatch.setitem(converters_mod.FILTERS, "no_skip", lambda row: "skip" not in row)
+    nine = [{"a": f"only answer {i}"} for i in range(MAX_CONSECUTIVE_MALFORMED - 1)]
+    src_dir = layout.root.parent / "runs"
+    write_local(src_dir, nine + [_good(0)] + nine + [_good(1)], "jsonl")
+    fields = {"instruction": "q", "output": "a"}
+    cfg = with_tokenizer(cfg_factory({"r": _local(src_dir, kind="instruct", fields=fields, filter="no_skip")}))
+    m = download(cfg, "r", layout, rows_needed=2)
+    assert m.rows() == 2 and m.rows_fetched == 20 and m.skipped_malformed == 18
+
+    five = nine[:5]
+    src_dir = layout.root.parent / "filtered"
+    write_local(src_dir, five + [{"q": "x", "a": "y", "skip": True}] + five + [_good(0)], "jsonl")
+    cfg = with_tokenizer(cfg_factory({"f": _local(src_dir, kind="instruct", fields=fields, filter="no_skip")}))
+    with pytest.raises(MalformedSourceError, match="f: 10 consecutive rows could not be converted"):
+        download(cfg, "f", layout, rows_needed=1)
+
+
+def test_malformed_row_warnings_are_capped_per_increment(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    After MALFORMED_WARNINGS_PER_INCREMENT warnings the rest go to DEBUG (the final "kept N of M" line carries the
+    total); alternating with good rows so no run reaches the failure threshold.
+    """
+
+    rows: list[Row] = []
+    for i in range(MALFORMED_WARNINGS_PER_INCREMENT + 20):
+        rows += [{"a": f"only answer {i}"}, _good(i)]
+    src_dir = layout.root.parent / "many"
+    write_local(src_dir, rows, "jsonl")
+    cfg = with_tokenizer(cfg_factory({"m": _local(src_dir, kind="instruct", fields={"instruction": "q", "output": "a"})}))
+    with caplog.at_level(logging.DEBUG, logger="data_preparation"):
+        m = download(cfg, "m", layout, rows_needed=len(rows))
+    skipped = [r for r in caplog.records if "malformed row skipped" in r.getMessage()]
+    assert [r.levelno for r in skipped] == [logging.WARNING] * MALFORMED_WARNINGS_PER_INCREMENT + [logging.DEBUG] * 20
+    assert m.skipped_malformed == MALFORMED_WARNINGS_PER_INCREMENT + 20 and m.rows() == MALFORMED_WARNINGS_PER_INCREMENT + 20
+    assert f"m: kept {m.rows()} of {2 * m.rows()} fetched rows" in caplog.text
 
 
 def test_download_instruct_filter_reads_the_source_once(

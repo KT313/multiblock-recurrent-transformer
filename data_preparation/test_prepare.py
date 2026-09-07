@@ -20,7 +20,7 @@ from data_preparation.lib.build.lock import build_lock
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.build.planner import DatasetReport
+from data_preparation.lib.build.planner import DatasetReport, SourceLedger
 from data_preparation.lib.build.runner import STEPS
 from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairReport
 
@@ -63,7 +63,11 @@ def test_commands_are_registered() -> None:
     assert args.run is prepare.run_describe and args.dataset_config == Path("x.yaml")
     args = parser.parse_args(["tiny"])
     assert args.run is prepare.run_prepare and args.dataset_config == Path("config/datasets/tiny.yaml")
-    for command in ("prepare", "status", "describe"):
+    args = parser.parse_args(["download", "--dataset_config", "x.yaml", "--sources", "a", "--yes", "--steps", "download"])
+    assert args.run is prepare.run_download and args.sources == ["a"] and args.yes and args.steps == ["download"] and args.dataset_dir == Path("dataset")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["download", "--dataset_config", "x.yaml", "--steps", "build"])  # download never builds
+    for command in ("prepare", "download", "status", "describe"):
         with pytest.raises(SystemExit):
             parser.parse_args([command])  # --dataset_config is required
     with pytest.raises(SystemExit):
@@ -167,6 +171,60 @@ def test_prepare_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1
+
+
+def test_an_explicit_full_steps_list_is_not_a_partial_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `--steps tokenizer download build` runs everything, so the completeness check applies (it used to be skipped
+    for any --steps); a strict subset is partial and exits 0 whatever the report says.
+    """
+
+    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: DatasetReport())
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--steps", "build", "tokenizer", "download"])
+    assert exc.value.code == 1
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--steps", "tokenizer", "download"])  # exit 0
+    prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--steps", "tokenizer"])  # exit 0
+
+
+def test_download_runs_tokenizer_and_download_only_and_prepare_builds_afterwards(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    root = tmp_path / "dataset"
+    layout = DatasetLayout(root)
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # exit 0
+    assert f"download complete: {root}" in caplog.text
+    assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
+    assert (layout.raw_dir("synthetic_pretrain") / "MANIFEST.json").is_file() and (layout.raw_dir("synthetic_instruct") / "MANIFEST.json").is_file()
+    assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.processed_dir("synthetic_instruct").exists()
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # the dataset is not built
+    assert exc.value.code == 1
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
+    prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # exit 0
+    assert layout.processed_dir("synthetic_pretrain").is_dir() and layout.processed_dir("synthetic_instruct").is_dir()
+
+
+def test_download_names_the_sources_still_short_and_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    The download verdict is about the raw side: a source whose processed folder is missing is fine, a raw folder
+    still short is not.
+    """
+
+    def ledger(name: str, **overrides: Any) -> SourceLedger:
+        fields: dict[str, Any] = dict(
+            name=name, kind="pretrain", rows_needed=100, rows_sufficient=84, rows_budget=70, tokens_per_row=64.0, raw_state="current", raw_reason="current",
+            raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_problem="absent", processed_reason="missing", processed_rows=0, training_rows=0,
+        )
+        return SourceLedger(**{**fields, **overrides})
+
+    report = DatasetReport(sources=[ledger("done"), ledger("short", raw_rows=40), ledger("absent", raw_state="missing", raw_reason="missing", raw_rows=0)], tokenizer_complete=True)
+    assert not report.complete  # nothing is built: prepare would call this incomplete
+    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: report)
+    with pytest.raises(SystemExit) as exc:
+        prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
+    assert exc.value.code == 1 and "download incomplete: short, absent" in caplog.text and "download failed" in caplog.text
+    report.sources = [ledger("done")]
+    prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])  # exit 0: raw rows are there, nothing built
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt(), BuildAborted("interrupted")])

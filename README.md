@@ -44,13 +44,17 @@ Optional: training builds whatever is missing itself by default (`auto_prepare: 
 # mini smoke run (real sources, a few MB)
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml
 
-# download thesis data sources
+# download and build the thesis data sources
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml
+
+# download only (tokenizer + raw shards), build later with prepare
+uv run python data_preparation/prepare.py download --dataset_config config/datasets/crow_300m_final.yaml
 
 # check which sources are missing locally without starting download
 uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
 
-# make shortcuts for the same: download / status
+# make shortcuts for the same: prepare / download / status
+make prepare config/datasets/crow_300m_final.yaml
 make download config/datasets/crow_300m_final.yaml
 make status config/datasets/crow_300m_final.yaml
 ```

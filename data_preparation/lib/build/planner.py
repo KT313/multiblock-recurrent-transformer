@@ -216,6 +216,24 @@ class DatasetReport:
 
         return [source for source in self.sources if not source.satisfaction()[0]]
 
+    def missing_raw_rows(self) -> list[str]:
+        """
+        Names of the items whose raw side is not done, the `download` command's completeness check (a download-only
+        run leaves no processed folder, so :meth:`SourceLedger.satisfaction` cannot be asked): a raw folder that is
+        not current, rows still to fetch, a loader that ran dry without storing one row (every row rejected: a wrong
+        fields / converter / filter / language), plus "tokenizer" when it is missing. Empty iff the downloads are
+        complete.
+        """
+
+        names = [
+            source.name
+            for source in self.sources
+            if source.raw_state != "current" or source.rows_to_fetch[0] > 0 or (source.exhausted and source.raw_rows == 0)
+        ]
+        if not self.tokenizer_complete:
+            names.append("tokenizer")
+        return names
+
     def table(self) -> str:
         """
         A fixed-width table: source, kind, rows needed, the tokens-per-row rate they were planned with, raw rows,
