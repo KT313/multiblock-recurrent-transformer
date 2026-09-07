@@ -361,24 +361,24 @@ def check_entry_shards(what: str, part: Part, entry: DataEntry, total: int, worl
 
 
 def validation_batches_available(
-    entries: list[DataEntry], rows_on_disk: Mapping[str, int], micro_batch_size: int, world_size: int
+    entries: list[DataEntry], rows_on_disk: Mapping[str, int], validation_batch_size: int, world_size: int
 ) -> int:
     """
-    How many micro-batches one evaluation can draw from a stage's validation loader.
+    How many batches one evaluation can draw from a stage's validation loader.
 
     One `__iter__` of the loader is one pass over every entry's row range, then it stops: `ceil(rows /
-    micro_batch_size)` batches, the last one short. Validation loaders run with `num_workers=0`, so each rank reads
-    every `world_size`-th row and the smallest shard holds `rows // world_size` of them.
+    validation_batch_size)` batches, the last one short. Validation loaders run with `num_workers=0`, so each rank
+    reads every `world_size`-th row and the smallest shard holds `rows // world_size` of them.
     """
 
     rows_per_rank = sum(entry_rows_in_range(entry, rows_on_disk[entry.data_dir]) // world_size for entry in entries)
-    return -(-rows_per_rank // micro_batch_size)  # ceil, in integers
+    return -(-rows_per_rank // validation_batch_size)  # ceil, in integers
 
 
 def check_validation_batches(
     stages: list[ResolvedStage],
     rows_on_disk: Mapping[str, int],
-    micro_batch_size: int,
+    validation_batch_size: int,
     eval_iters: int,
     world_size: int = 1,
 ) -> None:
@@ -390,24 +390,24 @@ def check_validation_batches(
     """
 
     for stage in stages:
-        available = validation_batches_available(stage.val_data, rows_on_disk, micro_batch_size, world_size)
+        available = validation_batches_available(stage.val_data, rows_on_disk, validation_batch_size, world_size)
         entries = ", ".join(entry.prefix for entry in stage.val_data)
         per_rank = f" per rank (world size {world_size})" if world_size > 1 else ""
         if available == 0:
             raise RuntimeError(
-                f"stage {stage.name!r}: its validation data ({entries}) yields 0 micro-batches of {micro_batch_size} "
+                f"stage {stage.name!r}: its validation data ({entries}) yields 0 batches of {validation_batch_size} "
                 f"rows{per_rank} but eval_iters is {eval_iters}, so evaluation would have nothing to score. Raise "
                 "validation_fraction for the source in the dataset config, give the stage a larger validation "
-                "source, or lower micro_batch_size"
+                "source, or lower validation_batch_size"
             )
         if available < eval_iters:
             log.warning(
-                "stage %s: its validation data (%s) yields %d micro-batch(es) of %d rows%s, fewer than eval_iters "
+                "stage %s: its validation data (%s) yields %d batch(es) of %d rows%s, fewer than eval_iters "
                 "(%d); every evaluation of this stage averages the %d batch(es) it gets",
                 stage.name,
                 entries,
                 available,
-                micro_batch_size,
+                validation_batch_size,
                 per_rank,
                 eval_iters,
                 available,
@@ -528,7 +528,7 @@ def resolve_dataset(
         )
     world_size = 1 if backend is None else backend.world_size
     check_entries(train_sources, stages, rows_on_disk, world_size)
-    check_validation_batches(stages, rows_on_disk, settings.micro_batch_size, settings.eval_iters, world_size)
+    check_validation_batches(stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters, world_size)
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),

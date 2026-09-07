@@ -50,6 +50,8 @@ def _settings(**overrides: object) -> Settings:
         "dataset_config": str(TINY_DATASET_CONFIG),
         "model_architecture_config": str(TINY_MODEL_ARCHITECTURE),
         "stage_base_lrs": [1e-3],
+        "tokens_per_micro_batch": 2048,
+        "micro_batches_per_step": 4,
     }
     return Settings(**(base | overrides))  # type: ignore[arg-type]  # heterogeneous kwargs for a test helper
 
@@ -195,7 +197,7 @@ def test_is_checkpoint_step_table() -> None:
         resolved_stage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
         resolved_stage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
     ]
-    stage_manager = StageManager(stages, world_batch_size=4, training_max_sequence_length=256)
+    stage_manager = StageManager(stages, tokens_per_step=1024)
     assert stage_manager.total_steps == 20 and stage_manager.stage_ending_at(11) == 0
     settings = _settings(save_step_interval=8, save_last_step=True)
     assert [s for s in range(1, 21) if is_checkpoint_step(settings, s, stage_manager)] == [8, 12, 16, 20]
@@ -214,14 +216,12 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "stage_base_lrs": [2e-3],
     "seed": 7,
     "training_max_sequence_length": 128,
-    "sort_batches_by_length": False,
-    "sequence_padding_multiple": 64,
+    "validation_padding_multiple": 64,
     "backend": "future_ddp",
     "precision": "32",
     "compile_model": True,
     "gradient_checkpointing": True,
-    "micro_batch_size": 2,
-    "world_batch_size": 2048,
+    "validation_batch_size": 2,
     "tokens_per_micro_batch": 16384,
     "micro_batches_per_step": 128,
     "optimizer": "AdamW",
@@ -237,10 +237,6 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "partial_depth_eval": [2],
 }
 
-# Compared like the fields above, but with one admissible value (`Settings._check_packing` refuses the other), so no
-# resume can find it changed.
-COMPARED_BUT_FIXED = ("pack_sequences",)
-
 
 def test_every_settings_field_is_classified() -> None:
     """
@@ -251,8 +247,7 @@ def test_every_settings_field_is_classified() -> None:
     field_names = {f.name for f in fields(Settings)}
     exempt = set(SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME)
     assert exempt <= field_names
-    assert set(CHANGED_COMPARED_VALUES) | set(COMPARED_BUT_FIXED) == field_names - exempt
-    assert not set(CHANGED_COMPARED_VALUES) & set(COMPARED_BUT_FIXED)
+    assert set(CHANGED_COMPARED_VALUES) == field_names - exempt
     assert PARAM_GROUPING_SETTING in field_names and PARAM_GROUPING_SETTING not in exempt
 
 

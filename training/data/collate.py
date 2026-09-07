@@ -3,8 +3,9 @@
 Batch collation in two halves: `collate_samples` tokenizes rows into unpadded samples (in the dataloader workers)
 and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (in the main process).
 
-`collate_fn` composes the two for a padded loader (validation). The split lets `world_batch_micro_batches` group a
-world batch into micro-batches BEFORE padding, so every micro-batch is padded once, to its own longest sample.
+`collate_fn` composes the two for the padded validation loaders. The training loaders stop after the first half:
+their workers hand out unpadded samples (`collate_worker_batch`) that `training.step.BatchStream` packs into one
+row per micro-batch (`training.data.packing`).
 """
 
 from typing import Any, NamedTuple
@@ -19,9 +20,9 @@ Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: 
 
 class Batch(NamedTuple):
     """
-    A padded, shifted micro-batch: `(input_ids, labels, data_ids)`, one data id per row. A tuple, so
-    `input_ids, labels, data_ids = batch` keeps working; the names let the step loop treat it and the packed
-    `training.data.packing.PackedBatch` alike.
+    A padded, shifted validation batch: `(input_ids, labels, data_ids)`, one data id per row. A tuple, so
+    `input_ids, labels, data_ids = batch` keeps working; the first three fields of the packed
+    `training.data.packing.PackedBatch` have the same names.
     """
 
     input_ids: torch.Tensor

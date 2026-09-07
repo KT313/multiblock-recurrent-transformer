@@ -339,14 +339,7 @@ def two_stage_manager(settings: Settings) -> StageManager:
         resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
         resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(
-        stages,
-        settings.world_batch_size,
-        settings.training_max_sequence_length,
-        warmup_steps=2,
-        cooldown_steps=2,
-        tokens_per_step=settings.tokens_per_optimizer_step,
-    )
+    return StageManager(stages, settings.tokens_per_optimizer_step, warmup_steps=2, cooldown_steps=2)
 
 
 def fake_result(

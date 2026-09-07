@@ -44,11 +44,8 @@ CROW_EXPLICIT: dict[str, Any] = {
     "precision": "bf16-mixed",
     "compile_model": True,
     "gradient_checkpointing": False,
-    "micro_batch_size": 4,
-    "world_batch_size": 1024,
-    "sort_batches_by_length": True,
-    "sequence_padding_multiple": 128,
-    "pack_sequences": True,
+    "validation_batch_size": 4,
+    "validation_padding_multiple": 128,
     "tokens_per_micro_batch": 8192,
     "micro_batches_per_step": 256,
     "optimizer": "ELLISAdam",
@@ -85,6 +82,8 @@ def _settings(**overrides: object) -> Settings:
         "dataset_config": TINY_DATASET_CONFIG,
         "model_architecture_config": TINY_MODEL_ARCHITECTURE,
         "stage_base_lrs": [1e-3],
+        "tokens_per_micro_batch": 8192,
+        "micro_batches_per_step": 4,
     }
     return Settings(**(base | overrides))  # type: ignore[arg-type]  # heterogeneous kwargs for a test helper
 
@@ -109,8 +108,8 @@ def test_parse_tiny_yaml() -> None:
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
     assert cfg.backend == "single_device" and cfg.precision == "bf16-mixed"
     assert cfg.resume is False and cfg.wandb_enabled is False
-    assert (cfg.micro_batch_size, cfg.world_batch_size) == (2, 4)
-    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (True, 512, 2)
+    assert (cfg.validation_batch_size, cfg.validation_padding_multiple) == (2, 128)
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (512, 2)
     assert cfg.optimizer == "AdamW"
     assert cfg.optim_config == OptimizerConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95))
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.eval_step_interval, cfg.eval_iters) == (2, 2, 8, 2)
@@ -177,7 +176,7 @@ def test_cli_overrides_win_over_yaml() -> None:
             str(TINY_YAML),
             "--seed",
             "7",
-            "--micro_batch_size",
+            "--validation_batch_size",
             "4",
             "--partial_depth_eval",
             "[1, 2]",
@@ -197,7 +196,7 @@ def test_cli_overrides_win_over_yaml() -> None:
             "/data/x",
         ]
     )
-    assert cfg.seed == 7 and cfg.micro_batch_size == 4 and cfg.partial_depth_eval == [1, 2]
+    assert cfg.seed == 7 and cfg.validation_batch_size == 4 and cfg.partial_depth_eval == [1, 2]
     assert cfg.out_dir == "/nowhere/x" and cfg.warmup_steps == 3
     assert cfg.model_overwrite == {"n_embd": 32} and cfg.export_to_hf is True
     assert cfg.stage_base_lrs == pytest.approx([1e-3, 2e-3, 3e-3])
@@ -218,7 +217,16 @@ def test_parse_without_config_requires_dataset_config() -> None:
 def test_parse_without_stage_base_lrs_is_rejected() -> None:
     with pytest.raises(ValueError, match="stage_base_lrs"):
         parse_settings(
-            ["--dataset_config", TINY_DATASET_CONFIG, "--model_architecture_config", TINY_MODEL_ARCHITECTURE]
+            [
+                "--dataset_config",
+                TINY_DATASET_CONFIG,
+                "--model_architecture_config",
+                TINY_MODEL_ARCHITECTURE,
+                "--tokens_per_micro_batch",
+                "8192",
+                "--micro_batches_per_step",
+                "4",
+            ]
         )
 
 
@@ -265,7 +273,7 @@ def test_settings_rejects_a_plain_dict_optim_config() -> None:
 
 def test_defaults_are_a_single_gpu_config() -> None:
     cfg = _settings()
-    assert cfg.backend == "single_device" and cfg.world_batch_size % cfg.micro_batch_size == 0
+    assert cfg.backend == "single_device" and cfg.validation_batch_size == 4
     assert cfg.model_overwrite == {} and cfg.optimizer == "ELLISAdam"
     assert cfg.optim_config == OptimizerConfig(lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95))
     assert cfg.out_dir == "outputs" and cfg.resume is True
@@ -273,7 +281,7 @@ def test_defaults_are_a_single_gpu_config() -> None:
     assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 2
     assert cfg.prepare_max_parallel_downloads == 2
     assert cfg.allow_dataset_change is False
-    assert cfg.gradient_accumulation_steps == 1024 // 4
+    assert cfg.gradient_accumulation_steps == cfg.micro_batches_per_step == 4
 
 
 def test_validation_empty_dataset_config() -> None:
@@ -291,26 +299,20 @@ def test_validation_negative_stage_base_lr() -> None:
         _settings(stage_base_lrs=[1e-3, -1.0])
 
 
-def test_validation_batch_divisibility() -> None:
-    with pytest.raises(ValueError, match="multiple of micro_batch_size"):
-        _settings(micro_batch_size=3, world_batch_size=8)
-
-
 def test_validation_of_nonsensical_batch_sizes() -> None:
     """
-    A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
-    loop of a step run zero times: the run "trained" and reported loss 0.0. Both fail at settings time now, and so
-    does a world batch smaller than one micro-batch.
+    A `micro_batches_per_step` of 0 or less made the micro-batch loop of a step run zero times: the run "trained"
+    and reported loss 0.0. It fails at settings time now, as do a non-positive pack length and validation batch.
     """
 
     for bad in (0, -4):
-        with pytest.raises(ValueError, match="micro_batch_size must be positive"):
-            _settings(micro_batch_size=bad, world_batch_size=8)
-        with pytest.raises(ValueError, match="world_batch_size must be positive"):
-            _settings(micro_batch_size=4, world_batch_size=bad)
-    with pytest.raises(ValueError, match=r"world_batch_size \(4\) must be >= micro_batch_size \(8\)"):
-        _settings(micro_batch_size=8, world_batch_size=4)
-    assert _settings(micro_batch_size=8, world_batch_size=8).gradient_accumulation_steps == 1
+        with pytest.raises(ValueError, match="micro_batches_per_step must be positive"):
+            _settings(micro_batches_per_step=bad)
+        with pytest.raises(ValueError, match="tokens_per_micro_batch must be positive"):
+            _settings(tokens_per_micro_batch=bad)
+        with pytest.raises(ValueError, match="validation_batch_size must be positive"):
+            _settings(validation_batch_size=bad)
+    assert _settings(micro_batches_per_step=1).gradient_accumulation_steps == 1
 
 
 def test_validation_misaligned_eval_and_log_intervals() -> None:
@@ -335,8 +337,8 @@ def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
     """
 
     yaml = tmp_path / "bad.yaml"
-    yaml.write_text(TINY_YAML.read_text().replace("micro_batch_size: 2", "micro_batch_size: 3"))
-    with pytest.raises(ValueError, match="multiple of micro_batch_size"):
+    yaml.write_text(TINY_YAML.read_text().replace("tokens_per_micro_batch: 512", "tokens_per_micro_batch: 128"))
+    with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(128\) must be >= training_max_sequence_length \(256\)"):
         parse_settings(["--config", str(yaml)])
 
 
@@ -349,9 +351,9 @@ def test_settings_do_not_touch_the_filesystem(tmp_path: Path) -> None:
     assert cfg.dataset_config.endswith("missing.yaml")
 
 
-@pytest.mark.parametrize("micro,world,expected", [(2, 4, 2), (1, 4, 4), (4, 4, 1), (2, 64, 32)])
-def test_gradient_accumulation_steps(micro: int, world: int, expected: int) -> None:
-    assert _settings(micro_batch_size=micro, world_batch_size=world).gradient_accumulation_steps == expected
+@pytest.mark.parametrize("packs", [1, 4, 32])
+def test_gradient_accumulation_steps_is_the_packs_per_step(packs: int) -> None:
+    assert _settings(micro_batches_per_step=packs).gradient_accumulation_steps == packs
 
 
 # --- the value-rule tables ---------------------------------------------------------------------------------------
@@ -424,32 +426,22 @@ def test_required_settings_are_rejected_when_empty(name: str) -> None:
 # --- sequence packing --------------------------------------------------------------------------------------------
 
 
-def test_packing_is_the_default_with_the_padded_sizes_derived() -> None:
+def test_the_packing_fields_are_required(tmp_path: Path) -> None:
     """
-    Packed by default; the packing fields left unset are the padded equivalents, so a config written in rows keeps
-    its step arithmetic (`tokens_per_optimizer_step`, `gradient_accumulation_steps`) and only the batch layout changes.
-    """
-
-    cfg = _settings(micro_batch_size=2, world_batch_size=8)
-    assert cfg.pack_sequences is True
-    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (2 * cfg.training_max_sequence_length, 4)
-    assert cfg.gradient_accumulation_steps == 4
-    assert cfg.tokens_per_optimizer_step == 8 * cfg.training_max_sequence_length
-    assert asdict(cfg)["micro_batches_per_step"] == 4  # recorded resolved (run_config.json, checkpoints)
-
-
-def test_padded_rows_are_refused() -> None:
-    """
-    `pack_sequences: false` is no training mode: the step averaged micro-batch means over length-sorted
-    micro-batches, so short rows weighed as much as full ones. The error says so and names the fix.
+    There is no padded training mode to fall back to: a config has to say how long a pack is and how many make a
+    step, and the keys of the removed padded mode are unknown.
     """
 
-    with pytest.raises(ValueError, match="pack_sequences: false is not supported") as excinfo:
-        _settings(pack_sequences=False)
-    message = str(excinfo.value)
-    assert "per-micro-batch mean" in message and "sorts each world batch by length" in message
-    assert "token-weighted" in message and "validation batches stay padded" in message
-    assert message.endswith("Set pack_sequences: true.")
+    for name in ("tokens_per_micro_batch", "micro_batches_per_step"):
+        yaml_path = tmp_path / f"without_{name}.yaml"
+        yaml_path.write_text("\n".join(line for line in TINY_YAML.read_text().splitlines() if not line.startswith(name)))
+        with pytest.raises(SystemExit):  # jsonargparse: the required key is missing
+            parse_settings(["--config", str(yaml_path)])
+    for removed in ("pack_sequences: true", "world_batch_size: 4", "sort_batches_by_length: true", "micro_batch_size: 2"):
+        yaml_path = tmp_path / "removed.yaml"
+        yaml_path.write_text(TINY_YAML.read_text() + f"\n{removed}\n")
+        with pytest.raises(SystemExit):  # jsonargparse: unrecognized key
+            parse_settings(["--config", str(yaml_path)])
 
 
 def test_explicit_packing_fields_define_the_step() -> None:
@@ -460,29 +452,16 @@ def test_explicit_packing_fields_define_the_step() -> None:
     assert exact.gradient_accumulation_steps == 1 and exact.tokens_per_optimizer_step == 2048
 
 
-def test_one_explicit_packing_field_derives_the_other() -> None:
-    packs = _settings(micro_batch_size=4, world_batch_size=1024, tokens_per_micro_batch=8192)
-    assert (packs.micro_batches_per_step, packs.tokens_per_optimizer_step) == (256, 256 * 8192)
-    step = _settings(micro_batch_size=4, world_batch_size=1024, micro_batches_per_step=4)
-    assert (step.tokens_per_micro_batch, step.tokens_per_optimizer_step) == (4 * 2048, 4 * 4 * 2048)
-
-
 def test_pack_must_hold_a_whole_document() -> None:
     with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(1024\) must be >= training_max_sequence_length \(2048\)"):
-        _settings(pack_sequences=True, tokens_per_micro_batch=1024, micro_batches_per_step=4)
-
-
-@pytest.mark.parametrize("micro_batches_per_step", [0, -4])
-def test_step_needs_at_least_one_pack(micro_batches_per_step: int) -> None:
-    with pytest.raises(ValueError, match="micro_batches_per_step must be positive"):
-        _settings(pack_sequences=True, tokens_per_micro_batch=8192, micro_batches_per_step=micro_batches_per_step)
+        _settings(tokens_per_micro_batch=1024, micro_batches_per_step=4)
 
 
 def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
     yaml_path = tmp_path / "packed.yaml"
     yaml_path.write_text(TINY_YAML.read_text().replace("micro_batches_per_step: 2", "micro_batches_per_step: 4"))
     cfg = parse_settings(["--config", str(yaml_path)])
-    assert (cfg.pack_sequences, cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (True, 512, 4)
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (512, 4)
     assert cfg.gradient_accumulation_steps == 4 and cfg.tokens_per_optimizer_step == 2048
     overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
     assert overridden.gradient_accumulation_steps == 8

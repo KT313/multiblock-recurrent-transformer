@@ -1,7 +1,7 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """
-Dataloader construction (one train loader per SOURCE for the whole run and one validation loader per stage,
-`build_run_dataloaders`) and the assembly of one world batch into padded micro-batches.
+Dataloader construction: one train loader per SOURCE for the whole run (unpadded worker batches the stream packs)
+and one validation loader per stage (padded batches), `build_run_dataloaders`.
 
 The stage structure never touches the train loaders: `training.step.BatchStream` draws the source per sample with
 the stage-interpolated weights, so a reader continues across stage boundaries and never re-reads rows.
@@ -16,14 +16,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from training.backend.base import Backend
-from training.data.collate import (
-    Batch,
-    Sample,
-    WorkerBatch,
-    collate_fn,
-    collate_worker_batch,
-    pad_and_shift,
-)
+from training.data.collate import Batch, Sample, WorkerBatch, collate_fn, collate_worker_batch
 from training.data.dataset_resolver import TRAIN_LOADER_NUM_WORKERS, DataEntry, ResolvedDataset
 from training.data.datasets import ParquetTextDataset, Row, WeightedMixtureDataset
 from training.data.tokenizer import IGNORE_INDEX, Tokenizer
@@ -32,13 +25,13 @@ from training.settings import Settings
 SampleBatch = list[Sample]  # the surviving tokenized rows of one worker batch (the `samples` half of a WorkerBatch)
 
 # The worker batch of the unpadded train loaders: rows tokenized per worker batch and worker batches kept ready ahead
-# (torch's `prefetch_factor`). Their product is how many tokenized rows a source has waiting when `BatchStream` pulls
-# a whole world batch at the start of an optimizer step; 64 x 4 = 256 covers `world_batch_size` 256 drawn from one
-# source, so the pull waits for no tokenization (with the old 4 x 4 = 16 the rest was tokenized while the GPU idled).
-# Neither value touches the sample order or the numerics: the one worker (`TRAIN_LOADER_NUM_WORKERS`) walks its range
-# in order and the stream concatenates its batches, `WorkerBatch.rows_read` counts the rows of any batch size and the
-# samples pulled ahead travel in the checkpoint (`BatchStream.state_dict`). Fixed here, not settings: a `Settings`
-# field is compared on resume, and this one may differ freely.
+# (torch's `prefetch_factor`). Their product is how many tokenized rows a source has waiting when `BatchStream`
+# refills its packing pool (`POOL_TOKEN_FACTOR` pack lengths of documents, drawn between two micro-batches); 64 x 4 =
+# 256 rows covers a refill from one source, so the pull waits for no tokenization (with the old 4 x 4 = 16 the rest was
+# tokenized while the GPU idled). Neither value touches the sample order or the numerics: the one worker
+# (`TRAIN_LOADER_NUM_WORKERS`) walks its range in order and the stream concatenates its batches, `WorkerBatch.rows_read`
+# counts the rows of any batch size and the samples pulled ahead travel in the checkpoint (`BatchStream.state_dict`).
+# Fixed here, not settings: a `Settings` field is compared on resume, and this one may differ freely.
 TRAIN_LOADER_BATCH_ROWS = 64
 TRAIN_LOADER_PREFETCH_FACTOR = 4
 
@@ -64,7 +57,7 @@ def build_dataloader(
     entries: list[DataEntry],
     tokenizer: Tokenizer,
     training_max_sequence_length: int,
-    micro_batch_size: int,
+    batch_size: int,
     num_workers: int = 0,
     seed: int = 1337,
     shard: tuple[int, int] = (0, 1),
@@ -73,7 +66,6 @@ def build_dataloader(
     pin_memory: bool = False,
     padded: bool = True,
     generator: torch.Generator | None = None,
-    worker_batch_rows: int | None = None,
 ) -> DataLoader[Row]:
     """
     Loader over entries: a single per-source train entry, or a stage's val_data mixed by weight
@@ -92,14 +84,13 @@ def build_dataloader(
         dataset,
         tokenizer,
         training_max_sequence_length,
-        micro_batch_size,
+        batch_size,
         num_workers=num_workers,
         padding_multiple=padding_multiple,
         ignore_index=ignore_index,
         pin_memory=pin_memory,
         padded=padded,
         generator=generator,
-        worker_batch_rows=worker_batch_rows,
     )
 
 
@@ -120,31 +111,28 @@ def dataloader_over(
     dataset: IterableDataset[Row],
     tokenizer: Tokenizer,
     training_max_sequence_length: int,
-    micro_batch_size: int,
+    batch_size: int,
     num_workers: int = 0,
     padding_multiple: int | None = None,
     ignore_index: int = IGNORE_INDEX,
     pin_memory: bool = False,
     padded: bool = True,
     generator: torch.Generator | None = None,
-    worker_batch_rows: int | None = None,
 ) -> DataLoader[Row]:
     """
-    The `DataLoader` over one dataset with the run's collate function.
+    The `DataLoader` over one dataset with the run's collate function, `batch_size` rows per batch.
 
-    padded (validation, the default) yields ready (input_ids, labels, data_ids) batches of `micro_batch_size` rows;
-    padded=False (training) yields a `WorkerBatch` of `worker_batch_rows` rows (None: `micro_batch_size`), padded
-    later per micro-batch in `world_batch_micro_batches`, so a padded loader refuses `worker_batch_rows`. pin_memory
-    is the backend's decision. generator is the source of the per-iterator base seed; without one, every `iter()`
-    draws it from the global torch RNG. Workers keep `TRAIN_LOADER_PREFETCH_FACTOR` batches ready.
+    padded (validation, the default) yields ready (input_ids, labels, data_ids) batches; padded=False (training)
+    yields a `WorkerBatch` of unpadded samples that `BatchStream` packs later, so `padding_multiple` and
+    `ignore_index` do not apply to it. pin_memory is the backend's decision. generator is the source of the
+    per-iterator base seed; without one, every `iter()` draws it from the global torch RNG. Workers keep
+    `TRAIN_LOADER_PREFETCH_FACTOR` batches ready.
     """
 
-    if worker_batch_rows is not None and worker_batch_rows <= 0:
-        raise ValueError(f"worker_batch_rows must be positive, got {worker_batch_rows}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
     collate: Callable[[list[Row]], Any]
     if padded:
-        if worker_batch_rows is not None:
-            raise ValueError("worker_batch_rows applies to unpadded loaders only: a padded batch is the micro-batch")
         collate = partial(
             collate_fn,
             tokenizer=tokenizer,
@@ -156,7 +144,7 @@ def dataloader_over(
         collate = partial(collate_worker_batch, tokenizer=tokenizer, training_max_sequence_length=training_max_sequence_length)
     return DataLoader(
         dataset,
-        batch_size=micro_batch_size if worker_batch_rows is None else worker_batch_rows,
+        batch_size=batch_size,
         shuffle=False,
         pin_memory=pin_memory,
         collate_fn=collate,
@@ -254,11 +242,11 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
     mixed with constant weights), all sharing one tokenizer.
 
     Train loaders: one worker process each (`TRAIN_LOADER_NUM_WORKERS`) that tokenizes `TRAIN_LOADER_BATCH_ROWS`
-    rows at a time and yields them unpadded as a `WorkerBatch`; `BatchStream` buffers those per source and pads
+    rows at a time and yields them unpadded as a `WorkerBatch`; `BatchStream` buffers those per source and packs
     per micro-batch, so the worker batch size is only a grouping and never changes the sample order. They do not
-    pin memory: `pad_and_shift` copies the rows into a fresh pageable micro-batch anyway (see there for why it
-    stays pageable). Validation loaders read in-process, yield padded batches that go to the device as they are,
-    and pin them when the backend wants pinned memory.
+    pin memory: `pack_samples` copies the rows into a fresh pageable micro-batch anyway (see `pad_and_shift` for
+    why it stays pageable). Validation loaders read in-process, yield padded batches of `validation_batch_size`
+    rows that go to the device as they are, and pin them when the backend wants pinned memory.
 
     Iterator seeds come from one private generator, so creating an iterator (first pull, epoch restart, each
     evaluation) never touches the global torch RNG and a resume replays the same latent noise.
@@ -273,14 +261,11 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
             parquet_dataset,
             tokenizer,
             training_max_sequence_length=settings.training_max_sequence_length,
-            micro_batch_size=settings.micro_batch_size,
+            batch_size=TRAIN_LOADER_BATCH_ROWS,
             num_workers=TRAIN_LOADER_NUM_WORKERS,
-            padding_multiple=settings.sequence_padding_multiple,
-            ignore_index=IGNORE_INDEX,
             pin_memory=False,
             padded=False,
             generator=generator,
-            worker_batch_rows=TRAIN_LOADER_BATCH_ROWS,
         )
         for source, parquet_dataset in train_datasets.items()
     }
@@ -289,11 +274,11 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
             stage.val_data,
             tokenizer,
             training_max_sequence_length=settings.training_max_sequence_length,
-            micro_batch_size=settings.micro_batch_size,
+            batch_size=settings.validation_batch_size,
             num_workers=0,
             seed=settings.seed + backend.rank,
             shard=shard,
-            padding_multiple=settings.sequence_padding_multiple,
+            padding_multiple=settings.validation_padding_multiple,
             ignore_index=IGNORE_INDEX,
             pin_memory=backend.pin_memory,
             padded=True,
@@ -302,36 +287,3 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
         for stage in dataset.stages
     ]
     return RunDataloaders(train_loaders, val_loaders, tokenizer, train_datasets)
-
-
-def sample_length(sample: Sample) -> int:
-    """
-    Tokens of a sample before padding: what its micro-batch will have to be padded to.
-    """
-
-    return sample[0].shape[0]
-
-
-def world_batch_micro_batches(
-    samples: list[Sample],
-    micro_batch_size: int,
-    tokenizer: Tokenizer,
-    training_max_sequence_length: int,
-    sort_by_length: bool,
-    padding_multiple: int | None = None,
-    ignore_index: int = IGNORE_INDEX,
-) -> list[Batch]:
-    """
-    Split one world batch of samples into micro-batches of `micro_batch_size` and pad each of them once.
-
-    With `sort_by_length` the samples are sorted by token count first (a stable sort), so a micro-batch groups rows
-    of similar length and pads less. Without it the arrival order is kept. The width comes from the full sample
-    length either way, never from the supervised part.
-    """
-
-    if sort_by_length:
-        samples = sorted(samples, key=sample_length)
-    return [
-        pad_and_shift(samples[start : start + micro_batch_size], tokenizer, training_max_sequence_length, padding_multiple, ignore_index)
-        for start in range(0, len(samples), micro_batch_size)
-    ]

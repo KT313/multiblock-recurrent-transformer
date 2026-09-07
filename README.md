@@ -69,10 +69,9 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 make training config/crow_300m_final.yaml
 ```
 
-Training packs documents end to end (`pack_sequences: true`, required): one row of `tokens_per_micro_batch`
-tokens per micro-batch, `micro_batches_per_step` of them per optimizer step, attention masked per document;
-validation stays padded. Left unset, the two are the padded equivalents `micro_batch_size × training_max_sequence_length` and
-`world_batch_size / micro_batch_size`, so a config written in rows keeps its step arithmetic.
+Training packs documents end to end: one row of `tokens_per_micro_batch` tokens per micro-batch,
+`micro_batches_per_step` of them per optimizer step, attention masked per document.
+Validation runs on padded rows, `validation_batch_size` per forward.
 
 A run resumes by default (`resume: true`): the most recently written checkpoint of `run_name` in its run directory is
 loaded, or `resume_checkpoint_path` names one; a checkpoint written with other settings, model config or dataset config

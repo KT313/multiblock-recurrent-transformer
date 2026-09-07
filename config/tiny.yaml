@@ -1,5 +1,5 @@
 # Tiny smoke-run config: the real train.py code path with a ~256K-parameter model on synthetic data.
-# Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 4 × 256 tokens per step),
+# Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 2 × 512 tokens per step),
 # a few seconds on CPU or GPU. The model is defined by config/model_architecture/tiny.yaml, the data (stages, token
 # budgets, weights, tokenizer) by config/datasets/tiny.yaml; training builds the data under dataset/ (sources/,
 # processed/, tokenizers/) when missing (`auto_prepare`), or run
@@ -26,13 +26,10 @@ precision: bf16-mixed
 compile_model: false
 gradient_checkpointing: false
 
-micro_batch_size: 2
-world_batch_size: 4
-sort_batches_by_length: true
-sequence_padding_multiple: 128
-pack_sequences: true            # required, false is refused (padded training weighed short rows like full ones)
-tokens_per_micro_batch: 512
-micro_batches_per_step: 2
+tokens_per_micro_batch: 512     # pack length; one packed row per micro-batch
+micro_batches_per_step: 2       # packs per optimizer step: 2 x 512 = 1024 tokens
+validation_batch_size: 2        # validation runs on padded rows, this many per forward
+validation_padding_multiple: 128
 
 optimizer: AdamW
 optim_config: {lr: 3e-4, weight_decay: 0.1, betas: [0.9, 0.95]}

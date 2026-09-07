@@ -176,6 +176,8 @@ def _settings(dataset_config: Path, dataset_dir: Path, **overrides: Any) -> Sett
         "dataset_dir": str(dataset_dir),
         "stage_base_lrs": [3e-4, 1e-4, 5e-5],
         "training_max_sequence_length": 256,
+        "tokens_per_micro_batch": 512,
+        "micro_batches_per_step": 2,
         "prepare_num_workers": 1,
     }
     return Settings(**(base | overrides))
@@ -504,7 +506,7 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
 
 def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pretrain_dir: Path) -> None:
     """
-    A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
+    A validation loader is one finite pass over its entries' row ranges (`ceil(rows / validation_batch_size)`
     batches, the rows of every entry dealt over `world_size` shards); several entries are read once each through
     `WeightedMixtureDataset`.
     """
@@ -512,15 +514,15 @@ def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pret
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], rows, micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=4) == 1
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, micro_batch_size=2, world_size=4) == 0
-    assert validation_batches_available([DataEntry("s-a", good)], rows, micro_batch_size=1, world_size=1) == total
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], rows, validation_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, validation_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, validation_batch_size=2, world_size=4) == 1
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, validation_batch_size=2, world_size=4) == 0
+    assert validation_batches_available([DataEntry("s-a", good)], rows, validation_batch_size=1, world_size=1) == total
     assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], rows, 4, 1) == 1  # a short last batch
     mixture = [DataEntry("s-a", good, max_rows=5), DataEntry("s-b", good, max_rows=2)]
-    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=1) == 2  # 7 rows once
-    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
+    assert validation_batches_available(mixture, rows, validation_batch_size=4, world_size=1) == 2  # 7 rows once
+    assert validation_batches_available(mixture, rows, validation_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
 
 
 def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
@@ -536,23 +538,23 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     rows = {good: _rows_in(tiny_pretrain_dir)}
     stage = _stage([DataEntry("s-a", good, max_rows=4)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=2)  # exactly eval_iters batches
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=8, eval_iters=1)  # one short batch is still a batch
+        check_validation_batches([stage], rows, validation_batch_size=8, eval_iters=1)  # one short batch is still a batch
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=5)
-    assert "stage s: its validation data (s-a) yields 2 micro-batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=5)
+    assert "stage s: its validation data (s-a) yields 2 batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
     # nothing at all reaches a rank (here: 4 rows dealt over 8 ranks, the last two get none) is the hard error
-    with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=1, world_size=8)
+    with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=1, world_size=8)
     # a validation loader that mixes several sources reads each of them once: it is checked like a single one
     mixed = _stage([DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         caplog.clear()
-        check_validation_batches([mixed], rows, micro_batch_size=8, eval_iters=50)
-    assert "stage s: its validation data (s-a, s-b) yields 1 micro-batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
+        check_validation_batches([mixed], rows, validation_batch_size=8, eval_iters=50)
+    assert "stage s: its validation data (s-a, s-b) yields 1 batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
 
 
 def test_resolve_dataset_warns_about_the_short_tiny_validation_splits(
@@ -564,15 +566,15 @@ def test_resolve_dataset_warns_about_the_short_tiny_validation_splits(
     resolver says so per stage.
     """
 
-    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=4)
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, validation_batch_size=2, eval_iters=4)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         resolved = resolve_dataset(settings)
     assert resolved.validation_rows["synthetic_instruct"] == 6 < 2 * 4  # fewer rows than eval_iters micro-batches
-    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 3 micro-batch(es)" in caplog.text
-    assert "stage pretrain_a: its validation data (pretrain_a-synthetic_pretrain) yields 3 micro-batch(es)" in caplog.text
+    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 3 batch(es)" in caplog.text
+    assert "stage pretrain_a: its validation data (pretrain_a-synthetic_pretrain) yields 3 batch(es)" in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2))
+        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, validation_batch_size=2, eval_iters=2))
     assert "micro-batch(es)" not in caplog.text  # two batches of two rows fit every split
 
 

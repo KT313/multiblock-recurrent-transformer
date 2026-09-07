@@ -11,9 +11,8 @@ is on disk, the mean of the capped row lengths read from the raw shards' tokens 
 (:func:`measured_tokens_per_row`, :meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
 it into a download target (× 1.2 safety margin, ÷ the training share after the validation holdout),
 :meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it, :meth:`DatasetConfig.rows_budget` into
-the rows the run draws (the status table's epochs). A run that pads instead of packing consumes one row per
-sequence and is over-provisioned by target ÷ rate: a tokens plan never downloads fewer rows than a sequences
-plan would. An estimate that ran high is what the round loop's top-ups correct once the rows are measured.
+the rows the run draws (the status table's epochs). An estimate that ran high is what the round loop's top-ups
+correct once the rows are measured.
 
 One :class:`SourceLedger` per source answers both questions the pipeline asks, "what is still to download?"
 (:attr:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`), from one read

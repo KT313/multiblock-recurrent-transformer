@@ -4,9 +4,9 @@
 # visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
 # command line: `python training/train.py --config config/crow_300m_final.yaml --run_name my-run`.
 #
-# All step values are OPTIMIZER steps. One step = world_batch_size × training_max_sequence_length = 1024 × 2048 ≈ 2.1M tokens,
-# so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on 4 GPUs;
-# on one GPU the same world batch is 256 micro-batches of 4, so a step takes correspondingly longer.
+# All step values are OPTIMIZER steps. One step = micro_batches_per_step × tokens_per_micro_batch = 256 × 8192 ≈ 2.1M
+# tokens, so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on
+# 4 GPUs; on one GPU the same step is 256 packs, so it takes correspondingly longer.
 # (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64,
 #  save 8192 → 128, eval 1024 → 16.)
 #
@@ -43,27 +43,17 @@ seed: 233                            # seed for model init, the recurrence sampl
 model_overwrite: {}                  # RecurrentConfig keys overriding the architecture config, e.g. {n_embd: 512}
 training_max_sequence_length: 2048   # documents are cut to this many tokens at training time; <= dataset_max_sequence_length of the dataset config <= model_max_sequence_length of the architecture
 
-# --- Data loading (every per-source train loader runs one worker; there is no worker-count knob) ----------------
-sort_batches_by_length: true         # regroup each world batch into length-sorted micro-batches (less padding)
-sequence_padding_multiple: 128       # pad micro-batches to a multiple of this many tokens (null: the max length)
-
 # --- Backend ----------------------------------------------------------------------------------------------------
 backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
 precision: bf16-mixed                # autocast precision of the forward/backward pass
 compile_model: true                  # torch.compile the model
 gradient_checkpointing: false        # recompute activations per recurrence iteration in the backward pass
 
-# --- Batching (one optimizer step = world_batch_size sequences) ------------------------------------------------
-micro_batch_size: 4                  # sequences per forward/backward pass (with pack_sequences: validation batches only)
-world_batch_size: 1024               # sequences per optimizer step (= micro_batch_size × gradient accumulation steps)
-
-# --- Sequence packing (training only; validation stays padded) ---------------------------------------------------
+# --- Sequence packing (the training batches; validation runs on padded rows, see below) -----------------------
 # Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
-# masked per document (FlexAttention), RoPE positions restarting per document; the step is then measured in tokens.
-# With packing, sort_batches_by_length / sequence_padding_multiple apply to the validation batches only.
-pack_sequences: true                 # required, false is refused (padded training weighed short rows like full ones)
-tokens_per_micro_batch: 8192         # pack length in tokens, >= training_max_sequence_length (null: micro_batch_size × training_max_sequence_length)
-micro_batches_per_step: 256          # packed micro-batches per optimizer step, a multiple of the number of devices (null: world_batch_size / micro_batch_size); 256 x 8192 = the padded 1024 x 2048
+# masked per document (FlexAttention), RoPE positions restarting per document; a step is measured in tokens.
+tokens_per_micro_batch: 8192            # pack length in tokens, >= training_max_sequence_length
+micro_batches_per_step: 256             # packs per optimizer step, a multiple of the number of devices; 256 x 8192 = 2,097,152 tokens per step
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
 optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
@@ -88,7 +78,9 @@ min_lr: 0                            # LR floor of warmup and cooldown
 log_step_interval: 1                 # log training metrics every this many steps
 log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
 eval_step_interval: 16               # run validation every this many steps
-eval_iters: 50                       # validation micro-batches per evaluated depth
+eval_iters: 50                       # validation batches per evaluated depth
+validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
+validation_padding_multiple: 128     # pad validation batches to a multiple of this many tokens (null: the longest row)
 partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at validation (plus the mean recurrence)
 save_step_interval: 128              # write a checkpoint every this many steps (plus before every stage transition)
 save_last_step: true                 # write a checkpoint at the end of training

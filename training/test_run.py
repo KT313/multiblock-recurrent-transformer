@@ -116,16 +116,16 @@ def test_stop_requested() -> None:
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
     """
-    `build_stage_manager` is the seven-argument constructor call: budgets of the resolved stages, batch and
-    sequence length, world size, warmup / cooldown and the packed micro-batches split over the devices.
+    `build_stage_manager` is the constructor call: budgets of the resolved stages, the tokens of one step, world
+    size, warmup / cooldown, and the check that the packs of a step split over the devices.
     """
 
     sm = build_stage_manager(tiny_settings, tiny_resolved, world_size=1)
     assert isinstance(sm, StageManager)
     assert sm.stages is tiny_resolved.stages
-    assert (sm.world_batch_size, sm.training_max_sequence_length, sm.world_size) == (tiny_settings.world_batch_size, tiny_settings.training_max_sequence_length, 1)
+    assert (sm.tokens_per_step, sm.world_size) == (tiny_settings.tokens_per_optimizer_step, 1) == (1024, 1)
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
-    assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (4 * 256)
+    assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (2 * 512)
     assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
     with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of devices \(3\)"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
@@ -682,7 +682,7 @@ def test_stage_boundary_resume_continues_schedule_and_stream(
     final_res = torch.load(checkpoint_dir(resumed_dir / "tiny") / "step-00000020-tiny.pth", map_location="cpu", weights_only=False)
     assert final_res["step"] == 20
     # the data stream continued: rows consumed per source add up to the uninterrupted run's counters exactly
-    # (no-transition config, worker batches of micro_batch_size 2 divide each step's draws: no buffered leftovers)
+    # (no-transition config: the draws of a step end at a worker-batch boundary, so there are no buffered leftovers)
     assert final_res["data_stream"]["consumed_rows"] == final_full["data_stream"]["consumed_rows"]
     assert final_res["model"].keys() == final_full["model"].keys()
 
@@ -993,7 +993,6 @@ def test_packed_tiny_run_finishes_and_resumes_exactly(
     """
 
     options: dict[str, Any] = dict(
-        pack_sequences=True,
         tokens_per_micro_batch=256,
         micro_batches_per_step=4,
         save_step_interval=4,

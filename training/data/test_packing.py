@@ -4,15 +4,19 @@ Tests for `training.data.packing`: the pool (refill target, first-fit from the f
 and `pack_samples` (layout, per-document equality with the padded path, label masking, the tail).
 """
 
+import itertools
 import logging
+from pathlib import Path
 
 import pytest
 import torch
 
-from training.data.collate import Sample, pad_and_shift
-from training.data.tokenizer import IGNORE_INDEX
+from training.data.collate import Sample, collate_samples, pad_and_shift
+from training.data.datasets import ParquetTextDataset
 from training.data.packing import POOL_TOKEN_FACTOR, PackedBatch, PackPool, pack_samples, shifted_length
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
+
+INSTRUCT_SIGNATURE = {"keys": ["instruction", "input", "output"], "format_fn": "concatenate_instruction_input_output"}
 
 # the synthetic tokenizer: <pad>=0, <bos>=1, <eos>=2, tok_i = 3 + i (vocab 259)
 FIRST_WORD = 3
@@ -187,3 +191,20 @@ def test_pack_samples_rejects_empty_and_overfull_packs(tokenizer: Tokenizer) -> 
 def test_custom_ignore_index(tokenizer: Tokenizer) -> None:
     pack = pack_samples([_sample(3)], 5, tokenizer, ignore_index=-7)
     assert pack.labels[0, 3:].tolist() == [-7, -7]
+
+
+def test_real_instruct_rows_keep_every_supervised_label(tokenizer: Tokenizer, tiny_instruct_dir: Path) -> None:
+    """
+    Instruct rows carry their labels at the END of the row (the prompt is masked): packing keeps every supervised
+    position of every document, whatever its prompt length.
+    """
+
+    rows = list(itertools.islice(iter(ParquetTextDataset(tiny_instruct_dir, "ft", INSTRUCT_SIGNATURE)), 8))
+    samples = collate_samples(rows, tokenizer, training_max_sequence_length=255)
+    expected = sorted(int((labels[1:] != IGNORE_INDEX).sum()) for _, labels, _ in samples)
+    assert len(samples) == 8 and expected[0] > 0
+    pack = pack_samples(samples, 8 * 255, tokenizer)
+    supervised = [
+        int((pack.labels[0, pack.document_ids[0] == document] != IGNORE_INDEX).sum()) for document in range(len(samples))
+    ]
+    assert sorted(supervised) == expected

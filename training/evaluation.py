@@ -73,7 +73,7 @@ def _evaluate(settings: Settings, backend: Backend, model: Module, val_loader: I
             "the validation loader yielded no batch: there is nothing to compute a validation loss from. Its "
             "stage has no validation rows left after the split (or fewer than one micro-batch per rank); give the "
             "stage a larger validation source, raise validation_fraction in the dataset config, or lower "
-            f"micro_batch_size ({settings.micro_batch_size})"
+            f"validation_batch_size ({settings.validation_batch_size})"
         )
     losses = backend.all_reduce(loss_sums / number_of_batches_seen)
     metrics = {"val_loss": losses[-1], "val_ppl": losses[-1].exp()}

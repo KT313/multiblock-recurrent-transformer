@@ -2,8 +2,9 @@
 """
 Training run settings: the YAML/CLI schema consumed by `training/train.py`.
 
-Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e. world
-batches of `world_batch_size × training_max_sequence_length` tokens. Defaults make a run on one local GPU work out of the box.
+Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e.
+`micro_batches_per_step` packed micro-batches of `tokens_per_micro_batch` tokens each. Defaults make a run on one
+local GPU work out of the box.
 """
 
 from dataclasses import dataclass, field
@@ -22,10 +23,11 @@ REQUIRED_SETTINGS: dict[str, str] = {
 POSITIVE_SETTINGS: dict[str, str] = {
     "log_step_interval": "save_step_interval is the only interval 0 disables",
     "eval_step_interval": "save_step_interval is the only interval 0 disables",
-    "eval_iters": "validation micro-batches per depth",
+    "eval_iters": "validation batches per depth",
     "grad_clip": "0 would zero every gradient",
-    "micro_batch_size": "sequences per forward/backward; 0 or less makes the micro-batch loop of a step run zero times",
-    "world_batch_size": "sequences per optimizer step",
+    "tokens_per_micro_batch": "the pack length; every micro-batch is one row of this many tokens",
+    "micro_batches_per_step": "packs per optimizer step; 0 or less makes the micro-batch loop of a step run zero times",
+    "validation_batch_size": "rows per validation forward",
     "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
     "sample_max_new_tokens": "tokens generated per sample prompt",
     "benchmark_batch_size": "sequences per lm-eval forward",
@@ -68,6 +70,14 @@ class Settings:
     dataset_config: str  # path to config/datasets/<name>.yaml
     model_architecture_config: str  # path to config/model_architecture/<name>.yaml
 
+    # Sequence packing (required): documents are laid end to end into ONE row of `tokens_per_micro_batch` tokens per
+    # micro-batch, never split, attention masked per document, RoPE positions restarting per document. One optimizer
+    # step is `micro_batches_per_step` such rows, i.e. `micro_batches_per_step x tokens_per_micro_batch` tokens, the
+    # unit of the stage budgets and the throughput metrics. Validation batches are padded rows instead
+    # (`validation_batch_size` below).
+    tokens_per_micro_batch: int  # pack length; >= training_max_sequence_length (the longest document after truncation)
+    micro_batches_per_step: int  # packs per optimizer step (a multiple of the number of devices)
+
     # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
@@ -88,32 +98,13 @@ class Settings:
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
-    training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and padded rows are sized by it; at most the dataset's and the model's length
-
-    # Data loading (train loaders always run one worker per source; there is no worker-count knob)
-    sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
-    sequence_padding_multiple: Optional[int] = 128  # pad micro-batches to a multiple of this (None: max length)
+    training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and validation rows are sized by it; at most the dataset's and the model's length
 
     # Backend
     backend: str = "single_device"
     precision: str = "bf16-mixed"
     compile_model: bool = False
     gradient_checkpointing: bool = False
-
-    # Batching in padded rows: validation batches `micro_batch_size` rows; for training the two only size the packing
-    # defaults below.
-    micro_batch_size: int = 4
-    world_batch_size: int = 1024
-
-    # Sequence packing, required (training only; validation stays padded). Documents are laid end to end into ONE
-    # row of `tokens_per_micro_batch` tokens per micro-batch, never split, attention masked per document, RoPE
-    # positions restarting per document. One optimizer step is `micro_batches_per_step` such rows, i.e.
-    # `micro_batches_per_step x tokens_per_micro_batch` tokens. Both left unset are the padded equivalents,
-    # `micro_batch_size x training_max_sequence_length` and `world_batch_size / micro_batch_size`, so a config written in rows keeps its
-    # token arithmetic. `sort_batches_by_length` / `sequence_padding_multiple` apply to the validation batches.
-    pack_sequences: bool = True  # false is refused (`_check_packing` says why); the field stays for old configs
-    tokens_per_micro_batch: Optional[int] = None  # pack length; >= training_max_sequence_length (the longest document after truncation)
-    micro_batches_per_step: Optional[int] = None  # packed micro-batches per optimizer step (a multiple of the number of devices)
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
@@ -125,11 +116,14 @@ class Settings:
     cooldown_steps: int = 0
     min_lr: float = 0.0
 
-    # Evaluation / logging / checkpoints
+    # Evaluation / logging / checkpoints. Validation batches are padded rows (not packs): `validation_batch_size`
+    # rows padded to the longest of them, rounded up to a multiple of `validation_padding_multiple`.
     log_step_interval: int = 1
     log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
     eval_step_interval: int = 100
-    eval_iters: int = 50  # validation micro-batches per depth
+    eval_iters: int = 50  # validation batches per depth
+    validation_batch_size: int = 4  # rows per validation forward
+    validation_padding_multiple: Optional[int] = 128  # pad validation batches to a multiple of this many tokens (None: the longest row)
     partial_depth_eval: list[int] = field(default_factory=list)  # extra recurrence depths evaluated at validation
     save_step_interval: int = 1000
     save_last_step: bool = True
@@ -176,18 +170,12 @@ class Settings:
                 raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
-        if self.world_batch_size < self.micro_batch_size:
+        if self.tokens_per_micro_batch < self.training_max_sequence_length:
             raise ValueError(
-                f"world_batch_size ({self.world_batch_size}) must be >= micro_batch_size ({self.micro_batch_size}): "
-                "one optimizer step is at least one micro-batch"
+                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= training_max_sequence_length "
+                f"({self.training_max_sequence_length}): a document is up to training_max_sequence_length tokens after "
+                "truncation and is never split across packs"
             )
-        if self.world_batch_size % self.micro_batch_size != 0:
-            raise ValueError(
-                f"world_batch_size ({self.world_batch_size}) must be a multiple of micro_batch_size "
-                f"({self.micro_batch_size}): gradient_accumulation_steps is their integer quotient, so anything else "
-                "silently trains on fewer sequences per step than configured"
-            )
-        self._check_packing()
         if self.eval_step_interval % self.log_step_interval != 0:  # both are POSITIVE_SETTINGS, no 0-disables case
             raise ValueError(
                 f"eval_step_interval ({self.eval_step_interval}) must be a multiple of log_step_interval "
@@ -211,59 +199,25 @@ class Settings:
                 "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
             )
 
-    def _check_packing(self) -> None:
-        """
-        Packing is required; a packing field left unset becomes its padded equivalent (checked like a given one,
-        and recorded that way in run_config.json and the checkpoints), the pack at least one full document long,
-        the step at least one micro-batch. Whether the micro-batches split evenly over the devices is the stage
-        manager's check (it knows the world size).
-        """
-
-        if not self.pack_sequences:
-            raise ValueError(
-                "pack_sequences: false is not supported. Training on padded rows averages the per-micro-batch mean "
-                "losses while the loader sorts each world batch by length, so a micro-batch of short rows gets the "
-                "same gradient weight as one of full-length rows, up to the ratio of their token counts. With "
-                "packing every micro-batch holds the same number of tokens and the step loss is token-weighted; "
-                "validation batches stay padded either way. Set pack_sequences: true."
-            )
-        if self.tokens_per_micro_batch is None:
-            self.tokens_per_micro_batch = self.micro_batch_size * self.training_max_sequence_length
-        if self.micro_batches_per_step is None:
-            self.micro_batches_per_step = self.world_batch_size // self.micro_batch_size
-        if self.tokens_per_micro_batch < self.training_max_sequence_length:
-            raise ValueError(
-                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= training_max_sequence_length ({self.training_max_sequence_length}): a "
-                "document is up to training_max_sequence_length tokens after truncation and is never split across packs"
-            )
-        if self.micro_batches_per_step <= 0:
-            raise ValueError(f"micro_batches_per_step must be positive, got {self.micro_batches_per_step}")
-
     @property
     def gradient_accumulation_steps(self) -> int:
         """
-        Micro-batches per optimizer step on one device (divide by world_size once distributed training exists; until
-        then `train()` refuses `world_size != 1`, a second rank would double the world batch).
+        Micro-batches per optimizer step on one device, `micro_batches_per_step` (divide by world_size once
+        distributed training exists; until then `train()` refuses `world_size != 1`, a second rank would double the
+        step). Whether the packs split evenly over the devices is checked where the world size is known
+        (`training.run.build_stage_manager`).
         """
 
-        if self.pack_sequences:
-            assert self.micro_batches_per_step is not None  # `_check_packing`
-            return self.micro_batches_per_step
-        return self.world_batch_size // self.micro_batch_size
+        return self.micro_batches_per_step
 
     @property
     def tokens_per_optimizer_step(self) -> int:
         """
         Tokens per optimizer step, the unit of the stage budgets and the throughput metrics:
-        `micro_batches_per_step x tokens_per_micro_batch` when packing, else `world_batch_size x training_max_sequence_length` (the
-        padded rows counted at full length, as the thesis did).
+        `micro_batches_per_step x tokens_per_micro_batch` (pack tails counted, as the packs are full-length rows).
         """
 
-        if self.pack_sequences:
-            assert self.micro_batches_per_step is not None and self.tokens_per_micro_batch is not None  # `_check_packing`
-            return self.micro_batches_per_step * self.tokens_per_micro_batch
-        return self.world_batch_size * self.training_max_sequence_length
-
+        return self.micro_batches_per_step * self.tokens_per_micro_batch
 
 
 def parse_settings(args: Optional[list[str]] = None) -> Settings:

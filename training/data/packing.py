@@ -4,13 +4,13 @@ Sequence packing: documents laid end to end into one row of a fixed length, neve
 attention mask block and its own RoPE positions.
 
 `PackPool` is the rolling pool of drawn documents `BatchStream` fills a pack from (first-fit from the front of the
-pool), `pack_samples` turns the chosen documents into a `PackedBatch`. The padded path (`training.data.collate`)
-is untouched; the two share `Sample`, `IGNORE_INDEX` and the label masking.
+pool), `pack_samples` turns the chosen documents into a `PackedBatch`. Validation still pads its rows
+(`training.data.collate`); the two share `Sample`, `IGNORE_INDEX` and the label masking.
 
-Per-document shift, then concatenation: every sample is shifted like a row of the padded path (inputs drop the
-last token, labels the first) BEFORE it is appended, so the last input of a document is labelled with that document's
-own EOS and no label ever points into the next document. Per document, inputs and labels are identical to the
-padded path; the model sees the same tokens, only side by side instead of row by row.
+Per-document shift, then concatenation: every sample is shifted like a padded row (inputs drop the last token,
+labels the first) BEFORE it is appended, so the last input of a document is labelled with that document's own EOS
+and no label ever points into the next document. Per document, inputs and labels are identical to the padded row
+`pad_and_shift` would make of it; the model sees the same tokens, only side by side instead of row by row.
 """
 
 import logging
