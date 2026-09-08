@@ -1,0 +1,114 @@
+# Small v2 run (v2_small): a 39M-parameter recurrent model on the 50M-token v2 dataset, expressed for one local GPU.
+#
+# This file lists EVERY run setting (`training/settings.py:Settings`) with its value, so the available knobs are
+# visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
+# command line: `python training/train.py --config config/v2_small.yaml --run_name my-run`.
+#
+# All step values are OPTIMIZER steps. One step = micro_batches_per_step x tokens_per_micro_batch = 64 x 8192 =
+# 524,288 tokens; the stage boundary summary at startup lists the resulting step counts. With the budgets of
+# config/datasets/v2_50M_tokens.yaml (30M + 15M + 5M tokens) the run is 57 + 28 + 9 = 94 steps, the transition
+# windows at the stage ends 5 and 2 steps. Consequences of the values below at that length: warmup_steps 8 ramps the
+# LR up over the first 8 of the 57 pretrain_phase1 steps, cooldown_steps 8 ramps it down over 8 of the 9 finetune
+# steps, so that stage is essentially the ramp-down; eval_step_interval 16 validates at steps 16, 32, 48, 64, 80 and
+# at the last step (94), so the finetune stage is validated once, at its end; save_step_interval 128 never fires,
+# checkpoints are written at steps 52 and 83 (before the two stage transitions) and at step 94 (save_last_step).
+#
+# Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/v2_small.yaml;
+# `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets and weights and the tokenizer
+# are defined in config/datasets/v2_50M_tokens.yaml. Training verifies the prepared data under dataset_dir and
+# builds what is missing (`auto_prepare`);
+# `python data_preparation/prepare.py prepare --dataset_config config/datasets/v2_50M_tokens.yaml` does the same up
+# front (export HF_TOKEN for the gated peS2o source). The only per-stage value that stays here is the base learning
+# rate (`stage_base_lrs`, positional, one per dataset-config stage).
+
+# --- Config references (both required) --------------------------------------------------------------------------
+dataset_config: config/datasets/v2_50M_tokens.yaml                    # sources, stages, budgets, weights, tokenizer
+model_architecture_config: config/model_architecture/v2_small.yaml   # RecurrentConfig: sizes, depth, recurrence
+
+# --- Data -------------------------------------------------------------------------------------------------------
+dataset_dir: dataset                 # root of the prepared data (sources/, processed/, tokenizers/)
+auto_prepare: true                   # build missing data in-process before training; false: fail with the build command
+prepare_num_workers: 4               # sources processed at a time by the in-process build (= prepare.py --num_workers)
+prepare_pass_workers: 4              # worker processes of EACH build's optional cleaning passes (decontamination / minhash, off in this dataset config; = prepare.py --pass_workers)
+prepare_max_parallel_downloads: 2    # sources downloading at a time during the in-process build
+stage_base_lrs: [3e-4, 1e-4, 5e-5]   # base LR per dataset-config stage, positional: pretrain_phase1, pretrain_phase2, finetune
+allow_dataset_change: false          # allow resuming from a checkpoint written with a different dataset config
+allow_settings_change: false         # allow resuming although settings / model config differ from the checkpoint (all compared but exemptions)
+
+# --- Run --------------------------------------------------------------------------------------------------------
+run_name: v2_small            # name of the run: checkpoint file names, wandb run, resume lookup
+out_dir: outputs                     # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log, configs
+resume: true                         # resume from the most recently written checkpoint in the run directory if one exists
+resume_checkpoint_path: null         # explicit checkpoint to resume from (overrides the search); null: search
+seed: 233                            # seed for model init, the recurrence sampler and data order
+
+# --- Model ------------------------------------------------------------------------------------------------------
+model_overwrite: {}                  # RecurrentConfig keys overriding the architecture config, e.g. {n_embd: 512}
+training_max_sequence_length: 2048   # documents are cut to this many tokens at training time; <= dataset_max_sequence_length of the dataset config <= model_max_sequence_length of the architecture
+
+# --- Backend ----------------------------------------------------------------------------------------------------
+backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
+precision: bf16-mixed                # autocast precision of the forward/backward pass
+compile_model: true                  # torch.compile the model
+gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.
+                                     # selective keeps the GEMM and FlexAttention outputs and recomputes only the cheap ops (v2_small, 8192-token packs:
+                                     # ~6 % slower than none, 75 % of the peak memory); full recomputes the whole iteration (~22 % slower, 35 % of the memory)
+
+# --- Sequence packing (the training batches; validation runs on padded rows, see below) -----------------------
+# Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
+# masked per document (FlexAttention), RoPE positions restarting per document; a step is measured in tokens.
+tokens_per_micro_batch: 8192            # pack length in tokens, >= training_max_sequence_length
+micro_batches_per_step: 64              # packs per optimizer step, a multiple of the number of devices; 64 x 8192 = 524,288 tokens per step
+
+# --- Optimizer + LR schedule ------------------------------------------------------------------------------------
+optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
+optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
+                                     # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
+  lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation
+  weight_decay: 4e-5  # decoupled
+  betas: [0.9, 0.95]
+  eps: null           # null: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)
+  update_clipping: true  # this and the three below exist only on ELLISAdam
+  atan_adam: true
+  running_init: true
+  decouple_wd: true
+no_weight_decay_for_bias_and_norm_params: true   # biases and norm weights get weight_decay 0
+grad_clip: 1.0                       # gradient-norm clipping threshold
+lr_schedule: trapezoid               # LR shape within and across stages (training/lr_schedule.py)
+warmup_steps: 8                     # linear LR warmup steps at the start of training
+cooldown_steps: 8                   # LR cooldown steps at the end of training
+min_lr: 0                            # LR floor of warmup and cooldown
+
+# --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
+log_step_interval: 8                 # log training metrics every this many steps (gradient metrics sync the GPU)
+log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
+eval_step_interval: 16               # run validation every this many steps
+eval_iters: 50                       # validation batches per evaluated depth
+validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
+validation_padding_multiple: 128     # pad validation batches to a multiple of this many tokens (null: the longest row)
+partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at validation (plus the mean recurrence)
+save_step_interval: 128              # write a checkpoint every this many steps (plus before every stage transition)
+save_last_step: true                 # write a checkpoint at the end of training
+logger_project: recurtrain-baseline  # wandb project
+wandb_offline: true                  # wandb offline mode (files under {out_dir}/{run_name}/wandb, sync later)
+wandb_enabled: true                  # false: no wandb at all
+
+# --- Export -----------------------------------------------------------------------------------------------------
+export_to_hf: false                  # write a HuggingFace trust_remote_code folder at the end of training
+export_hf_path: null                 # target of the export; null: {out_dir}/{run_name}/hf_export
+
+# --- Samples and benchmarks (evaluation/) ----------------------------------------------------------------------------
+# Both run RNG-isolated, so they never change the training numerics; files go to {run dir}/samples/ and
+# {run dir}/benchmarks/, named by step. Benchmarks need the eval extra (uv sync --extra eval) and network.
+sample_step_interval: 0              # write sample generations every this many steps (0: never)
+sample_at_training_progress: [100]   # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+sample_max_new_tokens: 64            # tokens generated per prompt
+sample_temperature: 0.0              # 0: greedy decoding
+sample_recurrences: []               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
+benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
+benchmark_at_training_progress: []   # ... and at these percentages of the run, like sample_at_training_progress
+benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
+benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
+benchmark_num_fewshot: -1         # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
+benchmark_batch_size: 8              # sequences per lm-eval forward
+benchmark_recurrences: []            # like sample_recurrences, for the benchmarks

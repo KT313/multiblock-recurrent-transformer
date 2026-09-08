@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from data_preparation.dataset_config import (
     DatasetConfig,
@@ -29,7 +31,7 @@ from data_preparation.dataset_config import (
 )
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.build.planner import DatasetReport
+from data_preparation.lib.build.planner import DatasetReport, UnreadableRawShardError
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
 from training.checkpoint import CheckpointMetadata
 from training.data.dataset_resolver import (
@@ -173,7 +175,9 @@ def _settings(dataset_config: Path, dataset_dir: Path, **overrides: Any) -> Sett
         "model_architecture_config": "config/model_architecture/tiny.yaml",
         "dataset_dir": str(dataset_dir),
         "stage_base_lrs": [3e-4, 1e-4, 5e-5],
-        "block_size": 256,
+        "training_max_sequence_length": 256,
+        "tokens_per_micro_batch": 512,
+        "micro_batches_per_step": 2,
         "prepare_num_workers": 1,
     }
     return Settings(**(base | overrides))
@@ -186,7 +190,6 @@ def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
     """
 
     return DatasetConfig(
-        name="t",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "a": SourceConfig(kind="pretrain", loader="synthetic"),
@@ -194,8 +197,8 @@ def _synthetic_config(**source_overrides: Any) -> DatasetConfig:
             "held": SourceConfig(kind="pretrain", loader="synthetic", rows=10),
         },
         stages=[StageConfig(name="s", tokens=100, train={"a": 0.5, "both": 0.5}, val={"both": 0.5, "held": 0.5})],
-        block_size=8,
-        max_seq_length=8,
+        training_target_sequence_length=8,
+        dataset_max_sequence_length=8,
     )
 
 
@@ -503,7 +506,7 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
 
 def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pretrain_dir: Path) -> None:
     """
-    A validation loader is one finite pass over its entries' row ranges (`ceil(rows / micro_batch_size)`
+    A validation loader is one finite pass over its entries' row ranges (`ceil(rows / validation_batch_size)`
     batches, the rows of every entry dealt over `world_size` shards); several entries are read once each through
     `WeightedMixtureDataset`.
     """
@@ -511,15 +514,15 @@ def test_validation_batches_available_counts_one_pass_over_every_entry(tiny_pret
     good = str(tiny_pretrain_dir)
     total = _rows_in(tiny_pretrain_dir)
     rows = {good: total}
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], rows, micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=1) == 4
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, micro_batch_size=2, world_size=4) == 1
-    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, micro_batch_size=2, world_size=4) == 0
-    assert validation_batches_available([DataEntry("s-a", good)], rows, micro_batch_size=1, world_size=1) == total
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=7)], rows, validation_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, validation_batch_size=2, world_size=1) == 4
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=8)], rows, validation_batch_size=2, world_size=4) == 1
+    assert validation_batches_available([DataEntry("s-a", good, max_rows=3)], rows, validation_batch_size=2, world_size=4) == 0
+    assert validation_batches_available([DataEntry("s-a", good)], rows, validation_batch_size=1, world_size=1) == total
     assert validation_batches_available([DataEntry("s-a", good, skip_rows=total - 1)], rows, 4, 1) == 1  # a short last batch
     mixture = [DataEntry("s-a", good, max_rows=5), DataEntry("s-b", good, max_rows=2)]
-    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=1) == 2  # 7 rows once
-    assert validation_batches_available(mixture, rows, micro_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
+    assert validation_batches_available(mixture, rows, validation_batch_size=4, world_size=1) == 2  # 7 rows once
+    assert validation_batches_available(mixture, rows, validation_batch_size=4, world_size=2) == 1  # 2 + 1 per rank
 
 
 def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
@@ -535,39 +538,44 @@ def test_check_validation_batches_fails_at_setup_on_a_split_without_one_batch(
     rows = {good: _rows_in(tiny_pretrain_dir)}
     stage = _stage([DataEntry("s-a", good, max_rows=4)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=2)  # exactly eval_iters batches
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=2)  # exactly eval_iters batches
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=8, eval_iters=1)  # one short batch is still a batch
+        check_validation_batches([stage], rows, validation_batch_size=8, eval_iters=1)  # one short batch is still a batch
     assert caplog.text == ""
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=5)
-    assert "stage s: its validation data (s-a) yields 2 micro-batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=5)
+    assert "stage s: its validation data (s-a) yields 2 batch(es) of 2 rows, fewer than eval_iters (5)" in caplog.text
     # nothing at all reaches a rank (here: 4 rows dealt over 8 ranks, the last two get none) is the hard error
-    with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 micro-batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
-        check_validation_batches([stage], rows, micro_batch_size=2, eval_iters=1, world_size=8)
+    with pytest.raises(RuntimeError, match=r"stage 's': its validation data \(s-a\) yields 0 batches of 2 rows per rank \(world size 8\) but eval_iters is 1, so evaluation"):
+        check_validation_batches([stage], rows, validation_batch_size=2, eval_iters=1, world_size=8)
     # a validation loader that mixes several sources reads each of them once: it is checked like a single one
     mixed = _stage([DataEntry("s-a", good, max_rows=1), DataEntry("s-b", good, max_rows=1)])
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         caplog.clear()
-        check_validation_batches([mixed], rows, micro_batch_size=8, eval_iters=50)
-    assert "stage s: its validation data (s-a, s-b) yields 1 micro-batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
+        check_validation_batches([mixed], rows, validation_batch_size=8, eval_iters=50)
+    assert "stage s: its validation data (s-a, s-b) yields 1 batch(es) of 8 rows, fewer than eval_iters (50)" in caplog.text
 
 
-def test_resolve_dataset_warns_about_the_short_tiny_finetune_split(
+def test_resolve_dataset_warns_about_the_short_tiny_validation_splits(
     tiny_dataset_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    The tiny dataset's finetune validation split is a couple of rows: enough for one micro-batch (the run is
-    fine, `evaluate` averages what it gets) but fewer than `eval_iters` batches, so the resolver says so.
+    The tiny dataset's validation splits are a handful of rows: enough for a micro-batch (the run is fine,
+    `evaluate` averages what it gets) but fewer than `eval_iters` batches once those ask for more, and the
+    resolver says so per stage.
     """
 
-    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, micro_batch_size=2, eval_iters=2)
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, validation_batch_size=2, eval_iters=4)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         resolved = resolve_dataset(settings)
-    assert resolved.validation_rows["synthetic_instruct"] < 2 * 2  # fewer rows than eval_iters micro-batches
-    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 1 micro-batch(es)" in caplog.text
-    assert "stage pretrain_a" not in caplog.text  # the pretrain split is long enough
+    assert resolved.validation_rows["synthetic_instruct"] == 6 < 2 * 4  # fewer rows than eval_iters micro-batches
+    assert "stage finetune: its validation data (finetune-synthetic_instruct) yields 3 batch(es)" in caplog.text
+    assert "stage pretrain_a: its validation data (pretrain_a-synthetic_pretrain) yields 3 batch(es)" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False, validation_batch_size=2, eval_iters=2))
+    assert "batch(es)" not in caplog.text  # two batches of two rows fit every split, so no stage is warned about
 
 
 def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -577,7 +585,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
     import training.data.dataset_resolver as resolver_module
 
-    monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir: DatasetReport(tokenizer_complete=True))
+    monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir, **kwargs: DatasetReport(tokenizer_complete=True))
     root = tmp_path / "ds"
     expected_folder = re.escape(str(DatasetLayout(root).processed_dir("synthetic_pretrain")))
     with pytest.raises(FileNotFoundError, match=f"source 'synthetic_pretrain' \\(stage keys pretrain_a.train, pretrain_b.train, pretrain_a.val, pretrain_b.val\\): processed folder {expected_folder} does not exist"):
@@ -601,12 +609,31 @@ def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(
     assert isinstance(resolved, ResolvedDataset) and not (folder / "data-00001.parquet").exists()
 
 
+def test_an_unreadable_raw_shard_fails_the_run_with_the_repair_command(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    The run reads the dataset through the same planner, which measures the tokens per row from the raw shards: a
+    truncated shard must fail the run with the command that repairs it, not with a bare Arrow error. Auto-prepare
+    cannot fix it on its own (dropping raw rows needs a confirmation), so the message is the same either way.
+    """
+
+    root = tmp_path / "ds"
+    shutil.copytree(tiny_dataset_dir, root)
+    shard = DatasetLayout(root).raw_dir("synthetic_pretrain") / "data-00000.parquet"
+    shard.write_bytes(b"corrupt")
+    with pytest.raises(UnreadableRawShardError) as error:
+        resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
+    message = str(error.value)
+    assert f"synthetic_pretrain: raw shard {shard} cannot be read" in message
+    assert "the repair step truncates raw/synthetic_pretrain to its readable prefix" in message
+    assert build_command(str(TINY_DATASET_YAML), str(root)) + " --yes" in message, "the command auto-prepare prints too"
+
+
 # --- resolve_dataset -------------------------------------------------------------------------------------------------
 
 
 def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: DatasetLayout) -> None:
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=False))
-    assert isinstance(resolved, ResolvedDataset) and resolved.config.name == "tiny"
+    assert isinstance(resolved, ResolvedDataset)
     assert resolved.config_hash == load_dataset_config(TINY_DATASET_YAML).config_hash()
     assert resolved.tokenizer_dir == str(tiny_layout.tokenizer_dir("synthetic"))
     assert [s.name for s in resolved.stages] == ["pretrain_a", "pretrain_b", "finetune"]
@@ -623,6 +650,9 @@ def test_resolve_on_prepared_tiny_dataset(tiny_dataset_dir: Path, tiny_layout: D
     assert resolved.stages[2].val_data[0].data_dir == str(tiny_layout.processed_dir("synthetic_instruct"))
     assert resolved.validation_rows == resolve_splits(resolved.config, tiny_layout, resolved.rows_on_disk)
     assert resolved.rows_on_disk == processed_row_counts(resolved.config, tiny_layout)
+    assert resolved.source_rows == {
+        name: resolved.rows_on_disk[str(tiny_layout.processed_dir(name))] for name in ("synthetic_pretrain", "synthetic_instruct")
+    }
     for entry in resolved.train_sources + [e for stage in resolved.stages for e in stage.val_data]:
         assert list(Path(entry.data_dir).glob("*.parquet")), entry
 
@@ -743,29 +773,50 @@ def test_auto_prepare_never_deletes_raw(tmp_path: Path, monkeypatch: pytest.Monk
 # --- cross-checks ---------------------------------------------------------------------------------------------------
 
 
-def test_base_lrs_length_mismatch_raises(tmp_path: Path, crow_cfg: DatasetConfig) -> None:
-    settings = _settings(CROW_DATASET_YAML, tmp_path, stage_base_lrs=[1e-3, 1e-4], block_size=2048)
-    with pytest.raises(ValueError, match="stage_base_lrs has 2 entries but dataset config .* has 3 stages"):
-        validate_settings(settings, crow_cfg)
-    with pytest.raises(ValueError, match="stage_base_lrs has 2 entries"):
+def _config_file(tmp_path: Path, config: DatasetConfig) -> Path:
+    """
+    The config written as `<tmp_path>/dataset.yaml`: the cross-check tests below read only values they set here,
+    never a shipped config that is free to change.
+    """
+
+    path = tmp_path / "dataset.yaml"
+    path.write_text(yaml.safe_dump(asdict(config), sort_keys=False))
+    return path
+
+
+@pytest.mark.timeout(3)  # a check that did not fire must not turn into a build (auto_prepare is off too)
+def test_base_lrs_length_mismatch_raises(tmp_path: Path) -> None:
+    config = _synthetic_config()  # one stage; `_settings` gives three base LRs
+    settings = _settings(_config_file(tmp_path, config), tmp_path / "data", auto_prepare=False, training_max_sequence_length=8)
+    with pytest.raises(ValueError, match="stage_base_lrs has 3 entries but dataset config .* has 1 stages"):
+        validate_settings(settings, config)
+    with pytest.raises(ValueError, match="stage_base_lrs has 3 entries"):
         resolve_dataset(settings)  # checked before any data is touched
 
 
-@pytest.mark.parametrize("block_size", [4096, 256])
-def test_block_size_mismatch_raises_naming_both_files(tmp_path: Path, crow_cfg: DatasetConfig, block_size: int) -> None:
-    settings = _settings(CROW_DATASET_YAML, tmp_path, block_size=block_size)
-    expected = f"block_size {block_size} of the run config does not match block_size 2048 of dataset config {str(CROW_DATASET_YAML)!r}"
+@pytest.mark.timeout(3)  # a refusal that did not happen must not turn into a build (auto_prepare is off too)
+def test_training_longer_than_the_dataset_rows_is_refused_at_load(tmp_path: Path) -> None:
+    """
+    A run longer than the rows were cut at is refused by the settings cross-check, before any data is touched
+    (`auto_prepare` off and an empty dataset dir: a check that let the run through would fail on the missing data,
+    never build it). A shorter run is fine (the sampler cycles rows that serve fewer tokens than planned).
+    """
+
+    config = _synthetic_config()  # rows cut at 8 tokens
+    path = _config_file(tmp_path, config)
+    expected = f"training_max_sequence_length (16) exceeds dataset_max_sequence_length (8) of {path.as_posix()}"
     with pytest.raises(ValueError, match=re.escape(expected)):
-        validate_settings(settings, crow_cfg)
-    with pytest.raises(ValueError, match=re.escape(expected)):
-        resolve_dataset(settings)  # checked before any data is touched (tmp_path is empty)
-    validate_settings(_settings(CROW_DATASET_YAML, tmp_path, block_size=2048), crow_cfg)  # equal is fine
+        resolve_dataset(_settings(path, tmp_path / "data", stage_base_lrs=[1e-3], training_max_sequence_length=16, auto_prepare=False))
+    validate_settings(_settings(path, tmp_path / "data", stage_base_lrs=[1e-3], training_max_sequence_length=4), config)
 
 
 # --- resume checks --------------------------------------------------------------------------------------------------
 
 
-def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedDataset:
+SOURCE_ROWS = {"a": 40, "b": 10}  # the row counts the resume checks share unless a test changes them
+
+
+def _resolved(config_hash: str, validation_rows: dict[str, int], source_rows: dict[str, int] = SOURCE_ROWS) -> ResolvedDataset:
     return ResolvedDataset(
         config=load_dataset_config(TINY_DATASET_YAML),
         config_hash=config_hash,
@@ -773,11 +824,12 @@ def _resolved(config_hash: str, validation_rows: dict[str, int]) -> ResolvedData
         stages=[],
         train_sources=[],
         validation_rows=validation_rows,
+        source_rows=source_rows,
         rows_on_disk={},
     )
 
 
-def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMetadata:
+def _metadata(config_hash: str, validation_rows: dict[str, int], source_rows: dict[str, int] = SOURCE_ROWS) -> CheckpointMetadata:
     return CheckpointMetadata(
         step=3,
         stage=0,
@@ -786,6 +838,7 @@ def _metadata(config_hash: str, validation_rows: dict[str, int]) -> CheckpointMe
         model_config={},
         dataset_config_hash=config_hash,
         validation_rows=validation_rows,
+        source_rows=source_rows,
         data_stream={},
     )
 
@@ -817,9 +870,28 @@ def test_check_dataset_unchanged_validation_rows_mismatch(caplog: pytest.LogCapt
     assert "'a': checkpoint 4, now 3" in caplog.text and "allow_dataset_change" in caplog.text
 
 
-def test_check_dataset_unchanged_reports_both_differences_at_once() -> None:
-    with pytest.raises(RuntimeError) as excinfo:
-        check_dataset_unchanged(_metadata("abc", {"a": 4}), _resolved("xyz", {"a": 3}), allow_change=False)
+def test_check_dataset_unchanged_source_rows_mismatch(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A source re-prepared to another row count is refused even when the validation split cannot see it (a
+    train-only source holds out 0 rows whatever its size): the stream resumes by row offset into the source.
+    """
+
+    split = {"a": 0, "b": 10}  # `a` is train-only: its validation rows are 0 at any size
+    with pytest.raises(RuntimeError, match=r"processed rows per source: 'a': checkpoint 40, now 55\)") as excinfo:
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 55, "b": 10}), allow_change=False)
     message = str(excinfo.value)
-    assert "hash abc, the current dataset config hashes to xyz; the validation split differs" in message
+    assert "'b'" not in message and "validation split" not in message and "allow_dataset_change: true" in message
+    with pytest.raises(RuntimeError, match="'b': checkpoint 10, now absent; 'c': checkpoint absent, now 3"):
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 40, "c": 3}), allow_change=False)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        check_dataset_unchanged(_metadata("h", split), _resolved("h", split, {"a": 55, "b": 10}), allow_change=True)
+    assert "'a': checkpoint 40, now 55" in caplog.text and "allow_dataset_change" in caplog.text
+
+
+def test_check_dataset_unchanged_reports_every_difference_at_once() -> None:
+    with pytest.raises(RuntimeError) as excinfo:
+        check_dataset_unchanged(_metadata("abc", {"a": 4}), _resolved("xyz", {"a": 3}, {"a": 30, "b": 10}), allow_change=False)
+    message = str(excinfo.value)
+    assert "hash abc, the current dataset config hashes to xyz; the rows per source differ" in message
+    assert "'a': checkpoint 40, now 30); the validation split differs" in message
     assert "'a': checkpoint 4, now 3" in message

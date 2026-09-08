@@ -402,25 +402,26 @@ def test_tiny_run_in_a_pseudo_terminal_leaves_the_kept_lines_and_the_summaries(t
     assert "saved checkpoint" in shown and "step-00000020-tiny.pth" in shown, shown
     assert shown.index("Training finished after 20 steps") < shown.index("overall") < shown.index("Training run in ")
     assert "20 optimizer steps completed" in shown and "3 checkpoints written" in shown  # the long path may wrap
-    assert sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")) == [
+    assert sorted(p.name for p in checkpoint_dir(out_dir / "tiny").glob("*.pth")) == [
         "step-00000006-tiny-stage-0_end.pth",
         "step-00000014-tiny-stage-1_end.pth",
         "step-00000020-tiny.pth",
     ]
-    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    log_text = (out_dir / "tiny" / TRAIN_LOG_NAME).read_text()
     assert "Total training steps: 20" in log_text and "Training finished after 20 steps" in log_text
 
 
 @pytest.mark.slow
 def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_screen(tiny_dataset_dir: Path, tmp_path: Path) -> None:
     """
-    Ctrl-C once while the live dashboard is up (a longer run: 80 optimizer steps of one micro-batch each): the run
+    Ctrl-C once while the live dashboard is up (the 20 packed steps of `config/tiny.yaml`; the override only sizes
+    the validation batches, the signal lands after a few steps): the run
     finishes its step, saves a checkpoint, exits 130; the screen shows the signal's kept warning, the "stopped on
     request" line, the static summary and the report once, no frame remnants.
     """
 
     out_dir = tmp_path / "out"
-    arguments = _tiny_cli_arguments(tiny_dataset_dir, out_dir, "--world_batch_size", "1", "--micro_batch_size", "1")
+    arguments = _tiny_cli_arguments(tiny_dataset_dir, out_dir, "--validation_batch_size", "1")
     code, text = _run_cli_in_pty(arguments, width=140, height=45, interrupt_after=0.5)
     assert code == 130, text[-3000:]
     shown = _assert_clean_terminal(text, 140)
@@ -428,10 +429,10 @@ def test_sigint_in_a_pseudo_terminal_saves_a_checkpoint_and_leaves_a_clean_scree
     assert shown.count("Training stopped on request after ") == 1 and "Training finished" not in shown, shown
     assert "rerun with resume: true to continue" in shown and "checkpoints written, last:" in shown, shown
     assert "stopped on request" in shown and "saved checkpoint" in shown, shown
-    checkpoints = sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth"))
+    checkpoints = sorted(p.name for p in checkpoint_dir(out_dir / "tiny").glob("*.pth"))
     assert checkpoints and all(name.startswith("step-000000") for name in checkpoints), checkpoints
     assert checkpoints[-1].endswith("-tiny.pth") and "_end" not in checkpoints[-1], "the last one is the stop checkpoint"
     assert checkpoints[-1][len("step-") : len("step-00000000")].lstrip("0").isdigit(), "named after the stopped step"
     # events are dashboard-only under the live display (the fallback logs them); the records are in train.log
-    log_text = (out_dir / TRAIN_LOG_NAME).read_text()
+    log_text = (out_dir / "tiny" / TRAIN_LOG_NAME).read_text()
     assert "SIGINT received" in log_text and "Training stopped on request" in log_text

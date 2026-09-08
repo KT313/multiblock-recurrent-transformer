@@ -12,10 +12,8 @@
 # init_strategy, init_orthogonal, activation_checkpoint_impl, injection_type, state_init, sampling_scheme accept
 # only that one value and are therefore not listed here).
 
-name: tiny                     # label of this architecture (written to model_config.json next to the checkpoints)
-
 # Core sizes
-block_size: 256                # maximum sequence length (size of the RoPE table); the run config's block_size must equal it
+model_max_sequence_length: 256   # the longest sequence the model accepts (the RoPE table covers this many positions); >= the run config's training_max_sequence_length
 n_embd: 64                     # hidden size of the residual stream
 intermediate_size: 128         # hidden size of the GatedMLP (null: 4 * n_embd)
 num_attention_heads: 4         # attention heads; n_embd must be divisible by it (head size = n_embd / heads = 16)
@@ -23,7 +21,7 @@ num_attention_heads: 4         # attention heads; n_embd must be divisible by it
 # Vocabulary
 vocab_size: 512                # size of the tokenizer vocabulary (the synthetic tokenizer has 259 tokens, padded to 512)
 padding_multiple: 512          # the embedding table is padded to a multiple of this
-padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (512); an explicit value also caps vocab_size
+padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (512); an explicit value must be >= vocab_size (a smaller one is rejected)
 tie_embeddings: true           # lm_head shares the token-embedding weights
 
 # Block details
@@ -31,10 +29,11 @@ rope_settings:
   rope_base: 50000             # base of the rotary position embedding frequencies
 norm_eps: 1.0e-6               # epsilon of every RMSNorm / LayerNorm (write floats with a dot: YAML reads 1e-6 as a string)
 qk_bias: true                  # learned additive bias on the queries and keys of every attention layer
+bf16_residual_stream: none     # residual stream under bf16 autocast: none = fp32 (the RMSNorm outputs promote to fp32), core = bf16 inside the core blocks, all = bf16 everywhere; fp32 without autocast
 
 # Recurrent structure
 n_layers_in_prelude: 2         # SandwichBlocks before the recurrent core (run once, embed the input)
 n_layers_in_coda: 1            # SandwichBlocks after the recurrent core (run once, before the output norm and lm_head)
 n_layers_in_recurrent_block: [1, 1]   # SandwichBlocks per recurrent core block; one entry per core block (here 2 blocks)
 mean_recurrence: [2, 2]        # mean number of iterations per block (training sampler mean and eval depth); one entry per core block
-mean_backprop_depth: [2, 2]    # mean number of iterations with gradients (truncated backprop); one entry per core block
+mean_backprop_depth: [2, 2]    # cap on the iterations with gradients per block (truncated backprop: the last min(sampled depth, this) iterations, so the average is lower); one entry per core block

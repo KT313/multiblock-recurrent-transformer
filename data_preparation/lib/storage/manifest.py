@@ -4,12 +4,17 @@ MANIFEST.json beside a shard directory: what the directory contains and which co
 
 Every stage directory (dataset/sources/<source>/raw/, dataset/processed/<source>/, tokenizers) carries one
 manifest. source_hash is the stage's key from the config that produced it: :meth:`DatasetConfig.raw_hash` for
-raw/ (loader identity plus token settings, so processing changes never invalidate downloads),
-:meth:`DatasetConfig.processed_hash` for processed/, tokenizer_hash for tokenizers. A manifest whose hash
-differs from the current config is stale: a processed folder is rebuilt, a raw folder is an error until the repair
-step deletes it after confirmation (raw is never re-downloaded silently). A raw manifest also records
-truncated_at_tokens (the max_seq_length its texts were cut at): raising the cap above it makes the folder
-*outdated* (:meth:`Manifest.is_outdated`), lowering it never does. Verification reads parquet metadata only.
+raw/ (the loader identity alone, so neither processing nor tokenizer changes invalidate downloads),
+:meth:`DatasetConfig.processed_hash` for processed/, tokenizer_hash for tokenizers. Raw and processed manifests
+also keep hash_payload, the exact dict source_hash was computed from, so a mismatch can be explained field by
+field (:func:`DatasetConfig.describe_hash_change`). A manifest whose hash differs from the current config is
+stale: a processed folder is rebuilt and a raw folder deleted, both only after the repair step listed the changed
+fields and the user confirmed (raw is never re-downloaded silently). A raw manifest also records
+truncated_at_tokens (the dataset_max_sequence_length its texts were cut at): raising the cap above it makes the folder
+*outdated* (:meth:`Manifest.is_outdated`), lowering it never does; and token_count / tokenizer / tokenizer_hash,
+how its token counts were made: a later tokenizer change is not a reason to re-download, the repair step offers to
+keep the rows under the new tokenizer (`tokenizer_changes` under extra lists every such adoption). Verification
+reads parquet metadata only.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.storage.parquet import shard_index
 
 log = get_logger(__name__)
 
@@ -65,7 +71,13 @@ class Manifest:
     shards: list[ShardInfo] = field(default_factory=list)
     token_count: str | None = None
     tokenizer: str | None = None
-    # raw manifests: texts were truncated to this many tokens at download time (the config's `max_seq_length` then);
+    # Raw manifests (on disk under `extra`): the hash of the tokenizer definition the token counts were made with
+    # (None with token_count estimate, and on manifests written before it was recorded: unknown is not a change).
+    tokenizer_hash: str | None = None
+    # Raw and processed manifests (on disk under `extra`): the dict `source_hash` was computed from
+    # (`DatasetConfig.raw_hash_payload` / `processed_hash_payload`); None on manifests written before it was recorded.
+    hash_payload: dict[str, Any] | None = None
+    # raw manifests: texts were truncated to this many tokens at download time (the config's `dataset_max_sequence_length` then);
     # None for processed / tokenizer manifests and for raw folders downloaded before truncation existed
     truncated_at_tokens: int | None = None
     versions: dict[str, str] = field(default_factory=dict)
@@ -82,6 +94,9 @@ class Manifest:
     check_limit_reached: int | None = None  # the `check_limit` that exhausted the source (a grown limit reopens it)
     skipped_malformed: int = 0  # instruct rows whose converter raised ValueError
     dropped_too_long: int = 0  # rows with more than the folder's token cap
+    # Raw folders are keyed by source name and shared by every dataset config: the file name of the config the folder
+    # was downloaded under (None when unknown) lets the repair step tell a deletion another config asks for.
+    dataset_config: str | None = None
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
@@ -107,17 +122,17 @@ class Manifest:
     def is_current(self, source_hash: str) -> bool:
         return self.source_hash == source_hash
 
-    def is_outdated(self, max_seq_length: int) -> bool:
+    def is_outdated(self, dataset_max_sequence_length: int) -> bool:
         """
         Whether a raw folder was stored with a smaller cap than the config asks for now.
 
-        Cap rule: rows are at most truncated_at_tokens long, so raising max_seq_length above it outdates the
+        Cap rule: rows are at most truncated_at_tokens long, so raising dataset_max_sequence_length above it outdates the
         folder (its texts are missing tokens the config now wants; it is re-downloaded after confirmation), while
-        lowering it never does (the build clamps stored counts, training truncates at block_size anyway). A
+        lowering it never does (the build clamps stored counts, training cuts rows at its own length anyway). A
         manifest without truncated_at_tokens is never outdated by this rule.
         """
 
-        return self.truncated_at_tokens is not None and max_seq_length > self.truncated_at_tokens
+        return self.truncated_at_tokens is not None and dataset_max_sequence_length > self.truncated_at_tokens
 
     def add_shard(
         self,
@@ -129,7 +144,8 @@ class Manifest:
         dropped_too_long: int | None = None,
     ) -> None:
         """
-        Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by name.
+        Record a shard; an existing entry with the same name is replaced. Shards are kept sorted by index (not
+        by name: data-100000 would sort before data-99999).
         """
 
         self.shards = [shard for shard in self.shards if shard.name != name]
@@ -139,7 +155,7 @@ class Manifest:
                 skipped_malformed=skipped_malformed, dropped_too_long=dropped_too_long,
             )
         )
-        self.shards.sort(key=lambda shard: shard.name)
+        self.shards.sort(key=lambda shard: (shard_index(Path(shard.name)) or 0, shard.name))
 
     # --- (de)serialisation -------------------------------------------------------------------------------------------
 
@@ -151,7 +167,7 @@ class Manifest:
 
         payload = asdict(self)
         extra: dict[str, Any] = payload.pop("extra")
-        typed = {name: payload.pop(name) for name in _PROCESSED_FIELDS + _RAW_FIELDS}
+        typed = {name: payload.pop(name) for name in _PROCESSED_FIELDS + _RAW_FIELDS + _SHARED_FIELDS}
         if self.stage == "processed":
             extra.update({key: typed[name] for key, name in _PROCESSED_KEYS.items()})
         elif self.stage == "raw":
@@ -160,6 +176,12 @@ class Manifest:
                 extra["exhausted"] = True
             if self.check_limit_reached is not None:
                 extra["check_limit"] = self.check_limit_reached
+            if self.dataset_config is not None:
+                extra["dataset_config"] = self.dataset_config
+            if self.tokenizer_hash is not None:
+                extra["tokenizer_hash"] = self.tokenizer_hash
+        if self.stage != "tokenizer" and self.hash_payload is not None:
+            extra["hash_payload"] = typed["hash_payload"]
         payload["extra"] = extra
         return payload
 
@@ -170,10 +192,9 @@ class Manifest:
         """
 
         kwargs = _known_fields_only(payload, cls)
-        raw_shards: list[dict[str, Any]] = kwargs.get("shards", [])
-        kwargs["shards"] = [ShardInfo(**_known_fields_only(shard, ShardInfo)) for shard in raw_shards]
+        kwargs["shards"] = _shard_infos(kwargs.get("shards", []))
         extra = dict(kwargs.get("extra", {}))
-        for key, name in {**_PROCESSED_KEYS, **_RAW_KEYS}.items():
+        for key, name in {**_PROCESSED_KEYS, **_RAW_KEYS, **_SHARED_KEYS}.items():
             if key in extra:
                 kwargs[name] = extra.pop(key)
         for name in ("skipped_malformed", "dropped_too_long"):
@@ -222,9 +243,41 @@ class Manifest:
 _PROCESSED_KEYS = {"input_shards": "input_shards", "columns": "columns", "shuffled": "shuffled", "seed": "shuffle_seed", "stats": "stats"}
 _RAW_KEYS = {
     "exhausted": "exhausted", "check_limit": "check_limit_reached", "skipped_malformed": "skipped_malformed", "dropped_too_long": "dropped_too_long",
+    "dataset_config": "dataset_config", "tokenizer_hash": "tokenizer_hash",
 }  # fmt: skip
+_SHARED_KEYS = {"hash_payload": "hash_payload"}  # raw and processed manifests
 _PROCESSED_FIELDS = tuple(_PROCESSED_KEYS.values())
 _RAW_FIELDS = tuple(_RAW_KEYS.values())
+_SHARED_FIELDS = tuple(_SHARED_KEYS.values())
+
+
+def _shard_infos(raw_shards: Any) -> list[ShardInfo]:
+    """
+    The `shards` of a manifest dict as :class:`ShardInfo`\\s.
+
+    Everything that is not a list of objects with a string name and integer counts is rejected here with a
+    TypeError/ValueError, so :meth:`Manifest.load` can apply its contract (warn without shards, refuse next to
+    them) instead of letting an AttributeError from `shards: [1]`, or a `rows: "3"` that only fails much later in
+    :meth:`Manifest.rows`, escape.
+    """
+
+    if not isinstance(raw_shards, list):
+        raise TypeError(f"shards must be a list, got {type(raw_shards).__name__}")
+    shards: list[ShardInfo] = []
+    for entry in raw_shards:
+        if not isinstance(entry, dict):
+            raise TypeError(f"shard entry must be an object, got {entry!r}")
+        shard = ShardInfo(**_known_fields_only(entry, ShardInfo))
+        if not isinstance(shard.name, str):
+            raise TypeError(f"shard name must be a string, got {shard.name!r}")
+        for count in ("rows", "tokens", "offset", "skipped_malformed", "dropped_too_long"):
+            value = getattr(shard, count)
+            if value is None and count != "rows":
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"shard {shard.name}: {count} must be an integer, got {value!r}")
+        shards.append(shard)
+    return shards
 
 
 def shard_list(shards: Iterable[ShardInfo]) -> list[list[Any]]:
@@ -263,12 +316,25 @@ def shard_rows(path: Path) -> int:
     return pq.read_metadata(path).num_rows
 
 
-def shard_tokens(path: Path) -> int:
+def shard_tokens(path: Path, cap: int | None = None) -> int:
     """
-    Sum of a shard's tokens column (one column read).
+    Sum of a shard's tokens column (one column read), every value capped at cap when given.
     """
 
-    column = pq.read_table(path, columns=["tokens"]).column("tokens")
+    return _sum_tokens(pq.read_table(path, columns=["tokens"]).column("tokens"), cap)
+
+
+def table_tokens(table: pa.Table, cap: int | None = None) -> int:
+    """
+    :func:`shard_tokens` of a table still in memory (the shard writer's, before it is read back).
+    """
+
+    return _sum_tokens(table.column("tokens"), cap)
+
+
+def _sum_tokens(column: pa.ChunkedArray[Any], cap: int | None) -> int:
+    if cap is not None:
+        column = pc.min_element_wise(column, cap)
     total = pc.sum(column).as_py()
     return 0 if total is None else int(total)
 

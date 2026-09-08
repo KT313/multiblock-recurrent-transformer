@@ -9,7 +9,7 @@ carries a trailing comment, `DatasetConfig` lists the top-level keys.
 
 Layout produced on disk (see `data_preparation/README.md`):
 
-    dataset/sources/<source>/raw/     rows as downloaded (text truncated to max_seq_length tokens); shared, append-only
+    dataset/sources/<source>/raw/     rows as downloaded (text truncated to dataset_max_sequence_length tokens); shared, append-only
     dataset/processed/<source>/       rows after cleaning (what training reads); derived from raw, shared
     dataset/tokenizers/<name>/
 
@@ -23,11 +23,14 @@ import hashlib
 import json
 from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from fractions import Fraction
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 from jsonargparse import ArgumentError, ArgumentParser
+
+from data_preparation.lib.stages.benchmarks import benchmark_revisions
+from data_preparation.lib.stages.truncation import TOKEN_RULE
 
 SourceKind = Literal["pretrain", "instruct"]
 LoaderName = Literal["hf_files", "hf_split", "hf_stream", "github_code", "local", "synthetic"]
@@ -46,35 +49,49 @@ DEFAULT_BENCHMARKS = [
     "mmlu_test",
     "winogrande_test",
 ]
-SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = sequence budget × this (covers filter / dedup losses); a Fraction so 50 × 1.2 is exactly 60
+DEFAULT_TOKENS_PER_ROW_ESTIMATE = 500  # `describe_tokens_per_row` until a source's first raw shard measures the real rate
+SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers filter / dedup losses and a tokens-per-row estimate that ran high); a Fraction so 50 × 1.2 is exactly 60
 
-SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
-# derivation, keep as a comment: processed rows are TEXT bounded by max_seq_length tokens at download
+SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load, the raw rows at the build
+# derivation, keep as a comment: processed rows are TEXT bounded by dataset_max_sequence_length tokens at download
 # (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
+MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, plus its LSH index; the same two checks, a lower limit
+# derivation: the LSH index holds every kept row at roughly 3-5 KB (num_perm 256, `lib/stages/fuzzy_dedup.py`) next
+# to the texts above, so 250k rows is ~1 GB of index plus a worst case of ~2.5 GB of text held once.
 
 # --- hash annotations --------------------------------------------------------------------------------------------------
 #
-# Every field of every config dataclass declares which of the three manifest hashes it belongs to, once, right where
-# it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `config_hash` assemble
-# their payloads from it, so no hash keeps a list of field names of its own.
+# Every field of every config dataclass declares which of the four manifest hashes it belongs to, once, right where
+# it is defined; `hash_payload` walks the annotations and `raw_hash` / `processed_hash` / `tokenizer_hash` /
+# `config_hash` assemble their payloads from it, so no hash keeps a list of field names of its own.
 #
-#   raw       identity of the downloaded rows: which rows a loader yields, in what order, and how their stored token
-#             counts are made. Keys `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so
-#             it is deleted (after confirmation) and downloaded again.
-#   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder, nothing is downloaded.
+# The rule for a folder's hash: it contains exactly the settings that change what that folder stores, nothing
+# that merely changes how the rows are fetched, counted, described or used later.
+#
+#   raw       identity of the downloaded rows: which rows a loader yields, in what order, with which columns. Keys
+#             `sources/<s>/raw/`, the bandwidth-expensive tree: a change makes it *stale*, so it is deleted (after
+#             confirmation) and downloaded again. The tokenizer and `token_count` are NOT in it: they only make the
+#             stored token counts and the truncation of pretrain texts, which the raw manifest records
+#             (`tokenizer_hash`, `token_count`) so that a later change is offered as a choice instead of a re-download.
+#   processed derives `processed/<s>/` from the raw shards: a change rebuilds that folder (after confirmation),
+#             nothing is downloaded. The tokenizer and `token_count` enter here.
+#   tokenizer the tokenizer definition, keys `tokenizers/<name>/`.
 #   config    everything else that defines the training data; only `config_hash` (recorded in checkpoints so a resume
 #             against different data is detected) counts it.
 #   none      not hashed at all: how rows are fetched or described, resource knobs; nothing that changes the data.
 #
 # Each name selects exactly the fields annotated with it; the hashes nest instead of re-walking fields:
 # `processed_hash` folds the raw hash in as one value and `config_hash` is composed of every source's processed hash,
-# the tokenizer hash and the `config` fields. Every selected field enters with its value, default or not.
-HashName = Literal["raw", "processed", "config"]
-HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "none")
+# the tokenizer hash and the `config` fields. Every selected field enters with its value, default or not. The
+# manifests record the exact payload each hash was computed from (`Manifest.hash_payload`), so a mismatch can be
+# explained field by field (:func:`describe_hash_change`).
+HashName = Literal["raw", "processed", "config", "tokenizer"]
+HASH_ANNOTATIONS: tuple[str, ...] = ("raw", "processed", "config", "tokenizer", "none")
 
 _RAW: dict[str, Any] = {"hash": "raw"}
 _PROCESSED: dict[str, Any] = {"hash": "processed"}
 _CONFIG: dict[str, Any] = {"hash": "config"}
+_TOKENIZER: dict[str, Any] = {"hash": "tokenizer"}
 _UNHASHED: dict[str, Any] = {"hash": "none"}
 # `max_cached_file_mb` says whether a Hub file is cached whole or read remotely by piece: traffic, not rows.
 _LOAD_KWARGS: dict[str, Any] = {**_RAW, "hash_drop": ("max_cached_file_mb",)}
@@ -87,6 +104,33 @@ def _seed_hash(source: SourceConfig) -> str:
     """
 
     return "raw" if source.loader == "synthetic" else "processed"
+
+
+def _reads_split(source: SourceConfig) -> bool:
+    """
+    Whether `split` selects the source's rows: only `hf_split` and `hf_stream` read it; `hf_files`,
+    `github_code`, `local` and `synthetic` never look at it (they carry the default "train" unread).
+    """
+
+    return source.loader in ("hf_split", "hf_stream")
+
+
+def _split_hash(source: SourceConfig) -> str:
+    """
+    `split` selects the rows only for the loaders that read a Hub split (:func:`_reads_split`); elsewhere it must
+    not re-label a raw folder.
+    """
+
+    return "raw" if _reads_split(source) else "none"
+
+
+def _text_field_hash(source: SourceConfig) -> str:
+    """
+    `text_field` names the column a pretrain row is stored from; an instruct row is built from `fields` /
+    `converter` and never reads it.
+    """
+
+    return "raw" if source.kind == "pretrain" else "none"
 
 
 def _normalize_hash(dedup: DedupConfig) -> str:
@@ -112,10 +156,10 @@ class TokenizerConfig:
     Which tokenizer defines "a token" for this dataset; saved to `dataset/tokenizers/<name>/`.
     """
 
-    name: str = field(metadata=_RAW)  # directory name under `dataset/tokenizers/`
-    kind: Literal["hf", "synthetic"] = field(default="hf", metadata=_RAW)  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
-    hf_id: Optional[str] = field(default=None, metadata=_RAW)  # required for kind=hf
-    revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it
+    name: str = field(metadata=_TOKENIZER)  # directory name under `dataset/tokenizers/`
+    kind: Literal["hf", "synthetic"] = field(default="hf", metadata=_TOKENIZER)  # hf = download `hf_id` from the Hub; synthetic = the tiny test tokenizer
+    hf_id: Optional[str] = field(default=None, metadata=_TOKENIZER)  # required for kind=hf
+    revision: Optional[str] = field(default=None, metadata=_TOKENIZER)  # Hub commit sha; pin it
 
     def __post_init__(self) -> None:
         if self.kind == "hf" and not self.hf_id:
@@ -160,6 +204,12 @@ class DecontaminationConfig:
     ngram: int = field(default=13, metadata=_PROCESSED)  # word n-gram size compared between a document and the benchmarks
     threshold: float = field(default=0.1, metadata=_PROCESSED)  # share of a document's n-grams found in one benchmark
 
+    def __post_init__(self) -> None:
+        if self.ngram <= 0:
+            raise ValueError("decontamination.ngram must be positive")
+        if not 0.0 <= self.threshold <= 1.0:
+            raise ValueError("decontamination.threshold must be in [0, 1]")
+
 
 @dataclass
 class ProcessingConfig:
@@ -167,7 +217,7 @@ class ProcessingConfig:
     Per-source processing options; the dataset-level block is the default, a pretrain source may override it.
     """
 
-    min_chars: int = field(default=50, metadata=_PROCESSED)  # drop shorter texts (pretrain only; the upper bound is `max_seq_length` at download)
+    min_chars: int = field(default=50, metadata=_PROCESSED)  # drop shorter texts (pretrain only; the upper bound is `dataset_max_sequence_length` at download)
     dedup: DedupConfig = field(default_factory=DedupConfig, metadata=_PROCESSED)  # exact / minhash / none, see DedupConfig
     quality_filter: bool = field(default=False, metadata=_PROCESSED)  # prose heuristics (sentences, caps ratio, repetition); thesis run: off
     decontamination: DecontaminationConfig = field(default_factory=DecontaminationConfig, metadata=_PROCESSED)  # benchmark overlap filter, see DecontaminationConfig
@@ -210,7 +260,7 @@ SOURCE_FIELD_SCOPES: dict[str, FieldScope] = {
     "shuffle": FieldScope(),
     "validation_fraction": FieldScope(),
     "describe_tokens_per_row": FieldScope(),
-    "split": FieldScope(),  # only hf_split / hf_stream read it, but it is part of every source's raw hash
+    "split": FieldScope(),  # only hf_split / hf_stream read it (and only there it is raw identity, `_split_hash`)
     # one kind only
     "text_field": FieldScope(kinds=frozenset({"pretrain"})),
     "processing": FieldScope(kinds=frozenset({"pretrain"})),
@@ -266,22 +316,22 @@ class SourceConfig:
     hf_id: Optional[str] = field(default=None, metadata=_RAW)  # Hub dataset id (hf_files / hf_split / hf_stream / github_code)
     revision: Optional[str] = field(default=None, metadata=_RAW)  # Hub commit sha; pin it so row order is stable across increments
     load_kwargs: dict[str, Any] = field(default_factory=dict, metadata=_LOAD_KWARGS)  # hf_files/github_code: {data_files: <glob>, max_cached_file_mb: <MB>}; else `load_dataset` kwargs
-    split: str = field(default="train", metadata=_RAW)  # Hub split to read (hf_split / hf_stream)
-    text_field: str = field(default="text", metadata=_RAW)  # pretrain: column holding the document
+    split: str = field(default="train", metadata={"hash": _split_hash})  # Hub split to read (hf_split / hf_stream)
+    text_field: str = field(default="text", metadata={"hash": _text_field_hash})  # pretrain: column holding the document
     language: Optional[str] = field(default=None, metadata=_RAW)  # github_code: language label of codeparrot/github-code-clean
     path: Optional[str] = field(default=None, metadata=_RAW)  # local: directory of parquet/jsonl files
     converter: Optional[str] = field(default=None, metadata=_RAW)  # named row converter (lib/sources/converters.py), e.g. gsm8k_question_answer
     fields: Optional[dict[str, str]] = field(default=None, metadata=_RAW)  # instruct: {instruction: <col>, input: <col>, output: <col>}
     filter: Optional[str] = field(default=None, metadata=_RAW)  # instruct: named row filter applied at download, e.g. sharegpt_quality
     check_limit: Optional[int] = field(default=None, metadata=_CONFIG)  # stop after inspecting this many source rows even if short of target (> 0)
-    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # rows to download for a validation-only source (required there, forbidden for train sources)
+    rows: Optional[int] = field(default=None, metadata=_CONFIG)  # processed rows a validation-only source delivers (required there, forbidden for train sources; the download adds the safety margin)
     seed: int = field(default=42, metadata={"hash": _seed_hash})  # synthetic generator seed; instruct: input-inversion and shuffle seed
     # hashed through the source's *effective* processing block (`source_processing`), not as a field of its own
     processing: Optional[ProcessingConfig] = field(default=None, metadata=_PROCESSED)  # pretrain: override of the dataset-level processing block
     input_inversions: float = field(default=0.0, metadata=_PROCESSED)  # instruct: share of rows turned into "given the output, what was the instruction?"
     shuffle: Optional[bool] = field(default=None, metadata=_PROCESSED)  # write processed/ in a seeded shuffled order; None = True for instruct, False for pretrain
     validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
-    describe_tokens_per_row: int = field(default=500, metadata=_UNHASHED)  # only used by `describe` for its token table; never a planner input
+    describe_tokens_per_row: int = field(default=DEFAULT_TOKENS_PER_ROW_ESTIMATE, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at the training length) and the row columns of `describe`
 
     def __post_init__(self) -> None:
         self._check_field_scopes()
@@ -336,7 +386,7 @@ class StageConfig:
     """
 
     name: str = field(metadata=_CONFIG)  # stage label (checkpoints, logs); unique per config
-    tokens: int = field(metadata=_CONFIG)  # training tokens of this stage (steps = tokens // (world_batch_size × block_size))
+    tokens: int = field(metadata=_CONFIG)  # training tokens of this stage (steps = tokens // tokens per optimizer step)
     train: dict[str, float] = field(metadata=_CONFIG)  # source name -> sampling weight (> 0, sum 1)
     val: dict[str, float] = field(metadata=_CONFIG)  # source name -> validation weight (> 0, sum 1)
     transition_pct: float = field(default=0.0, metadata=_CONFIG)  # fraction of this stage (at its end) blending into the next stage's data/LR
@@ -357,51 +407,51 @@ class DatasetConfig:
 
     Top-level keys:
 
-    - `name`: dataset name (logs, checkpoints).
     - `tokenizer`: which tokenizer defines "a token" (`TokenizerConfig`); saved to `dataset/tokenizers/<name>/`.
     - `sources`: named data sources (`SourceConfig`), shared by every config under `dataset/sources/<source>/raw/`
       and `dataset/processed/<source>/`.
     - `stages`: the training stages in order (`StageConfig`): token budget, train/val weights over sources, transition.
-    - `block_size`: training sequence length; the planner counts sequences with it; the run config must match.
-    - `max_seq_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
+    - `training_target_sequence_length`: the length the run trains at, what the download planner counts a row
+      with: a row serves min(its tokens, this) of the token budget. At most `dataset_max_sequence_length`.
+    - `dataset_max_sequence_length`: pretrain rows are truncated to this many tokens when downloaded, instruct rows longer than
       this are dropped; raising it above what raw was stored with re-downloads raw (after confirmation), lowering
-      it costs nothing; `block_size` must be <= it.
+      it costs nothing. A storage cap only: it keeps a stray 100k-token document from being stored whole.
     - `validation_fraction`: share of a source's rows held out when the source is used for training AND validation.
     - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
     - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
     - `processing`: dataset-level processing defaults (`ProcessingConfig`); a pretrain source may override.
 
     Stage keys are plain source names in `train` and `val`. A source used only in `val` states `rows` (how many to
-    download); a source used in `train` is sized by `sequence_budget` and must not give `rows`; a source used
+    deliver); a source used in `train` is sized by `token_budget` and must not give `rows`; a source used
     nowhere is rejected. A source in both `train` and `val` is split by the training resolver: its first
     `ceil(validation_fraction_of(source) × rows)` processed rows are validation, the rest training.
     """
 
-    name: str = field(metadata=_CONFIG)  # non-empty path component
     tokenizer: TokenizerConfig = field(metadata=_RAW)  # see TokenizerConfig
     sources: dict[str, SourceConfig] = field(metadata=_CONFIG)  # source name -> SourceConfig; the names are the stage keys
     stages: list[StageConfig] = field(metadata=_CONFIG)  # in training order; at least one, unique names
-    block_size: int = field(metadata=_CONFIG)  # training sequence length (sequences per stage = tokens ÷ block_size); <= max_seq_length
-    max_seq_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); block_size must be <= this
+    # Sizes the downloads, changes no data: a row counts min(its tokens, this) towards the token budget, the run's
+    # training_max_sequence_length cuts it there. Not hashed: a different target re-plans, it never rebuilds.
+    training_target_sequence_length: int = field(metadata=_UNHASHED)  # the length the run trains at; <= dataset_max_sequence_length
+    dataset_max_sequence_length: int = field(default=2048, metadata=_PROCESSED)  # token cap per stored row (pretrain: truncated, instruct: dropped); a storage cap, not the training length
     validation_fraction: float = field(default=0.05, metadata=_CONFIG)  # in [0, 1): held-out share of a source used in both train and val
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
     # whole into the Hub cache instead of being read remotely by piece.
     always_range_requests: bool = field(default=True, metadata=_UNHASHED)  # read every Hub file remotely by piece (row groups / stream prefix)
-    token_count: TokenCountMode = field(default="tokenizer", metadata=_RAW)  # "estimate" = chars / 4
+    token_count: TokenCountMode = field(default="tokenizer", metadata=_PROCESSED)  # "estimate" = chars / 4; the raw manifest records it, see "hash annotations"
     # hashed through every source's *effective* processing block, not as a field of its own
     processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
 
     # --- validation ------------------------------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
-        if not self.name or "/" in self.name:
-            raise ValueError("name must be a non-empty path component")
-        if self.max_seq_length <= 0:
-            raise ValueError("max_seq_length must be positive")
-        if self.block_size <= 0:
-            raise ValueError("block_size must be positive")
-        if self.block_size > self.max_seq_length:
-            raise ValueError(f"block_size ({self.block_size}) must be <= max_seq_length ({self.max_seq_length})")
+        if self.dataset_max_sequence_length <= 0:
+            raise ValueError("dataset_max_sequence_length must be positive")
+        if not 0 < self.training_target_sequence_length <= self.dataset_max_sequence_length:
+            raise ValueError(
+                f"training_target_sequence_length ({self.training_target_sequence_length}) must be positive and at most "
+                f"dataset_max_sequence_length ({self.dataset_max_sequence_length}): rows are cut there when stored"
+            )
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
         if not self.stages:
@@ -463,21 +513,42 @@ class DatasetConfig:
         """
         A shuffled source is built all-at-once: every processed row is held in memory, shuffled, then written
         (`lib/stages/build.py`). A config can legally ask that of a huge source and OOM hours into the build, so a
-        shuffled source whose planned row requirement (:meth:`rows_needed`, the planner's number) exceeds
+        shuffled source whose planned row requirement (:meth:`rows_needed` at the config's tokens-per-row estimate) exceeds
         `SHUFFLED_BUILD_MAX_ROWS` is refused here; both `prepare.py` and training's auto-prepare load the config
-        before any work.
+        before any work. A pretrain source under `dedup.mode: minhash` takes the same all-at-once path and holds
+        an LSH index of every kept row on top, so it is refused above the lower `MINHASH_BUILD_MAX_ROWS`. The build
+        checks the same limits again on the raw rows it really has (:meth:`check_all_at_once_rows`).
         """
 
         for name in self.sources:
-            if not self.shuffle_of(name):
-                continue
-            needed = self.rows_needed(name)
-            if needed > SHUFFLED_BUILD_MAX_ROWS:
-                raise ValueError(
-                    f"{name}: shuffle=true builds all-at-once in memory; {needed:,} rows exceed the limit of "
-                    f"{SHUFFLED_BUILD_MAX_ROWS:,}. Split the source or turn shuffle off. "
-                    "(A read-time shuffle that would lift this limit is not implemented.)"
-                )
+            self.check_all_at_once_rows(name, self.rows_needed(name), at_build=False)
+
+    def check_all_at_once_rows(self, name: str, rows: int, *, at_build: bool) -> None:
+        """
+        Refuse an all-at-once build of `rows` rows: they are all held in memory at once, plus an LSH index of the
+        kept ones under `dedup.mode: minhash`.
+
+        The same two limits are checked twice, on the two counts that exist. At config load (`at_build=False`) the
+        count is the planned requirement at the config's tokens-per-row estimate, and the remedy is to plan less.
+        At the start of the build (`at_build=True`) it is the raw rows on disk, which the estimate may have
+        undershot by a lot (the planner re-plans at the measured rate, and a download may overshoot); splitting the
+        source no longer helps then, so only the remedy of the message differs.
+        """
+
+        already_downloaded = f"The raw folder already holds these rows, so lower the token budget and delete raw/{name},"
+        if self.shuffle_of(name) and rows > SHUFFLED_BUILD_MAX_ROWS:
+            remedy = f"{already_downloaded} or turn shuffle off." if at_build else "Split the source or turn shuffle off."
+            raise ValueError(
+                f"{name}: shuffle=true builds all-at-once in memory; {rows:,} rows exceed the limit of "
+                f"{SHUFFLED_BUILD_MAX_ROWS:,}. {remedy} "
+                "(A read-time shuffle that would lift this limit is not implemented.)"
+            )
+        if self.sources[name].kind == "pretrain" and self.source_processing(name).dedup.mode == "minhash" and rows > MINHASH_BUILD_MAX_ROWS:
+            remedy = f"{already_downloaded} or use dedup.mode=exact." if at_build else "Use dedup.mode=exact or a smaller source."
+            raise ValueError(
+                f"{name}: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; "
+                f"{rows:,} rows exceed the limit of {MINHASH_BUILD_MAX_ROWS:,}. {remedy}"
+            )
 
     # --- source usage ----------------------------------------------------------------------------------------------
 
@@ -528,10 +599,10 @@ class DatasetConfig:
 
     # --- budgets ---------------------------------------------------------------------------------------------------
 
-    def sequence_budget(self, source_name: str) -> int:
+    def token_budget(self, source_name: str) -> int:
         """
-        Sequences (rows padded / truncated to block_size) the whole run draws from the source: the integral
-        of its sampling-weight schedule over the stage token budgets, rounded up.
+        Tokens the whole run draws from the source: the integral of its sampling-weight schedule over the stage
+        token budgets, rounded up.
 
         The trainer reads every source as ONE continuous stream for the whole run (a stage does not restart the
         source, it only changes the sampling weight), so stages sharing a source add up instead of overlapping.
@@ -551,92 +622,155 @@ class DatasetConfig:
             transition = Fraction(str(stage.transition_pct)) * stage.tokens
             next_weight = Fraction(str(next_stage.train.get(source_name, 0.0)))
             total += (stage.tokens - transition) * weight + transition * (weight + next_weight) / 2
-        return ceil(total / self.block_size)
+        return ceil(total)
 
-    def rows_needed(self, source_name: str) -> int:
+    def tokens_per_row_rate(self, source_name: str, tokens_per_row: float | None = None) -> Fraction:
+        """
+        Tokens one stored row serves the token budget with: a row serves min(its tokens,
+        training_target_sequence_length), the run cuts it there. tokens_per_row is that mean measured over the
+        rows on disk (:func:`lib.build.planner.measured_tokens_per_row`); before the first shard the source's
+        describe_tokens_per_row estimate stands in, clamped at the target (a mean of capped lengths never exceeds
+        the cap). An estimate that ran high is what the top-up rounds correct once the rows are measured.
+        """
+
+        rate = self.sources[source_name].describe_tokens_per_row if tokens_per_row is None else tokens_per_row
+        return min(Fraction(rate), Fraction(self.training_target_sequence_length))
+
+    def rows_budget(self, source_name: str, tokens_per_row: float | None = None) -> int:
+        """
+        Rows the whole run draws from the source: token_budget ÷ :meth:`tokens_per_row_rate`, rounded up (0 for
+        a source not used in training). The status table's epochs divide it by the training rows on disk.
+        """
+
+        return ceil(self._rows_budget(source_name, tokens_per_row))
+
+    def _rows_budget(self, source_name: str, tokens_per_row: float | None) -> Fraction:
+        return self.token_budget(source_name) / self.tokens_per_row_rate(source_name, tokens_per_row)
+
+    def rows_needed(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
         Raw rows to download for the source, the planner's row requirement (`_check_shuffled_build_sizes` reads
-        the same number). A source used for training: ceil(sequence_budget × SAFETY_MARGIN ÷ (1 −
-        validation_fraction_of(name))); the margin covers what the length filter and the dedup drop, the division
-        keeps the *training* part at the sequence budget after the validation holdout. A source used only for
-        validation: its rows. Exact `Fraction` arithmetic: 50 × 1.2 is 60, not 60.000000000000007.
+        the same number at the estimate). A source used for training: ceil(token_budget ÷ rate × SAFETY_MARGIN ÷
+        (1 − validation_fraction_of(name))) with rate = :meth:`tokens_per_row_rate`; the margin covers what the
+        length filter and the dedup drop and an estimate that ran high, the division keeps the *training* part at
+        the budget after the validation holdout. A source used only for validation: ceil(rows × SAFETY_MARGIN),
+        so that `rows` processed rows survive the build. Exact `Fraction` arithmetic: 50 × 1.2 is 60, not
+        60.000000000000007.
         """
 
         source = self.sources[source_name]
         if not self.used_in_train(source_name):
-            return int(source.rows or 0)
+            return ceil((source.rows or 0) * SAFETY_MARGIN)
         held_out = Fraction(str(self.validation_fraction_of(source_name)))
-        return ceil(self.sequence_budget(source_name) * SAFETY_MARGIN / (1 - held_out))
+        return ceil(self._rows_budget(source_name, tokens_per_row) * SAFETY_MARGIN / (1 - held_out))
 
-    def rows_sufficient(self, source_name: str) -> int:
+    def rows_sufficient(self, source_name: str, tokens_per_row: float | None = None) -> int:
         """
-        Processed rows at which a source serves its budget: rows_needed ÷ SAFETY_MARGIN (the sequence budget
-        over the training share of the rows, or the rows of a validation-only source, less the download margin).
+        Processed rows at which a source serves its budget: rows_needed ÷ SAFETY_MARGIN (the rows budget over the
+        training share of the rows), or the `rows` of a validation-only source.
         """
 
-        return ceil(self.rows_needed(source_name) / SAFETY_MARGIN)
+        if not self.used_in_train(source_name):
+            return int(self.sources[source_name].rows or 0)
+        return ceil(self.rows_needed(source_name, tokens_per_row) / SAFETY_MARGIN)
 
     # --- hashes (manifest keys; changing what goes into them invalidates data on disk) ------------------------------
 
     def raw_hash(self, source_name: str) -> str:
         """
         Hash of a source's raw/ folder: every field annotated raw, i.e. the loader identity (kind, loader,
-        repo, revision, files, split, text field, language, path, converter/fields/filter; seed only for
-        loader: synthetic, where it generates the rows) plus token_count and the tokenizer, on which the
-        stored tokens column and the token-boundary truncation depend.
+        repo, revision, files, language, path, converter/fields/filter; split only for the loaders that read a Hub
+        split, text_field only for pretrain rows, seed only for loader: synthetic, where it generates the rows).
 
-        Everything else is annotated processed, config or none and stays out: max_seq_length (the raw
-        manifest records what the rows were truncated at; only a raise re-downloads), processing options, budgets /
-        rows / check_limit (how many rows are needed or read, not what is read), validation_fraction,
-        input_inversions, shuffle, the non-synthetic seed (inversions and shuffle order are build-time),
-        describe_tokens_per_row, load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the
-        bandwidth-expensive part of a dataset; nothing but a real change of the source may invalidate them.
+        Everything else is annotated processed, config, tokenizer or none and stays out: the tokenizer and
+        token_count (they make the stored token counts and the truncation, which the raw manifest records itself
+        so that a change is a choice, not a re-download: `lib/stages/download.py:inspect_raw`),
+        dataset_max_sequence_length (the raw manifest records what the rows were truncated at; only a raise
+        re-downloads), processing options, budgets / rows / check_limit (how many rows are needed or read, not what
+        is read), validation_fraction, input_inversions, shuffle, the non-synthetic seed (inversions and shuffle
+        order are build-time), describe_tokens_per_row (how many rows the first download plans, not what is read),
+        load_kwargs.max_cached_file_mb (how a file is fetched). Raw shards are the bandwidth-expensive part of a
+        dataset; nothing but a real change of the source may invalidate them.
         """
 
-        payload = {
-            "source": hash_payload(self.sources[source_name], "raw"),
-            "token_count": self.token_count,
-            "tokenizer": hash_payload(self.tokenizer, "raw"),
-        }
-        return _stable_hash(payload)
+        return self.raw_hash_of(self.sources[source_name])
+
+    def raw_hash_of(self, source: SourceConfig) -> str:
+        """
+        :meth:`raw_hash` of a source that need not be in the config (a github_code language stored without a
+        source of its own): the same payload, so a later config entry with the same raw fields adopts its folder.
+        """
+
+        return _stable_hash(self.raw_hash_payload_of(source))
+
+    def raw_hash_payload(self, source_name: str) -> dict[str, Any]:
+        """
+        The dict :meth:`raw_hash` hashes; the raw manifest records it so a mismatch can be explained field by field.
+        """
+
+        return self.raw_hash_payload_of(self.sources[source_name])
+
+    def raw_hash_payload_of(self, source: SourceConfig) -> dict[str, Any]:
+        return {"source": hash_payload(source, "raw")}
 
     def processed_hash(self, source_name: str) -> str:
         """
-        Hash of a source's processed/ folder: the raw hash, plus the processed fields as the build
-        resolves them: max_seq_length (stored counts are clamped to it), the *effective* processing block (only
-        the dedup fields of the active mode: a minhash threshold does not change an exact-dedup result), the
-        input_inversions, the resolved shuffle and the seed behind both. These four are written out
-        rather than taken from :func:`hash_payload`, because the build uses their resolved values (shuffle_of,
-        source_processing) whether or not they were spelled in the YAML. A change rebuilds processed/ from
-        the raw shards (no download).
+        Hash of a source's processed/ folder: the raw hash, plus everything the build resolves the rows with:
+        the tokenizer definition, token_count and the counting rule (truncation.TOKEN_RULE) behind the tokens
+        column, dataset_max_sequence_length (stored counts are clamped to it), the *effective* processing block as
+        the build applies it (pretrain: only the dedup fields of the active mode, a minhash threshold does not
+        change an exact-dedup result; instruct: the dedup block alone, since min_chars, the quality filter and the
+        decontamination run in the pretrain branch only), the input_inversions (instruct only), the resolved
+        shuffle and the seed behind both. These are written out rather than taken from :func:`hash_payload`,
+        because the build uses their resolved values (shuffle_of, source_processing) whether or not they were
+        spelled in the YAML. With decontamination on, the pinned Hub revisions of the benchmarks it checks against
+        (`lib/stages/benchmarks.py`) enter too: a re-pin changes what the build filtered out. A change rebuilds
+        processed/ from the raw shards after confirmation (no download).
+        """
+
+        return _stable_hash(self.processed_hash_payload(source_name))
+
+    def processed_hash_payload(self, source_name: str) -> dict[str, Any]:
+        """
+        The dict :meth:`processed_hash` hashes; the processed manifest records it.
         """
 
         source = self.sources[source_name]
+        processing = self.source_processing(source_name)
         payload: dict[str, Any] = {
             "raw": self.raw_hash(source_name),
-            "max_seq_length": self.max_seq_length,
-            "processing": hash_payload(self.source_processing(source_name), "processed"),
-            "input_inversions": source.input_inversions,
+            "max_seq_length": self.dataset_max_sequence_length,  # the key keeps the field's old name
+            "tokenizer": hash_payload(self.tokenizer, "tokenizer"),
+            "token_count": self.token_count,
+            "token_rule": TOKEN_RULE,
             "shuffle": self.shuffle_of(source_name),
             "seed": source.seed,
         }
-        return _stable_hash(payload)
+        if source.kind == "instruct":
+            payload["processing"] = {"dedup": hash_payload(processing.dedup, "processed")}
+            payload["input_inversions"] = source.input_inversions
+            return payload
+        payload["processing"] = hash_payload(processing, "processed")
+        if processing.decontamination.enabled:
+            payload["benchmark_revisions"] = benchmark_revisions(list(processing.decontamination.benchmarks))
+        return payload
 
     def tokenizer_hash(self) -> str:
         """
-        Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`).
+        Hash of the tokenizer definition (the manifest key of `dataset/tokenizers/<name>/`; a raw manifest
+        records it next to the rows it counted).
         """
 
-        return _stable_hash(hash_payload(self.tokenizer, "raw"))
+        return _stable_hash(hash_payload(self.tokenizer, "tokenizer"))
 
     def config_hash(self) -> str:
         """
         Hash of everything that defines the training data (recorded in checkpoints so a resume with different
         data is detected), composed of the hashes below it: every source's processed_hash (which folds in its
-        raw hash and the *effective* processing block, so a Bloom budget change does not count here either) next
-        to the source's own config fields, the tokenizer hash, and the config fields of the dataset (name,
-        stages, block size, validation fraction). The knobs that only change how data are fetched or described
-        (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
+        raw hash, the tokenizer and the *effective* processing block, so a Bloom budget change does not count here
+        either) next to the source's own config fields, the tokenizer hash, and the config fields of the dataset
+        (stages, validation fraction). The knobs that only change how (or how far ahead) data are fetched or
+        described (always_range_requests, load_kwargs.max_cached_file_mb, describe_tokens_per_row) stay out.
         """
 
         payload = hash_payload(self, "config")
@@ -649,8 +783,10 @@ class DatasetConfig:
     def overlap_warnings(self) -> list[str]:
         """
         Sources used only for validation that read the same Hub repo as a training source with the same or a
-        nested data_files glob prefix: such a held-out set is likely not disjoint from the training data
-        (prefer listing the training source in val too: its validation_fraction split never overlaps).
+        nested data_files glob prefix: such a held-out set is likely not disjoint from the training data (prefer
+        listing the training source in val too: its validation_fraction split never overlaps). Two sources that
+        both read a Hub split (:func:`_reads_split`) and name different ones are disjoint by construction and
+        never warn; a `split` no loader reads says nothing about the rows.
         """
 
         warnings: list[str] = []
@@ -664,6 +800,8 @@ class DatasetConfig:
                 train = self.sources[train_name]
                 if train.hf_id != val.hf_id:
                     continue
+                if _reads_split(train) and _reads_split(val) and train.split != val.split:
+                    continue  # two splits of one repo (train vs test) are disjoint by construction
                 val_prefix = _glob_prefix(val.load_kwargs.get("data_files"))
                 train_prefix = _glob_prefix(train.load_kwargs.get("data_files"))
                 if val_prefix.startswith(train_prefix) or train_prefix.startswith(val_prefix):
@@ -691,11 +829,17 @@ def _is_non_negative_number(value: Any) -> bool:
 
 def _check_weights(what: str, weights: dict[str, float]) -> None:
     """
-    Non-empty, every weight > 0 (a zero weight would list a source a stage never draws from), sum 1.
+    Non-empty, every weight a finite number > 0 (a zero weight would list a source a stage never draws from), sum 1.
+
+    Finiteness first: every comparison against NaN is False, so a NaN weight would pass both checks below and then
+    drop its source out of the training mixture without a word (`BatchStream._pick_source` compares deficits).
     """
 
     if not weights:
         raise ValueError(f"{what}: must not be empty")
+    unusable = sorted(name for name, weight in weights.items() if not isfinite(weight))
+    if unusable:
+        raise ValueError(f"{what}: weights must be finite numbers, got {unusable} with a nan or inf weight")
     if any(weight <= 0 for weight in weights.values()):
         raise ValueError(f"{what}: weights must be > 0 (drop the key instead of a zero weight)")
     total = sum(weights.values())
@@ -723,9 +867,48 @@ def _stable_hash(payload: Any) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def describe_hash_change(stored: dict[str, Any] | None, current: dict[str, Any]) -> list[str]:
+    """
+    Why a folder's hash differs from the config's, one short line per field: `a.b.c: old -> new` for every
+    changed, added ((absent) -> new) or removed (old -> (absent)) key of the flattened payloads, keys sorted.
+    stored is the payload the manifest recorded (`Manifest.hash_payload`, JSON on disk; current is compared after
+    the same JSON round trip); None (a manifest from before payloads were recorded) gives the single line
+    "(no field detail recorded)". Two equal payloads under different hashes (the hash rule itself changed, or a
+    manifest was edited) give "(no recorded field differs: the hash rule changed)".
+    """
+
+    if stored is None:
+        return ["(no field detail recorded)"]
+    old, new = _flatten(stored), _flatten(json.loads(json.dumps(current, default=str)))
+    lines = []
+    for key in sorted(old.keys() | new.keys()):
+        if key not in new:
+            lines.append(f"{key}: {json.dumps(old[key])} -> (absent)")
+        elif key not in old:
+            lines.append(f"{key}: (absent) -> {json.dumps(new[key])}")
+        elif old[key] != new[key]:
+            lines.append(f"{key}: {json.dumps(old[key])} -> {json.dumps(new[key])}")
+    return lines or ["(no recorded field differs: the hash rule changed)"]
+
+
+def _flatten(payload: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """
+    {dotted key: leaf value} of a nested dict; lists are leaves (a data_files glob, a benchmark list).
+    """
+
+    flat: dict[str, Any] = {}
+    for key, value in payload.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict) and value:
+            flat.update(_flatten(value, name + "."))
+        else:
+            flat[name] = value
+    return flat
+
+
 def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
     """
-    The fields of obj annotated hash_name, as a JSON-ready dict; the input of the three hashes.
+    The fields of obj annotated hash_name, as a JSON-ready dict; the input of the four hashes.
 
     A field is counted when its metadata["hash"] annotation names hash_name (see "hash annotations" at the
     top of this file), and it enters with its value whether or not that value is the default: a changed default
@@ -748,7 +931,7 @@ def hash_payload(obj: Any, hash_name: HashName) -> dict[str, Any]:
 def field_hash_annotation(f: Field[Any], obj: Any) -> str:
     """
     Which hash f of obj belongs to: its metadata["hash"], or what the callable there answers for
-    obj (the two conditional fields: SourceConfig.seed and the dedup fields of an inactive mode).
+    obj (the conditional fields: SourceConfig.seed / split / text_field and the dedup fields of an inactive mode).
     """
 
     annotation = f.metadata.get("hash")

@@ -6,7 +6,7 @@ pretrain rows go through the length filter (min_chars; the upper bound is the to
 -> quality filter -> decontamination -> exact dedup (hash column, first occurrence wins); instruct rows
 (converter and filter already applied at download) get their input inversions -> empty-field and over-cap removal
 -> exact dedup over instruction\\ninput\\noutput. Both kinds publish layout.processed_columns(kind); the
-tokens of a pretrain row is the stored raw count clamped to the current max_seq_length.
+tokens of a pretrain row is the stored raw count clamped to the current dataset_max_sequence_length.
 
 Two write modes:
 
@@ -33,10 +33,11 @@ with zero shards still gets a (zero-shard) processed manifest, so the source cou
 from __future__ import annotations
 
 import multiprocessing
-import multiprocessing.pool
 import random
 import shutil
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ from data_preparation.lib.stages.download import (
     inspect_raw,
     new_manifest,
 )
+from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
 from data_preparation.lib.storage.parquet import publish_shard, shard_name
 from data_preparation.lib.ui.dashboard import progress
@@ -89,12 +91,15 @@ def build_source(
     pass_workers: int = 1,
     shard_size: int = DEFAULT_SHARD_SIZE,
     should_stop: StopCheck | None = None,
+    rows_target: int | None = None,
 ) -> Manifest:
     """
     Turn the raw shards of source name into processed/<name> (see the module docstring) and return the
     processed manifest. pass_workers sizes the spawn process pool of the optional cleaning passes
-    (decontamination / minhash; 1 = in-process). Raises FileNotFoundError without a current raw manifest (run
-    the download first).
+    (decontamination / minhash; 1 = in-process). rows_target caps a per-raw-shard build: it stops after the raw
+    shard that brings the processed rows to that many (the planner's rows_sufficient; raw rows past the budget
+    stay unbuilt until a larger target asks for them); an all-at-once build ignores it. Raises FileNotFoundError
+    without a current raw manifest (run the download first).
     """
 
     source = config.sources[name]
@@ -106,10 +111,18 @@ def build_source(
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")
     assessment = assess_processed_folder(config, name, processed_dir, shard_list(raw.shards), check_files=False)
+    if assessment.problem == "unreadable_manifest":
+        # never deleted here, on either path: the repair step does that, after the user confirmed
+        raise RuntimeError(
+            f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
+            "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
+        )
 
     if all_at_once:
         if assessment.problem == "none" and assessment.manifest is not None:
             return assessment.manifest  # built from exactly the current raw shards
+        # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
+        config.check_all_at_once_rows(name, raw.rows(), at_build=True)
         output = ProcessedOutput(_fresh_manifest(config, name, source_hash), _temporary_dir(processed_dir), is_new=True)
         pending = list(raw.shards)
     else:
@@ -127,6 +140,9 @@ def build_source(
             seen.add_all(output.stored_hashes())
         # the raw row count is the honest upper bound of what this build can insert
         log.info("%s: %s", name, seen.describe(raw.rows()))
+        seen.check(raw.rows())
+        stats["dedup"]["rows_on_disk"] = raw.rows()
+        stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 
     # per-shard builds check the stop request after every published shard; an all-at-once build reads every raw
@@ -138,7 +154,10 @@ def build_source(
         if all_at_once:
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
         else:
-            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop)
+            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
+    if seen is not None:
+        _record_filter_load(stats["dedup"], seen)
+        output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
     log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
     return output.manifest
 
@@ -151,14 +170,22 @@ def _build_per_raw_shard(
     output: ProcessedOutput,
     shard_size: int,
     should_stop: StopCheck | None,
+    rows_target: int | None = None,
 ) -> None:
     """
     One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
-    raw shard as covered) before the next raw shard starts; the stop request is checked in between.
+    raw shard as covered) before the next raw shard starts; the stop request is checked in between. With
+    rows_target the loop ends once the processed rows reach it (checked before every raw shard).
     """
 
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
     for index, shard in enumerate(pending, start=1):
+        if rows_target is not None and output.manifest.rows() >= rows_target:
+            log.info(
+                "%s: %d processed rows serve the budget of %d; %d raw shard(s) left unbuilt",
+                raw.source, output.manifest.rows(), rows_target, len(pending) - index + 1,
+            )
+            return
         if pipeline.bar is not None:
             pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows
@@ -201,6 +228,19 @@ def _build_all_at_once(
     output.save(shard_list(raw.shards))
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
+
+
+def _record_filter_load(dedup_stats: dict[str, Any], seen: SeenDocuments) -> None:
+    """
+    The measured load of the dedup filter into the stats of the finished build: rbloom estimates the insertions
+    from the set bits, so the processed folder says whether the build ran on a saturated filter (one that drops
+    unique documents as duplicates), not only what was expected of it. Once per build, not per shard: the estimate
+    counts the bits of the whole filter (about a second at the 1 GiB default).
+    """
+
+    items = seen.items_in_filter
+    dedup_stats["items_in_filter"] = round(items)
+    dedup_stats["measured_false_positive_rate"] = seen.expected_false_positive_rate(items)
 
 
 def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
@@ -260,16 +300,11 @@ class ProcessedOutput:
         The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
         raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
         the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
-        parsed is never deleted here: the repair step does that, after the user confirmed.
+        parsed never gets here (:func:`build_source` refuses it before choosing a path).
         """
 
         if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
             return cls(assessment.manifest, processed_dir, is_new=False)
-        if assessment.problem == "unreadable_manifest":
-            raise RuntimeError(
-                f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
-                "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
-            )
         if assessment.problem != "absent":
             log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
         if processed_dir.exists():
@@ -310,7 +345,7 @@ class ProcessedOutput:
 def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manifest:
     source = config.sources[name]
     processing = config.source_processing(name)
-    manifest = new_manifest(config, name, source_hash, "processed", tokens=True)
+    manifest = new_manifest(config, name, source_hash, "processed", tokens=True, hash_payload=config.processed_hash_payload(name))
     stats: dict[str, Any] = {
         "input_rows": 0,
         "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
@@ -324,7 +359,7 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
     else:
         stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
         stats["removed_empty"] = 0  # rows without instruction or output after stripping
-        stats["removed_too_long"] = 0  # rows over `max_seq_length` tokens (a safety net; the download already drops them)
+        stats["removed_too_long"] = 0  # rows over `dataset_max_sequence_length` tokens (a safety net; the download already drops them)
     manifest.columns = list(processed_columns(source.kind))
     manifest.shuffled = config.shuffle_of(name)
     manifest.shuffle_seed = source.seed
@@ -362,7 +397,7 @@ class RowPipeline:
         self.source: SourceConfig = config.sources[name]
         self.kind = self.source.kind
         self.processing = config.source_processing(name)
-        self.max_seq_length = config.max_seq_length
+        self.dataset_max_sequence_length = config.dataset_max_sequence_length
         self.pass_workers = pass_workers
         self.batch_size = batch_size
         self.stats = stats
@@ -405,13 +440,13 @@ class RowPipeline:
             rows = self.decontaminator(rows)
         normalize = processing.dedup.normalize
         for row in rows:
-            # stored counts are clamped to the current cap: lowering `max_seq_length` after the download never
+            # stored counts are clamped to the current cap: lowering `dataset_max_sequence_length` after the download never
             # re-downloads (the raw manifest's `truncated_at_tokens` bounds the stored texts), so a raw count may
-            # exceed the cap; training truncates at block_size <= max_seq_length anyway
+            # exceed the cap; training cuts rows at its own length, at most dataset_max_sequence_length, anyway
             yield {
                 "text": row["text"],
                 "source": self.name,
-                "tokens": min(int(row["tokens"]), self.max_seq_length),
+                "tokens": min(int(row["tokens"]), self.dataset_max_sequence_length),
                 "hash": text_hash64(row["text"], normalize),
             }
 
@@ -440,7 +475,7 @@ class RowPipeline:
         """
         {instruction, input, output, tokens, hash} rows of the raw shards: inversions decided per row by
         random.Random(f"{seed}:{global row index}") (deterministic, independent of shard boundaries and of a
-        resume), then rows without instruction / output and rows over max_seq_length tokens dropped (an inversion
+        resume), then rows without instruction / output and rows over dataset_max_sequence_length tokens dropped (an inversion
         prepends a fixed instruction, so it can push a row over the cap that fitted before).
         """
 
@@ -462,7 +497,7 @@ class RowPipeline:
                     if not has_required_fields(row):
                         self.stats["removed_empty"] += 1
                         continue
-                    if int(row["tokens"]) > self.max_seq_length:
+                    if int(row["tokens"]) > self.dataset_max_sequence_length:
                         self.stats["removed_too_long"] += 1
                         continue
                     yield {
@@ -492,8 +527,8 @@ class RowPipeline:
         if not chosen:
             return
         counts = self._counter().count_many([instruct_text(rows[offset]) for offset in chosen])
-        for offset, tokens in zip(chosen, counts):
-            rows[offset]["tokens"] = tokens
+        for offset, count in zip(chosen, counts):
+            rows[offset]["tokens"] = count + NUMBER_OF_SPECIAL_TOKENS  # the download's rule: the trainer's specials included
         self.stats["inverted"] += len(chosen)
 
     def _counter(self) -> TokenCounter:
@@ -539,9 +574,10 @@ def _increment(counts: dict[str, int], key: str) -> None:
 
 # --- decontamination -----------------------------------------------------------------------------------------------------
 
-# the per-process parameters of `_contaminated_by`, set by `_init_decontamination`: called directly for
-# `pass_workers <= 1`, as the pool initializer of every spawn worker otherwise (spawn children start with fresh
-# module globals, so the n-grams are handed over as picklable init args, loaded once in the parent)
+# the parameters of `_contaminated_by` in a spawn worker, set by `_init_decontamination`, the pool initializer
+# (spawn children start with fresh module globals, so the n-grams are handed over as picklable init args, loaded
+# once in the parent). The in-process path never touches them: several builds run in threads of one process
+# (`lib/build/runner.py`), each with its own decontamination settings, so `Decontaminator` keeps its own.
 _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 
@@ -554,7 +590,7 @@ def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float)
 
 def _contaminated_by(text: str) -> list[str]:
     """
-    Benchmarks text is contaminated by, using the process-global n-grams of _init_decontamination.
+    Benchmarks text is contaminated by, using the worker-global n-grams of _init_decontamination.
     """
 
     return check_contamination(text, _BENCHMARK_NGRAMS, _DECONTAM["n"], _DECONTAM["threshold"])[1]
@@ -563,10 +599,12 @@ def _contaminated_by(text: str) -> list[str]:
 class Decontaminator:
     """
     Drops rows contaminated by a benchmark (counts hits per benchmark in stats); the benchmark n-grams are
-    loaded once, in this process, and checked in-process (pass_workers <= 1) or in a pool of pass_workers
-    spawn processes that lives for the whole with block. Spawn, not fork: the pool is created from a build
-    worker thread (`lib/build/runner.py` runs one build per thread), and a fork of a multi-threaded process can
-    inherit a lock another thread holds mid-operation; spawn children start clean.
+    loaded once, in this process, and checked in-process (pass_workers <= 1, against the n-grams this object
+    holds) or in a pool of pass_workers spawn processes that lives for the whole with block. Spawn, not fork:
+    the pool is created from a build worker thread (`lib/build/runner.py` runs one build per thread), and a fork
+    of a multi-threaded process can inherit a lock another thread holds mid-operation; spawn children start clean.
+    A killed worker (OOM killer, a segfault) breaks the pool and is re-raised as a named RuntimeError, where a
+    multiprocessing.Pool would wait for the lost result forever.
     """
 
     def __init__(self, config: DecontaminationConfig, pass_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
@@ -574,23 +612,26 @@ class Decontaminator:
         self.pass_workers = pass_workers
         self.stats = stats
         self.cache_dir = str(layout.benchmark_cache_dir())
-        self._pool: multiprocessing.pool.Pool | None = None
+        self._ngrams: dict[str, set[str]] = {}
+        self._pool: ProcessPoolExecutor | None = None
 
     def __enter__(self) -> Decontaminator:
         if not self.config.enabled:
             return self
-        ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
-        init_args = (ngrams, self.config.ngram, self.config.threshold)
-        if self.pass_workers <= 1:
-            _init_decontamination(*init_args)
-        else:
-            self._pool = multiprocessing.get_context("spawn").Pool(self.pass_workers, initializer=_init_decontamination, initargs=init_args)
+        self._ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
+        if self.pass_workers > 1:
+            init_args = (self._ngrams, self.config.ngram, self.config.threshold)
+            self._pool = ProcessPoolExecutor(
+                max_workers=self.pass_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_decontamination,
+                initargs=init_args,
+            )
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self._pool is not None:
-            self._pool.terminate()
-            self._pool.join()
+            self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for the queued chunks
             self._pool = None
 
     def __call__(self, rows: Iterator[Row]) -> Iterator[Row]:
@@ -609,8 +650,15 @@ class Decontaminator:
 
         if self._pool is None:
             for row in rows:
-                yield row, _contaminated_by(row["text"])
+                yield row, check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
             return
         for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
-            yield from zip(chunk, self._pool.map(_contaminated_by, texts, chunksize=64))
+            try:
+                hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
+            except BrokenProcessPool as error:
+                raise RuntimeError(
+                    f"a decontamination worker died, likely OOM-killed ({error}); every worker holds its own copy of "
+                    "the benchmark n-grams, so lower --pass_workers or decontamination.benchmarks"
+                ) from error
+            yield from zip(chunk, hits)

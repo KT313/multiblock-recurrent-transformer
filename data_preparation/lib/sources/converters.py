@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
 Row converters and filters: `get_converter(source)` maps a raw row to the standard shape (pretrain `{"text"}`,
-instruct `{"instruction", "input", "output"}`), `get_filter(name)` a row predicate (`sharegpt_quality`).
+instruct `{"instruction", "input", "output"}`), `get_filter(name)` a row predicate (`sharegpt_quality`),
+`expected_format(source)` says in words what the converter of source accepts (for the error that fails a download
+whose rows keep coming out malformed).
 """
 
 from __future__ import annotations
@@ -134,6 +136,33 @@ CONVERTERS: dict[str, Converter] = {
     "first_two_turns": first_two_turns,
     "instruction_input_output": instruction_input_output,
 }
+
+
+IDENTITY_FORMAT = "columns instruction, output[, input]"
+
+# What each named converter expects a source row to look like, in the words of the error that fails a download
+# after too many malformed rows in a row (the row's own column names and value types are printed next to it).
+EXPECTED_FORMATS: dict[str, str] = {
+    "gsm8k_question_answer": "columns question, answer",
+    "sharegpt_conversations": "a `conversations` list of `{from, value}` turns (from: system / human / gpt)",
+    "first_two_turns": "a `conversations` list of at least two `{value}` turns (instruction, then output)",
+    "instruction_input_output": IDENTITY_FORMAT,
+}
+
+
+def expected_format(source: SourceConfig) -> str:
+    """
+    The input format of source's converter in words: a `fields` mapping as "columns instruction=<col>,
+    output=<col>[, input=<col>]", a named converter's entry of :data:`EXPECTED_FORMATS`, the identity case
+    (no converter: the rows carry instruction / output already) as "columns instruction, output[, input]".
+    """
+
+    if source.fields is not None:
+        columns = ", ".join(f"{name}={source.fields[name]}" for name in ("instruction", "output", "input") if name in source.fields)
+        return f"columns {columns}"
+    if source.converter is None:
+        return IDENTITY_FORMAT
+    return EXPECTED_FORMATS.get(source.converter, f"whatever converter {source.converter!r} accepts (no description registered)")
 
 
 def get_converter(source: SourceConfig) -> Converter | None:

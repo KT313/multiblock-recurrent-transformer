@@ -1,8 +1,8 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for the planner: `rows_needed` by hand (sequences, the split, validation-only sources), the download plan
-(clamped, zero when exhausted, stale raw rejected, topped up when the build drops more than the margin), the
-`SourceLedger` satisfaction cases and the status table.
+Tests for the planner: `rows_needed` by hand (tokens at a rate, the split, validation-only sources), the download
+plan (clamped, zero when exhausted or served, stale or unreadable raw rejected, topped up when the build drops more
+than the margin), the `SourceLedger` satisfaction cases and the status table.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.build.repair import ConfirmationRequired
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairError
 
 from data_preparation.dataset_config import (
     DatasetConfig,
@@ -29,6 +29,7 @@ from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.planner import (
     DatasetReport,
     SourceLedger,
+    UnreadableRawShardError,
     every_source_satisfies_its_budget,
     plan_downloads,
     raw_is_exhausted,
@@ -47,14 +48,13 @@ ConfigFile = Callable[[DatasetConfig], Path]
 Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 
-def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, block_size: int = 64, min_chars: int = 1) -> DatasetConfig:
+def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, training_target_sequence_length: int = 64, min_chars: int = 1) -> DatasetConfig:
     """
     `a` trained in both stages (weight 0.5 then 1.0) and validated on in the first (split), `b` only trained on
     in the first, `h` used only for validation (`rows`), instruct source `i` in a finetune stage (split).
     """
 
     return DatasetConfig(
-        name="two",
         tokenizer=TokenizerConfig(name="synthetic", kind="synthetic"),
         sources={
             "a": SourceConfig(kind="pretrain", loader="synthetic", seed=0),
@@ -67,8 +67,8 @@ def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, b
             StageConfig(name="s2", tokens=tokens_b, train={"a": 1.0}, val={"h": 1.0}),
             StageConfig(name="ft", tokens=1280, train={"i": 1.0}, val={"i": 1.0}),
         ],
-        block_size=block_size,
-        max_seq_length=128,
+        training_target_sequence_length=training_target_sequence_length,
+        dataset_max_sequence_length=128,
         processing=ProcessingConfig(min_chars=min_chars),
     )
 
@@ -80,46 +80,63 @@ def _state(report: DatasetReport, name: str) -> SourceLedger:
 # --- rows_needed ----------------------------------------------------------------------------------------------------
 
 
-def test_rows_needed_counts_sequences_with_the_margin_and_the_split() -> None:
-    cfg = two_stage_cfg()
-    # a: ceil((6400 × 0.5 + 3200 × 1.0) / 64) = 100 sequences over the run; × 1.2 ÷ (1 − 0.05) = 126.3 -> 127
-    assert cfg.sequence_budget("a") == 100 and cfg.validation_fraction_of("a") == 0.05 and cfg.rows_needed("a") == 127
-    # b: ceil(6400 × 0.5 / 64) = 50 sequences, not validated on: 50 × 1.2 = 60 exactly (no float slop from 1.2)
+def test_rows_needed_counts_tokens_at_the_rate_with_the_margin_and_the_split() -> None:
+    cfg = two_stage_cfg()  # the default estimate of 500 tokens per row is clamped at the training length 64
+    # a: 6400 × 0.5 + 3200 × 1.0 = 6400 tokens over the run, 100 rows at 64 tokens each; × 1.2 ÷ (1 − 0.05) = 126.3 -> 127
+    assert cfg.token_budget("a") == 6400 and cfg.rows_budget("a") == 100 and cfg.validation_fraction_of("a") == 0.05 and cfg.rows_needed("a") == 127
+    # b: 6400 × 0.5 = 3200 tokens = 50 rows, not validated on: 50 × 1.2 = 60 exactly (no float slop from 1.2)
     assert cfg.validation_fraction_of("b") == 0.0 and cfg.rows_needed("b") == 60
-    # i: ceil(1280 / 64) = 20 sequences, split: 20 × 1.2 ÷ 0.95 = 25.26 -> 26
+    # i: 1280 tokens = 20 rows, split: 20 × 1.2 ÷ 0.95 = 25.26 -> 26
     assert cfg.rows_needed("i") == 26
+    # a measured mean below the training length takes more rows: 6400 ÷ 32 = 200; × 1.2 ÷ 0.95 = 252.6 -> 253
+    assert cfg.tokens_per_row_rate("a", 32.0) == 32 and cfg.rows_needed("a", 32.0) == 253 and cfg.rows_sufficient("a", 32.0) == 211
+    assert cfg.rows_needed("a", 500.0) == 127  # a measured mean above the training length is clamped like the estimate
 
 
-def test_rows_needed_sums_the_stages_and_scales_with_block_size() -> None:
-    overlap = two_stage_cfg(tokens_b=12800)  # stage 2 grows: ceil((6400 × 0.5 + 12800) / 64) = 250 sequences
-    assert overlap.sequence_budget("a") == 250 and overlap.rows_needed("a") == 316  # 300 ÷ 0.95 = 315.8
+def test_rows_needed_sums_the_stages_and_scales_with_the_training_length() -> None:
+    overlap = two_stage_cfg(tokens_b=12800)  # stage 2 grows: 6400 × 0.5 + 12800 = 16000 tokens = 250 rows
+    assert overlap.token_budget("a") == 16000 and overlap.rows_budget("a") == 250 and overlap.rows_needed("a") == 316  # 300 ÷ 0.95 = 315.8
     assert overlap.rows_needed("b") == 60  # stage 1 unchanged
-    wide = two_stage_cfg(block_size=128)  # half the sequences per stage
-    assert wide.sequence_budget("a") == 50 and wide.rows_needed("a") == 64  # 60 ÷ 0.95 = 63.16
+    wide = two_stage_cfg(training_target_sequence_length=128)  # a row serves twice the tokens: half the rows
+    assert wide.rows_budget("a") == 50 and wide.rows_needed("a") == 64  # 60 ÷ 0.95 = 63.16
     assert wide.rows_needed("b") == 30
 
 
-def test_rows_needed_is_the_schema_formula() -> None:
+def test_rows_needed_is_the_schema_formula(layout: DatasetLayout) -> None:
     """
     The planner delegates to `DatasetConfig.rows_needed`, the number the shuffled-build cap checks at config
-    load, so the two views of the requirement cannot drift.
+    load, so the two views of the requirement cannot drift: the ledgers of an empty dataset (no measured rate
+    yet) carry exactly the documented formula, budget × margin ÷ the training share, or rows × margin for a
+    source used only for validation.
     """
 
     cfg = two_stage_cfg()
-    assert [cfg.rows_needed(name) for name in cfg.sources] == [cfg.rows_needed(name) for name in cfg.sources]
+    formula = {
+        name: ceil((source.rows or 0) * Fraction("1.2"))
+        if not cfg.used_in_train(name)
+        else ceil(cfg.rows_budget(name) * Fraction("1.2") / (1 - Fraction(str(cfg.validation_fraction_of(name)))))
+        for name, source in cfg.sources.items()
+    }
+    assert formula == {"a": 127, "b": 60, "h": 10, "i": 26}, "the formula spelled out, not read from the config"
+    assert {led.name: led.rows_needed for led in read_ledgers(cfg, layout)} == formula
 
 
-def test_rows_needed_of_a_validation_only_source_is_its_rows() -> None:
-    assert two_stage_cfg(rows_h=8).rows_needed("h") == 8
-    assert two_stage_cfg(rows_h=20).rows_needed("h") == 20
+def test_rows_needed_of_a_validation_only_source_is_its_rows_plus_the_margin() -> None:
+    """
+    `rows` of a validation-only source are delivered rows: the download adds the margin, the build has to keep
+    `rows` of them.
+    """
+
+    assert two_stage_cfg(rows_h=8).rows_needed("h") == 10 and two_stage_cfg(rows_h=8).rows_sufficient("h") == 8  # 8 × 1.2 = 9.6
+    assert two_stage_cfg(rows_h=20).rows_needed("h") == 24 and two_stage_cfg(rows_h=20).rows_sufficient("h") == 20
 
 
 def test_rows_sufficient_and_training_rows_after_split() -> None:
     cfg = two_stage_cfg()
     assert cfg.rows_sufficient("a") == 106  # 127 ÷ 1.2 = 105.8
-    assert cfg.rows_sufficient("b") == 50 and cfg.rows_sufficient("h") == 7 and cfg.rows_sufficient("i") == 22
-    # the resolver holds ceil(0.05 × rows) out; 127 rows -> 7 validation, 120 training >= the 100-sequence budget
-    assert training_rows_after_split(cfg, "a", 127) == 120 >= cfg.sequence_budget("a")
+    assert cfg.rows_sufficient("b") == 50 and cfg.rows_sufficient("h") == 8 and cfg.rows_sufficient("i") == 22
+    # the resolver holds ceil(0.05 × rows) out; 127 rows -> 7 validation, 120 training >= the 100-row budget
+    assert training_rows_after_split(cfg, "a", 127) == 120 >= cfg.rows_budget("a")
     assert training_rows_after_split(cfg, "b", 60) == 60  # not validated on: nothing held out
     assert training_rows_after_split(cfg, "a", 0) == 0
 
@@ -132,11 +149,11 @@ def test_plan_downloads_on_an_empty_dir(layout: DatasetLayout) -> None:
     assert [(s.name, s.raw_rows, s.rows_needed, *s.rows_to_fetch) for s in plan.sources] == [
         ("a", 0, 127, 127, "raw missing"),
         ("b", 0, 60, 60, "raw missing"),
-        ("h", 0, 8, 8, "raw missing"),
+        ("h", 0, 10, 10, "raw missing"),
         ("i", 0, 26, 26, "raw missing"),
     ]
-    assert plan.total_rows_to_fetch() == 221 and [s.name for s in plan.to_fetch()] == ["a", "b", "h", "i"]
-    assert plan.summary() == "4 source(s) short, downloading 221 rows (a 127, b 60, h 8, i 26)"
+    assert plan.total_rows_to_fetch() == 223 and [s.name for s in plan.to_fetch()] == ["a", "b", "h", "i"]
+    assert plan.summary() == "4 source(s) short, downloading 223 rows (a 127, b 60, h 10, i 26)"
     assert plan.describe().splitlines()[0].split() == ["source", "present", "needed", "fetch", "reason"]
     only = plan_downloads(two_stage_cfg(), layout, sources=["i", "a"])
     assert [s.name for s in only.sources] == ["a", "i"]  # config order
@@ -148,8 +165,10 @@ def test_rows_to_fetch_is_the_difference_clamped_at_zero(layout: DatasetLayout, 
     cfg = two_stage_cfg()
     assert prepare(config_file(cfg), layout.root, assume_yes=False).complete
     plan = plan_downloads(cfg, layout)
-    assert all(s.rows_to_fetch == (0, "enough rows") and s.raw_rows >= s.rows_needed for s in plan.sources)
-    assert plan.summary() == "nothing to download"
+    assert all(s.rows_to_fetch == (0, "budget served") for s in plan.sources) and plan.summary() == "nothing to download"
+    a, b, h, i = plan.sources
+    assert all(s.raw_rows >= s.rows_needed and s.tokens_per_row == 64 for s in (a, b, h))  # rows of the training length or longer: the clamp
+    assert i.tokens_per_row < 64 and i.raw_rows == 26 < i.rows_needed  # short instruct rows measured below the estimate: served by the margin
 
     bigger = two_stage_cfg(tokens_b=12800)  # same hashes, a larger budget for `a`: top up by the difference
     a = next(s for s in plan_downloads(bigger, layout).sources if s.name == "a")
@@ -164,7 +183,25 @@ def test_rows_to_fetch_is_zero_when_the_loader_is_exhausted(layout: DatasetLayou
     cfg = cfg_factory({"v": SourceConfig(kind="pretrain", loader="local", path=str(src_dir), rows=10)})
     prepare(config_file(cfg), layout.root, assume_yes=False)
     v = next(s for s in plan_downloads(cfg, layout).sources if s.name == "v")
-    assert (v.raw_rows, v.rows_needed, *v.rows_to_fetch) == (4, 10, 0, "exhausted")
+    assert (v.raw_rows, v.rows_needed, *v.rows_to_fetch) == (4, 12, 0, "exhausted")
+
+
+def test_the_measured_tokens_per_row_replace_the_estimate_once_raw_is_on_disk(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """
+    Before the first shard the ledger plans at the config's estimate (clamped at the training length); afterwards at the
+    raw manifest's mean tokens per row, so a source of short rows is asked for more rows than the estimate said.
+    """
+
+    cfg = two_stage_cfg(training_target_sequence_length=128)  # rows are cut at 128 tokens: the mean is measurably below the training length
+    assert source_ledger(cfg, "a", layout).tokens_per_row == 128 == cfg.tokens_per_row_rate("a")
+    prepare(config_file(cfg), layout.root, assume_yes=False)
+    raw = Manifest.load(layout.raw_dir("a"))
+    assert raw is not None and raw.tokens() is not None
+    mean = raw.tokens() / raw.rows()  # type: ignore[operator]  # checked above
+    a = source_ledger(cfg, "a", layout)
+    assert a.tokens_per_row == pytest.approx(mean) and 64 < mean < 128
+    assert (a.rows_needed, a.rows_sufficient, a.rows_budget) == (cfg.rows_needed("a", mean), cfg.rows_sufficient("a", mean), cfg.rows_budget("a", mean))
+    assert a.rows_needed > cfg.rows_needed("a") == 64 and a.satisfaction() == (True, "ok")  # served: the margin covered the estimate
 
 
 def test_raw_is_exhausted_honours_a_grown_check_limit() -> None:
@@ -189,16 +226,81 @@ def test_plan_downloads_fetches_nothing_for_a_stale_or_outdated_raw_folder(layou
 
     cfg = two_stage_cfg()
     prepare(config_file(cfg), layout.root, assume_yes=False)
-    cfg.token_count = "estimate"  # part of the raw hash: every raw folder is stale
+    cfg.sources["a"].seed = 9  # the synthetic seed is raw identity: the raw folder is stale
     stale_entry = next(s for s in plan_downloads(cfg, layout).sources if s.name == "a")
-    assert stale_entry.rows_to_fetch == (0, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
+    assert stale_entry.rows_to_fetch == (0, "raw stale: source.seed: 0 -> 9; the repair step deletes it after confirmation")
     outdated = two_stage_cfg()
-    outdated.max_seq_length = 4096  # raised above the stored cap
+    outdated.dataset_max_sequence_length = 4096  # raised above the stored cap
     outdated_entry = next(s for s in plan_downloads(outdated, layout).sources if s.name == "a")
     assert outdated_entry.rows_to_fetch[0] == 0 and outdated_entry.rows_to_fetch[1].startswith("raw outdated")
     a = source_ledger(cfg, "a", layout)  # the status table only reports it
-    assert a.satisfaction() == (False, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
+    assert a.satisfaction() == (False, "raw stale: source.seed: 0 -> 9; the repair step deletes it after confirmation")
+    relabelled = two_stage_cfg()
+    relabelled.token_count = "estimate"  # not raw identity: the same rows, counted differently, a choice for the repair step
+    b = next(s for s in plan_downloads(relabelled, layout).sources if s.name == "b")
+    assert b.raw_state == "tokenizer_changed" and b.raw_reason.startswith("token_count changed: tokenizer -> estimate; 60 rows")
+    assert b.rows_to_fetch == (0, f"raw {b.raw_reason}; the repair step asks whether to keep it")
+    assert b.satisfaction() == (False, f"raw {b.raw_reason}; the repair step asks whether to keep it") and b.raw_rows == 0
 
+
+def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """
+    `Manifest.load` raises for a manifest it cannot parse next to shards (the rows may have been expensive). The
+    ledger turns that into an unsatisfied source nothing is planned for, so `status`, `prepare --dry_run` and a
+    real `prepare` describe it instead of dying, and nobody deletes the folder: that is the user's call.
+    """
+
+    cfg = two_stage_cfg()
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=False)
+    (layout.raw_dir("b") / "MANIFEST.json").write_text("{ not json")
+    reason = "raw unreadable manifest next to shards; fix or delete the directory by hand"
+
+    b = source_ledger(cfg, "b", layout)
+    assert (b.raw_state, b.raw_rows, b.processed_rows, b.exhausted) == ("unreadable", 0, 0, False)
+    assert b.satisfaction() == (False, reason) and b.rows_to_fetch == (0, reason) and b.epochs() is None
+    assert b.state() == "incomplete" and not every_source_satisfies_its_budget(cfg, layout)
+    assert [s.name for s in plan_downloads(cfg, layout).to_fetch()] == [] and sources_with_pending_raw_shards(cfg, layout) == []
+
+    report = status(path, layout.root)
+    assert not report.complete and report.missing() == ["b"] and report.needs_repair == []  # the repair step leaves it alone
+    assert "b" in report.table() and reason in report.table()
+    for dry_run in (True, False):
+        assert not prepare(path, layout.root, assume_yes=True, dry_run=dry_run).complete
+    assert (layout.raw_dir("b") / "data-00000.parquet").is_file() and layout.processed_dir("b").is_dir()  # nothing was deleted
+
+
+def test_an_unreadable_raw_shard_names_the_shard_and_the_repair_command(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """
+    The tokens-per-row rate is read from the raw shards, so a truncated shard reaches every caller of the planner
+    (`status`, a dry run, training's auto-prepare). The planner names the source, the shard and the Arrow error;
+    the callers that know the config path add the repair command, because neither of them repairs anything itself.
+    """
+
+    cfg = two_stage_cfg()
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=False)
+    shard = layout.raw_dir("b") / "data-00000.parquet"
+    shard.write_bytes(b"corrupt")
+
+    with pytest.raises(UnreadableRawShardError) as bare:
+        source_ledger(cfg, "b", layout)
+    assert str(bare.value).startswith(f"b: raw shard {shard} cannot be read (")
+    assert isinstance(bare.value, RepairError), "prepare.py prints a RepairError as a message and exits 1"
+    assert "\n" not in str(bare.value), "the planner knows neither the config path nor the dataset directory"
+
+    command = f"python data_preparation/prepare.py prepare --dataset_config {path} --dataset_dir {layout.root} --yes"
+    calls: list[Callable[[], DatasetReport]] = [
+        lambda: status(path, layout.root),
+        lambda: prepare(path, layout.root, assume_yes=True, dry_run=True),
+    ]
+    for call in calls:
+        with pytest.raises(UnreadableRawShardError) as reported:
+            call()
+        message = str(reported.value)
+        assert str(shard) in message and "the repair step truncates raw/b to its readable prefix" in message
+        assert command in message and "then status again" in message
+    assert shard.is_file(), "a read-only call repairs nothing"
 
 
 # --- the ledger -------------------------------------------------------------------------------------------------------
@@ -210,7 +312,7 @@ def _ledger(**overrides: Any) -> SourceLedger:
     """
 
     defaults: dict[str, Any] = dict(
-        name="s", kind="pretrain", rows_needed=100, rows_sufficient=84, sequence_budget=70, raw_state="current",
+        name="s", kind="pretrain", rows_needed=100, rows_sufficient=84, rows_budget=70, tokens_per_row=64.0, raw_state="current",
         raw_reason="current", raw_rows=100, exhausted=False, skipped_malformed=0, dropped_too_long=0, processed_problem="none", processed_reason="ok",
         processed_rows=90, training_rows=90,
     )
@@ -227,20 +329,49 @@ def test_the_ledger_answers_both_questions_from_one_read(layout: DatasetLayout, 
     ledger = source_ledger(cfg, "a", layout)
     assert (ledger.name, ledger.kind, ledger.raw_state, ledger.processed_problem) == ("a", "pretrain", "current", "none")
     assert (ledger.rows_needed, ledger.rows_sufficient, ledger.raw_rows) == (127, 106, 127)
-    assert ledger.satisfaction() == (True, "ok") and ledger.rows_to_fetch == (0, "enough rows")
+    assert ledger.satisfaction() == (True, "ok") and ledger.rows_to_fetch == (0, "budget served")
     assert ledger == next(s for s in plan_downloads(cfg, layout).sources if s.name == "a") == source_ledger(cfg, "a", layout)
     assert [led.name for led in read_ledgers(cfg, layout, sources=["i", "a"])] == ["a", "i"]  # config order
+
+
+def test_missing_raw_rows_is_the_download_verdict() -> None:
+    """
+    The `download` command's completeness check: raw side only, so a source without a processed folder passes,
+    while a raw folder not current, short of rows, or exhausted with nothing stored fails; the tokenizer counts.
+    """
+
+    unbuilt = dict(processed_problem="absent", processed_reason="missing", processed_rows=0, training_rows=0)
+    report = DatasetReport(sources=[_ledger(**unbuilt)], tokenizer_complete=True)
+    assert report.missing_raw_rows() == [] and not report.complete
+    report.sources = [
+        _ledger(name="short", raw_rows=40, **unbuilt),
+        _ledger(name="stale", raw_state="stale", raw_reason="stale: x", raw_rows=0, **unbuilt),
+        _ledger(name="dry_ok", exhausted=True, raw_rows=30, **unbuilt),
+        _ledger(name="dry_empty", exhausted=True, raw_rows=0, skipped_malformed=30, **unbuilt),
+        _ledger(name="built"),
+    ]
+    assert report.missing_raw_rows() == ["short", "stale", "dry_empty"]
+    report.tokenizer_complete = False
+    assert report.missing_raw_rows() == ["short", "stale", "dry_empty", "tokenizer"]
 
 
 def test_the_satisfaction_cases() -> None:
     assert _ledger().satisfaction() == (True, "ok")
     stale = _ledger(raw_state="stale", raw_reason="stale: source identity or tokenizer changed")
     assert stale.satisfaction() == (False, "raw stale: source identity or tokenizer changed; the repair step deletes it after confirmation")
-    outdated = _ledger(raw_state="outdated", raw_reason="outdated: max_seq_length 64 -> 128")
-    assert outdated.satisfaction() == (False, "raw outdated: max_seq_length 64 -> 128; the repair step deletes it after confirmation")
+    outdated = _ledger(raw_state="outdated", raw_reason="outdated: dataset_max_sequence_length 64 -> 128")
+    assert outdated.satisfaction() == (False, "raw outdated: dataset_max_sequence_length 64 -> 128; the repair step deletes it after confirmation")
     assert _ledger(raw_state="missing", raw_reason="missing", raw_rows=0).satisfaction() == (False, "raw missing")
-    for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, max_seq_length or the source changed"), ("behind_raw", "behind raw")):
+    relabelled = _ledger(raw_state="tokenizer_changed", raw_reason="tokenizer changed: a (synthetic) -> b (synthetic); 5 rows ...")
+    assert relabelled.satisfaction() == (False, f"raw {relabelled.raw_reason}; the repair step asks whether to keep it")
+    for problem, reason in (("absent", "missing"), ("stale", "stale: processing settings, dataset_max_sequence_length or the source changed")):
         assert _ledger(processed_problem=problem, processed_reason=reason).satisfaction() == (False, f"processed {reason}")
+        assert _ledger(processed_problem=problem, processed_reason=reason).build_pending
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw", processed_rows=10).satisfaction() == (False, "processed behind raw")
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw", processed_rows=10).build_pending
+    assert _ledger(processed_problem="behind_raw", processed_reason="behind raw").satisfaction() == (True, "ok")  # served: the cap
+    assert not _ledger(processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=2).build_pending
+    assert not _ledger(raw_state="missing", raw_reason="missing", raw_rows=0, processed_problem="absent", processed_reason="missing").build_pending
     assert _ledger(processed_rows=10).satisfaction() == (False, "processed rows 10 < 84")
     dry_small = _ledger(processed_rows=10, training_rows=9, exhausted=True)
     assert dry_small.satisfaction() == (True, "exhausted at 10 of 84 rows")
@@ -291,6 +422,24 @@ def test_rows_to_fetch_tops_up_from_the_observed_yield() -> None:
     assert nothing_survives.rows_to_fetch == (0, "no row of 100 raw rows survives the build")  # no yield to extrapolate from
 
 
+def test_a_served_budget_is_never_re_downloaded() -> None:
+    """
+    A budget raised a little (or a measured rate a little below the estimate) leaves raw short of the new
+    `rows_needed` while the processed rows already serve it: satisfied, and nothing to fetch. Before, the raw
+    comparison came first and re-downloaded 150,000 rows nobody needed.
+    """
+
+    served = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=1_040_000, training_rows=1_040_000)
+    assert served.satisfaction() == (True, "ok") and served.rows_to_fetch == (0, "budget served")
+    unbuilt = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=0, processed_problem="absent", processed_reason="missing")
+    assert unbuilt.rows_to_fetch == (150_000, "rows 1,050,000 < 1,200,000")  # nothing built yet: raw is what counts
+    # the build is capped at the budget: a folder behind raw that serves it is served, one short of it builds first
+    behind = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=1_040_000, processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=5)
+    assert behind.rows_to_fetch == (0, "budget served") and behind.satisfaction() == (True, "ok, 5 raw shard(s) past the budget unbuilt") and not behind.build_pending
+    short = _ledger(rows_needed=1_200_000, rows_sufficient=1_000_000, raw_rows=1_050_000, processed_rows=500_000, processed_problem="behind_raw", processed_reason="behind raw", unbuilt_shards=50)
+    assert short.rows_to_fetch == (150_000, "rows 1,050,000 < 1,200,000") and short.build_pending  # raw short and the build has work
+
+
 def test_the_top_up_is_capped_at_the_full_requirement(caplog: pytest.LogCaptureFixture) -> None:
     """
     A pathological yield (1 of 1,200 rows) extrapolates to a download nobody wants: the round asks for at most
@@ -321,7 +470,7 @@ def test_sources_are_satisfied_after_prepare(layout: DatasetLayout, config_file:
     assert a.raw_rows == 127 and a.processed_rows >= 106 and a.rows_needed == 127
     assert a.epochs() == pytest.approx(100 / training_rows_after_split(cfg, "a", a.processed_rows))
     h = _state(report, "h")
-    assert h.satisfaction()[0] and h.raw_rows == 8 and h.epochs() is None  # not trained on: no budget to cycle
+    assert h.satisfaction()[0] and h.raw_rows == 10 and h.epochs() is None  # not trained on: no budget to cycle
     assert every_source_satisfies_its_budget(cfg, layout) and every_source_satisfies_its_budget(cfg, layout, sources=["i"])
     assert sources_with_pending_raw_shards(cfg, layout) == []
     assert report.describe().endswith("dataset complete")
@@ -339,7 +488,7 @@ def test_not_satisfied_when_processed_is_missing_stale_or_behind_raw(layout: Dat
 
     stale = two_stage_cfg(min_chars=2)  # changes every processed hash, no raw hash
     a = source_ledger(stale, "a", layout)
-    assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed stale: processing settings, max_seq_length or the source changed" and a.raw_rows == 127
+    assert not a.satisfaction()[0] and a.satisfaction()[1] == "processed stale: processing.min_chars: 1 -> 2" and a.raw_rows == 127
 
     bigger = two_stage_cfg(tokens_b=12800)
     prepare(config_file(bigger), layout.root, assume_yes=False, steps=["download"])  # raw topped up, processed not
@@ -379,7 +528,7 @@ def test_short_processed_folder_is_not_satisfied(layout: DatasetLayout, config_f
     a = source_ledger(bigger, "a", layout)
     assert not a.satisfaction()[0] and a.satisfaction()[1] == f"processed rows {a.processed_rows} < {bigger.rows_sufficient('a')}" and a.epochs() is None
     row = next(line for line in summarize_dataset_state(bigger, layout).table().splitlines() if line.startswith("a "))
-    assert row.split()[5] == "-" and row.split()[6] == "incomplete"  # epochs only when complete
+    assert row.split()[6] == "-" and row.split()[7] == "incomplete"  # epochs only when complete
 
 
 def test_exhausted_and_built_source_is_satisfied(layout: DatasetLayout, cfg_factory: CfgFactory, config_file: ConfigFile, write_local: Writer) -> None:
@@ -389,7 +538,7 @@ def test_exhausted_and_built_source_is_satisfied(layout: DatasetLayout, cfg_fact
     report = prepare(config_file(cfg), layout.root, assume_yes=False)
     v = _state(report, "v")
     assert report.complete and v.satisfaction()[0] and v.exhausted and v.state() == "exhausted"
-    assert v.satisfaction()[1] == "exhausted at 4 of 9 rows" and v.processed_rows == 4  # 9 = ceil(10 ÷ 1.2)
+    assert v.satisfaction()[1] == "exhausted at 4 of 10 rows" and v.processed_rows == 4  # its `rows` are the delivered rows
     (layout.processed_dir("v") / "MANIFEST.json").unlink()
     assert not source_ledger(cfg, "v", layout).satisfaction()[0]  # exhausted alone is not enough: the raw shards must be built
 
@@ -421,8 +570,8 @@ def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile
     report = summarize_dataset_state(cfg, layout)
     assert report.missing() == ["a", "b", "h", "i", "tokenizer"] and not report.complete
     lines = report.table().splitlines()
-    assert lines[0].split() == ["source", "kind", "needed", "raw", "processed", "epochs", "state", "reason"]
-    assert lines[1].split() == ["a", "pretrain", "127", "0", "0", "-", "incomplete", "raw", "missing"]
+    assert lines[0].split() == ["source", "kind", "needed", "tokens/row", "raw", "processed", "epochs", "state", "reason"]
+    assert lines[1].split() == ["a", "pretrain", "127", "64", "0", "0", "-", "incomplete", "raw", "missing"]
     assert lines[-1].split() == ["tokenizer", "tokenizer", "incomplete"]
     prepare(config_file(cfg), layout.root, assume_yes=False)
     complete = summarize_dataset_state(cfg, layout)

@@ -39,11 +39,11 @@ class Progress(Protocol):
 
 class NoProgress:
     """
-    The bar without a display: n still counts the updates.
+    The bar without a display: n still counts the updates, from initial.
     """
 
-    def __init__(self, total: int | None = None) -> None:
-        self.n = 0
+    def __init__(self, total: int | None = None, initial: int = 0) -> None:
+        self.n = initial
         self.total = total
 
     def update(self, n: int = 1) -> None:

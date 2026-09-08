@@ -14,12 +14,14 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from data_preparation import prepare as prepare_cli
 from data_preparation.conftest import REPO, REV, FakeHub
@@ -29,10 +31,10 @@ from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import RunLocked, build_lock
-from data_preparation.lib.build.planner import DownloadPlan, plan_downloads
+from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.stages.build import build_source as real_build
-from data_preparation.lib.stages.download import download as real_download
+from data_preparation.lib.stages.download import MalformedSourceError, download as real_download
 from data_preparation.lib.stages.download import download_github_code_group as real_group
 from data_preparation.lib.storage.manifest import Manifest
 
@@ -42,6 +44,10 @@ Writer = Callable[[Path, list[dict[str, Any]], str], Path]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
+# The per-stage budget of the tests that assert nothing about row counts: 190 rows of a single synthetic source, 64
+# per source of `_three_sources` (at 500 to 600 tokens the rows were most of a test's time). The tests that assert
+# counts, or download a 100-row partial shard first, keep their own budgets.
+TOKENS = 150
 
 
 def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
@@ -52,9 +58,13 @@ def all_mtimes(root: Path, *, include_lock: bool = False) -> dict[Path, int]:
     return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file() and (include_lock or p.name != ".build.lock")}
 
 
+def _state(report: DatasetReport, name: str) -> SourceLedger:
+    return next(source for source in report.sources if source.name == name)
+
+
 def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
     sources = {f"s{i}": SourceConfig(kind="pretrain", loader="synthetic", seed=i) for i in range(3)}
-    return cfg_factory(sources, tokens=600, name="three")
+    return cfg_factory(sources, tokens=TOKENS)
 
 
 # --- end to end ------------------------------------------------------------------------------------------------------
@@ -85,12 +95,12 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
         "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),  # used only for validation
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
-    cfg = cfg_factory(sources, tokens=500)
+    cfg = cfg_factory(sources, tokens=500, training_target_sequence_length=1)
     report = prepare(config_file(cfg), layout.root, assume_yes=False)
     assert report.complete and [s.name for s in report.sources] == ["p", "h", "i"]
     p, h, i = report.sources
     assert p.rows_needed == 600 and p.raw_rows == 600 and p.processed_rows >= 500 and p.epochs() is not None
-    assert h.rows_needed == 4 and h.raw_rows == 4 and h.epochs() is None
+    assert h.rows_needed == 5 and h.rows_sufficient == 4 and h.raw_rows == 5 and h.epochs() is None  # 4 delivered rows, × 1.2 downloaded
     assert i.kind == "instruct" and i.satisfaction()[0]
     processed_i = Manifest.load(layout.processed_dir("i"))
     assert processed_i is not None and processed_i.columns == ["instruction", "input", "output", "tokens", "hash"]
@@ -99,37 +109,71 @@ def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, lay
 # --- rounds ----------------------------------------------------------------------------------------------------------
 
 
-def test_a_download_that_falls_short_gets_a_second_round(
-    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_loader_that_falls_short_is_exhausted_until_reopened(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    A loader that returns fewer rows than asked (without being exhausted) leaves the source short after round 1;
-    round 2 plans the difference and tops it up.
+    A loader that yields fewer rows than asked is latched exhausted, whatever the reason: the source is
+    satisfied with the rows it has (warning, no second round), and a later run does not read on by itself even
+    when the source grew. `prepare(reopen=[name])` clears the latch; the download then resumes at its offset.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
-    calls: list[int] = []
+    src_dir = layout.root.parent / "growing"
+    write_local(src_dir, [{"text": f"tok_{i} tok_2 tok_3"} for i in range(4)], "parquet")
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=10, training_target_sequence_length=1)
+    needed, sufficient = cfg.rows_needed("p"), cfg.rows_sufficient("p")  # 10 rows × 1.2 ÷ 0.95 = 13, 11
+    path = config_file(cfg)
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        report = prepare(path, layout.root, assume_yes=False)
+    (p,) = report.sources
+    assert report.complete and p.exhausted and p.satisfaction() == (True, f"exhausted at 4 of {sufficient} rows") and (needed, sufficient) == (13, 11)
+    assert "round 2" not in caplog.text
+    assert f"p: source exhausted (exhausted at 4 of {sufficient} rows); the training sampler cycles the rows on disk; rerun with --reopen p if the source has more rows" in caplog.text
+    assert caplog.text.index("dataset status:") < caplog.text.index("p: source exhausted")  # the warning follows the table
 
-    def half_the_first_time(config: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
-        calls.append(rows_needed)
-        asked = rows_needed // 2 if len(calls) == 1 else rows_needed
-        return real_download(config, name, *args, rows_needed=asked, **kwargs)
+    write_local(src_dir, [{"text": f"tok_{i} tok_5 tok_6"} for i in range(20)], "parquet")  # the source grew
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        assert _state(prepare(path, layout.root, assume_yes=False), "p").exhausted  # the latch holds
+    assert "round 1: nothing to download" in caplog.text
+    with pytest.raises(ValueError, match="unknown sources"):
+        prepare(path, layout.root, assume_yes=False, reopen=["nope"])
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="data_preparation"):
+        report = prepare(path, layout.root, assume_yes=False, reopen=["p"])
+    (p,) = report.sources
+    assert "p: reopened; the next download reads on from offset 4" in caplog.text
+    assert f"round 1: 1 source(s) short, downloading {needed - 4} rows (p {needed - 4})" in caplog.text
+    assert report.complete and not p.exhausted and p.satisfaction() == (True, "ok") and p.raw_rows == p.processed_rows == needed
+    raw = Manifest.load(layout.raw_dir("p"))
+    assert raw is not None and raw.rows_fetched == needed and [s.rows for s in raw.shards] == [4, needed - 4]  # appended, not rewritten
 
-    monkeypatch.setattr(runner, "download", half_the_first_time)
-    needed = cfg.rows_needed("p")  # 500 sequences × 1.2 ÷ 0.95 (the factory validates on the trained source too) = 632
+
+def test_a_measured_rate_below_the_estimate_gets_a_second_round(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Round 1 is sized at the config's tokens-per-row estimate (500 by default, clamped at the dataset length); the raw
+    shards then measure the real mean. Synthetic rows cut at 256 tokens average well under 256 ÷ 1.2, so the
+    margin does not cover the difference and round 2 tops the source up at the measured rate.
+    """
+
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=25_600, tokens_per_row=500, dataset_max_sequence_length=256)
+    first = cfg.rows_needed("p")  # 25600 ÷ 256 = 100 rows × 1.2 ÷ 0.95 = 127
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
-    assert report.complete and calls == [needed, needed] == [632, 632]
-    assert "round 1: 1 source(s) short, downloading 632 rows (p 632)" in caplog.text
-    assert "round 2: 1 source(s) short, downloading 316 rows (p 316)" in caplog.text and "round 3" not in caplog.text
-    raw = Manifest.load(layout.raw_dir("p"))
-    assert raw is not None and raw.rows() == 632 and [s.rows for s in raw.shards] == [316, 316]  # appended, not rewritten
+    (p,) = report.sources
+    assert first == 127 and f"round 1: 1 source(s) short, downloading {first} rows (p {first})" in caplog.text
+    assert "round 2: 1 source(s) short" in caplog.text and "round 3" not in caplog.text
+    assert report.complete and p.satisfaction() == (True, "ok") and p.rows_to_fetch == (0, "budget served")
+    assert p.tokens_per_row < 256 / 1.2 and p.raw_rows > first and p.rows_needed == cfg.rows_needed("p", p.tokens_per_row) > first
+    assert p.processed_rows >= p.rows_sufficient and p.epochs() == pytest.approx(p.rows_budget / p.training_rows)
 
 
 def test_a_source_still_short_after_max_rounds_is_reported(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=100)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=100, training_target_sequence_length=1)
     calls = 0
 
     def one_row_per_call(config: DatasetConfig, name: str, *args: Any, rows_needed: int, **kwargs: Any) -> Manifest:
@@ -162,7 +206,7 @@ def test_a_dedup_shortfall_beyond_the_margin_is_topped_up_in_later_rounds(
     src_dir = layout.root.parent / "dupes"
     rows = [{"text": f"tok_{i} tok_2 tok_3"} if i % 5 == 0 else {"text": "tok_1 tok_2 tok_3"} for i in range(3500)]
     write_local(src_dir, rows, "parquet")
-    cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500)
+    cfg = cfg_factory({"d": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=500, training_target_sequence_length=1)
     needed, sufficient = cfg.rows_needed("d"), cfg.rows_sufficient("d")
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
@@ -181,10 +225,11 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, write_local: Writer, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    A `fields` mapping naming columns the rows do not have rejects every row as malformed: the source runs dry
-    with an empty processed folder. That used to count as satisfied: `prepare` and `status` said "dataset complete",
-    exit 0, and the training run failed much later (open finding H2). A failed source is a failed build, so it
-    is now unsatisfied with a reason that names the likely mistake.
+    A `fields` mapping naming columns the rows do not have rejects every row as malformed. That used to run the
+    source dry with an empty folder that counted as satisfied: `prepare` and `status` said "dataset complete", exit
+    0, and the training run failed much later (open finding H2). The download now fails at the tenth malformed
+    row in a row (`MalformedSourceError`, lib/stages/download.py) with the expected and the found formats, so
+    `prepare` raises, `status` reports the source incomplete and the CLI exits 1.
     """
 
     src_dir = layout.root.parent / "wrong_fields"
@@ -192,14 +237,16 @@ def test_a_source_whose_rows_never_survive_the_build_is_a_failed_build(
     source = SourceConfig(kind="instruct", loader="local", path=str(src_dir), fields={"instruction": "prompt", "output": "completion"})
     cfg = cfg_factory({"i": source}, tokens=100)
     path = config_file(cfg)
-    with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pytest.raises(MalformedSourceError) as failure:
+        prepare(path, layout.root, assume_yes=False)
+    message = str(failure.value)
+    assert message.startswith("i: 10 consecutive rows could not be converted; expected format: columns instruction=prompt, output=completion")
+    assert "{'question': 'str', 'answer': 'str'}" in message and "missing column(s) ['prompt', 'completion']" in message
+    assert "i: malformed row skipped" in caplog.text and "source i failed" in caplog.text
+    report = status(path, layout.root)
     (i,) = report.sources
-    assert not report.complete and not i.satisfaction()[0] and i.exhausted and (i.raw_rows, i.processed_rows) == (0, 0)
-    assert "NOT ONE" in i.satisfaction()[1] and "20 malformed" in i.satisfaction()[1]
-    assert "check the source's fields / converter / filter / language" in i.satisfaction()[1]
-    assert report.missing() == ["i"] and f"i: {i.satisfaction()[1]}" in caplog.text
-    assert status(path, layout.root).describe().endswith("dataset INCOMPLETE"), "`status` says the same"
+    assert not report.complete and not i.satisfaction()[0] and (i.raw_rows, i.processed_rows) == (0, 0)
+    assert report.describe().endswith("dataset INCOMPLETE"), "`status` says the same"
     with pytest.raises(SystemExit) as exit_code:
         prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root)])
     assert exit_code.value.code == 1
@@ -210,7 +257,7 @@ def test_exhausted_source_is_complete_with_a_warning(
 ) -> None:
     src_dir = layout.root.parent / "small"
     write_local(src_dir, [{"text": "tok_1 tok_2 tok_3"}] * 3 + [{"text": "tok_4 tok_5"}], "parquet")
-    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=1000)
+    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path=str(src_dir))}, tokens=1000, training_target_sequence_length=1)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         report = prepare(config_file(cfg), layout.root, assume_yes=False)
     (s,) = report.sources
@@ -223,7 +270,7 @@ def test_exhausted_source_is_complete_with_a_warning(
 
 
 def test_steps_download_then_build(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic"), "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4)}, tokens=TOKENS)
     path = config_file(cfg)
     report = prepare(path, layout.root, assume_yes=False, steps=["tokenizer", "download"])
     assert not report.complete and report.tokenizer_complete and report.missing() == ["p", "h"]
@@ -238,7 +285,7 @@ def test_steps_download_then_build(cfg_factory: CfgFactory, layout: DatasetLayou
 
 def test_sources_filter(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
-    path = config_file(cfg_factory(sources, tokens=500))
+    path = config_file(cfg_factory(sources, tokens=TOKENS))
     report = prepare(path, layout.root, assume_yes=False, sources=["a"])
     assert not report.complete and report.missing() == ["b"] and (layout.processed_dir("a") / "MANIFEST.json").is_file()
     assert not layout.raw_dir("b").exists()
@@ -258,11 +305,11 @@ def test_a_repeated_source_is_selected_once(cfg_factory: CfgFactory, layout: Dat
     """
 
     sources = {"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "b": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}
-    cfg = cfg_factory(sources, tokens=500)
+    cfg = cfg_factory(sources, tokens=TOKENS)
     assert runner.checked_sources(cfg, ["b", "a", "b"]) == ["a", "b"] and runner.checked_sources(cfg, None) is None
     path = config_file(cfg)
     assert prepare(path, layout.root, assume_yes=False, sources=["a", "a"]).missing() == ["b"]
-    stale = cfg_factory(sources, tokens=500, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
+    stale = cfg_factory(sources, tokens=TOKENS, token_count="estimate")  # a different raw hash: `a` is deleted and fetched again
     assert prepare(config_file(stale), layout.root, assume_yes=True, sources=["a", "a"]).missing() == ["b"]
     prepare_cli.main(["prepare", "--dataset_config", str(path), "--dataset_dir", str(layout.root), "--sources", "a", "a"])  # the CLI too
 
@@ -354,7 +401,7 @@ def test_interrupt_in_the_wait_stops_the_download_within_a_shard_and_keeps_its_s
     its next shard (published), `prepare` raises `BuildAborted` and the next run resumes.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500, training_target_sequence_length=1)
     shards_done: list[int] = []
 
     def slow_download(config: DatasetConfig, name: str, *args: Any, rows_needed: int, should_stop: Any = None, **kwargs: Any) -> Manifest:
@@ -411,6 +458,32 @@ def test_a_failing_follow_up_raises_the_stop_flag_and_cancels_the_queued_jobs() 
             runner.wait_for_jobs([pool], flag)
         assert flag.should_stop(), "the flag must be raised so running jobs stop at their next shard"
 
+
+def test_a_second_interrupt_ends_the_process_without_waiting_for_the_running_job(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Ctrl-C while the pool exit waits for a job that never reaches its next shard (a huge row group, a stalled
+    listing): the executor is abandoned and the process ends with 130 instead of joining the thread at exit.
+    """
+
+    flag = runner.StopFlag()
+    release = threading.Event()
+    exits: list[int] = []
+
+    def interrupt(*args: Any, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "wait", interrupt)  # the first Ctrl-C lands in `wait_for_jobs`
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__exit__", interrupt)  # the second in the pool exit
+    monkeypatch.setattr(os, "_exit", exits.append)
+    pool = runner.JobPool("downloads", max_workers=1, flag=flag, total=1)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pool:
+        pool.submit(runner.Job("source", "a", ("a",), lambda stop: release.wait(10)))
+        failures = runner.wait_for_jobs([pool], flag)
+    assert [type(error) for error in failures] == [BuildAborted] and flag.should_stop(), "the first interrupt: stop at the next shard"
+    assert exits == [130] and not release.is_set(), "the second: ended while the job was still running"
+    assert "second interrupt: ending without waiting for the running transfer" in caplog.text
+    release.set()
+    pool._executor.shutdown(wait=True)  # the test's own thread, not the process's exit
 
 
 def test_a_round_with_nothing_to_do_is_a_no_op(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
@@ -603,7 +676,7 @@ def test_interrupt_stops_downloads_and_builds_within_a_shard_and_the_rerun_resum
     published is kept, `prepare` raises `BuildAborted`; the next run resumes both.
     """
 
-    cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500)
+    cfg = cfg_factory({"s0": SourceConfig(kind="pretrain", loader="synthetic", seed=0), "s1": SourceConfig(kind="pretrain", loader="synthetic", seed=1)}, tokens=500, training_target_sequence_length=1)
     build_started = threading.Event()
     ticks: dict[str, int] = {}
 
@@ -696,7 +769,7 @@ def test_prepare_fails_fast_while_another_build_holds_the_lock(layout: DatasetLa
 
 
 def test_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture) -> None:
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=TOKENS))
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         report = prepare(path, layout.root, assume_yes=False, dry_run=True)
     assert not report.complete and not layout.root.exists()
@@ -711,12 +784,12 @@ def test_dry_run_writes_nothing(cfg_factory: CfgFactory, layout: DatasetLayout, 
 def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
     cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture
 ) -> None:
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS)
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw_dir = layout.raw_dir("p")
     before = all_mtimes(raw_dir)
 
-    cfg.token_count = "estimate"  # part of the raw hash: the raw folder is stale
+    cfg.sources["p"].seed = 1  # the synthetic seed is raw identity: the raw folder is stale
     path = config_file(cfg)
     asked: list[str] = []
 
@@ -735,7 +808,36 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
         report = prepare(path, layout.root, assume_yes=True)
     assert report.complete and "without asking" in caplog.text
     raw = Manifest.load(raw_dir)
-    assert raw is not None and raw.token_count == "estimate" and raw.is_current(cfg.raw_hash("p"))
+    assert raw is not None and raw.hash_payload["source"]["seed"] == 1 and raw.is_current(cfg.raw_hash("p")), "downloaded again under the new identity"
+
+
+def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(
+    cfg_factory: CfgFactory, layout: DatasetLayout, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Raw folders are shared by source name: config b gives `p` another loader identity, so a's raw folder is
+    stale for it. b's prepare refuses to delete it (`--yes` or not) until allowed, then downloads its own and
+    records itself in the manifest; status names the flag.
+    """
+
+    def config(path: Path, seed: int) -> Path:
+        cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=seed)}, tokens=TOKENS)
+        path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False))
+        return path
+
+    a, b = config(tmp_path / "a.yaml", 0), config(tmp_path / "b.yaml", 1)
+    assert prepare(a, layout.root, assume_yes=True).complete
+    raw = Manifest.load(layout.raw_dir("p"))
+    assert raw is not None and raw.dataset_config == "a.yaml"
+    with pytest.raises(ConfirmationRequired, match="downloaded under dataset config a.yaml, deleting it needs --allow_foreign_raw"):
+        prepare(b, layout.root, assume_yes=True)
+    assert Manifest.load(layout.raw_dir("p")) == raw, "nothing was changed"
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        assert not status(b, layout.root).complete
+    assert "would delete raw" in caplog.text and "deleting it needs --allow_foreign_raw" in caplog.text
+    assert prepare(b, layout.root, assume_yes=True, allow_foreign_raw=True).complete
+    replaced = Manifest.load(layout.raw_dir("p"))
+    assert replaced is not None and replaced.dataset_config == "b.yaml" and replaced.source_hash != raw.source_hash
 
 
 def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
@@ -746,7 +848,7 @@ def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
     assessment, counting the repairs the run left undone (all of them in a dry run) as incomplete.
     """
 
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS))
     assert prepare(path, layout.root, assume_yes=False).complete
     next(layout.processed_dir("p").glob("data-*.parquet")).unlink()  # broken: the repair step would delete the folder
     before = all_mtimes(layout.root, include_lock=True)
@@ -761,7 +863,7 @@ def test_dry_run_and_status_agree_on_a_tree_that_needs_a_repair(
 
 
 def test_status_is_read_only_and_reports_would_repair(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, caplog: pytest.LogCaptureFixture) -> None:
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS))
     prepare(path, layout.root, assume_yes=False)
     victim = next(layout.processed_dir("p").glob("data-*.parquet"))
     victim.unlink()
@@ -813,7 +915,7 @@ def _github_cfg(cfg_factory: CfgFactory, languages: list[str], **kwargs: Any) ->
         f"code_{lang.lower()}": SourceConfig(kind="pretrain", loader="github_code", hf_id=REPO, revision=REV, language=lang)
         for lang in languages
     }
-    return cfg_factory(sources, tokens=15, name="code", **kwargs)
+    return cfg_factory(sources, tokens=15, **kwargs)
 
 
 def _code_rows(prefix: str, n: int) -> list[dict[str, Any]]:
@@ -826,7 +928,7 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
 ) -> None:
     hub.add("data/a.parquet", _code_rows("a", 30))
     hub.add("data/b.parquet", _code_rows("b", 30))
-    cfg = _github_cfg(cfg_factory, ["Python", "Java", "Go"])
+    cfg = _github_cfg(cfg_factory, ["Python", "Java", "Go"], training_target_sequence_length=1)
     single: list[str] = []
 
     def spy_download(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
@@ -844,14 +946,14 @@ def test_github_code_languages_of_one_repo_download_in_one_pass(
         raw = Manifest.load(layout.raw_dir(name))
         assert raw is not None and raw.rows() >= 6  # 5 sequences each × 1.2
 
-    # `--sources` with one language uses the ordinary per-source path
+    # `--sources` with one language is a group of one: the group pass is what keeps the other languages' rows
     hub.streams.clear()
-    bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"])
+    bigger = _github_cfg(cfg_factory, ["Python", "Java", "Go"], training_target_sequence_length=1)
     bigger.stages[0].tokens = 30
     jobs = runner.download_jobs(plan_downloads(bigger, layout, sources=["code_python"]), bigger, layout, None)
-    assert [(job.what, job.name) for job in jobs] == [("source", "code_python")]
+    assert [(job.what, job.name, job.sources) for job in jobs] == [("github_code group", "code_python", ("code_python",))]
     prepare(config_file(bigger), layout.root, assume_yes=False, sources=["code_python"])
-    assert single == ["code_python"]
+    assert single == []
 
 
 # --- repairs on the way -----------------------------------------------------------------------------------------------
@@ -862,7 +964,7 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
     The raw shards are the bandwidth-expensive part: a processing-only edit must not re-download them.
     """
 
-    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=500)
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=TOKENS)
     prepare(config_file(cfg), layout.root, assume_yes=False)
     raw_dir, processed_dir = layout.raw_dir("p"), layout.processed_dir("p")
     raw_before = all_mtimes(raw_dir)
@@ -870,7 +972,14 @@ def test_processing_change_rebuilds_processed_but_leaves_raw_untouched(cfg_facto
     assert processed_before is not None
 
     cfg.processing = ProcessingConfig(min_chars=2)
-    report = prepare(config_file(cfg), layout.root, assume_yes=False)
+    asked: list[str] = []
+
+    def confirm(message: str) -> bool:
+        asked.append(message)
+        return True
+
+    report = prepare(config_file(cfg), layout.root, assume_yes=False, confirm=confirm)  # the rebuild asks, like a raw deletion
+    assert len(asked) == 1 and "  p: stale: processing.min_chars: 1 -> 2\n" in asked[0]
     assert report.complete and all_mtimes(raw_dir) == raw_before
     processed = Manifest.load(processed_dir)
     assert processed is not None and processed.is_current(cfg.processed_hash("p")) and not processed.is_current(processed_before.source_hash)
@@ -882,7 +991,7 @@ def test_missing_processed_shards_are_repaired(cfg_factory: CfgFactory, layout: 
         "h": SourceConfig(kind="pretrain", loader="synthetic", seed=1, rows=4),
         "i": SourceConfig(kind="instruct", loader="synthetic", seed=2),
     }
-    path = config_file(cfg_factory(sources, tokens=500))
+    path = config_file(cfg_factory(sources, tokens=TOKENS))
     prepare(path, layout.root, assume_yes=False)
     victims = [next(layout.processed_dir(name).glob("data-*.parquet")) for name in ("p", "h", "i")]
     for victim in victims:
@@ -900,13 +1009,16 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
     from data_preparation.lib.sources import loaders as loaders_mod
 
     monkeypatch.setattr(runner, "download", partial(real_download, shard_size=10))
-    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=50))
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=50, training_target_sequence_length=1))
     prepare(path, layout.root, assume_yes=False)
     raw = layout.raw_dir("p")
     manifest = Manifest.load(raw)
     assert manifest is not None and len(manifest.shards) >= 3, "the test needs several raw shards"
-    last = manifest.shards[-1]
-    (raw / last.name).write_bytes(b"corrupt")
+    # a shard the capped build covered (the last one is past the budget and unbuilt: losing it changes nothing)
+    processed = Manifest.load(layout.processed_dir("p"))
+    assert processed is not None and len(processed.input_shards) == len(manifest.shards) - 1
+    broken = manifest.shards[-2]
+    (raw / broken.name).write_bytes(b"corrupt")
     offsets: list[int] = []
     original = loaders_mod.LOADERS["synthetic"]
 
@@ -916,9 +1028,9 @@ def test_broken_raw_shard_is_truncated_not_redownloaded(
 
     monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", spy)
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
-        report = prepare(path, layout.root, assume_yes=False)
+        report = prepare(path, layout.root, assume_yes=True)  # a healthy shard after the broken one is dropped too: asks
     assert report.complete and "truncating" in caplog.text
-    assert offsets == [manifest.shards[-2].offset], "resumed behind the last good shard instead of from 0"
+    assert offsets == [manifest.shards[-3].offset], "resumed behind the last good shard instead of from 0"
     repaired = Manifest.load(raw)
     assert repaired is not None and repaired.rows() == manifest.rows() and [s.rows for s in repaired.shards] == [s.rows for s in manifest.shards]
 
@@ -955,3 +1067,41 @@ def test_prepare_logs_the_stop_reason_of_a_slow_build(
         prepare(path, layout.root, assume_yes=False, num_workers=3, max_parallel_downloads=3)
     assert 0 < ticks["s0"] < 100 and 0 < ticks["s2"] < 100
     assert "source s0 stopped: source s1 failed" in caplog.text
+
+
+def test_github_code_group_job_includes_satisfied_members_and_the_build_is_capped(
+    hub: FakeHub, cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A member with nothing to fetch still joins the group job (passively: it stores what the pass reads on for
+    the others), and every build job carries the planner's rows_sufficient as its cap.
+    """
+
+    languages = ("Python", "Python", "Go", "Python", "Go", "Java")  # Java is rare: its download reads past Python's target
+    for prefix in "ab":
+        hub.add(f"data/{prefix}.parquet", [{"id": f"{prefix}{i}", "text": f"{prefix} code {i}", "language": languages[i % 6]} for i in range(60)])
+    targets: dict[str, int] = {}
+
+    def spy_build(config: DatasetConfig, name: str, *args: Any, **kwargs: Any) -> Manifest:
+        targets[name] = kwargs["rows_target"]
+        return real_build(config, name, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "build_source", spy_build)
+    python_only = _github_cfg(cfg_factory, ["Python"], training_target_sequence_length=1)
+    assert prepare(config_file(python_only), layout.root, assume_yes=False).complete
+    python_ledger = source_ledger(python_only, "code_python", layout)
+    assert python_ledger.raw_rows >= python_ledger.rows_needed and targets == {"code_python": python_ledger.rows_sufficient}
+
+    both = _github_cfg(cfg_factory, ["Python", "Java"], training_target_sequence_length=1)
+    plan = plan_downloads(both, layout)
+    assert [source.name for source in plan.to_fetch()] == ["code_java"]  # Python serves its budget
+    jobs = runner.download_jobs(plan, both, layout, None)
+    assert [(job.what, job.sources) for job in jobs] == [("github_code group", ("code_python", "code_java"))]
+    targets.clear()
+    report = prepare(config_file(both), layout.root, assume_yes=False)
+    java_ledger = source_ledger(both, "code_java", layout)
+    assert report.complete and targets == {"code_java": java_ledger.rows_sufficient}  # Python's processed folder serves the budget: no build
+    grown = Manifest.load(layout.raw_dir("code_python"))
+    assert grown is not None and grown.rows() > python_ledger.raw_rows  # Python stored the rows read for Java past its own target
+    python_state = next(source for source in report.sources if source.name == "code_python")
+    assert python_state.satisfaction()[0] and not python_state.build_pending and python_state.unbuilt_shards >= 1

@@ -34,6 +34,7 @@ REPO = Path(__file__).resolve().parents[1]
 CROW = REPO / "config" / "datasets" / "crow_300m_final.yaml"
 TINY = REPO / "config" / "datasets" / "tiny.yaml"
 MINI = REPO / "config" / "datasets" / "crow_300m_mini.yaml"
+V2 = REPO / "config" / "datasets" / "v2_50M_tokens.yaml"
 
 FINETUNE_SHARES = {"flan": 0.40, "metamath": 0.15, "orca_math": 0.10, "evol_code": 0.125, "code_alpaca": 0.025, "slimorca": 0.10, "sharegpt": 0.05, "wizardlm": 0.05}
 
@@ -51,13 +52,12 @@ def _minimal() -> dict[str, Any]:
     """
 
     return {
-        "name": "t",
         "tokenizer": {"name": "synthetic", "kind": "synthetic"},
-        "block_size": 64,
+        "training_target_sequence_length": 64,
         "sources": {
-            "pre": {"kind": "pretrain", "loader": "synthetic"},
+            "pre": {"kind": "pretrain", "loader": "synthetic", "describe_tokens_per_row": 64},
             "hold": {"kind": "pretrain", "loader": "synthetic", "rows": 10},
-            "ins": {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}},
+            "ins": {"kind": "instruct", "loader": "hf_stream", "hf_id": "x/y", "fields": {"instruction": "a", "output": "b"}, "describe_tokens_per_row": 64},
         },
         "stages": [
             {"name": "s1", "tokens": 1000, "train": {"pre": 1.0}, "val": {"hold": 0.5, "pre": 0.5}},
@@ -70,17 +70,17 @@ def _build(d: dict[str, Any]) -> DatasetConfig:
     d = copy.deepcopy(d)
     sources = {k: SourceConfig(**({**v, "processing": _processing(v["processing"])} if v.get("processing") else v))
                for k, v in d["sources"].items()}
-    return DatasetConfig(
-        name=d["name"],
+    config = DatasetConfig(
         tokenizer=TokenizerConfig(**d["tokenizer"]),
         sources=sources,
         stages=[StageConfig(**s) for s in d["stages"]],
-        block_size=d["block_size"],
-        max_seq_length=d.get("max_seq_length", 2048),
+        training_target_sequence_length=d["training_target_sequence_length"],
+        dataset_max_sequence_length=d.get("dataset_max_sequence_length", 2048),
         validation_fraction=d.get("validation_fraction", 0.05),
         token_count=d.get("token_count", "tokenizer"),
         processing=_processing(d["processing"]) if d.get("processing") else ProcessingConfig(),
     )
+    return config
 
 
 def _processing(d: dict[str, Any]) -> ProcessingConfig:
@@ -101,28 +101,25 @@ def _write(tmp_path: Path, d: dict[str, Any]) -> Path:
 # --- shipped files ----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", [CROW, TINY, MINI])
+@pytest.mark.parametrize("path", [CROW, TINY, MINI, V2])
 def test_shipped_configs_load(path: Path) -> None:
     cfg = load_dataset_config(path)
-    assert cfg.name in ("crow-300m-final", "tiny", "crow-300m-mini")
     assert cfg.stages and cfg.sources
-    assert cfg.block_size <= cfg.max_seq_length
 
 
 def test_mini_config_is_the_final_config_with_tiny_budgets() -> None:
     """
-    The real-source smoke config differs from the thesis config only in name and budgets.
+    The real-source smoke config differs from the thesis config only in its budgets.
     """
 
     final, mini = load_dataset_config(CROW), load_dataset_config(MINI)
-    assert mini.name == "crow-300m-mini"
     assert [s.tokens for s in mini.stages] == [300_000, 150_000, 60_000]
     assert [(s.name, s.train, s.val, s.transition_pct) for s in mini.stages] == [
         (s.name, s.train, s.val, s.transition_pct) for s in final.stages
     ]
     assert mini.sources == final.sources and mini.tokenizer == final.tokenizer
-    assert (mini.processing, mini.max_seq_length, mini.block_size, mini.token_count, mini.validation_fraction) == (
-        final.processing, final.max_seq_length, final.block_size, final.token_count, final.validation_fraction
+    assert (mini.processing, mini.dataset_max_sequence_length, mini.token_count, mini.validation_fraction) == (
+        final.processing, final.dataset_max_sequence_length, final.token_count, final.validation_fraction
     )
 
 
@@ -136,7 +133,8 @@ def test_crow_config_matches_thesis_run() -> None:
     assert cfg.stages[2].train == FINETUNE_SHARES and cfg.stages[2].val == FINETUNE_SHARES
     assert all(cfg.sources[name].input_inversions == 0.05 for name in _sources_of_kind(cfg, "instruct"))
     assert all(cfg.sources[name].input_inversions == 0.0 for name in _sources_of_kind(cfg, "pretrain"))
-    assert (cfg.token_count, cfg.max_seq_length, cfg.block_size, cfg.validation_fraction) == ("tokenizer", 2048, 2048, 0.05)
+    assert (cfg.token_count, cfg.training_target_sequence_length, cfg.dataset_max_sequence_length) == ("tokenizer", 2048, 16384)
+    assert cfg.validation_fraction == 0.05
     assert cfg.processing.dedup.mode == "exact" and cfg.processing.dedup.bloom_memory_mb == 1024
     assert not cfg.processing.quality_filter and not cfg.processing.decontamination.enabled
     assert all(s.revision for s in cfg.sources.values()), "every Hub source must pin a revision"
@@ -151,7 +149,7 @@ def test_tiny_config_is_synthetic_only() -> None:
     cfg = load_dataset_config(TINY)
     assert cfg.tokenizer.kind == "synthetic"
     assert {s.loader for s in cfg.sources.values()} == {"synthetic"}
-    assert (cfg.max_seq_length, cfg.block_size) == (256, 256)
+    assert cfg.dataset_max_sequence_length == 256
     assert set(cfg.sources) == {"synthetic_pretrain", "synthetic_instruct"}
     assert cfg.sources["synthetic_instruct"].input_inversions == 0.1
     assert all(cfg.used_in_train(n) and cfg.used_in_val(n) for n in cfg.sources)
@@ -159,20 +157,19 @@ def test_tiny_config_is_synthetic_only() -> None:
 
 
 def test_overrides_apply_to_nested_keys() -> None:
-    cfg = load_dataset_config(TINY, ["--max_seq_length", "512", "--processing.dedup.mode", "none"])
-    assert cfg.max_seq_length == 512 and cfg.processing.dedup.mode == "none"
+    cfg = load_dataset_config(TINY, ["--dataset_max_sequence_length", "512", "--processing.dedup.mode", "none"])
+    assert cfg.dataset_max_sequence_length == 512 and cfg.processing.dedup.mode == "none"
 
 
 def test_load_from_written_yaml(tmp_path: Path) -> None:
     cfg = load_dataset_config(_write(tmp_path, _minimal()))
-    assert cfg.sources["hold"].rows == 10 and cfg.stages[1].train == {"ins": 1.0} and cfg.block_size == 64
+    assert cfg.sources["hold"].rows == 10 and cfg.stages[1].train == {"ins": 1.0}
 
 
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
         (lambda d: d["sources"]["hold"].update({"kind": "validation"}), r"Literal\['pretrain', 'instruct'\]"),
-        (lambda d: d.pop("block_size"), r"required: block_size"),
         (lambda d: d.update({"bogus": 1}), r"d\.yaml: Option 'bogus' is not accepted$"),
     ],
 )
@@ -204,9 +201,9 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["stages"][0]["train"].update({"pre": 2.0, "ins": -1.0}), "weights must be > 0"),
         (lambda d: d["stages"][0]["train"].update({"pre": 0.5, "nope": 0.5}), "unknown source 'nope'"),
         (lambda d: d["stages"][0].update({"val": {"pre/validation": 0.5, "hold": 0.5}}), "unknown source 'pre/validation'"),
-        (lambda d: d.update({"block_size": 0}), "block_size must be positive"),
-        (lambda d: d.update({"block_size": 4096}), r"block_size \(4096\) must be <= max_seq_length \(2048\)"),
-        (lambda d: d.update({"max_seq_length": 0}), "max_seq_length"),
+        (lambda d: d.update({"dataset_max_sequence_length": 0}), "dataset_max_sequence_length"),
+        (lambda d: d.update({"training_target_sequence_length": 0}), "training_target_sequence_length"),
+        (lambda d: d.update({"training_target_sequence_length": 4096}), r"training_target_sequence_length \(4096\) must be positive and at most dataset_max_sequence_length \(2048\)"),
         (lambda d: d.update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d.update({"validation_fraction": -0.1}), r"validation_fraction must be in \[0, 1\)"),
         (lambda d: d["sources"]["pre"].update({"validation_fraction": 1.0}), r"validation_fraction must be in \[0, 1\)"),
@@ -231,7 +228,6 @@ def test_minimal_is_valid() -> None:
         (lambda d: d["sources"]["pre"].update({"loader": "local"}), "requires path"),
         (lambda d: d["stages"].append(dict(d["stages"][0])), "unique"),
         (lambda d: d["stages"].clear(), "at least one stage"),
-        (lambda d: d.update({"name": "a/b"}), "path component"),
         (lambda d: d["stages"][0].update({"tokens": 0}), "tokens must be positive"),
         (lambda d: d["stages"][0].update({"transition_pct": 1.0}), "transition_pct"),
         (lambda d: d["stages"][0].update({"train": {}}), "must not be empty"),
@@ -316,10 +312,38 @@ def test_processing_validation() -> None:
     assert ProcessingConfig(min_chars=0).min_chars == 0
 
 
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"ngram": 0}, "decontamination.ngram must be positive"),
+        ({"threshold": -0.1}, r"decontamination.threshold must be in \[0, 1\]"),
+        ({"threshold": 1.5}, r"decontamination.threshold must be in \[0, 1\]"),
+    ],
+)
+def test_decontamination_validation(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        dc.DecontaminationConfig(**kwargs)
+    assert (dc.DecontaminationConfig(threshold=0.0).threshold, dc.DecontaminationConfig(threshold=1.0).threshold) == (0.0, 1.0)
+
+
 def test_weights_tolerate_float_noise() -> None:
     d = _minimal()
     d["stages"][0]["train"] = {"pre": 0.1 + 0.2 + 0.7}  # 1.0000000000000002
     _build(d)
+
+
+@pytest.mark.parametrize("weight", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_weights_are_refused(weight: float) -> None:
+    """
+    A NaN weight used to pass both remaining checks - every comparison against NaN is False, so neither `> 0` nor
+    the sum fires - and then dropped its source out of the training mixture silently (`_pick_source` compares
+    deficits, and a NaN deficit is never the largest). YAML spells it `.nan`, so it is one typo away.
+    """
+
+    d = _minimal()
+    d["stages"][0]["train"] = {"pre": weight, "ins": 1.0}
+    with pytest.raises(ValueError, match=r"weights must be finite numbers, got \['pre'\]"):
+        _build(d)
 
 
 # --- source usage, split, budgets -------------------------------------------------------------------------------------
@@ -359,7 +383,7 @@ def test_validation_fraction_of() -> None:
     assert cfg.validation_fraction_of("hold") == 0.0 and cfg.validation_fraction_of("only_train") == 0.0
 
 
-def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -> None:
+def test_token_budget_is_the_weight_schedule_integral() -> None:
     """
     One continuous stream per source: the budgets of stages sharing a source ADD UP (they used to be maximised
     when every stage re-read the source from the top).
@@ -370,16 +394,32 @@ def test_sequence_budget_is_the_weight_schedule_integral_in_block_size_units() -
     d["stages"][0]["train"] = {"pre": 0.6, "pre2": 0.4}
     d["stages"][1] = {"name": "s2", "tokens": 4000, "train": {"pre": 0.1, "pre2": 0.9}, "val": {"pre": 1.0}}
     d["stages"].append({"name": "s3", "tokens": 500, "train": {"ins": 1.0}, "val": {"ins": 1.0}})
-    cfg = _build(d)  # block_size 64; no transitions: the integral is the plain sum of stage.tokens × weight
-    assert cfg.sequence_budget("pre") == ceil((1000 * 0.6 + 4000 * 0.1) / 64) == 16
-    assert cfg.sequence_budget("pre2") == ceil((1000 * 0.4 + 4000 * 0.9) / 64) == 63
-    assert cfg.sequence_budget("ins") == 8  # ceil(500 / 64)
-    assert cfg.sequence_budget("hold") == 0  # validation only: `rows` says how many to download
-    d["block_size"] = 32
-    assert _build(d).sequence_budget("pre2") == 125  # ceil(4000 / 32)
+    cfg = _build(d)  # no transitions: the integral is the plain sum of stage.tokens × weight
+    assert cfg.token_budget("pre") == 1000 * 0.6 + 4000 * 0.1 == 1000
+    assert cfg.token_budget("pre2") == 1000 * 0.4 + 4000 * 0.9 == 4000
+    assert cfg.token_budget("ins") == 500
+    assert cfg.token_budget("hold") == 0  # validation only: `rows` says how many to deliver
 
 
-def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
+def test_rows_budget_divides_by_the_tokens_per_row_rate_clamped_at_the_training_length() -> None:
+    """
+    The rate is the source's `describe_tokens_per_row` estimate (500 by default) until a measured mean is given,
+    never more than the run's training length (the dataset length when no run is known): a longer row is cut there.
+    """
+
+    d = _minimal()
+    cfg = _build(d)  # target 64, the estimate is 64 too
+    assert cfg.tokens_per_row_rate("pre") == 64 and cfg.rows_budget("pre") == ceil(1000 / 64) == 16
+    assert cfg.rows_budget("ins") == 8 and cfg.rows_budget("hold") == 0
+    assert cfg.tokens_per_row_rate("pre", 100.0) == 64 and cfg.rows_budget("pre", 100.0) == 16  # measured above the cut: clamped too
+    assert cfg.tokens_per_row_rate("pre", 20.0) == 20 and cfg.rows_budget("pre", 20.0) == 50  # measured below: the budget takes more rows
+    d["sources"]["pre"]["describe_tokens_per_row"] = 40
+    assert _build(d).rows_budget("pre") == 25  # the estimate below the cut counts as given
+    d["training_target_sequence_length"] = 32
+    assert _build(d).rows_budget("pre") == 32 and _build(d).rows_budget("pre", 40.0) == 32  # ceil(1000 / 32)
+
+
+def test_token_budget_transition_windows_contribute_the_trapezoid() -> None:
     """
     Inside a transition the weights are linearly interpolated, so the window's integral is the trapezoid
     transition tokens × (weight + next stage's weight) / 2: a source leaving ramps out, one entering ramps in.
@@ -388,25 +428,28 @@ def test_sequence_budget_transition_windows_contribute_the_trapezoid() -> None:
     d = _minimal()
     d["stages"][0]["transition_pct"] = 0.2  # transition window: 1000 × 0.2 = 200 tokens at the end of s1
     cfg = _build(d)
-    assert cfg.sequence_budget("pre") == ceil((800 * 1.0 + 200 * (1.0 + 0.0) / 2) / 64) == 15  # ramps out over s1's end
-    assert cfg.sequence_budget("ins") == ceil((200 * (0.0 + 1.0) / 2 + 500 * 1.0) / 64) == 10  # ramps in over the same window
+    assert cfg.token_budget("pre") == 800 * 1.0 + 200 * (1.0 + 0.0) / 2 == 900  # ramps out over s1's end
+    assert cfg.token_budget("ins") == 200 * (0.0 + 1.0) / 2 + 500 * 1.0 == 600  # ramps in over the same window
 
 
-def test_sequence_budget_of_the_crow_config() -> None:
+def test_token_budget_of_the_crow_config() -> None:
     cfg = load_dataset_config(CROW)
     # fineweb_edu: 3.3B × (0.9 × 0.65 + 0.1 × (0.65 + 0.35)/2) + 1.5B × (0.9 × 0.35 + 0.1 × (0.35 + 0)/2) = 2 594.25M tokens
-    assert cfg.sequence_budget("fineweb_edu") == -(-2_594_250_000 // 2048) == 1_266_724
+    assert cfg.token_budget("fineweb_edu") == 2_594_250_000
+    assert cfg.rows_budget("fineweb_edu") == -(-2_594_250_000 // 2000) == 1_297_125  # at the config's 2000 tokens/row
     # gsm8k (phase 2 only): ramp-in 3.3B × 0.1 × 0.022/2 + phase 2 1.5B × (0.9 × 0.022 + 0.1 × 0.022/2) = 34.98M tokens
-    assert cfg.sequence_budget("gsm8k") == -(-34_980_000 // 2048) == 17_081
+    assert cfg.token_budget("gsm8k") == 34_980_000
     # flan (finetune only; no transition out of the last stage): ramp-in 1.5B × 0.1 × 0.40/2 + 150M × 0.40 = 90M tokens
-    assert cfg.sequence_budget("flan") == -(-90_000_000 // 2048) == 43_946
+    assert cfg.token_budget("flan") == 90_000_000
+    assert cfg.rows_budget("flan") == -(-90_000_000 // 300) == 300_000
 
 
 def test_rows_needed_counts_the_margin_and_the_split() -> None:
     cfg = _build(_minimal())
-    assert cfg.rows_needed("pre") == 21  # ceil(1000/64) = 16 sequences; × 1.2 ÷ (1 − 0.05) = 20.2 -> 21
-    assert cfg.rows_needed("ins") == 11  # ceil(500/64) = 8 sequences; × 1.2 ÷ 0.95 = 10.1 -> 11
-    assert cfg.rows_needed("hold") == 10  # validation-only: its `rows`
+    assert cfg.rows_needed("pre") == 20  # 1000 tokens ÷ 64 per row = 15.625 rows; × 1.2 ÷ (1 − 0.05) = 19.7 -> 20 (no rounding in between)
+    assert cfg.rows_needed("ins") == 10  # 500 ÷ 64 = 7.8125 rows; × 1.2 ÷ 0.95 = 9.87 -> 10
+    assert cfg.rows_needed("pre", 32.0) == 40  # a measured 32 tokens per row: 31.25 rows × 1.2 ÷ 0.95 = 39.5 -> 40
+    assert cfg.rows_needed("hold") == 12 and cfg.rows_sufficient("hold") == 10  # validation-only: its `rows` survive the build, × 1.2 downloaded
 
 
 # --- the shuffled-build row cap ---------------------------------------------------------------------------------------
@@ -414,8 +457,8 @@ def test_rows_needed_counts_the_margin_and_the_split() -> None:
 
 def _over_the_cap_tokens() -> int:
     """
-    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (block_size 64, split 0.05):
-    ceil(80e6 / 64) = 1,250,000 sequences; × 1.2 ÷ 0.95 = 1,578,948 rows.
+    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (64 tokens per row, split 0.05):
+    ceil(80e6 / 64) = 1,250,000 rows; × 1.2 ÷ 0.95 = 1,578,948 rows.
     """
 
     return 80_000_000
@@ -448,17 +491,72 @@ def test_the_build_cap_spares_small_shuffled_and_huge_unshuffled_sources(tmp_pat
     assert _build(huge_unshuffled).rows_needed("pre") == 1_578_948
 
 
+def test_check_all_at_once_rows_says_what_helps_at_the_build() -> None:
+    """
+    The build re-checks the two limits on the rows really on disk (`lib/stages/build.py`), which the load-time
+    estimate can undershoot. Same limits, same first sentence; splitting the source no longer helps once the rows
+    are downloaded, so only the remedy differs.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"]["shuffle"] = True
+    cfg = _build(d)  # under the caps at load: the planned requirement is 21 rows
+    rows = dc.SHUFFLED_BUILD_MAX_ROWS + 1
+    cfg.check_all_at_once_rows("pre", dc.SHUFFLED_BUILD_MAX_ROWS, at_build=True)  # exactly at the limit still builds
+    messages = []
+    for at_build in (False, True):
+        with pytest.raises(ValueError) as error:
+            cfg.check_all_at_once_rows("pre", rows, at_build=at_build)
+        messages.append(str(error.value))
+    first_sentence = "pre: shuffle=true builds all-at-once in memory; 1,000,001 rows exceed the limit of 1,000,000. "
+    assert all(message.startswith(first_sentence) for message in messages)
+    assert messages[0].endswith("Split the source or turn shuffle off. (A read-time shuffle that would lift this limit is not implemented.)")
+    assert messages[1].endswith(
+        "The raw folder already holds these rows, so lower the token budget and delete raw/pre, or turn shuffle off. "
+        "(A read-time shuffle that would lift this limit is not implemented.)"
+    )
+    minhash = _build({**d, "sources": {**d["sources"], "pre": {**d["sources"]["pre"], "processing": {"dedup": {"mode": "minhash"}}, "shuffle": False}}})
+    with pytest.raises(ValueError, match=re.escape(
+        "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 250,001 rows "
+        "exceed the limit of 250,000. The raw folder already holds these rows, so lower the token budget and "
+        "delete raw/pre, or use dedup.mode=exact."
+    )):
+        minhash.check_all_at_once_rows("pre", dc.MINHASH_BUILD_MAX_ROWS + 1, at_build=True)
+
+
 def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> None:
     instruct = _minimal()
     instruct["stages"][1]["tokens"] = _over_the_cap_tokens()  # `ins` never sets shuffle; instruct defaults to True
     with pytest.raises(ValueError, match="ins: shuffle=true builds all-at-once"):
         _build(instruct)
     val_only = _minimal()
-    val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows`
-    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,000,000 rows"):
+    val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows` (× the download margin)
+    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,400,000 rows"):
         _build(val_only)
     val_only["sources"]["hold"]["rows"] = 10
-    assert _build(val_only).rows_needed("hold") == 10
+    assert _build(val_only).rows_needed("hold") == 12
+
+
+def test_a_minhash_source_over_its_lower_build_cap_is_refused_at_load(tmp_path: Path) -> None:
+    """
+    `dedup.mode: minhash` builds all-at-once too and holds an LSH index of every kept row on top, so its cap is
+    lower than the shuffle cap; the same rows under exact dedup stream per shard and load fine.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
+    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 rows; × 1.2 ÷ 0.95 = 394,737: under the shuffle cap
+    with pytest.raises(ValueError, match=re.escape(
+        "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 394,737 rows exceed "
+        "the limit of 250,000. Use dedup.mode=exact or a smaller source."
+    )):
+        load_dataset_config(_write(tmp_path, d))
+    assert dc.MINHASH_BUILD_MAX_ROWS == 250_000 < dc.SHUFFLED_BUILD_MAX_ROWS
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "exact"}}
+    assert _build(d).rows_needed("pre") == 394_737
+    d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
+    d["stages"][0]["tokens"] = 1000
+    assert _build(d).source_processing("pre").dedup.mode == "minhash"
 
 
 def test_source_processing_override() -> None:
@@ -473,88 +571,60 @@ def test_source_processing_override() -> None:
 
 # --- hashes -----------------------------------------------------------------------------------------------------------
 
-# The hashes of the shipped configs, recorded 2026-09-02 (every value hashed, `config_hash` composed). They key data on disk: every folder under `dataset/`
-# carries the `raw_hash` / `processed_hash` of the source that produced it (raw folders are the bandwidth-expensive
-# part, terabytes on the author's machine, and a mismatch makes one stale, i.e. re-downloaded after confirmation),
-# and `config_hash` is what a training checkpoint stores to detect a resume against different data. Refactoring *how*
-# the hashes are derived must keep every value below byte-identical; only a deliberate change of *what* a hash counts
-# may re-record them, in a commit that says so and accepts that the data on disk are invalidated.
+# The hashes of the shipped configs, re-recorded 2026-09-07 (the tokenizer and token_count moved from the raw hash
+# to the processed hash, split / text_field count only where a loader reads them, instruct sources hash the dedup
+# block alone). They key data on disk: every folder under `dataset/` carries the `raw_hash` / `processed_hash` of
+# the source that produced it (raw folders are the bandwidth-expensive part, terabytes on the author's machine, and
+# a mismatch makes one stale, i.e. re-downloaded after confirmation), and `config_hash` is what a training checkpoint
+# stores to detect a resume against different data. Refactoring *how* the hashes are derived must keep every value
+# below byte-identical; only a deliberate change of *what* a hash counts may re-record them, in a commit that says so
+# and accepts that the data on disk are invalidated.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "4ff8d9e0eed79b78",
+        "config": "086e3cbcd55d23a5",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
-            "synthetic_pretrain": ("5f2929b477b8deb5", "bfa35901f2819b63"),
-            "synthetic_instruct": ("dc511fc028e085bb", "912472435e0be71b"),
+            "synthetic_pretrain": ("17d1b52ca471d587", "7eeb11a1b3e52a08"),
+            "synthetic_instruct": ("56011107fbf9f026", "b9ea28f7af1497fe"),
         },
     },
     "crow_300m_final": {
-        "config": "dc785383e72873de",
+        "config": "35de247a7878e845",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
-            "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
-            "wikipedia": ("88792981bda37dc3", "611b044b1fc6f263"),
-            "books_gutenberg": ("6a38441c92e29847", "d23074531dae2a38"),
-            "peso": ("02767a775fd39aea", "c1dc0a6a64ca2b01"),
-            "arxiv": ("872950d929a0419e", "9a187f913e4267a7"),
-            "openwebmath": ("01346e609ae41dbf", "19ff09b05eb611e8"),
-            "tinygsm": ("5890d3380e601cfb", "078f30f5310e7d7e"),
-            "algebraic_stack": ("b1bc1bd5ac357c91", "44231c53d8156c90"),
-            "gsm8k": ("8d022aec0b13b57c", "aeee0376c7d21b16"),
-            "github_code_clean_python": ("d578e5af298ab586", "867b71889c0d2d17"),
-            "github_code_clean_javascript": ("ca3f108e57fdaa39", "d80e68baa3207e82"),
-            "github_code_clean_typescript": ("a646e3a0ec7042fc", "287ccd66625cfacf"),
-            "github_code_clean_java": ("292ca4dc2e2e9282", "4145226c073feda7"),
-            "github_code_clean_cpp": ("0c323a907842a5e1", "b5e8cadeb60080b4"),
-            "github_code_clean_go": ("583b43c5436a549f", "2cce2f77543cacd0"),
-            "github_code_clean_rust": ("c3476032d04b705b", "3bd1c5179c7af8d2"),
-            "github_code_clean_shell": ("01a88a4b67a21a00", "bd59d88a8d4820c7"),
-            "github_code_clean_sql": ("ad7f5ec861a64545", "e4e1f0b71e1f711d"),
-            "github_code_clean_html": ("9e29794cf68713b8", "1b2211db55976677"),
-            "flan": ("cc1ec9b51a98377a", "054794a2f61aa59d"),
-            "metamath": ("6cf32456d23bd938", "aab70ac36319c077"),
-            "orca_math": ("1f81ec18662555dc", "eab5870c4bc2262d"),
-            "evol_code": ("9b22c4d3257240e6", "95f6c2bed184cf10"),
-            "code_alpaca": ("978b6b4fa5f41aca", "81945b40b5c594e4"),
-            "slimorca": ("b72f0e452b19d77d", "a463705d333284f3"),
-            "sharegpt": ("ec66c69c067d1279", "dcefdbdabbd56bfd"),
-            "wizardlm": ("22478e9186080536", "7f5d471283a10980"),
-        },
-    },
-    "crow_300m_mini": {
-        "config": "e1dd176c640cd5fe",
-        "tokenizer": "568e606fb9a422a5",
-        "sources": {
-            "fineweb_edu": ("1d7f7e8fd78c3886", "1a6ea90b075d6281"),
-            "wikipedia": ("88792981bda37dc3", "611b044b1fc6f263"),
-            "books_gutenberg": ("6a38441c92e29847", "d23074531dae2a38"),
-            "peso": ("02767a775fd39aea", "c1dc0a6a64ca2b01"),
-            "arxiv": ("872950d929a0419e", "9a187f913e4267a7"),
-            "openwebmath": ("01346e609ae41dbf", "19ff09b05eb611e8"),
-            "tinygsm": ("5890d3380e601cfb", "078f30f5310e7d7e"),
-            "algebraic_stack": ("b1bc1bd5ac357c91", "44231c53d8156c90"),
-            "gsm8k": ("8d022aec0b13b57c", "aeee0376c7d21b16"),
-            "github_code_clean_python": ("d578e5af298ab586", "867b71889c0d2d17"),
-            "github_code_clean_javascript": ("ca3f108e57fdaa39", "d80e68baa3207e82"),
-            "github_code_clean_typescript": ("a646e3a0ec7042fc", "287ccd66625cfacf"),
-            "github_code_clean_java": ("292ca4dc2e2e9282", "4145226c073feda7"),
-            "github_code_clean_cpp": ("0c323a907842a5e1", "b5e8cadeb60080b4"),
-            "github_code_clean_go": ("583b43c5436a549f", "2cce2f77543cacd0"),
-            "github_code_clean_rust": ("c3476032d04b705b", "3bd1c5179c7af8d2"),
-            "github_code_clean_shell": ("01a88a4b67a21a00", "bd59d88a8d4820c7"),
-            "github_code_clean_sql": ("ad7f5ec861a64545", "e4e1f0b71e1f711d"),
-            "github_code_clean_html": ("9e29794cf68713b8", "1b2211db55976677"),
-            "flan": ("cc1ec9b51a98377a", "054794a2f61aa59d"),
-            "metamath": ("6cf32456d23bd938", "aab70ac36319c077"),
-            "orca_math": ("1f81ec18662555dc", "eab5870c4bc2262d"),
-            "evol_code": ("9b22c4d3257240e6", "95f6c2bed184cf10"),
-            "code_alpaca": ("978b6b4fa5f41aca", "81945b40b5c594e4"),
-            "slimorca": ("b72f0e452b19d77d", "a463705d333284f3"),
-            "sharegpt": ("ec66c69c067d1279", "dcefdbdabbd56bfd"),
-            "wizardlm": ("22478e9186080536", "7f5d471283a10980"),
+            "fineweb_edu": ("9ff1cc2140a2b822", "ca1ab0beb98b43f7"),
+            "wikipedia": ("61e02e58f73be556", "cd387115bdf571c1"),
+            "books_gutenberg": ("74752e56358338db", "38c0da7d2237c732"),
+            "peso": ("027b6b0e07453405", "14615651c954450c"),
+            "arxiv": ("fdc556e8e7691bc1", "020ba0f1aeb71a55"),
+            "openwebmath": ("5bf655cea455bd69", "f7cafb657abd82c9"),
+            "tinygsm": ("13b313346343ec80", "59df3ce1090be4b7"),
+            "algebraic_stack": ("2b6cb00c561aef48", "3ee15d1db880b1b9"),
+            "gsm8k": ("968ddd882174e779", "03dd0e63dd5e1d45"),
+            "github_code_clean_python": ("8b2f34fa8f8fd6c1", "aacda6eb3eac10b5"),
+            "github_code_clean_javascript": ("fa1709c52ddffabe", "6716d51439cf0451"),
+            "github_code_clean_typescript": ("56211d7ec191935b", "58e95f0dc34b7ea3"),
+            "github_code_clean_java": ("d0287981275b84de", "fe416a2f8b88fd57"),
+            "github_code_clean_cpp": ("e6f44b73060bc948", "c54fbdc26d497826"),
+            "github_code_clean_go": ("957869561c65f50c", "fb5bfaa4a1741797"),
+            "github_code_clean_rust": ("d655b756494e1295", "0aa715b1b3dd1418"),
+            "github_code_clean_shell": ("06c3e2f62b5481c7", "d19072a55c1b70e9"),
+            "github_code_clean_sql": ("890f39eabba63e8a", "3785a8bae1fa1922"),
+            "github_code_clean_html": ("00e33acbdcfd3f11", "3978d8f25cd4261d"),
+            "flan": ("6d7a9f3f3bc1b8bc", "e74eddc0a7c705b9"),
+            "metamath": ("30b30fcdd9878afb", "4a3fc55288cfdde9"),
+            "orca_math": ("381878828be6e63e", "b96faabbf8e755a2"),
+            "evol_code": ("cb646fa51c648585", "d39756fbe8890177"),
+            "code_alpaca": ("ab159c3c08e77fd9", "382c34ee68619be9"),
+            "slimorca": ("b18dbd772a5a446e", "9f81da060897f48f"),
+            "sharegpt": ("da3c0a21cdeef944", "f504645e2fbb2aa5"),
+            "wizardlm": ("2350f2ca1c56dce9", "25d3f26f05f3359f"),
         },
     },
 }
+# The mini and the v2 config are the final config's sources with other budgets: the same raw and processed hashes.
+PINNED_HASHES["crow_300m_mini"] = {"config": "ad36dd19cd915340", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["v2_50M_tokens"] = {"config": "ef5b0671149a5938", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
 
 
 @pytest.mark.parametrize("name", list(PINNED_HASHES))
@@ -642,8 +712,9 @@ def test_hash_payload_hashes_every_counted_value_recursively() -> None:
     src = SourceConfig(kind="pretrain", loader="hf_files", hf_id="x/y", load_kwargs={"data_files": "*.parquet"})
     assert dc.hash_payload(src, "raw") == {
         "kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "revision": None, "load_kwargs": {"data_files": "*.parquet"},
-        "split": "train", "text_field": "text", "language": None, "path": None, "converter": None, "fields": None, "filter": None,
-    }  # fmt: skip
+        "text_field": "text", "language": None, "path": None, "converter": None, "fields": None, "filter": None,
+    }, "no split: hf_files never reads it"  # fmt: skip
+    assert dc.hash_payload(TokenizerConfig(name="t", kind="synthetic"), "tokenizer") == {"name": "t", "kind": "synthetic", "hf_id": None, "revision": None}
 
 
 def test_changing_a_default_changes_the_processed_hash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -668,8 +739,8 @@ def test_hash_payload_selects_by_annotation() -> None:
     src = SourceConfig(kind="instruct", loader="hf_stream", hf_id="x/y", fields={"instruction": "a", "output": "b"},
                        check_limit=5, rows=None, seed=7, input_inversions=0.5, describe_tokens_per_row=9)  # fmt: skip
     assert set(dc.hash_payload(src, "raw")) == {
-        "kind", "loader", "hf_id", "revision", "load_kwargs", "split", "text_field", "language", "path", "converter", "fields", "filter",
-    }  # fmt: skip
+        "kind", "loader", "hf_id", "revision", "load_kwargs", "split", "language", "path", "converter", "fields", "filter",
+    }, "split: hf_stream reads it; text_field: an instruct row never does"  # fmt: skip
     assert dc.hash_payload(src, "processed") == {"processing": None, "seed": 7, "input_inversions": 0.5, "shuffle": None}  # seed: not the synthetic loader
     assert dc.hash_payload(src, "config") == {"check_limit": 5, "rows": None, "validation_fraction": None}, "never `describe_tokens_per_row`"
 
@@ -748,10 +819,11 @@ def test_the_processing_payload_keeps_only_the_active_dedup_mode() -> None:
     assert payload(ProcessingConfig(dedup=DedupConfig(mode="none", normalize=False)))["dedup"] == {"mode": "none"}  # nothing is hashed
 
 
-def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
+def test_raw_hash_only_tracks_the_loader_identity() -> None:
     """
-    The raw shards are the bandwidth-expensive part: nothing but a real change of the source, or of how its
-    stored token counts are made, may invalidate them.
+    The raw shards are the bandwidth-expensive part: nothing but a real change of which rows the loader yields
+    may invalidate them. The tokenizer and token_count only make the stored counts; the raw manifest records them
+    itself and a change is offered as a choice (`inspect_raw`: tokenizer_changed), never a re-download.
     """
 
     base = _build(_minimal())
@@ -759,16 +831,18 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
 
     unchanged: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("tokens", 999_999),  # budget: same rows on disk
-        lambda d: d.__setitem__("block_size", 32),  # sequence budget only
         lambda d: d["sources"]["pre"].__setitem__("describe_tokens_per_row", 3),  # describe only
         lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),  # processing → processed only
         lambda d: d["sources"]["pre"].__setitem__("processing", {"dedup": {"mode": "minhash"}}),
         lambda d: d.__setitem__("processing", {"quality_filter": True, "decontamination": {"enabled": True}}),
-        lambda d: d.__setitem__("max_seq_length", 64),  # the raw manifest records the truncation cap itself
+        lambda d: d.__setitem__("dataset_max_sequence_length", 64),  # the raw manifest records the truncation cap itself
         lambda d: d.__setitem__("validation_fraction", 0.2),  # training-time split
         lambda d: d["sources"]["pre"].__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),  # processed order only
         lambda d: d["sources"]["pre"].__setitem__("check_limit", 5),  # bounds how far to read, not what is read
+        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # counts, not rows
+        lambda d: d.__setitem__("token_count", "estimate"),
+        lambda d: d["sources"]["pre"].__setitem__("split", "test"),  # the synthetic loader never reads it
     ]
     for change in unchanged:
         d = _minimal()
@@ -779,9 +853,6 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
         lambda d: d["sources"]["pre"].__setitem__("seed", 5),
         lambda d: d["sources"]["pre"].__setitem__("text_field", "body"),
         lambda d: d["sources"]["pre"].__setitem__("converter", "gsm8k_question_answer"),
-        lambda d: d["sources"]["pre"].__setitem__("split", "test"),
-        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # stored counts
-        lambda d: d.__setitem__("token_count", "estimate"),
     ]
     for change in invalidating:
         d = _minimal()
@@ -794,6 +865,17 @@ def test_raw_hash_only_tracks_the_loader_identity_and_token_counting() -> None:
     d = _minimal()
     d["sources"]["ins"]["input_inversions"] = 0.5  # applied by the build
     assert _build(d).raw_hash("ins") == base.raw_hash("ins")
+    d["sources"]["ins"]["split"] = "test"  # hf_stream reads the split
+    assert _build(d).raw_hash("ins") != base.raw_hash("ins")
+
+    # split counts exactly for the loaders that read a Hub split
+    d = _minimal()
+    d["sources"]["files"] = {"kind": "pretrain", "loader": "hf_files", "hf_id": "x/y", "load_kwargs": {"data_files": "*.parquet"}}
+    d["sources"]["rows"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "x/y"}
+    d["stages"][0]["train"] = {"pre": 0.5, "files": 0.25, "rows": 0.25}
+    files, rows = _build(d).raw_hash("files"), _build(d).raw_hash("rows")
+    d["sources"]["files"]["split"] = d["sources"]["rows"]["split"] = "test"
+    assert _build(d).raw_hash("files") == files and _build(d).raw_hash("rows") != rows
 
 
 def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() -> None:
@@ -803,7 +885,6 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
 
     unchanged: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("tokens", 999_999),
-        lambda d: d.__setitem__("block_size", 32),
         lambda d: d["sources"]["pre"].__setitem__("describe_tokens_per_row", 3),
         lambda d: d.__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["pre"].__setitem__("validation_fraction", 0.2),
@@ -817,7 +898,7 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         assert _build(d).processed_hash("pre") == h, change
 
     invalidating: list[Mutation] = [
-        lambda d: d.__setitem__("max_seq_length", 64),
+        lambda d: d.__setitem__("dataset_max_sequence_length", 64),
         lambda d: d["sources"]["pre"].__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"min_chars": 99}),
         lambda d: d.__setitem__("processing", {"dedup": {"normalize": False}}),
@@ -826,13 +907,29 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
         lambda d: d.__setitem__("processing", {"quality_filter": True}),
         lambda d: d["sources"]["pre"].__setitem__("shuffle", True),
         lambda d: d["sources"]["pre"].__setitem__("seed", 5),  # through raw_hash
-        lambda d: d.__setitem__("token_count", "estimate"),  # through raw_hash
-        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),  # through raw_hash
+        lambda d: d.__setitem__("token_count", "estimate"),  # the tokens column the build clamps and training reads
+        lambda d: d.__setitem__("tokenizer", {"name": "other", "kind": "hf", "hf_id": "a/b"}),
+        lambda d: d.__setitem__("tokenizer", {"name": "synthetic", "kind": "synthetic", "revision": "x"}),  # the definition, not the name
     ]
     for change in invalidating:
         d = _minimal()
         change(d)
         assert _build(d).processed_hash("pre") != h, change
+
+    # instruct sources run exact dedup only: the pretrain-only passes never change their hash
+    ins = base.processed_hash("ins")
+    for change in (
+        lambda d: d.__setitem__("processing", {"min_chars": 99}),
+        lambda d: d.__setitem__("processing", {"quality_filter": True}),
+        lambda d: d.__setitem__("processing", {"decontamination": {"enabled": True}}),
+    ):
+        d = _minimal()
+        change(d)
+        assert _build(d).processed_hash("ins") == ins, change
+    d = _minimal()
+    d["processing"] = {"dedup": {"normalize": False}}
+    assert _build(d).processed_hash("ins") != ins
+    assert "benchmark_revisions" not in _build({**_minimal(), "processing": {"decontamination": {"enabled": True}}}).processed_hash_payload("ins")
 
     # minhash fields count once minhash is the active mode (set per pretrain source: instruct sources reject it)
     d = _minimal()
@@ -854,6 +951,27 @@ def test_processed_hash_tracks_cap_active_dedup_fields_inversions_and_shuffle() 
     assert _build(d).processed_hash("ins") == base.processed_hash("ins")
 
 
+def test_processed_hash_pins_the_benchmarks_only_with_decontamination_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    What a decontaminated folder was filtered against is the benchmarks at their pinned Hub commits: a re-pin
+    rebuilds it and leaves every folder without decontamination alone.
+    """
+
+    from data_preparation.lib.stages import benchmarks as bm
+
+    off = _build(_minimal()).processed_hash("pre")
+    d = _minimal()
+    d["processing"] = {"decontamination": {"enabled": True, "benchmarks": ["gsm8k_test"]}}
+    on = _build(d).processed_hash("pre")
+    assert on != off
+    monkeypatch.setitem(bm.BENCHMARKS, "gsm8k_test", bm.BENCHMARKS["gsm8k_test"]._replace(revision="0" * 40))
+    assert _build(d).processed_hash("pre") != on
+    assert _build(_minimal()).processed_hash("pre") == off
+    d["processing"]["decontamination"]["benchmarks"] = ["gsm8k_test", "nope"]
+    with pytest.raises(KeyError, match="unknown benchmark"):
+        _build(d).processed_hash("pre")
+
+
 def test_hash_payload_golden_defaults() -> None:
     """
     Every default is hashed as a value, so changing one re-labels every folder built under the old default.
@@ -873,7 +991,7 @@ def test_hash_payload_golden_defaults() -> None:
         "validation_fraction": None, "rows": None, "describe_tokens_per_row": 500,
     }  # fmt: skip
     cfg = _build(_minimal())
-    assert (cfg.max_seq_length, cfg.validation_fraction, cfg.token_count, cfg.always_range_requests) == (2048, 0.05, "tokenizer", True)
+    assert (cfg.dataset_max_sequence_length, cfg.validation_fraction, cfg.token_count, cfg.always_range_requests) == (2048, 0.05, "tokenizer", True)
     assert isinstance(dc.SAFETY_MARGIN, Fraction) and float(dc.SAFETY_MARGIN) == 1.2
 
 
@@ -884,11 +1002,52 @@ def test_tokenizer_hash() -> None:
     assert a.tokenizer_hash() != _build(d).tokenizer_hash() and len(a.tokenizer_hash()) == 16
 
 
+def test_hash_payloads_are_exactly_what_the_hashes_hash() -> None:
+    """
+    The manifests record the payload next to the hash so a mismatch can be explained; the two must not drift.
+    """
+
+    cfg = _build(_minimal())
+    for name in cfg.sources:
+        assert dc._stable_hash(cfg.raw_hash_payload(name)) == cfg.raw_hash(name)
+        assert dc._stable_hash(cfg.processed_hash_payload(name)) == cfg.processed_hash(name)
+        assert cfg.raw_hash_payload_of(cfg.sources[name]) == cfg.raw_hash_payload(name)
+    assert set(cfg.raw_hash_payload("pre")) == {"source"}
+    assert set(cfg.processed_hash_payload("pre")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing"}
+    assert set(cfg.processed_hash_payload("ins")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing", "input_inversions"}
+    assert cfg.processed_hash_payload("ins")["processing"] == {"dedup": {"mode": "exact", "normalize": True}}
+
+
+def test_describe_hash_change() -> None:
+    """
+    One short line per changed field, flattened dotted keys, JSON values; the two no-detail cases have one line.
+    """
+
+    stored = {"source": {"kind": "pretrain", "revision": "a", "load_kwargs": {"data_files": "x/*.parquet"}, "path": None}, "seed": 1}
+    current = {"source": {"kind": "pretrain", "revision": "b", "load_kwargs": {"data_files": "y/*.parquet"}, "fields": {"a": "b"}}, "seed": 1}
+    assert dc.describe_hash_change(stored, current) == [
+        'source.fields.a: (absent) -> "b"',
+        'source.load_kwargs.data_files: "x/*.parquet" -> "y/*.parquet"',
+        "source.path: null -> (absent)",
+        'source.revision: "a" -> "b"',
+    ]
+    assert dc.describe_hash_change(None, current) == ["(no field detail recorded)"]
+    assert dc.describe_hash_change(stored, stored) == ["(no recorded field differs: the hash rule changed)"]
+    # a payload from disk went through JSON: tuples, and a dedup block that shrank to its active fields
+    assert dc.describe_hash_change({"benchmarks": ["a", "b"]}, {"benchmarks": ("a", "b")}) == ["(no recorded field differs: the hash rule changed)"]
+    assert dc.describe_hash_change({"processing": {"dedup": {"mode": "exact", "normalize": True}}}, {"processing": {"dedup": {"mode": "none"}}}) == [
+        'processing.dedup.mode: "exact" -> "none"', "processing.dedup.normalize: true -> (absent)",
+    ]  # fmt: skip
+    cfg = _build(_minimal())
+    d = _minimal()
+    d["processing"] = {"dedup": {"normalize": False}}
+    assert dc.describe_hash_change(cfg.processed_hash_payload("ins"), _build(d).processed_hash_payload("ins")) == ["processing.dedup.normalize: true -> false"]
+
+
 def test_config_hash_changes_on_any_field() -> None:
     base = _build(_minimal()).config_hash()
     changes: list[Mutation] = [
         lambda d: d["stages"][0].__setitem__("transition_pct", 0.5),
-        lambda d: d.__setitem__("block_size", 32),
         lambda d: d.__setitem__("validation_fraction", 0.2),
         lambda d: d["sources"]["ins"].__setitem__("input_inversions", 0.5),
     ]
@@ -915,7 +1074,7 @@ def test_config_hash_ignores_fetch_and_describe_knobs() -> None:
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:
     names = {f.name for f in fields(DatasetConfig)}
-    assert {"name", "tokenizer", "sources", "stages", "block_size", "max_seq_length", "validation_fraction", "processing"} <= names
+    assert {"tokenizer", "sources", "stages", "dataset_max_sequence_length", "validation_fraction", "processing"} <= names
     assert "instruct_mixtures" not in names
     cfg = _build(_minimal())
     assert asdict(cfg)["sources"]["pre"]["kind"] == "pretrain"
@@ -935,3 +1094,32 @@ def test_overlap_warnings_for_validation_only_sources() -> None:
     d["sources"]["hold"].pop("rows")
     assert _build(d).overlap_warnings() == []
     assert dc._glob_prefix("data/CC-MAIN-2013-20/*.parquet") == "data/CC-MAIN-2013-20/" and dc._glob_prefix(None) == ""
+
+
+def test_overlap_warnings_only_for_sources_that_read_the_same_split() -> None:
+    """
+    A held-out `test` split of a repo trained on through its `train` split is disjoint by construction: the two
+    used to warn because only `hf_id` was compared. A `split` the loader never reads (`hf_files` and friends,
+    default "train") says nothing about the rows, so there it must not silence the warning either.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "org/repo", "split": "train"}
+    d["sources"]["hold"] = {"kind": "pretrain", "loader": "hf_split", "hf_id": "org/repo", "split": "test", "rows": 5}
+    assert _build(d).overlap_warnings() == []
+    d["sources"]["hold"]["split"] = "train"
+    (warning,) = _build(d).overlap_warnings()
+    assert "'hold'" in warning and "'pre'" in warning
+    d["sources"]["hold"]["split"] = "test"  # hf_files never looks at `split`: differing values are not a reason
+    for source in ("pre", "hold"):
+        d["sources"][source].update(loader="hf_files", load_kwargs={"data_files": "data/*.parquet"})
+    assert len(_build(d).overlap_warnings()) == 1
+
+
+def test_raw_hash_of_a_source_outside_the_config_matches_raw_hash() -> None:
+    cfg = load_dataset_config(TINY)
+    name = "synthetic_pretrain"
+    source = cfg.sources[name]
+    assert cfg.raw_hash_of(source) == cfg.raw_hash(name)
+    assert cfg.raw_hash_of(dataclasses.replace(source, seed=source.seed + 1)) != cfg.raw_hash(name)  # synthetic: seed is raw identity
+    assert cfg.raw_hash_of(dataclasses.replace(source, describe_tokens_per_row=7)) == cfg.raw_hash(name)  # not hashed

@@ -9,7 +9,8 @@ dependencies = [
   "torch>=2.7",
   "numpy<2.0",
   "pyarrow>=15",
-  "transformers>=4.45",
+  # transformers>=5.0: the HF wrapper declares `_tied_weights_keys` in the 5.x {target: source} mapping form
+  "transformers>=5.0",
   "tokenizers>=0.20",
   "safetensors>=0.4.3",
   "jsonargparse[signatures]>=4.49",
@@ -27,6 +28,10 @@ data = [
   "datasketch",
   "ijson>=3.5.1",
   "zstandard>=0.25.0",
+]
+# benchmark evaluation (evaluation/benchmarks.py)
+eval = [
+  "lm_eval[hf]>=0.4.8",  # [hf]: accelerate, which lm_eval.models.huggingface imports (the HFLM the benchmarks run on)
 ]
 
 [dependency-groups]
@@ -46,8 +51,8 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-addopts = "-q -n 4 --dist loadgroup"  # four workers: each imports torch and builds its own tiny dataset; -n 0 runs serially
-testpaths = ["model", "training", "data_preparation", "ui"]
+addopts = "-q -rs -n 8 --dist loadgroup"  # -rs names every skipped test and its reason; eight workers (about 3 GB each at peak, 3 cores each); -n 0 runs serially
+testpaths = ["model", "training", "data_preparation", "ui", "evaluation"]
 pythonpath = ["."]
 markers = [
   "gpu: needs a CUDA device (skipped otherwise)",
@@ -68,18 +73,18 @@ ignore = ["E501", "E731", "E741", "B008", "B905", "SIM108", "C408", "G004", "PLC
 
 [tool.mypy]
 python_version = "3.11"
-files = ["model", "training", "data_preparation", "ui", "conftest.py"]
+files = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["\\.venv/", "\\.claude/", "outputs/", "dataset/"]
 strict = true
 warn_unreachable = true
 # third-party packages without (complete) stubs
 [[tool.mypy.overrides]]
-module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*"]
+module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*", "lm_eval.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]
 pythonVersion = "3.11"
-include = ["model", "training", "data_preparation", "ui", "conftest.py"]
+include = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["**/__pycache__", ".venv", ".claude", "outputs", "dataset"]
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false

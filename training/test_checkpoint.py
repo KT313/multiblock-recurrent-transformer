@@ -4,6 +4,7 @@ Tests for the checkpoint schema (`CheckpointMetadata`), naming/search, the save 
 bit-identity and optimizer state.
 """
 
+import os
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from training.checkpoint import (
     SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME,
     CheckpointMetadata,
     _step_from_name,
+    check_param_groups_unchanged,
     check_settings_unchanged,
     checkpoint_dir,
     checkpoint_name,
@@ -48,6 +50,8 @@ def _settings(**overrides: object) -> Settings:
         "dataset_config": str(TINY_DATASET_CONFIG),
         "model_architecture_config": str(TINY_MODEL_ARCHITECTURE),
         "stage_base_lrs": [1e-3],
+        "tokens_per_micro_batch": 2048,
+        "micro_batches_per_step": 4,
     }
     return Settings(**(base | overrides))  # type: ignore[arg-type]  # heterogeneous kwargs for a test helper
 
@@ -61,7 +65,8 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
         "model_config": model.config.to_dict(),
         "dataset_config_hash": "abc123",
         "validation_rows": {"synthetic_pretrain": 3, "synthetic_instruct": 1},
-        "data_stream": {"consumed_rows": {"synthetic_pretrain": 12}, "draw_rng": (3, (1, 2), None)},
+        "source_rows": {"synthetic_pretrain": 87, "synthetic_instruct": 102},
+        "data_stream": {"consumed_rows": {"synthetic_pretrain": 12}, "pool_loaded": {"synthetic_pretrain": 700}},
     }
     return CheckpointMetadata(**(values | overrides))
 
@@ -73,12 +78,12 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
     metadata = _metadata(backend, tiny_model, step=7)
     state = metadata.to_state()
     assert set(state) == {
-        "step", "stage", "rng", "settings", "model_config", "dataset_config_hash", "validation_rows", "data_stream"
+        "step", "stage", "rng", "settings", "model_config", "dataset_config_hash", "validation_rows", "source_rows", "data_stream"
     }
     assert state["rng"] is metadata.rng  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
     assert restored == metadata
-    assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["block_size"] == 256
+    assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["model_max_sequence_length"] == 256
 
 
 def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
@@ -103,6 +108,7 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
         "model_config",
         "dataset_config_hash",
         "validation_rows",
+        "source_rows",
         "data_stream",
     ]
 
@@ -128,12 +134,40 @@ def test_checkpoint_path_names(tmp_path: Path) -> None:
     assert _step_from_name(checkpoint_path(tmp_path, "my-run", 14, stage_end=1)) == 14
 
 
+def test_failed_checkpoints_are_named_apart_and_never_win_a_plain_resume(tmp_path: Path) -> None:
+    """
+    The checkpoint a non-finite step leaves behind gets `-failed` appended, so it cannot overwrite the regular
+    checkpoint of the same step, and `find_latest_checkpoint` does not see it however new it is: its data stream is
+    already past the failed step's documents, so continuing from it is a decision made with
+    `resume_checkpoint_path`, not one a plain `resume: true` makes silently.
+    """
+
+    assert checkpoint_name(6, "tiny", failed=True) == "step-00000006-tiny-failed.pth"
+    assert checkpoint_name(6, "tiny", stage_end=0, failed=True) == "step-00000006-tiny-stage-0_end-failed.pth"
+    assert checkpoint_path(tmp_path, "tiny", 6, failed=True) == tmp_path / "checkpoints" / "step-00000006-tiny-failed.pth"
+
+    d = checkpoint_dir(tmp_path)
+    d.mkdir()
+    (d / checkpoint_name(6, "tiny")).touch()
+    os.utime(d / checkpoint_name(6, "tiny"), (1_000_000, 1_000_000))
+    failed = d / checkpoint_name(6, "tiny", failed=True)
+    failed.touch()  # written after the regular one, and of a higher step below
+    (d / checkpoint_name(9, "tiny", failed=True)).touch()
+    found = find_latest_checkpoint(tmp_path, "tiny")
+    assert found is not None and found.name == "step-00000006-tiny.pth"
+    assert failed.exists(), "the regular checkpoint of the same step is a different file"
+
+
 def test_step_from_name() -> None:
     assert _step_from_name(Path("/x/step-00000014-tiny-stage-1_end.pth")) == 14
     assert _step_from_name(Path("step-00000020-my-run.pth")) == 20
 
 
-def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp_path: Path) -> None:
+def test_find_latest_checkpoint_picks_the_newest_file_including_stage_end_names(tmp_path: Path) -> None:
+    """
+    The most recently written checkpoint of the run wins, whatever its step; equal times fall back to the step.
+    """
+
     assert find_latest_checkpoint(tmp_path, "tiny") is None
     d = checkpoint_dir(tmp_path)
     d.mkdir()
@@ -146,6 +180,7 @@ def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp
     ]
     for n in names:
         (d / n).touch()
+        os.utime(d / n, (1_000_000, 1_000_000))  # all written "at the same time"
 
     def latest(run_name: str) -> str:
         found = find_latest_checkpoint(tmp_path, run_name)
@@ -154,11 +189,17 @@ def test_find_latest_checkpoint_picks_highest_step_including_stage_end_names(tmp
 
     assert latest("tiny") == "step-00000014-tiny-stage-1_end.pth"
     (d / checkpoint_name(9, "tiny")).touch()  # lexically later ("9" > "1") but a lower step
+    os.utime(d / checkpoint_name(9, "tiny"), (1_000_000, 1_000_000))
     assert latest("tiny") == "step-00000014-tiny-stage-1_end.pth"
     (d / checkpoint_name(20, "tiny")).touch()
+    os.utime(d / checkpoint_name(20, "tiny"), (1_000_000, 1_000_000))
     assert latest("tiny") == "step-00000020-tiny.pth"
     assert latest("other") == "step-00000099-other.pth"
     assert find_latest_checkpoint(tmp_path, "nothing") is None
+
+    # an explicit resume from step 6 wrote a new step 10 later: that file is the newest and wins over 14 and 20
+    os.utime(d / checkpoint_name(10, "tiny"), (2_000_000, 2_000_000))
+    assert latest("tiny") == "step-00000010-tiny.pth"
 
 
 @pytest.mark.parametrize("foreign", ["step-00000099-tiny-v2.pth", "step-00000099-other-tiny.pth"])
@@ -182,7 +223,7 @@ def test_is_checkpoint_step_table() -> None:
         resolved_stage("a", tokens=12 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
         resolved_stage("b", tokens=8 * 4 * 256, base_lr=1e-3, transition_pct=0.0),
     ]
-    stage_manager = StageManager(stages, world_batch_size=4, block_size=256)
+    stage_manager = StageManager(stages, tokens_per_step=1024)
     assert stage_manager.total_steps == 20 and stage_manager.stage_ending_at(11) == 0
     settings = _settings(save_step_interval=8, save_last_step=True)
     assert [s for s in range(1, 21) if is_checkpoint_step(settings, s, stage_manager)] == [8, 12, 16, 20]
@@ -196,30 +237,29 @@ def test_is_checkpoint_step_table() -> None:
 # --- the resume compatibility check ------------------------------------------------------------------------------------
 
 # One differing value per compared setting, i.e. per Settings field NOT in the exemption tuple (the defaults are in
-# `training/settings.py`); `test_every_settings_field_is_classified` keeps this table complete.
+# `training/settings.py`); `test_every_settings_field_is_classified` keeps this table complete. The values are set on
+# a constructed `Settings`, not passed to it: `lr_schedule` has exactly one legal value, so no differing schedule
+# survives `Settings.__post_init__`, and what is under test here is the resume comparison, not the value rules.
 CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "stage_base_lrs": [2e-3],
     "seed": 7,
-    "block_size": 128,
-    "sort_batches_by_length": False,
-    "sequence_padding_multiple": 64,
+    "training_max_sequence_length": 128,
+    "validation_padding_multiple": 64,
     "backend": "future_ddp",
     "precision": "32",
     "compile_model": True,
-    "gradient_checkpointing": True,
-    "micro_batch_size": 2,
-    "world_batch_size": 2048,
+    "gradient_checkpointing": "full",
+    "validation_batch_size": 2,
+    "tokens_per_micro_batch": 16384,
+    "micro_batches_per_step": 128,
     "optimizer": "AdamW",
     "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
     "grad_clip": 0.5,
-    "lr_schedule": "cosine",
+    "lr_schedule": "cosine",  # not constructible: one schedule is implemented (training/lr_schedule.py)
     "warmup_steps": 5,
     "cooldown_steps": 5,
     "min_lr": 1e-6,
-    "eval_step_interval": 7,
-    "eval_iters": 3,
-    "partial_depth_eval": [2],
 }
 
 
@@ -240,23 +280,23 @@ def test_check_settings_unchanged_catches_every_compared_setting(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    Each compared field fails a resume on its own, the eval knobs included: every forward draws from the global
-    torch RNG, so how often and how widely validation runs changes the training stream itself. The weight-decay
-    grouping flag is refused even under `allow_settings_change`: the restored optimizer keeps the checkpoint's
-    parameter groups, so the new value could never take effect.
+    Each compared field fails a resume on its own. The weight-decay grouping flag is refused even under
+    `allow_settings_change`: the restored optimizer keeps the checkpoint's parameter groups, so the new value could
+    never take effect.
     """
 
     metadata = _metadata(backend, tiny_model)
     config = tiny_model.config.to_dict()
     check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), config, False)  # nothing changed
     for key, value in CHANGED_COMPARED_VALUES.items():
-        changed = _settings(**({"run_name": "tiny", "seed": 42} | {key: value}))
+        changed = _settings(run_name="tiny", seed=42)
+        setattr(changed, key, value)  # set after construction, see the table's comment
         if key == PARAM_GROUPING_SETTING:
             for allow in (False, True):  # non-overridable
                 with pytest.raises(ValueError, match="parameter groups are restored from the checkpoint"):
                     check_settings_unchanged(metadata, changed, config, allow)
-        else:
-            with pytest.raises(ValueError, match=rf"resuming with changed \['{key}'\].*checkpoint .* != current "):
+        else:  # named; training_max_sequence_length and the batch sizes also move the packing token sizes derived from them
+            with pytest.raises(ValueError, match=rf"resuming with changed \[.*'{key}'.*checkpoint .* != current "):
                 check_settings_unchanged(metadata, changed, config, False)
             check_settings_unchanged(metadata, changed, config, True)  # allow_settings_change
 
@@ -265,13 +305,15 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
     backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    Paths, run bookkeeping, logging and the resume features themselves may differ from the checkpoint.
+    Paths, run bookkeeping, logging, the validation cadence and the resume features themselves may differ from the
+    checkpoint; validation runs under `torch.random.fork_rng`, so denser validation changes no training number.
     """
 
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
-        resume_warmup_steps=10, wandb_enabled=False, export_to_hf=True, auto_prepare=False,
+        eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
+        wandb_enabled=False, export_to_hf=True, auto_prepare=False,
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )
     check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
@@ -406,5 +448,36 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
     fresh = build_model(TINY_MODEL_ARCHITECTURE)
-    load_training_checkpoint(backend, path, Wrapper(fresh), ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3))
+    load_training_checkpoint(backend, path, Wrapper(fresh), ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
+
+
+def test_load_refuses_changed_optimizer_hyperparameters(
+    tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT
+) -> None:
+    """
+    `optimizer.load_state_dict` replaces the parameter groups with the checkpoint's, so an `optim_config` that
+    differs from the checkpoint's would silently lose: the load fails and names the differing keys.
+    """
+
+    opt, _ = _train_one_step(tiny_model)  # weight_decay 4e-5, betas (0.9, 0.95)
+    path = checkpoint_path(tmp_path, "tiny", 1)
+    save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model, step=1))
+
+    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    changed = ELLISAdam(get_param_groups(fresh, 0.5), lr=1e-3, betas=(0.8, 0.9))
+    with pytest.raises(ValueError, match=r"group 0: betas: checkpoint \(0\.9, 0\.95\) != current \(0\.8, 0\.9\)") as info:
+        load_training_checkpoint(backend, path, fresh, changed)
+    assert "weight_decay: checkpoint 4e-05 != current 0.5" in str(info.value)
+    assert "allow_settings_change cannot override this" in str(info.value)
+
+    same = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
+    load_training_checkpoint(backend, path, fresh, same)  # equal hyperparameters load fine, whatever the LR is
+
+
+def test_check_param_groups_unchanged() -> None:
+    check_param_groups_unchanged([{"betas": (0.9, 0.95)}], [{"betas": (0.9, 0.95)}])
+    with pytest.raises(ValueError, match="different number of optimizer parameter groups"):
+        check_param_groups_unchanged([{}], [{}, {}])
+    with pytest.raises(ValueError, match="group 1: eps: checkpoint 1e-08 != current 1e-06"):
+        check_param_groups_unchanged([{"eps": 1e-6}, {"eps": 1e-6}], [{"eps": 1e-6}, {"eps": 1e-8}])

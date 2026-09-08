@@ -6,7 +6,7 @@ This repository contains the code for my thesis "Efficient Large Language Models
 
 ## Work
 
-The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, output norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
+The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, input norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
 Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
@@ -44,12 +44,22 @@ Optional: training builds whatever is missing itself by default (`auto_prepare: 
 # mini smoke run (real sources, a few MB)
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml
 
-# download thesis data sources
+# download and build the thesis data sources
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml
+
+# download only (tokenizer + raw shards), build later with prepare
+uv run python data_preparation/prepare.py download --dataset_config config/datasets/crow_300m_final.yaml
 
 # check which sources are missing locally without starting download
 uv run python data_preparation/prepare.py status --dataset_config config/datasets/crow_300m_final.yaml
+
+# make shortcuts for the same: prepare / download / status
+make prepare config/datasets/crow_300m_final.yaml
+make download config/datasets/crow_300m_final.yaml
+make status config/datasets/crow_300m_final.yaml
 ```
+
+![TUI Data Preparation](docs/screenshots/tui_data_preparation.png)
 
 ### Training
 
@@ -60,7 +70,52 @@ TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml #
 
 # thesis run on single gpu
 uv run python training/train.py --config config/crow_300m_final.yaml
+
+# make shortcut for the same
+make training config/crow_300m_final.yaml
 ```
+
+![TUI Training](docs/screenshots/tui_training.png)
+
+Training packs documents end to end: one row of `tokens_per_micro_batch` tokens per micro-batch,
+`micro_batches_per_step` of them per optimizer step, attention masked per document.
+Validation runs on padded rows, `validation_batch_size` per forward.
+
+A run resumes by default (`resume: true`): the most recently written checkpoint of `run_name` in its run directory is
+loaded, or `resume_checkpoint_path` names one; a checkpoint written with other settings, model config or dataset config
+is refused unless `allow_settings_change` / `allow_dataset_change` say so. `compile_model: true` compiles the model with
+`torch.compile`. The architecture's `bf16_residual_stream` (`none`, `core`, `all`) decides which RMSNorm outputs are
+rounded to the autocast dtype under bf16-mixed precision: none, the core blocks' (the recurrence runs on a bf16 stream),
+or every norm's.
+
+### Evaluation
+
+Sample generations and lm-eval-harness scores (`evaluation/`), on a checkpoint or during training:
+
+```bash
+uv sync --extra eval      # lm-eval-harness, only needed for benchmarks
+
+# greedy samples for the built-in prompts; --tasks adds benchmarks
+uv run python evaluation/evaluate.py --checkpoint outputs/<run>/checkpoints/<file>.pth
+uv run python evaluation/evaluate.py --checkpoint <file>.pth --tasks arc_challenge,hellaswag --limit 200
+
+# make shortcut (EVAL_TASKS=a,b for benchmarks)
+make evaluate outputs/<run>/checkpoints/<file>.pth
+```
+
+During training the run config decides when they run: every `sample_step_interval` steps and after the steps at
+the percentages of the run in `sample_at_training_progress` (0: after the first step, 100: after the last;
+default `[100]`), combined; `benchmark_step_interval` and `benchmark_at_training_progress` (default: off) likewise.
+The percentages become step numbers once the stage plan is known; `train.log` lists them. Files land in
+`outputs/<run>/samples/` and `outputs/<run>/benchmarks/`, named by step; scores also go to wandb as
+`benchmark/<recurrence>/<task>/<metric>`. `sample_recurrences` and `benchmark_recurrences` list the recurrent
+steps per block to run with, e.g. `[[4, 4, 4], [12, 12, 12]]` (empty: the mean recurrence once); the CLI takes
+`--recurrence 4,4,4` repeatedly. Both run RNG-isolated, so they do not change the training.
+
+Every scored context starts with a BOS token, as every training row does; scores recorded before this was fixed
+(September 2026) were measured without it and are not comparable. Both samples and scores also shift slightly with
+`batch_size`: each recurrent forward draws its initial latent state for the whole batch at once, so a row's noise
+depends on the rows it is batched with and on how far they are padded.
 
 ## Architecture
 

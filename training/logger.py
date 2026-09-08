@@ -13,11 +13,12 @@ ending in a `TrainingReport`.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
-from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from datetime import datetime
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -28,12 +29,13 @@ import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from evaluation.samples import GeneratedSample
 from training.backend.base import plain_model
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import KEEP, TRAIN_LOG_NAME, dashboard_enabled
+from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled
 from training.ui.fallback import ConsoleFallbackDashboard
 
 if TYPE_CHECKING:
@@ -52,12 +54,20 @@ class Logger:
     """
     wandb run wrapper; every method is a no-op when `enabled=False` (wandb is then never imported).
 
-    The run is created quiet (`WANDB_QUIET_SETTINGS`): wandb's default console wrapping and banner lines would fight
-    the dashboard's stream capture.
+    Every process is its own wandb run, grouped under `run_name`; a resumed process is named
+    `<run_name>-from-<resume_step>` and tagged `resumed`, with `resume_step` in its config. (Continuing one wandb
+    run would drop the re-run steps below its last logged step.) The run is created quiet (`WANDB_QUIET_SETTINGS`):
+    wandb's default console wrapping and banner lines would fight the dashboard's stream capture.
     """
 
     def __init__(
-        self, project: str, run_name: str, out_dir: str | Path, offline: bool = True, enabled: bool = True
+        self,
+        project: str,
+        run_name: str,
+        out_dir: str | Path,
+        offline: bool = True,
+        enabled: bool = True,
+        resume_step: int | None = None,
     ) -> None:
         self.enabled = enabled
         self.run: Optional[Run] = None
@@ -68,8 +78,16 @@ class Logger:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         # the shared constant is a `dict[str, object]`; `wandb.Settings` types every field
         quiet = wandb.Settings(**cast(dict[str, Any], WANDB_QUIET_SETTINGS))
+        resumed = resume_step is not None
         self.run = wandb.init(
-            project=project, name=run_name, dir=str(out_dir), mode="offline" if offline else "online", settings=quiet
+            project=project,
+            name=f"{run_name}-from-{resume_step}" if resumed else run_name,
+            group=run_name,
+            tags=["resumed"] if resumed else [],
+            config={"resume_step": resume_step},
+            dir=str(out_dir),
+            mode="offline" if offline else "online",
+            settings=quiet,
         )
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
@@ -139,7 +157,7 @@ def describe_parameters(model: Module) -> str:
 class TrainingReport:
     """
     What `train()` returns: the counts, times, last losses and files of one run (built by `RunLogger.close`,
-    re-exported by `training/run.py`).
+    re-exported by `training/run.py`); `close` also writes it as `train_report.json` into the run directory.
     """
 
     run_directory: Path
@@ -154,10 +172,33 @@ class TrainingReport:
     export_dir: Path | None  # the HuggingFace export folder, None without `export_to_hf` (and after a stop)
     stopped: bool = False  # the run stopped on request (the CLI's Ctrl-C) before its last step
     history: dict[int, dict[str, float]] = field(default_factory=dict)  # per logged step, only with `keep_history`
+    samples_written: list[Path] = field(default_factory=list)  # every samples file written by this process, in order
+    # `benchmark/<recurrence>/<task>/<metric>` (`evaluation.benchmarks.flatten_results`) of the last run, {} if none
+    last_benchmarks: dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        The report as JSON-ready data: paths as strings, `history` left out (the wandb file holds the metrics),
+        plus `written_at` (local time).
+        """
+
+        data = {name: value for name, value in asdict(self).items() if name != "history"}
+        for name in ("run_directory", "resumed_from", "export_dir"):
+            data[name] = None if data[name] is None else str(data[name])
+        data["checkpoints_written"] = [str(path) for path in self.checkpoints_written]
+        data["samples_written"] = [str(path) for path in self.samples_written]
+        data["written_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        return data
+
+    def write_json(self, path: Path) -> None:
+        with open(path, "w") as file:
+            json.dump(self.to_dict(), file, indent=2)
+            file.write("\n")
 
     def summary(self) -> str:
         """
-        The lines the CLI prints after `train()` returned.
+        The lines the CLI prints after `train()` returned (the per-depth validation losses; the per-source ones
+        are in the JSON report).
         """
 
         origin = f"resumed from {self.resumed_from}" if self.resumed_from is not None else "fresh start"
@@ -171,11 +212,18 @@ class TrainingReport:
         loss = f"last loss {self.last_loss:.4f}" if self.last_loss is not None else "no step logged"
         if self.last_validation:
             losses = ", ".join(
-                f"{name} {value:.4f}" for name, value in self.last_validation.items() if name.startswith("val_loss")
+                f"{name} {value:.4f}"
+                for name, value in self.last_validation.items()
+                if name.startswith("val_loss") and "/" not in name
             )
             lines.append(f"  {loss} | last validation: {losses}")
         else:
             lines.append(f"  {loss} | no validation")
+        if self.last_benchmarks:
+            scores = ", ".join(f"{name.removeprefix('benchmark/')} {value:.4f}" for name, value in self.last_benchmarks.items())
+            lines.append(f"  benchmarks: {scores}")
+        if self.samples_written:
+            lines.append(f"  {len(self.samples_written)} samples files written, last: {self.samples_written[-1]}")
         if self.checkpoints_written:
             lines.append(f"  {len(self.checkpoints_written)} checkpoints written, last: {self.checkpoints_written[-1]}")
         else:
@@ -186,7 +234,7 @@ class TrainingReport:
 
 class Dashboard(Protocol):
     """
-    The four calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    The five calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake.
     """
 
@@ -199,6 +247,8 @@ class Dashboard(Protocol):
     def note_event(self, text: str) -> None: ...
 
     def set_status(self, text: str) -> None: ...
+
+    def discount_time(self, seconds: float) -> None: ...
 
 
 @contextmanager
@@ -268,7 +318,8 @@ class RunLogger:
         start_step: int,
         device: str,
         dashboard: Dashboard | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
         keep_history: bool = False,
     ) -> None:
@@ -290,19 +341,24 @@ class RunLogger:
         self.keep_history = keep_history  # a test knob: fill `history`
         self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats, if kept
         self.checkpoints_written: list[Path] = []
+        self.samples_written: list[Path] = []
+        self._last_benchmarks: dict[str, float] = {}
         self.resumed_from: Path | None = None
-        self.tokens_per_step = settings.world_batch_size * settings.block_size
-        self._clock = clock
+        self.tokens_per_step = settings.tokens_per_optimizer_step
+        self._clock = clock  # monotonic: every duration here is an interval, and an NTP step must not move one
         now = clock()
-        self.setup_seconds = now - setup_started if setup_started is not None else 0.0
+        # `setup_started` is the CLI's wall-clock reading (`train.py`), from before this object and its clock existed
+        self.setup_seconds = wall_clock() - setup_started if setup_started is not None else 0.0
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._interval_step = start_step  # the step the interval timer started at
-        self._sample_counter: Counter[str] = Counter()  # data ids of the world batches since the last log step
+        self._side_seconds = 0.0  # seconds spent outside the training loop since the last log step (`_timed_status`)
+        self._token_counter: dict[str, int] = {}  # document tokens trained per data id since the last log step
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
         self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
         self._last_loss: float | None = None
         self._last_validation: dict[str, float] = {}
+        self._report: TrainingReport | None = None  # written by the first `close()`, returned by every later one
 
     @classmethod
     def open(
@@ -316,15 +372,17 @@ class RunLogger:
         backend: Backend,
         *,
         dashboard: Dashboard | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         setup_started: float | None = None,
         keep_history: bool = False,
     ) -> RunLogger:
         """
         Open the run's logging once the setup is done: the wandb run (hyperparameters, `num_parameters`), the
         dashboard (unless `dashboard` is given), then the console header lines. The setup timer ends and the train
-        timer starts here. `progress.step` is the resume step; `setup_started` the clock reading at the start of the
-        run; `clock` and `keep_history` are test knobs.
+        timer starts here. `progress.step` is the resume step; `setup_started` the *wall-clock* reading at the start
+        of the run (`train.py`), measured against `wall_clock`, while `clock` (monotonic) times everything the run
+        itself measures; `clock`, `wall_clock` and `keep_history` are test knobs.
         """
 
         wandb = Logger(
@@ -333,6 +391,7 @@ class RunLogger:
             run_directory,
             offline=settings.wandb_offline,
             enabled=settings.wandb_enabled,
+            resume_step=progress.resume_step if progress.resume_step >= 0 else None,
         )
         wandb.log_hyperparams(asdict(settings) | {"dataset_config_hash": dataset.config_hash})
         wandb.log_summary({"num_parameters": num_parameters(plain_model(model))})
@@ -345,6 +404,7 @@ class RunLogger:
             device=str(backend.device),
             dashboard=dashboard,
             clock=clock,
+            wall_clock=wall_clock,
             setup_started=setup_started,
             keep_history=keep_history,
         )
@@ -370,8 +430,16 @@ class RunLogger:
         """
         Release wandb and the dashboard, so the terminal is restored on an exception and on Ctrl-C too; idempotent.
         Every resource is released even when an earlier release raises; the first failure is the one re-raised.
+
+        A run that leaves the block by raising, without having reached `close()`, first logs one kept ERROR record
+        with the traceback and sets the status to `failed`: the record still goes through the dashboard's handlers,
+        so it reaches `train.log` and the terminal, which the exit stack below takes away. A failed run gets no
+        report - `train_report.json` would then read as the run's result.
         """
 
+        if exc is not None and self._report is None:
+            console.error("Training failed: %s", exc, exc_info=exc, extra=KEEP)
+            self.status("failed")
         failures: list[BaseException] = []
         for release in (self.wandb.finish, self._exit_stack.close):
             try:
@@ -406,25 +474,52 @@ class RunLogger:
             self.status(previous)
 
     @contextmanager
-    def evaluating(self) -> Iterator[None]:
+    def _timed_status(self, text: str) -> Iterator[None]:
         """
-        Around one `evaluate` call: the status reads `evaluating`, and the duration becomes `val_time` (seconds)
-        next to the validation metrics of that step in `log_step`.
+        Around a block that is not a training step (evaluation, checkpoint, samples, benchmarks): `text` is the
+        status for it, and its duration is kept out of every throughput number - out of the interval behind
+        `seconds/step`, `tokens/second` and `remaining_time` here, and out of the dashboard's own estimate through
+        `discount_time`. Without that, one 30 s evaluation between two 0.5 s steps reads as a 60x slowdown.
         """
 
         started = self._clock()
-        with self._status_during("evaluating"):
+        with self._status_during(text):
             try:
                 yield
             finally:
-                self._evaluation_seconds = self._clock() - started
+                seconds = self._clock() - started
+                self._side_seconds += seconds
+                self.dashboard.discount_time(seconds)
+
+    @contextmanager
+    def evaluating(self) -> Iterator[None]:
+        """
+        Around one `evaluate` call: the status reads `evaluating`, the duration becomes `val_time` (seconds) next
+        to the validation metrics of that step in `log_step`, and it does not count as training time.
+        """
+
+        started = self._clock()
+        try:
+            with self._timed_status("evaluating"):
+                yield
+        finally:
+            self._evaluation_seconds = self._clock() - started
+
+    def working(self, text: str) -> AbstractContextManager[None]:
+        """
+        Around a block that is neither a step nor an evaluation (sampling, benchmarking): the status reads text
+        and the block does not count as training time.
+        """
+
+        return self._timed_status(text)
 
     def saving_checkpoint(self) -> AbstractContextManager[None]:
         """
-        Around one checkpoint write: the status reads `saving checkpoint`.
+        Around one checkpoint write: the status reads `saving checkpoint`, and the write does not count as
+        training time.
         """
 
-        return self._status_during("saving checkpoint")
+        return self._timed_status("saving checkpoint")
 
     def log_resume(self, path: Path, step: int) -> None:
         """
@@ -456,32 +551,82 @@ class RunLogger:
 
         self.dashboard.note_event(f"exported HuggingFace model to {path}")
 
+    def log_triggers(self, label: str, steps: Sequence[int]) -> None:
+        """
+        One console line naming the steps after which `label` (samples, benchmarks) runs; nothing when none.
+        """
+
+        if steps:
+            console.info("%s after steps: %s", label, ", ".join(str(step) for step in steps))
+
+    def log_samples(self, path: Path, samples: Sequence[GeneratedSample]) -> None:
+        """
+        Sample generations were written to `path`: the event names the file, a second one previews the first sample.
+        """
+
+        self.samples_written.append(path)
+        self.dashboard.note_event(f"wrote {len(samples)} samples to {path}")
+        if samples:
+            preview = f"sample: {samples[0].prompt!r} -> {samples[0].completion!r}"
+            self.dashboard.note_event(preview if len(preview) <= 160 else preview[:157] + "...")
+
+    def log_benchmarks(self, metrics: Mapping[str, float], path: Path, step: int) -> None:
+        """
+        Benchmark scores (`benchmark/<recurrence>/<task>/<metric>`) of `step`: to wandb at that step, one event
+        per recurrence setting and task, and the report's `last_benchmarks`.
+        """
+
+        self._last_benchmarks = dict(metrics)
+        self.wandb.log(dict(metrics), step=step)
+        per_task: dict[tuple[str, str], list[str]] = {}
+        for name, value in metrics.items():
+            _, recurrence, task, metric = name.split("/", 3)
+            per_task.setdefault((recurrence, task), []).append(f"{metric} {value:.4f}")
+        for (recurrence, task), scores in per_task.items():
+            self.dashboard.note_event(f"benchmark {task} (recurrence {recurrence}) at step {step}: {', '.join(scores)}")
+        self.dashboard.note_event(f"wrote benchmark results to {path}")
+
+    def log_benchmark_failure(self, error: BaseException) -> None:
+        """
+        The benchmark run raised: a kept warning and an event; the run goes on.
+        """
+
+        console.warning("benchmark evaluation failed, the run continues: %s", error, extra=KEEP)
+        self.dashboard.note_event(f"benchmark evaluation failed: {error}")
+
     # --- steps -------------------------------------------------------------------------------------------------------
 
     def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
         """
         Account one completed optimizer step (`progress.step`, after `progress.advance()`).
 
-        Every step: the data ids join the composition counter, a transition starting or ending becomes an event, a
+        Every step: the document tokens per data id join the composition counter, a transition starting or ending
+        becomes an event, a
         set `result.validation` becomes the dashboard's validation row, the bars move (with an empty metric dict, so
-        no tensor is read). At log steps (`step % log_step_interval == 0`) the metric dict goes to wandb, to
-        `history` with `keep_history`, and to the dashboard:
+        no tensor is read). At log steps (`step % log_step_interval == 0`, and the final step whatever the interval)
+        the metric dict goes to wandb, to `history` with `keep_history`, and to the dashboard:
 
         * `loss`, `ppl`, `lr`, `grad_norm` (pre-clip), `step`;
-        * `seconds/step`, `tokens/second`, `total_tokens` (from step 0, also after a resume), `total_time`,
-          `remaining_time`;
+        * `seconds/step`, `tokens/second`, `remaining_time`: training only, the timed blocks that are not steps
+          (evaluation, checkpoints, samples, benchmarks) subtracted; `total_tokens` (from step 0, also after a
+          resume) and `total_time` (wall time since `open`, everything included);
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
-        * `data_composition/<data id>`: the fraction of world-batch samples per data id since the last log step;
-        * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`, `val_time`).
+        * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
+          step (`result.data_tokens`: document slots, pack tails excluded), the realised token share the stage
+          weights promise;
+        * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`,
+          `val_loss/<data id>` per validation source, `val_time`).
         """
 
-        self._sample_counter.update(result.data_ids)
+        for data_id, tokens in result.data_tokens.items():
+            self._token_counter[data_id] = self._token_counter.get(data_id, 0) + tokens
         stage_at_done = self.stage_manager.get_stage_info(progress.step)
         self._note_transition(result.stage, stage_at_done)
         validation = self._log_validation(result, progress)
         transition = stage_at_done.transition_progress if stage_at_done.transition_to is not None else None
-        if progress.step % self.settings.log_step_interval != 0:
+        final = progress.step >= self.stage_manager.total_steps  # always logged: its metrics and validation close the run
+        if progress.step % self.settings.log_step_interval != 0 and not final:
             self.dashboard.update_step(progress.step, stage_at_done.stage_index, transition, {})
             return
         metrics = self._step_metrics(result, progress, validation)
@@ -536,14 +681,17 @@ class RunLogger:
 
         now = self._clock()
         steps_in_interval = max(progress.step - self._interval_step, 1)  # after an off-grid resume fewer than the interval
-        seconds_per_step = (now - self._interval_started) / steps_in_interval
+        # training only: evaluation, checkpoints, samples and benchmarks were timed by `_timed_status` and come off
+        training_seconds = max(now - self._interval_started - self._side_seconds, 0.0)
+        seconds_per_step = training_seconds / steps_in_interval
         self._interval_started, self._interval_step = now, progress.step
-        total_samples = sum(self._sample_counter.values())
+        self._side_seconds = 0.0
+        total_tokens = sum(self._token_counter.values())
         metrics: dict[str, Any] = {name: _to_scalar(value) for name, value in result.metrics.items()}
         metrics |= validation or {}
         metrics |= {
             "loss": _to_scalar(result.loss),
-            "ppl": _to_scalar(result.log_ppl.exp()),
+            "ppl": _to_scalar(result.loss.exp()),  # StepResult has no log_ppl any more: it was the same tensor
             "lr": result.learning_rate,
             "grad_norm": _to_scalar(result.grad_norm),
             "step": progress.step,
@@ -558,16 +706,20 @@ class RunLogger:
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }
-        metrics |= {f"data_composition/{name}": count / total_samples for name, count in self._sample_counter.items()}
-        self._sample_counter.clear()
+        metrics |= {f"data_composition/{name}": count / total_tokens for name, count in self._token_counter.items()}
+        self._token_counter.clear()
         return metrics
 
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
         """
         End the run's logging: `train_time` into the wandb summary, the final console line and status, the
-        dashboard closed; returns the report. `stopped` says the run ended on request before its last step.
+        dashboard closed; returns the report, also written to `train_report.json` in the run directory (the last
+        process's report; a resume overwrites it). `stopped` says the run ended on request before its last step.
+        A second call logs nothing, sets no status and rewrites nothing: it returns the report of the first.
         """
 
+        if self._report is not None:
+            return self._report
         train_seconds = self._clock() - self._train_started
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
@@ -575,7 +727,7 @@ class RunLogger:
         console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.status(ending)
         self._exit_stack.close()
-        return TrainingReport(
+        report = TrainingReport(
             run_directory=self.run_directory,
             steps_this_process=progress.step - self.start_step,
             completed_steps=progress.step,
@@ -588,7 +740,12 @@ class RunLogger:
             export_dir=export_dir,
             stopped=stopped,
             history=self.history,
+            samples_written=list(self.samples_written),
+            last_benchmarks=dict(self._last_benchmarks),
         )
+        report.write_json(self.run_directory / TRAIN_REPORT_NAME)
+        self._report = report
+        return report
 
 
 # --- gradient / parameter metrics -----------------------------------------------------------------------------------
@@ -646,50 +803,53 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
     total_rms: torch.Tensor | float = 0.0
     num_params_with_grad = 0
     finite_grads: list[torch.Tensor] = []
+    with_grad: list[tuple[dict[str, Any], torch.Tensor, torch.Tensor]] = []
     for group in optimizer.param_groups:
         for param in group["params"]:
-            grad = param.grad
-            if grad is None:
-                continue
-            name = names.get(id(param), "")
-            is_qkv = "qkv" in name and "weight" in name
-            is_proj = "mlp" in name and "proj" in name and "weight" in name
-            finite = bool(torch.isfinite(grad).all())
-            if is_qkv:
-                if not finite:
-                    metrics[f"query_grad_{grad_qkv_layer}"] = torch.as_tensor(float("NaN"))
-                elif dims is not None and grad.numel() % dims[0] == 0:
-                    metrics[f"query_grad_{grad_qkv_layer}"] = grad.view(-1, dims[0])[: dims[1], :].norm()
-                grad_qkv_layer += 1
-            if is_proj:
-                metrics[f"ffn2_grad_{grad_mlp_layer}"] = grad.norm() if finite else torch.as_tensor(float("NaN"))
-                grad_mlp_layer += 1
+            if param.grad is not None:
+                with_grad.append((group, param, param.grad))
+    # one host sync for all finite checks instead of one per parameter (the production run logs every step)
+    finite_flags = torch.stack([grad.isfinite().all() for *_, grad in with_grad]).tolist() if with_grad else []
+    for (group, param, grad), finite in zip(with_grad, finite_flags):
+        name = names.get(id(param), "")
+        is_qkv = "qkv" in name and "weight" in name
+        is_proj = "mlp" in name and "proj" in name and "weight" in name
+        if is_qkv:
             if not finite:
-                continue
-            finite_grads.append(grad)
-            state = optimizer.state.get(param)
-            if state is None:
-                continue
-            exp_avg_sq = state.get("exp_avg_sq")
-            if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
-                continue
-            rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp_(min=group["eps"] ** 2)).mean().sqrt()
-            total_rms += rms
-            num_params_with_grad += 1
-            if wte_weight is not None and param is wte_weight:
-                metrics["embed_RMS"] = rms
-            if is_qkv:
-                qkv_lr = _reverse_engineer_adam_effective_lr(param, state, group)
-                if dims is not None and qkv_lr.numel() % dims[0] == 0:
-                    n_embd, query_width, kv_width = dims
-                    qkv_lr = qkv_lr.view(-1, n_embd)
-                    metrics[f"q_effective_lr_{lr_qkv_layer}"] = qkv_lr[:query_width, :].mean()
-                    metrics[f"k_effective_lr_{lr_qkv_layer}"] = qkv_lr[query_width : query_width + kv_width, :].mean()
-                    metrics[f"v_effective_lr_{lr_qkv_layer}"] = qkv_lr[query_width + kv_width :, :].mean()
-                lr_qkv_layer += 1
-            if is_proj:
-                metrics[f"ffn2_effective_lr_{lr_mlp_layer}"] = _reverse_engineer_adam_effective_lr(param, state, group).mean()
-                lr_mlp_layer += 1
+                metrics[f"query_grad_{grad_qkv_layer}"] = torch.as_tensor(float("NaN"))
+            elif dims is not None and grad.numel() % dims[0] == 0:
+                metrics[f"query_grad_{grad_qkv_layer}"] = grad.view(-1, dims[0])[: dims[1], :].norm()
+            grad_qkv_layer += 1
+        if is_proj:
+            metrics[f"ffn2_grad_{grad_mlp_layer}"] = grad.norm() if finite else torch.as_tensor(float("NaN"))
+            grad_mlp_layer += 1
+        if not finite:
+            continue
+        finite_grads.append(grad)
+        state = optimizer.state.get(param)
+        if state is None:
+            continue
+        exp_avg_sq = state.get("exp_avg_sq")
+        if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
+            continue
+        # out of place: `.float()` aliases an fp32 buffer, an in-place clamp would edit the optimizer state
+        rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp(min=group["eps"] ** 2)).mean().sqrt()
+        total_rms += rms
+        num_params_with_grad += 1
+        if wte_weight is not None and param is wte_weight:
+            metrics["embed_RMS"] = rms
+        if is_qkv:
+            qkv_lr = _reverse_engineer_adam_effective_lr(param, state, group)
+            if dims is not None and qkv_lr.numel() % dims[0] == 0:
+                n_embd, query_width, kv_width = dims
+                qkv_lr = qkv_lr.view(-1, n_embd)
+                metrics[f"q_effective_lr_{lr_qkv_layer}"] = qkv_lr[:query_width, :].mean()
+                metrics[f"k_effective_lr_{lr_qkv_layer}"] = qkv_lr[query_width : query_width + kv_width, :].mean()
+                metrics[f"v_effective_lr_{lr_qkv_layer}"] = qkv_lr[query_width + kv_width :, :].mean()
+            lr_qkv_layer += 1
+        if is_proj:
+            metrics[f"ffn2_effective_lr_{lr_mlp_layer}"] = _reverse_engineer_adam_effective_lr(param, state, group).mean()
+            lr_mlp_layer += 1
 
     if num_params_with_grad > 0:
         metrics["avg_RMS"] = torch.as_tensor(total_rms / num_params_with_grad)  # already a Tensor after one add

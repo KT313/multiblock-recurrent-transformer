@@ -2,10 +2,11 @@
 """
 The golden 20-step tiny run: the numerics oracle of the training loop.
 
-Test support, not a test module: `write_tiny_yaml` (the settings the end-to-end tests run on), `golden_run_metrics`
-(a tiny run reduced to its numerics), `record_golden_run` (writes `training/golden_tiny_run.json`) and
-`golden_mismatches` (the comparison `test_golden_tiny_run` in `test_run.py` and `test_golden_tiny_steps` in
-`test_step.py` share). The golden is a refactor guard, not a promise about CPU training: it is recorded in fp32 on
+Test support, not a test module: `write_tiny_yaml` (the settings the end-to-end tests run on), `run_reference`
+(the tiny run in the golden configuration, as a `ReferenceRun` the `reference_run` fixture of `training/conftest.py`
+shares across a session), `reference_metrics` (that run reduced to its numerics), `record_golden_run` (writes
+`training/golden_tiny_run.json`) and `golden_mismatches` (the comparison `test_golden_tiny_run` in `test_run.py` and
+`test_golden_tiny_steps` in `test_step.py` share). The golden is a refactor guard, not a promise about CPU training: it is recorded in fp32 on
 the CPU with one thread and deterministic algorithms, so it catches a changed operation order, an extra RNG draw or
 a moved forward pass; it does not exercise the bf16 autocast path of real training.
 """
@@ -17,6 +18,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,8 @@ import yaml
 from data_preparation.lib.build.runner import prepare
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.run import train
-from training.settings import parse_settings
+from training.run import run_directory_of, train
+from training.settings import Settings, parse_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
@@ -38,7 +40,6 @@ GOLDEN_EXACT_ENV = "GOLDEN_EXACT"  # `GOLDEN_EXACT=1`: compare every float with 
 GOLDEN_RELATIVE_TOLERANCE = 1e-5
 GOLDEN_PER_STEP_KEYS = ("loss", "grad_norm", "lr")
 GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
-
 
 def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
     """
@@ -90,44 +91,92 @@ def optimizer_steps_taken(optimizer_state: dict[str, Any]) -> int:
     return int(per_parameter[min(per_parameter)]["step"])
 
 
-def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
+@dataclass(frozen=True)
+class ReferenceRun:
     """
-    The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms), reduced to its numerics.
-
-    `config/tiny.yaml` with `precision: "32"`, `wandb_enabled: false`, `export_to_hf: false`,
-    `resume: false` and `out_dir` in a temporary directory, through
-    `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. Returns
-    `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss, val_loss_<depth>...]}}, "checkpoints": [file names],
-    "optimizer_steps": number of optimizer.step() calls, "parameter_norms": {name: L2 norm in the final checkpoint}}`.
-    The per-step values are `report.history`; the `optimizer.step()` calls are read from the final checkpoint's
-    optimizer state (`optimizer_steps_taken`). Nothing is probed inside the run.
+    The 20-step tiny run in the golden configuration (`run_reference`): its per-step history, its yaml and its run
+    directory (the checkpoints stay on disk for `reference_metrics`). JSON round-trips it between xdist workers with
+    the floats as `repr`, so the bit-exact `==` comparisons of the parity chain hold on any worker.
     """
 
-    with tempfile.TemporaryDirectory() as tmp, single_thread_deterministic():
-        tmp_path = Path(tmp)
+    history: dict[int, dict[str, float]]
+    yaml_path: Path
+    run_directory: Path
+
+    @property
+    def settings(self) -> Settings:
+        return parse_settings(["--config", str(self.yaml_path)])
+
+    def to_json(self) -> str:
+        record = {
+            "history": {str(done): metrics for done, metrics in sorted(self.history.items())},
+            "yaml_path": str(self.yaml_path),
+            "run_directory": str(self.run_directory),
+        }
+        return json.dumps(record, indent=2) + "\n"
+
+    @classmethod
+    def from_json(cls, text: str) -> "ReferenceRun":
+        record = json.loads(text)
+        history = {int(done): metrics for done, metrics in record["history"].items()}
+        return cls(history, Path(record["yaml_path"]), Path(record["run_directory"]))
+
+
+def run_reference(tmp_path: Path, tiny_dataset_dir: Path) -> ReferenceRun:
+    """
+    The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms): the golden configuration.
+
+    `config/tiny.yaml` (packs of 512 tokens, two per step) with `precision: "32"`, `wandb_enabled: false`,
+    `export_to_hf: false`, `resume: false` and `out_dir` under `tmp_path`, through
+    `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. The yaml is
+    written to `tmp_path`. Nothing is probed inside the run.
+    """
+
+    with single_thread_deterministic():
         out_dir = tmp_path / "out"
         yaml_path = write_tiny_yaml(
             tmp_path, tiny_dataset_dir, out_dir, precision="32", wandb_enabled=False, export_to_hf=False, resume=False
         )
         settings = parse_settings(["--config", str(yaml_path)])
         report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)
+    return ReferenceRun(report.history, yaml_path, run_directory_of(settings))
 
-        steps: dict[str, dict[str, float]] = {}
-        for done, metrics in sorted(report.history.items()):
-            step_metrics = {key: metrics[key] for key in GOLDEN_PER_STEP_KEYS}
-            step_metrics |= {key: value for key, value in metrics.items() if key.startswith("val_loss")}
-            steps[str(done)] = step_metrics
-        final_checkpoint = find_latest_checkpoint(out_dir, settings.run_name)
-        assert final_checkpoint is not None
-        final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
-        return {
-            "steps": steps,
-            "checkpoints": sorted(p.name for p in checkpoint_dir(out_dir).glob("*.pth")),
-            "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),
-            "parameter_norms": {
-                name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state["model"].items()
-            },
-        }
+
+def reference_metrics(reference: ReferenceRun) -> dict[str, Any]:
+    """
+    A reference run reduced to its numerics: `{"steps": {"<done>": {loss, grad_norm, lr[, val_loss,
+    val_loss_<depth>...]}}, "checkpoints": [file names], "optimizer_steps": number of optimizer.step() calls,
+    "parameter_norms": {name: L2 norm in the final checkpoint}}`. The per-step values are the run's history; the
+    `optimizer.step()` calls are read from the final checkpoint's optimizer state (`optimizer_steps_taken`).
+    """
+
+    settings = reference.settings
+    steps: dict[str, dict[str, float]] = {}
+    for done, metrics in sorted(reference.history.items()):
+        step_metrics = {key: metrics[key] for key in GOLDEN_PER_STEP_KEYS}
+        step_metrics |= {key: value for key, value in metrics.items() if key.startswith("val_loss")}
+        steps[str(done)] = step_metrics
+    final_checkpoint = find_latest_checkpoint(reference.run_directory, settings.run_name)
+    assert final_checkpoint is not None
+    final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
+    return {
+        "steps": steps,
+        "checkpoints": sorted(p.name for p in checkpoint_dir(reference.run_directory).glob("*.pth")),
+        "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),
+        "parameter_norms": {
+            name: float(torch.linalg.vector_norm(tensor.float())) for name, tensor in final_state["model"].items()
+        },
+    }
+
+
+def golden_run_metrics(tiny_dataset_dir: Path) -> dict[str, Any]:
+    """
+    `reference_metrics` of a fresh `run_reference` in a temporary directory (what `record_golden_run` records; the
+    tests share one reference run per session through the `reference_run` fixture instead).
+    """
+
+    with tempfile.TemporaryDirectory() as tmp:
+        return reference_metrics(run_reference(Path(tmp), tiny_dataset_dir))
 
 
 def golden_run_json(metrics: dict[str, Any]) -> str:
@@ -147,7 +196,7 @@ def record_golden_run() -> Path:
         uv run python -c "from training.testing.golden import record_golden_run; record_golden_run()"
 
     Builds the tiny dataset into a temporary directory first (as the `tiny_dataset_dir` fixture does). The committed
-    fixture was recorded with torch 2.13.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic
+    fixture was recorded with torch 2.14.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic
     algorithms); two consecutive recordings there are byte-identical.
     """
 

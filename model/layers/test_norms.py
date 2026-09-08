@@ -74,3 +74,43 @@ def test_gradient_flows_to_weight_and_input() -> None:
     norm(x).sum().backward()
     assert norm.weight.grad is not None and x.grad is not None
     assert norm.weight.grad.abs().sum() > 0
+
+
+# --- the bf16 residual stream switch (`autocast_output`) --------------------------------------------------------------
+
+
+def test_autocast_output_rounds_to_the_autocast_dtype_once() -> None:
+    """
+    Under autocast the switched norm returns the autocast dtype, and its value is the fp32 result (normalization
+    times weight, as the plain norm computes it) rounded once.
+    """
+
+    plain, switched = RMSNorm(16), RMSNorm(16, autocast_output=True)
+    with torch.no_grad():
+        plain.weight.uniform_(0.5, 1.5)
+        switched.weight.copy_(plain.weight)
+    x = torch.randn(3, 16) * 4
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = switched(x)
+        reference = plain(x)
+    assert out.dtype == torch.bfloat16 and reference.dtype == torch.float32
+    assert torch.equal(out, reference.to(torch.bfloat16))
+
+
+def test_autocast_output_is_a_no_op_without_autocast() -> None:
+    plain, switched = RMSNorm(16), RMSNorm(16, autocast_output=True)
+    x = torch.randn(3, 16)
+    assert switched(x).dtype == torch.float32
+    assert torch.equal(switched(x), plain(x))
+    x_half = x.to(torch.bfloat16)
+    assert switched(x_half).dtype == torch.float32  # bf16 input times the fp32 weight promotes, as in the plain norm
+    assert torch.equal(switched(x_half), plain(x_half))
+
+
+def test_autocast_output_gradient_reaches_weight_and_input() -> None:
+    norm = RMSNorm(8, autocast_output=True)
+    x = torch.randn(2, 8, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        norm(x).float().sum().backward()
+    assert norm.weight.grad is not None and norm.weight.grad.dtype == torch.float32
+    assert x.grad is not None and x.grad.dtype == torch.float32 and torch.isfinite(x.grad).all()

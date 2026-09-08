@@ -137,6 +137,9 @@ def test_validation_losses_render_per_depth(board: TrainingDashboard) -> None:
     text = board.render_text()
     assert "validation (step 10)" in text
     assert "val_loss_4" in text and "3.4567" in text and "val_loss_8" in text and "3.2000" in text and "3.1000" in text
+    board.update_validation(20, {"val_loss_4": 2.6, "val_loss": 2.5, "val_loss/pretrain-a": 2.75})  # per-source: log line only
+    text = board.render_text()
+    assert "validation (step 20)" in text and "2.5000" in text and "val_loss/pretrain-a" not in text and "2.7500" not in text
 
 
 def test_events_list_keeps_the_last_lines(clock: FakeClock) -> None:
@@ -436,6 +439,36 @@ def test_a_failing_render_is_reported_and_disables_on_the_next_call(monkeypatch:
         assert _is_enabled(b) is False
     assert stream.getvalue().count("training dashboard disabled") == 1
     assert "event: after the broken frame" in stream.getvalue()
+
+
+class _RaisingFile(io.StringIO):
+    """
+    A console file that fails on a frame the way a layout error does: not an OSError, so not a dead terminal.
+    """
+
+    def write(self, text: str) -> int:
+        raise RuntimeError("renderer broke")
+
+
+def test_a_frame_that_fails_outside_the_render_demotes_the_board_to_the_console_fallback(clock: FakeClock) -> None:
+    """
+    `__rich_console__`'s own failures are deferred to the caller's thread; what rich raises around it arrives
+    through the base class, where the board's `_disable` must run instead of the base teardown (the step lines
+    need their console handler).
+    """
+
+    stream = io.StringIO()
+    with live_board("r", STAGES, STEPS, TOTAL, log_step_interval=1, console=string_console(), stream=stream, clock=clock) as b:
+        live = _live_of(b)
+        assert live is not None
+        b._console.file = _RaisingFile()
+        live.refresh()  # what the refresh thread does 4-8 times a second
+        assert _is_enabled(b) is False and _live_of(b) is None and not b.headless, "the terminal itself is fine"
+        b.update_step(2, 0, None, metrics(2))
+    output = stream.getvalue()
+    assert output.count("training dashboard disabled after an internal error") == 1
+    assert "display failed" not in output, "the board's demotion replaces the base class's warning"
+    assert "step 2/30" in output, "the fallback logs the step lines"
 
 
 def test_a_failing_start_disables_before_the_block_runs(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:

@@ -12,9 +12,9 @@ rows in file order. How a file is fetched depends on its size (known from the in
   whole (count is a minimum, align_to_row_group=True), so the same bytes are never downloaded twice; a
   top-up at a larger offset seeks straight to the right row group.
 * larger .jsonl / .jsonl.zst / .jsonl.gz / .json.gz / .json files are streamed from the
-  start (a .json array incrementally with ijson, :func:`iter_json_array`) and dropped after exactly
-  count rows. Their row count is only known once read to the end, so a top-up inside a partially consumed
-  file re-streams that file's prefix.
+  start (a .json array incrementally with ijson, :func:`iter_json_array`; a .json.gz is an array or json lines,
+  told apart by its first byte) and dropped after exactly count rows. Their row count is only known once read
+  to the end, so a top-up inside a partially consumed file re-streams that file's prefix.
 
 A :class:`FileIndex` per (repo, revision, glob) remembers the file list and sizes (one batched
 HfApi.get_paths_info call), the row count of every file read so far and the row-group row counts of every
@@ -26,6 +26,18 @@ kept in memory. Per-key counters (keyed_counts[key][file], group_counts[key][fil
 for github_code) share the index.
 
 Files read from the Hub cache (and local files) use exact count semantics: over-reading them costs nothing.
+
+Several requests share one pass (:func:`read_rows_multi`). A request that reached its count in a remote parquet
+file turns *passive*: it keeps taking the rows it matches from every row group the pass reads for the other
+requests (the bytes are fetched anyway) but never causes one to be read, and a request may be passive from the
+start (a folder that is complete but should keep growing while the pass runs). A row whose key (`key_of`) no
+request matches can create a passive request on first sight (`discover`). Passive rows are only taken while the
+request is *aligned*, i.e. its position was carried through every earlier row group, by a known count or by
+reading it in this pass; a passive request that would have to skip an unread row group or file is detached for
+the rest of the pass, so a folder fed passively is always a contiguous prefix of its source order. With
+`key_of`, a fully decoded row group records the rows of *every* key in the index (`group_counts`) and
+`full_counts[file]` says how many leading groups of a file were classified that way, so a key absent from those
+groups has a known count of zero there; that is what lets a passive request align on a later pass.
 
 Hub access goes through :func:`repo_listing`, :func:`resolve_revision`, :func:`paths_info`, :func:`hub_download`
 and :func:`open_remote` (stubbed by the tests) or the callables of a :class:`HubFetcher`, which also holds the
@@ -45,7 +57,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,8 +94,10 @@ HUB_REQUEST_TIMEOUT = 30.0  # seconds to connect, and between two reads, of any 
 def configure_hub_http() -> None:
     """
     Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
-    The library passes its own, shorter timeouts to range reads and cache downloads; the repo listing and the size
-    lookup (HfApi.dataset_info / get_paths_info) rely on the client's, which is unset by default.
+    The library passes its own, shorter timeouts to range reads and cache downloads; the size lookup
+    (HfApi.get_paths_info) relies on the client's, which is unset by default. The repo listing
+    (:func:`repo_listing`) gets the timeout as an explicit argument instead: HfApi.dataset_info passes its own
+    default timeout=None down to the client, and an explicit None disables the client's timeout in httpx.
     """
 
     from huggingface_hub import get_session
@@ -102,7 +116,7 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
     from huggingface_hub import HfApi
 
     configure_hub_http()
-    info = HfApi(token=token).dataset_info(repo_id, revision=revision)
+    info = HfApi(token=token).dataset_info(repo_id, revision=revision, timeout=HUB_REQUEST_TIMEOUT)
     if info.sha is None:
         raise RuntimeError(f"{repo_id}@{revision or 'main'}: the Hub returned no commit hash for the listing")
     return [sibling.rfilename for sibling in info.siblings or []], str(info.sha)
@@ -193,6 +207,9 @@ class FileIndex:
     row_groups: dict[str, list[int]] = field(default_factory=dict)  # parquet file -> rows per row group
     # key -> parquet file -> matching rows per row group, for the prefix of row groups read so far under `key`
     group_counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    # parquet file -> leading row groups whose rows were all classified by key (`record_group_keys`): a key with
+    # a shorter `group_counts` prefix had zero rows in the groups it lacks (`known_group_counts` fills them in)
+    full_counts: dict[str, int] = field(default_factory=dict)
     resolved_revision: str | None = None  # commit hash the file list was taken at (None: pre-recording index file)
     path: Path | None = None  # where the index is persisted (None: in memory)
     clock: Callable[[], float] = field(default=time.monotonic, repr=False, compare=False)  # injected by tests
@@ -218,14 +235,18 @@ class FileIndex:
             return index
         with _OPEN_INDEXES_LOCK:
             cached = _OPEN_INDEXES.get(path)
-            if cached is not None:
-                index = cached
-            elif path.is_file():
+        if cached is not None:
+            index = cached
+        else:
+            # the Hub round-trip (the listing, or the revision check of a loaded index) runs outside the lock: one
+            # stalled request must not hold up every other open of the process
+            if path.is_file():
                 index = cls._load(repo_id, revision, pattern, path)
                 index._check_revision(token)
             else:
                 index = cls._from_repo_listing(repo_id, revision, pattern, path, token)
-            _OPEN_INDEXES[path] = index
+            with _OPEN_INDEXES_LOCK:
+                index = _OPEN_INDEXES.setdefault(path, index)  # another thread may have published it meanwhile
         index.ensure_sizes(token)
         index.save()
         return index
@@ -247,6 +268,7 @@ class FileIndex:
             sizes=data.get("sizes", {}),
             row_groups=data.get("row_groups", {}),
             group_counts=data.get("group_counts", {}),
+            full_counts=data.get("full_counts", {}),
             resolved_revision=data.get("resolved_revision"),
             path=path,
         )
@@ -267,11 +289,16 @@ class FileIndex:
             self.resolved_revision = current  # one-time upgrade of a pre-recording index; persisted by open()'s save
             return
         if self.resolved_revision != current:
+            # Both ways out re-download the source: `revision` is part of the raw fingerprint, so pinning it marks
+            # the raw folder stale (the repair step deletes and downloads it again after confirmation); re-listing
+            # at the new head needs the raw folder deleted as well, its offsets were counted against the old listing.
             raise RuntimeError(
                 f"{self.repo_id}: the file index was built at revision {self.resolved_revision} but the repo now "
-                f"resolves to {current}. Pin `revision: {self.resolved_revision}` in the source config to keep "
-                f"going reproducibly (the raw data downloaded so far stays valid), or delete {self.path} (and "
-                f"consider the source's raw folder, its offsets were counted against the old listing) to re-sync."
+                f"resolves to {current}. Either way the source's raw folder is downloaded again: pin "
+                f"`revision: {self.resolved_revision}` in the source config to keep the listed commit (revision is "
+                f"part of the raw fingerprint, so raw/<source> becomes stale and the repair step re-downloads it "
+                f"after confirmation), or delete {self.path} together with the source's raw folder to re-list at "
+                f"{current} (the raw offsets were counted against the old listing)."
             )
 
     @classmethod
@@ -333,6 +360,7 @@ class FileIndex:
             "sizes": self.sizes,
             "row_groups": self.row_groups,
             "group_counts": self.group_counts,
+            "full_counts": self.full_counts,
         }
         with write_atomically(self.path) as tmp:
             tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
@@ -354,12 +382,19 @@ class FileIndex:
 
     def count(self, key: str | None, file: str) -> int | None:
         """
-        Known row count of file (key=None: all rows; else the keyed_counts[key] counter), or None.
+        Known row count of file (key=None: all rows; else the keyed_counts[key] counter, or the sum over
+        the row groups when every group of the file was classified by key, :attr:`full_counts`), or None.
         """
 
         if key is None:
             return self.row_counts.get(file)
-        return self.keyed_counts.get(key, {}).get(file)
+        known = self.keyed_counts.get(key, {}).get(file)
+        if known is not None:
+            return known
+        groups = self.row_groups.get(file)
+        if groups is not None and self.full_counts.get(file, 0) >= len(groups):
+            return sum(self.known_group_counts(key, file))
+        return None
 
     def record_count(self, key: str | None, file: str, value: int) -> None:
         """
@@ -387,12 +422,17 @@ class FileIndex:
     def known_group_counts(self, key: str | None, file: str) -> list[int]:
         """
         Rows per row group of file that count towards key (key=None: the footer's row counts; else the
-        matching rows of the row groups already read under key, a prefix of the file's groups).
+        matching rows of the row groups already read under key, a prefix of the file's groups, extended with
+        zeros up to :attr:`full_counts` [file]: groups classified by key in which key did not occur).
         """
 
         if key is None:
             return self.row_groups.get(file, [])
-        return self.group_counts.get(key, {}).get(file, [])
+        prefix = list(self.group_counts.get(key, {}).get(file, []))
+        classified = self.full_counts.get(file, 0)
+        if len(prefix) < classified:
+            prefix.extend([0] * (classified - len(prefix)))
+        return prefix
 
     def record_group_counts(self, key: str, file: str, groups: list[int]) -> None:
         """
@@ -404,6 +444,49 @@ class FileIndex:
 
         with self._lock:
             self.group_counts.setdefault(key, {})[file] = list(groups)
+
+    def record_group_keys(self, file: str, group: int, counts: dict[str, int]) -> None:
+        """
+        Store the rows of every key of a row group decoded completely under a `key_of` function: each key's
+        prefix grows by the group when it ends right before it (zeros first for the classified groups it lacks,
+        :attr:`full_counts`), keys with a prefix ending at group but absent from it get a 0, and full_counts
+        advances when group continues the classified prefix. In memory; saved on the clock / at the end.
+        """
+
+        with self._lock:
+            classified = self.full_counts.get(file, 0)
+            for key, matching in counts.items():
+                prefix = list(self.group_counts.get(key, {}).get(file, []))
+                if len(prefix) < group <= classified:
+                    prefix.extend([0] * (group - len(prefix)))
+                if len(prefix) == group:
+                    prefix.append(matching)
+                    self.group_counts.setdefault(key, {})[file] = prefix
+            for key, per_file in self.group_counts.items():
+                absent = per_file.get(file)
+                if absent is not None and len(absent) == group and key not in counts:
+                    absent.append(0)
+            if classified == group:
+                self.full_counts[file] = group + 1
+
+    def record_complete_file_counts(self, file: str, keys: Iterable[str] = ()) -> None:
+        """
+        Record the keyed file count of every key whose per-group prefix covers the whole file (a read that
+        went through the last row group made it complete), keys included (request keys that may never have
+        occurred: their prefix is all synthesised zeros); saved on the clock.
+        """
+
+        groups = self.row_groups.get(file)
+        if groups is None:
+            return
+        with self._lock:
+            for key in [*self.group_counts, *keys]:
+                if file in self.keyed_counts.get(key, {}):
+                    continue
+                prefix = self.known_group_counts(key, file)
+                if len(prefix) == len(groups):
+                    self.keyed_counts.setdefault(key, {})[file] = sum(prefix)
+            self._write_if_due()
 
 
 def glob_regex(pattern: str) -> re.Pattern[str]:
@@ -432,7 +515,10 @@ def glob_regex(pattern: str) -> re.Pattern[str]:
             if end == -1:
                 parts.append(re.escape(char))
             else:
-                parts.append("[" + pattern[i + 1 : end].replace("\\", "\\\\") + "]")
+                body = pattern[i + 1 : end].replace("\\", "\\\\")
+                if body[:1] in ("!", "^"):
+                    body = "^" + body[1:]  # a glob negation ([!a]); copied literally, ! would only match itself
+                parts.append("[" + body + "]")
                 i = end
         else:
             parts.append(re.escape(char))
@@ -686,11 +772,26 @@ def _json_lines_batches(handle: BinaryIO, name: str, skip: int, columns: list[st
         yield [row]
 
 
+def _json_gz_batches(handle: BinaryIO, name: str, skip: int, columns: list[str] | None, batch_size: int) -> Iterator[RowBatch]:
+    """
+    :data:`FORMAT_READERS` entry for .json.gz, which Hub repos use for both shapes: a JSON array (`[` as the
+    first non-blank byte, read like a .json) or json lines (read like a .jsonl.gz). One row per batch, as above.
+    """
+
+    with gzip.GzipFile(fileobj=handle, mode="rb") as decompressed:
+        if decompressed.peek(64).lstrip().startswith(b"["):
+            rows = iter_json_array(cast(BinaryIO, decompressed), name, skip)
+        else:
+            rows = _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
+        for row in rows:
+            yield [row]
+
+
 FORMAT_READERS: dict[str, FormatReader] = {
     ".parquet": _parquet_batches,
     ".jsonl.zst": _json_lines_batches,
     ".jsonl.gz": _json_lines_batches,
-    ".json.gz": _json_lines_batches,
+    ".json.gz": _json_gz_batches,
     ".jsonl": _json_lines_batches,
     ".json": _json_array_batches,
 }
@@ -777,7 +878,7 @@ def _iter_json_lines(handle: BinaryIO, fmt: str, skip: int) -> Iterator[Row]:
 
         with zstandard.ZstdDecompressor().stream_reader(handle, closefd=False) as decompressed:
             yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
-    elif fmt in (".jsonl.gz", ".json.gz"):
+    elif fmt == ".jsonl.gz":
         with gzip.GzipFile(fileobj=handle, mode="rb") as decompressed:
             yield from _parse_json_lines(io.TextIOWrapper(decompressed, encoding="utf-8"), skip)
     else:  # plain .jsonl
@@ -813,6 +914,10 @@ class ReadRequest:
     first offset such rows skipped. key is where the index records the per-file / per-row-group counts of
     matching rows (keyed_counts[key] / group_counts[key]); a request with match but no key records nothing
     and cannot skip files. name tags the rows it receives.
+
+    A passive request (count 0 by convention; it is ignored) never causes a file or row group to be read: it takes
+    the matching rows of every remote parquet row group the active requests read anyway, for as long as it is
+    aligned (module docstring), and ends with the pass.
     """
 
     name: str
@@ -820,6 +925,11 @@ class ReadRequest:
     count: int
     key: str | None = None
     match: RowFilter | None = None
+    passive: bool = False
+
+
+KeyOf = Callable[[Row, str], str]  # the key of a row of a file (`language=<value>`), for the all-key counts and discovery (row, file)
+Discover = Callable[[str], "ReadRequest | None"]  # a passive request for a key no request matches, or None to ignore the key
 
 
 @dataclass
@@ -829,11 +939,15 @@ class _Cursor:
 
     remaining_skip counts rows still to skip before the first yielded row (plain rows without match,
     matching rows with it); it carries across files (a file with fewer matching rows than the skip only shrinks it).
+    passive cursors (a passive request, or an active one that reached its count and reads on) only take rows
+    from row groups read for active cursors; detached is the sticky "lost alignment" state of a passive cursor.
     """
 
     request: ReadRequest
     remaining_skip: int
     taken: int = 0  # rows yielded so far
+    passive: bool = False
+    detached: bool = False
 
     @property
     def name(self) -> str:
@@ -855,6 +969,22 @@ class _Cursor:
     @property
     def satisfied(self) -> bool:
         return self.taken >= self.request.count
+
+    @property
+    def active(self) -> bool:
+        """
+        Still makes files and row groups be read: not passive and short of its count.
+        """
+
+        return not self.passive and not self.satisfied
+
+    @property
+    def collecting(self) -> bool:
+        """
+        A passive cursor still aligned with the pass.
+        """
+
+        return self.passive and not self.detached
 
     def wants(self, row: Row) -> bool:
         return self.match is None or self.match(row)
@@ -892,6 +1022,27 @@ class _Cursor:
         if self.request.key is None:
             return []
         return index.known_group_counts(self.request.key, file)
+
+
+def _cursor(request: ReadRequest) -> _Cursor:
+    return _Cursor(request=request, remaining_skip=request.offset, passive=request.passive)
+
+
+@dataclass
+class _Pass:
+    """
+    The shared state of one :func:`read_rows_multi` call: every cursor (discovered ones are appended while a
+    file is read), the key function and the discovery callback, and the keys already seen (matched by a
+    request, discovered, or declined by discover).
+    """
+
+    cursors: list[_Cursor]
+    key_of: KeyOf | None
+    discover: Discover | None
+    known_keys: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.known_keys.update(cursor.request.key for cursor in self.cursors if cursor.request.key is not None)
 
 
 def read_rows(
@@ -942,28 +1093,46 @@ def read_rows_multi(
     fetcher: HubFetcher | None = None,
     columns: list[str] | None = None,
     align_to_row_group: bool = True,
+    key_of: KeyOf | None = None,
+    discover: Discover | None = None,
 ) -> Iterator[tuple[str, Row]]:
     """
     Serve several :class:`ReadRequest` in one pass over the index's files: every file and every parquet row
     group is opened / read at most once and each row is handed to every request that wants it, as
-    (request.name, row) pairs. A file or row group is skipped when no request that still needs rows has to look
-    at it (each request seeks by its own known counts, see :func:`read_rows`); a request that reached its
-    count stops taking rows (at the end of the current remote row group with align_to_row_group) while the
-    others read on, and the pass ends when every request is satisfied or the files are exhausted. Everything else
-    (count semantics, what gets recorded in the index, columns) is as for :func:`read_rows`, per request.
+    (request.name, row) pairs. A file or row group is skipped when no active request has to look at it (each
+    request seeks by its own known counts, see :func:`read_rows`), and the pass ends when every active request is
+    satisfied or the files are exhausted. Everything else (count semantics, what gets recorded in the index,
+    columns) is as for :func:`read_rows`, per request.
+
+    A request that reached its count in a remote parquet file (align_to_row_group) turns passive and, like a
+    request passive from the start, keeps taking the rows it matches from the row groups the pass still reads,
+    while aligned (module docstring; a passive request that would have to skip an unread row group or file is
+    detached for the rest of the pass, and a file that is not parquet detaches every passive request). key_of
+    gives the key of any row (called with the row and the file it came from): every fully decoded row group then
+    records the rows of every key
+    (:meth:`FileIndex.record_group_keys`), and a row whose key no request carries is offered to discover once,
+    which may answer with a passive request for that key (its offset is the caller's business); the new
+    request joins the pass at that row group if it is aligned there, else it is detached at once. The requests
+    must have distinct names (the counts recorded per file are keyed by them).
     """
 
     if fetcher is None:
         fetcher = HubFetcher(token=token)
-    cursors = [_Cursor(request=request, remaining_skip=request.offset) for request in requests if request.count > 0]
+    if discover is not None and key_of is None:
+        raise ValueError("discover needs key_of")
+    names = [request.name for request in requests]
+    if len(set(names)) != len(names):  # the per-request counts are keyed by name: a shared name records a wrong count
+        raise ValueError(f"read_rows_multi needs distinct request names, got {names}")
+    state = _Pass([_cursor(request) for request in requests if request.passive or request.count > 0], key_of, discover)
 
     try:
-        for file in index.files:
-            readers = [cursor for cursor in cursors if not cursor.satisfied]
-            if not readers:
+        for position, file in enumerate(index.files):
+            active = [cursor for cursor in state.cursors if cursor.active]
+            if not active:
                 return
-            readers = [cursor for cursor in readers if not _skip_file_if_count_known(index, cursor, file)]
-            if not readers:
+            active = [cursor for cursor in active if not _skip_file_if_count_known(index, cursor, file)]
+            if not active:
+                _skip_file_passively(index, state, file)
                 continue
             fmt = file_format(file)
             if on_file is not None:
@@ -974,16 +1143,23 @@ def read_rows_multi(
                     if index.row_groups.get(file) is None:
                         index.record_row_groups(file, parquet_row_groups(parquet))  # the footer told us the row count
                     # a plain request may find that the whole file lies before its offset after all (footer only)
-                    readers = [
-                        cursor for cursor in readers if cursor.match is not None or not _skip_file_if_count_known(index, cursor, file)
+                    active = [
+                        cursor for cursor in active if cursor.match is not None or not _skip_file_if_count_known(index, cursor, file)
                     ]
-                    if not readers:
+                    if not active:
+                        _skip_file_passively(index, state, file)
                         continue
+                    collecting = [
+                        cursor for cursor in state.cursors if cursor.collecting and not _skip_file_if_count_known(index, cursor, file)
+                    ]
                     is_remote = not fetcher.uses_cache(index.sizes[file])
                     finish_group = align_to_row_group and is_remote
-                    yield from _parquet_rows(parquet, index, file, readers, columns, finish_group)
+                    yield from _parquet_rows(parquet, index, position, file, active + collecting, columns, finish_group, state)
                 else:
-                    yield from _stream_rows(handle, index, file, readers, columns)
+                    for cursor in state.cursors:  # passive rows come from parquet row groups only
+                        if cursor.collecting:
+                            cursor.detached = True
+                    yield from _stream_rows(handle, index, file, active, columns)
     finally:
         index.save()  # the row-group counts recorded in memory while reading
 
@@ -1000,6 +1176,16 @@ def _skip_file_if_count_known(index: FileIndex, cursor: _Cursor, file: str) -> b
     return cursor.skip_whole(known)
 
 
+def _skip_file_passively(index: FileIndex, state: _Pass, file: str) -> None:
+    """
+    A file no active cursor opens: a collecting cursor passes it by its known count or loses alignment.
+    """
+
+    for cursor in state.cursors:
+        if cursor.collecting and not _skip_file_if_count_known(index, cursor, file):
+            cursor.detached = True
+
+
 @dataclass
 class _ParquetReader:
     """
@@ -1010,7 +1196,35 @@ class _ParquetReader:
     known_group_counts: list[int]  # (matching) rows per row group, the prefix known so far
     first_group: int  # the first row group this request has to read (earlier ones were skipped by known counts)
     matched_in_group: int = 0
-    reading: bool = True  # False once the request stopped taking rows from this file
+    reading: bool = True  # False once an active request stopped taking rows from this file
+    next_group: int = 0  # passive: the row group its position lies at the start of or inside; it must be the next one decoded
+
+    @classmethod
+    def for_cursor(cls, cursor: _Cursor, index: FileIndex, file: str) -> _ParquetReader:
+        """
+        Position cursor inside file: skip the leading row groups its known counts cover.
+        """
+
+        known = list(cursor.known_group_counts(index, file))
+        first_group = 0
+        for rows_in_group in known:
+            if not cursor.skip_whole(rows_in_group):
+                break
+            first_group += 1
+        return cls(cursor, known, first_group, next_group=first_group)
+
+    @property
+    def active(self) -> bool:
+        return self.reading and self.cursor.active
+
+    @property
+    def taking(self) -> bool:
+        """
+        Takes rows from the group being decoded: an active reader that has not stopped inside the file (it
+        finishes the group it reached its count in), or a collecting passive one.
+        """
+
+        return self.cursor.collecting if self.cursor.passive else self.reading
 
     def finished_group(self, index: FileIndex, file: str, group: int) -> None:
         """
@@ -1026,42 +1240,55 @@ class _ParquetReader:
 def _parquet_rows(
     parquet: pq.ParquetFile,
     index: FileIndex,
+    position: int,
     file: str,
     cursors: list[_Cursor],
     columns: list[str] | None,
     finish_group: bool,
+    state: _Pass,
 ) -> Iterator[tuple[str, Row]]:
     """
-    Rows of one parquet file for several requests: a row group is read (once) when at least one request needs
-    it, row groups that every request skips by its known counts are never read. With finish_group a request
-    that reaches count still takes the rest of the row group. Keyed requests record the matching rows of every
-    row group they read completely; a request that reads the file to its end records the file's count.
+    Rows of one parquet file for several requests: a row group is read (once) when at least one active
+    request needs it, row groups that every active request skips by its known counts are never read. With
+    finish_group a request that reaches count still takes the rest of the row group and then turns passive.
+    Passive cursors take rows from a decoded group only when it is the one their position lies in (`next_group`);
+    one whose next group is skipped is detached. Keyed requests record the matching rows of every row group they
+    read completely, or, with the pass's key_of, every key of every completely decoded group is recorded and
+    unknown keys are offered to discover; a request that reads the file to its end records the file's count.
     """
 
     groups = index.row_groups[file]  # rows per row group, from the footer
-    readers: list[_ParquetReader] = []
-    for cursor in cursors:
-        known = list(cursor.known_group_counts(index, file))
-        first_group = 0
-        for rows_in_group in known:
-            if not cursor.skip_whole(rows_in_group):
-                break
-            first_group += 1
-        readers.append(_ParquetReader(cursor, known, first_group))
+    readers = [_ParquetReader.for_cursor(cursor, index, file) for cursor in cursors]
+    if not any(reader.active for reader in readers):
+        return
+    run_start = min(reader.first_group for reader in readers if reader.active)
 
-    for group in range(min(reader.first_group for reader in readers), len(groups)):
-        participants = [reader for reader in readers if reader.reading and reader.first_group <= group]
+    for group in range(run_start, len(groups)):
+        participants = [reader for reader in readers if reader.active and reader.first_group <= group]
+        _detach_passed(readers, group)
         if not participants:
-            if not any(reader.reading for reader in readers):
-                return
+            if not any(reader.active for reader in readers):
+                break
             continue  # the group lies before the first group of every request still reading
+        participants.extend(reader for reader in readers if reader.cursor.collecting and reader.next_group == group)
 
         for reader in participants:
             reader.matched_in_group = 0
+        counts: dict[str, int] = {}
+        complete = True
         for row in read_row_group(parquet, group, columns):
+            if state.key_of is not None:
+                key = state.key_of(row, file)
+                counts[key] = counts.get(key, 0) + 1
+                if key not in state.known_keys:
+                    discovered = _discover(state, key, index, position, file, group, run_start)
+                    if discovered is not None:
+                        readers.append(discovered)
+                        if discovered.next_group == group:
+                            participants.append(discovered)
             for reader in participants:
                 cursor = reader.cursor
-                if not reader.reading or not cursor.wants(row):
+                if not reader.taking or not cursor.wants(row):
                     continue
                 reader.matched_in_group += 1
                 if cursor.remaining_skip > 0:
@@ -1069,37 +1296,94 @@ def _parquet_rows(
                     continue
                 yield cursor.name, dict(row)
                 cursor.taken += 1
-                if cursor.satisfied and not finish_group:
+                if cursor.satisfied and not cursor.passive and not finish_group:
                     reader.reading = False  # stopped in the middle of the group: its count stays unknown
-            if not any(reader.reading for reader in participants):
+            if not any(reader.taking for reader in participants):
+                complete = False
                 break  # every request that wanted this group stopped inside it: leave the rest of it undecoded
 
-        is_last_group = group == len(groups) - 1
+        if complete:
+            if state.key_of is None:
+                for reader in participants:
+                    if reader.taking:
+                        reader.finished_group(index, file, group)
+            else:
+                index.record_group_keys(file, group, counts)
         for reader in participants:
-            if not reader.reading:
-                continue
-            reader.finished_group(index, file, group)
-            if reader.cursor.satisfied and not is_last_group:
-                reader.reading = False  # done; later row groups of this file were not read
-        if not any(reader.reading for reader in readers):
-            return
+            cursor = reader.cursor
+            if cursor.collecting:
+                reader.next_group = group + 1
+            elif reader.reading and cursor.satisfied:
+                reader.reading = False
+                if finish_group:  # the group was taken whole: the position is its end, the request reads on passively
+                    cursor.passive = True
+                    reader.next_group = group + 1
+        if not any(reader.active for reader in readers):
+            break
 
-    # Requests still reading went through the last group (or skipped every group by known counts): the file's
-    # matching rows are known now.
+    # Requests that went through the last group (or skipped every group by known counts) know the file's
+    # matching rows now; with key_of every key with a complete prefix does.
+    if state.key_of is not None:
+        index.record_complete_file_counts(file, [key for key in (reader.cursor.record_key for reader in readers) if key is not None])
+        return
     for reader in readers:
         record_key = reader.cursor.record_key
-        if reader.reading and record_key is not None:
+        went_through = reader.active or (reader.cursor.passive and reader.next_group == len(groups))
+        if went_through and record_key is not None and len(reader.known_group_counts) == len(groups):
             index.record_count(record_key, file, sum(reader.known_group_counts))
+
+
+def _detach_passed(readers: list[_ParquetReader], group: int) -> None:
+    """
+    A collecting cursor whose next group lies before group missed a row group the pass did not decode.
+    """
+
+    for reader in readers:
+        if reader.cursor.collecting and reader.next_group < group:
+            reader.cursor.detached = True
+
+
+def _discover(state: _Pass, key: str, index: FileIndex, position: int, file: str, group: int, run_start: int) -> _ParquetReader | None:
+    """
+    Offer a key no request carries to discover (once). A returned passive request becomes a cursor of the
+    pass; it joins the row group being decoded if it is aligned there: every earlier file passes by its known
+    count and its known counts in this file position it at run_start or later (the groups from there to this
+    one were decoded in this pass without the key, else it would have been discovered earlier); a position past
+    this group waits for its group like any passive reader. Otherwise the cursor is detached at once and stays
+    in the pass's list so the caller sees it.
+    """
+
+    state.known_keys.add(key)
+    if state.discover is None:
+        return None
+    request = state.discover(key)
+    if request is None:
+        return None
+    if not request.passive or request.key != key or request.match is None:
+        raise ValueError(f"discover must return a passive request keyed {key!r} with a match, got {request!r}")
+    cursor = _cursor(request)
+    state.cursors.append(cursor)
+    for earlier in index.files[:position]:
+        if not _skip_file_if_count_known(index, cursor, earlier):
+            cursor.detached = True
+            return None
+    reader = _ParquetReader.for_cursor(cursor, index, file)
+    if reader.first_group < run_start:
+        cursor.detached = True
+        return None
+    reader.next_group = max(reader.first_group, group)
+    return reader
 
 
 def _stream_rows(
     handle: BinaryIO, index: FileIndex, file: str, cursors: list[_Cursor], columns: list[str] | None = None
 ) -> Iterator[tuple[str, Row]]:
     """
-    Rows of one non-parquet file for several requests, each exactly up to its count and projected to
+    Rows of one non-parquet file for several active requests, each exactly up to its count and projected to
     columns; the stream is dropped as soon as every request is satisfied. The file is decoded from its first row
     (a stream has no cheap way to skip, and only a full read tells how many rows it holds), so a file read to its end
-    records its row count and, for every keyed request that read it through, its matching rows.
+    records its row count and, for every keyed request that read it through, its matching rows. Passive requests
+    take nothing here (the caller detaches them).
     """
 
     reading = list(cursors)

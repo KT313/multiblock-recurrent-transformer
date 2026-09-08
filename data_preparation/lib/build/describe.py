@@ -4,16 +4,17 @@ prepare.py describe: render a dataset config as a Markdown document (docs/data_m
 with it, so the documentation of the thesis mixture cannot drift from config/datasets/crow_300m_final.yaml).
 
 Pure function of the config file: tokenizer, sequence length and processing defaults, one table per stage (weights,
-derived token budgets and sequence counts), the validation split per source and the source registry. The leading
-comment block of the YAML file (the lines starting with # before the first key) is rendered as the "Notes"
+derived token budgets and estimated row counts), the validation split per source and the source registry. The
+leading comment block of the YAML file (the lines starting with # before the first key) is rendered as the "Notes"
 section, so config-specific remarks live next to the config. Per-source budgets are the planner's arithmetic
-(DatasetConfig.sequence_budget: the integral of the weight schedule over the run); the per-stage tables show
-stage.tokens × weight; the rows-per-stage column is an estimate from describe_tokens_per_row (which
-nothing else uses).
+(DatasetConfig.token_budget: the integral of the weight schedule over the run, and DatasetConfig.rows_budget at the
+describe_tokens_per_row estimate); the per-stage tables show stage.tokens × weight and the rows that many tokens
+are at the estimate.
 """
 
 from __future__ import annotations
 
+from fractions import Fraction
 from math import ceil
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
 
     config_file = Path(config_path).as_posix()
     lines: list[str] = [
-        f"# Dataset `{config.name}`",
+        f"# Dataset `{Path(config_path).stem}`",
         "",
         f"Generated from `{config_file}` with",
         "",
@@ -39,10 +40,14 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
         "```",
         "",
         "Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the",
-        "config times the stage weights; sequences are those tokens divided by `block_size` (what the training loader",
-        "draws and what the planner sizes downloads with). The weights mix rows, not tokens: a row shorter than",
-        "`block_size` realises fewer tokens than its sequence, so the last column estimates the tokens actually trained on",
-        "from `describe_tokens_per_row` (a per-source estimate nothing but this document uses).",
+        "config times the stage weights; the training loader packs rows end to end, so a",
+        "source is consumed by the token length of its rows. The training stream realises the weights as token shares by",
+        "filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/step.py`;",
+        "equal deficits go to the alphabetically smallest source name, so the order of the `sources:` block below never",
+        "changes the stream).",
+        "The rows columns estimate how many rows that is from",
+        "`describe_tokens_per_row` (the rate the planner sizes the first download with, clamped at the training length; the",
+        "downloaded shards then measure the real one).",
         "",
     ]
     if notes.strip():
@@ -84,11 +89,11 @@ def _general(config: DatasetConfig) -> list[str]:
         "## Tokenizer, sequence length and token counting",
         "",
         f"- tokenizer: {_tokenizer_label(config.tokenizer)}",
-        f"- `max_seq_length`: {config.max_seq_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
-        f"- `block_size`: {config.block_size} (training sequence length; the run config must use the same value)",
+        f"- `training_target_sequence_length`: {config.training_target_sequence_length} (the run trains at this length: a row counts min(its tokens, this) towards the budget)",
+        f"- `dataset_max_sequence_length`: {config.dataset_max_sequence_length} (pretrain rows are truncated to this many tokens when downloaded, longer instruct rows are dropped)",
         f"- `token_count`: {token_count}",
         f"- `validation_fraction`: {config.validation_fraction:.0%} of a source used for training and validation is held out",
-        f"- training tokens over all stages: {_tokens(total_tokens)} ({_sequences(total_tokens, config.block_size)} sequences)",
+        f"- training tokens over all stages: {_tokens(total_tokens)}",
         "",
         "## Processing defaults",
         "",
@@ -112,7 +117,7 @@ def _tokenizer_label(tokenizer: TokenizerConfig) -> str:
 
 def _processing_lines(processing: ProcessingConfig) -> list[str]:
     return [
-        f"- length filter: {processing.min_chars} <= chars (pretrain only; rows are cut at `max_seq_length` tokens when downloaded)",
+        f"- length filter: {processing.min_chars} <= chars (pretrain only; rows are cut at `dataset_max_sequence_length` tokens when downloaded)",
         f"- dedup: {_dedup_label(processing)}",
         f"- quality filter: {_yn(processing.quality_filter)}",
         f"- decontamination: {_decontamination_label(processing)}",
@@ -143,17 +148,13 @@ def _stages(config: DatasetConfig) -> list[str]:
         lines += [
             f"### Stage {index + 1}: `{stage.name}` ({_tokens(stage.tokens)} tokens, transition {stage.transition_pct:.0%})",
             "",
-            "| Train source | Weight | Tokens | Sequences | Tokens/row (est.) | Realised tokens (est.) |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| Train source | Weight | Tokens | Tokens/row (est.) | Rows (est.) |",
+            "|---|---:|---:|---:|---:|",
         ]
         for name, weight in stage.train.items():
             tokens = stage.tokens * weight
-            tokens_per_row = config.sources[name].describe_tokens_per_row
-            realised = ceil(tokens / config.block_size) * min(tokens_per_row, config.block_size)
-            lines.append(
-                f"| `{name}` | {weight:.2%} | {_tokens(int(tokens))} | {_sequences(tokens, config.block_size)} | "
-                f"{tokens_per_row} | {_tokens(realised)} |"
-            )
+            rate = config.tokens_per_row_rate(name)
+            lines.append(f"| `{name}` | {weight:.2%} | {_tokens(int(tokens))} | {_rate(rate)} | {ceil(tokens / rate):,} |")
         validation = ", ".join(f"`{name}` at {weight:.0%}" for name, weight in stage.val.items())
         lines += ["", f"Validation: {validation}", ""]
     return lines
@@ -236,8 +237,8 @@ def _details(config: DatasetConfig, name: str) -> str:
     if source.check_limit is not None:
         parts.append(f"check_limit {source.check_limit:,}")
     if config.used_in_train(name):
-        budget = config.sequence_budget(name)
-        parts.append(f"budget {budget:,} sequences ({_tokens(budget * config.block_size)} tokens)")
+        rate = config.tokens_per_row_rate(name)
+        parts.append(f"budget {_tokens(config.token_budget(name))} tokens (~{config.rows_budget(name):,} rows at {_rate(rate)} tokens/row)")
     else:
         parts.append(f"rows {source.rows:,} (validation only)")
     if source.kind == "instruct":
@@ -250,12 +251,12 @@ def _details(config: DatasetConfig, name: str) -> str:
     return ", ".join(parts)
 
 
-def _sequences(tokens: float, block_size: int) -> str:
+def _rate(rate: Fraction) -> str:
     """
-    Sequences of block_size tokens, rounded up like the planner does: 1,611,329.
+    A tokens-per-row rate as the planner uses it: the estimate, clamped at the dataset length.
     """
 
-    return f"{ceil(tokens / block_size):,}"
+    return f"{float(rate):,.0f}"
 
 
 def _tokens(n: int) -> str:

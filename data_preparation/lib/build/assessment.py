@@ -5,7 +5,8 @@ One health verdict per processed/<source> folder, with the cheapest repair that 
 The repair step, the planner, the build's own resume and the training-side verifier all judge processed folders;
 :func:`assess_processed_folder` is the one place that knows what a processed folder can be, so they cannot
 disagree. Every verdict carries the cheapest repair: rebuild (delete the folder, the build writes it again;
-derived data, no confirmation) or nothing.
+derived data, so only a stale folder and an unreadable manifest ask for confirmation, lib/build/repair.py) or
+nothing.
 
 crash_leftover is the one anomaly whose repair is *nothing*: a build that crashes between publishing a shard
 and saving the manifest leaves exactly one unlisted file, data-{len(manifest.shards):05d}.parquet, the name the
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from data_preparation.dataset_config import DatasetConfig
+from data_preparation.dataset_config import DatasetConfig, describe_hash_change
 from data_preparation.layout import processed_columns
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name
@@ -33,7 +34,7 @@ ProcessedProblem = Literal[
     "unreadable_manifest",  # MANIFEST.json exists but cannot be parsed
     "no_manifest",  # shard files without a manifest
     "raw_deleted",  # the raw folder the shards were built from is being deleted
-    "stale",  # manifest hash != the config's processed hash, another stage's manifest, or other columns
+    "stale",  # manifest hash != the config's processed hash (the reason lists the changed fields), another stage's manifest, or other columns
     "broken_shard",  # a listed shard is missing, unreadable, or has the wrong row count
     "stray_shards",  # unlisted shard file(s) no resumed build would overwrite
     "raw_changed",  # input_shards is no longer a prefix of the raw shard list
@@ -62,8 +63,9 @@ class ProcessedAssessment:
     @property
     def repair(self) -> CheapestRepair:
         """
-        The cheapest repair that heals the folder: rebuild = delete it and build again (derived data, no
-        confirmation); nothing = healthy, not built yet, pending, or the resumed build heals it by itself.
+        The cheapest repair that heals the folder: rebuild = delete it and build again (derived data; the repair
+        step asks first only for a stale folder, whose reason lists what changed, and for an unreadable manifest);
+        nothing = healthy, not built yet, pending, or the resumed build heals it by itself.
         """
 
         return "rebuild" if self.problem in _REBUILD else "nothing"
@@ -104,7 +106,8 @@ def assess_processed_folder(
     if manifest.stage != "processed":
         return ProcessedAssessment("stale", f"stale: a {manifest.stage} manifest where a processed one belongs", manifest)
     if not manifest.is_current(config.processed_hash(name)):
-        return ProcessedAssessment("stale", "stale: processing settings, max_seq_length or the source changed", manifest)
+        changes = describe_hash_change(manifest.hash_payload, config.processed_hash_payload(name))
+        return ProcessedAssessment("stale", "stale: " + "; ".join(changes), manifest)
     if manifest.columns != list(processed_columns(config.sources[name].kind)):
         return ProcessedAssessment("stale", "stale: the shards predate the current columns", manifest)
     covered = manifest.input_shards

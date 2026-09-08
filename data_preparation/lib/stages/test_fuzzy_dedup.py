@@ -6,6 +6,7 @@ in-process) implementation on a synthetic corpus with planted near- and exact du
 
 from __future__ import annotations
 
+import os
 import random
 import sys
 from collections.abc import Iterator
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 
 from data_preparation.dataset_config import DedupConfig
+from data_preparation.lib.stages import fuzzy_dedup as fuzzy_dedup_module
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 
 
@@ -107,6 +109,28 @@ def test_rows_stream_before_input_is_exhausted(pass_workers: int) -> None:
 
 
 @needs_datasketch
+def test_interleaved_in_process_passes_keep_their_own_parameters() -> None:
+    """
+    Builds run in threads of one process (`lib/build/runner.py`), each with its own dedup settings: two
+    in-process passes advanced turn by turn must keep exactly the rows each keeps on its own.
+    """
+
+    docs = make_corpus()
+    settings = {ngram: DedupConfig(mode="minhash", threshold=0.8, num_perm=32, ngram=ngram) for ngram in (2, 200)}  # 200 > every doc: nothing signed
+    alone = {ngram: [r["i"] for r in fuzzy_dedup(_rows(docs), dedup, {})] for ngram, dedup in settings.items()}
+    assert alone[2] != alone[200]
+    passes = {ngram: fuzzy_dedup(_rows(docs), dedup, {}) for ngram, dedup in settings.items()}
+    together: dict[int, list[int]] = {ngram: [] for ngram in passes}
+    while passes:
+        for ngram, rows in list(passes.items()):
+            try:
+                together[ngram].append(next(rows)["i"])
+            except StopIteration:
+                del passes[ngram]
+    assert together == alone
+
+
+@needs_datasketch
 def test_rows_too_short_for_an_ngram_are_not_collapsed() -> None:
     rows = [{"text": t} for t in ("int main() {}", "SELECT * FROM users;", "hello world", "another short doc")]
     stats: dict[str, Any] = {}
@@ -119,6 +143,30 @@ def test_stats_and_empty_input() -> None:
     stats: dict[str, Any] = {}
     assert list(fuzzy_dedup(iter([]), DedupConfig(mode="minhash"), stats)) == []
     assert stats["near_duplicates_removed"] == 0 and "seconds" not in stats
+
+
+def _kill_the_worker(texts: list[str]) -> list[Any]:
+    """
+    A signature task that ends its worker process the way the OOM killer does (module level: the spawn child
+    imports this module to run it).
+    """
+
+    os._exit(9)
+
+
+@needs_datasketch
+@pytest.mark.timeout(60)
+def test_a_killed_signature_worker_is_a_named_error_not_a_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A worker killed mid-chunk (the OOM killer is what does this on a real source) leaves its result unfinished.
+    The pool must report that instead of waiting for it forever, which is what a `multiprocessing.Pool` does.
+    """
+
+    monkeypatch.setattr(fuzzy_dedup_module, "_signatures", _kill_the_worker)
+    dedup = DedupConfig(mode="minhash", threshold=0.8, num_perm=32)
+    rows = fuzzy_dedup(_rows(make_corpus()), dedup, {}, pass_workers=2, chunk_size=16)
+    with pytest.raises(RuntimeError, match="minhash signature worker died, likely OOM-killed"):
+        list(rows)
 
 
 def test_missing_datasketch_is_a_clear_import_error(monkeypatch: pytest.MonkeyPatch) -> None:

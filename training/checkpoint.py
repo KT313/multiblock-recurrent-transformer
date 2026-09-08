@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
@@ -36,7 +37,8 @@ class CheckpointMetadata:
     model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
-    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read per source + the draw RNG
+    source_rows: dict[str, int]  # `ResolvedDataset.source_rows`, {source: processed rows}; a resume refuses a changed count
+    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
 
     def to_state(self) -> dict[str, Any]:
         """
@@ -64,46 +66,60 @@ def checkpoint_dir(out_dir: str | Path) -> Path:
     return Path(out_dir) / CHECKPOINT_SUBDIR
 
 
-def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None) -> str:
+FAILED_SUFFIX = "-failed"  # the non-finite-loss checkpoint; `find_latest_checkpoint` never returns one
+
+
+def checkpoint_name(step: int, run_name: str, stage_end: Optional[int] = None, failed: bool = False) -> str:
     """
     `step-{step:08d}-{run_name}` plus `-stage-{i}_end` for the checkpoint written before a stage transition.
+
+    `failed` appends `-failed`: the checkpoint a non-finite step leaves behind, under a name of its own so it never
+    overwrites the regular checkpoint of the same step and no plain resume picks it up (`find_latest_checkpoint`).
     """
 
     name = f"step-{step:08d}-{run_name}"
     if stage_end is not None:
         name += f"-stage-{stage_end}_end"
+    if failed:
+        name += FAILED_SUFFIX
     return name + CHECKPOINT_SUFFIX
 
 
-def checkpoint_path(run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None) -> Path:
+def checkpoint_path(
+    run_directory: str | Path, run_name: str, step: int, stage_end: Optional[int] = None, failed: bool = False
+) -> Path:
     """
     `run_directory/checkpoints/<checkpoint_name>`; `stage_end` is `StageManager.stage_ending_at(step - 1)`.
     """
 
-    return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end)
+    return checkpoint_dir(run_directory) / checkpoint_name(step, run_name, stage_end, failed)
 
 
 def _step_from_name(path: Path) -> int:
     return int(path.name.split("-")[1])
 
 
-def find_latest_checkpoint(out_dir: str | Path, run_name: str) -> Optional[Path]:
+def find_latest_checkpoint(run_directory: str | Path, run_name: str) -> Optional[Path]:
     """
-    Highest-step checkpoint of `run_name` under `out_dir/checkpoints`, or None.
+    Most recently written checkpoint of `run_name` under `run_directory/checkpoints` (the step breaks ties), or None.
+
+    `-failed` checkpoints are not candidates: the run they belong to ended on a non-finite step and their data
+    stream is already past that step's documents, so continuing from one is a decision the user makes explicitly
+    with `resume_checkpoint_path`, never what a plain `resume: true` picks up.
     """
 
-    directory = checkpoint_dir(out_dir)
+    directory = checkpoint_dir(run_directory)
     pattern = re.compile(rf"^step-\d{{8}}-{re.escape(run_name)}(-stage-\d+_end)?{re.escape(CHECKPOINT_SUFFIX)}$")
     candidates = [path for path in directory.glob(f"step-*{CHECKPOINT_SUFFIX}") if pattern.match(path.name)]
     if not candidates:
         return None
-    return max(candidates, key=_step_from_name)
+    # the file time, not the step: after an explicit resume from an older checkpoint, a higher step of the
+    # abandoned trajectory must not win the next plain resume
+    return max(candidates, key=lambda path: (path.stat().st_mtime, _step_from_name(path)))
 
 
 # `restore_checkpoint_if_resuming` compares EVERY `Settings` field against the checkpoint (`allow_settings_change`
 # overrides), so a new field is checked until it is exempted here. Each group says why differing is harmless.
-# Not exempt on purpose: the evaluation settings (`eval_step_interval`, `eval_iters`, `partial_depth_eval`). Every
-# forward consumes the global torch RNG, so how often and how much validation runs changes the training stream.
 SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # run identity and output location: where results go, not what is computed
     "run_name",
@@ -111,7 +127,6 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # the resume feature's own knobs: they exist to differ between the original run and its resume
     "resume",
     "resume_checkpoint_path",
-    "resume_warmup_steps",
     # the override flags themselves: comparing them would make the escape hatches refuse their own use
     "allow_settings_change",
     "allow_dataset_change",
@@ -131,6 +146,11 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",
     "log_gradient_metrics",
+    # validation cadence and width: `evaluate` runs under `torch.random.fork_rng` (training/evaluation.py), so how
+    # often and how much validation runs leaves the training stream untouched; only the reported numbers change
+    "eval_step_interval",
+    "eval_iters",
+    "partial_depth_eval",
     # checkpoint cadence: when state is saved, not what it is
     "save_step_interval",
     "save_last_step",
@@ -140,6 +160,19 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "wandb_enabled",
     "export_to_hf",
     "export_hf_path",
+    # samples and benchmarks: RNG-isolated inference, files next to the checkpoints
+    "sample_step_interval",
+    "sample_at_training_progress",
+    "sample_max_new_tokens",
+    "sample_temperature",
+    "sample_recurrences",
+    "benchmark_step_interval",
+    "benchmark_at_training_progress",
+    "benchmark_tasks",
+    "benchmark_limit",
+    "benchmark_num_fewshot",
+    "benchmark_batch_size",
+    "benchmark_recurrences",
 )
 
 # Can never take effect on resume: the optimizer's parameter groups are restored from the checkpoint.
@@ -228,11 +261,53 @@ def load_training_checkpoint(
     """
     Load the model and optimizer state in place and return the checkpoint's metadata.
 
-    The metadata is read first, so a checkpoint of an older layout fails before anything is modified.
+    The metadata is read first, so a checkpoint of an older layout fails before anything is modified. The
+    optimizer's parameter-group hyperparameters must match the checkpoint's (`check_param_groups_unchanged`).
     """
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
     unwrap_compiled(model).load_state_dict(state["model"])
+    expected = _group_hyperparameters(optimizer)
     optimizer.load_state_dict(state["optimizer"])
+    check_param_groups_unchanged(expected, _group_hyperparameters(optimizer))
     return metadata
+
+
+UNCOMPARED_GROUP_KEYS = ("params", "lr")  # `lr` is rewritten by the schedule every step
+
+
+def _group_hyperparameters(optimizer: Optimizer) -> list[dict[str, Any]]:
+    return [
+        {key: _plain(value) for key, value in group.items() if key not in UNCOMPARED_GROUP_KEYS}
+        for group in optimizer.param_groups
+    ]
+
+
+def _plain(value: Any) -> Any:
+    return value.item() if isinstance(value, torch.Tensor) and value.numel() == 1 else value
+
+
+def check_param_groups_unchanged(expected: list[dict[str, Any]], loaded: list[dict[str, Any]]) -> None:
+    """
+    Fail when the optimizer state of a checkpoint carried other parameter-group hyperparameters than the current
+    `optim_config` built (`optimizer.load_state_dict` replaces them, so the checkpoint's would silently win).
+    """
+
+    if len(expected) != len(loaded):
+        raise ValueError(
+            f"resuming with a different number of optimizer parameter groups ({len(loaded)} in the checkpoint, "
+            f"{len(expected)} built); start a fresh run"
+        )
+    differing = [
+        f"group {index}: {key}: checkpoint {after.get(key)!r} != current {before.get(key)!r}"
+        for index, (before, after) in enumerate(zip(expected, loaded))
+        for key in sorted(before.keys() | after.keys())
+        if before.get(key) != after.get(key)
+    ]
+    if differing:
+        raise ValueError(
+            "resuming with changed optimizer hyperparameters: " + "; ".join(differing) + "; the optimizer state is "
+            "restored from the checkpoint and would silently keep the checkpoint's values; allow_settings_change "
+            "cannot override this; keep the checkpoint's optim_config or start a fresh run"
+        )

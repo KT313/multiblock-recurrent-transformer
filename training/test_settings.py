@@ -11,8 +11,15 @@ from typing import Any
 import pytest
 import yaml
 
+from model.blocks.recurrence import CHECKPOINT_MODES as MODEL_CHECKPOINT_MODES
+from training.lr_schedule import SCHEDULES as IMPLEMENTED_SCHEDULES
+from training.optim import OPTIMIZERS as BUILDABLE_OPTIMIZERS
 from training.settings import (
+    CHECKPOINT_MODES,
+    DEFAULT_BENCHMARK_TASKS,
+    LR_SCHEDULES,
     NON_NEGATIVE_SETTINGS,
+    OPTIMIZERS,
     POSITIVE_SETTINGS,
     REQUIRED_SETTINGS,
     OptimizerConfig,
@@ -23,6 +30,8 @@ from training.settings import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_YAML = REPO_ROOT / "config" / "tiny.yaml"
 CROW_YAML = REPO_ROOT / "config" / "crow_300m_final.yaml"
+V2_SMALL_YAML = REPO_ROOT / "config" / "v2_small.yaml"
+SHIPPED_RUN_CONFIGS = (TINY_YAML, CROW_YAML, V2_SMALL_YAML)
 TINY_DATASET_CONFIG = "config/datasets/tiny.yaml"
 TINY_MODEL_ARCHITECTURE = "config/model_architecture/tiny.yaml"
 
@@ -33,7 +42,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "resume": True,
     "seed": 233,
     "model_architecture_config": "config/model_architecture/crow_300m_final.yaml",
-    "block_size": 2048,
+    "training_max_sequence_length": 2048,
     "dataset_config": "config/datasets/crow_300m_final.yaml",
     "dataset_dir": "dataset",
     "auto_prepare": True,
@@ -42,11 +51,11 @@ CROW_EXPLICIT: dict[str, Any] = {
     "backend": "single_device",
     "precision": "bf16-mixed",
     "compile_model": True,
-    "gradient_checkpointing": False,
-    "micro_batch_size": 4,
-    "world_batch_size": 1024,
-    "sort_batches_by_length": True,
-    "sequence_padding_multiple": 128,
+    "gradient_checkpointing": "none",
+    "validation_batch_size": 4,
+    "validation_padding_multiple": 128,
+    "tokens_per_micro_batch": 8192,
+    "micro_batches_per_step": 256,
     "optimizer": "ELLISAdam",
     "optim_config": {
         "lr": 1e-4,
@@ -64,7 +73,6 @@ CROW_EXPLICIT: dict[str, Any] = {
     "warmup_steps": 64,
     "cooldown_steps": 64,
     "min_lr": 0.0,
-    "resume_warmup_steps": 8,
     "log_step_interval": 1,
     "log_gradient_metrics": True,
     "eval_step_interval": 16,
@@ -82,6 +90,8 @@ def _settings(**overrides: object) -> Settings:
         "dataset_config": TINY_DATASET_CONFIG,
         "model_architecture_config": TINY_MODEL_ARCHITECTURE,
         "stage_base_lrs": [1e-3],
+        "tokens_per_micro_batch": 8192,
+        "micro_batches_per_step": 4,
     }
     return Settings(**(base | overrides))  # type: ignore[arg-type]  # heterogeneous kwargs for a test helper
 
@@ -99,14 +109,15 @@ def _field_defaults() -> dict[str, Any]:
 def test_parse_tiny_yaml() -> None:
     cfg = parse_settings(["--config", str(TINY_YAML)])
     assert isinstance(cfg, Settings)
-    assert cfg.run_name == "tiny" and cfg.block_size == 256
+    assert cfg.run_name == "tiny" and cfg.training_max_sequence_length == 256
     assert cfg.model_architecture_config == TINY_MODEL_ARCHITECTURE and cfg.model_overwrite == {}
     assert cfg.dataset_config == TINY_DATASET_CONFIG and cfg.dataset_dir == "dataset"
     assert cfg.auto_prepare is True and cfg.prepare_num_workers == 1 and cfg.allow_dataset_change is False
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
     assert cfg.backend == "single_device" and cfg.precision == "bf16-mixed"
     assert cfg.resume is False and cfg.wandb_enabled is False
-    assert (cfg.micro_batch_size, cfg.world_batch_size) == (2, 4)
+    assert (cfg.validation_batch_size, cfg.validation_padding_multiple) == (2, 128)
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (512, 2)
     assert cfg.optimizer == "AdamW"
     assert cfg.optim_config == OptimizerConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95))
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.eval_step_interval, cfg.eval_iters) == (2, 2, 8, 2)
@@ -117,7 +128,7 @@ def test_parse_crow_yaml() -> None:
     cfg = parse_settings(["--config", str(CROW_YAML)])
     assert cfg.dataset_config == "config/datasets/crow_300m_final.yaml"
     assert cfg.stage_base_lrs == pytest.approx([3e-4, 1e-4, 5e-5])
-    assert cfg.block_size == 2048 and cfg.optimizer == "ELLISAdam"
+    assert cfg.training_max_sequence_length == 2048 and cfg.optimizer == "ELLISAdam"
     assert cfg.model_architecture_config == "config/model_architecture/crow_300m_final.yaml"
     assert (cfg.warmup_steps, cfg.cooldown_steps, cfg.save_step_interval, cfg.eval_step_interval) == (64, 64, 128, 16)
     assert not hasattr(cfg, "tokenizer_path") and not hasattr(cfg, "training_stages")
@@ -148,12 +159,12 @@ def test_crow_yaml_effective_values_are_unchanged() -> None:
     assert cfg.resume_checkpoint_path is None and cfg.export_hf_path is None
 
 
-def test_run_configs_reference_existing_architecture_and_dataset_configs() -> None:
-    for path in (TINY_YAML, CROW_YAML):
-        cfg = parse_settings(["--config", str(path)])
-        assert (REPO_ROOT / cfg.model_architecture_config).is_file(), cfg.model_architecture_config
-        assert (REPO_ROOT / cfg.dataset_config).is_file(), cfg.dataset_config
-        assert cfg.model_architecture_config.startswith("config/model_architecture/")
+@pytest.mark.parametrize("path", SHIPPED_RUN_CONFIGS, ids=lambda path: path.stem)
+def test_run_configs_reference_existing_architecture_and_dataset_configs(path: Path) -> None:
+    cfg = parse_settings(["--config", str(path)])
+    assert (REPO_ROOT / cfg.model_architecture_config).is_file(), cfg.model_architecture_config
+    assert (REPO_ROOT / cfg.dataset_config).is_file(), cfg.dataset_config
+    assert cfg.model_architecture_config.startswith("config/model_architecture/")
 
 
 def test_parse_without_model_architecture_config_is_rejected() -> None:
@@ -166,6 +177,20 @@ def test_validation_empty_model_architecture_config() -> None:
         _settings(model_architecture_config="")
 
 
+def test_gradient_checkpointing_is_a_mode() -> None:
+    assert CHECKPOINT_MODES == MODEL_CHECKPOINT_MODES  # the torch-free copy in the settings and the model's own
+    assert _settings().gradient_checkpointing == "none"
+    for mode in ("selective", "full"):
+        assert _settings(gradient_checkpointing=mode).gradient_checkpointing == mode
+        parsed = parse_settings(["--config", str(TINY_YAML), "--gradient_checkpointing", mode])
+        assert parsed.gradient_checkpointing == mode
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not 'bogus'"):
+        _settings(gradient_checkpointing="bogus")
+    for value in ("true", "false", "bogus"):  # the former bool and an unknown mode: rejected at parse time
+        with pytest.raises(SystemExit):
+            parse_settings(["--config", str(TINY_YAML), "--gradient_checkpointing", value])
+
+
 def test_cli_overrides_win_over_yaml() -> None:
     cfg = parse_settings(
         [
@@ -173,7 +198,7 @@ def test_cli_overrides_win_over_yaml() -> None:
             str(TINY_YAML),
             "--seed",
             "7",
-            "--micro_batch_size",
+            "--validation_batch_size",
             "4",
             "--partial_depth_eval",
             "[1, 2]",
@@ -193,7 +218,7 @@ def test_cli_overrides_win_over_yaml() -> None:
             "/data/x",
         ]
     )
-    assert cfg.seed == 7 and cfg.micro_batch_size == 4 and cfg.partial_depth_eval == [1, 2]
+    assert cfg.seed == 7 and cfg.validation_batch_size == 4 and cfg.partial_depth_eval == [1, 2]
     assert cfg.out_dir == "/nowhere/x" and cfg.warmup_steps == 3
     assert cfg.model_overwrite == {"n_embd": 32} and cfg.export_to_hf is True
     assert cfg.stage_base_lrs == pytest.approx([1e-3, 2e-3, 3e-3])
@@ -214,7 +239,16 @@ def test_parse_without_config_requires_dataset_config() -> None:
 def test_parse_without_stage_base_lrs_is_rejected() -> None:
     with pytest.raises(ValueError, match="stage_base_lrs"):
         parse_settings(
-            ["--dataset_config", TINY_DATASET_CONFIG, "--model_architecture_config", TINY_MODEL_ARCHITECTURE]
+            [
+                "--dataset_config",
+                TINY_DATASET_CONFIG,
+                "--model_architecture_config",
+                TINY_MODEL_ARCHITECTURE,
+                "--tokens_per_micro_batch",
+                "8192",
+                "--micro_batches_per_step",
+                "4",
+            ]
         )
 
 
@@ -261,7 +295,7 @@ def test_settings_rejects_a_plain_dict_optim_config() -> None:
 
 def test_defaults_are_a_single_gpu_config() -> None:
     cfg = _settings()
-    assert cfg.backend == "single_device" and cfg.world_batch_size % cfg.micro_batch_size == 0
+    assert cfg.backend == "single_device" and cfg.validation_batch_size == 4
     assert cfg.model_overwrite == {} and cfg.optimizer == "ELLISAdam"
     assert cfg.optim_config == OptimizerConfig(lr=1e-4, weight_decay=4e-5, betas=(0.9, 0.95))
     assert cfg.out_dir == "outputs" and cfg.resume is True
@@ -269,7 +303,7 @@ def test_defaults_are_a_single_gpu_config() -> None:
     assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 2
     assert cfg.prepare_max_parallel_downloads == 2
     assert cfg.allow_dataset_change is False
-    assert cfg.gradient_accumulation_steps == 1024 // 4
+    assert cfg.gradient_accumulation_steps == cfg.micro_batches_per_step == 4
 
 
 def test_validation_empty_dataset_config() -> None:
@@ -287,26 +321,20 @@ def test_validation_negative_stage_base_lr() -> None:
         _settings(stage_base_lrs=[1e-3, -1.0])
 
 
-def test_validation_batch_divisibility() -> None:
-    with pytest.raises(ValueError, match="multiple of micro_batch_size"):
-        _settings(micro_batch_size=3, world_batch_size=8)
-
-
 def test_validation_of_nonsensical_batch_sizes() -> None:
     """
-    A `micro_batch_size` of 0 used to die with a raw ZeroDivisionError and a negative one made the micro-batch
-    loop of a step run zero times: the run "trained" and reported loss 0.0. Both fail at settings time now, and so
-    does a world batch smaller than one micro-batch.
+    A `micro_batches_per_step` of 0 or less made the micro-batch loop of a step run zero times: the run "trained"
+    and reported loss 0.0. It fails at settings time now, as do a non-positive pack length and validation batch.
     """
 
     for bad in (0, -4):
-        with pytest.raises(ValueError, match="micro_batch_size must be positive"):
-            _settings(micro_batch_size=bad, world_batch_size=8)
-        with pytest.raises(ValueError, match="world_batch_size must be positive"):
-            _settings(micro_batch_size=4, world_batch_size=bad)
-    with pytest.raises(ValueError, match=r"world_batch_size \(4\) must be >= micro_batch_size \(8\)"):
-        _settings(micro_batch_size=8, world_batch_size=4)
-    assert _settings(micro_batch_size=8, world_batch_size=8).gradient_accumulation_steps == 1
+        with pytest.raises(ValueError, match="micro_batches_per_step must be positive"):
+            _settings(micro_batches_per_step=bad)
+        with pytest.raises(ValueError, match="tokens_per_micro_batch must be positive"):
+            _settings(tokens_per_micro_batch=bad)
+        with pytest.raises(ValueError, match="validation_batch_size must be positive"):
+            _settings(validation_batch_size=bad)
+    assert _settings(micro_batches_per_step=1).gradient_accumulation_steps == 1
 
 
 def test_validation_misaligned_eval_and_log_intervals() -> None:
@@ -331,8 +359,8 @@ def test_validation_runs_for_yaml_configs_too(tmp_path: Path) -> None:
     """
 
     yaml = tmp_path / "bad.yaml"
-    yaml.write_text(TINY_YAML.read_text().replace("micro_batch_size: 2", "micro_batch_size: 3"))
-    with pytest.raises(ValueError, match="multiple of micro_batch_size"):
+    yaml.write_text(TINY_YAML.read_text().replace("tokens_per_micro_batch: 512", "tokens_per_micro_batch: 128"))
+    with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(128\) must be >= training_max_sequence_length \(256\)"):
         parse_settings(["--config", str(yaml)])
 
 
@@ -345,9 +373,9 @@ def test_settings_do_not_touch_the_filesystem(tmp_path: Path) -> None:
     assert cfg.dataset_config.endswith("missing.yaml")
 
 
-@pytest.mark.parametrize("micro,world,expected", [(2, 4, 2), (1, 4, 4), (4, 4, 1), (2, 64, 32)])
-def test_gradient_accumulation_steps(micro: int, world: int, expected: int) -> None:
-    assert _settings(micro_batch_size=micro, world_batch_size=world).gradient_accumulation_steps == expected
+@pytest.mark.parametrize("packs", [1, 4, 32])
+def test_gradient_accumulation_steps_is_the_packs_per_step(packs: int) -> None:
+    assert _settings(micro_batches_per_step=packs).gradient_accumulation_steps == packs
 
 
 # --- the value-rule tables ---------------------------------------------------------------------------------------
@@ -363,6 +391,41 @@ def test_value_rule_tables_name_real_fields_and_do_not_overlap() -> None:
     for table in tables:
         assert table and table <= names
     assert sum(len(t) for t in tables) == len(set().union(*tables))
+
+
+def test_sample_and_benchmark_settings() -> None:
+    """
+    The defaults (samples at the end, benchmarks off, the thesis tasks) and the value rules of the evaluation knobs.
+    """
+
+    from evaluation.benchmarks import DEFAULT_TASKS
+
+    settings = _settings()
+    assert (settings.sample_at_training_progress, settings.benchmark_at_training_progress) == ([100.0], [])
+    assert (settings.sample_step_interval, settings.benchmark_step_interval) == (0, 0)
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        _settings(sample_at_training_progress=[0, 101])
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        _settings(benchmark_at_training_progress=[-1])
+    assert (settings.sample_recurrences, settings.benchmark_recurrences) == ([], [])
+    assert _settings(sample_recurrences=[[4, 4, 4], [4, 8, 12]]).sample_recurrences == [[4, 4, 4], [4, 8, 12]]
+    with pytest.raises(ValueError, match="positive step count"):
+        _settings(sample_recurrences=[[4, 0, 4]])
+    with pytest.raises(ValueError, match="positive step count"):
+        _settings(benchmark_recurrences=[[]])
+    assert tuple(settings.benchmark_tasks) == DEFAULT_BENCHMARK_TASKS == DEFAULT_TASKS
+    assert _settings(benchmark_tasks=[]).benchmark_tasks == []  # allowed while no benchmark is requested
+    with pytest.raises(ValueError, match="sample_temperature"):
+        _settings(sample_temperature=-0.1)
+    with pytest.raises(ValueError, match="benchmark_limit"):
+        _settings(benchmark_limit=0)
+    assert settings.benchmark_num_fewshot == -1  # each task's own default; 0 means "no examples in the context"
+    with pytest.raises(ValueError, match="benchmark_num_fewshot"):
+        _settings(benchmark_num_fewshot=-2)
+    with pytest.raises(ValueError, match="benchmark_tasks is empty"):
+        _settings(benchmark_at_training_progress=[100], benchmark_tasks=[])
+    with pytest.raises(ValueError, match="benchmark_tasks is empty"):
+        _settings(benchmark_step_interval=5, benchmark_tasks=[])
 
 
 @pytest.mark.parametrize("name", sorted(POSITIVE_SETTINGS))
@@ -383,3 +446,89 @@ def test_required_settings_are_rejected_when_empty(name: str) -> None:
     empty: Any = [] if name == "stage_base_lrs" else ""
     with pytest.raises(ValueError, match=f"{name} is required"):
         _settings(**{name: empty})
+
+
+def test_the_optimizer_and_schedule_names_are_checked_at_construction() -> None:
+    """
+    A typo in `optimizer` or `lr_schedule` used to surface after `resolve_dataset` (which may build the dataset for
+    hours) or at the first optimizer step; both are plan-level names, checked here from the YAML alone.
+    """
+
+    assert OPTIMIZERS == BUILDABLE_OPTIMIZERS and LR_SCHEDULES == IMPLEMENTED_SCHEDULES  # torch-free copies
+    for name in OPTIMIZERS:
+        assert _settings(optimizer=name).optimizer == name
+    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, not 'Adam'"):
+        _settings(optimizer="Adam")
+    with pytest.raises(ValueError, match="optimizer must be one of"):  # no dataset is read to get here
+        _settings(optimizer="Adam", dataset_config="config/datasets/does_not_exist.yaml")
+    for schedule in LR_SCHEDULES:
+        assert _settings(lr_schedule=schedule).lr_schedule == schedule
+    with pytest.raises(ValueError, match="lr_schedule must be one of trapezoid, not 'cosine'"):
+        _settings(lr_schedule="cosine")
+
+
+def test_partial_depth_eval_entries_must_be_positive() -> None:
+    """
+    A non-positive depth used to raise inside `canon_steps` at the first evaluation, an hour into a run.
+    """
+
+    assert _settings(partial_depth_eval=[1, 4]).partial_depth_eval == [1, 4]
+    for depths in ([0], [4, -1]):
+        with pytest.raises(ValueError, match="partial_depth_eval must list positive recurrence depths"):
+            _settings(partial_depth_eval=depths)
+
+
+def test_optim_config_lr_must_be_positive() -> None:
+    """
+    `optim_config.lr` is not the schedule's LR, but ELLISAdam divides by it (the decoupled weight decay is
+    `lr / init_lr x weight_decay`), so 0 or a negative value is a config mistake, not a disabled optimizer.
+    """
+
+    for lr in (0.0, -1e-4):
+        with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+            _settings(optim_config=OptimizerConfig(lr=lr))
+    assert _settings(optim_config=OptimizerConfig(lr=1e-4)).optim_config.lr == 1e-4
+
+
+# --- sequence packing --------------------------------------------------------------------------------------------
+
+
+def test_the_packing_fields_are_required(tmp_path: Path) -> None:
+    """
+    There is no padded training mode to fall back to: a config has to say how long a pack is and how many make a
+    step, and the keys of the removed padded mode are unknown.
+    """
+
+    for name in ("tokens_per_micro_batch", "micro_batches_per_step"):
+        yaml_path = tmp_path / f"without_{name}.yaml"
+        yaml_path.write_text("\n".join(line for line in TINY_YAML.read_text().splitlines() if not line.startswith(name)))
+        with pytest.raises(SystemExit):  # jsonargparse: the required key is missing
+            parse_settings(["--config", str(yaml_path)])
+    for removed in ("pack_sequences: true", "world_batch_size: 4", "sort_batches_by_length: true", "micro_batch_size: 2"):
+        yaml_path = tmp_path / "removed.yaml"
+        yaml_path.write_text(TINY_YAML.read_text() + f"\n{removed}\n")
+        with pytest.raises(SystemExit):  # jsonargparse: unrecognized key
+            parse_settings(["--config", str(yaml_path)])
+
+
+def test_explicit_packing_fields_define_the_step() -> None:
+    cfg = _settings(tokens_per_micro_batch=8192, micro_batches_per_step=32)
+    assert cfg.gradient_accumulation_steps == 32
+    assert cfg.tokens_per_optimizer_step == 8192 * 32
+    exact = _settings(tokens_per_micro_batch=2048, micro_batches_per_step=1)  # pack = training_max_sequence_length
+    assert exact.gradient_accumulation_steps == 1 and exact.tokens_per_optimizer_step == 2048
+
+
+def test_pack_must_hold_a_whole_document() -> None:
+    with pytest.raises(ValueError, match=r"tokens_per_micro_batch \(1024\) must be >= training_max_sequence_length \(2048\)"):
+        _settings(tokens_per_micro_batch=1024, micro_batches_per_step=4)
+
+
+def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "packed.yaml"
+    yaml_path.write_text(TINY_YAML.read_text().replace("micro_batches_per_step: 2", "micro_batches_per_step: 4"))
+    cfg = parse_settings(["--config", str(yaml_path)])
+    assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (512, 4)
+    assert cfg.gradient_accumulation_steps == 4 and cfg.tokens_per_optimizer_step == 2048
+    overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
+    assert overridden.gradient_accumulation_steps == 8

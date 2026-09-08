@@ -4,7 +4,7 @@ Where a dataset config's outputs live on disk (pure path arithmetic, no I/O).
 
 The tree shows the download/build boundary: sources/ holds only downloaded data, processed/ only derived data.
 
-    <root>/sources/<source>/raw/                         downloaded rows (text truncated to `max_seq_length` tokens,
+    <root>/sources/<source>/raw/                         downloaded rows (text truncated to `dataset_max_sequence_length` tokens,
                                                          + `tokens` column); append-only, shared by every dataset config;
                                                          deleted only when the source identity changes or the cap is
                                                          raised, after the user confirmed

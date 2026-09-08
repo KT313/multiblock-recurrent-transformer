@@ -17,7 +17,8 @@ import model.model as model_module
 from model.blocks import recurrence
 from model.blocks.recurrence import sample_recurrence_steps
 from model.blocks.sandwich import SandwichBlock
-from model.layers.attention import precompute_freqs_cis
+from model.layers.attention import apply_rotary_emb_complex_like, document_attention_mask, precompute_freqs_cis
+from model.layers.norms import RMSNorm
 from model.model import RecurrentGPT, TransformerModules
 
 GOLDEN_PATH = Path(__file__).with_name("golden_tiny_forward.pt")
@@ -60,7 +61,7 @@ def test_structure_follows_config(tiny_model: RecurrentGPT) -> None:
     assert len(t.coda) == cfg.n_layers_in_coda == 1
     assert t.wte.weight.shape == (cfg.padded_vocab_size, cfg.n_embd)
     assert tiny_model.lm_head.weight is t.wte.weight  # tied
-    assert tiny_model.freqs_cis.shape == (1, cfg.block_size, 1, cfg.head_size // 2, 2)
+    assert tiny_model.freqs_cis.shape == (1, cfg.model_max_sequence_length, 1, cfg.head_size // 2, 2)
     assert tiny_model.emb_scale == pytest.approx(cfg.n_embd**0.5)
     assert sum(p.numel() for p in tiny_model.parameters()) == 256_256
 
@@ -72,7 +73,6 @@ def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
     """
 
     expected = [
-        "freqs_cis",
         "transformer.wte.weight",
         "transformer.prelude.0.norm_1.weight",
         "transformer.prelude.0.attn.qk_bias",
@@ -133,8 +133,8 @@ def test_state_dict_keys_are_pinned(tiny_model: RecurrentGPT) -> None:
 
 
 def test_build_model_kwargs_routing() -> None:
-    m = seeded_tiny(ignore_index=-1, gradient_checkpointing=True, n_layers_in_coda=3)
-    assert m.ignore_index == -1 and m.gradient_checkpointing is True
+    m = seeded_tiny(ignore_index=-1, gradient_checkpointing="full", n_layers_in_coda=3)
+    assert m.ignore_index == -1 and m.gradient_checkpointing == "full"
     assert len(m.transformer.coda) == 3
     cfg = tiny_config()
     with pytest.raises(ValueError, match="overrides"):
@@ -147,16 +147,40 @@ def test_transformer_module_dict_and_buffer() -> None:
     m = seeded_tiny()
     assert isinstance(m.transformer, TransformerModules)
     assert set(m.transformer.keys()) == {"wte", "prelude", "adapters", "core_blocks", "coda", "ln_fs", "ln_final"}
-    assert "freqs_cis" in dict(m.named_buffers())  # persistent buffer -> part of the state dict
-    assert "freqs_cis" in m.state_dict()
+    assert "freqs_cis" in dict(m.named_buffers())
+    assert "freqs_cis" not in m.state_dict()  # not persistent: a checkpoint cannot override the config's RoPE table
 
 
 def test_precompute_freqs_cis_method_matches_function() -> None:
     m = seeded_tiny()
     cfg = m.config
-    expected = precompute_freqs_cis(cfg.head_size, cfg.block_size, cfg.rope_settings.rope_base)
+    expected = precompute_freqs_cis(cfg.head_size, cfg.model_max_sequence_length, cfg.rope_settings.rope_base)
     assert torch.equal(m._precompute_freqs_cis(), expected)
     assert torch.equal(m.freqs_cis, expected)
+
+
+def test_rope_table_stays_fp32_when_the_model_is_cast_to_bfloat16() -> None:
+    """
+    `.to(torch.bfloat16)` (what a third-party user of the exported model may do) must leave the RoPE table alone:
+    a bf16 table rounds every cos/sin by about 2e-3 and every rotation after that uses the rounded angles.
+    """
+
+    fp32_model = seeded_tiny()
+    bf16_model = seeded_tiny().to(torch.bfloat16)
+    assert bf16_model.freqs_cis.dtype == torch.float32
+    assert bf16_model.transformer.wte.weight.dtype == torch.bfloat16  # the parameters were cast
+
+    torch.manual_seed(0)
+    S, hd = 8, fp32_model.config.head_size
+    q, k = torch.randn(2, S, 3, hd), torch.randn(2, S, 3, hd)
+    expected_q, expected_k = apply_rotary_emb_complex_like(q, k, fp32_model.freqs_cis[:, :S])
+    got_q, got_k = apply_rotary_emb_complex_like(q, k, bf16_model.freqs_cis[:, :S])
+    torch.testing.assert_close(got_q, expected_q, atol=1e-7, rtol=0)
+    torch.testing.assert_close(got_k, expected_k, atol=1e-7, rtol=0)
+
+    # the test has teeth: rotating by a rounded table is off by far more than that tolerance
+    rounded_q, _ = apply_rotary_emb_complex_like(q, k, fp32_model.freqs_cis[:, :S].to(torch.bfloat16))
+    assert (rounded_q - expected_q).abs().max().item() > 1e-4
 
 
 def test_reset_parameters_reinitializes_embedding_and_norms_only() -> None:
@@ -430,6 +454,39 @@ def test_position_ids_select_rope_rows(tiny_model: RecurrentGPT) -> None:
     assert not torch.allclose(a, d)
 
 
+def test_a_sequence_longer_than_the_model_maximum_raises(tiny_model: RecurrentGPT) -> None:
+    """
+    The failure used to be a shape mismatch inside RoPE. Only for the path that takes the table's first S rows.
+    """
+
+    max_length = tiny_model.config.model_max_sequence_length
+    with pytest.raises(ValueError, match=f"{max_length + 1} is longer than model_max_sequence_length"):
+        tiny_model(ids(1, max_length + 1))
+    tiny_model(ids(1, max_length))  # the maximum itself is accepted
+
+
+def test_a_pack_longer_than_the_model_maximum_is_accepted_with_per_document_positions(
+    tiny_model: RecurrentGPT,
+) -> None:
+    """
+    Packed training feeds packs of several documents: the pack is longer than `model_max_sequence_length` while
+    every document, and so every position, fits. The length guard must not fire on that.
+    """
+
+    max_length = tiny_model.config.model_max_sequence_length
+    sequence_length = 2 * max_length
+    document_ids = torch.arange(sequence_length) // max_length
+    position_ids = torch.arange(sequence_length) % max_length
+    outputs = tiny_model(
+        ids(1, sequence_length),
+        attention_mask=document_attention_mask(document_ids[None]),
+        position_ids=position_ids[None],
+        return_logits=True,
+    )
+    logits = outputs["logits"]
+    assert logits is not None and logits.shape[:2] == (1, sequence_length)
+
+
 # --- prepare_attention_inputs -----------------------------------------------------------------------------------------
 
 
@@ -482,7 +539,7 @@ def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
     x = ids(2, 4)
     ints = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
     _rotary, mask = model_module.prepare_attention_inputs(table, x, attention_mask=ints)
-    assert mask is not None and mask.dtype == torch.bool and mask.shape == (2, 1, 4, 4)
+    assert isinstance(mask, Tensor) and mask.dtype == torch.bool and mask.shape == (2, 1, 4, 4)
     assert torch.equal(mask[1, 0], torch.ones(4, 4, dtype=torch.bool).tril()), "an all-ones mask is plain causality"
     expected_padded = torch.tensor(
         [[True, False, False, False],  # a pad query keeps only itself
@@ -493,7 +550,7 @@ def test_prepare_attention_inputs_builds_a_causal_padding_bool_mask() -> None:
     assert torch.equal(mask[0, 0], expected_padded)
     assert bool(mask.any(dim=-1).all()), "no row attends to nothing"
     _rotary, from_bools = model_module.prepare_attention_inputs(table, x, attention_mask=ints.bool())
-    assert from_bools is not None and torch.equal(from_bools, mask), "1/0 ints and bools mean the same"
+    assert isinstance(from_bools, Tensor) and torch.equal(from_bools, mask), "1/0 ints and bools mean the same"
 
 
 def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
@@ -521,17 +578,20 @@ def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
 # --- gradient checkpointing -------------------------------------------------------------------------------------------
 
 
-def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", ["selective", "full"])
+def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     plain = seeded_tiny()
-    ckpt = seeded_tiny(gradient_checkpointing=True)
+    ckpt = seeded_tiny(gradient_checkpointing=mode)
+    assert ckpt.gradient_checkpointing == mode
     calls: list[int] = []
-    orig_checkpoint = recurrence._checkpoint
+    wrapper_name = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}[mode]
+    orig_checkpoint = getattr(recurrence, wrapper_name)
 
     def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
         calls.append(1)
         return cast(Tensor, orig_checkpoint(*args, **kwargs))
 
-    monkeypatch.setattr(recurrence, "_checkpoint", counting_checkpoint)
+    monkeypatch.setattr(recurrence, wrapper_name, counting_checkpoint)
     x = ids()
     torch.manual_seed(11)
     out_a = plain(x, labels=x, return_logits=True)
@@ -548,6 +608,13 @@ def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPat
         torch.testing.assert_close(pa.grad, pb.grad, atol=1e-6, rtol=1e-5, msg=na)
 
 
+def test_gradient_checkpointing_mode_is_checked_at_construction() -> None:
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not 'bogus'"):
+        seeded_tiny(gradient_checkpointing="bogus")
+    with pytest.raises(ValueError, match="not False"):
+        seeded_tiny(gradient_checkpointing=False)
+
+
 # --- sampler (the scheme itself is tested in blocks/test_recurrence.py) ----------------------------------------------
 
 
@@ -557,11 +624,11 @@ def test_randomized_iteration_sampler_binds_step_mode_and_config(training: bool)
     m.step = 7
     for block_idx, (mean, depth) in enumerate(zip([12, 6], [8, 3])):
         n, k = m.sample_block_depths(block_idx)
-        ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, training=training)
+        ref_n, ref_k = sample_recurrence_steps(mean, depth, step=7, block_idx=block_idx, training=training)
         assert (n.item(), k.item()) == (ref_n.item(), ref_k.item())
     m.step = 8
     n8, _ = m.sample_block_depths(0)
-    assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, training=training)[0])
+    assert torch.equal(n8, sample_recurrence_steps(12, 8, step=8, block_idx=0, training=training)[0])
 
 
 def test_train_forward_deterministic_under_seed_and_step(tiny_model: RecurrentGPT) -> None:
@@ -591,17 +658,127 @@ def test_loss_ignores_ignore_index_labels(tiny_model: RecurrentGPT) -> None:
     assert not torch.allclose(out["loss"], torch.nn.functional.cross_entropy(logits.view(-1, VOCAB), x.view(-1)))
 
 
-def test_out_of_range_labels_are_masked_too(tiny_model: RecurrentGPT) -> None:
-    x = ids()
+def test_out_of_range_labels_are_masked_too() -> None:
+    """
+    Labels are masked at `vocab_size`, not at the padded embedding table. The tiny architecture pads 512 to 512,
+    so this variant declares 500 real ids in the same 512 rows: a label of 505 addresses a padding row, which is
+    trained on no target and whose logit the HF wrapper sets to -inf, so both loss paths have to ignore it.
+    """
+
+    model = seeded_tiny(vocab_size=500)
+    assert model.config.padded_vocab_size == VOCAB
+    x = ids() % 500
     labels = x.clone()
-    labels[0, :10] = VOCAB + 5
+    labels[0, :10] = 505  # inside the embedding table, outside the vocabulary
+    labels[1, :5] = VOCAB + 5  # beyond the table
     ref = x.clone()
     ref[0, :10] = -100
+    ref[1, :5] = -100
+    assert torch.equal(model.mask_labels(labels), ref)
+
     torch.manual_seed(2)
-    a = tiny_model(x, labels=labels, num_steps=(1, 1))["loss"]
+    a = model(x, labels=labels, num_steps=(1, 1))["loss"]
     torch.manual_seed(2)
-    b = tiny_model(x, labels=ref, num_steps=(1, 1))["loss"]
+    b = model(x, labels=ref, num_steps=(1, 1))["loss"]
     assert torch.equal(a, b)
+    torch.manual_seed(2)  # the chunked path masks with the same bound
+    chunked = model(x, labels=labels, num_steps=(1, 1), return_token_losses_chunked_nograd=True)["loss"]
+    torch.testing.assert_close(chunked, a)
+
+
+# --- packed sequences ---------------------------------------------------------------------------------------------------
+
+
+def _packed_inputs(documents: list[Tensor], pack_length: int) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    `(input_ids, position_ids, document_ids)` of `documents` (1-D id tensors) laid end to end in a row of
+    `pack_length`, the tail EOS (2) with its own document id, as `training.data.packing.pack_samples` lays them out.
+    """
+
+    input_ids = torch.full((1, pack_length), 2, dtype=torch.long)
+    position_ids = torch.zeros((1, pack_length), dtype=torch.long)
+    document_ids = torch.full((1, pack_length), len(documents), dtype=torch.int32)
+    offset = 0
+    for document, tokens in enumerate(documents):
+        n = tokens.shape[0]
+        input_ids[0, offset : offset + n] = tokens
+        position_ids[0, offset : offset + n] = torch.arange(n)
+        document_ids[0, offset : offset + n] = document
+        offset += n
+    position_ids[0, offset:] = torch.arange(pack_length - offset)
+    return input_ids, position_ids, document_ids
+
+
+def test_prepare_attention_inputs_passes_a_ready_mask_through_and_needs_positions() -> None:
+    """
+    A ready document mask (dense bool on the CPU, a `BlockMask` on CUDA) is not rebuilt; it needs the `(B, S)`
+    per-document positions, because the RoPE rows are what make a document start at position 0 again.
+    """
+
+    table = freqs_table()
+    x = ids(1, 6)
+    document_ids = torch.tensor([[0, 0, 1, 1, 1, 2]], dtype=torch.int32)
+    ready = document_attention_mask(document_ids)
+    positions = torch.tensor([[0, 1, 0, 1, 2, 0]])
+    rotary, mask = model_module.prepare_attention_inputs(table, x, attention_mask=ready, position_ids=positions)
+    assert mask is ready
+    assert torch.equal(rotary[0], table[0].index_select(0, positions[0]))
+    with pytest.raises(ValueError, match="needs \\(B, S\\) position_ids"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=ready)
+    with pytest.raises(ValueError, match="needs \\(B, S\\) position_ids"):
+        model_module.prepare_attention_inputs(table, x, attention_mask=ready, position_ids=positions[0])
+
+
+def test_packed_forward_equals_the_documents_on_their_own(tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The parity check of the packing migration: two documents packed into one row, with the document mask and the
+    per-document positions, get the logits they get as separate sequences; the tail is finite. The latent state is
+    zeroed (it is drawn per token and would differ between the two layouts).
+    """
+
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+    tiny_model.eval()
+    a, b = ids(1, 11, seed=3)[0], ids(1, 6, seed=4)[0]
+    input_ids, position_ids, document_ids = _packed_inputs([a, b], pack_length=20)
+    mask = document_attention_mask(document_ids)
+    packed = tiny_model(input_ids, attention_mask=mask, position_ids=position_ids, return_logits=True)["logits"]
+    alone_a = tiny_model(a[None], return_logits=True)["logits"]
+    alone_b = tiny_model(b[None], return_logits=True)["logits"]
+    assert packed is not None and alone_a is not None and alone_b is not None
+    torch.testing.assert_close(packed[:, :11], alone_a, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(packed[:, 11:17], alone_b, atol=1e-5, rtol=1e-5)
+    assert torch.isfinite(packed).all()
+    # without the mask (plain causality over the whole row) document b sees document a: a different result
+    unmasked = tiny_model(input_ids, position_ids=position_ids, return_logits=True)["logits"]
+    assert unmasked is not None and not torch.allclose(unmasked[:, 11:17], alone_b, atol=1e-3)
+
+
+def test_packed_loss_and_token_losses_follow_the_documents(tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    With per-document labels (the tail ignored), the packed loss is the mean over all supervised positions of both
+    documents, and the chunked per-token losses are those of the documents on their own.
+    """
+
+    monkeypatch.setattr(model_module, "initialize_state", torch.zeros_like)
+    tiny_model.eval()
+    a, b = ids(1, 9, seed=5)[0], ids(1, 8, seed=6)[0]  # 9 + 8 = 17 supervised positions, 7 of tail
+    input_ids, position_ids, document_ids = _packed_inputs([a, b], pack_length=24)
+    labels = torch.full_like(input_ids, -100)
+    labels[0, :9], labels[0, 9:17] = ids(1, 9, seed=7)[0], ids(1, 8, seed=8)[0]
+    mask = document_attention_mask(document_ids)
+    packed = tiny_model(
+        input_ids, attention_mask=mask, position_ids=position_ids, labels=labels, return_token_losses_chunked_nograd=True
+    )
+    token_losses = packed["token_losses"]
+    assert token_losses is not None and torch.isfinite(token_losses).all()
+    alone_a = tiny_model(a[None], labels=labels[:, :9], return_token_losses_chunked_nograd=True)["token_losses"]
+    alone_b = tiny_model(b[None], labels=labels[:, 9:17], return_token_losses_chunked_nograd=True)["token_losses"]
+    assert alone_a is not None and alone_b is not None
+    torch.testing.assert_close(token_losses[:, :9], alone_a, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(token_losses[:, 9:17], alone_b, atol=1e-5, rtol=1e-5)
+    assert torch.equal(token_losses[:, 17:], torch.zeros(1, 7))
+    expected = (alone_a.sum() + alone_b.sum()) / 17
+    torch.testing.assert_close(packed["loss"], expected, atol=1e-5, rtol=1e-5)
 
 
 def test_custom_ignore_index() -> None:
@@ -667,3 +844,116 @@ def test_compile_smoke() -> None:
     out = compiled(x, labels=x, return_logits=True)
     assert out["logits"].shape == (2, 32, VOCAB)
     out["loss"].backward()
+
+
+# --- the bf16 residual stream ------------------------------------------------------------------------------------------
+
+
+def norm_output_dtypes(model: RecurrentGPT, autocast: bool) -> dict[str, torch.dtype]:
+    """
+    The output dtype of every RMSNorm and LayerNorm of `model` on one eval-mode forward (fixed depths), by name.
+    """
+
+    seen: dict[str, torch.dtype] = {}
+    handles = []
+    for name, module in model.named_modules():
+        if isinstance(module, (RMSNorm, torch.nn.LayerNorm)):
+            handles.append(
+                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, out.dtype))
+            )
+    model.eval()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        model(ids(), num_steps=(1, 1))
+    for handle in handles:
+        handle.remove()
+    return seen
+
+
+def rmsnorm_names(model: RecurrentGPT, prefix: str) -> list[str]:
+    return [name for name, m in model.named_modules() if isinstance(m, RMSNorm) and name.startswith(prefix)]
+
+
+@pytest.mark.parametrize("value", ["none", "core", "all"])
+def test_bf16_residual_stream_rounds_the_right_norms_under_autocast(value: str) -> None:
+    """
+    "core": the core blocks' RMSNorms emit bf16, the prelude's and coda's stay fp32; "all": every RMSNorm emits
+    bf16; "none": nothing. The LayerNorms (`ln_fs`, `ln_final`) are not switched: with an fp32 input ("none",
+    "core") they emit fp32 on any device; with the bf16 input of "all" the CUDA autocast policy still gives fp32
+    while the CPU policy follows the input, so that case is left to the GPU smoke test.
+    """
+
+    model = seeded_tiny(bf16_residual_stream=value)
+    dtypes = norm_output_dtypes(model, autocast=True)
+    core = rmsnorm_names(model, "transformer.core_blocks")
+    outer = rmsnorm_names(model, "transformer.prelude") + rmsnorm_names(model, "transformer.coda")
+    assert core and outer
+    expected_core = torch.bfloat16 if value != "none" else torch.float32
+    expected_outer = torch.bfloat16 if value == "all" else torch.float32
+    assert all(dtypes[name] == expected_core for name in core)
+    assert all(dtypes[name] == expected_outer for name in outer)
+    if value != "all":
+        assert all(dtypes[name] == torch.float32 for name in dtypes if "ln_f" in name)
+
+
+def test_bf16_residual_stream_is_fp32_without_autocast() -> None:
+    model = seeded_tiny(bf16_residual_stream="all")
+    assert set(norm_output_dtypes(model, autocast=False).values()) == {torch.float32}
+
+
+def test_bf16_residual_stream_matches_the_fp32_stream_closely_and_trains() -> None:
+    """
+    Same seeded weights, same latent draw: the "core" loss under bf16 autocast stays within bf16 tolerance of the
+    fp32-stream loss, and every parameter receives a finite gradient.
+    """
+
+    losses = {}
+    for value in ("none", "core"):
+        model = seeded_tiny(bf16_residual_stream=value)
+        x = ids()
+        torch.manual_seed(7)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = model(x, labels=x, num_steps=(1, 2))
+        losses[value] = out["loss"]
+        out["loss"].backward()
+        for name, param in model.named_parameters():
+            assert param.grad is not None and torch.isfinite(param.grad).all(), name
+    torch.testing.assert_close(losses["core"], losses["none"], atol=0.0, rtol=2e-2)
+    assert not torch.equal(losses["core"], losses["none"])  # the rounding is real
+
+
+def test_bf16_residual_stream_latent_enters_the_first_iteration_in_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Under autocast with "core" the initial latent is rounded to the autocast dtype before the first iteration (the
+    adapter GEMM would cast it anyway; a fp32 first iteration was a second dtype variant of the compiled frame).
+    """
+
+    seen: list[torch.dtype] = []
+    original = recurrence.iterate_core_block
+
+    def spy(x_latent: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        seen.append(x_latent.dtype)
+        return cast(Tensor, original(x_latent, *args, **kwargs))
+
+    monkeypatch.setattr(model_module, "iterate_core_block", spy)
+    for value, autocast, expected in (
+        ("core", True, torch.bfloat16),
+        ("core", False, torch.float32),
+        ("none", True, torch.float32),
+    ):
+        seen.clear()
+        model = seeded_tiny(bf16_residual_stream=value).eval()
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            model(ids(), num_steps=(1, 1))
+        assert seen and set(seen) == {expected}, (value, autocast, seen)
+
+
+@pytest.mark.gpu
+def test_compile_smoke_bf16_residual_stream() -> None:
+    model = seeded_tiny(bf16_residual_stream="core").cuda()
+    compiled = torch.compile(model, dynamic=True)
+    x = ids().cuda()
+    torch.manual_seed(1)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = compiled(x, labels=x)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and all(p.grad is not None for p in model.parameters())

@@ -2,15 +2,26 @@
 """
 Training run settings: the YAML/CLI schema consumed by `training/train.py`.
 
-Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e. world
-batches of `world_batch_size × block_size` tokens. Defaults make a run on one local GPU work out of the box.
+Framework-neutral (no torch imports). Every `*_steps` / `*_interval` value counts OPTIMIZER steps, i.e.
+`micro_batches_per_step` packed micro-batches of `tokens_per_micro_batch` tokens each. Defaults make a run on one
+local GPU work out of the box.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
+
+# The activation-checkpointing modes of the recurrence iterations, `model.blocks.recurrence.CHECKPOINT_MODES` (which
+# imports torch; this module stays framework-neutral, a settings test keeps the two equal).
+CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
+
+# The optimizers `training.optim.build_optimizer` builds and the schedules `training.lr_schedule` implements. Both
+# modules import torch (directly or through the stage manager); this module stays framework-neutral, so the names
+# are copied here to be checked at construction time, and settings tests keep the copies equal to the originals.
+OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam")
+LR_SCHEDULES: tuple[str, ...] = ("trapezoid",)
 
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
 # relating two fields stay explicit below the loops.
@@ -22,18 +33,23 @@ REQUIRED_SETTINGS: dict[str, str] = {
 POSITIVE_SETTINGS: dict[str, str] = {
     "log_step_interval": "save_step_interval is the only interval 0 disables",
     "eval_step_interval": "save_step_interval is the only interval 0 disables",
-    "eval_iters": "validation micro-batches per depth",
+    "eval_iters": "validation batches per depth",
     "grad_clip": "0 would zero every gradient",
-    "micro_batch_size": "sequences per forward/backward; 0 or less makes the micro-batch loop of a step run zero times",
-    "world_batch_size": "sequences per optimizer step",
+    "tokens_per_micro_batch": "the pack length; every micro-batch is one row of this many tokens",
+    "micro_batches_per_step": "packs per optimizer step; 0 or less makes the micro-batch loop of a step run zero times",
+    "validation_batch_size": "rows per validation forward",
     "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
+    "sample_max_new_tokens": "tokens generated per sample prompt",
+    "benchmark_batch_size": "sequences per lm-eval forward",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
     "save_step_interval",
     "warmup_steps",
     "cooldown_steps",
-    "resume_warmup_steps",
+    "sample_step_interval",
+    "benchmark_step_interval",
 )
+DEFAULT_BENCHMARK_TASKS: tuple[str, ...] = ("arc_challenge", "hellaswag", "mmlu", "winogrande")  # the thesis benchmarks
 
 
 @dataclass
@@ -64,6 +80,14 @@ class Settings:
     dataset_config: str  # path to config/datasets/<name>.yaml
     model_architecture_config: str  # path to config/model_architecture/<name>.yaml
 
+    # Sequence packing (required): documents are laid end to end into ONE row of `tokens_per_micro_batch` tokens per
+    # micro-batch, never split, attention masked per document, RoPE positions restarting per document. One optimizer
+    # step is `micro_batches_per_step` such rows, i.e. `micro_batches_per_step x tokens_per_micro_batch` tokens, the
+    # unit of the stage budgets and the throughput metrics. Validation batches are padded rows instead
+    # (`validation_batch_size` below).
+    tokens_per_micro_batch: int  # pack length; >= training_max_sequence_length (the longest document after truncation)
+    micro_batches_per_step: int  # packs per optimizer step (a multiple of the number of devices)
+
     # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
@@ -77,28 +101,20 @@ class Settings:
 
     # Run
     run_name: str = "crow-300m"
-    out_dir: str = "outputs"  # checkpoints go to {out_dir}/checkpoints, wandb files to {out_dir}/wandb
-    resume: bool = True  # resume from the latest checkpoint of `run_name` in `out_dir` if one exists
+    out_dir: str = "outputs"  # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log, run_config.json
+    resume: bool = True  # resume from the most recently written checkpoint of `run_name` in its run directory if one exists
     resume_checkpoint_path: Optional[str] = None  # explicit checkpoint to resume from (overrides the search)
     seed: int = 1337
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
-    block_size: int = 2048  # sequence length; must equal the architecture config's and the dataset config's
-
-    # Data loading (train loaders always run one worker per source; there is no worker-count knob)
-    sort_batches_by_length: bool = True  # regroup each world batch into length-sorted micro-batches
-    sequence_padding_multiple: Optional[int] = 128  # pad micro-batches to a multiple of this (None: max length)
+    training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and validation rows are sized by it; at most the dataset's and the model's length
 
     # Backend
     backend: str = "single_device"
     precision: str = "bf16-mixed"
     compile_model: bool = False
-    gradient_checkpointing: bool = False
-
-    # Batching (one optimizer step = world_batch_size sequences)
-    micro_batch_size: int = 4
-    world_batch_size: int = 1024
+    gradient_checkpointing: Literal["none", "selective", "full"] = "none"  # recompute the recurrence iterations' activations in the backward: selective keeps the GEMM/FlexAttention outputs (memory 75 %, ~6 % slower), full recomputes everything (35 %, ~22 % slower); model/blocks/recurrence.py
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
@@ -109,13 +125,15 @@ class Settings:
     warmup_steps: int = 0
     cooldown_steps: int = 0
     min_lr: float = 0.0
-    resume_warmup_steps: int = 0  # LR ramps from min_lr back to schedule over this many steps after a resume
 
-    # Evaluation / logging / checkpoints
+    # Evaluation / logging / checkpoints. Validation batches are padded rows (not packs): `validation_batch_size`
+    # rows padded to the longest of them, rounded up to a multiple of `validation_padding_multiple`.
     log_step_interval: int = 1
     log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
     eval_step_interval: int = 100
-    eval_iters: int = 50  # validation micro-batches per depth
+    eval_iters: int = 50  # validation batches per depth
+    validation_batch_size: int = 4  # rows per validation forward
+    validation_padding_multiple: Optional[int] = 128  # pad validation batches to a multiple of this many tokens (None: the longest row)
     partial_depth_eval: list[int] = field(default_factory=list)  # extra recurrence depths evaluated at validation
     save_step_interval: int = 1000
     save_last_step: bool = True
@@ -125,7 +143,24 @@ class Settings:
 
     # Export
     export_to_hf: bool = False  # write a HuggingFace trust_remote_code folder at the end of training
-    export_hf_path: Optional[str] = None  # default: {out_dir}/hf_export
+    export_hf_path: Optional[str] = None  # default: {out_dir}/{run_name}/hf_export
+
+    # Samples and benchmarks (`evaluation/`): text the model writes for fixed prompts, lm-eval-harness scores. Both
+    # run RNG-isolated (`evaluation/wrapper.py`), so they never change the training numerics. The percentages are
+    # turned into step numbers once the stage plan is known (`training/triggers.py`). Files go to
+    # {run dir}/samples/ and {run dir}/benchmarks/, named by step.
+    sample_step_interval: int = 0  # write samples every this many steps (0: never)
+    sample_at_training_progress: list[float] = field(default_factory=lambda: [100.0])  # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+    sample_max_new_tokens: int = 64
+    sample_temperature: float = 0.0  # 0: greedy decoding
+    sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
+    benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)
+    benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress (needs the eval extra: uv sync --extra eval)
+    benchmark_tasks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARK_TASKS))  # lm-eval task names
+    benchmark_limit: Optional[int] = None  # examples per task (None: all); a few hundred keeps in-training runs short
+    benchmark_num_fewshot: int = -1  # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
+    benchmark_batch_size: int = 8
+    benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
     def __post_init__(self) -> None:
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name
@@ -145,16 +180,31 @@ class Settings:
                 raise ValueError(f"{name} must be >= 0")
         if any(lr < 0 for lr in self.stage_base_lrs):
             raise ValueError("stage_base_lrs must be non-negative")
-        if self.world_batch_size < self.micro_batch_size:
+        # the plan-level names, checked here so a typo fails before the dataset is verified or built (an unknown
+        # optimizer used to fail after the build, an unknown schedule at the first optimizer step)
+        if self.optimizer not in OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {', '.join(OPTIMIZERS)}, not {self.optimizer!r}")
+        if self.lr_schedule not in LR_SCHEDULES:
+            raise ValueError(f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, not {self.lr_schedule!r}")
+        if any(depth <= 0 for depth in self.partial_depth_eval):
             raise ValueError(
-                f"world_batch_size ({self.world_batch_size}) must be >= micro_batch_size ({self.micro_batch_size}): "
-                "one optimizer step is at least one micro-batch"
+                f"partial_depth_eval must list positive recurrence depths, got {self.partial_depth_eval}"
             )
-        if self.world_batch_size % self.micro_batch_size != 0:
+        if self.optim_config.lr <= 0:  # ELLISAdam divides by it (the decoupled-decay reference init_lr)
             raise ValueError(
-                f"world_batch_size ({self.world_batch_size}) must be a multiple of micro_batch_size "
-                f"({self.micro_batch_size}): gradient_accumulation_steps is their integer quotient, so anything else "
-                "silently trains on fewer sequences per step than configured"
+                f"optim_config.lr must be positive, got {self.optim_config.lr}: it is the optimizer's constructor "
+                "LR and, for ELLISAdam, the reference of the decoupled weight decay (decay = lr / init_lr x "
+                "weight_decay). The schedule's learning rate is stage_base_lrs"
+            )
+        if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
+            raise ValueError(
+                f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {self.gradient_checkpointing!r}"
+            )
+        if self.tokens_per_micro_batch < self.training_max_sequence_length:
+            raise ValueError(
+                f"tokens_per_micro_batch ({self.tokens_per_micro_batch}) must be >= training_max_sequence_length "
+                f"({self.training_max_sequence_length}): a document is up to training_max_sequence_length tokens after "
+                "truncation and is never split across packs"
             )
         if self.eval_step_interval % self.log_step_interval != 0:  # both are POSITIVE_SETTINGS, no 0-disables case
             raise ValueError(
@@ -163,15 +213,43 @@ class Settings:
             )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
+        if self.sample_temperature < 0:
+            raise ValueError("sample_temperature must be >= 0 (0: greedy)")
+        if self.benchmark_limit is not None and self.benchmark_limit <= 0:
+            raise ValueError("benchmark_limit must be positive or null (all examples)")
+        if self.benchmark_num_fewshot < -1:
+            raise ValueError("benchmark_num_fewshot must be >= -1 (-1: each task's own default, 0: no examples)")
+        for name in ("sample_at_training_progress", "benchmark_at_training_progress"):
+            if any(not 0 <= percentage <= 100 for percentage in getattr(self, name)):
+                raise ValueError(f"{name} must list percentages between 0 and 100, got {getattr(self, name)}")
+        for name in ("sample_recurrences", "benchmark_recurrences"):
+            for setting in getattr(self, name):
+                if not setting or any(steps <= 0 for steps in setting):
+                    raise ValueError(f"{name}: every setting needs one positive step count per recurrent block, got {setting}")
+        if (self.benchmark_at_training_progress or self.benchmark_step_interval) and not self.benchmark_tasks:
+            raise ValueError(
+                "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
+            )
 
     @property
     def gradient_accumulation_steps(self) -> int:
         """
-        Micro-batches per optimizer step on one device (divide by world_size once distributed training exists).
+        Micro-batches per optimizer step on one device, `micro_batches_per_step` (divide by world_size once
+        distributed training exists; until then `train()` refuses `world_size != 1`, a second rank would double the
+        step). Whether the packs split evenly over the devices is checked where the world size is known
+        (`training.run.build_stage_manager`).
         """
 
-        return self.world_batch_size // self.micro_batch_size
+        return self.micro_batches_per_step
 
+    @property
+    def tokens_per_optimizer_step(self) -> int:
+        """
+        Tokens per optimizer step, the unit of the stage budgets and the throughput metrics:
+        `micro_batches_per_step x tokens_per_micro_batch` (pack tails counted, as the packs are full-length rows).
+        """
+
+        return self.micro_batches_per_step * self.tokens_per_micro_batch
 
 
 def parse_settings(args: Optional[list[str]] = None) -> Settings:

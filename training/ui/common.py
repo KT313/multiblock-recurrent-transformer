@@ -15,6 +15,7 @@ from ui.enabled import display_enabled
 ENV_VAR = "TRAINING_DASHBOARD"
 TRAINING_LOGGER_NAME = "training"  # the logger hierarchy of `training/`; `open()` attaches it by default
 TRAIN_LOG_NAME = "train.log"  # full log of every run, appended under the run directory (`log_file=`)
+TRAIN_REPORT_NAME = "train_report.json"  # the `TrainingReport` of the last process, next to train.log
 DASHBOARD_LOGGER_NAME = f"{TRAINING_LOGGER_NAME}.ui.dashboard"  # the dashboard's own records
 LINES_LOGGER_NAME = f"{TRAINING_LOGGER_NAME}.ui.lines"  # the dashboards' step / validation / event lines
 KEEP = {"keep": True}  # `extra=` of the records that must survive in the terminal scrollback under a live dashboard

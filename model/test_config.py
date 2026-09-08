@@ -4,6 +4,7 @@ Tests for `model.config`: per-block broadcasting, derived sizes, the shipped arc
 round trip. `tiny_config` / `TINY_ARCHITECTURE` are the shared helpers of the other `model/test_*.py` files.
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -85,10 +86,11 @@ def test_padded_vocab_size_derived_from_padding_multiple() -> None:
     assert cfg.vocab_size == 500
 
 
-def test_explicit_padded_vocab_size_clamps_vocab_size() -> None:
-    cfg = tiny(vocab_size=1000, padded_vocab_size=768)
-    assert cfg.padded_vocab_size == 768
-    assert cfg.vocab_size == 768
+def test_explicit_padded_vocab_size_must_hold_the_vocabulary() -> None:
+    cfg = tiny(vocab_size=700, padded_vocab_size=768)
+    assert (cfg.padded_vocab_size, cfg.vocab_size) == (768, 700)
+    with pytest.raises(ValueError, match="padded_vocab_size 768 is smaller than vocab_size 1000"):
+        tiny(vocab_size=1000, padded_vocab_size=768)  # used to truncate the vocabulary silently
 
 
 def test_head_size_and_intermediate_size() -> None:
@@ -111,7 +113,7 @@ def test_depth_arithmetic() -> None:
         mean_backprop_depth=[2, 1],
     )
     assert cfg.effective_expected_depth == 2 + 1 + (1 * 3 + 2 * 4)
-    assert cfg.mean_backprop_layers == 1 * 2 + 2 * 1
+    assert cfg.max_backprop_layers == 1 * 2 + 2 * 1
     assert cfg.init.num_layers == cfg.effective_expected_depth
 
 
@@ -120,14 +122,13 @@ def test_depth_arithmetic() -> None:
 
 def test_crow_architecture_yaml() -> None:
     cfg = RecurrentConfig.from_yaml(CROW_ARCHITECTURE)
-    assert cfg.name == "crow-300m-final"
     assert cfg.n_layers_in_recurrent_block == [4, 4, 4]
     assert cfg.mean_recurrence == [12, 12, 12] and cfg.mean_backprop_depth == [8, 8, 8]
     assert cfg.effective_expected_depth == 2 + 2 + 3 * 4 * 12
-    assert cfg.mean_backprop_layers == 3 * 4 * 8
+    assert cfg.max_backprop_layers == 3 * 4 * 8
     assert cfg.padded_vocab_size == 32768
     assert cfg.head_size == 64
-    assert cfg.intermediate_size == 4096 and cfg.block_size == 2048 and cfg.vocab_size == 32000
+    assert cfg.intermediate_size == 4096 and cfg.model_max_sequence_length == 2048 and cfg.vocab_size == 32000
     assert isinstance(cfg.norm_eps, float) and cfg.norm_eps == 1e-6  # YAML floats need a dot: 1e-6 would be a str
     assert cfg.rope_settings == RoPESettings(rope_base=50_000)
     assert cfg.qk_bias is True and cfg.tie_embeddings is True
@@ -135,8 +136,7 @@ def test_crow_architecture_yaml() -> None:
 
 def test_tiny_architecture_yaml() -> None:
     cfg = tiny()
-    assert cfg.name == "tiny"
-    assert (cfg.block_size, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
+    assert (cfg.model_max_sequence_length, cfg.n_embd, cfg.intermediate_size, cfg.num_attention_heads) == (256, 64, 128, 4)
     assert (cfg.vocab_size, cfg.padded_vocab_size, cfg.head_size) == (512, 512, 16)
     assert cfg.n_layers_in_prelude == 2 and cfg.n_layers_in_coda == 1
     assert cfg.n_layers_in_recurrent_block == [1, 1]
@@ -170,7 +170,6 @@ def test_architecture_yamls_list_every_tunable_field() -> None:
 
 def test_from_yaml_applies_overrides() -> None:
     cfg = tiny(n_embd=32, num_attention_heads=2, mean_recurrence=[7, 9])
-    assert cfg.name == "tiny"
     assert cfg.n_embd == 32
     assert cfg.head_size == 16
     assert cfg.mean_recurrence == [7, 9]
@@ -239,7 +238,7 @@ def test_rope_settings_accepts_dict() -> None:
 
 def test_to_dict_contains_only_dataclass_fields() -> None:
     d = tiny().to_dict()
-    assert "init" not in d and "head_size" not in d and "mean_backprop_layers" not in d
+    assert "init" not in d and "head_size" not in d and "max_backprop_layers" not in d
     assert d["rope_settings"] == {"rope_base": 50_000}
 
 
@@ -258,6 +257,7 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
 def test_invalid_single_value_fields_rejected(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"{field}="):
         tiny(**{field: value})
+
 
 @pytest.mark.parametrize(
     ("overrides", "match"),
@@ -279,3 +279,60 @@ def test_degenerate_recurrence_values_are_rejected_at_config_time(overrides: dic
         tiny(**overrides)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"num_attention_heads": 0}, "num_attention_heads must be >= 1"),
+        ({"n_embd": 0}, "n_embd must be >= 1"),
+        ({"padding_multiple": 0}, "padding_multiple must be >= 1"),
+        ({"vocab_size": 0}, "vocab_size must be >= 1"),
+        ({"model_max_sequence_length": 0}, "model_max_sequence_length must be >= 1"),
+        ({"intermediate_size": 0}, "intermediate_size must be >= 1"),
+        ({"norm_eps": 0.0}, "norm_eps must be > 0"),
+        ({"norm_eps": -1e-6}, "norm_eps must be > 0"),
+        ({"rope_settings": {"rope_base": 0}}, "rope_base must be > 0"),
+    ],
+)
+def test_degenerate_sizes_are_rejected_at_config_time(overrides: dict[str, object], match: str) -> None:
+    """
+    These used to reach a ZeroDivisionError in `find_multiple`, an empty embedding table or a division by zero
+    head count instead.
+    """
+
+    with pytest.raises(ValueError, match=match):
+        tiny(**overrides)
+
+
+def test_intermediate_size_none_still_defaults_to_four_times_n_embd() -> None:
+    assert tiny(intermediate_size=None).intermediate_size == 4 * tiny().n_embd
+
+
+def test_from_json_rejects_unknown_keys(tmp_path: Path) -> None:
+    """
+    Like `from_yaml`: a field renamed since the file was written must not be dropped silently.
+    """
+
+    path = tmp_path / "cfg.json"
+    written = tiny().to_dict()
+    written["block_size"] = 128
+    path.write_text(json.dumps(written), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown RecurrentConfig key"):
+        RecurrentConfig.from_json(path)
+
+
+@pytest.mark.parametrize("value", ["none", "core", "all"])
+def test_bf16_residual_stream_values(value: str, tmp_path: Path) -> None:
+    cfg = tiny_config(bf16_residual_stream=value)
+    assert cfg.bf16_residual_stream == value
+    cfg.to_json(tmp_path / "cfg.json")
+    assert RecurrentConfig.from_json(tmp_path / "cfg.json").bf16_residual_stream == value
+
+
+def test_bf16_residual_stream_rejects_other_values() -> None:
+    with pytest.raises(ValueError, match="bf16_residual_stream='everywhere'"):
+        tiny_config(bf16_residual_stream="everywhere")
+
+
+def test_bf16_residual_stream_default_is_off_in_every_architecture_yaml() -> None:
+    for path in (TINY_ARCHITECTURE, CROW_ARCHITECTURE):
+        assert RecurrentConfig.from_yaml(path).bf16_residual_stream == "none", path

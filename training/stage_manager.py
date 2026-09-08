@@ -4,8 +4,8 @@ Multi-stage training manager: stage boundaries, transitions and stage-dependent 
 
 The stages are the resolver's `ResolvedStage`s (token budget, base LR, transition length, sampling weights); the
 manager turns budgets into optimizer-step boundaries and weights into a per-step schedule. All steps are OPTIMIZER
-steps (one world batch of `world_batch_size * block_size` tokens each), so step counts are independent of the world
-size; `world_size` only feeds the sanity check that the world batch splits evenly across devices.
+steps of `tokens_per_step` tokens (`Settings.tokens_per_optimizer_step`: the packs of one step), so step counts are
+independent of the world size; `world_size` only appears in the summary.
 """
 
 from dataclasses import dataclass
@@ -85,29 +85,25 @@ class StageManager:
     def __init__(
         self,
         stages: list[ResolvedStage],
-        world_batch_size: int,
-        block_size: int,
+        tokens_per_step: int,
         world_size: int = 1,
         warmup_steps: int = 0,
         cooldown_steps: int = 0,
-        micro_batch_size: Optional[int] = None,
     ) -> None:
+        """
+        `tokens_per_step` is the size of one optimizer step (`Settings.tokens_per_optimizer_step`); whether the
+        packs of a step split evenly over the devices is the caller's check (`training.run.build_stage_manager`).
+        """
+
         if not stages:
             raise ValueError("stages must contain at least one stage")
-        if world_batch_size % world_size != 0:
-            raise ValueError(f"world_batch_size ({world_batch_size}) must be divisible by world_size ({world_size})")
-        if micro_batch_size is not None and world_batch_size % (micro_batch_size * world_size) != 0:
-            raise ValueError(
-                f"world_batch_size ({world_batch_size}) must be a multiple of micro_batch_size * world_size "
-                f"({micro_batch_size} * {world_size})"
-            )
+        if tokens_per_step <= 0:
+            raise ValueError(f"tokens_per_step must be positive, got {tokens_per_step}")
         self.stages = stages
-        self.world_batch_size = world_batch_size
-        self.block_size = block_size
         self.world_size = world_size
         self.warmup_steps = warmup_steps
         self.cooldown_steps = cooldown_steps
-        self.tokens_per_step = world_batch_size * block_size
+        self.tokens_per_step = tokens_per_step
 
         self.boundaries = self._calculate_stage_boundaries()
         self.total_steps = self.boundaries[-1].end_step
@@ -152,7 +148,8 @@ class StageManager:
             if stage_steps < 1:
                 raise ValueError(
                     f"stage {stage.name!r} is shorter than one optimizer step ({stage.tokens} tokens < "
-                    f"{self.tokens_per_step} per step); increase its tokens or lower world_batch_size"
+                    f"{self.tokens_per_step} per step); increase its tokens or lower tokens_per_micro_batch or "
+                    "micro_batches_per_step"
                 )
             if boundary.end_step - boundary.transition_start_step >= stage_steps:
                 raise ValueError(f"stage {stage.name!r}: the transition must be shorter than the stage")
@@ -241,7 +238,7 @@ class StageManager:
         lines = ["Multi-Stage Training Configuration:"]
         lines.append(f"  Total stages: {len(self.stages)}")
         lines.append(f"  Total optimizer steps: {self.total_steps:,}")
-        lines.append(f"  Tokens per optimizer step: {self.tokens_per_step:,} (world batch {self.world_batch_size} x block {self.block_size})")
+        lines.append(f"  Tokens per optimizer step: {self.tokens_per_step:,}")
         lines.append(f"  World size: {self.world_size}")
         lines.append("")
 

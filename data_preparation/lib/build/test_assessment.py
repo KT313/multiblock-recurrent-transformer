@@ -8,12 +8,13 @@ uses (`check_files=False`).
 from __future__ import annotations
 
 from collections.abc import Callable
+from math import ceil
 from pathlib import Path
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.runner import prepare, status
-from data_preparation.lib.build.planner import source_ledger
+from data_preparation.lib.build.planner import measured_tokens_per_row, source_ledger
 from data_preparation.lib.build.repair import repair_broken_and_stale_folders
 from data_preparation.lib.build.assessment import (
     ProcessedAssessment,
@@ -98,7 +99,10 @@ def test_wrong_hash_is_stale(cfg_factory: CfgFactory, with_tokenizer: Prep, layo
     manifest.save(layout.processed_dir("a"))
     assessment = _assess(cfg, layout, _raw_shards(layout))
     assert (assessment.problem, assessment.repair) == ("stale", "rebuild")
-    assert assessment.reason == "stale: processing settings, max_seq_length or the source changed"
+    assert assessment.reason == "stale: (no recorded field differs: the hash rule changed)", "the recorded payload still matches: only the hash was edited"
+    manifest.hash_payload = {**manifest.hash_payload, "max_seq_length": 32} if manifest.hash_payload else None
+    manifest.save(layout.processed_dir("a"))
+    assert _assess(cfg, layout, _raw_shards(layout)).reason == f"stale: max_seq_length: 32 -> {cfg.dataset_max_sequence_length}"
 
 
 def test_missing_listed_shard_is_broken_only_when_files_are_checked(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -208,11 +212,20 @@ def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     """
     The M1 state through the entry points: status and prepare --dry_run report a pending build and no
     repair, prepare resumes the build over the leftover and ends complete, all three from the same verdict.
+    The budget is sized after the download so that the one built shard is short of it (the build is capped at
+    the budget: with a budget the first shard already serves, the leftover is no pending build at all, below).
     """
 
-    cfg = with_tokenizer(cfg_factory({"a": SourceConfig(kind="pretrain", loader="synthetic", seed=0)}, tokens=6))
+    source = SourceConfig(kind="pretrain", loader="synthetic", seed=0)
+    first = with_tokenizer(cfg_factory({"a": source}, tokens=6))
+    download(first, "a", layout, rows_needed=8, shard_size=4)  # 2 raw shards
+    raw = Manifest.load(layout.raw_dir("a"))
+    assert raw is not None
+    rate = measured_tokens_per_row(first, "a", layout, raw)
+    assert rate is not None
+    cfg = cfg_factory({"a": source}, tokens=ceil(6 * rate))  # a rows budget of 6 at the measured rate: needs 8 raw, 7 processed rows
     path = config_file(cfg)
-    download(cfg, "a", layout, rows_needed=8, shard_size=4)  # 2 raw shards; rows_needed(cfg) is 8 too
+    assert (source_ledger(cfg, "a", layout).rows_needed, source_ledger(cfg, "a", layout).rows_sufficient) == (8, 7)
     build_source(cfg, "a", layout, shard_size=4)
     _make_crash_leftover(layout.processed_dir("a"))
 
@@ -226,6 +239,17 @@ def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     assert manifest is not None and len(manifest.input_shards) == 2
     listed = {shard.name for shard in manifest.shards}
     assert {p.name for p in layout.processed_dir("a").glob("*.parquet")} == listed
+
+    # the same leftover on a folder whose one shard serves the budget: complete, nothing pending, the stray
+    # file is reported as the leftover a later, larger build overwrites (repair: nothing)
+    _make_crash_leftover(layout.processed_dir("a"))
+    served = config_file(first)  # budget of 6 tokens: one processed row serves it
+    for report in (status(served, layout.root), prepare(served, layout.root, assume_yes=False)):
+        assert report.complete and report.needs_repair == []
+        state = next(s for s in report.sources if s.name == "a")
+        assert state.satisfaction() == (True, "ok, 1 raw shard(s) past the budget unbuilt") and not state.build_pending
+    assessment = assess_processed_folder(first, "a", layout.processed_dir("a"), _raw_shards(layout, "a"))
+    assert assessment.problem == "crash_leftover" and assessment.repair == "nothing"
 
 
 def _make_stale(folder: Path) -> None:

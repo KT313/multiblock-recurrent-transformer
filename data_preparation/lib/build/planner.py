@@ -1,23 +1,37 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Planner: what a dataset config needs on disk versus what the manifests say is there, counted in sequences.
+Planner: what a dataset config needs on disk versus what the manifests say is there, counted in tokens.
 
-The trainer draws rows from one continuous stream per source with the stage weight and pads or truncates every row
-to block_size, so the run consumes the integral of the source's weight schedule over the stage token budgets
-divided by block_size: its :meth:`DatasetConfig.sequence_budget` (the 1.2 safety margin comes on top). That is
-the planner's unit: :meth:`DatasetConfig.rows_needed` turns it into a download target,
-:meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it. No tokens-per-row estimate enters this
-arithmetic (describe.py prints one for its token table only).
+The trainer draws rows from one continuous stream per source with the stage weight and packs them end to end, cut at
+the length the dataset config plans for, training_target_sequence_length: a row serves min(its tokens, target) of the
+token budget. The run needs the integral of the source's weight schedule over the stage token budgets,
+:meth:`DatasetConfig.token_budget`, in tokens. Rows are what a loader delivers, so the planner divides that budget by
+a tokens-per-row rate: the source's describe_tokens_per_row estimate (clamped at the target) until the first raw shard
+is on disk, the mean of the capped row lengths read from the raw shards' tokens column from then on
+(:func:`measured_tokens_per_row`, :meth:`DatasetConfig.tokens_per_row_rate`). :meth:`DatasetConfig.rows_needed` turns
+it into a download target (× 1.2 safety margin, ÷ the training share after the validation holdout),
+:meth:`DatasetConfig.rows_sufficient` into the processed rows that serve it, :meth:`DatasetConfig.rows_budget` into
+the rows the run draws (the status table's epochs). An estimate that ran high is what the round loop's top-ups
+correct once the rows are measured.
 
 One :class:`SourceLedger` per source answers both questions the pipeline asks, "what is still to download?"
 (:attr:`SourceLedger.rows_to_fetch`) and "is this source done?" (:meth:`SourceLedger.satisfaction`), from one read
 of the config and the manifests, so the plan and the satisfaction check cannot disagree. The ledger sizes a top-up
-from the observed yield (processed / raw). An exhausted source with no rows, or whose few rows all go to the
-training-time validation holdout (:func:`training_rows_after_split`), is a failure: a failed source is a failed
-build, never a silently smaller dataset.
+from the observed yield (processed / raw) and never re-downloads a source whose processed rows already serve the
+budget. An exhausted source with no rows, or whose few rows all go to the training-time validation holdout
+(:func:`training_rows_after_split`), is a failure: a failed source is a failed build, never a silently smaller
+dataset.
 
-Everything here reads manifests only (no parquet footers): a processed folder's health is the shared verdict of
-lib/build/assessment.py with check_files=False; broken or stray shard files are the repair step's business.
+The build is capped at the budget: a processed folder that serves `rows_sufficient` rows is satisfied and not a
+pending build even while raw shards remain unbuilt (`behind_raw` is the folder's health, the budget decides whether
+it is work; :attr:`SourceLedger.build_pending`). Raw rows past the budget (a github_code member fed on after its
+target, see stages/download.py) therefore cost raw disk only; a larger budget builds the next shards.
+
+Everything here reads manifests, plus the tokens column of current raw shards for the rate (no other shard data):
+a processed folder's health is the shared verdict of lib/build/assessment.py with check_files=False; broken or stray
+shard files are the repair step's business. A raw manifest that cannot be parsed next to shards is a reported state
+(nothing is planned for it, nobody deletes it); a raw *shard* that cannot be read stops the plan with
+:class:`UnreadableRawShardError` (the repair step truncates such a folder, so the error names the command).
 Pure functions of (config, layout); lib/build/runner.py executes them.
 """
 
@@ -28,15 +42,45 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import cached_property
 from math import ceil
+from pathlib import Path
+
+import pyarrow as pa
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
+from data_preparation.lib.build.repair import RepairError
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, inspect_raw
-from data_preparation.lib.storage.manifest import shard_list, Manifest
+from data_preparation.lib.storage.manifest import shard_list, shard_tokens, Manifest
 
 log = get_logger(__name__)
+
+
+class UnreadableRawShardError(RepairError):
+    """
+    A raw shard the tokens-per-row rate is measured from cannot be read (truncated by a crash, replaced by
+    something that is not parquet, deleted between the manifest read and this one).
+
+    A :class:`RepairError` because that is exactly what it needs: the repair step truncates the folder to its
+    readable prefix. The planner knows neither the config path nor the dataset directory, so the command that
+    runs the repair is appended by its caller (:func:`lib.build.runner.status`); `remedy` carries it.
+    """
+
+    def __init__(self, source: str, path: Path, error: BaseException, remedy: str = "") -> None:
+        self.source = source
+        self.path = path
+        self.error = error
+        self.remedy = remedy
+        message = f"{source}: raw shard {path} cannot be read ({type(error).__name__}: {error})"
+        super().__init__(f"{message}\n{remedy}" if remedy else message)
+
+    def with_remedy(self, remedy: str) -> UnreadableRawShardError:
+        """
+        The same error with the remedy (what to run) appended to its message.
+        """
+
+        return UnreadableRawShardError(self.source, self.path, self.error, remedy)
 
 
 # --- rows ---------------------------------------------------------------------------------------------------------
@@ -93,12 +137,12 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
     """
-    Whether name has raw shards its processed folder does not cover yet (or no healthy processed folder);
-    False without a current raw manifest: there is nothing to build from.
+    Whether name has a build to run (:attr:`SourceLedger.build_pending`): no healthy processed folder, or
+    raw shards it does not cover while it is short of the budget. False without a current raw manifest: there is
+    nothing to build from.
     """
 
-    raw = inspect_raw(config, name, layout).current_manifest
-    return raw is not None and assess_processed(config, name, layout, raw).problem != "none"
+    return source_ledger(config, name, layout).build_pending
 
 
 def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
@@ -161,7 +205,8 @@ def plan_downloads(config: DatasetConfig, layout: DatasetLayout, *, sources: Ite
 
     A raw folder that is stale or outdated is planned as "nothing to fetch" with the state as its reason: the
     repair step deletes it (after confirmation) before any download runs, and a dry run shows the state instead of
-    failing. The download never appends to a folder whose rows the current config would not have produced.
+    failing. The download never appends to a folder whose rows the current config would not have produced. A raw
+    manifest that cannot be parsed is planned as nothing to fetch too: only the user can fix or delete that folder.
     """
 
     return DownloadPlan(read_ledgers(config, layout, sources=sources))
@@ -202,21 +247,40 @@ class DatasetReport:
 
         return [source for source in self.sources if not source.satisfaction()[0]]
 
-    def table(self) -> str:
+    def missing_raw_rows(self) -> list[str]:
         """
-        A fixed-width table: source, kind, rows needed, raw rows, processed rows, epochs, state, reason.
+        Names of the items whose raw side is not done, the `download` command's completeness check (a download-only
+        run leaves no processed folder, so :meth:`SourceLedger.satisfaction` cannot be asked): a raw folder that is
+        not current, rows still to fetch, a loader that ran dry without storing one row (every row rejected: a wrong
+        fields / converter / filter / language), plus "tokenizer" when it is missing. Empty iff the downloads are
+        complete.
         """
 
-        header = ("source", "kind", "needed", "raw", "processed", "epochs", "state", "reason")
+        names = [
+            source.name
+            for source in self.sources
+            if source.raw_state != "current" or source.rows_to_fetch[0] > 0 or (source.exhausted and source.raw_rows == 0)
+        ]
+        if not self.tokenizer_complete:
+            names.append("tokenizer")
+        return names
+
+    def table(self) -> str:
+        """
+        A fixed-width table: source, kind, rows needed, the tokens-per-row rate they were planned with, raw rows,
+        processed rows, epochs, state, reason.
+        """
+
+        header = ("source", "kind", "needed", "tokens/row", "raw", "processed", "epochs", "state", "reason")
         rows = []
         for source in self.sources:
             epochs = source.epochs()
             state = "needs repair" if source.name in self.needs_repair else source.state()
             rows.append((
-                source.name, source.kind, f"{source.rows_needed:,}", f"{source.raw_rows:,}", f"{source.processed_rows:,}",
-                "-" if epochs is None else f"{epochs:.2f}", state, source.satisfaction()[1],
+                source.name, source.kind, f"{source.rows_needed:,}", f"{source.tokens_per_row:,.0f}", f"{source.raw_rows:,}",
+                f"{source.processed_rows:,}", "-" if epochs is None else f"{epochs:.2f}", state, source.satisfaction()[1],
             ))  # fmt: skip
-        rows.append(("tokenizer", "tokenizer", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
+        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
         return format_table(header, rows)
 
     def describe(self) -> str:
@@ -241,8 +305,9 @@ class SourceLedger:
     kind: str
     rows_needed: int  # raw rows to download (:meth:`DatasetConfig.rows_needed`)
     rows_sufficient: int  # processed rows that serve the budget (:meth:`DatasetConfig.rows_sufficient`)
-    sequence_budget: int  # sequences the whole run draws (weight-schedule integral; 0 when the source is not trained on)
-    raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated"
+    rows_budget: int  # rows the whole run draws (token budget ÷ tokens_per_row; 0 when the source is not trained on)
+    tokens_per_row: float  # the rate the three numbers above were planned with (measured mean of the capped row lengths, else the estimate)
+    raw_state: RawManifestState  # "missing" | "current" | "stale" | "outdated" | "tokenizer_changed" | "unreadable"
     raw_reason: str  # the state's reason line (:func:`inspect_raw`): what the plan and the status table say about it
     raw_rows: int  # rows in the raw manifest (0 unless the folder is current)
     exhausted: bool  # the loader has nothing more to give (:func:`raw_is_exhausted`)
@@ -252,6 +317,7 @@ class SourceLedger:
     processed_reason: str  # its reason line
     processed_rows: int  # rows in the processed manifest (0 unless it is built or behind raw)
     training_rows: int  # processed rows left after the training-time validation split
+    unbuilt_shards: int = 0  # raw shards the processed folder does not cover (a healthy folder behind raw)
 
     # --- what to download ------------------------------------------------------------------------------------------
 
@@ -262,6 +328,33 @@ class SourceLedger:
         """
 
         return self.processed_problem == "none"
+
+    @property
+    def healthy(self) -> bool:
+        """
+        The processed folder is current and intact: built, or behind raw (raw shards it does not cover yet).
+        """
+
+        return self.processed_problem in ("none", "behind_raw")
+
+    @property
+    def serves_budget(self) -> bool:
+        """
+        A healthy processed folder with at least :attr:`rows_sufficient` rows (built or not: the cap).
+        """
+
+        return self.healthy and self.processed_rows >= self.rows_sufficient
+
+    @property
+    def build_pending(self) -> bool:
+        """
+        The build has work: a current raw folder whose processed folder is missing, to be rebuilt, or behind
+        raw while short of the budget. A folder behind raw that serves the budget is the cap, not pending work.
+        """
+
+        if self.raw_state != "current" or self.built:
+            return False
+        return not self.serves_budget
 
     @property
     def rows_target(self) -> int:
@@ -276,22 +369,30 @@ class SourceLedger:
     @cached_property
     def rows_to_fetch(self) -> tuple[int, str]:
         """
-        (rows, reason): raw rows to add. The difference to :attr:`rows_needed` while raw is short; a top-up
-        sized by the observed yield once raw is long enough but the build dropped more than the safety margin
-        covers; 0 when the loader is dry, the raw folder is the repair step's business, or the budget is served.
-        Computed once per ledger (the pathological-yield warning is logged once).
+        (rows, reason): raw rows to add. Nothing once the built processed rows serve the budget (a raised
+        budget or a measured rate below the estimate re-downloads nothing the margin already covered); the
+        difference to :attr:`rows_needed` while raw is short; a top-up sized by the observed yield once raw is long
+        enough but the build dropped more than the safety margin covers; 0 when the loader is dry or the raw folder
+        is the repair step's (or the user's) business. Computed once per ledger (the pathological-yield warning is
+        logged once).
         """
 
-        if self.raw_state not in ("missing", "current"):
+        if self.raw_state in ("stale", "outdated"):
             return 0, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
+        if self.raw_state == "tokenizer_changed":
+            return 0, f"raw {self.raw_reason}; the repair step asks whether to keep it"
         if self.raw_state == "missing":
             return self.rows_needed, f"raw {self.raw_reason}"
+        if self.raw_state == "unreadable":
+            return 0, f"raw {self.raw_reason}"
         if self.exhausted:
             return 0, "exhausted"
+        if self.serves_budget:
+            return 0, "budget served"
         if self.raw_rows < self.rows_needed:
             return self.rows_needed - self.raw_rows, f"rows {self.raw_rows:,} < {self.rows_needed:,}"
-        if not self.built or self.processed_rows >= self.rows_sufficient:
-            return 0, "enough rows"  # nothing to top up: either not built yet (build first), or the budget is served
+        if not self.built:
+            return 0, "enough rows"  # nothing to top up before the build ran
         top_up = self._top_up_rows()
         if top_up <= 0:
             return 0, f"no row of {self.raw_rows:,} raw rows survives the build"  # more raw would be dropped too
@@ -329,18 +430,22 @@ class SourceLedger:
         validation holdout (:attr:`training_rows`; the sampler cycles what is there). A source that ran dry with
         nothing is not satisfied (its rows were all rejected: a wrong fields / converter / filter /
         language), nor is one whose few rows all go to the validation holdout: a failed source is a failed
-        build, never a silently smaller dataset. A stale / outdated raw folder is reported, never counted. The
-        reason is the status table's last column: "ok", or what is missing.
+        build, never a silently smaller dataset. A stale / outdated / tokenizer_changed / unreadable raw folder is
+        reported, never counted. The reason is the status table's last column: "ok", or what is missing.
         """
 
-        if self.raw_state not in ("missing", "current"):
+        if self.raw_state in ("stale", "outdated"):
             return False, f"raw {self.raw_reason}; the repair step deletes it after confirmation"
-        if self.raw_state == "missing":
+        if self.raw_state == "tokenizer_changed":
+            return False, f"raw {self.raw_reason}; the repair step asks whether to keep it"
+        if self.raw_state != "current":  # missing, or a manifest nobody can parse
             return False, f"raw {self.raw_reason}"
+        if self.serves_budget:
+            if self.unbuilt_shards:
+                return True, f"ok, {self.unbuilt_shards:,} raw shard(s) past the budget unbuilt"
+            return True, "ok"
         if not self.built:
             return False, f"processed {self.processed_reason}"
-        if self.processed_rows >= self.rows_sufficient:
-            return True, "ok"
         if self.exhausted:
             if self.processed_rows == 0:
                 return False, (
@@ -368,22 +473,24 @@ class SourceLedger:
 
     def epochs(self) -> float | None:
         """
-        How often the trainer cycles this source's training rows to serve its sequence budget (the run's total
-        demand over all stages); None while it is not satisfied, for a source it does not train on, or without rows.
+        How often the trainer cycles this source's training rows to serve its rows budget (the run's total
+        demand over all stages at the planned tokens-per-row rate); None while it is not satisfied, for a source it
+        does not train on, or without rows.
         """
 
-        if not self.satisfaction()[0] or self.sequence_budget <= 0 or self.training_rows <= 0:
+        if not self.satisfaction()[0] or self.rows_budget <= 0 or self.training_rows <= 0:
             return None
-        return self.sequence_budget / self.training_rows
+        return self.rows_budget / self.training_rows
 
 
 def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> SourceLedger:
     """
-    Read one source's ledger: the budget from config, the rest from the raw and processed manifests. A raw
-    folder that is not current contributes nothing (its rows are about to be deleted or were never downloaded), so
-    its processed folder is not counted either. An unreadable processed manifest is the repair step's deletion (no
-    confirmation, processed data is derived), reported instead of raised so status / prepare --dry_run
-    describe the very state repair heals.
+    Read one source's ledger: the budget from config at the tokens-per-row rate measured over the raw shards (the
+    config's estimate before the first shard), the rest from the raw and processed manifests. A raw folder that is
+    not current contributes nothing (its rows are about to be deleted, were never downloaded, or nobody can read
+    their manifest), so its processed folder is not counted either. An unreadable processed manifest is the repair
+    step's deletion (no confirmation, processed data is derived), reported instead of raised so status /
+    prepare --dry_run describe the very state repair heals.
     """
 
     raw_inspection = inspect_raw(config, name, layout)
@@ -392,12 +499,15 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
     if processed.problem == "unreadable_manifest":
         log.warning("%s: unreadable manifest in %s; the repair step deletes the folder and builds it again", name, layout.processed_dir(name))
     processed_rows = processed.manifest.rows() if processed.manifest is not None and processed.problem in ("none", "behind_raw") else 0
+    unbuilt = len(raw.shards) - len(processed.manifest.input_shards) if raw is not None and processed.manifest is not None and processed.problem == "behind_raw" else 0
+    measured = measured_tokens_per_row(config, name, layout, raw)
     return SourceLedger(
         name=name,
         kind=config.sources[name].kind,
-        rows_needed=config.rows_needed(name),
-        rows_sufficient=config.rows_sufficient(name),
-        sequence_budget=config.sequence_budget(name),
+        rows_needed=config.rows_needed(name, measured),
+        rows_sufficient=config.rows_sufficient(name, measured),
+        rows_budget=config.rows_budget(name, measured),
+        tokens_per_row=float(config.tokens_per_row_rate(name, measured)),
         raw_state=raw_inspection.state,
         raw_reason=raw_inspection.reason,
         raw_rows=0 if raw is None else raw.rows(),
@@ -408,7 +518,32 @@ def source_ledger(config: DatasetConfig, name: str, layout: DatasetLayout) -> So
         processed_reason=processed.reason,
         processed_rows=processed_rows,
         training_rows=training_rows_after_split(config, name, processed_rows),
+        unbuilt_shards=unbuilt,
     )
+
+
+def measured_tokens_per_row(config: DatasetConfig, name: str, layout: DatasetLayout, raw: Manifest | None) -> float | None:
+    """
+    The mean over the stored rows of min(tokens, training_target_sequence_length), the rate the planner divides
+    the token budget by: a 530-token row serves 530 tokens of the budget, a 4000-token one the target. Read from
+    the tokens column of every shard of a current raw manifest (one column per shard, no other data); None without
+    rows or token counts (the config's estimate stands in then).
+
+    A shard that cannot be read is an :class:`UnreadableRawShardError`, not the bare Arrow error: every caller of
+    the planner (status, prepare, training's auto-prepare) goes through here, and the repair step is what fixes it.
+    """
+
+    if raw is None or raw.rows() <= 0 or raw.tokens() is None:
+        return None
+    raw_dir = layout.raw_dir(name)
+    capped = 0
+    for shard in raw.shards:
+        path = raw_dir / shard.name
+        try:
+            capped += shard_tokens(path, cap=config.training_target_sequence_length)
+        except (OSError, pa.ArrowException) as error:
+            raise UnreadableRawShardError(name, path, error) from error
+    return capped / raw.rows()
 
 
 def read_ledgers(config: DatasetConfig, layout: DatasetLayout, *, sources: Iterable[str] | None = None) -> list[SourceLedger]:

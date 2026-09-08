@@ -112,6 +112,31 @@ def test_load_absent_or_unparsable(tmp_path: Path, caplog: pytest.LogCaptureFixt
         Manifest.load(tmp_path)
 
 
+def test_load_rejects_malformed_shard_entries(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A `shards` list that is not a list of shard objects follows the same contract as any other unreadable
+    manifest (warn without shards, raise next to them); the entries used to reach `ShardInfo(**entry)` and die
+    with an AttributeError past both branches, and a `rows: "3"` only much later in :meth:`Manifest.rows`.
+    """
+
+    payloads = [
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [1]},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": "x"},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [{"name": "data-00000.parquet", "rows": "3"}]},
+        {"source": "s", "source_hash": "h", "stage": "raw", "shards": [{"name": 7, "rows": 3}]},
+    ]
+    for payload in payloads:
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(payload))
+        assert Manifest.load(tmp_path) is None
+    assert sum("unparsable manifest" in r.message for r in caplog.records) == len(payloads)
+
+    pq.write_table(pa.table({"text": ["a"]}), tmp_path / "data-00000.parquet")
+    for payload in payloads:
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(payload))
+        with pytest.raises(RuntimeError, match="unreadable manifest .* next to shards"):
+            Manifest.load(tmp_path)
+
+
 def test_stage_validated() -> None:
     assert STAGES == ("raw", "processed", "tokenizer")
     for stage in STAGES:
@@ -136,6 +161,43 @@ def test_add_shard_replaces_and_sorts() -> None:
     m.add_shard("data-00000.parquet", 1, 10)
     m.add_shard("data-00001.parquet", 3, 30)
     assert m.shards == [ShardInfo("data-00000.parquet", 1, 10), ShardInfo("data-00001.parquet", 3, 30)]
+    m.add_shard("data-100000.parquet", 1)
+    m.add_shard("data-99999.parquet", 1)
+    assert [shard.name for shard in m.shards][-2:] == ["data-99999.parquet", "data-100000.parquet"], "by index, not by name"
+
+
+def test_a_raw_manifest_records_the_dataset_config_it_was_downloaded_under(tmp_path: Path) -> None:
+    m = Manifest(source="s", source_hash="h", stage="raw", dataset_config="crow.yaml")
+    assert m.to_dict()["extra"]["dataset_config"] == "crow.yaml"
+    m.save(tmp_path)
+    loaded = Manifest.load(tmp_path)
+    assert loaded is not None and loaded.dataset_config == "crow.yaml" and loaded.extra == {}
+    assert "dataset_config" not in Manifest(source="s", source_hash="h", stage="raw").to_dict()["extra"], "unknown: not written"
+
+
+def test_raw_manifests_record_the_tokenizer_hash_and_both_record_the_hash_payload(tmp_path: Path) -> None:
+    """
+    The dict a hash was computed from is stored next to the hash (raw and processed) so a mismatch can be
+    explained field by field; the tokenizer's hash is raw-only (it decides the tokenizer_changed state) and the
+    adoptions of a new tokenizer accumulate under `tokenizer_changes` like any other untyped extra. Manifests from
+    before these were recorded have None and write nothing.
+    """
+
+    payload = {"source": {"kind": "pretrain", "revision": "abc"}}
+    changes = [{"from": {"token_count": "tokenizer", "tokenizer": "old", "tokenizer_hash": "h0"}, "to": {"token_count": "tokenizer", "tokenizer": "t", "tokenizer_hash": "h1"}, "at_rows": 30}]
+    m = Manifest(source="s", source_hash="h", stage="raw", tokenizer="t", tokenizer_hash="h1", hash_payload=payload, extra={"tokenizer_changes": changes})
+    on_disk = m.to_dict()["extra"]
+    assert on_disk["tokenizer_hash"] == "h1" and on_disk["hash_payload"] == payload and on_disk["tokenizer_changes"] == changes
+    m.save(tmp_path)
+    loaded = Manifest.load(tmp_path)
+    assert loaded == m and loaded.hash_payload == payload and loaded.tokenizer_hash == "h1" and loaded.extra == {"tokenizer_changes": changes}
+    processed = Manifest(source="s", source_hash="h", stage="processed", hash_payload=payload).to_dict()["extra"]
+    assert processed["hash_payload"] == payload and "tokenizer_hash" not in processed
+    legacy = Manifest(source="s", source_hash="h", stage="raw").to_dict()["extra"]
+    assert "tokenizer_hash" not in legacy and "hash_payload" not in legacy
+    loaded_legacy = Manifest.from_dict({"source": "s", "source_hash": "h", "stage": "raw", "extra": legacy})
+    assert loaded_legacy.tokenizer_hash is None and loaded_legacy.hash_payload is None and loaded_legacy.extra == {}
+    assert "hash_payload" not in Manifest(source="t", source_hash="h", stage="tokenizer", hash_payload=payload).to_dict()["extra"]
 
 
 def test_shard_rows_and_verify(tmp_path: Path) -> None:

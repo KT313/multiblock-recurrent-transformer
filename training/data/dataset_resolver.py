@@ -7,9 +7,10 @@ and the stage token budgets.
 The validation split is decided here, once per source and run: a source used only for training is read whole, one
 used only for validation is read whole as validation, one used for both holds out its first
 `ceil(validation_fraction × rows)` processed rows. Rows are counted once per source from the parquet footers and
-cross-checked against the manifest. The chosen `validation_rows` travel with every checkpoint and are verified on
-resume (`check_dataset_unchanged`). Every entry is checked at setup (`check_entries`, `check_validation_batches`)
-instead of mid-run.
+cross-checked against the manifest. The chosen `validation_rows` and the row count per source (`source_rows`)
+travel with every checkpoint and are verified on resume (`check_dataset_unchanged`): the stream resumes by row
+offset, so a source re-prepared in between would continue from other rows. Every entry is checked at setup
+(`check_entries`, `check_validation_batches`) instead of mid-run.
 
 Framework-neutral apart from `data_preparation.*`; no torch. The only cross-over between the run config and the
 dataset config happens here.
@@ -34,6 +35,7 @@ from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dat
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
+from data_preparation.lib.storage.parquet import SHARD_PATTERN
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 from training.settings import Settings
 
@@ -50,7 +52,8 @@ INSTRUCT_DATA_SIGNATURE: dict[str, Any] = {
 Part = Literal["train", "val"]
 
 
-TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting
+TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting (its worker
+# batch size and prefetch depth are `training.data.loader.TRAIN_LOADER_BATCH_ROWS` / `TRAIN_LOADER_PREFETCH_FACTOR`)
 
 
 @dataclass
@@ -104,6 +107,7 @@ class ResolvedDataset:
     stages: list[ResolvedStage]
     train_sources: list[DataEntry]  # one per source any stage trains on, in config order; read by ONE loader all run
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
+    source_rows: dict[str, int]  # per source: the rows of processed/<source> (what a checkpoint stores and a resume verifies)
     rows_on_disk: dict[str, int]  # per processed directory (`DataEntry.data_dir`): its rows, counted once at setup
 
 
@@ -141,7 +145,7 @@ def _rows_on_disk(directory: Path, what: str) -> int:
 
     if not directory.is_dir():
         raise FileNotFoundError(f"{what}: processed folder {directory} does not exist")
-    shards = sorted(directory.glob("data-*.parquet"))
+    shards = sorted(path for path in directory.glob("*.parquet") if SHARD_PATTERN.match(path.name))  # what `ParquetTextDataset` reads
     if not shards:
         raise FileNotFoundError(f"{what}: processed folder {directory} holds no data-*.parquet shard")
     return sum(shard_rows(shard) for shard in shards)
@@ -314,8 +318,9 @@ def check_entries(
 def check_entry_rows(what: str, part: Part, entry: DataEntry, total: int) -> None:
     """
     The entry's row range (clipped to the `total` rows on disk as `ParquetTextDataset` clips it) holds at least
-    one row. For a train source this is what makes the stream's restart-on-exhaustion safe: a restart on an empty
-    range would spin forever.
+    one row. That guarantees rows ON DISK, not usable samples: a row the collate drops for lack of a supervised
+    label is read and yields nothing. `RunDataloaders.next_train_batch` checks the samples per epoch and refuses
+    to restart a train source whose full epoch produced none, which is what keeps the restart from spinning.
     """
 
     if entry_rows_in_range(entry, total) <= 0:
@@ -360,24 +365,24 @@ def check_entry_shards(what: str, part: Part, entry: DataEntry, total: int, worl
 
 
 def validation_batches_available(
-    entries: list[DataEntry], rows_on_disk: Mapping[str, int], micro_batch_size: int, world_size: int
+    entries: list[DataEntry], rows_on_disk: Mapping[str, int], validation_batch_size: int, world_size: int
 ) -> int:
     """
-    How many micro-batches one evaluation can draw from a stage's validation loader.
+    How many batches one evaluation can draw from a stage's validation loader.
 
     One `__iter__` of the loader is one pass over every entry's row range, then it stops: `ceil(rows /
-    micro_batch_size)` batches, the last one short. Validation loaders run with `num_workers=0`, so each rank reads
-    every `world_size`-th row and the smallest shard holds `rows // world_size` of them.
+    validation_batch_size)` batches, the last one short. Validation loaders run with `num_workers=0`, so each rank
+    reads every `world_size`-th row and the smallest shard holds `rows // world_size` of them.
     """
 
     rows_per_rank = sum(entry_rows_in_range(entry, rows_on_disk[entry.data_dir]) // world_size for entry in entries)
-    return -(-rows_per_rank // micro_batch_size)  # ceil, in integers
+    return -(-rows_per_rank // validation_batch_size)  # ceil, in integers
 
 
 def check_validation_batches(
     stages: list[ResolvedStage],
     rows_on_disk: Mapping[str, int],
-    micro_batch_size: int,
+    validation_batch_size: int,
     eval_iters: int,
     world_size: int = 1,
 ) -> None:
@@ -389,24 +394,24 @@ def check_validation_batches(
     """
 
     for stage in stages:
-        available = validation_batches_available(stage.val_data, rows_on_disk, micro_batch_size, world_size)
+        available = validation_batches_available(stage.val_data, rows_on_disk, validation_batch_size, world_size)
         entries = ", ".join(entry.prefix for entry in stage.val_data)
         per_rank = f" per rank (world size {world_size})" if world_size > 1 else ""
         if available == 0:
             raise RuntimeError(
-                f"stage {stage.name!r}: its validation data ({entries}) yields 0 micro-batches of {micro_batch_size} "
+                f"stage {stage.name!r}: its validation data ({entries}) yields 0 batches of {validation_batch_size} "
                 f"rows{per_rank} but eval_iters is {eval_iters}, so evaluation would have nothing to score. Raise "
                 "validation_fraction for the source in the dataset config, give the stage a larger validation "
-                "source, or lower micro_batch_size"
+                "source, or lower validation_batch_size"
             )
         if available < eval_iters:
             log.warning(
-                "stage %s: its validation data (%s) yields %d micro-batch(es) of %d rows%s, fewer than eval_iters "
+                "stage %s: its validation data (%s) yields %d batch(es) of %d rows%s, fewer than eval_iters "
                 "(%d); every evaluation of this stage averages the %d batch(es) it gets",
                 stage.name,
                 entries,
                 available,
-                micro_batch_size,
+                validation_batch_size,
                 per_rank,
                 eval_iters,
                 available,
@@ -418,22 +423,21 @@ def check_validation_batches(
 
 def validate_settings(settings: Settings, dataset_config: DatasetConfig) -> None:
     """
-    The two cross-checks between run config and dataset config: one base LR per stage, and the same
-    `block_size` (the planner counted sequences with the dataset config's; `block_size <= max_seq_length` follows
-    from the dataset-config schema).
+    The cross-checks between run config and dataset config: one base LR per stage, and a run no longer than the
+    rows were cut at (`training/run.py::check_sequence_lengths` checks all three lengths once the model config is
+    known; this one runs before any data is touched).
     """
 
+    if settings.training_max_sequence_length > dataset_config.dataset_max_sequence_length:
+        raise ValueError(
+            f"training_max_sequence_length ({settings.training_max_sequence_length}) exceeds dataset_max_sequence_length "
+            f"({dataset_config.dataset_max_sequence_length}) of {Path(settings.dataset_config).as_posix()}: the rows are cut shorter than the run trains"
+        )
     if len(settings.stage_base_lrs) != len(dataset_config.stages):
         raise ValueError(
             f"stage_base_lrs has {len(settings.stage_base_lrs)} entries but dataset config "
-            f"{settings.dataset_config!r} ({dataset_config.name}) has {len(dataset_config.stages)} stages "
+            f"{settings.dataset_config!r} has {len(dataset_config.stages)} stages "
             f"{[stage.name for stage in dataset_config.stages]}; give one base LR per stage, in order"
-        )
-    if settings.block_size != dataset_config.block_size:
-        raise ValueError(
-            f"block_size {settings.block_size} of the run config does not match block_size {dataset_config.block_size} of dataset "
-            f"config {settings.dataset_config!r}; the planner sized the data in sequences of the dataset config's "
-            "block_size, so the two must be equal"
         )
 
 
@@ -463,7 +467,7 @@ def _ensure_prepared(
             + build_command(settings.dataset_config, settings.dataset_dir)
         )
 
-    log.info("dataset %s is incomplete, preparing missing data (%s)", dataset_config.name, missing)
+    log.info("dataset %s is incomplete, preparing missing data (%s)", settings.dataset_config, missing)
     if backend is None or backend.is_main:
         with DataDashboard() as dashboard, dashboard.attach(logging.getLogger(ROOT_LOGGER_NAME), log_file=layout.root / BUILD_LOG_NAME):
             try:
@@ -528,7 +532,7 @@ def resolve_dataset(
         )
     world_size = 1 if backend is None else backend.world_size
     check_entries(train_sources, stages, rows_on_disk, world_size)
-    check_validation_batches(stages, rows_on_disk, settings.micro_batch_size, settings.eval_iters, world_size)
+    check_validation_batches(stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters, world_size)
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),
@@ -536,6 +540,7 @@ def resolve_dataset(
         stages=stages,
         train_sources=train_sources,
         validation_rows=validation_rows,
+        source_rows={name: rows_on_disk[str(layout.processed_dir(name))] for name in dataset_config.sources},
         rows_on_disk=rows_on_disk,
     )
 
@@ -547,9 +552,11 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
     """
     Verify that a checkpoint was written against the dataset the run now resolves to.
 
-    Compared: the dataset-config hash and the validation split (`{source: validation_rows}`, which only differs
-    when the data on disk changed; a resumed run would then validate on rows it trained on). A mismatch raises
-    `RuntimeError` naming every difference, unless `allow_change` (`allow_dataset_change`), which only warns.
+    Compared: the dataset-config hash, the rows per source (`{source: rows}`: the stream resumes by row offset
+    into each source, so a source re-prepared to another row count would continue from other rows) and the
+    validation split (`{source: validation_rows}`: a resumed run would otherwise validate on rows it trained on).
+    A mismatch raises `RuntimeError` naming every difference, unless `allow_change` (`allow_dataset_change`), which
+    only warns.
     """
 
     problems: list[str] = []
@@ -558,18 +565,17 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
             f"checkpoint was written with dataset config hash {metadata.dataset_config_hash}, the current dataset "
             f"config hashes to {dataset.config_hash}"
         )
-    stored, expected = metadata.validation_rows, dataset.validation_rows
-    mismatches = [
-        f"{name!r}: checkpoint {stored.get(name, 'absent')}, now {expected.get(name, 'absent')}"
-        for name in sorted(set(stored) | set(expected))
-        if stored.get(name) != expected.get(name)
-    ]
-    if mismatches:
-        problems.append(
-            "the validation split differs from the checkpoint's (validation rows per source: "
-            + "; ".join(mismatches)
-            + ")"
-        )
+    for what, stored, expected in (
+        ("the rows per source differ from the checkpoint's (processed rows per source: ", metadata.source_rows, dataset.source_rows),
+        ("the validation split differs from the checkpoint's (validation rows per source: ", metadata.validation_rows, dataset.validation_rows),
+    ):
+        mismatches = [
+            f"{name!r}: checkpoint {stored.get(name, 'absent')}, now {expected.get(name, 'absent')}"
+            for name in sorted(set(stored) | set(expected))
+            if stored.get(name) != expected.get(name)
+        ]
+        if mismatches:
+            problems.append(what + "; ".join(mismatches) + ")")
     if not problems:
         return
     message = "; ".join(problems)

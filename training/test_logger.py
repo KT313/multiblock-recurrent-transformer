@@ -7,6 +7,7 @@ recording fake and on a real `TrainingDashboard` over a StringIO console, the fa
 """
 
 import io
+import json
 import logging
 import math
 import sys
@@ -19,6 +20,7 @@ import torch
 from rich.console import Console
 
 from data_preparation.dataset_config import DatasetConfig
+from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
 from training.backend.single_device import SingleDeviceBackend
 from training.data.dataset_resolver import ResolvedDataset
@@ -41,10 +43,10 @@ from training.settings import Settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 from training.step import StepResult, TrainingProgress
-from training.test_step import reference_settings, reference_stage_manager
+from training.test_step import PACK_LENGTH, reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import TRAIN_LOG_NAME
+from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 from training.ui.fallback import ConsoleFallbackDashboard
 
 
@@ -100,6 +102,7 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
     logger = Logger("proj", "run", tmp_path / "out", offline=True, enabled=True)
     assert calls[0][1]["mode"] == "offline" and calls[0][1]["project"] == "proj"
     assert calls[0][1]["name"] == "run" and calls[0][1]["dir"] == str(tmp_path / "out")
+    assert calls[0][1]["group"] == "run" and calls[0][1]["tags"] == [] and calls[0][1]["config"] == {"resume_step": None}
     quiet = calls[0][1]["settings"]  # no stdout / stderr wrapping and no banner under the dashboard
     assert isinstance(quiet, _Settings) and quiet.values == WANDB_QUIET_SETTINGS == {"console": "off", "silent": True}
     assert (tmp_path / "out").is_dir()
@@ -116,6 +119,11 @@ def test_enabled_logger_forwards_scalars(tmp_path: Path, monkeypatch: pytest.Mon
 
     Logger("proj", "run", tmp_path / "online", offline=False, enabled=True)
     assert calls[-1][1]["mode"] == "online"
+
+    Logger("proj", "run", tmp_path / "resumed", enabled=True, resume_step=1000)  # linked to the first process's run
+    resumed = calls[-1][1]
+    assert (resumed["name"], resumed["group"], resumed["tags"]) == ("run-from-1000", "run", ["resumed"])
+    assert resumed["config"] == {"resume_step": 1000}
 
 
 def test_to_scalar() -> None:
@@ -186,7 +194,12 @@ N_ATTN_LAYERS = 2 + 2 + 1  # prelude + core blocks (1 layer each) + coda
 
 def test_track_gradient_metrics_on_tiny_model(tiny_model: RecurrentGPT) -> None:
     opt = _step_tiny(tiny_model)
+    state_before = {id(p): {k: v.clone() for k, v in s.items() if torch.is_tensor(v)} for p, s in opt.state.items()}
     metrics = track_gradient_metrics(tiny_model, opt)
+    for param, state in opt.state.items():  # a log step changes no state (the resume checks rely on it)
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                assert torch.equal(value, state_before[id(param)][key]), key
 
     for i in range(N_ATTN_LAYERS):
         for key in (
@@ -263,6 +276,33 @@ def test_non_finite_gradient_is_reported_as_nan(tiny_model: RecurrentGPT) -> Non
     assert "ffn2_effective_lr_0" not in metrics  # params with non-finite grads are skipped for effective LRs
 
 
+def test_nan_gradient_metrics_match_the_per_parameter_values() -> None:
+    torch.manual_seed(0)
+    proj = torch.nn.Linear(3, 2)
+    model = torch.nn.Sequential()
+    model.add_module("mlp", torch.nn.Sequential())
+    model[0].add_module("proj", proj)  # named `mlp.proj.weight`: counted as an `ffn2_grad_<i>` weight
+    model.add_module("head", torch.nn.Linear(2, 1))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, eps=1e-8)
+    model(torch.randn(4, 3)).sum().backward()
+    opt.step()
+    assert proj.weight.grad is not None
+    proj.weight.grad.fill_(float("NaN"))
+    metrics = track_gradient_metrics(model, opt)
+
+    assert set(metrics) == {"ffn2_grad_0", "avg_RMS", "local_l1_grad_norm", "l2_param_norm", "l1_param_norm"}
+    assert math.isnan(metrics["ffn2_grad_0"].item())
+    finite = [p for p in model.parameters() if p is not proj.weight]  # in optimizer-group order
+    rms = [
+        p.grad.pow(2).div(opt.state[p]["exp_avg_sq"].clamp(min=1e-16)).mean().sqrt() for p in finite if p.grad is not None
+    ]
+    assert torch.equal(metrics["avg_RMS"], torch.as_tensor(sum(rms) / len(rms)))
+    l1_norms = [p.grad.norm(1.0) for p in finite if p.grad is not None]
+    assert torch.equal(metrics["local_l1_grad_norm"], torch.stack(l1_norms).mean())
+    assert torch.equal(metrics["l2_param_norm"], torch.stack([p.norm() for p in model.parameters()]).norm())
+    assert torch.equal(metrics["l1_param_norm"], torch.stack([p.norm(1.0) for p in model.parameters()]).mean())
+
+
 # --------------------------------------------------------------------------------------------------------------
 # RunLogger: a run without a dataset (in-memory settings, a stage manager, fake step results, a fake clock)
 
@@ -282,7 +322,7 @@ class FakeClock:
         self.now += seconds
 
 
-TOKENS_PER_STEP = 4 * 256  # reference_settings: world_batch_size 4, block_size 256
+TOKENS_PER_STEP = 2 * PACK_LENGTH  # reference_settings: two packs of PACK_LENGTH tokens per optimizer step
 STEP_KEYS = {
     "loss", "ppl", "lr", "grad_norm", "step", "seconds/step", "tokens/second", "total_tokens", "total_time",
     "remaining_time", "stage/current_stage", "stage/base_lr", "stage/in_transition", "stage/transition_progress",
@@ -299,7 +339,7 @@ def two_stage_manager(settings: Settings) -> StageManager:
         resolved_stage("a", tokens=8 * TOKENS_PER_STEP, base_lr=3e-4, transition_pct=0.25),
         resolved_stage("b", tokens=4 * TOKENS_PER_STEP, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(stages, settings.world_batch_size, settings.block_size, warmup_steps=2, cooldown_steps=2)
+    return StageManager(stages, settings.tokens_per_optimizer_step, warmup_steps=2, cooldown_steps=2)
 
 
 def fake_result(
@@ -308,21 +348,28 @@ def fake_result(
     *,
     loss: float = 2.0,
     data_ids: list[str] | None = None,
+    data_tokens: dict[str, int] | None = None,
     metrics: dict[str, torch.Tensor] | None = None,
     validation: dict[str, torch.Tensor] | None = None,
 ) -> StepResult:
     """
-    A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors.
+    A `StepResult` as `run_one_optimizer_step` returns it, with tensors where the step has tensors. Without
+    `data_tokens` every document counts 64 tokens, so the token composition equals the document composition.
     """
 
+    ids = data_ids if data_ids is not None else ["source_a"] * 4
+    if data_tokens is None:
+        data_tokens = {}
+        for data_id in ids:
+            data_tokens[data_id] = data_tokens.get(data_id, 0) + 64
     return StepResult(
         step=step,
         learning_rate=1e-4 * step,
         loss=torch.tensor(loss),
-        log_ppl=torch.tensor(loss),
         grad_norm=torch.tensor(0.5),
         stage=stage_manager.get_stage_info(step),
-        data_ids=data_ids if data_ids is not None else ["source_a"] * 4,
+        data_ids=ids,
+        data_tokens=data_tokens,
         metrics=metrics or {},
         validation=validation,
     )
@@ -335,7 +382,7 @@ def resolved(tiny_dataset_config: DatasetConfig) -> ResolvedDataset:
     """
 
     return ResolvedDataset(
-        config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}, rows_on_disk={}
+        config=tiny_dataset_config, config_hash="hash-1", tokenizer_dir="unused", stages=[], train_sources=[], validation_rows={}, source_rows={}, rows_on_disk={}
     )
 
 
@@ -356,6 +403,7 @@ class RecordingDashboard:
         self.validations: list[tuple[int, dict[str, object]]] = []
         self.events: list[str] = []
         self.statuses: list[str] = []
+        self.discounted: list[float] = []  # the seconds of every block that was not a training step
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -370,6 +418,9 @@ class RecordingDashboard:
 
     def set_status(self, text: str) -> None:
         self.statuses.append(text)
+
+    def discount_time(self, seconds: float) -> None:
+        self.discounted.append(seconds)
 
 
 def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
@@ -418,6 +469,7 @@ def open_run_logger(
         backend,
         dashboard=dashboard if dashboard is not None else RecordingDashboard(),
         clock=clock,
+        wall_clock=clock,  # the fake timeline stands in for the CLI's wall clock too (`setup_started`)
         setup_started=setup_started,
         keep_history=True,
     )
@@ -552,7 +604,10 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     """
     `log_step_interval: 2`: only even steps are logged (no `.item()` in between; the dashboard gets an empty step
     dict at the odd steps, which only moves its bars), `seconds/step` is the interval time per step, the composition
-    counts every world batch since the last log step and starts over afterwards.
+    counts the document TOKENS of every step since the last log step (pack tails excluded, `result.data_tokens`;
+    the document counts play no part: step 1 has as many `a` as `b` documents but three times the `b` tokens) and
+    starts over afterwards. The final step is logged whatever the interval (with `log_step_interval: 3` it would
+    otherwise be dropped, its validation with it).
     """
 
     recorded = _record_wandb_logs(monkeypatch)
@@ -561,20 +616,32 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     clock = FakeClock()
     run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
     progress = TrainingProgress()
-    batches = [["a", "a", "b", "b"], ["b", "b", "b", "b"], ["a"] * 4, ["a"] * 4]
-    for data_ids in batches:
-        result = fake_result(stage_manager, progress.step, data_ids=data_ids)
+    batches = [
+        (["a", "a", "b", "b"], {"a": 100, "b": 300}),  # 2 + 2 documents, 1 : 3 in tokens
+        (["b", "b", "b", "b"], {"b": 400}),
+        (["a"] * 4, {"a": 500}),
+        (["a"] * 4, {"a": 300}),
+    ]
+    for data_ids, data_tokens in batches:
+        result = fake_result(stage_manager, progress.step, data_ids=data_ids, data_tokens=data_tokens)
         progress.advance()
         clock.advance(1.0)
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
+    final_logger = open_run_logger(reference_settings(log_step_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
+    final_progress = TrainingProgress()
+    while final_progress.step < stage_manager.total_steps:
+        result = fake_result(stage_manager, final_progress.step, data_ids=["a"] * 4)
+        final_progress.advance()
+        final_logger.log_step(result, final_progress)
+    assert stage_manager.total_steps % 3 != 0 and stage_manager.total_steps in final_logger.history
     shown = recording(run_logger).steps
     assert [(step, stage) for step, stage, _, _ in shown] == [(1, 0), (2, 0), (3, 0), (4, 0)], "the bars move every step"
     assert shown[0][3] == {} and shown[2][3] == {}, "nothing is read from the step's tensors at a non-log step"
     assert shown[1][3]["loss"] == 2.0 and shown[3][3]["step"] == 4
     second, fourth = run_logger.history[2], run_logger.history[4]
     assert second["seconds/step"] == 1.0 and second["tokens/second"] == TOKENS_PER_STEP
-    assert second["data_composition/a"] == 0.25 and second["data_composition/b"] == 0.75
+    assert second["data_composition/a"] == 0.125 and second["data_composition/b"] == 0.875  # 100 : 700 tokens
     assert fourth["data_composition/a"] == 1.0 and "data_composition/b" not in fourth
     for metrics in (second, fourth):
         assert sum(v for k, v in metrics.items() if k.startswith("data_composition/")) == pytest.approx(1.0)
@@ -654,6 +721,88 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
     assert all(isinstance(v, float) for v in report.last_validation.values())
 
 
+def test_side_blocks_are_kept_out_of_the_throughput_metrics(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    """
+    L-H1: `seconds/step`, `tokens/second` and `remaining_time` are training only. A 30 s evaluation between two
+    0.5 s steps used to read as a 60x slowdown; every block timed by the logger (evaluation, checkpoint, samples,
+    benchmarks) comes off the interval and off the dashboard's own estimate (`discount_time`). `total_time` stays
+    wall time.
+    """
+
+    settings = reference_settings()  # log_step_interval 1: every step carries a metric dict
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    with run_logger.evaluating():
+        clock.advance(30.0)
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    assert run_logger.history[2]["seconds/step"] == 0.5
+    assert run_logger.history[2]["tokens/second"] == TOKENS_PER_STEP / 0.5
+    assert run_logger.history[2]["remaining_time"] == 0.5 * (stage_manager.total_steps - 2)
+    assert run_logger.history[2]["total_time"] == 31.0, "total_time is the wall time since `open`, evaluation included"
+
+    with run_logger.saving_checkpoint():
+        clock.advance(20.0)
+    with run_logger.working("sampling"):
+        clock.advance(4.0)
+    run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
+    assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
+    assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
+
+
+def test_a_failing_run_logs_its_traceback_and_leaves_no_report(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    L-H2: leaving the `with` by raising, without having reached `close()`, writes one kept ERROR record with the
+    traceback into `train.log` - while the dashboard's file handler is still attached - and sets the status to
+    `failed`. No `train_report.json`: it would read as the result of a run that has none.
+    """
+
+    settings = reference_settings()
+    stage_manager = two_stage_manager(settings)
+    progress = TrainingProgress()
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    statuses: list[str] = []
+    opened = RunLogger.open(settings, tmp_path, resolved, tiny_model, stage_manager, progress, backend, clock=FakeClock())
+    with pytest.raises(RuntimeError, match="the step exploded"), opened as run_logger:
+        monkeypatch.setattr(run_logger.dashboard, "set_status", statuses.append)
+        run_fake_steps(run_logger, stage_manager, progress, FakeClock(), 2, 1.0)
+        raise RuntimeError("the step exploded")
+    assert statuses == ["failed"]
+    log_text = (tmp_path / TRAIN_LOG_NAME).read_text()
+    assert "ERROR training.logger: Training failed: the step exploded" in log_text
+    assert "Traceback (most recent call last)" in log_text and "RuntimeError: the step exploded" in log_text
+    assert "step 2/12" in log_text, "the record is written before `__exit__` takes the file handler away"
+    assert not (tmp_path / TRAIN_REPORT_NAME).exists(), "a failed run has no report"
+
+
+def test_close_after_a_failure_is_still_the_run_that_reports(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
+) -> None:
+    """
+    L-H2: a run that handled its exception and closed on its own (`close()` inside the block) is finished, not
+    failed - `__exit__` adds nothing.
+    """
+
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    progress = TrainingProgress()
+    opened = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    with pytest.raises(RuntimeError, match="handled"), opened as run_logger:
+        run_logger.close(progress, None)
+        raise RuntimeError("handled")
+    assert recording(run_logger).statuses == ["finished"], "the status of the run that closed itself stands"
+    assert not any("Training failed" in r.getMessage() for r in console_records.records)
+    assert (tmp_path / TRAIN_REPORT_NAME).exists(), "the report `close()` wrote is the run's result"
+
+
 def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
@@ -680,7 +829,7 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
         run_logger.log_export(export_dir)
         report = run_logger.close(progress, export_dir)
         assert released == ["released"]
-        run_logger.close(progress, export_dir)  # a second close changes nothing
+        assert run_logger.close(progress, export_dir) is report  # a second close changes nothing
     assert released == ["released"]  # `__exit__` after `close()` is a no-op
     with run_logger:
         pass
@@ -693,6 +842,23 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
     assert report.last_loss == 2.0 and report.last_validation == {}
     assert report.checkpoints_written == [first, second] and report.export_dir == export_dir
     assert sorted(report.history) == [5, 6, 7] and report.history is run_logger.history
+    written = json.loads((tmp_path / TRAIN_REPORT_NAME).read_text())
+    assert written.pop("written_at").startswith("20")
+    assert written == {
+        "run_directory": str(tmp_path),
+        "steps_this_process": 3,
+        "completed_steps": 7,
+        "resumed_from": str(resume_path),
+        "setup_seconds": 10.0,
+        "train_seconds": 6.0,
+        "last_loss": 2.0,
+        "last_validation": {},
+        "checkpoints_written": [str(first), str(second)],
+        "export_dir": str(export_dir),
+        "stopped": False,
+        "samples_written": [],
+        "last_benchmarks": {},
+    }
     assert report.summary() == "\n".join(
         [
             f"Training run in {tmp_path}: 3 optimizer steps completed (final step 7, resumed from {resume_path})",
@@ -708,9 +874,54 @@ def test_close_returns_the_report_of_a_resumed_run_and_is_idempotent(
         f"saved checkpoint {second}",
         f"exported HuggingFace model to {export_dir}",
     ]
-    assert recording(run_logger).statuses == ["finished", "finished"]  # once per `close()`
+    assert recording(run_logger).statuses == ["finished"]  # only the first `close()` sets it
     kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
-    assert kept.count("Training finished after 7 steps in 6.0s.") == 2 and not any("checkpoint" in k for k in kept)
+    assert kept.count("Training finished after 7 steps in 6.0s.") == 1 and not any("checkpoint" in k for k in kept)
+
+
+def test_log_samples_and_benchmarks_reach_the_dashboard_wandb_and_report(
+    tiny_model: RecurrentGPT,
+    resolved: ResolvedDataset,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    console_records: pytest.LogCaptureFixture,
+) -> None:
+    """
+    `log_samples` notes the file and previews the first sample; `log_benchmarks` sends the scores to wandb at the
+    step and notes one event per task; a failure is a kept warning plus an event; the report and its JSON carry
+    the samples files and the last scores.
+    """
+
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    recorded = _record_wandb_logs(monkeypatch)
+    metrics = {"benchmark/mean/arc_easy/acc": 0.25, "benchmark/mean/arc_easy/acc_norm": 0.3, "benchmark/4-4/hellaswag/acc": 0.26}
+    first, second = tmp_path / "samples" / "step-00000010.jsonl", tmp_path / "samples" / "step-00000020.jsonl"
+    with open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, FakeClock(0.0)) as run_logger:
+        run_logger.log_samples(first, [GeneratedSample("Once", "continuation", "upon a time", 3, False)])
+        run_logger.log_samples(second, [])
+        with run_logger.working("benchmarking"):
+            pass
+        run_logger.log_benchmarks(metrics, tmp_path / "benchmarks" / "step-00000007.json", 7)
+        run_logger.log_benchmark_failure(RuntimeError("no network"))
+        report = run_logger.close(TrainingProgress(step=7), None)
+    events = recording(run_logger).events
+    assert f"wrote 1 samples to {first}" in events and "sample: 'Once' -> 'upon a time'" in events
+    assert f"wrote 0 samples to {second}" in events
+    assert "benchmark arc_easy (recurrence mean) at step 7: acc 0.2500, acc_norm 0.3000" in events
+    assert "benchmark hellaswag (recurrence 4-4) at step 7: acc 0.2600" in events
+    assert f"wrote benchmark results to {tmp_path / 'benchmarks' / 'step-00000007.json'}" in events
+    assert "benchmark evaluation failed: no network" in events
+    assert "benchmarking" in recording(run_logger).statuses
+    assert recorded == {7: metrics}
+    assert report.samples_written == [first, second] and report.last_benchmarks == metrics
+    summary = report.summary()
+    assert "  benchmarks: mean/arc_easy/acc 0.2500, mean/arc_easy/acc_norm 0.3000, 4-4/hellaswag/acc 0.2600" in summary
+    assert f"  2 samples files written, last: {second}" in summary
+    written = json.loads((tmp_path / TRAIN_REPORT_NAME).read_text())
+    assert written["samples_written"] == [str(first), str(second)] and written["last_benchmarks"] == metrics
+    kept = [r.getMessage() for r in console_records.records if getattr(r, "keep", False)]
+    assert "benchmark evaluation failed, the run continues: no network" in kept
 
 
 def test_fresh_start_report_summary_without_steps(

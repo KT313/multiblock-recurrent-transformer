@@ -29,6 +29,7 @@ from ui.capture import attach_logger
 from training.ui.capture import TerminalCapture, line_handler, run_log_handlers
 from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
+    depth_losses,
     METRIC_COLUMNS,
     event_line,
     fit_panel_heights,
@@ -207,6 +208,22 @@ class TrainingDashboard(LiveDisplay):
     def _redirect_streams(self) -> None:
         self._capture.redirect_streams()
 
+    @property
+    def _streams_captured(self) -> bool:
+        return self._capture.streams_redirected
+
+    def _display_failed(self, error: BaseException) -> None:
+        """
+        A frame that did not render, instead of the base class's teardown: the board's own demotion, which also
+        gives the step lines a console handler. `_disable` is the once-only guard (it returns as soon as the
+        display is off), so the extra frame `Live.stop` draws does not come back around.
+
+        Errors from `__rich_console__` itself never arrive here; the board catches those and hands them to the
+        caller's thread (:meth:`_check_render_error`). This covers what rich raises around it.
+        """
+
+        self._disable(error)
+
     def _disable(self, error: BaseException) -> None:
         """
         Close the display after an internal error and behave like the console fallback from now on. Logs one
@@ -283,9 +300,19 @@ class TrainingDashboard(LiveDisplay):
         if text is not None:
             lines_log.info(text)
 
+    def discount_time(self, seconds: float) -> None:
+        """
+        `seconds` since the last step were spent outside the training loop (evaluation, checkpoint, samples,
+        benchmarks); the throughput estimate behind the ETA leaves them out.
+        """
+
+        with self._lock:
+            self._throughput.discount(seconds)
+
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """
-        The validation losses measured after step (one entry per recurrence depth, e.g. val_loss_4).
+        The validation losses measured after step (per recurrence depth, e.g. val_loss_4, and per source,
+        val_loss/<data id>); the table shows the depths, the log line everything.
         """
 
         self._guarded(lambda: self._apply_validation(step, losses))
@@ -335,7 +362,7 @@ class TrainingDashboard(LiveDisplay):
 
     def _apply_validation(self, step: int, losses: Mapping[str, object]) -> None:
         with self._lock:
-            self._validation = (step, floats(losses))
+            self._validation = (step, depth_losses(floats(losses)))  # per-source losses: log line and wandb only
 
     def _apply_event(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")

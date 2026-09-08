@@ -3,7 +3,6 @@
 # few MB of data in minutes. `nampdn-ai/mini-peS2o` is gated: export `HF_TOKEN` (or `uv run hf auth login`) before
 # building. Build with
 #     uv run python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_mini.yaml
-name: crow-300m-mini
 
 tokenizer:
   name: llama-32k
@@ -11,15 +10,16 @@ tokenizer:
   hf_id: hf-internal-testing/llama-tokenizer
   revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
 
-max_seq_length: 2048            # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
+training_target_sequence_length: 2048        # the run trains at this length: a row counts min(its tokens, this) towards the download
+                                # budget (a 530-token row 530, a 4000-token row 2048); at most dataset_max_sequence_length
+dataset_max_sequence_length: 16384           # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
                                 # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
                                 # costs nothing
-block_size: 2048                # training sequence length; the planner counts sequences with it; the run config must match
 token_count: tokenizer          # or: estimate (chars / 4)
 validation_fraction: 0.05       # share of a source's rows held out when it is used for training AND validation
 
 processing:                     # defaults for every source; a pretrain source may override with its own block
-  min_chars: 50                 # pretrain only; the upper bound is max_seq_length at download
+  min_chars: 50                 # pretrain only; the upper bound is dataset_max_sequence_length at download
   dedup: {mode: exact, normalize: true, bloom_memory_mb: 1024}   # minhash (not for scale): {mode: minhash, threshold: 0.95, num_perm: 256}
   quality_filter: false
   decontamination: {enabled: false}

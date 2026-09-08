@@ -13,6 +13,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from torch.utils.data import IterableDataset, get_worker_info
 
+from data_preparation.lib.storage.parquet import SHARD_PATTERN
+
 logger = logging.getLogger(__name__)
 
 Row = dict[str, Any]
@@ -24,7 +26,7 @@ PARQUET_READ_BATCH_ROWS = 1024
 
 class ParquetTextDataset(IterableDataset[Row]):
     """
-    One directory of parquet files, streamed in sorted file order without shuffling.
+    One directory of build shards (data-NNNNN.parquet), streamed in sorted file order without shuffling.
 
     Each row is a dict with the data_signature["keys"] columns plus data_signature and data_id.
     skip_rows / max_rows restrict the dataset to the row range [skip_rows, skip_rows + max_rows), clipped
@@ -48,9 +50,11 @@ class ParquetTextDataset(IterableDataset[Row]):
         self.prefix = prefix
         self.data_signature = data_signature or DEFAULT_DATA_SIGNATURE
         self.rank, self.world_size = shard
-        self.files = sorted(self.data_dir.glob("*.parquet"))
+        # the build's shards only (`SHARD_PATTERN`, data-NNNNN.parquet), the same set `dataset_resolver` counts the
+        # rows of: a stray parquet file would shift every row index behind the validation split
+        self.files = sorted(path for path in self.data_dir.glob("*.parquet") if SHARD_PATTERN.match(path.name))
         if not self.files:
-            raise FileNotFoundError(f"No parquet files in {self.data_dir}")
+            raise FileNotFoundError(f"No data-NNNNN.parquet shard in {self.data_dir}")
         columns = set(pq.ParquetFile(self.files[0]).schema_arrow.names)  # metadata only, no row is read
         missing = [key for key in self.data_signature["keys"] if key not in columns]
         if missing:
@@ -82,6 +86,23 @@ class ParquetTextDataset(IterableDataset[Row]):
         if rows < 0:
             raise ValueError(f"{self.prefix}: resume offset must be non-negative, got {rows}")
         self.resume_offset = rows % self.num_rows if self.num_rows else 0
+
+    def epoch_rows(self, num_workers: int) -> int:
+        """
+        Rows this rank's loader yields in its next epoch: the rows of the range from `resume_offset` on whose shard
+        (`_shard`, with `num_workers` workers, 0 or 1 for an in-process loader) belongs to this rank. Arithmetic,
+        never a pass over the rows; `RunDataloaders` compares an epoch's delivered rows against it.
+        """
+
+        workers = max(num_workers, 1)
+        shards = self.world_size * workers
+        first, last = self.rank * workers, (self.rank + 1) * workers  # this rank's shard ids: [first, last)
+
+        def before(row: int) -> int:  # rows of [0, row) whose shard id lies in [first, last)
+            full, rest = divmod(row, shards)
+            return full * workers + max(0, min(rest, last) - first)
+
+        return before(self.num_rows) - before(self.resume_offset)
 
     def _shard(self) -> tuple[int, int]:
         """

@@ -37,6 +37,10 @@ def test_canon_steps_all_input_forms() -> None:
     assert canon_steps(torch.tensor(4)) == (4, 0)
     assert canon_steps(torch.tensor([4])) == (4, 0)
     assert canon_steps(torch.tensor([[3], [2]])) == (3, 2)
+    assert canon_steps((0, 1)) == (0, 1)
+    for depthless in (0, (0, 0), torch.tensor([0]), (-1, 2)):  # zero steps would hand the random initial state on as the output
+        with pytest.raises(ValueError, match="at least one recurrent step"):
+            canon_steps(depthless)
     n, k = canon_steps(torch.tensor([3, 2], dtype=torch.long))
     assert isinstance(n, int) and isinstance(k, int)
 
@@ -70,7 +74,7 @@ def test_initialize_state_is_a_seeded_standard_normal() -> None:
 
 def test_sampler_eval_returns_mean_recurrence_and_zero_grad_steps() -> None:
     for step in (0, 17):
-        n, k = sample_recurrence_steps(12, 8, step=step, training=False)
+        n, k = sample_recurrence_steps(12, 8, step=step, block_idx=0, training=False)
         assert n.dtype == torch.long and k.dtype == torch.long
         assert (n.item(), k.item()) == (12, 0)
 
@@ -79,7 +83,7 @@ def test_sampler_respects_backprop_bound_and_is_positive() -> None:
     for mean, bound in ((12, 8), (6, 3)):
         ks, ns = set(), set()
         for step in range(300):
-            n, k = sample_recurrence_steps(mean, bound, step=step, training=True)
+            n, k = sample_recurrence_steps(mean, bound, step=step, block_idx=0, training=True)
             assert 1 <= k.item() <= bound
             assert n.item() >= 0
             assert n.item() + k.item() >= 1
@@ -89,31 +93,51 @@ def test_sampler_respects_backprop_bound_and_is_positive() -> None:
         assert bound in ks  # the bound is attained when p >= s
 
 
-def test_sampler_total_depth_mean_is_mean_recurrence_plus_one() -> None:
+def test_sampler_total_depth_mean_is_mean_recurrence() -> None:
     """
-    n + k == p == Poisson(LogNormal(log(t+s) - sigma^2/2, sigma)) + 1, whose mean is mean_recurrence + 1
-    (the +1 is inherited from upstream and kept for identity). Also: k == min(s, p), n == p - k.
+    n + k == p == Poisson(LogNormal(log(mean - 1) - sigma^2/2, sigma)) + 1, whose mean is `mean_recurrence` (the
+    same depth eval mode and the init scaling use) and whose minimum is the one guaranteed pass. Also:
+    k == min(s, p), n == p - k.
     """
 
     for mean, s in ((12, 8), (4, 3)):
         totals = []
         for step in range(2000):
-            n, k = sample_recurrence_steps(mean, s, step=step, training=True)
+            n, k = sample_recurrence_steps(mean, s, step=step, block_idx=0, training=True)
             p = n.item() + k.item()
+            assert p >= 1
             assert k.item() == min(s, p) and n.item() == p - k.item()
             totals.append(p)
         avg = sum(totals) / len(totals)
-        assert avg == pytest.approx(mean + 1, abs=0.5), avg
+        assert avg == pytest.approx(mean, abs=0.5), avg
 
 
-def test_sampler_deterministic_in_step_independent_of_global_rng() -> None:
-    torch.manual_seed(0)
-    a = sample_recurrence_steps(2, 2, step=42, training=True)
-    torch.manual_seed(999)
-    b = sample_recurrence_steps(2, 2, step=42, training=True)
-    assert (a[0].item(), a[1].item()) == (b[0].item(), b[1].item())
-    draws = {tuple(v.item() for v in sample_recurrence_steps(2, 2, step=step, training=True)) for step in range(50)}
+def test_sampler_mean_recurrence_one_always_draws_a_single_pass() -> None:
+    for step in range(50):
+        n, k = sample_recurrence_steps(1, 1, step=step, block_idx=0, training=True)
+        assert (n.item(), k.item()) == (0, 1)
+
+
+def test_sampler_deterministic_in_step_and_block_independent_of_global_rng() -> None:
+    for block_idx in (0, 1):
+        torch.manual_seed(0)
+        a = sample_recurrence_steps(2, 2, step=42, block_idx=block_idx, training=True)
+        torch.manual_seed(999)
+        b = sample_recurrence_steps(2, 2, step=42, block_idx=block_idx, training=True)
+        assert (a[0].item(), a[1].item()) == (b[0].item(), b[1].item())
+    draws = {tuple(v.item() for v in sample_recurrence_steps(2, 2, step=step, block_idx=0, training=True)) for step in range(50)}
     assert len(draws) > 1
+
+
+def test_sampler_blocks_with_equal_means_draw_independently() -> None:
+    def sequence(block_idx: int) -> list[tuple[int, int]]:
+        draws = []
+        for step in range(200):
+            n, k = sample_recurrence_steps(12, 8, step=step, block_idx=block_idx, training=True)
+            draws.append((int(n.item()), int(k.item())))
+        return draws
+
+    assert sequence(0) != sequence(1)
 
 
 def test_sampler_advances_global_rng() -> None:
@@ -123,7 +147,7 @@ def test_sampler_advances_global_rng() -> None:
 
     for training in (True, False):
         torch.manual_seed(0)
-        sample_recurrence_steps(2, 2, step=0, training=training)
+        sample_recurrence_steps(2, 2, step=0, block_idx=0, training=training)
         after = torch.rand(())
         torch.manual_seed(0)
         torch.rand((1,))
@@ -132,7 +156,7 @@ def test_sampler_advances_global_rng() -> None:
 
 def test_sampler_on_meta_device_returns_the_expected_depths() -> None:
     with torch.device("meta"):
-        n, k = sample_recurrence_steps(12, 8, step=3, training=True)
+        n, k = sample_recurrence_steps(12, 8, step=3, block_idx=0, training=True)
     assert (n, k) == (4, 8)
 
 
@@ -156,7 +180,7 @@ def test_iterate_core_block_matches_manual_loop(tiny_model: RecurrentGPT) -> Non
     x_latent, x_base = torch.randn(1, 6, 64), torch.randn(1, 6, 64)
     adapter, layers = block_parts(tiny_model, 1)
     got = iterate_core_block(
-        x_latent, x_base, freqs, None, 2, 1, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, 2, 1, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     expected = x_latent
     for _ in range(3):
@@ -166,11 +190,11 @@ def test_iterate_core_block_matches_manual_loop(tiny_model: RecurrentGPT) -> Non
     # tensor step counts (the sampler's output) work like ints
     two, one = torch.tensor(2), torch.tensor(1)
     same = iterate_core_block(
-        x_latent, x_base, freqs, None, two, one, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, two, one, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     torch.testing.assert_close(same, expected)
     no_grad = iterate_core_block(
-        x_latent, x_base, freqs, None, 2, 0, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x_latent, x_base, freqs, None, 2, 0, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     assert not no_grad.requires_grad  # all steps under no_grad
 
@@ -194,27 +218,56 @@ def test_first_n_iterations_run_without_grad_and_last_k_with_grad(
     adapter, layers = block_parts(tiny_model, 0)
     x = torch.randn(1, 4, 64)
     iterate_core_block(
-        x, x, tiny_model.freqs_cis[:, :4], None, n, k, adapter=adapter, layers=layers, gradient_checkpointing=False
+        x, x, tiny_model.freqs_cis[:, :4], None, n, k, adapter=adapter, layers=layers, gradient_checkpointing="none"
     )
     assert grad_modes == [False] * n + [True] * k
 
 
+CHECKPOINT_WRAPPERS = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}
+
+
+def count_checkpoint_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """
+    Swap both module-level checkpoint wrappers for counting ones; the returned dict holds the calls per mode.
+    """
+
+    calls = dict.fromkeys(CHECKPOINT_WRAPPERS, 0)
+
+    def counting(mode: str, orig: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Tensor:
+            calls[mode] += 1
+            return orig(*args, **kwargs)  # type: ignore[no-any-return]  # functools.partial of an untyped checkpoint
+
+        return wrapper
+
+    for mode, name in CHECKPOINT_WRAPPERS.items():
+        monkeypatch.setattr(recurrence, name, counting(mode, getattr(recurrence, name)))
+    return calls
+
+
+@pytest.mark.parametrize("mode", ["selective", "full"])
 def test_gradient_checkpointing_wraps_each_backprop_iteration(
-    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    calls: list[int] = []
-    orig_checkpoint = recurrence._checkpoint
+    calls = count_checkpoint_calls(monkeypatch)
+    adapter, layers = block_parts(tiny_model, 0)
+    x = torch.randn(1, 4, 64, requires_grad=True)
+    freqs = tiny_model.freqs_cis[:, :4]
+    plain = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing="none")
+    assert calls == {"selective": 0, "full": 0}
+    ckpt = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=mode)
+    assert calls == {mode: 3, **{other: 0 for other in CHECKPOINT_WRAPPERS if other != mode}}
+    torch.testing.assert_close(plain, ckpt)
+    # the recompute in the backward gives the same gradient
+    (plain_grad,) = torch.autograd.grad(plain.sum(), x)
+    (ckpt_grad,) = torch.autograd.grad(ckpt.sum(), x)
+    torch.testing.assert_close(ckpt_grad, plain_grad)
 
-    def counting_checkpoint(*args: Any, **kwargs: Any) -> Tensor:
-        calls.append(1)
-        return orig_checkpoint(*args, **kwargs)  # type: ignore[no-any-return]  # functools.partial of an untyped checkpoint
 
-    monkeypatch.setattr(recurrence, "_checkpoint", counting_checkpoint)
+def test_gradient_checkpointing_mode_is_checked(tiny_model: RecurrentGPT) -> None:
     adapter, layers = block_parts(tiny_model, 0)
     x = torch.randn(1, 4, 64)
-    freqs = tiny_model.freqs_cis[:, :4]
-    plain = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=False)
-    assert calls == []
-    ckpt = iterate_core_block(x, x, freqs, None, 1, 3, adapter=adapter, layers=layers, gradient_checkpointing=True)
-    assert len(calls) == 3
-    torch.testing.assert_close(plain, ckpt)
+    with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not True"):
+        iterate_core_block(
+            x, x, tiny_model.freqs_cis[:, :4], None, 1, 1, adapter=adapter, layers=layers, gradient_checkpointing=True
+        )

@@ -1,7 +1,7 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """
-Trapezoid learning-rate schedule (linear warmup, constant plateau, linear cooldown) with resume warmup and
-multi-stage interpolation. All step arguments are OPTIMIZER steps.
+Trapezoid learning-rate schedule (linear warmup, constant plateau, linear cooldown) with multi-stage
+interpolation. All step arguments are OPTIMIZER steps.
 """
 
 from training.stage_manager import StageManager
@@ -13,8 +13,8 @@ def _scheduled_lr(
     step: int, total_steps: int, stage_manager: StageManager, *, min_lr: float, warmup_steps: int, cooldown_steps: int
 ) -> float:
     """
-    The schedule without the resume warmup: global warmup at the start, global cooldown at the end, the per-stage
-    base LR in between and a linear interpolation between the adjacent base LRs inside a stage transition.
+    Global warmup at the start, global cooldown at the end, the per-stage base LR in between and a linear
+    interpolation between the adjacent base LRs inside a stage transition.
     """
 
     stages = stage_manager.stages
@@ -40,16 +40,6 @@ def _scheduled_lr(
     return max(base_lr, min_lr)
 
 
-def _resume_warmup(steps_since_resume: int, resume_warmup_steps: int, min_lr: float, target_lr: float) -> float:
-    """
-    Linear ramp from `min_lr` to `target_lr` over `resume_warmup_steps` after a resume, at `steps_since_resume`
-    (the caller only asks inside the ramp: `0 <= steps_since_resume < resume_warmup_steps`).
-    """
-
-    warmup_factor = steps_since_resume / resume_warmup_steps
-    return min_lr + warmup_factor * (target_lr - min_lr)
-
-
 def get_lr_multistage(
     step: int,
     total_steps: int,
@@ -59,22 +49,15 @@ def get_lr_multistage(
     warmup_steps: int,
     cooldown_steps: int,
     schedule: str = "trapezoid",
-    resume_step: int = -1,
-    resume_warmup_steps: int = 0,
 ) -> float:
     """
     Multi-stage LR: global warmup at the start, global cooldown at the end, per-stage base LR in between and a
-    linear interpolation between the adjacent base LRs inside a stage transition (`_scheduled_lr`); after a resume
-    at `resume_step` the first `resume_warmup_steps` steps ramp from `min_lr` up to that scheduled value.
+    linear interpolation between the adjacent base LRs inside a stage transition (`_scheduled_lr`).
     """
 
     if schedule not in SCHEDULES:
         raise ValueError(f"Unsupported lr_schedule: {schedule}")
 
-    target_lr = _scheduled_lr(
+    return _scheduled_lr(
         step, total_steps, stage_manager, min_lr=min_lr, warmup_steps=warmup_steps, cooldown_steps=cooldown_steps
     )
-    steps_since_resume = step - resume_step
-    if resume_step >= 0 and 0 <= steps_since_resume < resume_warmup_steps:
-        return _resume_warmup(steps_since_resume, resume_warmup_steps, min_lr, target_lr)
-    return target_lr

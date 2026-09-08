@@ -10,6 +10,7 @@ import importlib
 import io
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -17,11 +18,12 @@ from typing import Any
 
 import os
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig, load_dataset_config
+from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
@@ -31,8 +33,12 @@ from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.ui.dashboard import DataDashboard
 from data_preparation.conftest import REPO, REV, FakeHub, truncate_to_good_prefix
 from data_preparation.lib.abort import BuildAborted
+from data_preparation.lib.progress import NoProgress
 from data_preparation.lib.stages.download import (
-    _auto_tokenizer,
+    _load_tokenizer,
+    MALFORMED_WARNINGS_PER_INCREMENT,
+    MAX_CONSECUTIVE_MALFORMED,
+    MalformedSourceError,
     RawFolderError,
     TokenCounter,
     current_manifest,
@@ -40,8 +46,9 @@ from data_preparation.lib.stages.download import (
     download_github_code_group,
     inspect_raw,
     prepare_tokenizer,
+    reopen_raw,
 )
-from data_preparation.lib.stages.truncation import estimate_tokens
+from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, NUMBER_OF_SPECIAL_TOKENS, estimate_tokens
 
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
@@ -106,14 +113,14 @@ def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
     real = transformers.AutoTokenizer.from_pretrained
 
     def fake(name: str, *args: Any, **kwargs: Any) -> Any:
-        calls.append((name, kwargs.get("revision")))
+        calls.append((name, kwargs.get("revision"), kwargs.get("token")))
         return real(str(tiny_tokenizer_dir), *args)
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", fake)
     tok = TokenizerConfig(name="llama", kind="hf", hf_id="org/tok", revision="abc")
     cfg = cfg_factory({"p": _synthetic()}, tokenizer=tok)
-    manifest = prepare_tokenizer(cfg, layout)
-    assert calls == [("org/tok", "abc")]
+    manifest = prepare_tokenizer(cfg, layout, hf_token="hf_secret")
+    assert calls == [("org/tok", "abc", "hf_secret")]
     assert (layout.tokenizer_dir("llama") / "tokenizer_config.json").is_file()
     assert manifest.extra == {"kind": "hf", "hf_id": "org/tok", "revision": "abc"}
     assert prepare_tokenizer(cfg, layout) == manifest and len(calls) == 1
@@ -125,7 +132,7 @@ def test_prepare_tokenizer_hf_uses_from_pretrained_with_revision(
 def test_token_counter_tokenizer_mode_counts_uncapped_and_truncates(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Callable[[DatasetConfig], DatasetConfig]
 ) -> None:
-    cfg = with_tokenizer(cfg_factory({"p": _synthetic(), "i": _synthetic(kind="instruct")}, max_seq_length=5))
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(), "i": _synthetic(kind="instruct")}, dataset_max_sequence_length=5))
     counter = TokenCounter(cfg, layout)
     assert counter.count("tok_1 tok_2 tok_3") == 3
     assert counter.count(" ".join(["tok_1"] * 9)) == 9, "no cap: the download truncates text / drops rows instead"
@@ -135,7 +142,7 @@ def test_token_counter_tokenizer_mode_counts_uncapped_and_truncates(
 
 
 def test_token_counter_estimate_mode_needs_no_tokenizer(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
-    cfg = cfg_factory({"p": _synthetic()}, token_count="estimate", max_seq_length=10)
+    cfg = cfg_factory({"p": _synthetic()}, token_count="estimate", dataset_max_sequence_length=10)
     counter = TokenCounter(cfg, layout)  # tokenizer dir does not exist
     assert counter.count("a" * 8) == 2 and counter.count("a" * 400) == 100
     assert counter.count_many(["a" * 8, "a" * 400]) == [2, 100]
@@ -154,7 +161,7 @@ def test_token_counter_missing_tokenizer_raises(cfg_factory: CfgFactory, layout:
 def test_download_synthetic_appends_incrementally(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, mtimes: Mtimes, read_rows: Reader
 ) -> None:
-    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=512))  # above every synthetic row: nothing truncated
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=512))  # above every synthetic row: nothing truncated
     raw = layout.raw_dir("p")
     m1 = download(cfg, "p", layout, rows_needed=25, shard_size=10)
     assert [s.rows for s in m1.shards] == [10, 10, 5] and m1.rows_fetched == 25 and m1.stage == "raw"
@@ -231,7 +238,7 @@ def test_download_local_applies_converter_and_flags_exhaustion(
     m = download(cfg, "g", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 7 and m.rows_fetched == 7 and m.exhausted is True
     rows = read_rows(layout.raw_dir("g"))
-    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6}
+    assert rows[0] == {"text": "Question: q0\n\nAnswer: a0", "tokens": 6 + NUMBER_OF_SPECIAL_TOKENS}
     assert m.token_count == "tokenizer" and m.tokenizer == "synthetic" and m.tokens() == sum(r["tokens"] for r in rows)
     # exhausted: a larger request is a no-op
     assert download(cfg, "g", layout, rows_needed=100, shard_size=4) == m
@@ -249,13 +256,38 @@ def test_download_projects_to_the_text_field_and_requires_it(
     write_local(src_dir, [{"code": "print(1)" * 10, "lang": "py"}], "jsonl")
     cfg = with_tokenizer(cfg_factory({"c": _local(src_dir, text_field="code")}))
     download(cfg, "c", layout, rows_needed=1)
-    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40}]  # tokens of `code`; no `lang`
+    assert read_rows(layout.raw_dir("c")) == [{"code": "print(1)" * 10, "tokens": 40 + NUMBER_OF_SPECIAL_TOKENS}]  # tokens of `code`; no `lang`
     bad = cfg_factory({"c": _local(src_dir, text_field="text")})
     other = DatasetLayout(layout.root / "other")
     prepare_tokenizer(bad, other)
     with pytest.raises(ValueError, match="no 'text' column"):
         download(bad, "c", other, rows_needed=1)
 
+
+
+def test_pretrain_rows_are_projected_to_a_string_text_field_whatever_the_loader_yields(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    Loaders without a column projection (hf_split, hf_stream) deliver every source column: a surplus column whose
+    type varies between rows would fail the Arrow conversion, and a non-string text value would be stored as-is.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        yield {"text": "tok_1 tok_2", "meta": {"nested": 1}}
+        yield {"text": 42, "meta": "a string this time"}
+        yield {"text": None, "meta": None}
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    download(cfg, "p", layout, rows_needed=3)
+    (shard,) = sorted(layout.raw_dir("p").glob("data-*.parquet"))
+    schema = pq.read_schema(shard)
+    assert schema.names == ["text", "tokens"]
+    assert pa.types.is_string(schema.field("text").type) and pa.types.is_integer(schema.field("tokens").type)
+    assert [r["text"] for r in read_rows(layout.raw_dir("p"))] == ["tok_1 tok_2", "42", ""]
 
 
 def test_a_written_shard_holds_only_the_row_columns(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -278,16 +310,16 @@ def test_download_raises_instead_of_deleting_a_stale_or_outdated_raw_folder(
     before, rows_before = mtimes(raw), read_rows(raw)
 
     stale = cfg_factory({"p": _synthetic(seed=9)})  # a different seed -> different raw hash
-    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: source identity or tokenizer changed") as info:
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is stale: source.seed: 0 -> 9; it must be deleted and downloaded again") as info:
         download(stale, "p", layout, rows_needed=7, shard_size=5)
     assert isinstance(info.value, RuntimeError) and info.value.directory == raw
-    outdated = replace(cfg, max_seq_length=cfg.max_seq_length * 2)
-    with pytest.raises(RawFolderError, match=r"p: raw folder .* is outdated: max_seq_length 64 -> 128") as info:
+    outdated = replace(cfg, dataset_max_sequence_length=cfg.dataset_max_sequence_length * 2)
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is outdated: dataset_max_sequence_length 64 -> 128") as info:
         download(outdated, "p", layout, rows_needed=7, shard_size=5)
     assert "download never deletes raw" in str(info.value)
     assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == m, "nothing deleted or rewritten"
     # a lowered cap is fine: the rows are at most 64 tokens long, which is more than the config now needs
-    assert download(replace(cfg, max_seq_length=32), "p", layout, rows_needed=12, shard_size=5) == m
+    assert download(replace(cfg, dataset_max_sequence_length=32, training_target_sequence_length=32), "p", layout, rows_needed=12, shard_size=5) == m
 
 
 def test_download_refuses_to_restart_over_shards_without_a_manifest(
@@ -378,10 +410,117 @@ def test_download_instruct_converts_filters_and_counts_malformed(
     m = download(cfg, "i", layout, rows_needed=3, shard_size=10)
     assert m.rows() == 3 and m.rows_fetched == 5 and m.skipped_malformed == 2
     assert read_rows(layout.raw_dir("i")) == [
-        {"instruction": "what", "input": "", "output": "that", "tokens": 2},
-        {"instruction": "how", "input": "background", "output": "so", "tokens": 3},
-        {"instruction": "why", "input": "", "output": "because", "tokens": 2},
-    ]  # tokens: instruction + input + output
+        {"instruction": "what", "input": "", "output": "that", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS},
+        {"instruction": "how", "input": "background", "output": "so", "tokens": 3 + NUMBER_OF_SPECIAL_TOKENS},
+        {"instruction": "why", "input": "", "output": "because", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS},
+    ]  # tokens: instruction + input + output, plus the trainer's BOS and EOS
+
+
+def test_download_instruct_skips_converter_results_without_instruction_or_output(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A converter that returns a row without `instruction` / `output` is as malformed as one that raises; the row
+    is skipped and counted, the download goes on.
+    """
+
+    from data_preparation.lib.sources import converters as converters_mod
+
+    def half_converter(row: Row) -> Row:
+        return {key: row[key] for key in ("instruction", "output") if key in row}
+
+    monkeypatch.setitem(converters_mod.CONVERTERS, "half", half_converter)
+    src_dir = layout.root.parent / "half"
+    write_local(src_dir, [{"instruction": "a"}, {"output": "b"}, {"instruction": "c", "output": "d"}], "jsonl")
+    cfg = with_tokenizer(cfg_factory({"h": _local(src_dir, kind="instruct", converter="half")}))
+    m = download(cfg, "h", layout, rows_needed=3)
+    assert m.rows() == 1 and m.rows_fetched == 3 and m.skipped_malformed == 2 and m.exhausted is True
+    assert read_rows(layout.raw_dir("h")) == [{"instruction": "c", "input": "", "output": "d", "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS}]
+
+
+def _good(i: int) -> Row:
+    return {"q": f"q{i}", "a": f"a{i}"}
+
+
+def test_ten_consecutive_malformed_rows_fail_the_download_with_both_formats(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A wrong `fields` mapping is found within the first rows, not after a night of skipping: the error states what
+    the converter expected and the shapes (column -> type) and reasons of the rows it got; the shards published
+    before it stay on disk like after any other download failure.
+    """
+
+    good = [_good(i) for i in range(3)]
+    wrong = [{"question": f"q{i}", "answer": f"a{i}", "n": i} for i in range(MAX_CONSECUTIVE_MALFORMED + 5)]
+    src_dir = layout.root.parent / "wrong"
+    write_local(src_dir, good + wrong, "jsonl")
+    src = _local(src_dir, kind="instruct", fields={"instruction": "q", "output": "a"})
+    cfg = with_tokenizer(cfg_factory({"w": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"), pytest.raises(MalformedSourceError) as error:
+        download(cfg, "w", layout, rows_needed=50, shard_size=2)
+    message = str(error.value)
+    assert message.startswith("w: 10 consecutive rows could not be converted; expected format: columns instruction=q, output=a; ")
+    assert "formats of the last 10 rows: " in message
+    assert message.count("{'question': 'str', 'answer': 'str', 'n': 'int'} (row is missing column(s) ['q', 'a']; available columns: ['answer', 'n', 'question'])") == 10
+    assert error.value.expected == "columns instruction=q, output=a" and len(error.value.samples) == 10
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "malformed row skipped" in r.getMessage()]
+    assert len(warnings) == 10 and all(r.getMessage().startswith("w: malformed row skipped (row is missing column(s) ['q', 'a']") for r in warnings)
+    # the good rows before the failure were published: a full shard when it filled, the rest when the failure hit.
+    # A shard's offset is the source row after its last kept row, so the malformed run behind it is not committed:
+    # a resume re-reads those rows (and fails again until the fields are fixed)
+    m = Manifest.load(layout.raw_dir("w"))
+    assert m is not None and m.rows() == 3 and m.rows_fetched == 3 and m.skipped_malformed == 0 and not m.exhausted
+    assert [(s.rows, s.offset) for s in m.shards] == [(2, 2), (1, 3)]
+
+
+def test_a_converted_row_ends_a_run_of_malformed_ones_but_a_filter_rejection_does_not(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    9 malformed, 1 good, 9 malformed downloads through (18 skipped); a filter rejection between two runs of
+    5 is not a converted row, so the run reaches 10 and fails.
+    """
+
+    from data_preparation.lib.sources import converters as converters_mod
+
+    monkeypatch.setitem(converters_mod.FILTERS, "no_skip", lambda row: "skip" not in row)
+    nine = [{"a": f"only answer {i}"} for i in range(MAX_CONSECUTIVE_MALFORMED - 1)]
+    src_dir = layout.root.parent / "runs"
+    write_local(src_dir, nine + [_good(0)] + nine + [_good(1)], "jsonl")
+    fields = {"instruction": "q", "output": "a"}
+    cfg = with_tokenizer(cfg_factory({"r": _local(src_dir, kind="instruct", fields=fields, filter="no_skip")}))
+    m = download(cfg, "r", layout, rows_needed=2)
+    assert m.rows() == 2 and m.rows_fetched == 20 and m.skipped_malformed == 18
+
+    five = nine[:5]
+    src_dir = layout.root.parent / "filtered"
+    write_local(src_dir, five + [{"q": "x", "a": "y", "skip": True}] + five + [_good(0)], "jsonl")
+    cfg = with_tokenizer(cfg_factory({"f": _local(src_dir, kind="instruct", fields=fields, filter="no_skip")}))
+    with pytest.raises(MalformedSourceError, match="f: 10 consecutive rows could not be converted"):
+        download(cfg, "f", layout, rows_needed=1)
+
+
+def test_malformed_row_warnings_are_capped_per_increment(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    After MALFORMED_WARNINGS_PER_INCREMENT warnings the rest go to DEBUG (the final "kept N of M" line carries the
+    total); alternating with good rows so no run reaches the failure threshold.
+    """
+
+    rows: list[Row] = []
+    for i in range(MALFORMED_WARNINGS_PER_INCREMENT + 20):
+        rows += [{"a": f"only answer {i}"}, _good(i)]
+    src_dir = layout.root.parent / "many"
+    write_local(src_dir, rows, "jsonl")
+    cfg = with_tokenizer(cfg_factory({"m": _local(src_dir, kind="instruct", fields={"instruction": "q", "output": "a"})}))
+    with caplog.at_level(logging.DEBUG, logger="data_preparation"):
+        m = download(cfg, "m", layout, rows_needed=len(rows))
+    skipped = [r for r in caplog.records if "malformed row skipped" in r.getMessage()]
+    assert [r.levelno for r in skipped] == [logging.WARNING] * MALFORMED_WARNINGS_PER_INCREMENT + [logging.DEBUG] * 20
+    assert m.skipped_malformed == MALFORMED_WARNINGS_PER_INCREMENT + 20 and m.rows() == MALFORMED_WARNINGS_PER_INCREMENT + 20
+    assert f"m: kept {m.rows()} of {2 * m.rows()} fetched rows" in caplog.text
 
 
 def test_download_instruct_filter_reads_the_source_once(
@@ -395,7 +534,7 @@ def test_download_instruct_filter_reads_the_source_once(
     m = download(cfg, "s", layout, rows_needed=3, shard_size=10)
     # 3 kept rows need 6 source rows, read through one loader call that stops at the third kept row
     assert m.rows() == 3 and m.rows_fetched == 6 and not m.exhausted
-    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2} for r in read_rows(layout.raw_dir("s")))
+    assert all(r == {"instruction": "h" * 60, "input": "", "output": "g" * 60, "tokens": 2 + NUMBER_OF_SPECIAL_TOKENS} for r in read_rows(layout.raw_dir("s")))
     m2 = download(cfg, "s", layout, rows_needed=10, shard_size=10)
     assert m2.rows() == 4 and m2.rows_fetched == 8 and m2.exhausted is True
 
@@ -424,13 +563,13 @@ def test_download_instruct_check_limit_bounds_inspected_rows(
 
 
 def test_download_synthetic_instruct_rows(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader) -> None:
-    cfg = with_tokenizer(cfg_factory({"i": _synthetic(kind="instruct", seed=2)}, max_seq_length=128))  # above every synthetic row
+    cfg = with_tokenizer(cfg_factory({"i": _synthetic(kind="instruct", seed=2)}, dataset_max_sequence_length=128))  # above every synthetic row
     m = download(cfg, "i", layout, rows_needed=3)
     assert m.rows() == 3
     rows = read_rows(layout.raw_dir("i"))
     assert rows == [{**synthetic_row("instruct", 2, i), "tokens": r["tokens"]} for i, r in enumerate(rows)]
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) for r in rows)
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + NUMBER_OF_SPECIAL_TOKENS for r in rows)
 
 
 # --- manifest helpers --------------------------------------------------------------------------------------------------
@@ -447,20 +586,18 @@ def test_current_manifest_stage_mismatch_and_require(tmp_path: Path, caplog: pyt
     assert payload["stage"] == "raw"
 
 
-def test_fetch_source_forces_range_requests_by_default() -> None:
-    from dataclasses import replace
-
-    from data_preparation.dataset_config import SourceConfig
+def test_fetch_source_forces_range_requests_by_default(cfg_factory: CfgFactory) -> None:
     from data_preparation.lib.stages.download import fetch_source
 
-    cfg = load_dataset_config(Path("config/datasets/crow_300m_mini.yaml"))
+    files = SourceConfig(kind="pretrain", loader="hf_files", hf_id="o/files", load_kwargs={"data_files": "data/*.parquet"})
+    split = SourceConfig(kind="pretrain", loader="hf_split", hf_id="o/split", load_kwargs={"name": "main"})
+    cfg = cfg_factory({"files": files, "py": _github("Python"), "split": split})
     assert cfg.always_range_requests
-    src = cfg.sources["fineweb_edu"]
+    src = cfg.sources["files"]
     assert fetch_source(cfg, src).load_kwargs["max_cached_file_mb"] == 0
     assert "max_cached_file_mb" not in src.load_kwargs  # original untouched
-    github = cfg.sources["github_code_clean_python"]
-    assert fetch_source(cfg, github).load_kwargs["max_cached_file_mb"] == 0
-    assert fetch_source(cfg, cfg.sources["gsm8k"]) is cfg.sources["gsm8k"]  # hf_split: not a hub_files source
+    assert fetch_source(cfg, cfg.sources["py"]).load_kwargs["max_cached_file_mb"] == 0
+    assert fetch_source(cfg, cfg.sources["split"]) is cfg.sources["split"]  # hf_split: not a hub_files source
     off = replace(cfg, always_range_requests=False)
     assert fetch_source(off, src) is src
     custom = SourceConfig(kind="pretrain", loader="hf_files", hf_id="a/b", load_kwargs={"data_files": "*.parquet", "max_cached_file_mb": 7})
@@ -489,8 +626,9 @@ def test_download_github_code_group_equals_separate_downloads(
     hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader
 ) -> None:
     """
-    Golden: one group pass leaves exactly the raw shards / offsets / exhausted flags of three separate downloads,
-    while opening every repo file once.
+    Golden: one group pass gives every member the rows, offsets and exhausted flag of its separate download as a
+    prefix, while opening every repo file once; what the pass reads on for Rust (never satisfied: the whole repo)
+    is kept as well: Python's and Java's rows past their targets, and Go's rows in a folder of their own.
     """
 
     hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
@@ -505,47 +643,58 @@ def test_download_github_code_group_equals_separate_downloads(
         download(cfg, name, separate, rows_needed=rows_needed[name], shard_size=3)
     expected = _raw_state(separate, list(sources), read_rows)
     assert [r["text"] for r in expected["py"]["rows"]] == ["a code 0", "a code 3", "a code 6", "b code 0"]
-    assert expected["py"]["rows_fetched"] == 4 and set(expected["py"]["rows"][0]) == {"text", "language", "tokens"}
+    assert expected["py"]["rows_fetched"] == 4 and set(expected["py"]["rows"][0]) == {"text", "tokens"}  # `language` only routes the row
     assert expected["rust"]["rows"] == [] and expected["rust"]["exhausted"]
 
     hub.streams.clear()
     grouped = DatasetLayout(tmp_path / "grouped")
     prepare_tokenizer(cfg, grouped)
     manifests = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
-    assert set(manifests) == set(sources)
-    assert _raw_state(grouped, list(sources), read_rows) == expected
-    assert hub.streams == ["data/a.parquet", "data/b.parquet"]  # each file opened once for all three languages
+    assert set(manifests) == {*sources, "name_go"}  # REPO is org/name: Go's folder is sources/name_go
+    state = _raw_state(grouped, [*sources, "name_go"], read_rows)
+    assert state["rust"] == expected["rust"]
+    for name in ("py", "java"):
+        assert state[name]["rows"][: rows_needed[name]] == expected[name]["rows"] and not state[name]["exhausted"]
+    assert [r["text"] for r in state["py"]["rows"]] == ["a code 0", "a code 3", "a code 6", "b code 0", "b code 3", "b code 6"]
+    assert [r["text"] for r in state["java"]["rows"]] == ["a code 1", "a code 4", "a code 7", "b code 1", "b code 4", "b code 7"]
+    assert [r["text"] for r in state["name_go"]["rows"]] == ["a code 2", "a code 5", "b code 2", "b code 5"]
+    assert {name: state[name]["rows_fetched"] for name in state} == {"py": 6, "java": 6, "rust": 0, "name_go": 4}
+    assert set(state["name_go"]["rows"][0]) == {"text", "tokens"} and all(r["tokens"] == 5 for r in state["name_go"]["rows"])
+    go = Manifest.load(grouped.raw_dir("name_go"))
+    assert go is not None and go.extra == {"github_code_group": ["py", "java", "rust"], "surplus": True} and not go.exhausted
+    assert go.source_hash == cfg.raw_hash_of(replace(sources["py"], language="Go"))  # a config entry `name_go: {..., language: Go}` adopts it
+    assert hub.streams == ["data/a.parquet", "data/b.parquet"]  # each file opened once for all languages
 
-    # a second call with the same needs is a no-op; a larger need for one language tops up only that one
+    # a second call with the same needs reads nothing (no member has rows to fetch); a member asked for more than
+    # the repo holds is exhausted without a read: its rows in both files are known
     hub.streams.clear()
     again = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
-    assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 4, "java": 2, "rust": 0}
-    topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "java": 4}, shard_size=3)
-    assert [r["text"] for r in read_rows(grouped.raw_dir("java"))] == ["a code 1", "a code 4", "a code 7", "b code 1"]
-    assert topped["java"].rows_fetched == 4 and topped["py"].rows() == 4
-    download(cfg, "java", separate, rows_needed=4, shard_size=3)
-    assert _raw_state(grouped, ["java"], read_rows) == _raw_state(separate, ["java"], read_rows)
+    assert hub.streams == [] and {n: m.rows() for n, m in again.items()} == {"py": 6, "java": 6, "rust": 0}
+    topped = download_github_code_group(cfg, list(sources), grouped, rows_needed={**rows_needed, "py": 8}, shard_size=3)
+    assert hub.streams == [] and topped["py"].rows() == 6 and topped["py"].exhausted
 
 
 def test_download_github_code_group_rejects_other_sources(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "s": _synthetic()}))
     with pytest.raises(ValueError, match="needs github_code sources"):
         download_github_code_group(cfg, ["py", "s"], layout, rows_needed={"py": 1, "s": 1})
+    with pytest.raises(ValueError, match="at least one source"):  # names[0] was read before the list was checked
+        download_github_code_group(cfg, [], layout, rows_needed={})
 
 
 # --- truncation at the token cap, dropped instruct rows, raw manifest state ---------------------------------------------
 
 
-def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loading_the_tokenizer_disables_tokenizers_parallelism(monkeypatch: pytest.MonkeyPatch, tiny_tokenizer_dir: Path) -> None:
     """
     Rust tokenizer threads plus a later fork is the known `tokenizers` deadlock; loading must set the guard.
     """
 
     monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
-    _auto_tokenizer()
+    _load_tokenizer(tiny_tokenizer_dir, "synthetic")
     assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")  # an explicit user choice is respected
-    _auto_tokenizer()
+    _load_tokenizer(tiny_tokenizer_dir, "synthetic")
     assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
 
 
@@ -554,12 +703,12 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
     """
-    Stored text is a prefix of the source text that re-tokenizes to <= the cap; `tokens` is the stored text's own
-    count; rows under the cap are stored unchanged; the manifest records the cap.
+    Stored text is a prefix of the source text; `tokens` is the stored text's own count plus the trainer's BOS and
+    EOS and is <= the cap; rows that fit with the specials are stored unchanged; the manifest records the cap.
     """
 
     cap = 100
-    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=cap))
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=cap))
     m = download(cfg, "p", layout, rows_needed=40, shard_size=10)
     counter = TokenCounter(cfg, layout)
     rows = read_rows(layout.raw_dir("p"))
@@ -567,8 +716,8 @@ def test_download_truncates_pretrain_text_at_the_token_cap(
     truncated = unchanged = 0
     for index, row in enumerate(rows):
         original = synthetic_row("pretrain", 3, index)["text"]
-        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) <= cap
-        if counter.count(original) <= cap:
+        assert original.startswith(row["text"]) and row["tokens"] == counter.count(row["text"]) + NUMBER_OF_SPECIAL_TOKENS <= cap
+        if counter.count(original) + NUMBER_OF_SPECIAL_TOKENS <= cap:
             assert row["text"] == original
             unchanged += 1
         else:
@@ -582,13 +731,13 @@ def test_download_appends_at_the_folder_cap_when_the_config_cap_is_lower(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader
 ) -> None:
     """
-    Lowering `max_seq_length` is free, so an append under the lower cap must not shorten the folder's rows: the
+    Lowering `dataset_max_sequence_length` is free, so an append under the lower cap must not shorten the folder's rows: the
     manifest keeps promising `truncated_at_tokens`, and raising the cap back must still be `current`, not a lie.
     """
 
-    high = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=100))
+    high = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=100))
     download(high, "p", layout, rows_needed=20, shard_size=10)
-    low = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, max_seq_length=40))
+    low = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=40))
     assert inspect_raw(low, "p", layout).state == "current", "a lower cap never outdates the folder"
     m = download(low, "p", layout, rows_needed=40, shard_size=10)
     rows = read_rows(layout.raw_dir("p"))
@@ -605,10 +754,11 @@ def test_download_truncates_in_estimate_mode_at_four_chars_per_token(
 ) -> None:
     src_dir = layout.root.parent / "est"
     write_local(src_dir, [{"text": "x" * 1000}, {"text": "short"}], "parquet")
-    cfg = cfg_factory({"e": _local(src_dir)}, token_count="estimate", max_seq_length=10)
+    cfg = cfg_factory({"e": _local(src_dir)}, token_count="estimate", dataset_max_sequence_length=10)
     m = download(cfg, "e", layout, rows_needed=2)  # no tokenizer stage needed
     rows = read_rows(layout.raw_dir("e"))
-    assert rows == [{"text": "x" * 40, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short")}]
+    text_cap = (10 - NUMBER_OF_SPECIAL_TOKENS) * CHARS_PER_TOKEN_ESTIMATE  # the specials take 2 of the 10 tokens
+    assert rows == [{"text": "x" * text_cap, "tokens": 10}, {"text": "short", "tokens": estimate_tokens("short") + NUMBER_OF_SPECIAL_TOKENS}]
     assert m.truncated_at_tokens == 10 and m.token_count == "estimate" and m.tokenizer is None
 
 
@@ -624,7 +774,7 @@ def test_download_github_code_group_truncates_like_separate_downloads(
     ]
     hub.add("data/a.parquet", long_rows)
     cap = 7
-    cfg = cfg_factory({"py": _github("Python"), "java": _github("Java")}, max_seq_length=cap)
+    cfg = cfg_factory({"py": _github("Python"), "java": _github("Java")}, dataset_max_sequence_length=cap)
     separate, grouped = DatasetLayout(tmp_path / "separate"), DatasetLayout(tmp_path / "grouped")
     for layout in (separate, grouped):
         prepare_tokenizer(cfg, layout)
@@ -635,7 +785,8 @@ def test_download_github_code_group_truncates_like_separate_downloads(
     for name in ("py", "java"):
         rows = read_rows(grouped.raw_dir(name))
         assert rows == read_rows(separate.raw_dir(name)) and len(rows) == 3
-        assert all(r["tokens"] == cap == counter.count(r["text"]) and r["text"].count(" ") == cap for r in rows)  # cut where token 7 starts
+        words = cap - NUMBER_OF_SPECIAL_TOKENS
+        assert all(r["tokens"] == cap == counter.count(r["text"]) + NUMBER_OF_SPECIAL_TOKENS and r["text"].count(" ") == words for r in rows)  # cut where token 5 starts
         assert all(any(source["text"].startswith(r["text"]) for source in long_rows) for r in rows)
         assert manifests[name].truncated_at_tokens == cap and manifests[name].tokens() == 3 * cap
 
@@ -666,7 +817,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     token_batch: int,
 ) -> None:
     """
-    Rows over `max_seq_length` are not stored, never truncated; `dropped_too_long` / `skipped_malformed` are
+    Rows over `dataset_max_sequence_length` are not stored, never truncated; `dropped_too_long` / `skipped_malformed` are
     recorded per shard up to its last stored row, so a stop after the first shard and a resume count every rejected
     row exactly once (round-2 bug: the totals were saved from the running counters).
     """
@@ -674,27 +825,28 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     monkeypatch.setattr(download_module, "TOKEN_BATCH", token_batch)
     src_dir = layout.root.parent / "drop"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
-    cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, max_seq_length=5))
+    cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, dataset_max_sequence_length=5))
 
     with pytest.raises(BuildAborted):
         download(cfg, "d", layout, rows_needed=10, shard_size=4, should_stop=lambda: True)  # checked after each shard
     partial = Manifest.load(layout.raw_dir("d"))
-    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12)]  # kept rows i = 2, 5, 8, 11
-    assert partial.rows_fetched == 12 and (partial.skipped_malformed, partial.dropped_too_long) == (4, 4)
+    # kept rows i = 2, 5, 8, 11 in the shard that tripped the stop, then the row consumed before the stop was seen
+    # (i = 14, published as a short shard): everything consumed is stored, the offset is where the fetch stood
+    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12), (1, 15)]
+    assert partial.rows_fetched == 15 and (partial.skipped_malformed, partial.dropped_too_long) == (5, 5)
 
     m = download(cfg, "d", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 10 and m.rows_fetched == 30 and m.skipped_malformed == 10 and m.dropped_too_long == 10
     assert m.truncated_at_tokens == 5
     rows = read_rows(layout.raw_dir("d"))
     assert [r["instruction"] for r in rows] == [f"i{i}" for i in range(30) if i % 3 == 2]
-    assert all(r["tokens"] == 2 and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
+    assert all(r["tokens"] == 2 + NUMBER_OF_SPECIAL_TOKENS and len(r["output"].split()) == 1 for r in rows), "no long row stored, none truncated"
 
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "d", other, rows_needed=10, shard_size=4)
     assert (reference.skipped_malformed, reference.dropped_too_long) == (m.skipped_malformed, m.dropped_too_long) and reference.rows_fetched == m.rows_fetched
-    assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m.shards]
-    assert read_rows(other.raw_dir("d")) == rows
+    assert (reference.rows(), reference.tokens()) == (m.rows(), m.tokens()) and read_rows(other.raw_dir("d")) == rows  # only the shard boundaries differ
 
 
 def test_download_instruct_estimate_mode_drops_by_estimated_count(
@@ -703,37 +855,133 @@ def test_download_instruct_estimate_mode_drops_by_estimated_count(
     src_dir = layout.root.parent / "est_i"
     write_local(src_dir, [{"instruction": "a" * 20, "output": "b" * 20}, {"instruction": "q", "output": "a"}], "jsonl")
     src = _local(src_dir, kind="instruct", converter="instruction_input_output")
-    cfg = cfg_factory({"e": src}, token_count="estimate", max_seq_length=8)
+    cfg = cfg_factory({"e": src}, token_count="estimate", dataset_max_sequence_length=8)
     m = download(cfg, "e", layout, rows_needed=2)
     stored = read_rows(layout.raw_dir("e"))
-    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0]))}]
-    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20}))
+    assert stored == [{"instruction": "q", "input": "", "output": "a", "tokens": estimate_tokens(instruct_text(stored[0])) + NUMBER_OF_SPECIAL_TOKENS}]
+    assert stored[0]["tokens"] <= 8 < estimate_tokens(instruct_text({"instruction": "a" * 20, "input": "", "output": "b" * 20})) + NUMBER_OF_SPECIAL_TOKENS
     assert m.dropped_too_long == 1 and m.exhausted is True
 
 
 def test_inspect_raw_states(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
-    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}, max_seq_length=64))
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}, dataset_max_sequence_length=64))
     assert inspect_raw(cfg, "p", layout).state == "missing" and inspect_raw(cfg, "p", layout).current_manifest is None
     assert inspect_raw(cfg, "p", layout).reason == "missing"
     m = download(cfg, "p", layout, rows_needed=5)
     assert inspect_raw(cfg, "p", layout).state == "current" and inspect_raw(cfg, "p", layout).current_manifest == m
     assert inspect_raw(cfg, "p", layout).reason == "current"
 
-    raised = replace(cfg, max_seq_length=4096)
+    raised = replace(cfg, dataset_max_sequence_length=4096)
     assert inspect_raw(raised, "p", layout).state == "outdated" and inspect_raw(raised, "p", layout).current_manifest is None
-    assert inspect_raw(raised, "p", layout).reason == "outdated: max_seq_length 64 -> 4096"
-    lowered = replace(cfg, max_seq_length=16)
+    assert inspect_raw(raised, "p", layout).reason == "outdated: dataset_max_sequence_length 64 -> 4096"
+    lowered = replace(cfg, dataset_max_sequence_length=16, training_target_sequence_length=16)
     assert inspect_raw(lowered, "p", layout).state == "current" and inspect_raw(lowered, "p", layout).current_manifest == m
 
-    other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic"))
-    assert inspect_raw(other_tokenizer, "p", layout).state == "stale" and inspect_raw(other_tokenizer, "p", layout).current_manifest is None
-    assert inspect_raw(other_tokenizer, "p", layout).reason == "stale: source identity or tokenizer changed"
-    assert inspect_raw(cfg_factory({"p": _synthetic(seed=1)}), "p", layout).state == "stale"
+    other_seed = cfg_factory({"p": _synthetic(seed=1)}, dataset_max_sequence_length=64)
+    assert inspect_raw(other_seed, "p", layout).state == "stale" and inspect_raw(other_seed, "p", layout).current_manifest is None
+    assert inspect_raw(other_seed, "p", layout).reason == "stale: source.seed: 0 -> 1", "the changed fields, from the recorded payload"
     # stale wins over outdated (the folder holds other rows altogether)
-    assert inspect_raw(replace(other_tokenizer, max_seq_length=4096), "p", layout).state == "stale"
+    assert inspect_raw(replace(other_seed, dataset_max_sequence_length=4096), "p", layout).state == "stale"
+
+    # the tokenizer is not raw identity: the same rows, counted differently, are a choice for the repair step
+    other_tokenizer = cfg_factory({"p": _synthetic(seed=0)}, dataset_max_sequence_length=64, tokenizer=TokenizerConfig(name="other", kind="synthetic"))
+    inspection = inspect_raw(other_tokenizer, "p", layout)
+    assert (inspection.state, inspection.current_manifest, inspection.manifest) == ("tokenizer_changed", None, m)
+    assert inspection.reason == (
+        "tokenizer changed: synthetic (synthetic) -> other (synthetic); 5 rows were counted and truncated under the old one, "
+        "their token counts and truncation will not match the new tokenizer"
+    )
+    estimate = cfg_factory({"p": _synthetic(seed=0)}, dataset_max_sequence_length=64, token_count="estimate")
+    assert inspect_raw(estimate, "p", layout).state == "tokenizer_changed"
+    assert inspect_raw(estimate, "p", layout).reason == "token_count changed: tokenizer -> estimate; 5 rows were counted the old way, their stored token counts will not match the new one"
+    # outdated wins over tokenizer_changed (the folder is re-downloaded with the new tokenizer anyway)
+    assert inspect_raw(replace(other_tokenizer, dataset_max_sequence_length=4096), "p", layout).state == "outdated"
+    # a same-named tokenizer whose definition changed: the tokenizer step already replaced tokenizers/<name>, so only the hash names the old one
+    _edit_raw_manifest(layout, "p", tokenizer_hash="0123456789abcdef")
+    assert inspect_raw(cfg, "p", layout).reason.startswith("tokenizer changed: synthetic (definition 0123456789abcdef, no longer under tokenizers/) -> synthetic (synthetic); 5 rows")
+    # a manifest from before the tokenizer hash was recorded: unknown is not a change
+    _edit_raw_manifest(layout, "p", tokenizer_hash=None)
+    assert inspect_raw(other_tokenizer, "p", layout).state == "current" and inspect_raw(estimate, "p", layout).state == "tokenizer_changed"
+    # a manifest from before the payload was recorded says so instead of listing fields
+    _edit_raw_manifest(layout, "p", hash_payload=None)
+    assert inspect_raw(other_seed, "p", layout).reason == "stale: (no field detail recorded)"
     # a manifest of another stage in the raw folder is stale too
     Manifest(source="p", source_hash=cfg.raw_hash("p"), stage="processed").save(layout.raw_dir("p"))
-    assert inspect_raw(cfg, "p", layout).state == "stale"
+    assert inspect_raw(cfg, "p", layout).state == "stale" and inspect_raw(cfg, "p", layout).reason == "stale: a processed manifest where a raw one belongs"
+
+
+def _edit_raw_manifest(layout: DatasetLayout, name: str, **changes: Any) -> None:
+    manifest = Manifest.load(layout.raw_dir(name))
+    assert manifest is not None
+    for key, value in changes.items():
+        setattr(manifest, key, value)
+    manifest.save(layout.raw_dir(name))
+
+
+def test_download_refuses_a_folder_counted_with_another_tokenizer(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, mtimes: Mtimes
+) -> None:
+    """
+    Appending rows counted with the new tokenizer to rows counted with the old one is the repair step's adopt
+    decision, not the download's: it refuses like for a stale folder, names the remedy, and rewrites nothing.
+    The raw manifest records how the counts were made so the repair step can re-label it.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}))
+    m = download(cfg, "p", layout, rows_needed=5)
+    assert (m.tokenizer, m.tokenizer_hash, m.token_count, m.hash_payload) == ("synthetic", cfg.tokenizer_hash(), "tokenizer", cfg.raw_hash_payload("p"))
+    before = mtimes(layout.raw_dir("p"))
+    other = with_tokenizer(cfg_factory({"p": _synthetic(seed=0)}, tokenizer=TokenizerConfig(name="other", kind="synthetic")))
+    with pytest.raises(RawFolderError, match=r"is tokenizer changed: synthetic \(synthetic\) -> other \(synthetic\); 5 rows .*; the download never deletes raw data; the repair step asks whether to keep the folder and go on with the new tokenizer$"):
+        download(other, "p", layout, rows_needed=10)
+    assert mtimes(layout.raw_dir("p")) == before and Manifest.load(layout.raw_dir("p")) == m
+    estimate = cfg_factory({"p": _synthetic(seed=0)}, token_count="estimate")
+    with pytest.raises(RawFolderError, match="is token_count changed: tokenizer -> estimate"):
+        download(estimate, "p", layout, rows_needed=10)
+    estimate_only = cfg_factory({"e": _synthetic(seed=0)}, token_count="estimate")
+    e = download(estimate_only, "e", layout, rows_needed=5)
+    assert (e.tokenizer, e.tokenizer_hash, e.token_count) == (None, None, "estimate"), "an estimate needs no tokenizer"
+
+
+def test_an_unreadable_raw_manifest_is_a_state_the_download_refuses(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+    """
+    `Manifest.load` raises for a manifest it cannot parse next to shards; `inspect_raw` reports that as a state
+    (status and the planner describe it) and the download refuses the folder like a stale one, deleting nothing.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    download(cfg, "p", layout, rows_needed=5)
+    (layout.raw_dir("p") / "MANIFEST.json").write_text("{ not json")
+    inspection = inspect_raw(cfg, "p", layout)
+    assert (inspection.state, inspection.manifest, inspection.current_manifest) == ("unreadable", None, None)
+    assert inspection.reason == "unreadable manifest next to shards; fix or delete the directory by hand"
+    with pytest.raises(RawFolderError, match=r"p: raw folder .* is unreadable manifest next to shards; fix or delete the directory by hand; the download never deletes raw data$"):
+        download(cfg, "p", layout, rows_needed=10)
+    assert (layout.raw_dir("p") / "data-00000.parquet").is_file()
+    with pytest.raises(RuntimeError, match="unreadable manifest"):
+        Manifest.load(layout.raw_dir("p"))  # other callers still get the error
+
+
+def test_reopen_raw_clears_the_exhausted_latch(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer) -> None:
+    """
+    A loader that yielded fewer rows than asked leaves the manifest exhausted for good; `reopen_raw` (prepare
+    --reopen) clears the flag and the limit it recorded, so the next download reads on from the offset.
+    """
+
+    src_dir = layout.root.parent / "small"
+    write_local(src_dir, [{"text": f"tok_{i}"} for i in range(3)], "parquet")
+    cfg = with_tokenizer(cfg_factory({"g": _local(src_dir, check_limit=3)}))
+    assert not reopen_raw(cfg, "g", layout)  # no folder yet
+    m = download(cfg, "g", layout, rows_needed=5)
+    assert m.exhausted and m.check_limit_reached == 3
+    assert download(cfg, "g", layout, rows_needed=5) == m  # exhausted: a no-op
+    assert reopen_raw(cfg, "g", layout) and not reopen_raw(cfg, "g", layout)  # cleared once, nothing to clear twice
+    reopened = Manifest.load(layout.raw_dir("g"))
+    assert reopened is not None and not reopened.exhausted and reopened.check_limit_reached is None and reopened.rows_fetched == 3
+    write_local(src_dir, [{"text": f"tok_{i}"} for i in range(3, 8)], "parquet")
+    cfg.sources["g"].check_limit = None
+    m2 = download(cfg, "g", layout, rows_needed=5)
+    assert m2.rows() == 5 and m2.rows_fetched == 5 and not m2.exhausted and [s.rows for s in m2.shards] == [3, 2]
 
 
 def test_download_github_code_group_raises_for_an_outdated_member(
@@ -744,8 +992,8 @@ def test_download_github_code_group_raises_for_an_outdated_member(
     download_github_code_group(cfg, ["py", "java"], layout, rows_needed={"py": 2, "java": 2})
     before = {name: mtimes(layout.raw_dir(name)) for name in ("py", "java")}
     hub.streams.clear()
-    with pytest.raises(RawFolderError, match="py: raw folder .* is outdated: max_seq_length 64 -> 65"):
-        download_github_code_group(replace(cfg, max_seq_length=65), ["py", "java"], layout, rows_needed={"py": 4, "java": 4})
+    with pytest.raises(RawFolderError, match="py: raw folder .* is outdated: dataset_max_sequence_length 64 -> 65"):
+        download_github_code_group(replace(cfg, dataset_max_sequence_length=65), ["py", "java"], layout, rows_needed={"py": 4, "java": 4})
     assert hub.streams == [] and {name: mtimes(layout.raw_dir(name)) for name in ("py", "java")} == before
 
 
@@ -783,21 +1031,25 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
         download(cfg, "p", layout, rows_needed=40, shard_size=10)
     raw = layout.raw_dir("p")
     m = Manifest.load(raw)
-    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
-    assert m.rows() == 20 and not m.exhausted and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
+    # the two full shards, plus every row consumed when the loader failed (20..26: tokenized and buffered, or still
+    # waiting for the tokenizer), published as a short shard so the offset is where the download really stood
+    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20), (7, 27)] and m.rows_fetched == 27
+    assert m.rows() == 27 and not m.exhausted and not list(raw.glob("*.tmp")) and not (raw.parent / "raw.tmp").exists()
 
-    # the next call resumes at the last complete shard; the loader is asked from offset 20 and nothing is lost
+    # the next call resumes behind the last published shard; the loader is asked from offset 27 and nothing is lost
     _failing_loader(monkeypatch, fail_at=None)
     m2 = download(cfg, "p", layout, rows_needed=40, shard_size=10)
     assert offsets == [0] and m2.rows() == 40 and m2.rows_fetched == 40
-    assert [(s.name, s.rows, s.offset) for s in m2.shards] == [(f"data-{i:05d}.parquet", 10, 10 * (i + 1)) for i in range(4)]
+    assert [(s.name, s.rows, s.offset) for s in m2.shards] == [
+        ("data-00000.parquet", 10, 10), ("data-00001.parquet", 10, 20), ("data-00002.parquet", 7, 27), ("data-00003.parquet", 10, 37), ("data-00004.parquet", 3, 40),
+    ]
     assert [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(40)]
 
-    # golden: identical to one uninterrupted download
+    # golden: the same rows and counts as one uninterrupted download (only the shard boundaries differ)
     other = DatasetLayout(tmp_path / "other")
     prepare_tokenizer(cfg, other)
     reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
-    assert [(s.name, s.rows, s.tokens, s.offset) for s in reference.shards] == [(s.name, s.rows, s.tokens, s.offset) for s in m2.shards]
+    assert (reference.rows(), reference.tokens(), reference.rows_fetched) == (m2.rows(), m2.tokens(), m2.rows_fetched)
     assert read_rows(other.raw_dir("p")) == read_rows(raw)
 
 
@@ -834,7 +1086,10 @@ def test_download_stops_within_one_shard_when_asked(
     with pytest.raises(BuildAborted):
         download(cfg, "p", layout, rows_needed=100, shard_size=10, should_stop=should_stop)
     m = Manifest.load(layout.raw_dir("p"))
-    assert m is not None and m.rows() == 20 and m.rows_fetched == 20 and calls["n"] == 2
+    # the stop is seen at the second shard and asked no more (the check is suspended from then on); the rows the
+    # fetch thread had consumed meanwhile (an instant loader runs ahead by a few batches) are stored, not dropped
+    assert m is not None and 20 <= m.rows() == m.rows_fetched <= 100 and calls["n"] == 2
+    assert [shard.rows for shard in m.shards[:2]] == [10, 10]
     assert download(cfg, "p", layout, rows_needed=100, shard_size=10).rows() == 100  # resumes to completion
 
 
@@ -876,7 +1131,7 @@ def test_download_instruct_counts_rejected_rows_once_across_a_truncate_and_resum
 
     src_dir = layout.root.parent / "retruncate"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
-    cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, max_seq_length=5))
+    cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, dataset_max_sequence_length=5))
     full = download(cfg, "d", layout, rows_needed=10, shard_size=4)
     assert (full.skipped_malformed, full.dropped_too_long) == (10, 10) and full.rows_fetched == 30
     shards = [(s.rows, s.offset, s.skipped_malformed, s.dropped_too_long) for s in full.shards]
@@ -959,3 +1214,274 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
     assert calls == [(0, 2**62)] and closed == [True], "one call, closed after the 20th kept row"
     m2 = download(cfg, "s", layout, rows_needed=25, shard_size=10)
     assert m2.rows() == 25 and calls[1] == (77, 2**62)
+
+
+# --- the token worker ----------------------------------------------------------------------------------------------
+
+
+class _FakeCounter:
+    """
+    A `TokenCounter` stand-in (estimate counts) whose `truncate_many` calls go through `on_batch(call number)` first.
+    """
+
+    on_batch: Callable[[int], None] = staticmethod(lambda call: None)
+    calls = 0
+
+    def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
+        pass
+
+    def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
+        type(self).calls += 1
+        type(self).on_batch(type(self).calls)
+        return [(text, estimate_tokens(text)) for text in texts]
+
+    def count_many(self, texts: list[str]) -> list[int]:
+        return [estimate_tokens(text) for text in texts]
+
+
+def _counting_loader(monkeypatch: pytest.MonkeyPatch, on_row: Callable[[int], None], total: int = 100) -> list[bool]:
+    """
+    Stub the synthetic loader with one that yields `total` rows and calls on_row(rows yielded so far) before
+    each; returns the list that records the loader's generator being closed.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    closed: list[bool] = []
+
+    def loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        try:
+            for i in range(offset, min(offset + count, total)):
+                on_row(i - offset + 1)
+                yield {"text": f"row {i}"}
+        finally:
+            closed.append(True)
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", loader)
+    return closed
+
+
+def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    The first tokenizer call blocks until the loader has yielded two more batches: only a fetch thread that runs
+    ahead of the token worker gets there (in one thread the tokenizer would wait for rows that are never pulled).
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    tokenizer_may_go = threading.Event()
+
+    def on_batch(call: int) -> None:
+        if call == 1:
+            assert tokenizer_may_go.wait(timeout=10), "the fetch thread did not run ahead of the tokenizer"
+
+    def on_row(yielded: int) -> None:
+        if yielded == 3 * download_module.TOKEN_BATCH:
+            tokenizer_may_go.set()
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
+    monkeypatch.setattr(_FakeCounter, "calls", 0)
+    monkeypatch.setattr(download_module, "TokenCounter", _FakeCounter)
+    closed = _counting_loader(monkeypatch, on_row, total=40)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    m = download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    assert tokenizer_may_go.is_set() and closed == [True]
+    assert m.rows() == 40 and m.rows_fetched == 40 and [(s.rows, s.offset) for s in m.shards] == [(10, 10 * (i + 1)) for i in range(4)]
+    assert [r["text"] for r in read_rows(layout.raw_dir("p"))] == [f"row {i}" for i in range(40)]  # in order, whatever the threads did
+
+
+def test_a_failure_on_the_token_worker_ends_the_download_like_a_loader_failure(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader
+) -> None:
+    """
+    The tokenizer raises on the fifth batch (rows 20-24, after two shards were published): the download raises
+    that error on its own thread, the loader's stream is closed, the published shards stay and the partial one is
+    discarded (the same outcome as the loader failing there), and the next call resumes at shard 2.
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+
+    def on_batch(call: int) -> None:
+        if call == 5:
+            raise RuntimeError("tokenizer exploded")
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
+    monkeypatch.setattr(_FakeCounter, "calls", 0)
+    monkeypatch.setattr(download_module, "TokenCounter", _FakeCounter)
+    closed = _counting_loader(monkeypatch, lambda yielded: None, total=100)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    threads_before = threading.active_count()
+    with pytest.raises(RuntimeError, match="tokenizer exploded"):
+        download(cfg, "p", layout, rows_needed=100, shard_size=10)
+    raw = layout.raw_dir("p")
+    m = Manifest.load(raw)
+    assert closed == [True] and threading.active_count() == threads_before, "the stream is closed and the worker joined"
+    assert m is not None and [(s.rows, s.offset) for s in m.shards] == [(10, 10), (10, 20)] and m.rows_fetched == 20
+    assert not list(raw.glob("*.tmp")) and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(20)]
+
+    monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(lambda call: None))
+    m2 = download(cfg, "p", layout, rows_needed=100, shard_size=10)
+    assert m2.rows() == 100 and [r["text"] for r in read_rows(raw)] == [f"row {i}" for i in range(100)]
+
+
+# --- the group pass keeps every language it decodes ----------------------------------------------------------------------
+
+
+def test_download_github_code_group_resumes_every_folder_aligned_after_a_stop(
+    hub: FakeHub, cfg_factory: CfgFactory, tmp_path: Path, read_rows: Reader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A stop publishes the buffered rows of every folder (members and extras) as short shards, so each folder's
+    offset is where it really stood; the next pass realigns every one of them and the end state equals an
+    uninterrupted pass. Rows reach the writers in small batches so the stop lands mid-pass.
+    """
+
+    monkeypatch.setattr(download_module, "TOKEN_BATCH", 2)
+    for prefix in "abcd":
+        hub.add(f"data/{prefix}.parquet", _code_rows(prefix, 12))  # row groups of 2; Python, Java, Go in turns
+    sources = {"py": _github("Python"), "rust": _github("Rust")}
+    cfg = cfg_factory(sources)
+    rows_needed = {"py": 2, "rust": 3}  # Rust never appears: the whole repo is read; Python turns passive early
+
+    reference = DatasetLayout(tmp_path / "reference")
+    prepare_tokenizer(cfg, reference)
+    download_github_code_group(cfg, list(sources), reference, rows_needed=rows_needed, shard_size=4)
+    names = ["py", "rust", "name_java", "name_go"]
+    expected = _raw_state(reference, names, read_rows)
+    assert [len(expected[name]["rows"]) for name in names] == [16, 0, 16, 16]
+
+    stopped = DatasetLayout(tmp_path / "stopped")
+    prepare_tokenizer(cfg, stopped)
+    published = {"n": 0}
+
+    def stop_after_first_shard() -> bool:
+        published["n"] += 1
+        return published["n"] >= 1
+
+    with pytest.raises(BuildAborted):
+        download_github_code_group(cfg, list(sources), stopped, rows_needed=rows_needed, shard_size=4, should_stop=stop_after_first_shard)
+    partial = {name: Manifest.load(stopped.raw_dir(name)) for name in names}
+    assert partial["py"] is not None and any(partial[name] is not None for name in ("name_java", "name_go"))
+    for name in ("py", "name_java", "name_go"):
+        manifest = partial[name]
+        if manifest is None:  # no row of that language reached its writer before the stop: no manifest yet, next pass from 0
+            assert not list(stopped.raw_dir(name).glob("*.parquet"))
+            continue
+        assert manifest.rows() == manifest.rows_fetched < 16  # the flushed short shard moved the offset to the last stored row
+        assert [r["text"] for r in read_rows(stopped.raw_dir(name))] == [r["text"] for r in expected[name]["rows"][: manifest.rows()]]
+    resumed = download_github_code_group(cfg, list(sources), stopped, rows_needed=rows_needed, shard_size=4)
+    assert resumed["rust"].exhausted
+    state = _raw_state(stopped, names, read_rows)
+    for name in names:
+        assert state[name]["rows"] == expected[name]["rows"] and state[name]["rows_fetched"] == expected[name]["rows_fetched"], name
+    assert state["rust"]["exhausted"] and not state["py"]["exhausted"]
+
+
+def test_download_github_code_group_skips_extras_it_cannot_store(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A language whose derived name is a configured source outside the group, or whose folder is stale, is left
+    alone (warned about, nothing deleted); the others are stored.
+    """
+
+    hub.add("data/a.parquet", _code_rows("a", 12))
+    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "rust": _github("Rust"), "name_go": _synthetic()}))
+    stale_dir = layout.raw_dir("name_java")
+    stale_dir.mkdir(parents=True)
+    Manifest(source="name_java", source_hash="0000000000000000", stage="raw").save(stale_dir)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifests = download_github_code_group(cfg, ["py", "rust"], layout, rows_needed={"py": 1, "rust": 1}, shard_size=4)
+    assert set(manifests) == {"py", "rust"}
+    assert "name_go is a configured source outside this github_code group" in caplog.text
+    assert "not storing rows of Java" in caplog.text and "stale" in caplog.text
+    stale = Manifest.load(stale_dir)
+    assert stale is not None and stale.source_hash == "0000000000000000" and not list(stale_dir.glob("*.parquet"))
+    assert not layout.raw_dir("name_go").exists()
+    assert [r["text"] for r in read_rows(layout.raw_dir("py"))] == [f"a code {i}" for i in range(0, 12, 3)]
+
+
+# --- the download bar ------------------------------------------------------------------------------------------------
+
+
+class _RecordingBar(NoProgress):
+    """
+    The bar the stage opens, remembered by the `bars` fixture: total, initial (n before any update), n at the end.
+    """
+
+    def __init__(self, total: int | None = None, initial: int = 0, **_: Any) -> None:
+        super().__init__(total, initial)
+        self.initial = initial
+
+
+@pytest.fixture
+def bars(monkeypatch: pytest.MonkeyPatch) -> list[_RecordingBar]:
+    """
+    Every bar the download stage opens, in order.
+    """
+
+    opened: list[_RecordingBar] = []
+
+    def fake_progress(**kwargs: Any) -> _RecordingBar:
+        bar = _RecordingBar(**kwargs)
+        opened.append(bar)
+        return bar
+
+    monkeypatch.setattr(download_module, "progress", fake_progress)
+    return opened
+
+
+def test_download_bar_opens_at_the_rows_on_disk_and_counts_to_the_target(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, bars: list[_RecordingBar]
+) -> None:
+    """
+    The bar reads rows on disk / target: a resumed source starts where it stood, not at 0 of the remaining rows.
+    """
+
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic(seed=3)}, dataset_max_sequence_length=512))
+    download(cfg, "p", layout, rows_needed=25, shard_size=10)
+    download(cfg, "p", layout, rows_needed=40, shard_size=10)
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 25, 25), (25, 40, 40)]
+
+
+def test_download_bar_stops_at_the_target_when_the_loader_finishes_its_row_group(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, bars: list[_RecordingBar]
+) -> None:
+    """
+    The rows a loader yields past the target are stored (test_download_keeps_every_row_a_loader_yields_beyond_rows_needed)
+    but not counted by the bar: it ends at 100 %, and a folder holding more than the next target opens above it.
+    """
+
+    from data_preparation.lib.sources import loaders as loaders_mod
+
+    def group_loader(source: SourceConfig, offset: int, count: int, shared_parameters: SharedLoaderParameters) -> Any:
+        return iter([{"text": f"row {i}"} for i in range(offset, offset + max(count, 20))])  # a 20-row "row group"
+
+    monkeypatch.setitem(loaders_mod.LOADERS, "synthetic", group_loader)
+    cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
+    m = download(cfg, "p", layout, rows_needed=11, shard_size=8)
+    assert m.rows() == 20
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 11, 11)]
+
+
+def test_download_github_code_group_bar_counts_only_rows_towards_a_target(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, read_rows: Reader, bars: list[_RecordingBar]
+) -> None:
+    """
+    The group bar covers the active members only (their rows on disk / their targets); a passive member's rows,
+    an extra language's rows and the rows an active member stores past its target move the folders, not the bar.
+    """
+
+    hub.add("data/a.parquet", _code_rows("a", 8))  # row groups of 2; Python a0 a3 a6, Java a1 a4 a7, Go a2 a5
+    hub.add("data/b.parquet", _code_rows("b", 8))
+    cfg = with_tokenizer(cfg_factory({"py": _github("Python"), "java": _github("Java")}))
+    first = download_github_code_group(cfg, ["py", "java"], layout, rows_needed={"py": 1, "java": 1}, shard_size=3)
+    assert first["py"].rows() == 1 and first["java"].rows() == 1  # the first row group holds a0 (Python) and a1 (Java)
+    assert [(bar.initial, bar.total, bar.n) for bar in bars] == [(0, 2, 2)]
+
+    second = download_github_code_group(cfg, ["py", "java"], layout, rows_needed={"py": 4, "java": 1}, shard_size=3)
+    assert [r["text"] for r in read_rows(layout.raw_dir("py"))] == ["a code 0", "a code 3", "a code 6", "b code 0"]
+    assert second["java"].rows() > 1, "the passive member stored what the pass read on"
+    assert layout.raw_dir("name_go").exists(), "the extra language got a folder"
+    assert [(bar.initial, bar.total, bar.n) for bar in bars][1] == (1, 4, 4), "java (passive) and Go count for neither total nor n"

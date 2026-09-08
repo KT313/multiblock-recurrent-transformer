@@ -9,7 +9,7 @@ import time
 
 from training.ui.common import Clock
 
-RATE_SMOOTHING = 0.1  # weight of the newest seconds/step sample in the exponential moving average behind the ETA
+RATE_SMOOTHING = 0.04  # weight of the newest seconds/step sample in the EMA behind the ETA: a memory of about 25 steps
 
 
 class Throughput:
@@ -19,7 +19,8 @@ class Throughput:
     The first interval sets the estimate, the second replaces it (the first interval holds torch.compile and the
     loader start-up, an outlier), later ones move it by :data:`RATE_SMOOTHING` (an exponential moving average, so
     one slow step does not swing the ETA). start_step is the step the run (re)starts at, so a resumed run does
-    not count the checkpointed steps as done in zero seconds.
+    not count the checkpointed steps as done in zero seconds. :meth:`discount` takes the time of a block that was
+    not training out of the interval the next :meth:`record` measures, so the estimate stays steps of training.
     """
 
     def __init__(self, total_steps: int, *, start_step: int = 0, clock: Clock = time.monotonic) -> None:
@@ -40,7 +41,7 @@ class Throughput:
         advanced = step - self._last_step
         if advanced <= 0:
             return
-        sample = (now - self._last_time) / advanced
+        sample = max(now - self._last_time, 0.0) / advanced  # `discount` can have moved the interval start past now
         self._samples += 1
         previous = self.seconds_per_step  # None for the first sample only; the check below narrows the type
         if previous is None or self._samples <= 2:
@@ -49,6 +50,14 @@ class Throughput:
             self.seconds_per_step = (1 - RATE_SMOOTHING) * previous + RATE_SMOOTHING * sample
         self._last_time = now
         self._last_step = step
+
+    def discount(self, seconds: float) -> None:
+        """
+        `seconds` of the running interval were not training (an evaluation, a checkpoint write, samples,
+        benchmarks): the next :meth:`record` measures the interval without them. `elapsed` stays wall time.
+        """
+
+        self._last_time += seconds
 
     @property
     def elapsed(self) -> float:

@@ -11,13 +11,16 @@ import logging
 import random
 import shutil
 import sys
+import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from data_preparation import dataset_config as dc
 from data_preparation.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
@@ -29,9 +32,11 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source
+from data_preparation.lib.stages import exact_dedup
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
+from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import Manifest
 
 Row = dict[str, Any]
@@ -48,6 +53,18 @@ GOOD = (
 
 def _words(n: int, start: int = 0) -> str:
     return " ".join(f"tok_{(start + i) % 256}" for i in range(n))
+
+
+FILTER_STAT_KEYS = ("rows_on_disk", "expected_false_positive_rate", "items_in_filter", "measured_false_positive_rate")
+
+
+def _pop_filter_stats(dedup_stats: dict[str, Any]) -> dict[str, Any]:
+    """
+    Take the dedup filter's load out of a copy of `stats["dedup"]` (how full the Bloom filter ran, not what the
+    pass removed), so the pass counters can be compared by equality.
+    """
+
+    return {key: dedup_stats.pop(key) for key in FILTER_STAT_KEYS}
 
 
 @pytest.fixture
@@ -82,8 +99,9 @@ def test_build_length_filter_drops_short_and_keeps_stats(
     m = build_source(cfg, "s", layout)
     rows = read_rows(layout.processed_dir("s"))
     assert [r["text"] for r in rows] == ["ok " * 5, _words(6), "y" * 7, "z" * 8], "short / null dropped, nothing truncated"
-    assert [r["tokens"] for r in rows] == [5, 6, 1, 1], "the raw counts are reused as they are"
-    assert m.stats["length_filter"] == {"input_samples": 6, "removed_too_short": 1, "removed_invalid": 1, "output_samples": 4}
+    assert [r["tokens"] for r in rows] == [7, 8, 3, 3], "the raw counts (text plus BOS and EOS) are reused as they are"
+    # the download stores a null text as "", so the length filter sees it as too short, not invalid
+    assert m.stats["length_filter"] == {"input_samples": 6, "removed_too_short": 2, "removed_invalid": 0, "output_samples": 4}
     assert m.stats["input_rows"] == 6 and m.rows() == 4
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 2]]
     assert m.columns == ["text", "source", "tokens", "hash"] and m.shuffled is False
@@ -128,18 +146,22 @@ def test_build_exact_dedup_tokens_and_idempotence(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
     read_rows: Reader, mtimes: Mtimes,
 ) -> None:  # fmt: skip
-    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(64)]  # the last one exactly at the cap
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=64)
+    texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(62)]  # the last one exactly at the cap with BOS and EOS
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=64)
     m = build_source(cfg, "s", layout, shard_size=2)
     processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
     rows = read_rows(processed)
-    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(64)], "normalized duplicates dropped, text untouched"
-    assert [r["tokens"] for r in rows] == [5, 3, 64], "the raw counts (true counts of the stored text) reused"
+    assert [r["text"] for r in rows] == [_words(5), _words(3, 100), _words(62)], "normalized duplicates dropped, text untouched"
+    assert [r["tokens"] for r in rows] == [7, 5, 64], "the raw counts (true counts of the stored text plus the specials) reused"
     assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
     assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
-    assert [(s.rows, s.tokens) for s in m.shards] == [(2, 8), (1, 64)] and m.tokens() == 72
-    assert m.stats["dedup"] == {"mode": "exact", "duplicates_removed": 2}
+    assert [(s.rows, s.tokens) for s in m.shards] == [(2, 12), (1, 64)] and m.tokens() == 76
+    dedup_stats = dict(m.stats["dedup"])
+    load = _pop_filter_stats(dedup_stats)
+    assert dedup_stats == {"mode": "exact", "duplicates_removed": 2}
+    assert load["rows_on_disk"] == 5 and load["items_in_filter"] == 3, "the raw rows, and the hashes really inserted"
+    assert 0 < load["expected_false_positive_rate"] < 1e-9 and 0 < load["measured_false_positive_rate"] < 1e-9
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
     before = mtimes(processed)
     assert build_source(cfg, "s", layout, shard_size=2) == m and mtimes(processed) == before
@@ -149,27 +171,27 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
     """
-    Lowering `max_seq_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
+    Lowering `dataset_max_sequence_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
     counts to the new cap instead.
     """
 
-    cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, max_seq_length=64)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [30, 3]
-    lowered = replace(cfg, max_seq_length=8)
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(30), _words(3)], with_tokenizer, write=write_local, dataset_max_sequence_length=64)
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5]
+    lowered = replace(cfg, dataset_max_sequence_length=8, training_target_sequence_length=8)  # the target may not exceed the cap
     assert lowered.raw_hash("s") == cfg.raw_hash("s") and lowered.processed_hash("s") != cfg.processed_hash("s")
     m = build_source(lowered, "s", layout)
-    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 3] and m.tokens() == 11
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [30, 3], "raw untouched"
+    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 5] and m.tokens() == 13
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5], "raw untouched"
 
 
 def test_build_estimate_mode_caps_too(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
-    cfg = _prepare(cfg_factory, layout, local_dir, ["a" * 40, "b" * 400], with_tokenizer, write=write_local, token_count="estimate", max_seq_length=50)
+    cfg = _prepare(cfg_factory, layout, local_dir, ["a" * 40, "b" * 400], with_tokenizer, write=write_local, token_count="estimate", dataset_max_sequence_length=50)
     m = build_source(cfg, "s", layout)
     assert m.token_count == "estimate" and m.tokenizer is None
-    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [10, 50]
-    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 200], "the download cut the long text at 4 chars/token"
+    assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [12, 50]
+    assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 192], "the download cut the long text at 4 chars/token, 2 tokens left for the specials"
 
 
 def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
@@ -186,7 +208,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     cfg = _prepare(cfg_factory, layout, local_dir, first, with_tokenizer, write=write_local, shard_size=3)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         m1 = build_source(cfg, "s", layout, shard_size=4)
-    assert "s: dedup filter: 1 MB, ~7 rows" in caplog.text, "the test config's 1 MB budget, sized for the raw rows"
+    assert "s: dedup filter: 1 MB, 7 rows on disk" in caplog.text, "the test config's 1 MB budget, and the raw rows it is fed"
     processed = layout.processed_dir("s")
     old_rows = read_rows(processed)
     assert len(old_rows) == 6 and m1.stats["input_rows"] == 7 and m1.columns == ["text", "source", "tokens", "hash"]
@@ -214,7 +236,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     assert [r["text"] for r in new_rows[len(old_rows) :]] == [_words(6, 50), _words(6, 51)]
     # one processed shard per raw shard with survivors (raw shard 2 is a single duplicate -> no shard; raw shard 3 =
     # two duplicates + one new row -> 1 row)
-    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(3, 18), (3, 18), (1, 6), (1, 6)]
+    assert [(sh.rows, sh.tokens) for sh in m2.shards] == [(3, 24), (3, 24), (1, 8), (1, 8)]
 
     # golden: a fresh full pass over the same raw data keeps exactly the same rows
     fresh = DatasetLayout(tmp_path / "fresh")
@@ -238,7 +260,7 @@ def test_incremental_build_with_quality_filter_equals_a_full_pass(
     bad_caps = GOOD.upper()  # dropped: too many ALL-CAPS words; same normalized hash as GOOD
     proc = ProcessingConfig(min_chars=5, quality_filter=True)
     cfg = _prepare(cfg_factory, layout, local_dir, [bad_caps, "Another good text. It has sentences. Three of them here."],
-                   with_tokenizer, write=write_local, processing=proc, max_seq_length=500, shard_size=2)  # fmt: skip
+                   with_tokenizer, write=write_local, processing=proc, dataset_max_sequence_length=500, shard_size=2)  # fmt: skip
     m1 = build_source(cfg, "s", layout)
     assert m1.rows() == 1 and m1.stats["quality_filter"]["filtered_count"] == 1
     write_local(local_dir, [{"text": GOOD}], "parquet")
@@ -302,6 +324,26 @@ def test_build_refuses_a_processed_manifest_it_cannot_parse(
     assert read_rows(processed) == rows, "nothing was deleted"
 
 
+def test_all_at_once_build_refuses_a_processed_manifest_it_cannot_parse_too(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    """
+    The all-at-once path (shuffled sources, minhash) rebuilds into a .tmp folder and swaps it over the old one; a
+    manifest nobody can parse is refused before that, like on the per-shard path, so the folder stays for the
+    repair step's confirmation.
+    """
+
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(4, i) for i in range(3)], with_tokenizer, write=write_local, source={"shuffle": True})
+    build_source(cfg, "s", layout)
+    processed = layout.processed_dir("s")
+    rows = read_rows(processed)
+    (processed / "MANIFEST.json").write_text("{ not json")
+    with pytest.raises(RuntimeError, match="cannot be parsed; the repair step deletes the folder after confirmation"):
+        build_source(cfg, "s", layout)
+    assert (processed / "MANIFEST.json").read_text() == "{ not json" and read_rows(processed) == rows, "nothing was rebuilt or deleted"
+    assert not processed.with_name("s.tmp").exists() and not processed.with_name("s.old").exists()
+
+
 def test_stale_rebuild_removes_the_shards_of_the_previous_build(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
@@ -339,10 +381,10 @@ def test_build_quality_filter_only_when_enabled(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
 ) -> None:
     texts = [GOOD, "This is one sentence. Another one here."]
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=500)
     build_source(cfg, "s", layout)
     assert len(read_rows(layout.processed_dir("s"))) == 2
-    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, quality_filter=True), max_seq_length=500))
+    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, quality_filter=True), dataset_max_sequence_length=500))
     download(on, "s", layout, rows_needed=2)
     m = build_source(on, "s", layout)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
@@ -368,11 +410,11 @@ def test_build_decontamination_only_when_enabled(
 
     monkeypatch.setattr(stages_build, "load_benchmark_ngrams", fake_load)
     texts = [planted, GOOD, planted + " tail"]
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=500)
     build_source(cfg, "s", layout, pass_workers=pass_workers)
     assert len(read_rows(layout.processed_dir("s"))) == 3 and calls == []
     decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test", "mmlu_test"])
-    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon), max_seq_length=500))
+    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon), dataset_max_sequence_length=500))
     download(on, "s", layout, rows_needed=3)
     m = build_source(on, "s", layout, pass_workers=pass_workers)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
@@ -389,7 +431,7 @@ def test_build_benchmark_load_failure_is_an_error(
 
     monkeypatch.setattr(stages_build, "load_benchmark_ngrams", failing)
     proc = ProcessingConfig(min_chars=1, decontamination=DecontaminationConfig(enabled=True))
-    cfg = _prepare(cfg_factory, layout, local_dir, [GOOD], with_tokenizer, write=write_local, processing=proc, max_seq_length=500)
+    cfg = _prepare(cfg_factory, layout, local_dir, [GOOD], with_tokenizer, write=write_local, processing=proc, dataset_max_sequence_length=500)
     with pytest.raises(OSError, match="hub unreachable"):
         build_source(cfg, "s", layout)
     assert not (layout.processed_dir("s") / "MANIFEST.json").exists()
@@ -406,7 +448,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     short_a, short_b, short_a_variant = "hello world", "SELECT * FROM users;", "Hello   World"  # < 5 words: no n-grams
     proc = ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="minhash", threshold=0.8, num_perm=64))
     cfg = _prepare(cfg_factory, layout, local_dir, [base, near, other, base, partial, short_a, short_b, short_a_variant], with_tokenizer,
-                   write=write_local, processing=proc, max_seq_length=500)  # fmt: skip
+                   write=write_local, processing=proc, dataset_max_sequence_length=500)  # fmt: skip
     m = build_source(cfg, "s", layout)
     processed = layout.processed_dir("s")
     # minhash mode = the normalized exact pass first (second `base`, the case variant of `short_a`), then the fuzzy
@@ -415,6 +457,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     assert not processed.with_name("s.tmp").exists()
     dedup_stats = dict(m.stats["dedup"])
     assert dedup_stats.pop("seconds") >= 0
+    assert _pop_filter_stats(dedup_stats)["rows_on_disk"] == 8
     assert dedup_stats == {
         "mode": "minhash", "duplicates_removed": 2, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 1,
         "near_duplicate_rate": 0.25, "too_short_passed": 2,  # rate over the rows that went through the LSH
@@ -427,6 +470,60 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     m2 = build_source(cfg, "s", layout)
     assert m2.stats["input_rows"] == 9 and m2.stats["dedup"]["near_duplicates_removed"] == 2
     assert [r["text"] for r in read_rows(processed)] == [base, other, partial, short_a, short_b]
+
+
+def test_concurrent_in_process_builds_keep_their_own_pass_settings(
+    cfg_factory: CfgFactory, layout: DatasetLayout, write_local: Writer, read_rows: Reader, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    `lib/build/runner.py` builds several sources in threads of one process; with `pass_workers=1` each build's
+    decontamination and minhash pass must use its own source's settings, not whichever build set up last. The
+    stubbed benchmark loader holds both builds at a barrier, so their passes are set up side by side.
+    """
+
+    pytest.importorskip("datasketch")
+    base = " ".join(f"word{i}" for i in range(100))
+    near = base.replace("word50", "changed")
+    planted = {"gsm8k_test": " ".join(f"a{i}" for i in range(20)), "mmlu_test": " ".join(f"b{i}" for i in range(20))}
+    texts = [planted["gsm8k_test"], base, near, planted["mmlu_test"], GOOD]
+    gate = [threading.Barrier(1)]
+
+    def fake_load(names: list[str], n: int = 13, cache_dir: str | None = None) -> dict[str, set[str]]:
+        gate[0].wait(timeout=30)
+        return {name: get_ngram_set(planted[name], n) for name in names}
+
+    monkeypatch.setattr(stages_build, "load_benchmark_ngrams", fake_load)
+
+    def processing(ngram: int, benchmark: str, decontamination_ngram: int) -> ProcessingConfig:
+        dedup = DedupConfig(mode="minhash", threshold=0.8, num_perm=64, ngram=ngram, bloom_memory_mb=1)
+        return ProcessingConfig(min_chars=5, dedup=dedup, decontamination=DecontaminationConfig(enabled=True, benchmarks=[benchmark], ngram=decontamination_ngram))
+
+    write_local(layout.root.parent / "src", [{"text": t} for t in texts], "parquet")
+    sources = {
+        "a": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(2, "gsm8k_test", 5)),
+        "b": SourceConfig(kind="pretrain", loader="local", path=str(layout.root.parent / "src"), processing=processing(200, "mmlu_test", 13)),  # 200 > every text: nothing signed
+    }
+    cfg = cfg_factory(sources, dataset_max_sequence_length=500)
+
+    def build_both(root: Path, threads: int) -> dict[str, tuple[list[str], dict[str, Any]]]:
+        target = DatasetLayout(root)
+        prepare_tokenizer(cfg, target)
+        for name in sources:
+            download(cfg, name, target, rows_needed=len(texts))
+        with ThreadPoolExecutor(threads) as pool:
+            manifests = list(pool.map(lambda name: build_source(cfg, name, target, pass_workers=1), sources))
+        results = {}
+        for name, manifest in zip(sources, manifests):
+            stats = dict(manifest.stats)
+            stats["dedup"] = {key: value for key, value in stats["dedup"].items() if key != "seconds"}
+            results[name] = ([r["text"] for r in read_rows(target.processed_dir(name))], stats)
+        return results
+
+    sequential = build_both(tmp_path / "sequential", threads=1)
+    assert sequential["a"][0] == [base, planted["mmlu_test"], GOOD], "a: its planted text decontaminated, `near` a near-duplicate at ngram 2"
+    assert sequential["b"][0] == [planted["gsm8k_test"], base, near, GOOD], "b: the other planted text, nothing signed at ngram 200"
+    gate[0] = threading.Barrier(2)
+    assert build_both(tmp_path / "concurrent", threads=2) == sequential
 
 
 def test_build_minhash_without_datasketch_raises(
@@ -499,9 +596,9 @@ def _instruct_row(i: int, n_out: int = 4) -> Row:
     return {"instruction": f"tok_{i} tok_{i + 1}", "input": "", "output": " ".join(f"tok_{(i * 7 + j) % 256}" for j in range(n_out))}
 
 
-def _instruct_cfg(cfg_factory: CfgFactory, with_tokenizer: Prep, local_dir: Path, max_seq_length: int = 64, **source_kwargs: Any) -> DatasetConfig:
+def _instruct_cfg(cfg_factory: CfgFactory, with_tokenizer: Prep, local_dir: Path, dataset_max_sequence_length: int = 64, **source_kwargs: Any) -> DatasetConfig:
     src = SourceConfig(kind="instruct", loader="local", path=str(local_dir), converter="instruction_input_output", **source_kwargs)
-    return with_tokenizer(cfg_factory({"i": src}, max_seq_length=max_seq_length))
+    return with_tokenizer(cfg_factory({"i": src}, dataset_max_sequence_length=dataset_max_sequence_length))
 
 
 def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
@@ -518,11 +615,13 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     out = read_rows(processed)
     assert [set(r) for r in out] == [{"instruction", "input", "output", "tokens", "hash"}] * 20
     assert m.columns == ["instruction", "input", "output", "tokens", "hash"] and m.shuffled is True and m.shuffle_seed == 3
-    assert m.stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
+    stats = {**m.stats, "dedup": dict(m.stats["dedup"])}
+    assert _pop_filter_stats(stats["dedup"])["items_in_filter"] == 20, "one hash per surviving row"
+    assert stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
     assert m.input_shards == [["data-00000.parquet", 8], ["data-00001.parquet", 8], ["data-00002.parquet", 8]]
-    assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 6
+    assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 8
     assert all(r["hash"] == text_hash64(instruct_text(r)) for r in out)
-    expected = [{**_instruct_row(i), "tokens": 6} for i in range(20)]
+    expected = [{**_instruct_row(i), "tokens": 8} for i in range(20)]
     random.Random(3).shuffle(expected)
     assert [{k: r[k] for k in ("instruction", "input", "output", "tokens")} for r in out] == expected, "seeded shuffle of the survivors, in raw order before the shuffle"
     assert not processed.with_name("i.tmp").exists()
@@ -573,7 +672,7 @@ def test_instruct_inversions_are_seeded_per_row_and_survive_a_resume(
     inverted = [r for r in resumed if r["instruction"].startswith("Given this output")]
     assert 4 <= len(inverted) <= 20 and m.stats["inverted"] == len(inverted) and m.shuffled is False
     counter = TokenCounter(cfg, layout)
-    assert all(r["tokens"] == counter.count(instruct_text(r)) != 6 for r in inverted), "tokens recounted"
+    assert all(r["tokens"] == counter.count(instruct_text(r)) + NUMBER_OF_SPECIAL_TOKENS != 8 for r in inverted), "tokens recounted, specials included"
     assert [r["instruction"] for r in resumed if not r["instruction"].startswith("Given")] == [
         r["instruction"] for i, r in enumerate(rows) if not resumed[i]["instruction"].startswith("Given")
     ], "raw order kept without shuffle"
@@ -598,15 +697,15 @@ def test_instruct_rows_over_the_cap_are_dropped_and_counted(
     cfg_factory: CfgFactory, layout: DatasetLayout, with_tokenizer: Prep, write_local: Writer, read_rows: Reader
 ) -> None:
     src_dir = layout.root.parent / "long"
-    rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 6 and 10 tokens
+    rows = [_instruct_row(i, n_out=4) for i in range(5)] + [_instruct_row(i, n_out=8) for i in range(5)]  # 8 and 12 tokens with the specials
     write_local(src_dir, rows, "jsonl")
-    cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, max_seq_length=8)
+    cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir, dataset_max_sequence_length=8)
     raw = download(cfg, "i", layout, rows_needed=10)
-    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [6] * 5, "rows over the cap are dropped at download, never truncated"
+    assert [r["tokens"] for r in read_rows(layout.raw_dir("i"))] == [8] * 5, "rows over the cap are dropped at download, never truncated"
     assert raw.dropped_too_long == 5 and raw.exhausted is True
     m = build_source(cfg, "i", layout)
     out = read_rows(layout.processed_dir("i"))
-    assert len(out) == 5 and all(r["tokens"] == 6 for r in out) and m.stats["removed_too_long"] == 0  # the build's safety net has nothing left to do
+    assert len(out) == 5 and all(r["tokens"] == 8 for r in out) and m.stats["removed_too_long"] == 0  # the build's safety net has nothing left to do
 
 
 def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(
@@ -687,3 +786,78 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     assert len(read_rows(processed)) == 8, "the new folder is in place"
     assert len(read_rows(old)) == 4, "the replaced folder survived the crash aside"
     assert not processed.with_name("i.tmp").exists()
+
+
+# --- the build cap ------------------------------------------------------------------------------------------------------
+
+
+def test_build_stops_at_rows_target_and_resumes_to_a_larger_one(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    texts = [_words(6, i) for i in range(10)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=3)  # raw shards of 3, 3, 3, 1
+    processed = layout.processed_dir("s")
+    m = build_source(cfg, "s", layout, rows_target=4)  # the second raw shard brings the processed rows to 6 >= 4
+    assert m.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]] and m.rows() == 6
+    assert build_source(cfg, "s", layout, rows_target=6).input_shards == m.input_shards  # served already: nothing built
+    m2 = build_source(cfg, "s", layout, rows_target=8)  # a larger target builds on from the covered shards
+    assert m2.input_shards == [[f"data-{i:05d}.parquet", 3] for i in range(3)] and m2.rows() == 9
+    m3 = build_source(cfg, "s", layout)  # no target: everything
+    assert m3.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])] and m3.rows() == 10
+    assert [r["text"] for r in read_rows(processed)] == texts
+
+
+def test_an_all_at_once_build_ignores_rows_target(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep
+) -> None:
+    texts = [_words(6, i) for i in range(12)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=4, source={"shuffle": True, "seed": 5})
+    m = build_source(cfg, "s", layout, shard_size=5, rows_target=2)
+    assert m.rows() == 12 and m.input_shards == [[f"data-{i:05d}.parquet", 4] for i in range(3)]
+
+
+def test_a_raw_folder_over_the_all_at_once_cap_is_refused_before_anything_is_allocated(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """
+    The config load checks the *planned* rows at its tokens-per-row estimate; the raw folder can hold many more
+    (the planner re-plans at the measured rate, a download overshoots). The build checks what is really there,
+    before it reads a shard or allocates the Bloom filter, and its message differs only in the remedy.
+    """
+
+    texts = [_words(6, i) for i in range(5)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2, source={"shuffle": True})
+
+    def no_filter(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the row cap must be checked before the dedup filter is allocated")
+
+    monkeypatch.setattr(dc, "SHUFFLED_BUILD_MAX_ROWS", 3)
+    monkeypatch.setattr(stages_build, "SeenDocuments", no_filter)
+    with pytest.raises(ValueError) as refused:
+        build_source(cfg, "s", layout)
+    first_sentence = "s: shuffle=true builds all-at-once in memory; 5 rows exceed the limit of 3. "
+    assert str(refused.value).startswith(first_sentence)
+    assert "The raw folder already holds these rows, so lower the token budget and delete raw/s, or turn shuffle off." in str(refused.value)
+    assert not layout.processed_dir("s").exists() and not layout.processed_dir("s").with_name("s.tmp").exists()
+    with pytest.raises(ValueError) as at_load:
+        cfg.check_all_at_once_rows("s", 5, at_build=False)
+    assert str(at_load.value).startswith(first_sentence), "the config-load refusal says the same thing"
+    assert "Split the source or turn shuffle off." in str(at_load.value)
+
+
+def test_a_build_whose_rows_saturate_the_dedup_filter_is_refused(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """
+    Past twice the filter's nominal capacity a build would drop unique documents as duplicates, so it refuses and
+    names the budget that fixes it. The capacity is shrunk here instead of downloading 600 k rows.
+    """
+
+    texts = [_words(6, i) for i in range(5)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2)
+    monkeypatch.setattr(exact_dedup, "expected_items", lambda *args, **kwargs: 2)
+    with pytest.raises(ValueError, match="past the 2x this build accepts"):
+        build_source(cfg, "s", layout)
+    assert not layout.processed_dir("s").exists()

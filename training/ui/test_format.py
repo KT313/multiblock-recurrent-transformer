@@ -7,6 +7,7 @@ from __future__ import annotations
 
 
 from training.ui.format import (
+    depth_losses,
     as_float,
     event_line,
     fit_panel_heights,
@@ -51,6 +52,8 @@ def test_format_metric() -> None:
 def test_log_lines_of_the_fallback_and_the_log_file() -> None:
     assert validation_line(10, {"val_loss_4": 3.25, "val_loss": 3.125, "bad": "x"}) == "step 10: validation val_loss_4 3.2500, val_loss 3.1250"
     assert validation_line(3, {}) == "step 3: validation (no losses)"
+    assert validation_line(4, {"val_loss": 3.0, "val_loss/finetune-flan": 2.5}) == "step 4: validation val_loss 3.0000, val_loss/finetune-flan 2.5000"
+    assert depth_losses({"val_loss_4": 3.25, "val_loss/pretrain-a": 3.0, "val_loss": 3.125}) == {"val_loss_4": 3.25, "val_loss": 3.125}
     assert event_line("saved checkpoint x.pth") == "event: saved checkpoint x.pth"
     assert status_line("evaluating") == "status: evaluating"
 

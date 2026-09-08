@@ -1,14 +1,14 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values, continuity at every stage
-transition and the resume warmup ramp.
+Tests for the trapezoid multi-stage LR schedule: warmup/plateau/cooldown values and continuity at every stage
+transition.
 """
 
 from typing import Any
 
 import pytest
 
-from training.lr_schedule import SCHEDULES, _resume_warmup, get_lr_multistage
+from training.lr_schedule import SCHEDULES, get_lr_multistage
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
 
@@ -21,7 +21,7 @@ def _tiny_manager(warmup: int = 2, cooldown: int = 2) -> StageManager:
         resolved_stage("b", tokens=8 * TPS, base_lr=1e-4, transition_pct=0.25),
         resolved_stage("c", tokens=4 * TPS, base_lr=5e-5, transition_pct=0.0),
     ]
-    return StageManager(stages, world_batch_size=4, block_size=256, warmup_steps=warmup, cooldown_steps=cooldown)
+    return StageManager(stages, tokens_per_step=1024, warmup_steps=warmup, cooldown_steps=cooldown)
 
 
 def _lr(sm: StageManager, step: int, **kw: Any) -> float:
@@ -116,7 +116,7 @@ def test_warmup_and_cooldown_boundaries_are_continuous_with_the_plateau() -> Non
 def test_zero_length_transition_switches_lr_hard_at_the_boundary() -> None:
     tps = 4 * 256
     stages = [resolved_stage("a", 8 * tps, base_lr=3e-4, transition_pct=0.05), resolved_stage("b", 8 * tps, base_lr=1e-4)]
-    sm = StageManager(stages, world_batch_size=4, block_size=256)
+    sm = StageManager(stages, tokens_per_step=1024)
     assert sm.boundaries[0].transition_start_step == sm.boundaries[0].end_step == 8
     assert [_lr(sm, s) for s in (6, 7, 8, 9)] == pytest.approx([3e-4, 3e-4, 1e-4, 1e-4])
 
@@ -129,7 +129,7 @@ def _continuity_manager() -> StageManager:
         resolved_stage("s2", tokens=40 * tps, base_lr=6e-4, transition_pct=0.5),  # transition 20 steps
         resolved_stage("s3", tokens=30 * tps, base_lr=1e-4, transition_pct=0.0),
     ]
-    return StageManager(stages, world_batch_size=8, block_size=128, warmup_steps=5, cooldown_steps=10)
+    return StageManager(stages, tokens_per_step=1024, warmup_steps=5, cooldown_steps=10)
 
 
 def test_multistage_schedule_is_continuous_at_every_boundary() -> None:
@@ -160,44 +160,3 @@ def test_schedule_plateaus_and_cooldown_of_continuity_config() -> None:
     assert _lr(sm, 95) == pytest.approx(1e-3 + (2e-4 - 1e-3) * 5 / 10)
     assert _lr(sm, 190) == pytest.approx(6e-4 + (1e-4 - 6e-4) * 10 / 20)
     assert _lr(sm, 225) == pytest.approx(1e-4 * 5 / 10)
-
-
-def test_resume_warmup_helper() -> None:
-    assert _resume_warmup(0, 4, 0.0, 1e-4) == pytest.approx(0.0)
-    assert _resume_warmup(1, 4, 0.0, 1e-4) == pytest.approx(0.25e-4)
-    assert _resume_warmup(1, 4, 2e-5, 1e-4) == pytest.approx(2e-5 + 0.25 * 8e-5)
-
-
-def test_resume_warmup_applies_only_inside_the_ramp() -> None:
-    """
-    `get_lr_multistage` ramps for `resume_warmup_steps` steps after `resume_step` and is the plain schedule before
-    the resume, after the ramp, without a resume (`resume_step=-1`) and with the ramp disabled.
-    """
-
-    sm = _tiny_manager()
-    plateau = _lr(sm, 5)
-    kw = dict(resume_step=10, resume_warmup_steps=4)
-    assert _lr(sm, 10, **kw) == pytest.approx(0.0)
-    assert _lr(sm, 11, **kw) == pytest.approx(0.25 * _lr(sm, 11))
-    assert _lr(sm, 14, **kw) == pytest.approx(_lr(sm, 14))  # ramp over
-    assert _lr(sm, 9, **kw) == pytest.approx(_lr(sm, 9))  # before the resume
-    assert _lr(sm, 5, resume_step=-1, resume_warmup_steps=4) == pytest.approx(plateau)  # no resume
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=0) == pytest.approx(_lr(sm, 11))  # disabled
-
-
-def test_resume_warmup_ramps_from_min_lr_to_schedule() -> None:
-    sm = _tiny_manager()
-    kw = {"resume_step": 10, "resume_warmup_steps": 4, "min_lr": 0.0}
-    assert _lr(sm, 10, **kw) == pytest.approx(0.0)
-    assert _lr(sm, 11, **kw) == pytest.approx(0.25 * 1e-4)
-    assert _lr(sm, 13, **kw) == pytest.approx(0.75 * 1e-4)
-    assert _lr(sm, 14, **kw) == pytest.approx(1e-4)  # ramp over: back on the schedule
-    assert _lr(sm, 15, **kw) == pytest.approx(7.5e-5)
-    assert _lr(sm, 9, **kw) == pytest.approx(1e-4)  # steps before the resume are untouched
-
-
-def test_resume_warmup_respects_min_lr_and_disabled_cases() -> None:
-    sm = _tiny_manager()
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=4, min_lr=2e-5) == pytest.approx(2e-5 + 0.25 * 8e-5)
-    assert _lr(sm, 11, resume_step=-1, resume_warmup_steps=4) == pytest.approx(1e-4)
-    assert _lr(sm, 11, resume_step=10, resume_warmup_steps=0) == pytest.approx(1e-4)

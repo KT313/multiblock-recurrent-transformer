@@ -25,7 +25,7 @@ from ..model import RecurrentGPT
 
 # The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
-    "block_size",
+    "model_max_sequence_length",
     "n_embd",
     "intermediate_size",
     "num_attention_heads",
@@ -36,6 +36,7 @@ _MODEL_FIELDS = (
     "attn_impl",
     "norm_eps",
     "qk_bias",
+    "bf16_residual_stream",
     "init_strategy",
     "init_orthogonal",
     "activation_checkpoint_impl",
@@ -87,11 +88,32 @@ def mask_padded_vocabulary(logits: torch.Tensor, vocab_size: int, padded_vocab_s
 class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # transformers' __init_subclass__ is untyped
     """
     `RecurrentConfig` fields as a `PretrainedConfig` (RoPE settings flattened to `rope_base`).
+
+    The nested `rope_settings` of `RecurrentConfig.to_dict()` is accepted as well, so
+    `RecurrentGPTConfig(**recurrent_config.to_dict())` keeps the RoPE base.
     """
 
     model_type = "recurrent_gpt"
 
-    def __init__(self, rope_base: int = 50_000, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        rope_base: int | None = None,
+        rope_settings: dict[str, Any] | RoPESettings | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # `rope_settings` is the nested form of the same field: `RecurrentGPTConfig(**recurrent_config.to_dict())`
+        # passes it instead of `rope_base`, and dropping it silently would leave the RoPE base at its default.
+        if rope_settings is not None:
+            if isinstance(rope_settings, RoPESettings):
+                nested_rope_base = rope_settings.rope_base
+            else:
+                nested_rope_base = RoPESettings(**rope_settings).rope_base
+            if rope_base is not None and int(rope_base) != int(nested_rope_base):
+                raise ValueError(f"rope_base ({rope_base}) and rope_settings ({nested_rope_base}) disagree")
+            rope_base = nested_rope_base
+        if rope_base is None:
+            rope_base = RoPESettings().rope_base
+
         # Defaults fill keys missing from a config.json (export_to_hf writes every field); the exported folder has no
         # access to config/model_architecture/, so the dataclass defaults apply.
         defaults = RecurrentConfig()
@@ -141,13 +163,16 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
     config_class = RecurrentGPTConfig
     base_model_prefix = "model"
     _no_split_modules = ["SandwichBlock"]
-    _supports_cache_class = False
     _tied_weights_keys = {"model.lm_head.weight": "model.transformer.wte.weight"}
 
     def __init__(self, config: RecurrentGPTConfig) -> None:
         super().__init__(config)
         self.model: RecurrentGPT = RecurrentGPT(config.to_recurrent_config())
+        # persistent here: `from_pretrained` materialises only the tensors of the saved state dict, a non-persistent
+        # buffer would stay uninitialised (in the training model it is not persistent, so the config always wins)
+        self.model.register_buffer("freqs_cis", self.model.freqs_cis, persistent=True)
         self.num_recurrent_blocks = len(self.model.transformer.core_blocks)
+        self._training_forwards = 0  # the inner model's sampler step, see `forward`
         self.post_init()  # type: ignore[no-untyped-call]  # untyped in transformers
 
     def _init_weights(self, module: torch.nn.Module) -> None:
@@ -177,10 +202,23 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         loss `CE(logits[t], x[t + 1])`, positions labelled -100 ignored. The inner `RecurrentGPT` expects pre-shifted
         labels, so it gets `labels=None`. `attention_mask` `(B, S)` (1 = keep) and `position_ids` (1-D or `(B, S)`)
         are forwarded to the inner model.
+
+        Every sampled training forward counts as one sampler step: the inner model's `step` (which seeds the
+        recurrence depths, `model/blocks/recurrence.py`) is set to `self._training_forwards` here, so a HF Trainer
+        or PEFT run draws a new depth per forward instead of the fixed depth of step 0, and the micro-batches of
+        one accumulated optimizer step draw independently. The value stays until the next forward, so an
+        activation-checkpoint recompute in the backward draws the same depth. The counter is a plain attribute,
+        not a buffer: `save_pretrained` does not store it and a resumed Trainer restarts the depth sequence at 0
+        (the depths are a distribution, not a schedule). The native training loop writes `step` itself
+        (`training/step.py`) and never goes through this wrapper.
         """
 
         if return_dict is None:
             return_dict = self.config.return_dict
+
+        sampler_step = num_steps is None and self.training
+        if sampler_step:
+            self.model.step = self._training_forwards
 
         if num_steps is None and not self.training:
             env_steps = os.environ.get("EVAL_RECURRENCE_STEPS", "").strip()
@@ -200,6 +238,8 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
             return_logits=True,
             num_steps=num_steps,
         )
+        if sampler_step:
+            self._training_forwards += 1
         logits = outputs["logits"]
         assert logits is not None  # `return_logits=True`
         logits = mask_padded_vocabulary(logits, int(self.config.vocab_size), int(self.config.padded_vocab_size))
@@ -341,6 +381,7 @@ def export_to_hf(
     state_dict: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
         state_dict[f"model.{name}"] = tensor.detach().cpu()
+    state_dict["model.freqs_cis"] = model.freqs_cis.detach().cpu()  # persistent in the wrapper only (see its __init__)
     hf_model.load_state_dict(state_dict, assign=True)
     hf_model.save_pretrained(out_dir, safe_serialization=True)
     export_sources(_PACKAGE_DIR, out_dir)

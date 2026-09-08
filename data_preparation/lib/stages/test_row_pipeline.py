@@ -91,7 +91,7 @@ def test_get_ngrams() -> None:
         ("hi", "too_short"),
         ("This is one sentence. Another one here.", "too_few_sentences"),
         ("THIS IS A LOUD SENTENCE HERE. ANOTHER LOUD SENTENCE. AND ONE MORE LOUD ONE.", "too_many_caps"),
-        ("@@@@@@@@@@@@ a. ############ b. $$$$$$$$$$$$ c.", "too_few_alphanumeric"),
+        ("@@@@@@@@@@@@ a. ############ b. $$$$$$$$$$$$ c.", "too_few_alphanumeric_or_space"),
         ("the cat sat. the cat sat. the cat sat. the cat sat. the cat sat.", "too_repetitive_bigrams"),
         (_repetitive_trigrams(), "too_repetitive_trigrams"),
         (GOOD, "passed"),
@@ -113,7 +113,7 @@ def test_check_quality_reasons(text: str, reason: str) -> None:
         ("AA BB CC alpha. beta gamma delta. epsilon zeta eta.", "passed"),
         ("AA BB CC DD. beta gamma delta. epsilon zeta eta.", "too_many_caps"),
         ("aa bb cc dd. ee ff gg hh. ii jj kk ll." + "#" * 102, "passed"),
-        ("aa bb cc dd. ee ff gg hh. ii jj kk ll." + "#" * 103, "too_few_alphanumeric"),
+        ("aa bb cc dd. ee ff gg hh. ii jj kk ll." + "#" * 103, "too_few_alphanumeric_or_space"),
         ("alpha beta gamma. alpha beta gamma. alpha delta epsilon zeta eta.", "passed"),
         ("alpha beta gamma. alpha beta gamma. alpha beta epsilon zeta eta.", "too_repetitive_bigrams"),
         (" ".join(["b0 b1 b2 b3 b4 b5."] * 2 + [f"u{i}" for i in range(9)] + ["u9."]), "passed"),
@@ -168,8 +168,9 @@ def test_check_contamination_with_planted_13gram_overlap() -> None:
 # --- instruct rows -----------------------------------------------------------------------------------------------------
 
 
-def test_instruct_text() -> None:
-    assert rp.instruct_text({"instruction": "a", "input": "b", "output": "c"}) == "a\nb\nc"
+def test_instruct_text_is_the_trainers_text() -> None:
+    assert rp.instruct_text({"instruction": "a", "input": "b", "output": "c"}) == "a\n\nb\n\nc"
+    assert rp.instruct_text({"instruction": " a ", "input": "  ", "output": "c\n"}) == "a\n\nc", "stripped; a blank input is no input"
     assert rp.instruct_text({"instruction": "a", "input": None, "output": "c"}) == "a\n\nc"
     assert rp.instruct_text({"instruction": "a", "output": "c"}) == "a\n\nc"
 

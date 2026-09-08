@@ -7,6 +7,7 @@ dataset configs is registered. Offline, CPU, fast.
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import types
@@ -17,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import zstandard
 
 from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources.converters import (
@@ -31,11 +33,24 @@ from data_preparation.lib.sources.converters import (
     sharegpt_conversations,
     sharegpt_quality,
 )
-from data_preparation.lib.sources.loaders import LOADERS, Row, SharedLoaderParameters, get_loader, load_local
+from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE
+from data_preparation.lib.sources.loaders import (
+    LOADERS,
+    Row,
+    SharedLoaderParameters,
+    get_loader,
+    github_code_extra_name,
+    github_code_extra_source,
+    language_key,
+    language_of_key,
+    language_slug,
+    load_local,
+)
 from data_preparation.lib.sources.synthetic import VOCAB_SIZE, synthetic_row, write_synthetic_tokenizer
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
-CONFIGS = [REPO / "config" / "datasets" / "crow_300m_final.yaml", REPO / "config" / "datasets" / "tiny.yaml"]
+CONFIGS = sorted((REPO / "config" / "datasets").glob("*.yaml"))  # every shipped dataset config
 
 
 # --- stub `datasets` module -------------------------------------------------------------------------------------------
@@ -171,6 +186,27 @@ def test_local_reads_parquet_and_jsonl_in_sorted_order(tmp_path: Path) -> None:
     assert list(LOADERS["local"](source, 0, 0)) == []
 
 
+def test_local_reads_every_format_of_the_hub_reader(tmp_path: Path) -> None:
+    """
+    `local` accepts what the Hub file reader accepts (`hub_files.FORMATS`): compressed json lines and json
+    arrays too, the suffix matched case-insensitively, everything else ignored.
+    """
+
+    def lines(*texts: str) -> bytes:
+        return "".join(json.dumps({"text": text}) + "\n" for text in texts).encode()
+
+    (tmp_path / "a.jsonl.zst").write_bytes(zstandard.ZstdCompressor().compress(lines("a0")))
+    with gzip.open(tmp_path / "b.jsonl.gz", "wb") as fh:
+        fh.write(lines("b0"))
+    with gzip.open(tmp_path / "c.json.gz", "wb") as fh:
+        fh.write(lines("c0"))
+    (tmp_path / "d.json").write_text(json.dumps([{"text": "d0"}]))
+    (tmp_path / "e.JSONL").write_bytes(lines("e0"))
+    (tmp_path / "f.txt").write_text("ignored")
+    source = _src(loader="local", path=str(tmp_path), hf_id=None, revision=None)
+    assert [r["text"] for r in LOADERS["local"](source, 0, 10)] == ["a0", "b0", "c0", "d0", "e0"]
+
+
 def test_local_projects_jsonl_and_parquet_to_the_requested_columns(tmp_path: Path) -> None:
     """
     `local` goes through the shared reading contract: `columns` projects both formats (a `.jsonl` row's surplus
@@ -217,13 +253,11 @@ def test_synthetic_row_shapes() -> None:
 
 
 def test_write_synthetic_tokenizer(tmp_path: Path) -> None:
-    from transformers import AutoTokenizer
-
     write_synthetic_tokenizer(tmp_path / "tok")
-    tokenizer = AutoTokenizer.from_pretrained(str(tmp_path / "tok"))
-    assert tokenizer.convert_tokens_to_ids(["<pad>", "<bos>", "<eos>", "tok_0", "tok_255"]) == [0, 1, 2, 3, 258]
-    assert tokenizer.encode("tok_1 tok_2", add_special_tokens=False) == [4, 5]
-    assert len(tokenizer) == VOCAB_SIZE == 259
+    tokenizer = SavedTokenizer(tmp_path / "tok")
+    assert (tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id) == (0, 1, 2)
+    assert tokenizer.encode("tok_0 tok_255") == [3, 258] and tokenizer.encode("tok_1 tok_2") == [4, 5]
+    assert len(tokenizer) == tokenizer.vocab_size == VOCAB_SIZE == 259
 
 
 # --- registries -------------------------------------------------------------------------------------------------------
@@ -381,3 +415,38 @@ def test_fields_converter_turns_null_values_into_empty_strings() -> None:
 
     convert = fields_converter({"instruction": "q", "input": "ctx", "output": "a"})
     assert convert({"q": None, "ctx": None, "a": "x"}) == {"instruction": "", "input": "", "output": "x"}
+
+
+# --- github_code: the names and sources of languages stored without a source of their own ----------------------------
+
+
+def test_language_slug_and_the_derived_extra_source() -> None:
+    labels = ("Python", "C#", "C++", "Objective-C", "Jupyter Notebook", "GO", "Visual Basic", "TeX", "PowerShell")
+    assert [language_slug(label) for label in labels] == ["python", "csharp", "cpp", "objective_c", "jupyter_notebook", "go", "visual_basic", "tex", "powershell"]
+    with pytest.raises(ValueError, match="no slug"):
+        language_slug("--")
+    template = SourceConfig(
+        kind="pretrain", loader="github_code", hf_id="codeparrot/github-code-clean", revision="r", language="Python", text_field="code",
+        describe_tokens_per_row=1234,
+    )
+    assert github_code_extra_name(template, "C#") == "github_code_clean_csharp"
+    assert github_code_extra_name(template, "C++") == "github_code_clean_cpp" and github_code_extra_name(template, "GO") == "github_code_clean_go"
+    extra = github_code_extra_source(template, "C#")
+    assert (extra.language, extra.text_field, extra.hf_id, extra.revision, extra.kind, extra.loader) == ("C#", "code", template.hf_id, "r", "pretrain", "github_code")
+    assert extra.describe_tokens_per_row == DEFAULT_TOKENS_PER_ROW_ESTIMATE  # the template's estimate is its own
+    assert language_of_key(language_key("C#")) == "C#" and language_key("C#") == "language=C#"
+    with pytest.raises(ValueError, match="not a language key"):
+        language_of_key("C#")
+
+
+def test_extra_names_reproduce_the_shipped_github_code_source_names() -> None:
+    """
+    The crow config names its languages the way the pass names an extra one, so adding a language later means
+    adding the entry under the name its folder already has.
+    """
+
+    cfg = load_dataset_config(REPO / "config" / "datasets" / "crow_300m_final.yaml")
+    github = {name: source for name, source in cfg.sources.items() if source.loader == "github_code"}
+    assert len(github) == 10
+    for name, source in github.items():
+        assert github_code_extra_name(source, str(source.language)) == name

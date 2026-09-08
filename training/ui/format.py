@@ -106,6 +106,14 @@ def floats(values: Mapping[str, object]) -> dict[str, float]:
     return {key: value for key, raw in values.items() if (value := as_float(raw)) is not None}
 
 
+def depth_losses(losses: Mapping[str, float]) -> dict[str, float]:
+    """
+    The validation losses per recurrence depth: every entry but the per-source ones (`val_loss/<data id>`).
+    """
+
+    return {key: value for key, value in losses.items() if "/" not in key}
+
+
 def known_metrics(metrics: Mapping[str, object]) -> dict[str, float]:
     """
     The metric-table keys present in metrics (in table order) as floats.

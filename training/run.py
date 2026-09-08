@@ -3,12 +3,12 @@
 `train()`: one training run as a readable entry function, plus the setup helpers it is made of.
 
     create_backend                    device, precision, torch flags; then `seed_everything`
-    prepare_run_directory             out_dir/checkpoints, run_config.json
+    prepare_run_directory             out_dir/<run_name>/checkpoints, run_config.json
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
-    build_run_model                   architecture yaml + overrides, block-size check, model_config.json, to device
+    build_run_model                   architecture yaml + overrides, sequence-length check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     RunState                          the objects above in one place for the helpers below
     restore_checkpoint_if_resuming    latest / explicit checkpoint -> model, optimizer, RNG state, progress
@@ -20,8 +20,9 @@ live in `step.py` and `evaluation.py`, device code in `backend/`, console lines 
 The setup order is itself numerics: seed, dataset and loaders (no torch RNG draw), model (its init is the first RNG
 consumer), optimizer, resume (restores the stored RNG state). The golden run in `test_run.py` fails on any change.
 
-A resume repeats no rows (the checkpoint carries `BatchStream.state_dict()`) but is not bit-exact: buffered samples
-are skipped and fresh loader iterators draw new base seeds, so losses diverge while the data stream continues.
+A resume continues the run exactly (the checkpoint carries `BatchStream.state_dict()`, the RNG states and the
+optimizer state; the loaders seed their iterators from a private generator): on a deterministic backend the resumed
+steps reproduce the uninterrupted run's numbers, on a GPU the usual nondeterminism applies.
 
 The CLI around this is `training/train.py`; `TrainingReport` is defined next to `RunLogger` in `logger.py`.
 """
@@ -31,14 +32,15 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import cast, Any
 
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from data_preparation.dataset_config import DatasetConfig
+from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
-from model.hf import export_to_hf
 from training.backend import get_backend
 from training.backend.base import Backend, plain_model
 from training.checkpoint import (
@@ -51,7 +53,11 @@ from training.checkpoint import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
-from training.data.collate import IGNORE_INDEX
+from training.data.tokenizer import IGNORE_INDEX
+from evaluation.benchmarks import benchmarks_path, evaluate_on_benchmarks
+from evaluation.prompts import load_prompts
+from evaluation.samples import GeneratedSample, generate_and_save_samples, samples_path
+from training.data.tokenizer import Tokenizer
 from training.data.loader import build_run_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.evaluation import evaluate, is_evaluation_step
@@ -60,7 +66,11 @@ from training.optim import build_optimizer, get_param_groups
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
-from training.step import BatchStream, TrainingProgress, run_one_optimizer_step
+from training.triggers import StepTriggers
+from training.step import BatchStream, NonFiniteLossError, TrainingProgress, run_one_optimizer_step
+
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -107,21 +117,37 @@ def train(
     step; the loop then saves a checkpoint, skips the export and returns with `report.stopped`.
     `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
-    The run directory is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
+    `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
 
-    Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint, so the
-    stored RNG state includes the evaluation draws) are the thesis loop's; `test_golden_tiny_run` fails on any change.
+    Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint) are the
+    thesis loop's; `test_golden_tiny_run` fails on any change. Evaluation runs under `torch.random.fork_rng`
+    (`training/evaluation.py`), so it draws nothing the training stream would miss.
     """
 
+    check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
+    if backend.world_size != 1:
+        raise NotImplementedError(
+            f"world_size {backend.world_size}: the loop is single-device. Two places count per rank where they must count"
+            " per world before a multi-rank backend can exist: `BatchStream._next_sample` (training/step.py) adds the rows this"
+            " rank pulled to consumed_rows while `set_resume_offset` skips range rows over all shards, and"
+            " `Settings.gradient_accumulation_steps` (training/settings.py) is per device, never divided by the world size."
+        )
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
-    with run_lock(run_directory / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
+    with run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training"):  # released on every way out, exception included
         dataset = resolve_dataset(settings, backend, should_stop=should_stop)
         stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+        sample_triggers = StepTriggers.from_settings(
+            settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps
+        )
+        benchmark_triggers = StepTriggers.from_settings(
+            settings.benchmark_step_interval, settings.benchmark_at_training_progress, stage_manager.total_steps
+        )
         loaders = build_run_dataloaders(settings, dataset, backend)
         try:
-            model = build_run_model(settings, backend, run_directory)
+            model = build_run_model(settings, dataset, backend, run_directory)
+            check_tokenizer_vocabulary(loaders.tokenizer, plain_model(model).config)
             optimizer = build_run_optimizer(settings, model, backend)
             state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
             resume = restore_checkpoint_if_resuming(state)
@@ -138,20 +164,26 @@ def train(
                 setup_started=started_at,
                 keep_history=keep_history,
             ) as logger:
-                if resume is None:
+                if resume is None or not (run_directory / "run_config.json").exists():
                     record_run_config(settings, run_directory)
+                if resume is None:
                     logger.log_fresh_start()
                 else:
                     logger.log_resume(resume.checkpoint, progress.step)
+                logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
+                logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
                 batches = BatchStream(settings, loaders, stage_manager, progress)
                 if resume is not None and resume.data_stream is not None:
                     batches.load_state_dict(resume.data_stream)
                 logger.status("training")
                 stopped = False
                 while progress.step < stage_manager.total_steps and not stopped:
-                    result = run_one_optimizer_step(
-                        settings, backend, model, optimizer, stage_manager, batches, progress
-                    )
+                    try:
+                        result = run_one_optimizer_step(
+                            settings, backend, model, optimizer, stage_manager, batches, progress
+                        )
+                    except NonFiniteLossError as error:
+                        raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
                     progress.advance()
                     if is_evaluation_step(settings, progress.step, stage_manager):
                         validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
@@ -164,6 +196,11 @@ def train(
                         logger.status("stopping after this step, saving a checkpoint")
                     if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
                         save_run_checkpoint(state, logger, batches)
+                    # after the checkpoint: a failing benchmark (network, the missing extra) never costs one
+                    if not stopped and sample_triggers.due(progress.step):
+                        write_samples(state, logger, loaders.tokenizer)
+                    if not stopped and benchmark_triggers.due(progress.step):
+                        run_benchmarks(state, logger, loaders.tokenizer)
                 export_dir = None if stopped else export_if_requested(state, logger)
                 return logger.close(progress, export_dir, stopped=stopped)
         finally:
@@ -182,20 +219,28 @@ def create_backend(settings: Settings) -> Backend:
     return get_backend(settings.backend, precision=settings.precision)
 
 
-def prepare_run_directory(settings: Settings) -> Path:
+def run_directory_of(settings: Settings) -> Path:
     """
-    Create the run directory (`settings.out_dir`) with its `checkpoints/` folder. Returns the run directory.
+    The run directory: `out_dir/<run_name>`, where the checkpoints, logs and wandb files of the run go.
     """
 
-    run_directory = Path(settings.out_dir)
+    return Path(settings.out_dir) / settings.run_name
+
+
+def prepare_run_directory(settings: Settings) -> Path:
+    """
+    Create the run directory (`run_directory_of`) with its `checkpoints/` folder. Returns the run directory.
+    """
+
+    run_directory = run_directory_of(settings)
     checkpoint_dir(run_directory).mkdir(parents=True, exist_ok=True)
     return run_directory
 
 
 def record_run_config(settings: Settings, run_directory: Path) -> None:
     """
-    Write `run_config.json` (the settings as parsed) for a FRESH run only; a resume keeps the file the run was
-    started with.
+    Write `run_config.json` (the settings as parsed). A fresh run always writes it; a resume only into a run
+    directory without one (an explicit `resume_checkpoint_path` into a new directory) and keeps it otherwise.
     """
 
     with open(run_directory / "run_config.json", "w") as file:
@@ -204,44 +249,110 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
 
 def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
     """
-    The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries.
+    The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries of
+    `micro_batches_per_step x tokens_per_micro_batch` tokens; the packs of a step must split evenly over the devices.
     """
 
+    if settings.gradient_accumulation_steps % world_size != 0:
+        raise ValueError(
+            f"micro_batches_per_step ({settings.gradient_accumulation_steps}) must be a multiple of the number of "
+            f"devices ({world_size}): every device takes the same number of packed micro-batches per optimizer step"
+        )
     return StageManager(
         dataset.stages,
-        world_batch_size=settings.world_batch_size,
-        block_size=settings.block_size,
+        tokens_per_step=settings.tokens_per_optimizer_step,
         world_size=world_size,
         warmup_steps=settings.warmup_steps,
         cooldown_steps=settings.cooldown_steps,
-        micro_batch_size=settings.micro_batch_size,
     )
 
 
-def check_block_sizes_agree(settings: Settings, model_config: RecurrentConfig) -> None:
+def check_evaluation_recurrences(settings: Settings) -> None:
     """
-    The run config's `block_size` must equal the architecture's (the RoPE table is sized by it). The dataset-side
-    check (`block_size` of the dataset config) is the resolver's.
+    Every `sample_recurrences` / `benchmark_recurrences` setting must name one step count per core block of the
+    architecture config (with `model_overwrite` applied).
     """
 
-    if model_config.block_size != settings.block_size:
+    model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
+    blocks = len(cast(list[int], model_config.n_layers_in_recurrent_block))  # a list after __post_init__
+    for name in ("sample_recurrences", "benchmark_recurrences"):
+        for index, setting in enumerate(getattr(settings, name)):
+            if len(setting) != blocks:
+                raise ValueError(
+                    f"{name}[{index}] = {setting} has {len(setting)} entries but the model architecture "
+                    f"{settings.model_architecture_config} has {blocks} recurrent blocks"
+                )
+
+
+def check_sequence_lengths(settings: Settings, dataset_config: DatasetConfig, model_config: RecurrentConfig) -> None:
+    """
+    Training cuts rows at `training_max_sequence_length`, which must fit both the model's RoPE table
+    (`model_max_sequence_length` positions) and the stored rows (cut at `dataset_max_sequence_length` when
+    downloaded): longer than the model's table is impossible, longer than the data was cut means every row is
+    shorter than the training window, never what was intended. The two upper bounds are independent (a dataset
+    may store 16k-token rows for a model whose table covers 2k). A run cutting rows at another length than the
+    dataset config planned its downloads for (`training_target_sequence_length`) is warned about: the rows on
+    disk serve fewer tokens than budgeted when the run cuts shorter (the sampler cycles the source), more when it
+    cuts longer.
+    """
+
+    model, dataset, training = (
+        model_config.model_max_sequence_length, dataset_config.dataset_max_sequence_length, settings.training_max_sequence_length
+    )
+    if training > model or training > dataset:
         raise ValueError(
-            f"block_size {settings.block_size} of the run config does not match block_size {model_config.block_size} "
-            f"of the model architecture config {settings.model_architecture_config} (with model_overwrite applied)"
+            f"training_max_sequence_length {training} (the run config) must be at most model_max_sequence_length {model} "
+            f"({settings.model_architecture_config}, with model_overwrite applied) and dataset_max_sequence_length {dataset} "
+            f"({settings.dataset_config})"
+        )
+    target = dataset_config.training_target_sequence_length
+    if training != target:
+        log.warning(
+            "training_max_sequence_length %d differs from training_target_sequence_length %d of %s: the downloads were sized "
+            "for rows cut at %d tokens", training, target, settings.dataset_config, target
         )
 
 
-def build_run_model(settings: Settings, backend: Backend, run_directory: Path) -> Module:
+def check_tokenizer_vocabulary(tokenizer: Tokenizer, model_config: RecurrentConfig) -> None:
     """
-    The run's model: architecture yaml + `model_overwrite`, block-size check, `RecurrentGPT`, `model_config.json`,
-    then `backend.setup_model` (device, optional compile).
+    The dataset's tokenizer and the model's vocabulary must agree: every id the tokenizer produces (added tokens
+    included, `len(tokenizer)`) has to be below `vocab_size`. A dataset config that swaps in a larger tokenizer
+    would otherwise fail on an index error at the first batch holding an id beyond the padded table, and for ids
+    between `vocab_size` and `padded_vocab_size` train nothing at all: those are the padding rows of the embedding
+    table, whose labels the loss ignores (`model.mask_labels`) and whose logits the HF wrapper sets to -inf. The
+    padded size therefore does not enter the check (`padded_vocab_size >= vocab_size` always holds).
+
+    A tokenizer smaller than the architecture's declared `vocab_size` only trains rows that never occur, so it is
+    a warning: the number is worth seeing when a run reports its parameter count.
+    """
+
+    tokens, vocab = len(tokenizer), model_config.vocab_size
+    if tokens > vocab:
+        raise ValueError(
+            f"The tokenizer of the dataset has {tokens} tokens but the model's vocabulary holds {vocab} ids "
+            f"(vocab_size of the model architecture config, padded to {model_config.padded_vocab_size} embedding "
+            "rows): ids from vocab_size on are never trained. Raise vocab_size or use the tokenizer the "
+            "architecture was sized for."
+        )
+    if vocab != tokens:
+        log.warning(
+            "The model architecture declares vocab_size %d but the dataset's tokenizer has %d tokens: the "
+            "difference is embedding rows that never occur in the data",
+            model_config.vocab_size, tokens
+        )
+
+
+def build_run_model(settings: Settings, dataset: ResolvedDataset, backend: Backend, run_directory: Path) -> Module:
+    """
+    The run's model: architecture yaml + `model_overwrite`, the sequence-length check against the dataset config,
+    `RecurrentGPT`, `model_config.json`, then `backend.setup_model` (device, optional compile).
 
     Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`; nothing that
     draws may run before it.
     """
 
     model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
-    check_block_sizes_agree(settings, model_config)
+    check_sequence_lengths(settings, dataset.config, model_config)
     model = RecurrentGPT(
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )
@@ -265,10 +376,10 @@ def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
     """
     Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
 
-    With `settings.resume`: `resume_checkpoint_path` if set, else the latest checkpoint of `run_name` in the run
-    directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and settings
-    against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step = checkpoint step`.
-    The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
+    With `settings.resume`: `resume_checkpoint_path` if set, else the most recently written checkpoint of `run_name`
+    in the run directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and
+    settings against the checkpoint, restores the RNG state and sets `progress.step = progress.resume_step =
+    checkpoint step`. The returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
     """
 
     settings = state.settings
@@ -300,18 +411,43 @@ def stop_requested(should_stop: StopCheck | None) -> bool:
     return should_stop is not None and should_stop()
 
 
-def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream) -> None:
+def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: BatchStream) -> str:
+    """
+    A step that produced a non-finite loss or gradient norm did not update the model (`optimizer.step` never ran),
+    so the model and optimizer state are those of the completed steps: save them, unless no step completed yet.
+    Returns the note for the error message.
+
+    Written as `...-failed.pth`, beside (never over) the regular checkpoint of the same step, and skipped by
+    `find_latest_checkpoint` so a plain `resume: true` continues from the last regular checkpoint. The data stream
+    is the one AFTER the failed step: the step read all its micro-batches before the loss was checked, so a resume
+    from this file re-runs the step on the NEXT documents and the failed step's documents are skipped. To train
+    them, resume from a regular checkpoint instead.
+    """
+
+    if state.progress.step == 0:
+        return "no checkpoint written (the first step failed)"
+    state.optimizer.zero_grad(set_to_none=True)
+    path = save_run_checkpoint(state, logger, batches, failed=True)
+    return (
+        f"the model before this step is checkpointed as {path} (resuming from it continues AFTER this step's "
+        "documents, which are skipped; the regular checkpoints are untouched)"
+    )
+
+
+def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream, failed: bool = False) -> Path:
     """
     Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
 
     Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
-    the stage the run is heading for (`StageManager.entering_stage_at`). Numerics: called after evaluation and
-    logging, so the stored RNG state includes the evaluation draws.
+    the stage the run is heading for (`StageManager.entering_stage_at`). Called after evaluation and logging; the
+    stored RNG state is the one after the step, evaluation having drawn under `torch.random.fork_rng`. `failed`
+    appends `-failed` to the name, for the checkpoint of a step that ended the run on a non-finite loss
+    (`_checkpoint_before_failed_step`).
     """
 
     settings, progress, stage_manager = state.settings, state.progress, state.stage_manager
     stage_end = stage_manager.stage_ending_at(progress.step - 1)
-    path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end)
+    path = checkpoint_path(state.run_directory, settings.run_name, progress.step, stage_end, failed=failed)
     metadata = CheckpointMetadata(
         step=progress.step,
         stage=stage_manager.entering_stage_at(progress.step),
@@ -320,11 +456,70 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream
         model_config=plain_model(state.model).config.to_dict(),
         dataset_config_hash=state.dataset.config_hash,
         validation_rows=state.dataset.validation_rows,
+        source_rows=state.dataset.source_rows,
         data_stream=batches.state_dict(),
     )
     with logger.saving_checkpoint():
         save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
     logger.log_checkpoint(path)
+    return path
+
+
+def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> list[GeneratedSample]:
+    """
+    Sample generations of the model as it is now, written to `samples/step-XXXXXXXX.jsonl` of the run directory
+    and noted by the logger. RNG-isolated: the training numerics do not change. An empty list when generation
+    failed (a warning, the run goes on), the policy `run_benchmarks` has: neither is worth a run.
+    """
+
+    settings, step = state.settings, state.progress.step
+    path = samples_path(state.run_directory, step)
+    try:
+        with logger.working("generating samples"):
+            samples = generate_and_save_samples(
+                plain_model(state.model),
+                tokenizer,
+                path,
+                step=step,
+                prompts=load_prompts(),
+                max_new_tokens=settings.sample_max_new_tokens,
+                temperature=settings.sample_temperature,
+                recurrences=settings.sample_recurrences or [None],
+            )
+    except Exception as error:  # a prompt the model cannot take, an OOM in generation: the run must not end on it
+        log.warning("sample generation failed, the run continues: %s", error)
+        return []
+    logger.log_samples(path, samples)
+    return samples
+
+
+def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> dict[str, float] | None:
+    """
+    lm-eval scores of the model as it is now, written to `benchmarks/step-XXXXXXXX.json` of the run directory and
+    logged as `benchmark/<recurrence>/<task>/<metric>`; None when the harness failed (logged as a warning, the run goes on).
+    """
+
+    settings, step = state.settings, state.progress.step
+    path = benchmarks_path(state.run_directory, step)
+    try:
+        with logger.working("benchmarking"):
+            metrics = evaluate_on_benchmarks(
+                plain_model(state.model),
+                tokenizer,
+                settings.benchmark_tasks,
+                num_fewshot=settings.benchmark_num_fewshot,
+                limit=settings.benchmark_limit,
+                batch_size=settings.benchmark_batch_size,
+                recurrences=settings.benchmark_recurrences or [None],
+                out_path=path,
+                step=step,
+                seed=settings.seed,
+            )
+    except Exception as error:  # the harness needs the extra and the network; the run must not end on it
+        logger.log_benchmark_failure(error)
+        return None
+    logger.log_benchmarks(metrics, path, step)
+    return metrics
 
 
 # --- after the loop --------------------------------------------------------------------------------------------------
@@ -342,6 +537,8 @@ def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
     export_dir = Path(settings.export_hf_path) if settings.export_hf_path else state.run_directory / "hf_export"
     logger.status("exporting")
     trained_model = plain_model(state.model)
+    from model.hf import export_to_hf  # transformers behind it: imported when a run exports, not at start-up
+
     export_to_hf(trained_model, trained_model.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
     logger.log_export(export_dir)
     return export_dir

@@ -1,13 +1,15 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 import json
 import pickle
+import re
 import shutil
 from pathlib import Path
 
 import pytest
 
 from data_preparation.lib.sources.synthetic import N_WORD_TOKENS, SPECIALS
-from training.data.tokenizer import Tokenizer
+from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+from training.data.tokenizer import BOS_PROBE, Tokenizer
 
 
 def test_special_ids_and_sizes(tokenizer: Tokenizer) -> None:
@@ -33,8 +35,8 @@ def test_encode_never_adds_specials_implicitly(tokenizer: Tokenizer) -> None:
 
 
 def test_unknown_word_maps_to_unk(tokenizer: Tokenizer) -> None:
-    # The synthetic tokenizer uses <pad> as its unk token.
-    assert tokenizer.encode("definitely_not_a_token") == [tokenizer.pad_id]
+    # The synthetic tokenizer uses <pad> (id 0) as its unk token; it is a token like any other, not a sentinel.
+    assert tokenizer.encode("definitely_not_a_token") == [0]
 
 
 def test_decode_round_trip(tokenizer: Tokenizer) -> None:
@@ -60,39 +62,128 @@ def test_missing_tokenizer_json_raises(tmp_path: Path) -> None:
         Tokenizer(tmp_path)
 
 
-def _without_pad(tiny_tokenizer_dir: Path, tmp_path: Path) -> Path:
-    dst = tmp_path / "nopad"
+def _without(tiny_tokenizer_dir: Path, tmp_path: Path, token: str) -> Path:
+    dst = tmp_path / f"no_{token}"
     shutil.copytree(tiny_tokenizer_dir, dst)
     for name in ("tokenizer_config.json", "special_tokens_map.json"):
         cfg = json.loads((dst / name).read_text())
-        cfg.pop("pad_token", None)
+        cfg.pop(token, None)
         (dst / name).write_text(json.dumps(cfg))
     return dst
 
 
-def test_missing_pad_token_falls_back(tiny_tokenizer_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_missing_pad_token_pads_generation_with_eos(tiny_tokenizer_dir: Path, tmp_path: Path) -> None:
     """
-    The synthetic tokenizer exposes no unk at the HF level, so without a pad token it falls back to EOS.
+    The Llama case: no pad token, so generation pads with EOS. Training never uses the pad id.
     """
 
-    with caplog.at_level("WARNING"):
-        tokenizer = Tokenizer(_without_pad(tiny_tokenizer_dir, tmp_path))
-    assert tokenizer.processor.pad_token_id is None
+    tokenizer = Tokenizer(_without(tiny_tokenizer_dir, tmp_path, "pad_token"))
+    assert SavedTokenizer(tokenizer.path).pad_id is None
     assert tokenizer.pad_id == tokenizer.eos_id == 2
-    assert "no pad token" in caplog.text and "eos_token_id" in caplog.text
 
 
-def test_resolve_pad_id_order() -> None:
-    """
-    Thesis behaviour for the Llama tokenizer: no pad token -> `<unk>` (id 0); then EOS; then an error.
-    """
+@pytest.mark.parametrize("token", ["bos_token", "eos_token"])
+def test_missing_bos_or_eos_token_raises(tiny_tokenizer_dir: Path, tmp_path: Path, token: str) -> None:
+    path = _without(tiny_tokenizer_dir, tmp_path, token)
+    with pytest.raises(ValueError, match=f"{path}.*BOS and an EOS"):
+        Tokenizer(path)
 
+
+def test_resolve_pad_id_prefers_the_pad_token() -> None:
     from types import SimpleNamespace
 
     from training.data.tokenizer import resolve_pad_id
 
-    assert resolve_pad_id(SimpleNamespace(pad_token_id=5, unk_token_id=0, eos_token_id=2), Path("t")) == 5
-    assert resolve_pad_id(SimpleNamespace(pad_token_id=None, unk_token_id=0, eos_token_id=2), Path("t")) == 0
-    assert resolve_pad_id(SimpleNamespace(pad_token_id=None, unk_token_id=None, eos_token_id=2), Path("t")) == 2
-    with pytest.raises(ValueError, match="no pad, unk or eos token"):
-        resolve_pad_id(SimpleNamespace(pad_token_id=None, unk_token_id=None, eos_token_id=None), Path("t"))
+    assert resolve_pad_id(SimpleNamespace(pad_id=5), eos_id=2) == 5
+    assert resolve_pad_id(SimpleNamespace(pad_id=None), eos_id=2) == 2
+
+
+def _tokenizer_dir_with_an_added_token_eos(tmp_path: Path) -> Path:
+    """
+    A hand-written tokenizer directory (never the Hub) whose EOS is an added token, not a base-vocabulary one:
+    base vocab <pad>=0, <bos>=1, tok_0=2, and <eos>=3 in `added_tokens`. That is the shape of most modern HF
+    tokenizers (Llama-3, SmolLM2, Qwen), where `get_vocab_size(with_added_tokens=False)` excludes the specials.
+    """
+
+    path = tmp_path / "added_token_eos"
+    path.mkdir()
+    tokenizer_json = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {"id": 3, "content": "<eos>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True}
+        ],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": {"<pad>": 0, "<bos>": 1, "tok_0": 2}, "unk_token": "<pad>"},
+    }
+    special_tokens_map = {"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>"}
+    (path / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+    (path / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "PreTrainedTokenizerFast", **special_tokens_map}))
+    (path / "special_tokens_map.json").write_text(json.dumps(special_tokens_map))
+    return path
+
+
+def test_specials_outside_the_base_vocabulary_are_refused_at_load(tmp_path: Path) -> None:
+    """
+    `collate.mask_label_ids` masks every id >= vocab_size, so an added-token EOS would silently erase the EOS
+    label of every document: the load must fail instead.
+    """
+
+    path = _tokenizer_dir_with_an_added_token_eos(tmp_path)
+    backend = SavedTokenizer(path)
+    # EOS 3 sits past the base vocabulary (3 tokens) and only `with_added_tokens=True` counts it: the guard's case
+    assert (backend.eos_id, backend.vocab_size, len(backend)) == (3, 3, 4)
+    with pytest.raises(ValueError, match="EOS 3 lie.*outside its base vocabulary of 3 tokens"):
+        Tokenizer(path)
+
+
+def test_processor_prepends_bos_when_asked_for_special_tokens(tokenizer: Tokenizer) -> None:
+    """
+    lm-eval encodes through `processor` with `add_special_tokens=True` (`add_bos_token=True` on its `HFLM`), so a
+    benchmark context has to come out shaped like a training row: BOS once, at the front, and no EOS.
+    """
+
+    processor = tokenizer.processor
+    with_specials = processor.encode("tok_3 tok_4", add_special_tokens=True)
+    assert with_specials == tokenizer.encode("tok_3 tok_4", bos=True)
+    assert with_specials[0] == tokenizer.bos_id and tokenizer.bos_id not in with_specials[1:]
+    assert tokenizer.eos_id not in with_specials
+    assert processor.encode("tok_3 tok_4", add_special_tokens=False) == tokenizer.encode("tok_3 tok_4")
+
+
+def test_processor_batch_call_gives_every_row_a_bos(tokenizer: Tokenizer) -> None:
+    """
+    lm-eval's `tok_batch_encode` pads a batch of contexts to the longest, on the left; every row still has to start
+    at its BOS.
+    """
+
+    batch = tokenizer.processor(
+        ["tok_3", "tok_3 tok_4 tok_5"], padding="longest", padding_side="left", return_tensors="pt"
+    )
+    ids, mask = batch["input_ids"], batch["attention_mask"]
+    assert ids.shape == (2, 4) and mask.tolist() == [[0, 0, 1, 1], [1, 1, 1, 1]]
+    for row, row_mask in zip(ids.tolist(), mask.tolist(), strict=True):
+        first_real = row[row_mask.index(1)]
+        assert first_real == tokenizer.bos_id
+        assert tokenizer.eos_id not in row
+
+
+def test_processor_refuses_a_transformers_that_ignores_add_bos_token(
+    tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The flag's effect is a transformers implementation detail; a version that drops it must fail loudly at setup
+    rather than score every benchmark on contexts without BOS.
+    """
+
+    import transformers
+
+    plain = transformers.AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir), add_bos_token=False)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: plain))
+    with pytest.raises(RuntimeError, match=re.escape(transformers.__version__)) as raised:
+        _ = Tokenizer(tiny_tokenizer_dir).processor
+    assert "does not prepend BOS" in str(raised.value) and repr(BOS_PROBE) in str(raised.value)

@@ -2,11 +2,9 @@
 # (<pad>, <bos>, <eos>, tok_0..tok_255) and random-word documents generated on demand. Builds in seconds, no
 # network. `python data_preparation/prepare.py prepare --dataset_config config/datasets/tiny.yaml`.
 
-name: tiny
-
 tokenizer: {name: synthetic, kind: synthetic}
-max_seq_length: 256
-block_size: 256                 # config/tiny.yaml must use the same block_size
+training_target_sequence_length: 256
+dataset_max_sequence_length: 256
 token_count: tokenizer
 validation_fraction: 0.05       # every source below is used for training and validation: its first 5 % of rows are held out
 

@@ -19,6 +19,7 @@ from data_preparation.lib.storage.atomic import write_atomically
 log = get_logger(__name__)
 SHARD_PATTERN = re.compile(r"^data-(\d{5,})\.parquet$")
 SHARD_COMPRESSION: Literal["zstd"] = "zstd"  # every shard written from now on; older snappy shards stay readable
+OnShard = Callable[[Path, pa.Table], None]  # a published shard and the table it holds (its counts without a read)
 
 
 def list_parquet_files(directory: Path) -> list[Path]:
@@ -51,14 +52,14 @@ def shard_name(index: int) -> str:
 class ShardWriter:
     """
     Writes dict rows as out_dir/data-NNNNN.parquet shards of shard_size rows. add(row) buffers rows and
-    publishes every full shard as soon as it is written (atomically, then on_shard(path) so the caller records it
-    in a manifest). Numbering starts at start_shard (append mode); stale shards >= start_shard in out_dir
-    are removed on enter. An exception leaves the published shards in place and discards only the buffered partial
+    publishes every full shard as soon as it is written (atomically, then on_shard(path, table) so the caller
+    records it in a manifest without reading the shard back). Numbering starts at start_shard (append mode);
+    stale shards >= start_shard in out_dir are removed on enter. An exception leaves the published shards in place and discards only the buffered partial
     shard: raw downloads are append-only, and losing a whole increment to a network error would throw away hours of
     transfer. Several writers (one per output directory) can be fed from one input stream.
     """
 
-    def __init__(self, out_dir: Path, shard_size: int, *, start_shard: int = 0, on_shard: Callable[[Path], None]) -> None:
+    def __init__(self, out_dir: Path, shard_size: int, *, start_shard: int = 0, on_shard: OnShard) -> None:
         if shard_size <= 0:
             raise ValueError(f"shard_size must be positive, got {shard_size}")
         if start_shard < 0:
@@ -81,15 +82,26 @@ class ShardWriter:
         if exc_type is not None:
             self._buffer = []
             return
-        if self._buffer:
-            self.write_shard(pa.Table.from_pylist(self._buffer))
-            self._buffer = []
+        self.flush()
 
     def add(self, row: dict[str, Any]) -> None:
         self._buffer.append(row)
         if len(self._buffer) >= self.shard_size:
-            self.write_shard(pa.Table.from_pylist(self._buffer))
-            self._buffer = []
+            self.flush()
+
+    def flush(self) -> None:
+        """
+        Publish the buffered rows now as a shard, if there are any (short when called before the buffer is
+        full: what leaving the with block does without an exception, or what a caller does that wants the rows
+        kept although an exception is propagating; the rows are valid and in order). The buffer is emptied
+        *before* the publish, so a callback that raises after recording the shard (the stop check) never leaves
+        the rows to be published twice.
+        """
+
+        if not self._buffer:
+            return
+        rows, self._buffer = self._buffer, []
+        self.write_shard(pa.Table.from_pylist(rows))
 
     def write_shard(self, table: pa.Table) -> None:
         """
@@ -98,7 +110,7 @@ class ShardWriter:
 
         path = publish_shard(table, self.out_dir / shard_name(self.start_shard + self.shards_written))
         self.shards_written += 1
-        self._on_shard(path)
+        self._on_shard(path, table)
 
     def _remove_stale_shards(self) -> None:
         for existing in list_parquet_files(self.out_dir):

@@ -15,6 +15,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import model.model as model_module
+from model.layers.norms import RMSNorm
 from model import build_model
 from model.config import RecurrentConfig, RoPESettings
 from model.test_config import TINY_ARCHITECTURE, tiny_config
@@ -145,10 +146,25 @@ def test_config_round_trip() -> None:
     assert hf_cfg.num_hidden_layers == cfg.effective_expected_depth
     assert hf_cfg.tie_word_embeddings is True
     back = hf_cfg.to_recurrent_config()
-    expected = cfg.to_dict()
-    expected["name"] = ""  # the architecture label is not an HF field
-    assert back.to_dict() == expected
-    assert back.head_size == cfg.head_size and back.mean_backprop_layers == cfg.mean_backprop_layers
+    assert back.to_dict() == cfg.to_dict()
+    assert back.head_size == cfg.head_size and back.max_backprop_layers == cfg.max_backprop_layers
+
+
+def test_hf_config_from_a_recurrent_config_dict_keeps_the_rope_base() -> None:
+    """
+    `RecurrentConfig.to_dict()` emits the nested `rope_settings`, not `rope_base`; it used to fall through to
+    `PretrainedConfig` as an opaque attribute while `rope_base` stayed at its default.
+    """
+
+    cfg = tiny_config(rope_settings=RoPESettings(rope_base=777))
+    hf_cfg = RecurrentGPTConfig(**cfg.to_dict())
+    assert hf_cfg.rope_base == 777
+    assert hf_cfg.to_recurrent_config().to_dict() == cfg.to_dict()
+
+
+def test_hf_config_rejects_a_rope_base_disagreeing_with_rope_settings() -> None:
+    with pytest.raises(ValueError, match="disagree"):
+        RecurrentGPTConfig(rope_base=1, rope_settings={"rope_base": 2})
 
 
 def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
@@ -223,18 +239,48 @@ def test_wrapper_loss_is_the_next_token_loss_shifted_internally() -> None:
 def test_wrapper_in_train_mode_uses_the_sampler_and_returns_loss_tuple() -> None:
     hf_model = tiny_hf_model().train(True)
     x = ids()
-    hf_model.model.step = 3
     torch.manual_seed(1)
     out = hf_model(x, labels=x, return_dict=False)
     assert isinstance(out, tuple) and len(out) == 2
     torch.manual_seed(1)
-    ref = hf_model.model(x, return_logits=True)  # num_steps=None -> sampled at step 3
+    ref = hf_model.model(x, return_logits=True)  # num_steps=None -> sampled at the step the wrapper wrote
     assert torch.equal(out[1], ref["logits"])
     assert torch.equal(out[0], hf_model.model.loss(out[1][:, :-1].contiguous(), x[:, 1:].contiguous()))
     # ... which is not the eval path
     torch.manual_seed(1)
     eval_ref = hf_model.model(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
     assert not torch.equal(out[1], eval_ref)
+
+
+def test_training_forwards_count_the_samplers_steps() -> None:
+    """
+    Nothing outside sets the inner model's `step` in a HF Trainer or PEFT run, so the wrapper counts its own
+    sampled training forwards; otherwise every forward would draw the depths of step 0 forever.
+    """
+
+    hf_model = tiny_hf_model().train(True)
+    x = ids()
+    assert hf_model._training_forwards == 0
+    torch.manual_seed(1)
+    first = hf_model(x).logits
+    assert hf_model.model.step == 0 and hf_model._training_forwards == 1
+    torch.manual_seed(1)
+    second = hf_model(x).logits  # the value written for the backward stays until the next forward
+    assert hf_model.model.step == 1 and hf_model._training_forwards == 2
+    assert not torch.equal(first, second), "the same seed and input, so only the drawn depths can differ"
+
+    # the forward at counter value s is the native forward at `step = s`
+    native = tiny_hf_model().train(True).model
+    for step, wrapped in enumerate((first, second)):
+        native.step = step
+        torch.manual_seed(1)
+        assert torch.equal(native(x, return_logits=True)["logits"], wrapped)
+
+    # an explicit `num_steps` (and eval mode) leaves the counter alone: only sampled forwards are sampler steps
+    hf_model(x, num_steps=[(2, 0), (2, 0)])
+    hf_model.train(False)
+    hf_model(x)
+    assert hf_model._training_forwards == 2
 
 
 def test_env_recurrence_steps_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,12 +305,11 @@ def test_env_recurrence_steps_is_ignored_in_training_mode(monkeypatch: pytest.Mo
 
     monkeypatch.setenv("EVAL_RECURRENCE_STEPS", "1,1")
     hf_model = tiny_hf_model().train(True)
-    hf_model.model.step = 3
     x = ids()
     torch.manual_seed(1)
     out = hf_model(x).logits
     torch.manual_seed(1)
-    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps=None -> sampled at step 3
+    sampled = hf_model.model(x, return_logits=True)["logits"]  # num_steps=None -> sampled at the wrapper's step
     assert torch.equal(out, sampled)
     torch.manual_seed(1)
     fixed = hf_model.model(x, return_logits=True, num_steps=[(1, 0), (1, 0)])["logits"]
@@ -318,6 +363,36 @@ def test_padded_vocabulary_columns_are_masked_and_never_generated() -> None:
     generated = generate(x[:, :4], max_new_tokens=6, do_sample=True)
     assert isinstance(generated, torch.Tensor) and (generated < 500).all()
     assert torch.isfinite(tiny_hf_model().train(False)(x).logits).all(), "an unpadded table is not masked"
+
+
+def test_a_label_in_the_padding_columns_is_ignored_instead_of_infinite() -> None:
+    """
+    A label in `[vocab_size, padded_vocab_size)` used to be a valid target for the loss while its logit column is
+    -inf here, which gave an infinite loss through the wrapper and a finite one natively. Both mask at
+    `vocab_size` now, so the label is ignored on either side.
+    """
+
+    cfg = tiny_config(vocab_size=500, padding_multiple=512)
+    torch.manual_seed(0)
+    hf_model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(cfg)).train(False)
+    x = ids() % 500
+    labels = x.clone()
+    labels[0, 5] = 505  # a padding row: inside the table, outside the vocabulary
+    ignored = x.clone()
+    ignored[0, 5] = -100
+
+    torch.manual_seed(1)  # the latent state is drawn per forward
+    loss = hf_model(x, labels=labels).loss
+    assert torch.isfinite(loss)
+    torch.manual_seed(1)
+    assert torch.equal(loss, hf_model(x, labels=ignored).loss)
+    inner = hf_model.model
+    torch.manual_seed(1)
+    logits = inner(x, return_logits=True, num_steps=[(2, 0), (2, 0)])["logits"]
+    assert logits is not None
+    shifted = logits[:, :-1, :].contiguous()
+    native = inner.loss(shifted, labels[:, 1:].contiguous())
+    assert torch.equal(native, inner.loss(shifted, ignored[:, 1:].contiguous()))
 
 
 @pytest.fixture
@@ -510,3 +585,15 @@ print("STANDALONE_OK")
     )
     assert result.returncode == 0, result.stderr[-3000:]
     assert "STANDALONE_OK" in result.stdout
+
+
+def test_hf_config_carries_bf16_residual_stream(tmp_path: Path) -> None:
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config(bf16_residual_stream="core"))
+    assert hf_cfg.bf16_residual_stream == "core"
+    hf_cfg.save_pretrained(tmp_path)
+    loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
+    assert loaded.to_recurrent_config().bf16_residual_stream == "core"
+    model = RecurrentGPTForCausalLM(loaded)
+    core_norm = cast(RMSNorm, model.model.get_submodule("transformer.core_blocks.0.0.norm_1"))
+    prelude_norm = cast(RMSNorm, model.model.get_submodule("transformer.prelude.0.norm_1"))
+    assert core_norm.autocast_output is True and prelude_norm.autocast_output is False
