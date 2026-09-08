@@ -39,9 +39,9 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -53,6 +53,7 @@ from data_preparation.lib.build.lock import build_lock
 from data_preparation.lib.build.planner import (
     DatasetReport,
     DownloadPlan,
+    UnreadableRawShardError,
     build_is_pending,
     every_source_satisfies_its_budget,
     plan_downloads,
@@ -79,6 +80,33 @@ DEFAULT_PASS_WORKERS = 4  # spawn processes per build for the optional cleaning 
 
 
 # --- prepare / status ------------------------------------------------------------------------------------------------
+
+
+def prepare_command(config_path: str | Path, dataset_dir: str | Path) -> str:
+    """
+    The command an error message tells the user to run: the same one training's auto-prepare prints
+    (`training/data/dataset_resolver.py::build_command`), with the `--yes` that answers the repair confirmation.
+    """
+
+    return f"python data_preparation/prepare.py prepare --dataset_config {config_path} --dataset_dir {dataset_dir} --yes"
+
+
+@contextmanager
+def unreadable_shard_remedy(config_path: str | Path, dataset_dir: str | Path) -> Iterator[None]:
+    """
+    Give an :class:`UnreadableRawShardError` from the planner the remedy this level knows: the repair step and the
+    command that runs it. The planner sees neither the config path nor the dataset directory, and a read-only
+    caller (status, a dry run) does not repair anything itself, so the message has to say what will.
+    """
+
+    try:
+        yield
+    except UnreadableRawShardError as error:
+        remedy = (
+            f"the repair step truncates raw/{error.source} to its readable prefix, or deletes the folder when no "
+            f"shard is readable; run\n  {prepare_command(config_path, dataset_dir)}\nthen status again"
+        )
+        raise error.with_remedy(remedy) from error
 
 
 def prepare(
@@ -122,7 +150,7 @@ def prepare(
     check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
     warn_about_overlaps(config)
 
-    with build_lock(layout.root) if not dry_run else nullcontext():
+    with build_lock(layout.root) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
         if "tokenizer" in active_steps and not dry_run:
             prepare_tokenizer(config, layout, hf_token=hf_token)
         repair_report = repair_broken_and_stale_folders(
@@ -160,9 +188,10 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     config = load_dataset_config(config_path)
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
-    repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name)
-    log_repair(repair_report)
-    return assess_dataset_state(config, layout, repair_report)
+    with unreadable_shard_remedy(config_path, dataset_dir):
+        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name)
+        log_repair(repair_report)
+        return assess_dataset_state(config, layout, repair_report)
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------

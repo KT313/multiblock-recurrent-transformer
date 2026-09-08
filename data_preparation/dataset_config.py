@@ -52,10 +52,10 @@ DEFAULT_BENCHMARKS = [
 DEFAULT_TOKENS_PER_ROW_ESTIMATE = 500  # `describe_tokens_per_row` until a source's first raw shard measures the real rate
 SAFETY_MARGIN = Fraction("1.2")  # rows downloaded = rows budget × this (covers filter / dedup losses and a tokens-per-row estimate that ran high); a Fraction so 50 × 1.2 is exactly 60
 
-SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load
+SHUFFLED_BUILD_MAX_ROWS = 1_000_000  # a shuffled source is built all-at-once in memory; `rows_needed` above this fails at config load, the raw rows at the build
 # derivation, keep as a comment: processed rows are TEXT bounded by dataset_max_sequence_length tokens at download
 # (~8-10 KB/row worst case), so 1M rows is a worst case of ~10 GB held once; typical instruct rows are far smaller.
-MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, plus its LSH index; the same check, a lower limit
+MINHASH_BUILD_MAX_ROWS = 250_000  # a minhash source is built all-at-once too, plus its LSH index; the same two checks, a lower limit
 # derivation: the LSH index holds every kept row at roughly 3-5 KB (num_perm 256, `lib/stages/fuzzy_dedup.py`) next
 # to the texts above, so 250k rows is ~1 GB of index plus a worst case of ~2.5 GB of text held once.
 
@@ -516,22 +516,39 @@ class DatasetConfig:
         shuffled source whose planned row requirement (:meth:`rows_needed` at the config's tokens-per-row estimate) exceeds
         `SHUFFLED_BUILD_MAX_ROWS` is refused here; both `prepare.py` and training's auto-prepare load the config
         before any work. A pretrain source under `dedup.mode: minhash` takes the same all-at-once path and holds
-        an LSH index of every kept row on top, so it is refused above the lower `MINHASH_BUILD_MAX_ROWS`.
+        an LSH index of every kept row on top, so it is refused above the lower `MINHASH_BUILD_MAX_ROWS`. The build
+        checks the same limits again on the raw rows it really has (:meth:`check_all_at_once_rows`).
         """
 
-        for name, source in self.sources.items():
-            needed = self.rows_needed(name)
-            if self.shuffle_of(name) and needed > SHUFFLED_BUILD_MAX_ROWS:
-                raise ValueError(
-                    f"{name}: shuffle=true builds all-at-once in memory; {needed:,} rows exceed the limit of "
-                    f"{SHUFFLED_BUILD_MAX_ROWS:,}. Split the source or turn shuffle off. "
-                    "(A read-time shuffle that would lift this limit is not implemented.)"
-                )
-            if source.kind == "pretrain" and self.source_processing(name).dedup.mode == "minhash" and needed > MINHASH_BUILD_MAX_ROWS:
-                raise ValueError(
-                    f"{name}: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; "
-                    f"{needed:,} rows exceed the limit of {MINHASH_BUILD_MAX_ROWS:,}. Use dedup.mode=exact or a smaller source."
-                )
+        for name in self.sources:
+            self.check_all_at_once_rows(name, self.rows_needed(name), at_build=False)
+
+    def check_all_at_once_rows(self, name: str, rows: int, *, at_build: bool) -> None:
+        """
+        Refuse an all-at-once build of `rows` rows: they are all held in memory at once, plus an LSH index of the
+        kept ones under `dedup.mode: minhash`.
+
+        The same two limits are checked twice, on the two counts that exist. At config load (`at_build=False`) the
+        count is the planned requirement at the config's tokens-per-row estimate, and the remedy is to plan less.
+        At the start of the build (`at_build=True`) it is the raw rows on disk, which the estimate may have
+        undershot by a lot (the planner re-plans at the measured rate, and a download may overshoot); splitting the
+        source no longer helps then, so only the remedy of the message differs.
+        """
+
+        already_downloaded = f"The raw folder already holds these rows, so lower the token budget and delete raw/{name},"
+        if self.shuffle_of(name) and rows > SHUFFLED_BUILD_MAX_ROWS:
+            remedy = f"{already_downloaded} or turn shuffle off." if at_build else "Split the source or turn shuffle off."
+            raise ValueError(
+                f"{name}: shuffle=true builds all-at-once in memory; {rows:,} rows exceed the limit of "
+                f"{SHUFFLED_BUILD_MAX_ROWS:,}. {remedy} "
+                "(A read-time shuffle that would lift this limit is not implemented.)"
+            )
+        if self.sources[name].kind == "pretrain" and self.source_processing(name).dedup.mode == "minhash" and rows > MINHASH_BUILD_MAX_ROWS:
+            remedy = f"{already_downloaded} or use dedup.mode=exact." if at_build else "Use dedup.mode=exact or a smaller source."
+            raise ValueError(
+                f"{name}: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; "
+                f"{rows:,} rows exceed the limit of {MINHASH_BUILD_MAX_ROWS:,}. {remedy}"
+            )
 
     # --- source usage ----------------------------------------------------------------------------------------------
 

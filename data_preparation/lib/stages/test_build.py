@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from data_preparation import dataset_config as dc
 from data_preparation.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
@@ -31,6 +32,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source
+from data_preparation.lib.stages import exact_dedup
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
@@ -51,6 +53,18 @@ GOOD = (
 
 def _words(n: int, start: int = 0) -> str:
     return " ".join(f"tok_{(start + i) % 256}" for i in range(n))
+
+
+FILTER_STAT_KEYS = ("rows_on_disk", "expected_false_positive_rate", "items_in_filter", "measured_false_positive_rate")
+
+
+def _pop_filter_stats(dedup_stats: dict[str, Any]) -> dict[str, Any]:
+    """
+    Take the dedup filter's load out of a copy of `stats["dedup"]` (how full the Bloom filter ran, not what the
+    pass removed), so the pass counters can be compared by equality.
+    """
+
+    return {key: dedup_stats.pop(key) for key in FILTER_STAT_KEYS}
 
 
 @pytest.fixture
@@ -143,7 +157,11 @@ def test_build_exact_dedup_tokens_and_idempotence(
     assert {r["source"] for r in rows} == {"s"} and [set(r) for r in rows] == [{"text", "source", "tokens", "hash"}] * 3
     assert [r["hash"] for r in rows] == [text_hash64(r["text"]) for r in rows]
     assert [(s.rows, s.tokens) for s in m.shards] == [(2, 12), (1, 64)] and m.tokens() == 76
-    assert m.stats["dedup"] == {"mode": "exact", "duplicates_removed": 2}
+    dedup_stats = dict(m.stats["dedup"])
+    load = _pop_filter_stats(dedup_stats)
+    assert dedup_stats == {"mode": "exact", "duplicates_removed": 2}
+    assert load["rows_on_disk"] == 5 and load["items_in_filter"] == 3, "the raw rows, and the hashes really inserted"
+    assert 0 < load["expected_false_positive_rate"] < 1e-9 and 0 < load["measured_false_positive_rate"] < 1e-9
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
     before = mtimes(processed)
     assert build_source(cfg, "s", layout, shard_size=2) == m and mtimes(processed) == before
@@ -439,6 +457,7 @@ def test_build_minhash_removes_near_duplicates_all_at_once(
     assert not processed.with_name("s.tmp").exists()
     dedup_stats = dict(m.stats["dedup"])
     assert dedup_stats.pop("seconds") >= 0
+    assert _pop_filter_stats(dedup_stats)["rows_on_disk"] == 8
     assert dedup_stats == {
         "mode": "minhash", "duplicates_removed": 2, "threshold": 0.8, "num_perm": 64, "near_duplicates_removed": 1,
         "near_duplicate_rate": 0.25, "too_short_passed": 2,  # rate over the rows that went through the LSH
@@ -596,7 +615,9 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     out = read_rows(processed)
     assert [set(r) for r in out] == [{"instruction", "input", "output", "tokens", "hash"}] * 20
     assert m.columns == ["instruction", "input", "output", "tokens", "hash"] and m.shuffled is True and m.shuffle_seed == 3
-    assert m.stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
+    stats = {**m.stats, "dedup": dict(m.stats["dedup"])}
+    assert _pop_filter_stats(stats["dedup"])["items_in_filter"] == 20, "one hash per surviving row"
+    assert stats == {"input_rows": 24, "dedup": {"mode": "exact", "duplicates_removed": 2}, "inverted": 0, "removed_empty": 2, "removed_too_long": 0}
     assert m.input_shards == [["data-00000.parquet", 8], ["data-00001.parquet", 8], ["data-00002.parquet", 8]]
     assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 8
     assert all(r["hash"] == text_hash64(instruct_text(r)) for r in out)
@@ -793,3 +814,50 @@ def test_an_all_at_once_build_ignores_rows_target(
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=4, source={"shuffle": True, "seed": 5})
     m = build_source(cfg, "s", layout, shard_size=5, rows_target=2)
     assert m.rows() == 12 and m.input_shards == [[f"data-{i:05d}.parquet", 4] for i in range(3)]
+
+
+def test_a_raw_folder_over_the_all_at_once_cap_is_refused_before_anything_is_allocated(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """
+    The config load checks the *planned* rows at its tokens-per-row estimate; the raw folder can hold many more
+    (the planner re-plans at the measured rate, a download overshoots). The build checks what is really there,
+    before it reads a shard or allocates the Bloom filter, and its message differs only in the remedy.
+    """
+
+    texts = [_words(6, i) for i in range(5)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2, source={"shuffle": True})
+
+    def no_filter(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the row cap must be checked before the dedup filter is allocated")
+
+    monkeypatch.setattr(dc, "SHUFFLED_BUILD_MAX_ROWS", 3)
+    monkeypatch.setattr(stages_build, "SeenDocuments", no_filter)
+    with pytest.raises(ValueError) as refused:
+        build_source(cfg, "s", layout)
+    first_sentence = "s: shuffle=true builds all-at-once in memory; 5 rows exceed the limit of 3. "
+    assert str(refused.value).startswith(first_sentence)
+    assert "The raw folder already holds these rows, so lower the token budget and delete raw/s, or turn shuffle off." in str(refused.value)
+    assert not layout.processed_dir("s").exists() and not layout.processed_dir("s").with_name("s.tmp").exists()
+    with pytest.raises(ValueError) as at_load:
+        cfg.check_all_at_once_rows("s", 5, at_build=False)
+    assert str(at_load.value).startswith(first_sentence), "the config-load refusal says the same thing"
+    assert "Split the source or turn shuffle off." in str(at_load.value)
+
+
+def test_a_build_whose_rows_saturate_the_dedup_filter_is_refused(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """
+    Past twice the filter's nominal capacity a build would drop unique documents as duplicates, so it refuses and
+    names the budget that fixes it. The capacity is shrunk here instead of downloading 600 k rows.
+    """
+
+    texts = [_words(6, i) for i in range(5)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2)
+    monkeypatch.setattr(exact_dedup, "expected_items", lambda *args, **kwargs: 2)
+    with pytest.raises(ValueError, match="past the 2x this build accepts"):
+        build_source(cfg, "s", layout)
+    assert not layout.processed_dir("s").exists()

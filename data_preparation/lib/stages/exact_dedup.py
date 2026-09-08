@@ -11,6 +11,12 @@ rbloom's hash_func must return a Python int in [-2^127, 2^127 - 1] that is well 
 (the filter seeds a 128-bit LCG with it). Python's hash(int) reduces modulo 2^61 - 1 and would collide
 distinct 64-bit keys, hence :func:`mix128`. rbloom sizes the filter as m = -n ln p / ln(2)^2 bits;
 :func:`expected_items` inverts that so the memory budget, not a row estimate, decides the size.
+
+How full the filter runs is the build's business, not the config's: the budget is fixed, the rows are whatever the
+source turned out to hold. :meth:`SeenDocuments.describe` logs the expected rate for the rows on disk and
+:meth:`SeenDocuments.check` refuses a build that would run far past the nominal capacity, where false positives
+stop being negligible; both numbers, and the measured load at save time, go into the processed manifest's
+`stats["dedup"]` (`lib/stages/build.py`).
 """
 
 from __future__ import annotations
@@ -24,12 +30,18 @@ from typing import cast
 import pyarrow.parquet as pq
 from rbloom import Bloom
 
+from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.row_pipeline import normalize_text
+
+log = get_logger(__name__)
 
 TARGET_FALSE_POSITIVE_RATE = 0.001
 """The false-positive rate the filter is sized for when it holds exactly :func:`expected_items` documents."""
 
 BITS_PER_MB = 1 << 23
+
+BLOOM_MAX_LOAD = 2.0
+"""Insertions per nominal capacity a build still runs on; above it the filter drops too many unique documents."""
 
 _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15  # splitmix64's golden-ratio increment
@@ -92,6 +104,22 @@ def expected_items(memory_mb: int, false_positive_rate: float = TARGET_FALSE_POS
     return int(bits_for_budget(memory_mb) * math.log(2) ** 2 / -math.log(false_positive_rate))
 
 
+def memory_mb_for(rows: int, false_positive_rate: float = TARGET_FALSE_POSITIVE_RATE) -> int:
+    """
+    The smallest bloom_memory_mb whose nominal capacity covers rows (what an over-full filter is told to ask for).
+    """
+
+    return max(1, math.ceil(rows / expected_items(1, false_positive_rate)))
+
+
+def _compact(rows: int) -> str:
+    """
+    Row counts in log lines: millions above a million (597 M), grouped digits below.
+    """
+
+    return f"{rows / 1_000_000:.0f} M" if rows >= 1_000_000 else f"{rows:,}"
+
+
 class SeenDocuments:
     """
     The exact-dedup filter of one build: add_if_new per candidate row, add_all to refill from disk.
@@ -102,6 +130,40 @@ class SeenDocuments:
         self.expected_items = expected_items(memory_mb)
         # rbloom's stub leaves hash_func unannotated (hash_func=__builtins__.hash); the contract is int -> int
         self._bloom = Bloom(self.expected_items, TARGET_FALSE_POSITIVE_RATE, hash_func=mix128)
+
+    @property
+    def nominal_capacity(self) -> int:
+        """
+        Insertions the filter is sized for: at that many it hits :data:`TARGET_FALSE_POSITIVE_RATE`.
+        """
+
+        return self.expected_items
+
+    @property
+    def items_in_filter(self) -> float:
+        """
+        rbloom's estimate of the insertions so far, from the set bits (a refill from disk counts, duplicates do not).
+        """
+
+        return self._bloom.approx_items
+
+    def expected_false_positive_rate(self, items: float) -> float:
+        """
+        The classic Bloom estimate (1 - exp(-k n / m)) ** k for n = items: the share of unique documents this
+        filter drops as duplicates once that many were inserted.
+        """
+
+        return (1.0 - math.exp(-self._probes * items / self._bloom.size_in_bits)) ** self._probes
+
+    @property
+    def _probes(self) -> int:
+        """
+        The k of the filter, hash functions per key. rbloom derives it from the arguments of the constructor as
+        floor(m / n x ln 2) (it truncates, where the classic optimum rounds: k = 9, not 10, at p = 0.001) and does
+        not expose it, so it is re-derived here from the same two numbers.
+        """
+
+        return max(1, int(self._bloom.size_in_bits / self.expected_items * math.log(2)))
 
     def add_if_new(self, hash64: int) -> bool:
         """
@@ -122,11 +184,42 @@ class SeenDocuments:
 
     def describe(self, rows_on_disk: int) -> str:
         """
-        The one-line log message printed once per source: dedup filter: 1024 MB, 2,600,000 rows on disk (the raw
-        rows going through it, not a capacity of the filter).
+        The one-line log message printed once per source, e.g. `dedup filter: 1024 MB, 2,600,000 rows on disk
+        (upper bound of insertions) -> FPR ≈ 0.00 % (0 % of the nominal 597 M rows)`. rows_on_disk is the raw rows
+        of the source, the honest upper bound of what this build inserts, not a capacity of the filter.
         """
 
-        return f"dedup filter: {self.memory_mb} MB, {rows_on_disk:,} rows on disk"
+        rate = self.expected_false_positive_rate(rows_on_disk)
+        load = rows_on_disk / self.nominal_capacity
+        return (
+            f"dedup filter: {self.memory_mb} MB, {rows_on_disk:,} rows on disk (upper bound of insertions) -> "
+            f"FPR ≈ {rate * 100:.2f} % ({load * 100:.0f} % of the nominal {_compact(self.nominal_capacity)} rows)"
+        )
+
+    def check(self, rows_on_disk: int) -> None:
+        """
+        Warn about a filter that runs past its nominal capacity, refuse one past :data:`BLOOM_MAX_LOAD` times it:
+        beyond that the false positives stop being negligible and the build would silently drop unique documents.
+        The budget is a resource knob (unhashed), so raising it costs nothing but memory and invalidates nothing
+        on disk.
+        """
+
+        load = rows_on_disk / self.nominal_capacity
+        if load <= 1.0:
+            return
+        rate = self.expected_false_positive_rate(rows_on_disk)
+        remedy = (
+            f"raise dedup.bloom_memory_mb to {memory_mb_for(rows_on_disk)} (it is unhashed: nothing on disk is "
+            "invalidated), or give the source fewer rows"
+        )
+        overload = (
+            f"{rows_on_disk:,} rows on disk are {load:.1f}x the nominal capacity of the {self.memory_mb} MB dedup "
+            f"filter ({_compact(self.nominal_capacity)} rows), so about {rate * 100:.1f} % of the unique documents "
+            "are dropped as duplicates"
+        )
+        if load > BLOOM_MAX_LOAD:
+            raise ValueError(f"{overload}; that is past the {BLOOM_MAX_LOAD:g}x this build accepts: {remedy}")
+        log.warning("%s; %s", overload, remedy)
 
 
 def stored_hashes(parquet_files: Iterable[Path]) -> Iterator[int]:

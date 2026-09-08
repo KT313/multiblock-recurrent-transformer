@@ -31,7 +31,7 @@ from data_preparation.dataset_config import (
 )
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
-from data_preparation.lib.build.planner import DatasetReport
+from data_preparation.lib.build.planner import DatasetReport, UnreadableRawShardError
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
 from training.checkpoint import CheckpointMetadata
 from training.data.dataset_resolver import (
@@ -607,6 +607,25 @@ def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=True))
     assert isinstance(resolved, ResolvedDataset) and not (folder / "data-00001.parquet").exists()
+
+
+def test_an_unreadable_raw_shard_fails_the_run_with_the_repair_command(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    The run reads the dataset through the same planner, which measures the tokens per row from the raw shards: a
+    truncated shard must fail the run with the command that repairs it, not with a bare Arrow error. Auto-prepare
+    cannot fix it on its own (dropping raw rows needs a confirmation), so the message is the same either way.
+    """
+
+    root = tmp_path / "ds"
+    shutil.copytree(tiny_dataset_dir, root)
+    shard = DatasetLayout(root).raw_dir("synthetic_pretrain") / "data-00000.parquet"
+    shard.write_bytes(b"corrupt")
+    with pytest.raises(UnreadableRawShardError) as error:
+        resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
+    message = str(error.value)
+    assert f"synthetic_pretrain: raw shard {shard} cannot be read" in message
+    assert "the repair step truncates raw/synthetic_pretrain to its readable prefix" in message
+    assert build_command(str(TINY_DATASET_YAML), str(root)) + " --yes" in message, "the command auto-prepare prints too"
 
 
 # --- resolve_dataset -------------------------------------------------------------------------------------------------

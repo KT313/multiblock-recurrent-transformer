@@ -281,10 +281,21 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
 `normalize: false` for verbatim) and keeps the first occurrence. The "seen" set is a Bloom filter (`rbloom`) under a
 fixed memory budget, `dedup.bloom_memory_mb` (default 1024 MB, per source): fixed size, O(1) per document, and its
 only error is a **false positive (a unique document dropped as a duplicate), never a kept duplicate**. Sized for a
-0.1 % false-positive rate at its nominal capacity (~600 M documents at 1 GiB), the rate is negligible below that
-(≈ 3e-7 at 200 M rows, unmeasurably small at the crow budgets; the build logs the expected rate once per source:
-`dedup filter: 1024 MB, ~2.6 M rows -> FPR ≈ ...`). The filter is not persisted: every build refills it from the
-`hash` column of the processed shards
+0.1 % false-positive rate at its nominal capacity (597 M documents at 1 GiB, nine probes per key), the rate is
+negligible below that (≈ 3e-7 at 200 M rows, unmeasurably small at the crow budgets). The build logs the expected
+rate once per source, counting the source's raw rows as the upper bound of what it inserts:
+
+```
+dedup filter: 1024 MB, 2,600,000 rows on disk (upper bound of insertions) -> FPR ≈ 0.00 % (0 % of the nominal 597 M rows)
+```
+
+Past the nominal capacity the build warns and names the `bloom_memory_mb` that brings it back under (raising it
+invalidates nothing, see below); past **twice** it, where the rate is already ≈ 5 %, the build refuses to run
+rather than drop that many unique documents. The processed manifest keeps both numbers under `stats.dedup`:
+`rows_on_disk` and `expected_false_positive_rate` from the start of the build, `items_in_filter` and
+`measured_false_positive_rate` (rbloom's estimate from the set bits) as of the last shard it wrote.
+
+The filter is not persisted: every build refills it from the `hash` column of the processed shards
 already on disk, which is exactly the set a full pass would have accumulated, so an incremental build keeps the
 same rows as a full one. Changing `bloom_memory_mb` does not invalidate processed folders (it is a resource knob).
 

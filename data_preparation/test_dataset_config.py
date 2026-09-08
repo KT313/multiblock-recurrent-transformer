@@ -491,6 +491,39 @@ def test_the_build_cap_spares_small_shuffled_and_huge_unshuffled_sources(tmp_pat
     assert _build(huge_unshuffled).rows_needed("pre") == 1_578_948
 
 
+def test_check_all_at_once_rows_says_what_helps_at_the_build() -> None:
+    """
+    The build re-checks the two limits on the rows really on disk (`lib/stages/build.py`), which the load-time
+    estimate can undershoot. Same limits, same first sentence; splitting the source no longer helps once the rows
+    are downloaded, so only the remedy differs.
+    """
+
+    d = _minimal()
+    d["sources"]["pre"]["shuffle"] = True
+    cfg = _build(d)  # under the caps at load: the planned requirement is 21 rows
+    rows = dc.SHUFFLED_BUILD_MAX_ROWS + 1
+    cfg.check_all_at_once_rows("pre", dc.SHUFFLED_BUILD_MAX_ROWS, at_build=True)  # exactly at the limit still builds
+    messages = []
+    for at_build in (False, True):
+        with pytest.raises(ValueError) as error:
+            cfg.check_all_at_once_rows("pre", rows, at_build=at_build)
+        messages.append(str(error.value))
+    first_sentence = "pre: shuffle=true builds all-at-once in memory; 1,000,001 rows exceed the limit of 1,000,000. "
+    assert all(message.startswith(first_sentence) for message in messages)
+    assert messages[0].endswith("Split the source or turn shuffle off. (A read-time shuffle that would lift this limit is not implemented.)")
+    assert messages[1].endswith(
+        "The raw folder already holds these rows, so lower the token budget and delete raw/pre, or turn shuffle off. "
+        "(A read-time shuffle that would lift this limit is not implemented.)"
+    )
+    minhash = _build({**d, "sources": {**d["sources"], "pre": {**d["sources"]["pre"], "processing": {"dedup": {"mode": "minhash"}}, "shuffle": False}}})
+    with pytest.raises(ValueError, match=re.escape(
+        "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 250,001 rows "
+        "exceed the limit of 250,000. The raw folder already holds these rows, so lower the token budget and "
+        "delete raw/pre, or use dedup.mode=exact."
+    )):
+        minhash.check_all_at_once_rows("pre", dc.MINHASH_BUILD_MAX_ROWS + 1, at_build=True)
+
+
 def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> None:
     instruct = _minimal()
     instruct["stages"][1]["tokens"] = _over_the_cap_tokens()  # `ins` never sets shuffle; instruct defaults to True
