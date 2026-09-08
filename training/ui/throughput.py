@@ -9,7 +9,7 @@ import time
 
 from training.ui.common import Clock
 
-RATE_SMOOTHING = 0.1  # weight of the newest seconds/step sample in the exponential moving average behind the ETA
+RATE_SMOOTHING = 0.04  # weight of the newest seconds/step sample in the EMA behind the ETA: a memory of about 25 steps
 
 
 class Throughput:

@@ -25,11 +25,11 @@ def test_throughput_eta_arithmetic(clock: FakeClock) -> None:
     assert throughput.remaining(20) == pytest.approx(160.0)
     assert throughput.elapsed == pytest.approx(30.0)
     clock.advance(10)
-    throughput.record(30)  # 1 s/step sample: from here on the EMA, 0.9 * 2 + 0.1 * 1
-    assert throughput.seconds_per_step == pytest.approx(1.9)
+    throughput.record(30)  # 1 s/step sample: from here on the EMA, 0.96 * 2 + 0.04 * 1
+    assert throughput.seconds_per_step == pytest.approx(1.96)
     throughput.record(30)  # no progress: ignored
     throughput.record(5)  # going backwards: ignored
-    assert throughput.seconds_per_step == pytest.approx(1.9)
+    assert throughput.seconds_per_step == pytest.approx(1.96)
 
 
 def test_throughput_forgets_the_first_interval(clock: FakeClock) -> None:
