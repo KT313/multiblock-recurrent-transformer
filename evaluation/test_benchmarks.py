@@ -4,6 +4,7 @@ Tests of the lm-eval integration with a stubbed `lm_eval`; scoring a task needs 
 the encoding of a context is checked through the real `HFLM` where the extra is installed.
 """
 
+import importlib
 import json
 import os
 import re
@@ -168,7 +169,8 @@ def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_t
     pytest.importorskip("lm_eval", reason="needs the eval extra (uv sync --extra eval)")
     # Not an importorskip: with lm_eval installed, an `lm_eval.models.huggingface` that will not import (a missing
     # accelerate) is the state this test is here to catch, because a benchmark run dies on the same import.
-    import lm_eval.models.huggingface as huggingface
+    # `Any`: lm_eval ships no stubs for the HFLM constructor, and the assertions below are about its behaviour
+    huggingface: Any = importlib.import_module("lm_eval.models.huggingface")
 
     tokenizer = Tokenizer(tiny_tokenizer_dir)
     language_model = huggingface.HFLM(

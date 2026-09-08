@@ -132,8 +132,8 @@ class BatchStream:
         self.stage_manager = stage_manager
         self.progress = progress
         self.consumed_rows: dict[str, int] = {}  # source name -> rows read so far (dropped rows included)
-        self._loaded: dict[str, int] = {source: 0 for source in loaders.train_sources}  # slots put into the pool
-        self._target: dict[str, float] = {source: 0.0 for source in loaders.train_sources}  # slots it should have
+        self._loaded: dict[str, int] = dict.fromkeys(loaders.train_sources, 0)  # slots put into the pool
+        self._target: dict[str, float] = dict.fromkeys(loaders.train_sources, 0.0)  # slots it should have
         self._buffers: dict[str, deque[Sample]] = {source: deque() for source in loaders.train_sources}
         self._pool = PackPool(settings.tokens_per_micro_batch)
         self._micro_batches: Iterator[PackedBatch] = self._packs()
