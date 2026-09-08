@@ -59,6 +59,8 @@ make download config/datasets/crow_300m_final.yaml
 make status config/datasets/crow_300m_final.yaml
 ```
 
+![TUI Data Preparation](docs/screenshots/tui_data_preparation.png)
+
 ### Training
 
 ```bash
@@ -72,6 +74,8 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 # make shortcut for the same
 make training config/crow_300m_final.yaml
 ```
+
+![TUI Training](docs/screenshots/tui_training.png)
 
 Training packs documents end to end: one row of `tokens_per_micro_batch` tokens per micro-batch,
 `micro_batches_per_step` of them per optimizer step, attention masked per document.
