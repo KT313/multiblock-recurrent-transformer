@@ -8,6 +8,7 @@ the stage-interpolated weights, so a reader continues across stage boundaries an
 """
 
 import logging
+import resource
 import signal
 from dataclasses import dataclass, field
 from functools import partial
@@ -31,8 +32,15 @@ from training.settings import Settings
 # (`TRAIN_LOADER_NUM_WORKERS`) walks its range in order and the stream concatenates its batches, `WorkerBatch.rows_read`
 # counts the rows of any batch size and the samples pulled ahead travel in the checkpoint (`BatchStream.state_dict`).
 # Fixed here, not settings: a `Settings` field is compared on resume, and this one may differ freely.
+# File descriptors: torch shares a worker's tensors with the training process through one descriptor per tensor
+# (its `file_descriptor` strategy), held until the batch has been received, so the batches in flight cost up to
+# TRAIN_LOADER_BATCH_ROWS x TRAIN_LOADER_PREFETCH_FACTOR x 2 tensors per source of the `ulimit -n` budget. A worker
+# that runs out drops the batch with a traceback on stderr and the loader skips it; `build_run_dataloaders` lifts the
+# soft limit to the hard one (`raise_open_file_limit`) and `RunDataloaders` refuses an epoch that delivered fewer
+# rows than the range holds, so the loss is an error and never silent.
 TRAIN_LOADER_BATCH_ROWS = 64
 TRAIN_LOADER_PREFETCH_FACTOR = 4
+UNLIMITED_OPEN_FILES = 1 << 20  # the soft open-file limit `raise_open_file_limit` sets under an unlimited hard limit
 
 log = logging.getLogger(__name__)
 
@@ -163,22 +171,26 @@ class EpochCounters:
     and the dropped rows between them, plus whether the epoch began at the start of the range.
 
     full_epoch is False only for the first epoch after a resume, which starts at an offset and may legitimately
-    end without a sample; `next_train_batch` refuses a FULL epoch without one. warned is the run-wide flag of the
-    single drop warning a source gets and is the one field an epoch reset leaves alone.
+    end without a sample; `next_train_batch` refuses a FULL epoch without one. expected_rows is what the dataset
+    says the epoch holds for this rank (`ParquetTextDataset.epoch_rows`; None without a dataset, for a test fake),
+    and an epoch that ends with fewer rows read lost worker batches. warned is the run-wide flag of the single drop
+    warning a source gets and is the one field an epoch reset leaves alone.
     """
 
     full_epoch: bool = True
+    expected_rows: int | None = None
     rows_read: int = 0
     samples: int = 0
     dropped_rows: int = 0
     warned: bool = False
 
-    def start_epoch(self, full_epoch: bool) -> None:
+    def start_epoch(self, full_epoch: bool, expected_rows: int | None) -> None:
         """
         Begin counting a new epoch; `warned` survives, so a source warns about dropped rows once per run.
         """
 
         self.full_epoch = full_epoch
+        self.expected_rows = expected_rows
         self.rows_read = self.samples = self.dropped_rows = 0
 
 
@@ -236,13 +248,16 @@ class RunDataloaders:
 
         offset = self.pending_offsets.pop(source, 0)
         dataset = self.datasets.get(source)
+        loader = self.train_loaders[source]
+        expected_rows: int | None = None
         if dataset is None:
             offset = 0  # no dataset to skip on (a test fake): the iterator reads its loader from the start
         else:
             dataset.set_resume_offset(offset)
             offset = dataset.resume_offset  # taken modulo the range, so a whole epoch of rows starts at 0 again
-        self.epochs[source].start_epoch(full_epoch=offset == 0)
-        iterator = self._train_iterators[source] = iter(self.train_loaders[source])
+            expected_rows = dataset.epoch_rows(getattr(loader, "num_workers", 0))
+        self.epochs[source].start_epoch(full_epoch=offset == 0, expected_rows=expected_rows)
+        iterator = self._train_iterators[source] = iter(loader)
         return iterator
 
     def _count_batch(self, source: str, batch: WorkerBatch) -> None:
@@ -268,13 +283,26 @@ class RunDataloaders:
 
     def _end_of_epoch(self, source: str) -> None:
         """
-        Close the finished epoch of source: refuse a full epoch that yielded no sample, log what it read otherwise.
+        Close the finished epoch of source: refuse an epoch that delivered fewer rows than the dataset holds for
+        this rank (the worker lost batches) or a full epoch that yielded no sample, log what it read otherwise.
 
+        A lost batch would otherwise pass silently: torch's loader skips a batch whose worker failed to hand it over
+        once the worker reports the end of the range, and the rows are neither trained on nor counted for a resume.
         A restart re-reads the same rows, so a source whose every row the collate drops would restart forever with
-        a frozen step counter. `train()` calls `close()` on every way out, so the raise shuts the worker down.
+        a frozen step counter. `train()` calls `close()` on every way out, so either raise shuts the worker down.
         """
 
         counters = self.epochs[source]
+        if counters.expected_rows is not None and counters.rows_read != counters.expected_rows:
+            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            raise RuntimeError(
+                f"train source {source!r}: its loader delivered {counters.rows_read} of the {counters.expected_rows} "
+                "rows of this epoch, so the worker lost batches on the way (its tracebacks are above). The usual "
+                "cause is 'Too many open files': every tensor a worker hands over holds one file descriptor until "
+                f"the training process has received it, up to {TRAIN_LOADER_BATCH_ROWS * TRAIN_LOADER_PREFETCH_FACTOR * 2} "
+                f"per source; this process may open {soft_limit} (hard limit {hard_limit}). Raise the hard limit "
+                "(`ulimit -Hn`, or LimitNOFILE in the systemd unit), or lower TRAIN_LOADER_PREFETCH_FACTOR"
+            )
         if counters.full_epoch and counters.samples == 0:
             raise RuntimeError(
                 f"train source {source!r} yielded no usable sample in a full epoch over its {counters.rows_read} "
@@ -332,6 +360,23 @@ class RunDataloaders:
             self._train_iterators[source] = None
 
 
+def raise_open_file_limit() -> int:
+    """
+    Lift this process's soft limit on open file descriptors to its hard limit and return the limit in force.
+
+    The default soft limit of 1024 is below what the train loaders' batches in flight can hold (see the note at
+    `TRAIN_LOADER_BATCH_ROWS`); the hard limit is the administrator's ceiling and needs no privilege to reach (an
+    unlimited hard limit gets `UNLIMITED_OPEN_FILES`). Worker processes inherit the raised limit.
+    """
+
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = max(soft_limit, UNLIMITED_OPEN_FILES) if hard_limit == resource.RLIM_INFINITY else hard_limit
+    if soft_limit != target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard_limit))
+        log.debug("open file limit raised from %d to %d for the train loader workers", soft_limit, target)
+    return target
+
+
 def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend: Backend) -> RunDataloaders:
     """
     The loaders of one run: one train loader per train source and one validation loader per stage (its entries
@@ -348,6 +393,8 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
     evaluation) never touches the global torch RNG and a resume replays the same latent noise.
     """
 
+    if TRAIN_LOADER_NUM_WORKERS > 0:
+        raise_open_file_limit()
     tokenizer = Tokenizer(dataset.tokenizer_dir)
     shard = (backend.rank, backend.world_size)
     generator = torch.Generator().manual_seed(settings.seed + backend.rank)  # the worker RNG is unused (no shuffle)

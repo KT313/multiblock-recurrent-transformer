@@ -87,6 +87,23 @@ class ParquetTextDataset(IterableDataset[Row]):
             raise ValueError(f"{self.prefix}: resume offset must be non-negative, got {rows}")
         self.resume_offset = rows % self.num_rows if self.num_rows else 0
 
+    def epoch_rows(self, num_workers: int) -> int:
+        """
+        Rows this rank's loader yields in its next epoch: the rows of the range from `resume_offset` on whose shard
+        (`_shard`, with `num_workers` workers, 0 or 1 for an in-process loader) belongs to this rank. Arithmetic,
+        never a pass over the rows; `RunDataloaders` compares an epoch's delivered rows against it.
+        """
+
+        workers = max(num_workers, 1)
+        shards = self.world_size * workers
+        first, last = self.rank * workers, (self.rank + 1) * workers  # this rank's shard ids: [first, last)
+
+        def before(row: int) -> int:  # rows of [0, row) whose shard id lies in [first, last)
+            full, rest = divmod(row, shards)
+            return full * workers + max(0, min(rest, last) - first)
+
+        return before(self.num_rows) - before(self.resume_offset)
+
     def _shard(self) -> tuple[int, int]:
         """
         (shard_id, num_shards) for the calling process/worker; the single place sharding is decided.

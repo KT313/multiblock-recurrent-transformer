@@ -125,6 +125,30 @@ def test_sharding_grid_world_and_workers(
     assert len(seen) == len(expected), "shards overlap"
 
 
+@pytest.mark.parametrize(("world", "num_workers", "offset"), [(1, 0, 0), (1, 1, 5), (2, 2, 0), (3, 2, 7), (2, 3, 22), (1, 3, 23)])
+def test_epoch_rows_counts_the_ranks_share_from_the_offset(
+    small_dir: Path, monkeypatch: pytest.MonkeyPatch, world: int, num_workers: int, offset: int
+) -> None:
+    """
+    `epoch_rows` is the arithmetic twin of iterating: for every rank it equals the rows its workers yield together
+    from the resume offset on (0 workers means the in-process loader, one shard per rank).
+    """
+
+    total = 0
+    for rank in range(world):
+        dataset = ParquetTextDataset(small_dir, "p", shard=(rank, world))
+        dataset.set_resume_offset(offset)
+        yielded = 0
+        for worker_id in range(max(num_workers, 1)):
+            info = None if num_workers == 0 else SimpleNamespace(id=worker_id, num_workers=num_workers)
+            monkeypatch.setattr(datasets_module, "get_worker_info", lambda info=info: info)
+            yielded += sum(1 for _ in dataset)
+        assert dataset.epoch_rows(num_workers) == yielded, rank
+        total += yielded
+    rows = len(_expected_rows(small_dir))
+    assert total == rows - offset % rows  # an offset of the whole range wraps to 0
+
+
 def test_sharding_counts_across_read_batches_and_files(small_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     The global row index must not reset at parquet read-batch or file boundaries.

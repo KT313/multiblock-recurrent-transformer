@@ -2,6 +2,7 @@
 import itertools
 import logging
 import math
+import resource
 import signal
 from collections import Counter
 from pathlib import Path
@@ -24,13 +25,15 @@ from training.data.dataset_resolver import (
     validation_batches_available,
 )
 from training.data.loader import (
+    RunDataloaders,
     TRAIN_LOADER_BATCH_ROWS,
     TRAIN_LOADER_PREFETCH_FACTOR,
-    RunDataloaders,
+    UNLIMITED_OPEN_FILES,
     build_dataloader,
     build_run_dataloaders,
     dataloader_over,
     entry_dataset,
+    raise_open_file_limit,
     worker_init_fn,
 )
 from training.data.datasets import ParquetTextDataset, Row
@@ -592,6 +595,81 @@ def test_a_resumed_epoch_without_a_sample_restarts_instead_of_raising(tmp_path: 
     assert len(loaders.next_train_batch("ft").samples) == 1  # the restart reads the whole range and yields
     assert parquet.resume_offset == 0
     loaders.close()
+
+
+class _LosingLoader:
+    """
+    A train loader whose worker 'loses' every second batch: what torch's loader does when the worker could not hand
+    a batch over (out of file descriptors) and then reported the end of its range.
+    """
+
+    num_workers = 0
+
+    def __init__(self, loader: Iterable[WorkerBatch]) -> None:
+        self._loader = loader
+
+    def __iter__(self) -> Iterator[WorkerBatch]:
+        for index, batch in enumerate(self._loader):
+            if index % 2 == 0:
+                yield batch
+
+
+@pytest.mark.timeout(60)
+def test_an_epoch_that_lost_worker_batches_raises_instead_of_training_on_the_rest(
+    tmp_path: Path, tokenizer: Tokenizer
+) -> None:
+    """
+    The dataset knows how many rows the epoch holds for this rank; a loader that delivered fewer lost batches, and
+    the error says so (rows delivered and owed, the file-descriptor cause and this process's limit) instead of
+    blaming the collate or restarting over the same broken worker.
+    """
+
+    loaders, parquet = _instruct_source(tmp_path / "lost", tokenizer, [SHORT_PROMPT] * 4)
+    loaders.train_loaders["ft"] = _LosingLoader(loaders.train_loaders["ft"])
+    with pytest.raises(RuntimeError, match="delivered 2 of the 4 rows of this epoch") as raised:
+        for _ in range(10):
+            loaders.next_train_batch("ft")
+    message = str(raised.value)
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    assert "'ft'" in message and "lost batches" in message and "Too many open files" in message
+    assert f"this process may open {soft_limit}" in message
+    assert parquet.epoch_rows(0) == 4
+    loaders.close()
+
+
+def test_a_resumed_epoch_owes_only_the_rows_after_the_offset(tmp_path: Path, tokenizer: Tokenizer) -> None:
+    """
+    The rows an epoch owes start at the resume offset: a resumed epoch that delivers exactly its remainder is
+    complete, and the next full epoch owes the whole range again.
+    """
+
+    loaders, _ = _instruct_source(tmp_path / "owed", tokenizer, [SHORT_PROMPT] * 3)
+    loaders.set_resume_offsets({"ft": 2})
+    loaders.next_train_batch("ft")
+    assert loaders.epochs["ft"].expected_rows == 1
+    loaders.next_train_batch("ft")  # the restart: a full epoch over the range
+    assert loaders.epochs["ft"].expected_rows == 3 and loaders.epochs["ft"].full_epoch
+    loaders.close()
+
+
+def test_raise_open_file_limit_lifts_the_soft_limit_to_the_hard_one() -> None:
+    """
+    The train loaders' batches in flight can hold more descriptors than the usual soft limit of 1024 allows; the
+    process lifts its own limit to the administrator's ceiling, or to `UNLIMITED_OPEN_FILES` when there is none.
+    """
+
+    original = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft_limit, hard_limit = original
+    lowered = min(soft_limit, 1024)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (lowered, hard_limit))
+        assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] == lowered
+        expected = max(lowered, UNLIMITED_OPEN_FILES) if hard_limit == resource.RLIM_INFINITY else hard_limit
+        assert raise_open_file_limit() == expected
+        assert resource.getrlimit(resource.RLIMIT_NOFILE) == (expected, hard_limit)
+        assert raise_open_file_limit() == expected  # idempotent
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, original)
 
 
 @pytest.mark.timeout(60)
