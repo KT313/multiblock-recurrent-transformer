@@ -38,6 +38,10 @@ training:  ## train: make training config/<run>.yaml
 	$(require_config)
 	uv run python training/train.py --config $(CONFIG)
 
+training-autotune:
+	$(require_config)
+	TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 uv run python training/train.py --config $(CONFIG)
+
 evaluate:  ## samples (and benchmarks with EVAL_TASKS=a,b) for a checkpoint: make evaluate <checkpoint.pth>
 	$(require_checkpoint)
 	uv run python evaluation/evaluate.py --checkpoint $(CHECKPOINT) --tasks "$(EVAL_TASKS)"
