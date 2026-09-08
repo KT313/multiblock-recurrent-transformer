@@ -5,8 +5,10 @@ Tests for the Bloom-filter exact-dedup set (tiny 1 MB budgets).
 
 from __future__ import annotations
 
+import logging
 import math
 import random
+import re
 from pathlib import Path
 
 import pyarrow as pa
@@ -15,10 +17,12 @@ import pytest
 
 from data_preparation.lib.stages.exact_dedup import (
     BITS_PER_MB,
+    BLOOM_MAX_LOAD,
     TARGET_FALSE_POSITIVE_RATE,
     SeenDocuments,
     bits_for_budget,
     expected_items,
+    memory_mb_for,
     mix128,
     stored_hashes,
     text_hash64,
@@ -107,8 +111,78 @@ def test_bits_for_budget_and_expected_items() -> None:
         bits_for_budget(0)
 
 
-def test_describe_names_the_budget_and_the_rows() -> None:
-    assert SeenDocuments(memory_mb=1).describe(2_600_000) == "dedup filter: 1 MB, 2,600,000 rows on disk"
+def test_describe_names_the_budget_the_rows_and_the_expected_rate() -> None:
+    seen = SeenDocuments(memory_mb=1)
+    assert seen.nominal_capacity == 583_450, "the row count the message quotes"
+    assert seen.describe(2_000) == (
+        "dedup filter: 1 MB, 2,000 rows on disk (upper bound of insertions) -> "
+        "FPR ≈ 0.00 % (0 % of the nominal 583,450 rows)"
+    )
+    assert seen.describe(1_166_900) == (
+        "dedup filter: 1 MB, 1,166,900 rows on disk (upper bound of insertions) -> "
+        "FPR ≈ 4.83 % (200 % of the nominal 583,450 rows)"
+    ), "an over-full filter says so in the same line"
+    # a capacity in the millions is compact, as in the README line of the 1024 MB default ("the nominal 597 M rows")
+    assert "the nominal 1 M rows" in SeenDocuments(memory_mb=2).describe(2_000)
+
+
+def test_expected_false_positive_rate_matches_the_target_at_the_nominal_capacity() -> None:
+    """
+    The filter is sized for `TARGET_FALSE_POSITIVE_RATE` at its nominal capacity; twice as many insertions cost
+    roughly 50x that (the rate rises steeply, which is what `check` refuses).
+    """
+
+    seen = SeenDocuments(memory_mb=1)
+    assert seen.expected_false_positive_rate(0) == 0.0
+    at_nominal = seen.expected_false_positive_rate(seen.nominal_capacity)
+    assert TARGET_FALSE_POSITIVE_RATE / 2 < at_nominal < 2 * TARGET_FALSE_POSITIVE_RATE
+    at_twice = seen.expected_false_positive_rate(2 * seen.nominal_capacity)
+    assert 0.02 < at_twice < 0.09, at_twice
+    assert seen.expected_false_positive_rate(200) < at_nominal, "monotone in the insertions"
+
+
+def test_check_is_quiet_up_to_the_nominal_capacity(caplog: pytest.LogCaptureFixture) -> None:
+    seen = SeenDocuments(memory_mb=1)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        seen.check(seen.nominal_capacity)
+    assert caplog.text == ""
+
+
+def test_check_warns_over_the_nominal_capacity_and_names_the_budget(caplog: pytest.LogCaptureFixture) -> None:
+    seen = SeenDocuments(memory_mb=1)
+    rows = int(1.5 * seen.nominal_capacity)
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        seen.check(rows)  # a warning, not a refusal: 1.5x is under BLOOM_MAX_LOAD
+    assert f"{rows:,} rows on disk are 1.5x the nominal capacity of the 1 MB dedup filter (583,450 rows)" in caplog.text
+    assert "1.2 % of the unique documents are dropped as duplicates" in caplog.text
+    assert "raise dedup.bloom_memory_mb to 2 (it is unhashed: nothing on disk is invalidated)" in caplog.text
+
+
+def test_check_refuses_past_the_maximum_load() -> None:
+    seen = SeenDocuments(memory_mb=1)
+    rows = int(BLOOM_MAX_LOAD * seen.nominal_capacity) + 1
+    with pytest.raises(ValueError, match=re.escape("that is past the 2x this build accepts")) as error:
+        seen.check(rows)
+    assert "4.8 % of the unique documents are dropped as duplicates" in str(error.value)
+    assert "raise dedup.bloom_memory_mb to 3" in str(error.value), "the budget that brings it back under the nominal capacity"
+    seen.check(int(BLOOM_MAX_LOAD * seen.nominal_capacity))  # exactly at the limit still builds (a warning)
+
+
+def test_memory_mb_for_covers_the_rows() -> None:
+    assert memory_mb_for(0) == 1 and memory_mb_for(1) == 1
+    assert memory_mb_for(expected_items(1)) == 1
+    assert memory_mb_for(expected_items(1) + 1) == 2
+    assert expected_items(memory_mb_for(2_600_000)) > 2_600_000
+
+
+def test_items_in_filter_estimates_the_insertions() -> None:
+    seen = SeenDocuments(memory_mb=1)
+    assert seen.items_in_filter == 0
+    hashes = _random_hashes(10_000, seed=6)
+    seen.add_all(hashes)
+    assert 0.98 * len(hashes) < seen.items_in_filter < 1.02 * len(hashes)
+    seen.add_all(hashes)  # the same documents again: nothing is inserted
+    assert seen.items_in_filter < 1.02 * len(hashes)
 
 
 def test_size_in_bits_is_the_budget_within_a_byte() -> None:
@@ -156,9 +230,10 @@ def test_observed_false_positive_rate_roughly_matches_formula() -> None:
     fresh = [rng.randint(INT64_MIN, INT64_MAX) for _ in range(100_000)]  # collisions with the inserts: ~3e-9 each
     hits = sum(h in seen._bloom for h in fresh)
     observed = hits / len(fresh)
-    k = 9  # rbloom's probe count for the 0.1 % target: floor(-log2 p)
+    k = 9  # rbloom's probe count for the 0.1 % target: floor(m / n x ln 2), what `expected_false_positive_rate` re-derives
     expected = (1 - math.exp(-k * inserted / BITS_PER_MB)) ** k  # the classic Bloom estimate: ~1e-3 -> ~100 hits
     assert expected / 3 < observed < expected * 3, (observed, expected)
+    assert seen.expected_false_positive_rate(inserted) == pytest.approx(expected), "the method uses rbloom's own k"
 
 
 def test_planted_duplicate_survives_a_restart_via_stored_hashes(tmp_path: Path) -> None:

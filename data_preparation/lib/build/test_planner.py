@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from data_preparation.lib.build.repair import ConfirmationRequired
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairError
 
 from data_preparation.dataset_config import (
     DatasetConfig,
@@ -29,6 +29,7 @@ from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.planner import (
     DatasetReport,
     SourceLedger,
+    UnreadableRawShardError,
     every_source_satisfies_its_budget,
     plan_downloads,
     raw_is_exhausted,
@@ -268,6 +269,38 @@ def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: Data
         assert not prepare(path, layout.root, assume_yes=True, dry_run=dry_run).complete
     assert (layout.raw_dir("b") / "data-00000.parquet").is_file() and layout.processed_dir("b").is_dir()  # nothing was deleted
 
+
+def test_an_unreadable_raw_shard_names_the_shard_and_the_repair_command(layout: DatasetLayout, config_file: ConfigFile) -> None:
+    """
+    The tokens-per-row rate is read from the raw shards, so a truncated shard reaches every caller of the planner
+    (`status`, a dry run, training's auto-prepare). The planner names the source, the shard and the Arrow error;
+    the callers that know the config path add the repair command, because neither of them repairs anything itself.
+    """
+
+    cfg = two_stage_cfg()
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=False)
+    shard = layout.raw_dir("b") / "data-00000.parquet"
+    shard.write_bytes(b"corrupt")
+
+    with pytest.raises(UnreadableRawShardError) as bare:
+        source_ledger(cfg, "b", layout)
+    assert str(bare.value).startswith(f"b: raw shard {shard} cannot be read (")
+    assert isinstance(bare.value, RepairError), "prepare.py prints a RepairError as a message and exits 1"
+    assert "\n" not in str(bare.value), "the planner knows neither the config path nor the dataset directory"
+
+    command = f"python data_preparation/prepare.py prepare --dataset_config {path} --dataset_dir {layout.root} --yes"
+    calls: list[Callable[[], DatasetReport]] = [
+        lambda: status(path, layout.root),
+        lambda: prepare(path, layout.root, assume_yes=True, dry_run=True),
+    ]
+    for call in calls:
+        with pytest.raises(UnreadableRawShardError) as reported:
+            call()
+        message = str(reported.value)
+        assert str(shard) in message and "the repair step truncates raw/b to its readable prefix" in message
+        assert command in message and "then status again" in message
+    assert shard.is_file(), "a read-only call repairs nothing"
 
 
 # --- the ledger -------------------------------------------------------------------------------------------------------

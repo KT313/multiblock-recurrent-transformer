@@ -30,7 +30,8 @@ target, see stages/download.py) therefore cost raw disk only; a larger budget bu
 Everything here reads manifests, plus the tokens column of current raw shards for the rate (no other shard data):
 a processed folder's health is the shared verdict of lib/build/assessment.py with check_files=False; broken or stray
 shard files are the repair step's business. A raw manifest that cannot be parsed next to shards is a reported state
-(nothing is planned for it, nobody deletes it).
+(nothing is planned for it, nobody deletes it); a raw *shard* that cannot be read stops the plan with
+:class:`UnreadableRawShardError` (the repair step truncates such a folder, so the error names the command).
 Pure functions of (config, layout); lib/build/runner.py executes them.
 """
 
@@ -41,15 +42,45 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import cached_property
 from math import ceil
+from pathlib import Path
+
+import pyarrow as pa
 
 from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
+from data_preparation.lib.build.repair import RepairError
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, inspect_raw
 from data_preparation.lib.storage.manifest import shard_list, shard_tokens, Manifest
 
 log = get_logger(__name__)
+
+
+class UnreadableRawShardError(RepairError):
+    """
+    A raw shard the tokens-per-row rate is measured from cannot be read (truncated by a crash, replaced by
+    something that is not parquet, deleted between the manifest read and this one).
+
+    A :class:`RepairError` because that is exactly what it needs: the repair step truncates the folder to its
+    readable prefix. The planner knows neither the config path nor the dataset directory, so the command that
+    runs the repair is appended by its caller (:func:`lib.build.runner.status`); `remedy` carries it.
+    """
+
+    def __init__(self, source: str, path: Path, error: BaseException, remedy: str = "") -> None:
+        self.source = source
+        self.path = path
+        self.error = error
+        self.remedy = remedy
+        message = f"{source}: raw shard {path} cannot be read ({type(error).__name__}: {error})"
+        super().__init__(f"{message}\n{remedy}" if remedy else message)
+
+    def with_remedy(self, remedy: str) -> UnreadableRawShardError:
+        """
+        The same error with the remedy (what to run) appended to its message.
+        """
+
+        return UnreadableRawShardError(self.source, self.path, self.error, remedy)
 
 
 # --- rows ---------------------------------------------------------------------------------------------------------
@@ -497,12 +528,21 @@ def measured_tokens_per_row(config: DatasetConfig, name: str, layout: DatasetLay
     the token budget by: a 530-token row serves 530 tokens of the budget, a 4000-token one the target. Read from
     the tokens column of every shard of a current raw manifest (one column per shard, no other data); None without
     rows or token counts (the config's estimate stands in then).
+
+    A shard that cannot be read is an :class:`UnreadableRawShardError`, not the bare Arrow error: every caller of
+    the planner (status, prepare, training's auto-prepare) goes through here, and the repair step is what fixes it.
     """
 
     if raw is None or raw.rows() <= 0 or raw.tokens() is None:
         return None
     raw_dir = layout.raw_dir(name)
-    capped = sum(shard_tokens(raw_dir / shard.name, cap=config.training_target_sequence_length) for shard in raw.shards)
+    capped = 0
+    for shard in raw.shards:
+        path = raw_dir / shard.name
+        try:
+            capped += shard_tokens(path, cap=config.training_target_sequence_length)
+        except (OSError, pa.ArrowException) as error:
+            raise UnreadableRawShardError(name, path, error) from error
     return capped / raw.rows()
 
 

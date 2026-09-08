@@ -6,6 +6,7 @@ in-process) implementation on a synthetic corpus with planted near- and exact du
 
 from __future__ import annotations
 
+import os
 import random
 import sys
 from collections.abc import Iterator
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 
 from data_preparation.dataset_config import DedupConfig
+from data_preparation.lib.stages import fuzzy_dedup as fuzzy_dedup_module
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 
 
@@ -141,6 +143,30 @@ def test_stats_and_empty_input() -> None:
     stats: dict[str, Any] = {}
     assert list(fuzzy_dedup(iter([]), DedupConfig(mode="minhash"), stats)) == []
     assert stats["near_duplicates_removed"] == 0 and "seconds" not in stats
+
+
+def _kill_the_worker(texts: list[str]) -> list[Any]:
+    """
+    A signature task that ends its worker process the way the OOM killer does (module level: the spawn child
+    imports this module to run it).
+    """
+
+    os._exit(9)
+
+
+@needs_datasketch
+@pytest.mark.timeout(60)
+def test_a_killed_signature_worker_is_a_named_error_not_a_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A worker killed mid-chunk (the OOM killer is what does this on a real source) leaves its result unfinished.
+    The pool must report that instead of waiting for it forever, which is what a `multiprocessing.Pool` does.
+    """
+
+    monkeypatch.setattr(fuzzy_dedup_module, "_signatures", _kill_the_worker)
+    dedup = DedupConfig(mode="minhash", threshold=0.8, num_perm=32)
+    rows = fuzzy_dedup(_rows(make_corpus()), dedup, {}, pass_workers=2, chunk_size=16)
+    with pytest.raises(RuntimeError, match="minhash signature worker died, likely OOM-killed"):
+        list(rows)
 
 
 def test_missing_datasketch_is_a_clear_import_error(monkeypatch: pytest.MonkeyPatch) -> None:

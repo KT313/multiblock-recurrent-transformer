@@ -33,10 +33,11 @@ with zero shards still gets a (zero-shard) processed manifest, so the source cou
 from __future__ import annotations
 
 import multiprocessing
-import multiprocessing.pool
 import random
 import shutil
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -120,6 +121,8 @@ def build_source(
     if all_at_once:
         if assessment.problem == "none" and assessment.manifest is not None:
             return assessment.manifest  # built from exactly the current raw shards
+        # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
+        config.check_all_at_once_rows(name, raw.rows(), at_build=True)
         output = ProcessedOutput(_fresh_manifest(config, name, source_hash), _temporary_dir(processed_dir), is_new=True)
         pending = list(raw.shards)
     else:
@@ -137,6 +140,9 @@ def build_source(
             seen.add_all(output.stored_hashes())
         # the raw row count is the honest upper bound of what this build can insert
         log.info("%s: %s", name, seen.describe(raw.rows()))
+        seen.check(raw.rows())
+        stats["dedup"]["rows_on_disk"] = raw.rows()
+        stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 
     # per-shard builds check the stop request after every published shard; an all-at-once build reads every raw
@@ -149,6 +155,9 @@ def build_source(
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
         else:
             _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
+    if seen is not None:
+        _record_filter_load(stats["dedup"], seen)
+        output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
     log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
     return output.manifest
 
@@ -219,6 +228,19 @@ def _build_all_at_once(
     output.save(shard_list(raw.shards))
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
+
+
+def _record_filter_load(dedup_stats: dict[str, Any], seen: SeenDocuments) -> None:
+    """
+    The measured load of the dedup filter into the stats of the finished build: rbloom estimates the insertions
+    from the set bits, so the processed folder says whether the build ran on a saturated filter (one that drops
+    unique documents as duplicates), not only what was expected of it. Once per build, not per shard: the estimate
+    counts the bits of the whole filter (about a second at the 1 GiB default).
+    """
+
+    items = seen.items_in_filter
+    dedup_stats["items_in_filter"] = round(items)
+    dedup_stats["measured_false_positive_rate"] = seen.expected_false_positive_rate(items)
 
 
 def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
@@ -581,6 +603,8 @@ class Decontaminator:
     holds) or in a pool of pass_workers spawn processes that lives for the whole with block. Spawn, not fork:
     the pool is created from a build worker thread (`lib/build/runner.py` runs one build per thread), and a fork
     of a multi-threaded process can inherit a lock another thread holds mid-operation; spawn children start clean.
+    A killed worker (OOM killer, a segfault) breaks the pool and is re-raised as a named RuntimeError, where a
+    multiprocessing.Pool would wait for the lost result forever.
     """
 
     def __init__(self, config: DecontaminationConfig, pass_workers: int, layout: DatasetLayout, stats: dict[str, Any]) -> None:
@@ -589,7 +613,7 @@ class Decontaminator:
         self.stats = stats
         self.cache_dir = str(layout.benchmark_cache_dir())
         self._ngrams: dict[str, set[str]] = {}
-        self._pool: multiprocessing.pool.Pool | None = None
+        self._pool: ProcessPoolExecutor | None = None
 
     def __enter__(self) -> Decontaminator:
         if not self.config.enabled:
@@ -597,13 +621,17 @@ class Decontaminator:
         self._ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
         if self.pass_workers > 1:
             init_args = (self._ngrams, self.config.ngram, self.config.threshold)
-            self._pool = multiprocessing.get_context("spawn").Pool(self.pass_workers, initializer=_init_decontamination, initargs=init_args)
+            self._pool = ProcessPoolExecutor(
+                max_workers=self.pass_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_decontamination,
+                initargs=init_args,
+            )
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self._pool is not None:
-            self._pool.terminate()
-            self._pool.join()
+            self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for the queued chunks
             self._pool = None
 
     def __call__(self, rows: Iterator[Row]) -> Iterator[Row]:
@@ -626,4 +654,11 @@ class Decontaminator:
             return
         for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
-            yield from zip(chunk, self._pool.map(_contaminated_by, texts, chunksize=64))
+            try:
+                hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
+            except BrokenProcessPool as error:
+                raise RuntimeError(
+                    f"a decontamination worker died, likely OOM-killed ({error}); every worker holds its own copy of "
+                    "the benchmark n-grams, so lower --pass_workers or decontamination.benchmarks"
+                ) from error
+            yield from zip(chunk, hits)

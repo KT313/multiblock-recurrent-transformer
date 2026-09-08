@@ -2,12 +2,14 @@
 """
 Streaming MinHash + LSH near-duplicate removal (dedup.mode: minhash), first occurrence wins.
 
-Signatures are computed in a spawn-context multiprocessing.Pool of pass_workers (pass_workers > 1;
+Signatures are computed in a spawn-context ProcessPoolExecutor of pass_workers (pass_workers > 1;
 spawn because the pool is created from a build worker thread, where a fork could inherit another thread's lock
 mid-hold) in chunks of chunk_size rows; workers return only the uint64[num_perm] hash values of each
 document (nothing but numpy arrays is pickled), the main process rebuilds the MinHash from that array and
-queries/inserts the single MinHashLSH in input order. Rows stream in and out; at most 2 * pass_workers
-chunks are in flight at any time.
+queries/inserts the single MinHashLSH in input order. Rows stream in and out of this function; at most
+2 * pass_workers chunks are in flight at any time. Its only caller materialises the survivors
+(`lib/stages/build.py::_build_all_at_once`) for the shuffle anyway, and the LSH index is a full pass over the
+source, so the streaming buys a bounded queue and an early stop, not a smaller build.
 
 Memory: the LSH index holds the signature of every *kept* row, i.e. O(kept rows). Per kept row this is the
 num_perm uint64 hash values (8 * num_perm bytes, 2 KB at num_perm=256) plus b band keys and the doc_<i>
@@ -21,8 +23,9 @@ import multiprocessing
 import time
 from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from functools import partial
-from multiprocessing.pool import AsyncResult
 from typing import Any
 
 import numpy as np
@@ -120,6 +123,17 @@ def _signatures_in_process(rows: Iterator[Row], dedup: DedupConfig) -> Iterator[
         yield row, signature(row["text"])
 
 
+def _worker_died(error: BrokenProcessPool) -> RuntimeError:
+    """
+    The error a killed signature worker becomes: the pool itself only reports that a process vanished.
+    """
+
+    return RuntimeError(
+        f"a minhash signature worker died, likely OOM-killed ({error}); minhash holds the whole source in memory "
+        "(see the module docstring), so lower --pass_workers, use dedup.mode=exact, or give the source fewer rows"
+    )
+
+
 def _signatures_in_pool(
     rows: Iterator[Row], dedup: DedupConfig, pass_workers: int, chunk_size: int
 ) -> Iterator[tuple[Row, Signature]]:
@@ -127,24 +141,42 @@ def _signatures_in_pool(
     (row, signature) pairs in input order, signatures computed by a spawn worker pool chunk by chunk.
 
     Bounded in-order pipeline: at most 2 * pass_workers chunks are read ahead of the consumer, so the input keeps
-    streaming however slow the LSH side is (pool.imap would read the whole input into its task queue).
+    streaming however slow the LSH side is (Executor.map would read the whole input into its task queue).
+    A worker that dies (OOM killer, a segfault in a C extension) breaks the pool, which is re-raised as a named
+    RuntimeError; a multiprocessing.Pool would wait for its result forever instead. The shutdown cancels what is
+    still queued, so a consumer that stops early (an aborted build, an error downstream) does not wait for the
+    chunks in flight to be computed.
     """
 
     max_inflight = 2 * pass_workers
-    inflight: deque[tuple[list[Row], AsyncResult[list[Signature]]]] = deque()
+    inflight: deque[tuple[list[Row], Future[list[Signature]]]] = deque()
 
     def oldest_finished() -> Iterator[tuple[Row, Signature]]:
         chunk, pending = inflight.popleft()
-        return zip(chunk, pending.get())
+        try:
+            return zip(chunk, pending.result())
+        except BrokenProcessPool as error:
+            raise _worker_died(error) from error
 
-    with multiprocessing.get_context("spawn").Pool(pass_workers, initializer=_init_worker, initargs=(dedup.num_perm, dedup.ngram)) as pool:
+    pool = ProcessPoolExecutor(
+        max_workers=pass_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_worker,
+        initargs=(dedup.num_perm, dedup.ngram),
+    )
+    try:
         for chunk in chunks(rows, chunk_size):
             texts = [row["text"] for row in chunk]
-            inflight.append((chunk, pool.apply_async(_signatures, (texts,))))
+            try:
+                inflight.append((chunk, pool.submit(_signatures, texts)))
+            except BrokenProcessPool as error:  # a worker died before this chunk was even queued
+                raise _worker_died(error) from error
             if len(inflight) >= max_inflight:
                 yield from oldest_finished()
         while inflight:
             yield from oldest_finished()
+    finally:
+        pool.shutdown(cancel_futures=True)
 
 
 def fuzzy_dedup(
