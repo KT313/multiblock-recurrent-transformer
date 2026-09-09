@@ -278,6 +278,35 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
     assert metrics["val_loss/a"] != metrics["val_loss/b"]
 
 
+def test_per_source_losses_are_summed_over_the_ranks_whatever_sources_each_saw(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    The per-source sums travel as gathered objects: a rank that never saw a source contributes no entry for it,
+    another rank's entry for a source unknown here still shows up, and shared sources add up before the one
+    division. The per-depth losses stay the mean of the per-rank means (`all_reduce`, identity here).
+    """
+
+    class TwoRankBackend(SingleDeviceBackend):
+        def all_gather_object(self, obj: Any) -> list[Any]:  # a second rank that saw source b with 10 tokens and source c
+            other = {"b": torch.tensor([20.0, 10.0]), "c": torch.tensor([3.0, 3.0])}
+            return [obj, other]
+
+    settings.eval_iters = 1
+    batches = [Batch(x, y, ["a", "b"]) for x, y, _ in _batches(1)]
+    torch.manual_seed(1)
+    single = evaluate(settings, cpu_backend, tiny_model, batches)
+    torch.manual_seed(1)
+    two = evaluate(settings, TwoRankBackend(device="cpu", precision="32"), tiny_model, batches)
+    assert {key for key in two if key.startswith("val_loss/")} == {"val_loss/a", "val_loss/b", "val_loss/c"}
+    assert two["val_loss/a"] == single["val_loss/a"]  # only this rank saw a
+    tokens_b = int((batches[0].labels[1] != -100).sum())
+    local_sum_b = single["val_loss/b"] * tokens_b
+    assert two["val_loss/b"].item() == pytest.approx(((local_sum_b + 20.0) / (tokens_b + 10)).item(), rel=1e-6)
+    assert two["val_loss/c"].item() == 1.0
+    assert two["val_loss"] == single["val_loss"]
+
+
 def test_is_evaluation_step_table(settings: Settings) -> None:
     """
     Every `eval_step_interval` completed steps and after the last step (here a 20-step run, interval 8).

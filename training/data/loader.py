@@ -10,6 +10,7 @@ the stage-interpolated weights, so a reader continues across stage boundaries an
 import logging
 import resource
 import signal
+import time
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -204,6 +205,13 @@ class RunDataloaders:
     parquet datasets behind the train loaders (a test fake passes {}): the offset of `set_resume_offsets` is
     applied to a dataset right before its first iterator after a resume and reset to 0 for every later epoch.
     training_max_sequence_length is only quoted in the messages about dropped rows; a fake may leave it out.
+
+    Data wait: `next_train_batch` times every pull from a loader (`clock`, monotonic) and adds the seconds to
+    `wait_seconds` per source; `take_wait_seconds` hands them out and resets. A pull blocks only when the worker has
+    no batch ready, so this is the time the training process (and every GPU behind it) waits for data. The first
+    pull of a fresh iterator (a source's first batch, every epoch restart) is the worker start-up (process spawn,
+    tokenizer load) and is not counted: it would put nearly every run's first log interval over the warning
+    threshold and says nothing about the tokenization rate.
     """
 
     train_loaders: dict[str, Iterable[WorkerBatch]]
@@ -211,7 +219,9 @@ class RunDataloaders:
     tokenizer: Tokenizer
     datasets: dict[str, ParquetTextDataset]
     training_max_sequence_length: int | None = None
+    clock: Callable[[], float] = time.monotonic  # a test knob
     pending_offsets: dict[str, int] = field(default_factory=dict, init=False)  # source -> rows its next epoch skips
+    wait_seconds: dict[str, float] = field(default_factory=dict, init=False)  # source -> seconds blocked since the last take
     _train_iterators: dict[str, Iterator[WorkerBatch] | None] = field(init=False)
     epochs: dict[str, EpochCounters] = field(init=False)  # source -> what its running epoch has read
 
@@ -326,16 +336,30 @@ class RunDataloaders:
         """
 
         iterator = self._train_iterators[source]
+        fresh = iterator is None  # a fresh iterator's first pull is the worker start-up, not a wait on tokenization
         if iterator is None:
             iterator = self._start_train_iterator(source)
         while True:
+            started = self.clock()
             batch = next(iterator, None)  # a sentinel, so the error below is not chained onto a StopIteration
+            if not fresh:
+                self.wait_seconds[source] = self.wait_seconds.get(source, 0.0) + (self.clock() - started)
             if batch is not None:
                 self._count_batch(source, batch)
                 return batch
             # the epoch is over and the next one starts at row 0, so the second round either yields or raises
             self._end_of_epoch(source)
             iterator = self._start_train_iterator(source)
+            fresh = True
+
+    def take_wait_seconds(self) -> dict[str, float]:
+        """
+        The seconds `next_train_batch` blocked per source since the last call (sources without a pull left out),
+        and a reset of the counter; `train()` hands them to `RunLogger.log_step` after every step.
+        """
+
+        waited, self.wait_seconds = self.wait_seconds, {}
+        return waited
 
     def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
         """
@@ -391,27 +415,34 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
 
     Iterator seeds come from one private generator, so creating an iterator (first pull, epoch restart, each
     evaluation) never touches the global torch RNG and a resume replays the same latent noise.
+
+    Ranks: the train loaders exist on the main rank only, which reads every source as ONE shard and packs for the
+    whole world (`training.step.RankBatches`); the other ranks get no train loader (and raise no file limit). The
+    validation loaders exist on every rank, each reading its shard of the rows.
     """
 
-    if TRAIN_LOADER_NUM_WORKERS > 0:
-        raise_open_file_limit()
     tokenizer = Tokenizer(dataset.tokenizer_dir)
-    shard = (backend.rank, backend.world_size)
     generator = torch.Generator().manual_seed(settings.seed + backend.rank)  # the worker RNG is unused (no shuffle)
-    train_datasets = {entry.prefix: entry_dataset(entry, shard) for entry in dataset.train_sources}
-    train_loaders: dict[str, Iterable[WorkerBatch]] = {
-        source: dataloader_over(
-            parquet_dataset,
-            tokenizer,
-            training_max_sequence_length=settings.training_max_sequence_length,
-            batch_size=TRAIN_LOADER_BATCH_ROWS,
-            num_workers=TRAIN_LOADER_NUM_WORKERS,
-            pin_memory=False,
-            padded=False,
-            generator=generator,
-        )
-        for source, parquet_dataset in train_datasets.items()
-    }
+    train_datasets: dict[str, ParquetTextDataset] = {}
+    train_loaders: dict[str, Iterable[WorkerBatch]] = {}
+    if backend.is_main:
+        if TRAIN_LOADER_NUM_WORKERS > 0:
+            raise_open_file_limit()
+        train_datasets = {entry.prefix: entry_dataset(entry) for entry in dataset.train_sources}  # one shard
+        train_loaders = {
+            source: dataloader_over(
+                parquet_dataset,
+                tokenizer,
+                training_max_sequence_length=settings.training_max_sequence_length,
+                batch_size=TRAIN_LOADER_BATCH_ROWS,
+                num_workers=TRAIN_LOADER_NUM_WORKERS,
+                pin_memory=False,
+                padded=False,
+                generator=generator,
+            )
+            for source, parquet_dataset in train_datasets.items()
+        }
+    shard = (backend.rank, backend.world_size)
     val_loaders = [
         build_dataloader(
             stage.val_data,

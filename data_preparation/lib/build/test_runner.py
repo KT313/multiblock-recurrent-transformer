@@ -808,7 +808,8 @@ def test_unconfirmed_raw_deletion_raises_and_deletes_nothing(
         report = prepare(path, layout.root, assume_yes=True)
     assert report.complete and "without asking" in caplog.text
     raw = Manifest.load(raw_dir)
-    assert raw is not None and raw.hash_payload["source"]["seed"] == 1 and raw.is_current(cfg.raw_hash("p")), "downloaded again under the new identity"
+    assert raw is not None and raw.hash_payload is not None
+    assert raw.hash_payload["source"]["seed"] == 1 and raw.is_current(cfg.raw_hash("p")), "downloaded again under the new identity"
 
 
 def test_a_raw_folder_of_another_config_needs_allow_foreign_raw(

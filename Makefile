@@ -1,5 +1,5 @@
 # Development entry points. Everything runs through uv (no manual venvs).
-.PHONY: setup test typecheck lint download prepare status training evaluate
+.PHONY: setup test typecheck lint download prepare status training training-ddp training-autotune evaluate
 
 setup:  ## create/update the uv environment (incl. data-prep extras and dev tools)
 	uv sync --all-extras
@@ -37,6 +37,16 @@ status:  ## show which dataset sources are missing: make status config/datasets/
 training:  ## train: make training config/<run>.yaml
 	$(require_config)
 	uv run python training/train.py --config $(CONFIG)
+
+training-autotune:
+	$(require_config)
+	TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 uv run python training/train.py --config $(CONFIG)
+
+GPUS ?= gpu                    # torchrun's `gpu`: one rank per visible GPU; GPUS=2 for a subset
+SHUTDOWN_TIMEOUT ?= 1800       # seconds torchrun waits after Ctrl-C before it kills the ranks (the step plus the checkpoint write)
+training-ddp:  ## train on every GPU of this machine: make training-ddp config/<run>.yaml [GPUS=2] (the config needs backend: ddp)
+	$(require_config)
+	uv run torchrun --standalone --nproc_per_node=$(GPUS) --shutdown-timeout=$(SHUTDOWN_TIMEOUT) training/train.py --config $(CONFIG)
 
 evaluate:  ## samples (and benchmarks with EVAL_TASKS=a,b) for a checkpoint: make evaluate <checkpoint.pth>
 	$(require_checkpoint)

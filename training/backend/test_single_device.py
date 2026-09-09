@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for the single-device backend: device pick, autocast, clipping, checkpoint round trip, no-op collectives,
-RNG state round trip, device transfer and pin_memory.
+Tests for the single-device backend: device pick, the torchrun guard, autocast, clipping, checkpoint round trip,
+identity collectives, the wrapper layering behind `plain_model`, RNG state round trip, device transfer and pin_memory.
 """
 
 import random
@@ -13,10 +13,11 @@ import numpy as np
 import pytest
 import torch
 
+from model import RecurrentGPT
 from training.backend import BACKENDS, get_backend
 from training.backend.base import Backend
 from training.backend.single_device import SingleDeviceBackend
-from training.backend.single_device import PRECISIONS, _set_torch_flags
+from training.backend.single_device import PRECISIONS, WORLD_SIZE_ENV, _set_torch_flags
 
 
 def test_registry_and_default_device() -> None:
@@ -26,7 +27,7 @@ def test_registry_and_default_device() -> None:
     assert backend.device.type == expected
     assert (backend.world_size, backend.rank, backend.is_main) == (1, 0, True)
     assert backend.pin_memory == (expected == "cuda")
-    assert set(BACKENDS) == {"single_device"}
+    assert set(BACKENDS) == {"single_device", "ddp"}
 
 
 def test_single_device_backend_implements_the_protocol() -> None:
@@ -34,6 +35,18 @@ def test_single_device_backend_implements_the_protocol() -> None:
     assert protocol_methods <= set(dir(SingleDeviceBackend))
     backend: Backend = SingleDeviceBackend(device="cpu", precision="32")  # static check: satisfies the Protocol
     assert backend.device.type == "cpu"
+
+
+def test_a_torchrun_launch_with_several_ranks_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Under torchrun every rank would build this backend on the same device and train its own copy of the run.
+    """
+
+    monkeypatch.setenv(WORLD_SIZE_ENV, "2")
+    with pytest.raises(RuntimeError, match="WORLD_SIZE=2 .* set `backend: ddp`"):
+        SingleDeviceBackend(device="cpu", precision="32")
+    monkeypatch.setenv(WORLD_SIZE_ENV, "1")
+    assert SingleDeviceBackend(device="cpu", precision="32").world_size == 1
 
 
 def test_unknown_backend_raises() -> None:
@@ -115,6 +128,23 @@ def test_setup_model_compile_wraps_the_module(monkeypatch: pytest.MonkeyPatch) -
     model = torch.nn.Linear(3, 2)
     assert backend.setup_model(model, compile_model=True) is model
     assert calls == [(model, True)]
+    assert backend.wrappers == ("compile",)  # recorded even though the stub returned the module itself
+
+
+def test_plain_model_unwraps_what_setup_model_wrapped(tiny_model: RecurrentGPT) -> None:
+    """
+    `plain_model` follows the layering `setup_model` recorded: the plain model as it is without compile, the module
+    behind the `torch.compile` wrapper with it (compiling only wraps here, no forward runs), and a `TypeError` for
+    a model that does not carry the recorded layering.
+    """
+
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    assert backend.plain_model(backend.setup_model(tiny_model)) is tiny_model
+    compiled = backend.setup_model(tiny_model, compile_model=True)
+    assert compiled is not tiny_model and backend.wrappers == ("compile",)
+    assert backend.plain_model(compiled) is tiny_model
+    with pytest.raises(TypeError, match="expected a compile wrapper"):
+        backend.plain_model(tiny_model)
 
 
 def test_backward_and_clip_grad_norm_value() -> None:
@@ -137,13 +167,18 @@ def test_clip_grad_norm_tolerates_non_finite_gradients() -> None:
     assert torch.isinf(backend.clip_grad_norm(model, max_norm=1.0))  # error_if_nonfinite=False
 
 
-def test_noop_collectives() -> None:
+def test_identity_collectives() -> None:
     backend = SingleDeviceBackend(device="cpu", precision="32")
     t = torch.arange(3.0)
     assert backend.all_reduce(t) is t
     assert backend.all_reduce(t, op="sum") is t
     backend.barrier()
     assert isinstance(backend.no_sync(torch.nn.Linear(1, 1)), nullcontext)
+    state = {"a": 1}
+    gathered = backend.all_gather_object(state)
+    assert gathered == [state] and gathered[0] is state
+    assert backend.any_flag(True) is True and backend.any_flag(False) is False
+    backend.shutdown()
 
 
 def test_checkpoint_round_trip_bit_identical(tmp_path: Path) -> None:
@@ -170,6 +205,23 @@ def test_seed_everything_is_reproducible() -> None:
     backend.seed_everything(123)
     b = (torch.rand(4), random.random(), np.random.rand())
     assert torch.equal(a[0], b[0]) and a[1:] == b[1:]
+
+
+def test_seed_everything_adds_the_rank() -> None:
+    """
+    Rank 0 seeds with `seed` itself (the goldens depend on it); a rank r seeds with `seed + r`, so a multi-rank
+    subclass draws other latent noise per rank.
+    """
+
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    backend.seed_everything(10)
+    assert torch.equal(torch.get_rng_state(), torch.manual_seed(10).get_state())
+    backend.rank = 3
+    backend.seed_everything(10)
+    torch.manual_seed(13)
+    expected = torch.get_rng_state()
+    backend.seed_everything(10)
+    assert torch.equal(torch.get_rng_state(), expected) and random.random() == random.Random(13).random()
 
 
 def test_rng_state_round_trip(tmp_path: Path) -> None:

@@ -7,13 +7,13 @@ bit-identity and optimizer state.
 import os
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
 
 from model import RecurrentGPT, build_model
-from training.backend.base import unwrap_compiled
+from training.backend.base import unwrap_model
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import (
     CHECKPOINT_SUBDIR,
@@ -60,7 +60,8 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
     values: dict[str, Any] = {
         "step": step,
         "stage": 0,
-        "rng": backend.rng_state(),
+        "world_size": 1,
+        "rng_states": [backend.rng_state()],
         "settings": asdict(_settings(run_name="tiny", seed=42)),
         "model_config": model.config.to_dict(),
         "dataset_config_hash": "abc123",
@@ -78,9 +79,10 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
     metadata = _metadata(backend, tiny_model, step=7)
     state = metadata.to_state()
     assert set(state) == {
-        "step", "stage", "rng", "settings", "model_config", "dataset_config_hash", "validation_rows", "source_rows", "data_stream"
+        "step", "stage", "world_size", "rng_states", "settings", "model_config", "dataset_config_hash", "validation_rows",
+        "source_rows", "data_stream",
     }
-    assert state["rng"] is metadata.rng  # a shallow copy: the RNG tensors are not duplicated
+    assert state["rng_states"] is metadata.rng_states  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
     assert restored == metadata
     assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["model_max_sequence_length"] == 256
@@ -103,7 +105,8 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
     assert [f.name for f in fields(CheckpointMetadata)] == [
         "step",
         "stage",
-        "rng",
+        "world_size",
+        "rng_states",
         "settings",
         "model_config",
         "dataset_config_hash",
@@ -245,7 +248,6 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "seed": 7,
     "training_max_sequence_length": 128,
     "validation_padding_multiple": 64,
-    "backend": "future_ddp",
     "precision": "32",
     "compile_model": True,
     "gradient_checkpointing": "full",
@@ -313,7 +315,7 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
         eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
-        wandb_enabled=False, export_to_hf=True, auto_prepare=False,
+        wandb_enabled=False, export_to_hf=True, auto_prepare=False, backend="ddp",  # the world size is compared on its own
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )
     check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
@@ -342,14 +344,26 @@ def test_check_settings_unchanged_treats_a_missing_stored_key_as_changed(
 # --- save / load -----------------------------------------------------------------------------------------------------
 
 
-def test_unwrap_compiled_strips_compile_wrapper(tiny_model: RecurrentGPT) -> None:
-    class Wrapper(torch.nn.Module):
-        def __init__(self, inner: torch.nn.Module) -> None:
-            super().__init__()
-            self._orig_mod = inner
+def test_unwrap_model_follows_exactly_the_expected_layering(tiny_model: RecurrentGPT) -> None:
+    """
+    `unwrap_model` steps through the wrappers `layers` names and nothing else: a missing, extra or foreign wrapper
+    is a `TypeError` naming the chain, never a silently returned wrapper. `torch.compile` only wraps here (no
+    forward runs), so the test stays fast.
+    """
 
-    assert unwrap_compiled(tiny_model) is tiny_model
-    assert unwrap_compiled(Wrapper(tiny_model)) is tiny_model
+    compiled = cast(torch.nn.Module, torch.compile(tiny_model, dynamic=True))  # typed as a bare callable
+    assert unwrap_model(tiny_model, ()) is tiny_model
+    assert unwrap_model(compiled, ("compile",)) is tiny_model
+    with pytest.raises(TypeError, match=r"expected a compile wrapper .* found RecurrentGPT"):
+        unwrap_model(tiny_model, ("compile",))
+    with pytest.raises(TypeError, match=r"expected a RecurrentGPT behind the wrappers \(\) but found OptimizedModule"):
+        unwrap_model(compiled, ())
+    with pytest.raises(TypeError, match=r"expected a ddp wrapper .* found OptimizedModule"):
+        unwrap_model(compiled, ("ddp", "compile"))
+    with pytest.raises(TypeError, match="expected a RecurrentGPT .* found Linear"):
+        unwrap_model(cast(torch.nn.Module, torch.compile(torch.nn.Linear(2, 2))), ("compile",))
+    with pytest.raises(ValueError, match="unknown wrapper kind"):
+        unwrap_model(tiny_model, ("fsdp",))
 
 
 def _train_one_step(model: RecurrentGPT) -> tuple[ELLISAdam, torch.Tensor]:
@@ -385,7 +399,8 @@ def test_save_load_forward_bit_identical(
     assert restored.settings["optim_config"] == asdict(OptimizerConfig())
     assert restored.dataset_config_hash == "abc123" and restored.validation_rows == metadata.validation_rows
     assert restored.model_config == tiny_model.config.to_dict()
-    assert torch.equal(restored.rng["torch"], metadata.rng["torch"])
+    assert restored.world_size == 1 and len(restored.rng_states) == 1
+    assert torch.equal(restored.rng_states[0]["torch"], metadata.rng_states[0]["torch"])
 
     tiny_model.eval()
     fresh.eval()
@@ -434,21 +449,20 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT
 ) -> None:
     """
-    State-dict keys must not carry an `_orig_mod.` prefix when the model is a torch.compile wrapper.
+    State-dict keys must not carry an `_orig_mod.` prefix when the model is a torch.compile wrapper: the backend
+    knows it compiled (`wrappers`) and saves / loads the plain model's state dict. Compiling only wraps here.
     """
 
-    class Wrapper(torch.nn.Module):
-        def __init__(self, inner: torch.nn.Module) -> None:
-            super().__init__()
-            self._orig_mod = inner
-
     opt, _ = _train_one_step(tiny_model)
+    compiled = backend.setup_model(tiny_model, compile_model=True)
+    assert backend.wrappers == ("compile",) and backend.plain_model(compiled) is tiny_model
     path = tmp_path / "w.pth"
-    save_training_checkpoint(backend, path, Wrapper(tiny_model), opt, _metadata(backend, tiny_model))
+    save_training_checkpoint(backend, path, compiled, opt, _metadata(backend, tiny_model))
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
     fresh = build_model(TINY_MODEL_ARCHITECTURE)
-    load_training_checkpoint(backend, path, Wrapper(fresh), ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
+    compiled_fresh = backend.setup_model(fresh, compile_model=True)
+    load_training_checkpoint(backend, path, compiled_fresh, ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
 
 

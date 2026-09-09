@@ -131,7 +131,9 @@ def sample_recurrence_steps(
 
     # A private generator seeded by the optimizer step and the block, not the global RNG: a forward re-run under
     # activation checkpointing draws the same depth again. The block stride is far above any step count, so blocks
-    # never share a seed. Distributed training must multiply the seed by (rank + 1) so ranks draw different depths.
+    # never share a seed. The seed has no rank in it on purpose: in distributed training every rank draws the SAME
+    # depth, so every rank's step costs the same and none waits for a deeper one; only the latent noise
+    # (`initialize_state`, the global RNG seeded per rank) differs between ranks.
     generator = torch.Generator(device="cpu")
     generator.manual_seed((514229 + step + 2**24 * block_idx) % (2**31 - 1))
 

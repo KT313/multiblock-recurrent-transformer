@@ -51,6 +51,7 @@ from training.step import (
     NonFiniteLossError,
     run_one_optimizer_step,
     scheduled_learning_rate,
+    RankBatches,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -262,10 +263,10 @@ def _hand_accumulation(
     copy_of_model.step = step
     torch.manual_seed(seed)
     losses = []
-    for _ in range(settings.gradient_accumulation_steps):
+    for _ in range(settings.micro_batches_per_rank(1)):
         loss = copy_of_model(**model_inputs(next(batches), backend))["loss"]
         assert loss is not None
-        (loss / settings.gradient_accumulation_steps).backward()
+        (loss / settings.micro_batches_per_rank(1)).backward()
         losses.append(loss.detach())
     grads = [p.grad for p in copy_of_model.parameters() if p.grad is not None]
     norm = torch.stack([g.norm() for g in grads]).norm()
@@ -295,7 +296,7 @@ def test_loss_and_grad_norm_match_a_hand_computation(cpu_backend: SingleDeviceBa
         scripted_batches(settings),
         TrainingProgress(),
     )
-    assert len(expected_losses) == settings.gradient_accumulation_steps == 2
+    assert len(expected_losses) == settings.micro_batches_per_rank(1) == 2
     assert result.loss.item() == pytest.approx(torch.stack(expected_losses).mean().item(), rel=1e-6)
     assert result.grad_norm.item() == pytest.approx(expected_norm.item(), rel=1e-5)
     assert result.grad_norm.item() > settings.grad_clip  # so the clipping actually happened and the norm is pre-clip
@@ -499,7 +500,7 @@ def _micro_batches(settings: Settings, stream: BatchStream, world_batches: int) 
 
     out: list[PackedBatch] = []
     for _ in range(world_batches):
-        out += _packs(stream, settings.gradient_accumulation_steps)
+        out += _packs(stream, settings.micro_batches_per_rank(1))
         stream.progress.advance()
     return out
 
@@ -752,7 +753,7 @@ def test_batch_stream_fills_every_pack_from_short_worker_batches(
     progress = TrainingProgress()
     stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(6):
-        for pack in _packs(stream, settings.gradient_accumulation_steps):
+        for pack in _packs(stream, settings.micro_batches_per_rank(1)):
             assert sum(_document_slots(pack)) + pack.padding_tokens == PACK_LENGTH and pack.padding_tokens <= 6
         progress.advance()
 
@@ -866,7 +867,7 @@ def test_batch_stream_resume_does_not_repeat_rows(
         stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
         before = documents(stream, 3)
         state = stream.state_dict()
-    assert len(set(before)) == len(before) > 3 * settings.gradient_accumulation_steps
+    assert len(set(before)) == len(before) > 3 * settings.micro_batches_per_rank(1)
 
     with _run_loaders(settings, dataset, cpu_backend) as loaders:
         resumed = BatchStream(settings, loaders, stage_manager, TrainingProgress())
@@ -924,7 +925,7 @@ def test_batch_stream_same_seed_yields_the_same_stream(
             return _micro_batches(settings, BatchStream(settings, loaders, stage_manager, TrainingProgress()), world_batches)
 
     first, second = packs(3), packs(3)
-    assert len(first) == len(second) == 3 * settings.gradient_accumulation_steps
+    assert len(first) == len(second) == 3 * settings.micro_batches_per_rank(1)
     assert _same_batches(first, second)
 
 
@@ -1045,7 +1046,7 @@ def _drop_stream(
 
 def _run_world_batches(settings: Settings, stream: BatchStream, world_batches: int) -> None:
     for _ in range(world_batches):
-        for _ in range(settings.gradient_accumulation_steps):
+        for _ in range(settings.micro_batches_per_rank(1)):
             next(stream)
         stream.progress.advance()
 
@@ -1313,11 +1314,11 @@ def test_packed_stream_yields_one_full_pack_per_micro_batch(
     """
 
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
-    assert settings.gradient_accumulation_steps == 4 and settings.tokens_per_optimizer_step == 1024
+    assert settings.micro_batches_per_rank(1) == 4 and settings.tokens_per_optimizer_step == 1024
     progress = TrainingProgress()
     stream = BatchStream(settings, loaders, stage_manager, progress)
     for _ in range(2):
-        for _ in range(settings.gradient_accumulation_steps):
+        for _ in range(settings.micro_batches_per_rank(1)):
             batch = next(stream)
             assert isinstance(batch, PackedBatch)
             for tensor in (batch.input_ids, batch.labels, batch.position_ids, batch.document_ids):
@@ -1341,7 +1342,7 @@ def test_packed_stream_draws_exactly_the_documents_the_padded_stream_would(
 
     settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
     stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
-    packs = [_next_pack(stream) for _ in range(settings.gradient_accumulation_steps)]
+    packs = [_next_pack(stream) for _ in range(settings.micro_batches_per_rank(1))]
     state = stream.state_dict()
     drawn = sum(len(pack.data_ids) for pack in packs) + len(state["pool"])
     assert state["consumed_rows"] == {"a": drawn} and state["buffers"] == {}
@@ -1453,6 +1454,87 @@ def test_batch_stream_drops_the_row_counter_of_a_source_that_is_gone(
     assert stream.state_dict()["consumed_rows"] == {"a": 7}
 
 
+# --- RankBatches: the per-rank view of the stream -------------------------------------------------------------------
+
+
+def _pack_tensors_equal(a: PackedBatch, b: PackedBatch) -> bool:
+    return all(
+        torch.equal(getattr(a, name), getattr(b, name)) for name in ("input_ids", "labels", "position_ids", "document_ids")
+    )
+
+
+def test_rank_batches_at_world_size_one_is_the_stream_itself(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    One rank: `RankBatches` hands out exactly the stream's packs, statistics included, and its state is the
+    stream's. A non-main rank without a stream, or a main rank without one, is a construction error.
+    """
+
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    reference_stream = BatchStream(settings, RunDataloaders({t: _Repeat(t) for t in "abc"}, [], stream_tokenizer, {}), stage_manager, TrainingProgress())
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    batches = RankBatches(cpu_backend, stream, settings.tokens_per_micro_batch)
+    for _ in range(4):
+        expected, actual = _next_pack(reference_stream), next(batches)
+        assert _pack_tensors_equal(expected, actual)
+        assert (actual.data_ids, actual.data_tokens, actual.padding_tokens) == (expected.data_ids, expected.data_tokens, expected.padding_tokens)
+    assert batches.state_dict() == stream.state_dict() and batches.state_dict()["consumed_rows"]
+    with pytest.raises(ValueError, match="main rank owns the data stream"):
+        RankBatches(cpu_backend, None, settings.tokens_per_micro_batch)
+
+    class NonMain(SingleDeviceBackend):
+        is_main = False
+
+    with pytest.raises(ValueError, match="only the main rank reads data"):
+        RankBatches(NonMain(device="cpu", precision="32"), stream, settings.tokens_per_micro_batch)
+
+
+def test_rank_batches_scatters_one_pack_per_rank_and_keeps_the_world_statistics_on_the_main_rank(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Two ranks, simulated in one process: the main rank pulls two packs, scatters the stacked `(2, 4, L)` tensor and
+    trains on pack 0, its returned pack carrying both packs' data ids, tokens and padding; the other rank receives
+    pack 1 with empty statistics, int32 document ids and an empty state dict.
+    """
+
+    scattered: list[torch.Tensor] = []
+
+    class MainOfTwo(SingleDeviceBackend):
+        world_size = 2
+
+        def scatter_packs(self, packs: torch.Tensor | None, slice_shape: tuple[int, ...]) -> torch.Tensor:
+            assert packs is not None and tuple(packs.shape) == (2, *slice_shape) and packs.dtype == torch.int64
+            scattered.append(packs)
+            return packs[0]
+
+    class SecondOfTwo(SingleDeviceBackend):
+        world_size, rank, is_main = 2, 1, False
+
+        def scatter_packs(self, packs: torch.Tensor | None, slice_shape: tuple[int, ...]) -> torch.Tensor:
+            assert packs is None
+            return scattered[-1][1]
+
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    reference_stream = BatchStream(settings, RunDataloaders({t: _Repeat(t) for t in "abc"}, [], stream_tokenizer, {}), stage_manager, TrainingProgress())
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    main = RankBatches(MainOfTwo(device="cpu", precision="32"), stream, settings.tokens_per_micro_batch)
+    second = RankBatches(SecondOfTwo(device="cpu", precision="32"), None, settings.tokens_per_micro_batch)
+    for _ in range(3):
+        first_pack, second_pack = _next_pack(reference_stream), _next_pack(reference_stream)
+        mine, theirs = next(main), next(second)
+        assert _pack_tensors_equal(mine, first_pack) and _pack_tensors_equal(theirs, second_pack)
+        assert mine.data_ids == first_pack.data_ids + second_pack.data_ids
+        assert mine.data_tokens == first_pack.data_tokens + second_pack.data_tokens
+        assert mine.padding_tokens == first_pack.padding_tokens + second_pack.padding_tokens
+        assert (theirs.data_ids, theirs.data_tokens, theirs.padding_tokens) == ([], [], 0)
+        assert theirs.document_ids.dtype == torch.int32 and mine.document_ids.dtype == torch.int32
+        assert theirs.input_ids.shape == (1, settings.tokens_per_micro_batch)
+    assert second.state_dict() == {} and main.state_dict() == stream.state_dict()
+    second.load_state_dict({"anything": 1})  # nothing to restore on a rank without a stream
+
+
 def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> None:
     """
     A pack reaches the model as `input_ids`, `labels`, `position_ids` and the ready document mask (dense on the
@@ -1480,7 +1562,7 @@ def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> N
     """
 
     settings = reference_settings()
-    assert settings.gradient_accumulation_steps == 2
+    assert settings.micro_batches_per_rank(1) == 2
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     results = run_steps(settings, cpu_backend, model, optimizer, steps=2)

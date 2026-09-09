@@ -312,6 +312,50 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
     assert lines[-1].endswith("INFO data_preparation.training.data.dataset_resolver: source a: 40 processed rows, all training")
 
 
+def test_a_non_main_rank_logs_warnings_only_with_a_rank_prefix(
+    capsys: pytest.CaptureFixture[str],
+    detached_training_handlers: logging.Logger,
+    detached_data_preparation_handlers: logging.Logger,
+) -> None:
+    """
+    Under torchrun a rank above 0 keeps WARNING and above on both hierarchies, every line prefixed with `[rank N]`,
+    so the main rank tells the story of the run and a failing rank is still heard.
+    """
+
+    training_logger = train_module.configure_console_logging(rank=3)
+    assert training_logger.level == logging.WARNING and detached_data_preparation_handlers.level == logging.WARNING
+    logging.getLogger("training.logger").info("Total training steps: 20 (2 micro-batches each)")
+    logging.getLogger("data_preparation.training.data.dataset_resolver").info("source a: 40 processed rows, all training")
+    logging.getLogger("training.run").warning("the loader workers do not keep up")
+    logging.getLogger("data_preparation.lib.build.runner").error("shard broken")
+    lines = capsys.readouterr().err.rstrip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("[rank 3] ") and lines[0].endswith("WARNING training.run: the loader workers do not keep up")
+    assert lines[1].startswith("[rank 3] ") and lines[1].endswith("ERROR data_preparation.lib.build.runner: shard broken")
+    # back on the main rank: INFO again, no prefix (the same handlers, reconfigured)
+    train_module.configure_console_logging(rank=0)
+    logging.getLogger("training.logger").info("resumed")
+    line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert not line.startswith("[rank") and line.endswith("INFO training.logger: resumed")
+
+
+def test_main_on_a_non_main_rank_prints_no_summary(
+    monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], detached_training_handlers: logging.Logger
+) -> None:
+    """
+    `RANK=1` (torchrun): the run happens, the report summary is the main rank's to print.
+    """
+
+    monkeypatch.setenv("RANK", "1")
+    fake_train = FakeTrain(_report(tmp_path / "out"))
+    monkeypatch.setattr(train_module, "train", fake_train)
+    assert main(["--config", str(yaml_path)]) == 0
+    assert len(fake_train.calls) == 1 and capsys.readouterr().out == ""
+    assert train_module.launch_rank() == 1
+    monkeypatch.delenv("RANK")
+    assert train_module.launch_rank() == 0
+
+
 # --- end to end in a pseudo-terminal: the live dashboard ---------------------------------------------------------------
 
 

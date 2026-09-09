@@ -7,8 +7,13 @@ Everything here is numerics, bit-identical to the thesis loop; the golden tests 
 fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
 run, the source of every document chosen deterministically so that the sources' TOKEN shares follow the stage
 weights (`BatchStream._pick_source`), and the documents packed into one row per micro-batch
-(`training.data.packing`). Steps are OPTIMIZER steps: `gradient_accumulation_steps` packed micro-batches, one
-`optimizer.step()`.
+(`training.data.packing`). Steps are OPTIMIZER steps: `micro_batches_per_step` packed micro-batches over all ranks
+(`Settings.micro_batches_per_rank` of them on each), one `optimizer.step()`.
+
+With several ranks the stream lives on the main rank only: `RankBatches` is every rank's view of it. Per micro-batch
+index the main rank pulls one pack per rank, scatters each rank its own (`Backend.scatter_packs`) and keeps the data
+statistics of all of them, so the logged composition describes the whole world's step; the other ranks own no train
+loader at all. At world size 1 it is the stream itself.
 """
 
 import logging
@@ -24,7 +29,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from model.layers.attention import document_attention_mask
-from training.backend.base import Backend, plain_model
+from training.backend.base import Backend
 from training.data.collate import Sample
 from training.data.loader import RunDataloaders
 from training.data.packing import PackedBatch, PackPool, pack_samples, shifted_length
@@ -91,7 +96,7 @@ class StepResult:
 
 class BatchStream:
     """
-    Endless stream of packed micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
+    Endless stream of packed micro-batches; every `micro_batches_per_step` of them form one optimizer step.
 
     One reader per source for the whole run; stages only change the weights, so a source shared by two stages is
     never re-read. Every document goes into a `PackPool`: before every micro-batch the pool is refilled to
@@ -283,6 +288,83 @@ class BatchStream:
             yield pack_samples(samples, pool.pack_length, self.loaders.tokenizer, IGNORE_INDEX)
 
 
+# The tensors of a pack a rank receives, in the order they are stacked for the scatter (`RankBatches`); all `(1, L)`
+PACK_TENSORS = ("input_ids", "labels", "position_ids", "document_ids")
+
+
+class RankBatches:
+    """
+    This rank's packed micro-batches: the `BatchStream` itself at world size 1, otherwise the main rank's stream
+    scattered one pack per rank and micro-batch index.
+
+    The main rank pulls `world_size` packs per `__next__`, stacks their four `(1, L)` tensors into a
+    `(world_size, 4, L)` int64 tensor (`PACK_TENSORS` order, the int32 document ids widened for the stack), scatters it
+    (`Backend.scatter_packs`) and trains on pack 0. The pack it returns carries the data statistics of ALL packs
+    (`data_ids` / `data_tokens` concatenated in pack order, `padding_tokens` summed), so `StepResult` and the logger's
+    composition and padding metrics describe the world's step without knowing about ranks. The other ranks receive
+    their slice and return it with empty statistics (their logger is silent anyway). One collective per micro-batch
+    index: the main rank packs micro-batch i + 1 while the devices run i.
+
+    `state_dict` / `load_state_dict` are the stream's on the main rank; the state dict is empty on the other ranks,
+    whose checkpoint is never written.
+    """
+
+    def __init__(self, backend: Backend, stream: "BatchStream | None", pack_length: int) -> None:
+        if backend.is_main and stream is None:
+            raise ValueError("the main rank owns the data stream and must pass it")
+        if not backend.is_main and stream is not None:
+            raise ValueError("only the main rank reads data; a non-main rank passes no stream")
+        self.backend = backend
+        self.stream = stream
+        self.pack_length = pack_length
+
+    def __iter__(self) -> Iterator[PackedBatch]:
+        return self
+
+    def __next__(self) -> PackedBatch:
+        backend = self.backend
+        slice_shape = (len(PACK_TENSORS), self.pack_length)
+        if self.stream is not None:
+            if backend.world_size == 1:
+                return next(self.stream)
+            packs = [next(self.stream) for _ in range(backend.world_size)]
+            stacked = torch.stack(
+                [torch.cat([getattr(pack, name).to(torch.int64) for name in PACK_TENSORS], dim=0) for pack in packs]
+            )
+            mine = backend.scatter_packs(stacked, slice_shape)
+            return self._pack_from(
+                mine,
+                data_ids=[data_id for pack in packs for data_id in pack.data_ids],
+                data_tokens=[tokens for pack in packs for tokens in pack.data_tokens],
+                padding_tokens=sum(pack.padding_tokens for pack in packs),
+            )
+        return self._pack_from(backend.scatter_packs(None, slice_shape), data_ids=[], data_tokens=[], padding_tokens=0)
+
+    @staticmethod
+    def _pack_from(rows: Tensor, *, data_ids: list[str], data_tokens: list[int], padding_tokens: int) -> PackedBatch:
+        """
+        The `PackedBatch` of one received `(4, L)` slice: the rows back to `(1, L)` each, the document ids to int32.
+        """
+
+        input_ids, labels, position_ids, document_ids = (rows[index : index + 1] for index in range(len(PACK_TENSORS)))
+        return PackedBatch(
+            input_ids=input_ids,
+            labels=labels,
+            data_ids=data_ids,
+            position_ids=position_ids,
+            document_ids=document_ids.to(torch.int32),
+            padding_tokens=padding_tokens,
+            data_tokens=data_tokens,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.stream.state_dict() if self.stream is not None else {}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if self.stream is not None:
+            self.stream.load_state_dict(state)
+
+
 def scheduled_learning_rate(settings: Settings, stage_manager: StageManager, progress: TrainingProgress) -> float:
     """
     The LR of optimizer step `progress.step`: trapezoid warmup / cooldown over the whole run, the per-stage base
@@ -325,20 +407,21 @@ def run_one_optimizer_step(
     progress: TrainingProgress,
 ) -> StepResult:
     """
-    Run optimizer step `progress.step`: `gradient_accumulation_steps` packed micro-batches from `batches`, one
-    `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
+    Run optimizer step `progress.step`: this rank's `micro_batches_per_rank` packed micro-batches from `batches`,
+    one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
 
     Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
-    loss is all-reduced every step (a no-op on one device). The loss is the mean over the valid tokens of each pack,
+    loss is all-reduced every step (a no-op on one device) BEFORE it is checked for finiteness, so every rank sees
+    the same number and makes the same decision to raise. The loss is the mean over the valid tokens of each pack,
     averaged over the packs: with full packs the valid-token counts are nearly equal (they differ by the pack tails),
     so the step loss is close to token-weighted. Training on padded rows was removed for exactly this reason: the
     loader sorted a world batch by length, so a micro-batch of short rows weighed as much as one of full rows.
     """
 
     step = progress.step
-    accumulation_steps = settings.gradient_accumulation_steps
-    plain_model(model).step = step
+    accumulation_steps = settings.micro_batches_per_rank(backend.world_size)
+    backend.plain_model(model).step = step
     stage = stage_manager.get_stage_info(step)
     learning_rate = scheduled_learning_rate(settings, stage_manager, progress)
     set_lr(optimizer, learning_rate)
@@ -359,7 +442,7 @@ def run_one_optimizer_step(
                 outputs = model(**inputs)
             backend.backward(outputs["loss"] / accumulation_steps)
         loss_sum += outputs["loss"].detach()
-    loss = loss_sum / accumulation_steps
+    loss = backend.all_reduce(loss_sum / accumulation_steps)  # the world mean: every rank checks the same number
     if not torch.isfinite(loss):
         raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")
 
@@ -374,7 +457,7 @@ def run_one_optimizer_step(
     metrics: dict[str, Tensor] = {}
     if (step + 1) % settings.log_step_interval == 0:
         if settings.log_gradient_metrics:
-            metrics = track_gradient_metrics(model, optimizer)
+            metrics = track_gradient_metrics(backend.plain_model(model), optimizer)  # the DDP wrapper hides `.transformer`
         # packing efficiency: the share of the step's tokens that were pack tails
         metrics["packing/padding_fraction"] = torch.tensor(padding_tokens / settings.tokens_per_optimizer_step)
     optimizer.zero_grad(set_to_none=True)
@@ -382,7 +465,7 @@ def run_one_optimizer_step(
     return StepResult(
         step=step,
         learning_rate=learning_rate,
-        loss=backend.all_reduce(loss),
+        loss=loss,
         grad_norm=grad_norm,
         stage=stage,
         data_ids=data_ids,

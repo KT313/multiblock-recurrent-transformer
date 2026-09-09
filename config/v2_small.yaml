@@ -83,7 +83,7 @@ min_lr: 0                            # LR floor of warmup and cooldown
 log_step_interval: 8                 # log training metrics every this many steps (gradient metrics sync the GPU)
 log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
 eval_step_interval: 16               # run validation every this many steps
-eval_iters: 50                       # validation batches per evaluated depth
+eval_iters: 64                       # validation batches per evaluated depth
 validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
 validation_padding_multiple: 128     # pad validation batches to a multiple of this many tokens (null: the longest row)
 partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at validation (plus the mean recurrence)

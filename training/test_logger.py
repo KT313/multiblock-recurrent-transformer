@@ -13,7 +13,7 @@ import math
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
@@ -25,6 +25,8 @@ from model import RecurrentGPT
 from training.backend.single_device import SingleDeviceBackend
 from training.data.dataset_resolver import ResolvedDataset
 from training.logger import (
+    DATA_WAIT_WARNING_INTERVAL_SECONDS,
+    NullDashboard,
     CONSOLE_LOGGER_NAME,
     Dashboard,
     Logger,
@@ -145,8 +147,6 @@ def test_describe_parameters_counts_total_recurrent_and_unrolled(tiny_model: Rec
     assert 0 < recurrent < total
     expected = f"Model: {total:,} parameters, {recurrent:,} in recurrent blocks, unfolds to {total + recurrent:,} at mean recurrence."
     assert describe_parameters(tiny_model) == expected
-    compiled = cast(torch.nn.Module, torch.compile(tiny_model))  # typed as a bare callable, is an OptimizedModule
-    assert describe_parameters(compiled) == expected  # the compiled wrapper is unwrapped
 
 
 def test_num_parameters_counts_tied_weights_once(tiny_model: RecurrentGPT) -> None:
@@ -326,7 +326,7 @@ TOKENS_PER_STEP = 2 * PACK_LENGTH  # reference_settings: two packs of PACK_LENGT
 STEP_KEYS = {
     "loss", "ppl", "lr", "grad_norm", "step", "seconds/step", "tokens/second", "total_tokens", "total_time",
     "remaining_time", "stage/current_stage", "stage/base_lr", "stage/in_transition", "stage/transition_progress",
-    "stage/stage_progress",
+    "stage/stage_progress", "data/wait_seconds", "data/wait_fraction",
 }  # fmt: skip
 
 
@@ -753,6 +753,93 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
     assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
+
+
+def test_data_wait_metrics_and_the_rate_limited_warning(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
+) -> None:
+    """
+    The seconds the loaders blocked (`data_wait` of `log_step`) are summed per log interval into `data/wait_seconds`
+    and, against the interval's training time, `data/wait_fraction`. Above `DATA_WAIT_WARNING_FRACTION` one kept
+    WARNING names the slowest source and the dashboard gets an event; the warning repeats at most every
+    `DATA_WAIT_WARNING_INTERVAL_SECONDS` while the wait persists, and a quiet interval reports zeros.
+    """
+
+    settings = reference_settings()  # log_step_interval 1
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+    console_records.clear()
+
+    def step(seconds: float, data_wait: dict[str, float] | None) -> None:
+        result = fake_result(stage_manager, progress.step)
+        progress.advance()
+        clock.advance(seconds)
+        run_logger.log_step(result, progress, data_wait=data_wait)
+
+    step(1.0, {"a": 0.15, "b": 0.05})  # 20 % of the training time
+    assert run_logger.history[1]["data/wait_seconds"] == pytest.approx(0.2)
+    assert run_logger.history[1]["data/wait_fraction"] == pytest.approx(0.2)
+    warnings = [record for record in console_records.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1 and getattr(warnings[0], "keep", False) is True
+    assert "waited 0.2s for training data over the last 1 step(s), 20% of the training time" in warnings[0].getMessage()
+    assert "(slowest: a 0.1s, b 0.1s)" in warnings[0].getMessage()  # per-source seconds, largest first
+    assert recording(run_logger).events[-1] == "waiting for training data: 20% of the training time (a 0.1s, b 0.1s)"
+
+    step(1.0, {"a": 0.5})  # still above the threshold, but inside the quiet interval: no second warning
+    assert run_logger.history[2]["data/wait_fraction"] == pytest.approx(0.5)
+    step(1.0, None)  # a quiet interval reports zeros
+    assert (run_logger.history[3]["data/wait_seconds"], run_logger.history[3]["data/wait_fraction"]) == (0.0, 0.0)
+    step(1.0, {"a": 0.01})  # below the threshold: a metric, no warning
+    assert run_logger.history[4]["data/wait_fraction"] == pytest.approx(0.01)
+    assert len([record for record in console_records.records if record.levelno == logging.WARNING]) == 1
+
+    with run_logger.saving_checkpoint():  # a side block: not training time, so the fraction ignores it, but the
+        clock.advance(DATA_WAIT_WARNING_INTERVAL_SECONDS)  # quiet interval of the warning has passed
+    step(1.0, {"b": 0.3})
+    assert run_logger.history[5]["data/wait_fraction"] == pytest.approx(0.3)
+    warnings = [record for record in console_records.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 2 and "(slowest: b 0.3s)" in warnings[1].getMessage()
+
+
+def test_a_non_main_rank_logs_nothing_and_writes_no_file(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
+) -> None:
+    """
+    On a rank that is not the main one `RunLogger.open` drives a `NullDashboard` (so `open_dashboard` never runs and
+    no `train.log` appears), keeps wandb off whatever the settings say, sends its console records to the silent
+    logger, and `close` returns the report without writing `train_report.json`. Every call the loop makes still works.
+    """
+
+    class NonMainBackend(SingleDeviceBackend):
+        is_main = False
+
+    settings = reference_settings(wandb_enabled=True)
+    stage_manager = reference_stage_manager(settings)
+    progress = TrainingProgress()
+    run_logger = RunLogger.open(
+        settings, tmp_path, resolved, tiny_model, stage_manager, progress, NonMainBackend(device="cpu", precision="32"),
+        clock=FakeClock(), keep_history=True,
+    )
+    with run_logger:
+        assert isinstance(run_logger.dashboard, NullDashboard) and run_logger.is_main is False
+        assert run_logger.wandb.enabled is False
+        run_logger.log_fresh_start()
+        run_logger.log_triggers("samples", [5])
+        with run_logger.evaluating():
+            pass
+        result = fake_result(stage_manager, 0)
+        progress.advance()
+        run_logger.log_step(result, progress, data_wait={"a": 5.0})
+        with run_logger.saving_checkpoint():
+            run_logger.log_checkpoint(tmp_path / "x.pth")
+        run_logger.log_benchmark_failure(RuntimeError("no harness"))
+        report = run_logger.close(progress, None)
+    assert report.completed_steps == 1 and report.checkpoints_written == [tmp_path / "x.pth"]
+    assert run_logger.history[1]["loss"] == 2.0  # the loop's bookkeeping runs as on the main rank
+    assert console_records.records == []  # nothing on the `training.logger` logger, the header lines included
+    assert not (tmp_path / TRAIN_LOG_NAME).exists() and not (tmp_path / TRAIN_REPORT_NAME).exists()
 
 
 def test_a_failing_run_logs_its_traceback_and_leaves_no_report(

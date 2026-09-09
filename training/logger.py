@@ -9,6 +9,16 @@ ending in a `TrainingReport`.
 * records on the `training.logger` logger, marked `extra={"keep": True}` so they survive under the live display;
 * dashboard calls: `update_step` at every step (the metric dict only at log steps, so no device sync is added),
   `update_validation`, `note_event` and `set_status`.
+
+Only the main rank logs: on any other rank (`backend.is_main` False) the logger runs the same code with a
+`NullDashboard`, wandb off, its console records on a silent logger and no `train.log` / `train_report.json`. Nothing
+of what a step reports is rank-specific (the loss is all-reduced, the gradients averaged, the data statistics belong
+to the rank that packs), so the other ranks have nothing to send.
+
+`log_step` also takes the seconds the loaders blocked on a worker batch (`RunDataloaders.take_wait_seconds`) and
+reports them per log interval as `data/wait_seconds` and `data/wait_fraction`; a fraction above
+`DATA_WAIT_WARNING_FRACTION` is a kept WARNING (rate-limited), since a GPU waiting for data is a run that trains slower
+than it could.
 """
 
 from __future__ import annotations
@@ -30,7 +40,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from evaluation.samples import GeneratedSample
-from training.backend.base import plain_model
+from model import RecurrentGPT
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
@@ -46,8 +56,18 @@ if TYPE_CHECKING:
     from training.step import StepResult, TrainingProgress  # `step.py` imports `track_gradient_metrics` from here
 
 CONSOLE_LOGGER_NAME = "training.logger"  # under the `training` hierarchy; named explicitly, not via `__name__`
+SILENT_CONSOLE_LOGGER_NAME = f"{CONSOLE_LOGGER_NAME}.silent"  # the non-main ranks' console: nothing leaves it
 
 console = logging.getLogger(CONSOLE_LOGGER_NAME)
+silent_console = logging.getLogger(SILENT_CONSOLE_LOGGER_NAME)
+silent_console.setLevel(logging.CRITICAL + 1)  # no record is even created (pytest attaches its handlers to every logger)
+silent_console.propagate = False  # and one that were would not reach the `training` handlers or the dashboard
+silent_console.addHandler(logging.NullHandler())
+
+# The share of an interval's training time spent waiting for training data above which `log_step` warns, and how
+# long it then stays quiet while the wait persists. Constants, not settings: neither changes the run's numbers.
+DATA_WAIT_WARNING_FRACTION = 0.05
+DATA_WAIT_WARNING_INTERVAL_SECONDS = 600.0
 
 
 class Logger:
@@ -130,18 +150,17 @@ def num_parameters(model: Module, only_trainable: bool = False) -> int:
     return sum(parameter.numel() for parameter in parameters)
 
 
-def describe_parameters(model: Module) -> str:
+def describe_parameters(model: RecurrentGPT) -> str:
     """
     The parameter-count line printed at the start of a run: total parameters, parameters inside the recurrent core
     blocks and the count of the unrolled model at the mean recurrence (`total - recurrent + recurrent * mean of
-    mean_recurrence`). Accepts the compiled wrapper too (it is unwrapped).
+    mean_recurrence`). Takes the plain model (`Backend.plain_model`), not a wrapper.
     """
 
-    unwrapped = plain_model(model)
-    total_parameters = num_parameters(unwrapped)
-    core_blocks = cast(Iterable[Module], unwrapped.transformer.core_blocks)
+    total_parameters = num_parameters(model)
+    core_blocks = cast(Iterable[Module], model.transformer.core_blocks)
     recurrent_parameters = sum(parameter.numel() for block in core_blocks for parameter in block.parameters())
-    mean_recurrence = cast(list[int], unwrapped.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
+    mean_recurrence = cast(list[int], model.config.mean_recurrence)  # a list after RecurrentConfig.__post_init__
     mean_of_means = sum(mean_recurrence) / len(mean_recurrence)
     unrolled_parameters = int(total_parameters - recurrent_parameters + recurrent_parameters * mean_of_means)
     return (
@@ -251,6 +270,29 @@ class Dashboard(Protocol):
     def discount_time(self, seconds: float) -> None: ...
 
 
+class NullDashboard:
+    """
+    The `Dashboard` of a non-main rank: every call is a no-op, no display, no log file.
+    """
+
+    def update_step(
+        self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
+    ) -> None:
+        return None
+
+    def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
+        return None
+
+    def note_event(self, text: str) -> None:
+        return None
+
+    def set_status(self, text: str) -> None:
+        return None
+
+    def discount_time(self, seconds: float) -> None:
+        return None
+
+
 @contextmanager
 def open_dashboard(
     settings: Settings, run_directory: Path, stage_manager: StageManager, *, start_step: int, device: str
@@ -305,7 +347,9 @@ class RunLogger:
 
     Create it with `open()` once the setup is done and use it as a context manager, so a failing loop still releases
     the dashboard; `close()` returns the `TrainingReport`. Nothing here touches the numerics: tensors become floats
-    only at log steps and for validation metrics, where the thesis loop called `.item()`.
+    only at log steps and for validation metrics, where the thesis loop called `.item()`. With `is_main` False (a
+    non-main rank) the same calls run against a `NullDashboard` and a silent console logger, and `close` writes no
+    report file.
     """
 
     def __init__(
@@ -317,6 +361,7 @@ class RunLogger:
         *,
         start_step: int,
         device: str,
+        is_main: bool = True,
         dashboard: Dashboard | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -329,15 +374,19 @@ class RunLogger:
         self.wandb = wandb
         self.start_step = start_step  # `progress.step` when the logger opened (the resume step, 0 for a fresh run)
         self.device = device
+        self.is_main = is_main  # False on a non-main rank: no dashboard, no console records, no report file
+        self.console = console if is_main else silent_console
         self._exit_stack = ExitStack()  # closed by `close()` / `__exit__`; the dashboard is entered on it
-        # a given dashboard (tests) is driven as it is and not closed here; else `open_dashboard` picks one for the run
-        self.dashboard: Dashboard = (
-            dashboard
-            if dashboard is not None
-            else self._exit_stack.enter_context(
+        # a given dashboard (tests) is driven as it is and not closed here; a non-main rank drives a `NullDashboard`;
+        # else `open_dashboard` picks one for the run (and owns `train.log`)
+        if dashboard is not None:
+            self.dashboard: Dashboard = dashboard
+        elif not is_main:
+            self.dashboard = NullDashboard()
+        else:
+            self.dashboard = self._exit_stack.enter_context(
                 open_dashboard(settings, run_directory, stage_manager, start_step=start_step, device=device)
             )
-        )
         self.keep_history = keep_history  # a test knob: fill `history`
         self.history: dict[int, dict[str, float]] = {}  # per logged step: the metric dict as floats, if kept
         self.checkpoints_written: list[Path] = []
@@ -354,6 +403,8 @@ class RunLogger:
         self._interval_step = start_step  # the step the interval timer started at
         self._side_seconds = 0.0  # seconds spent outside the training loop since the last log step (`_timed_status`)
         self._token_counter: dict[str, int] = {}  # document tokens trained per data id since the last log step
+        self._data_wait: dict[str, float] = {}  # seconds the loaders blocked per source since the last log step
+        self._data_wait_warned_at: float | None = None  # clock reading of the last data-wait warning
         self._evaluation_seconds: float | None = None  # duration of the last `evaluating()` block, read by `log_step`
         self._status = "starting"  # the dashboard's header status; `_status_during` restores it after a block
         self._last_loss: float | None = None
@@ -382,19 +433,22 @@ class RunLogger:
         dashboard (unless `dashboard` is given), then the console header lines. The setup timer ends and the train
         timer starts here. `progress.step` is the resume step; `setup_started` the *wall-clock* reading at the start
         of the run (`train.py`), measured against `wall_clock`, while `clock` (monotonic) times everything the run
-        itself measures; `clock`, `wall_clock` and `keep_history` are test knobs.
+        itself measures; `clock`, `wall_clock` and `keep_history` are test knobs. On a non-main rank
+        (`backend.is_main` False) wandb stays off and the logger is silent (class docstring).
         """
 
+        is_main = backend.is_main
         wandb = Logger(
             settings.logger_project,
             settings.run_name,
             run_directory,
             offline=settings.wandb_offline,
-            enabled=settings.wandb_enabled,
+            enabled=settings.wandb_enabled and is_main,
             resume_step=progress.resume_step if progress.resume_step >= 0 else None,
         )
         wandb.log_hyperparams(asdict(settings) | {"dataset_config_hash": dataset.config_hash})
-        wandb.log_summary({"num_parameters": num_parameters(plain_model(model))})
+        plain = backend.plain_model(model)
+        wandb.log_summary({"num_parameters": num_parameters(plain)})
         run_logger = cls(
             settings,
             run_directory,
@@ -402,19 +456,21 @@ class RunLogger:
             wandb,
             start_step=progress.step,
             device=str(backend.device),
+            is_main=is_main,
             dashboard=dashboard,
             clock=clock,
             wall_clock=wall_clock,
             setup_started=setup_started,
             keep_history=keep_history,
         )
-        console.info(stage_manager.get_stage_summary(), extra=KEEP)
-        console.info(
-            f"Total training steps: {stage_manager.total_steps:,} ({settings.gradient_accumulation_steps} micro-batches each)",
+        run_logger.console.info(stage_manager.get_stage_summary(), extra=KEEP)
+        run_logger.console.info(
+            f"Total training steps: {stage_manager.total_steps:,} "
+            f"({settings.micro_batches_per_rank(backend.world_size)} micro-batches each)",
             extra=KEEP,
         )
-        console.info(describe_parameters(model), extra=KEEP)
-        console.info(
+        run_logger.console.info(describe_parameters(plain), extra=KEEP)
+        run_logger.console.info(
             f"Setup took {run_logger.setup_seconds:.1f}s, starting training at step {progress.step} "
             f"on {run_logger.device} ({settings.precision}).",
             extra=KEEP,
@@ -438,7 +494,7 @@ class RunLogger:
         """
 
         if exc is not None and self._report is None:
-            console.error("Training failed: %s", exc, exc_info=exc, extra=KEEP)
+            self.console.error("Training failed: %s", exc, exc_info=exc, extra=KEEP)
             self.status("failed")
         failures: list[BaseException] = []
         for release in (self.wandb.finish, self._exit_stack.close):
@@ -557,7 +613,7 @@ class RunLogger:
         """
 
         if steps:
-            console.info("%s after steps: %s", label, ", ".join(str(step) for step in steps))
+            self.console.info("%s after steps: %s", label, ", ".join(str(step) for step in steps))
 
     def log_samples(self, path: Path, samples: Sequence[GeneratedSample]) -> None:
         """
@@ -591,17 +647,20 @@ class RunLogger:
         The benchmark run raised: a kept warning and an event; the run goes on.
         """
 
-        console.warning("benchmark evaluation failed, the run continues: %s", error, extra=KEEP)
+        self.console.warning("benchmark evaluation failed, the run continues: %s", error, extra=KEEP)
         self.dashboard.note_event(f"benchmark evaluation failed: {error}")
 
     # --- steps -------------------------------------------------------------------------------------------------------
 
-    def log_step(self, result: StepResult, progress: TrainingProgress) -> None:
+    def log_step(
+        self, result: StepResult, progress: TrainingProgress, data_wait: Mapping[str, float] | None = None
+    ) -> None:
         """
-        Account one completed optimizer step (`progress.step`, after `progress.advance()`).
+        Account one completed optimizer step (`progress.step`, after `progress.advance()`). `data_wait`: the seconds
+        the train loaders blocked on a worker batch per source during the step (`RunDataloaders.take_wait_seconds`).
 
-        Every step: the document tokens per data id join the composition counter, a transition starting or ending
-        becomes an event, a
+        Every step: the document tokens per data id join the composition counter, the data wait joins its counter,
+        a transition starting or ending becomes an event, a
         set `result.validation` becomes the dashboard's validation row, the bars move (with an empty metric dict, so
         no tensor is read). At log steps (`step % log_step_interval == 0`, and the final step whatever the interval)
         the metric dict goes to wandb, to `history` with `keep_history`, and to the dashboard:
@@ -615,12 +674,17 @@ class RunLogger:
         * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
           step (`result.data_tokens`: document slots, pack tails excluded), the realised token share the stage
           weights promise;
+        * `data/wait_seconds`, `data/wait_fraction`: the seconds the loaders blocked on a worker batch since the last
+          log step and their share of the interval's training time; above `DATA_WAIT_WARNING_FRACTION` a kept
+          warning names the slowest sources, repeated at most every `DATA_WAIT_WARNING_INTERVAL_SECONDS`;
         * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`,
           `val_loss/<data id>` per validation source, `val_time`).
         """
 
         for data_id, tokens in result.data_tokens.items():
             self._token_counter[data_id] = self._token_counter.get(data_id, 0) + tokens
+        for source, seconds in (data_wait or {}).items():
+            self._data_wait[source] = self._data_wait.get(source, 0.0) + seconds
         stage_at_done = self.stage_manager.get_stage_info(progress.step)
         self._note_transition(result.stage, stage_at_done)
         validation = self._log_validation(result, progress)
@@ -708,13 +772,46 @@ class RunLogger:
         }
         metrics |= {f"data_composition/{name}": count / total_tokens for name, count in self._token_counter.items()}
         self._token_counter.clear()
+        metrics |= self._data_wait_metrics(now, training_seconds, steps_in_interval)
         return metrics
+
+    def _data_wait_metrics(self, now: float, training_seconds: float, steps: int) -> dict[str, float]:
+        """
+        `data/wait_seconds` and `data/wait_fraction` of the interval that just ended (`_step_metrics`), the warning
+        when the fraction is above `DATA_WAIT_WARNING_FRACTION` (at most once per `DATA_WAIT_WARNING_INTERVAL_SECONDS`),
+        and the reset of the wait counter.
+        """
+
+        wait_seconds = sum(self._data_wait.values())
+        fraction = wait_seconds / training_seconds if training_seconds > 0 else 0.0
+        if fraction > DATA_WAIT_WARNING_FRACTION and (
+            self._data_wait_warned_at is None or now - self._data_wait_warned_at >= DATA_WAIT_WARNING_INTERVAL_SECONDS
+        ):
+            self._data_wait_warned_at = now
+            slowest = ", ".join(
+                f"{source} {seconds:.1f}s"
+                for source, seconds in sorted(self._data_wait.items(), key=lambda item: -item[1])[:3]
+            )
+            self.console.warning(
+                "the run waited %.1fs for training data over the last %d step(s), %.0f%% of the training time "
+                "(slowest: %s): the loader workers do not keep up with the model (worker start-ups are not counted), "
+                "tokenization is the bottleneck",
+                wait_seconds,
+                steps,
+                100 * fraction,
+                slowest,
+                extra=KEEP,
+            )
+            self.dashboard.note_event(f"waiting for training data: {100 * fraction:.0f}% of the training time ({slowest})")
+        self._data_wait.clear()
+        return {"data/wait_seconds": wait_seconds, "data/wait_fraction": fraction}
 
     def close(self, progress: TrainingProgress, export_dir: Path | None, *, stopped: bool = False) -> TrainingReport:
         """
         End the run's logging: `train_time` into the wandb summary, the final console line and status, the
         dashboard closed; returns the report, also written to `train_report.json` in the run directory (the last
-        process's report; a resume overwrites it). `stopped` says the run ended on request before its last step.
+        process's report; a resume overwrites it) by the main rank. `stopped` says the run ended on request before
+        its last step.
         A second call logs nothing, sets no status and rewrites nothing: it returns the report of the first.
         """
 
@@ -724,7 +821,7 @@ class RunLogger:
         self.wandb.log_summary({"train_time": train_seconds})
         self.wandb.finish()
         ending = "stopped on request" if stopped else "finished"
-        console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
+        self.console.info(f"Training {ending} after {progress.step} steps in {train_seconds:.1f}s.", extra=KEEP)
         self.status(ending)
         self._exit_stack.close()
         report = TrainingReport(
@@ -743,7 +840,8 @@ class RunLogger:
             samples_written=list(self.samples_written),
             last_benchmarks=dict(self._last_benchmarks),
         )
-        report.write_json(self.run_directory / TRAIN_REPORT_NAME)
+        if self.is_main:
+            report.write_json(self.run_directory / TRAIN_REPORT_NAME)
         self._report = report
         return report
 

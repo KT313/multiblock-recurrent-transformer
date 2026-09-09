@@ -25,6 +25,7 @@ from training.settings import (
     OptimizerConfig,
     Settings,
     parse_settings,
+    split_over_ranks,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -76,7 +77,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "log_step_interval": 1,
     "log_gradient_metrics": True,
     "eval_step_interval": 16,
-    "eval_iters": 50,
+    "eval_iters": 64,
     "partial_depth_eval": [1, 2, 4, 8, 16],
     "save_step_interval": 128,
     "save_last_step": True,
@@ -303,7 +304,7 @@ def test_defaults_are_a_single_gpu_config() -> None:
     assert cfg.dataset_dir == "dataset" and cfg.auto_prepare is True and cfg.prepare_num_workers == 2
     assert cfg.prepare_max_parallel_downloads == 2
     assert cfg.allow_dataset_change is False
-    assert cfg.gradient_accumulation_steps == cfg.micro_batches_per_step == 4
+    assert cfg.micro_batches_per_rank(1) == cfg.micro_batches_per_step == 4
 
 
 def test_validation_empty_dataset_config() -> None:
@@ -334,7 +335,7 @@ def test_validation_of_nonsensical_batch_sizes() -> None:
             _settings(tokens_per_micro_batch=bad)
         with pytest.raises(ValueError, match="validation_batch_size must be positive"):
             _settings(validation_batch_size=bad)
-    assert _settings(micro_batches_per_step=1).gradient_accumulation_steps == 1
+    assert _settings(micro_batches_per_step=1).micro_batches_per_rank(1) == 1
 
 
 def test_validation_misaligned_eval_and_log_intervals() -> None:
@@ -374,8 +375,26 @@ def test_settings_do_not_touch_the_filesystem(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("packs", [1, 4, 32])
-def test_gradient_accumulation_steps_is_the_packs_per_step(packs: int) -> None:
-    assert _settings(micro_batches_per_step=packs).gradient_accumulation_steps == packs
+def test_micro_batches_per_rank_is_the_packs_per_step_on_one_rank(packs: int) -> None:
+    assert _settings(micro_batches_per_step=packs).micro_batches_per_rank(1) == packs
+
+
+def test_per_rank_counts_split_the_world_totals_and_refuse_a_remainder() -> None:
+    """
+    `micro_batches_per_step` and `eval_iters` are world totals: every rank takes an equal share, a remainder is an
+    error naming the setting (the step and the evaluation must be the same size whatever the world size).
+    """
+
+    cfg = _settings(micro_batches_per_step=8, eval_iters=6)
+    assert [cfg.micro_batches_per_rank(world) for world in (1, 2, 4, 8)] == [8, 4, 2, 1]
+    assert [cfg.eval_iters_per_rank(world) for world in (1, 2, 3, 6)] == [6, 3, 2, 1]
+    with pytest.raises(ValueError, match=r"micro_batches_per_step \(8\) must be a multiple of the number of ranks \(3\)"):
+        cfg.micro_batches_per_rank(3)
+    with pytest.raises(ValueError, match=r"eval_iters \(6\) must be a multiple of the number of ranks \(4\)"):
+        cfg.eval_iters_per_rank(4)
+    with pytest.raises(ValueError, match="number of ranks must be at least 1"):
+        cfg.micro_batches_per_rank(0)
+    assert split_over_ranks("x", 10, 5) == 2
 
 
 # --- the value-rule tables ---------------------------------------------------------------------------------------
@@ -513,10 +532,10 @@ def test_the_packing_fields_are_required(tmp_path: Path) -> None:
 
 def test_explicit_packing_fields_define_the_step() -> None:
     cfg = _settings(tokens_per_micro_batch=8192, micro_batches_per_step=32)
-    assert cfg.gradient_accumulation_steps == 32
+    assert cfg.micro_batches_per_rank(1) == 32
     assert cfg.tokens_per_optimizer_step == 8192 * 32
     exact = _settings(tokens_per_micro_batch=2048, micro_batches_per_step=1)  # pack = training_max_sequence_length
-    assert exact.gradient_accumulation_steps == 1 and exact.tokens_per_optimizer_step == 2048
+    assert exact.micro_batches_per_rank(1) == 1 and exact.tokens_per_optimizer_step == 2048
 
 
 def test_pack_must_hold_a_whole_document() -> None:
@@ -529,6 +548,6 @@ def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
     yaml_path.write_text(TINY_YAML.read_text().replace("micro_batches_per_step: 2", "micro_batches_per_step: 4"))
     cfg = parse_settings(["--config", str(yaml_path)])
     assert (cfg.tokens_per_micro_batch, cfg.micro_batches_per_step) == (512, 4)
-    assert cfg.gradient_accumulation_steps == 4 and cfg.tokens_per_optimizer_step == 2048
+    assert cfg.micro_batches_per_rank(1) == 4 and cfg.tokens_per_optimizer_step == 2048
     overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
-    assert overridden.gradient_accumulation_steps == 8
+    assert overridden.micro_batches_per_rank(1) == 8

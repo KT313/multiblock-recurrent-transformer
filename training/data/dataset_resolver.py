@@ -312,7 +312,9 @@ def check_entries(
     for what, part, entry in _labeled_entries(train_sources, stages):
         total = rows_on_disk[entry.data_dir]
         check_entry_rows(what, part, entry, total)
-        check_entry_shards(what, part, entry, total, world_size)
+        # the train sources are read by the main rank alone (one shard whatever the world size); the validation
+        # entries are dealt over the ranks
+        check_entry_shards(what, part, entry, total, 1 if part == "train" else world_size)
 
 
 def check_entry_rows(what: str, part: Part, entry: DataEntry, total: int) -> None:
@@ -334,7 +336,8 @@ def check_entry_rows(what: str, part: Part, entry: DataEntry, total: int) -> Non
 def loader_shards(num_workers: int, world_size: int) -> int:
     """
     Shards a loader's datasets deal their rows over: one per dataloader worker and rank
-    (`ParquetTextDataset._shard`). `num_workers=0` loads in the calling process, which is ONE shard per rank.
+    (`ParquetTextDataset._shard`). `num_workers=0` loads in the calling process, which is ONE shard per rank. The
+    train loaders live on the main rank only, so `check_entries` passes them a world size of 1.
     """
 
     return world_size * max(num_workers, 1)
@@ -346,7 +349,8 @@ def check_entry_shards(what: str, part: Part, entry: DataEntry, total: int, worl
 
     `ParquetTextDataset` deals rows round-robin over `world_size × num_workers` shards; an empty shard kills a train
     loader's restart mid-run and makes ranks score different validation data. Train loaders run one worker per
-    source and validation loaders in-process, so both have `world_size` shards: only a larger world can starve one.
+    source on the main rank (one shard: the caller passes world size 1) and validation loaders in-process on every
+    rank (`world_size` shards): only a larger world can starve a validation entry.
     """
 
     num_workers = TRAIN_LOADER_NUM_WORKERS if part == "train" else 0
@@ -389,8 +393,9 @@ def check_validation_batches(
     """
     Fail (or warn) at setup about a validation split that cannot feed `training.evaluation.evaluate`.
 
-    No batch at all is an error naming the stage and its entries; fewer than `eval_iters` batches is a warning,
-    since `evaluate` averages the batches it gets.
+    `eval_iters` is the count PER RANK (`Settings.eval_iters_per_rank`), like the batches available per rank. No
+    batch at all is an error naming the stage and its entries; fewer than `eval_iters` batches is a warning, since
+    `evaluate` averages the batches it gets.
     """
 
     for stage in stages:
@@ -532,7 +537,9 @@ def resolve_dataset(
         )
     world_size = 1 if backend is None else backend.world_size
     check_entries(train_sources, stages, rows_on_disk, world_size)
-    check_validation_batches(stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters, world_size)
+    check_validation_batches(
+        stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
+    )
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),

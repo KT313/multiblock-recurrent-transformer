@@ -44,7 +44,7 @@ model_overwrite: {}                  # RecurrentConfig keys overriding the archi
 training_max_sequence_length: 2048   # documents are cut to this many tokens at training time; <= dataset_max_sequence_length of the dataset config <= model_max_sequence_length of the architecture
 
 # --- Backend ----------------------------------------------------------------------------------------------------
-backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
+backend: single_device               # training backend (training/backend/): single_device = one GPU (CPU fallback); ddp = one process per GPU, launched with torchrun (make training-ddp ... GPUS=n; docs/distributed_training.md)
 precision: bf16-mixed                # autocast precision of the forward/backward pass
 compile_model: true                  # torch.compile the model
 gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.
@@ -80,7 +80,7 @@ min_lr: 0                            # LR floor of warmup and cooldown
 log_step_interval: 1                 # log training metrics every this many steps
 log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
 eval_step_interval: 16               # run validation every this many steps
-eval_iters: 50                       # validation batches per evaluated depth
+eval_iters: 64                       # validation batches per evaluated depth
 validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
 validation_padding_multiple: 128     # pad validation batches to a multiple of this many tokens (null: the longest row)
 partial_depth_eval: [1, 2, 4, 8, 16] # extra recurrence depths evaluated at validation (plus the mean recurrence)

@@ -21,9 +21,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import RecurrentConfig, RecurrentGPT
-from training.backend.base import plain_model
 from training.backend.single_device import SingleDeviceBackend
-from training.checkpoint import checkpoint_dir, find_latest_checkpoint
+from training.checkpoint import CheckpointMetadata, checkpoint_dir, find_latest_checkpoint, save_training_checkpoint
 from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 from training.data.dataset_resolver import ResolvedDataset, resolve_dataset
 from training.data.packing import POOL_TOKEN_FACTOR
@@ -129,7 +128,7 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     assert (sm.warmup_steps, sm.cooldown_steps) == (tiny_settings.warmup_steps, tiny_settings.cooldown_steps)
     assert sm.total_steps == 20  # tiny: (8192 + 8192 + 4096) // (2 * 512)
     assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
-    with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of devices \(3\)"):
+    with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of ranks \(3\)"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
 
 
@@ -284,6 +283,39 @@ def test_restore_checkpoint_if_resuming_starts_fresh_without_a_checkpoint(
         state = RunState(tiny_settings, run_directory, cpu_backend, tiny_model, optimizer, tiny_resolved, stage_manager, TrainingProgress())
         assert restore_checkpoint_if_resuming(state) is None
         assert state.progress == TrainingProgress(step=0, resume_step=-1)
+
+
+def test_restore_refuses_a_checkpoint_of_another_world_size(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, tiny_model: RecurrentGPT, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    The RNG states of a checkpoint are per rank: one written by a run with two ranks cannot continue on one. The
+    refusal names both counts and comes before anything is restored into the progress.
+    """
+
+    run_directory = prepare_run_directory(tiny_settings)
+    optimizer = build_run_optimizer(tiny_settings, tiny_model, cpu_backend)
+    stage_manager = build_stage_manager(tiny_settings, tiny_resolved, cpu_backend.world_size)
+    state = RunState(tiny_settings, run_directory, cpu_backend, tiny_model, optimizer, tiny_resolved, stage_manager, TrainingProgress())
+    rng = cpu_backend.rng_state()
+    metadata = CheckpointMetadata(
+        step=3,
+        stage=0,
+        world_size=2,
+        rng_states=[rng, rng],
+        settings=asdict(tiny_settings),
+        model_config=tiny_model.config.to_dict(),
+        dataset_config_hash=tiny_resolved.config_hash,
+        validation_rows=tiny_resolved.validation_rows,
+        source_rows=tiny_resolved.source_rows,
+        data_stream={"consumed_rows": {}, "pool_loaded": {}, "pool_target": {}, "buffers": {}, "pool": []},
+    )
+    path = checkpoint_dir(run_directory) / "step-00000003-two-ranks.pth"
+    save_training_checkpoint(cpu_backend, path, tiny_model, optimizer, metadata)
+    tiny_settings.resume, tiny_settings.resume_checkpoint_path = True, str(path)
+    with pytest.raises(ValueError, match=r"written by a run with 2 rank\(s\), this run has 1: resume with the same number"):
+        restore_checkpoint_if_resuming(state)
+    assert state.progress == TrainingProgress(step=0, resume_step=-1)
 
 
 def test_training_longer_than_the_dataset_rows_is_refused(
@@ -496,7 +528,8 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
     for name, step, stage in (("step-00000006-tiny-stage-0_end.pth", 6, 1), ("step-00000014-tiny-stage-1_end.pth", 14, 2)):
         extra = torch.load(checkpoint_dir(full_run["run_dir"]) / name, map_location="cpu", weights_only=False)
         assert (extra["step"], extra["stage"]) == (step, stage)
-        assert extra["settings"]["run_name"] == "tiny" and set(extra["rng"]) >= {"python", "torch"}
+        assert extra["settings"]["run_name"] == "tiny" and extra["world_size"] == 1
+        assert len(extra["rng_states"]) == 1 and set(extra["rng_states"][0]) >= {"python", "torch"}
         assert extra["model_config"]["model_max_sequence_length"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
         assert extra["dataset_config_hash"] == full_run["dataset_hash"]
         assert extra["validation_rows"] == validation_rows
@@ -834,10 +867,10 @@ def test_mid_stage_resume_continues_the_data_stream(
     assert 0 < unconsumed < train_rows + TRAIN_LOADER_BATCH_ROWS
 
     resumed_dir = tmp_path / "resumed" / "out"
-    mid = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
+    mid_path = checkpoint_dir(full_dir) / "step-00000012-tiny.pth"
     _run(
         _no_transition_yaml(
-            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid), **NO_TRANSITION_OPTIONS
+            tmp_path / "resumed", tiny_dataset_dir, resumed_dir, resume=True, resume_checkpoint_path=str(mid_path), **NO_TRANSITION_OPTIONS
         ),
         cpu_backend,
     )
@@ -1270,7 +1303,7 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
     resume = restore_checkpoint_if_resuming(state)
     assert resume is not None and resume.checkpoint == checkpoint and state.progress.step == 5
     stored = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    restored_model = plain_model(model).state_dict()
+    restored_model = backend.plain_model(model).state_dict()
     assert restored_model.keys() == stored["model"].keys()
     for name, tensor in restored_model.items():
         assert torch.equal(tensor.cpu(), stored["model"][name]), name
