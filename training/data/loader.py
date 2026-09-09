@@ -10,6 +10,7 @@ the stage-interpolated weights, so a reader continues across stage boundaries an
 import logging
 import resource
 import signal
+import time
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -204,6 +205,11 @@ class RunDataloaders:
     parquet datasets behind the train loaders (a test fake passes {}): the offset of `set_resume_offsets` is
     applied to a dataset right before its first iterator after a resume and reset to 0 for every later epoch.
     training_max_sequence_length is only quoted in the messages about dropped rows; a fake may leave it out.
+
+    Data wait: `next_train_batch` times every pull from a loader (`clock`, monotonic) and adds the seconds to
+    `wait_seconds` per source; `take_wait_seconds` hands them out and resets. A pull blocks only when the worker has
+    no batch ready, so this is the time the training process (and every GPU behind it) waits for data. A source's
+    first pull and every epoch restart include the worker start-up (process spawn, tokenizer load) and count too.
     """
 
     train_loaders: dict[str, Iterable[WorkerBatch]]
@@ -211,7 +217,9 @@ class RunDataloaders:
     tokenizer: Tokenizer
     datasets: dict[str, ParquetTextDataset]
     training_max_sequence_length: int | None = None
+    clock: Callable[[], float] = time.monotonic  # a test knob
     pending_offsets: dict[str, int] = field(default_factory=dict, init=False)  # source -> rows its next epoch skips
+    wait_seconds: dict[str, float] = field(default_factory=dict, init=False)  # source -> seconds blocked since the last take
     _train_iterators: dict[str, Iterator[WorkerBatch] | None] = field(init=False)
     epochs: dict[str, EpochCounters] = field(init=False)  # source -> what its running epoch has read
 
@@ -329,13 +337,24 @@ class RunDataloaders:
         if iterator is None:
             iterator = self._start_train_iterator(source)
         while True:
+            started = self.clock()
             batch = next(iterator, None)  # a sentinel, so the error below is not chained onto a StopIteration
+            self.wait_seconds[source] = self.wait_seconds.get(source, 0.0) + (self.clock() - started)
             if batch is not None:
                 self._count_batch(source, batch)
                 return batch
             # the epoch is over and the next one starts at row 0, so the second round either yields or raises
             self._end_of_epoch(source)
             iterator = self._start_train_iterator(source)
+
+    def take_wait_seconds(self) -> dict[str, float]:
+        """
+        The seconds `next_train_batch` blocked per source since the last call (sources without a pull left out),
+        and a reset of the counter; `train()` hands them to `RunLogger.log_step` after every step.
+        """
+
+        waited, self.wait_seconds = self.wait_seconds, {}
+        return waited
 
     def set_resume_offsets(self, consumed_rows: Mapping[str, int]) -> None:
         """

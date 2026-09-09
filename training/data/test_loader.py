@@ -433,6 +433,44 @@ def _first(batch: WorkerBatch) -> int:
     return int(batch.samples[0][0][0])
 
 
+class _SlowLoader:
+    """
+    A 'loader' of `n` one-sample worker batches whose every pull moves the fake clock by `seconds`, the way a worker
+    that has no batch ready makes `next()` wait; the restart after exhaustion costs one pull too.
+    """
+
+    def __init__(self, tag: str, n: int, seconds: float, clock: list[float]) -> None:
+        self.tag, self.n, self.seconds, self.clock = tag, n, seconds, clock
+
+    def __iter__(self) -> Iterator[WorkerBatch]:
+        for batch in _tagged(self.tag, self.n):
+            self.clock[0] += self.seconds
+            yield batch
+        self.clock[0] += self.seconds  # the pull that finds the epoch over
+
+
+def test_next_train_batch_times_the_wait_for_a_worker_batch(tokenizer: Tokenizer) -> None:
+    """
+    Every pull is timed against the loaders' clock and booked per source; `take_wait_seconds` hands the seconds out
+    and resets, so the logger sees one interval at a time. The pull that finds an epoch over and the restart's first
+    pull count as well (a worker start-up is a wait too).
+    """
+
+    now = [0.0]
+    rd = RunDataloaders(
+        {"a": _SlowLoader("a", 2, 0.5, now), "b": _SlowLoader("b", 3, 0.1, now)}, [], tokenizer, {}, clock=lambda: now[0]
+    )
+    assert rd.take_wait_seconds() == {}
+    rd.next_train_batch("a")
+    rd.next_train_batch("b")
+    assert rd.take_wait_seconds() == pytest.approx({"a": 0.5, "b": 0.1})
+    assert rd.take_wait_seconds() == {}  # reset
+    rd.next_train_batch("a")
+    rd.next_train_batch("a")  # the epoch of a is over: the exhausted pull plus the restart's first pull
+    assert rd.take_wait_seconds() == pytest.approx({"a": 0.5 + 0.5 + 0.5})
+    assert rd.epochs["a"].rows_read == 1
+
+
 def test_next_train_batch_cycles_on_exhaustion(tokenizer: Tokenizer) -> None:
     """
     A source that runs dry restarts its loader (an empty source cannot occur: the resolver's
