@@ -183,8 +183,9 @@ def train(
                     while progress.step < stage_manager.total_steps and not stopped:
                         try:
                             result = run_one_optimizer_step(
-                                settings, backend, model, optimizer, stage_manager, batches, progress
-                            )
+                                settings, backend, model, optimizer, stage_manager, batches, progress,
+                                on_micro_batch=logger.note_micro_batch,
+                            )  # fmt: skip
                         except NonFiniteLossError as error:
                             raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
                         progress.advance()

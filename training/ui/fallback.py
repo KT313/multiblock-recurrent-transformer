@@ -1,6 +1,6 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-The console fallback of the training dashboard: the same four calls, one log line per interval, no display.
+The console fallback of the training dashboard: the same calls, one log line per interval, no display.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from training.ui.throughput import Throughput
 
 class ConsoleFallbackDashboard:
     """
-    The console fallback: the four calls of :class:`~training.ui.board.TrainingDashboard` without a live display.
+    The console fallback: the calls of :class:`~training.ui.board.TrainingDashboard` without a live display.
 
     update_step logs one line every log_step_interval steps (and at the last step), update_validation and
     note_event one line each, set_status a DEBUG line, all on :data:`~training.ui.common.lines_log`, whose
@@ -107,6 +107,9 @@ class ConsoleFallbackDashboard:
         """
 
         self.throughput.discount(seconds)
+
+    def update_micro_batch(self, completed: int, total: int) -> None:
+        return None  # a line per micro-batch would flood the console; the step lines carry the progress
 
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         lines_log.info(validation_line(step, losses))

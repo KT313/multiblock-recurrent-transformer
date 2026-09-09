@@ -16,7 +16,7 @@ from pathlib import Path
 from rich.console import Console
 
 from training.ui.board import TrainingDashboard
-from training.ui.common import KEEP, dashboard_enabled, log
+from training.ui.common import KEEP, dashboard_enabled, log, micro_batches_shown
 from training.ui.fallback import ConsoleFallbackDashboard
 
 DEMO_STAGES = ["pretrain", "instruct"]
@@ -42,8 +42,9 @@ def demo(
     board: TrainingDashboard | ConsoleFallbackDashboard
     if enabled if enabled is not None else dashboard_enabled():
         board = TrainingDashboard(
-            "demo-run", DEMO_STAGES, DEMO_STEPS, total_steps, details=details, log_step_interval=5, console=console
-        )
+            "demo-run", DEMO_STAGES, DEMO_STEPS, total_steps, details=details, log_step_interval=5, console=console,
+            show_micro_batches=micro_batches_shown(),
+        )  # fmt: skip
     else:
         board = ConsoleFallbackDashboard("demo-run", DEMO_STAGES, DEMO_STEPS, total_steps, details=details, log_step_interval=5)
     try:
@@ -53,7 +54,9 @@ def demo(
             log.info("Total training steps: %d (4 micro-batches each)", total_steps, extra=KEEP)
             loss = 6.0
             for step in range(1, total_steps + 1):
-                time.sleep(pause)
+                for micro_batch in range(1, 5):  # the 4 micro-batches of the step (DASHBOARD_SHOW_MICRO_BATCHES shows them)
+                    time.sleep(pause / 4)
+                    board.update_micro_batch(micro_batch, 4)
                 loss = loss * 0.97 + rng.uniform(-0.05, 0.05)
                 stage_index = 0 if step <= DEMO_STEPS[0] else 1
                 in_transition = 27 <= step <= 30

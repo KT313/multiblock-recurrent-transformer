@@ -67,6 +67,7 @@ make status config/datasets/crow_300m_final.yaml
 # mini smoke run with synthetic data
 uv run python training/train.py --config config/tiny.yaml
 TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml # TUI disabled
+DASHBOARD_SHOW_MICRO_BATCHES=1 uv run python training/train.py --config config/tiny.yaml # TUI with a micro-batch bar per optimizer step
 
 # thesis run on single gpu
 uv run python training/train.py --config config/crow_300m_final.yaml

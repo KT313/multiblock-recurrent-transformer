@@ -58,6 +58,31 @@ def test_stage_bars_and_overall_bar(board: TrainingDashboard) -> None:
     assert StageBar("x", 0).percentage == 100.0 and StageBar("x", 4, completed=9).percentage == 100.0
 
 
+def test_micro_batch_bar_is_off_by_default_and_counts_one_step_at_a_time(clock: FakeClock) -> None:
+    """
+    `update_micro_batch` is ignored without `show_micro_batches`; with it, a bar under the overall bar shows the
+    running step's micro-batches (empty before the first report, never full from a total of 0) and `update_step`
+    resets it to 0 for the next step.
+    """
+
+    board = TrainingDashboard("run", STAGES, STEPS, TOTAL, clock=clock)
+    board.update_micro_batch(2, 4)
+    assert "micro-batches" not in board.render_text()
+
+    shown = TrainingDashboard("run", STAGES, STEPS, TOTAL, clock=clock, show_micro_batches=True)
+    text = shown.render_text()
+    assert "micro-batches" in text and "0/0" in text and "  0%" in text
+    shown.update_micro_batch(1, 4)
+    shown.update_micro_batch(3, 4)
+    text = shown.render_text()
+    assert "3/4" in text and " 75%" in text and "of step 0" in text
+    shown.update_step(1, 0, None, metrics(1))
+    assert "0/4" in shown.render_text(), "the step is done: the count starts again"
+    shown.update_micro_batch(4, 4)
+    assert "4/4" in shown.render_text() and "of step 1" in shown.render_text()
+    assert [task.completed for task in shown.tasks] == [1, 0, 1], "the stage bars are not affected"
+
+
 def test_stage_transition_moves_the_highlight(board: TrainingDashboard) -> None:
     board.update_step(18, 0, 0.5, metrics(18))
     text = board.render_text()

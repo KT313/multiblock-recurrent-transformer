@@ -273,6 +273,26 @@ def _hand_accumulation(
     return losses, norm
 
 
+def test_on_micro_batch_reports_every_micro_batch_of_the_step(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+    """
+    `on_micro_batch(completed, total)` is called once per micro-batch, after its backward, counting from 1 to this
+    rank's `micro_batches_per_rank`; the dashboard's micro-batch bar hangs on it. Without the callback nothing changes.
+    """
+
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    batches = scripted_batches(settings)
+    progress = TrainingProgress()
+    reports: list[tuple[int, int]] = []
+    run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress, on_micro_batch=lambda done, total: reports.append((done, total)))
+    per_rank = settings.micro_batches_per_rank(1)
+    assert reports == [(index, per_rank) for index in range(1, per_rank + 1)]
+    progress.advance()
+    run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+    assert len(reports) == per_rank, "no callback, no report"
+
+
 def test_loss_and_grad_norm_match_a_hand_computation(cpu_backend: SingleDeviceBackend) -> None:
     """
     `loss` is the mean of the per-micro-batch losses; `grad_norm` is the pre-clip L2 norm of the accumulated

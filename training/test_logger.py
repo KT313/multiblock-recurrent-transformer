@@ -404,6 +404,7 @@ class RecordingDashboard:
         self.events: list[str] = []
         self.statuses: list[str] = []
         self.discounted: list[float] = []  # the seconds of every block that was not a training step
+        self.micro_batches: list[tuple[int, int]] = []  # (completed, total) of every micro-batch report
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -421,6 +422,9 @@ class RecordingDashboard:
 
     def discount_time(self, seconds: float) -> None:
         self.discounted.append(seconds)
+
+    def update_micro_batch(self, completed: int, total: int) -> None:
+        self.micro_batches.append((completed, total))
 
 
 def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
@@ -753,6 +757,9 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
     assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
+    run_logger.note_micro_batch(1, 4)
+    run_logger.note_micro_batch(4, 4)
+    assert recording(run_logger).micro_batches == [(1, 4), (4, 4)], "handed to the dashboard as they are"
 
 
 def test_data_wait_metrics_and_the_rate_limited_warning(

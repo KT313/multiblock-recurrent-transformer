@@ -45,7 +45,7 @@ from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled
+from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled, micro_batches_shown
 from training.ui.fallback import ConsoleFallbackDashboard
 
 if TYPE_CHECKING:
@@ -253,7 +253,7 @@ class TrainingReport:
 
 class Dashboard(Protocol):
     """
-    The five calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    The six calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake.
     """
 
@@ -268,6 +268,8 @@ class Dashboard(Protocol):
     def set_status(self, text: str) -> None: ...
 
     def discount_time(self, seconds: float) -> None: ...
+
+    def update_micro_batch(self, completed: int, total: int) -> None: ...
 
 
 class NullDashboard:
@@ -290,6 +292,9 @@ class NullDashboard:
         return None
 
     def discount_time(self, seconds: float) -> None:
+        return None
+
+    def update_micro_batch(self, completed: int, total: int) -> None:
         return None
 
 
@@ -324,6 +329,7 @@ def open_dashboard(
             start_step=start_step,
             log_step_interval=settings.log_step_interval,
             fallback_stream=sys.stderr,
+            show_micro_batches=micro_batches_shown(),
         )
     else:
         board = ConsoleFallbackDashboard(
@@ -546,6 +552,15 @@ class RunLogger:
                 seconds = self._clock() - started
                 self._side_seconds += seconds
                 self.dashboard.discount_time(seconds)
+
+    def note_micro_batch(self, completed: int, total: int) -> None:
+        """
+        `completed` of the `total` micro-batches of the running optimizer step are done on this rank; the loop calls
+        it after every micro-batch (`run_one_optimizer_step`'s `on_micro_batch`). Only the live dashboard with
+        `DASHBOARD_SHOW_MICRO_BATCHES` shows it; no record, no metric.
+        """
+
+        self.dashboard.update_micro_batch(completed, total)
 
     @contextmanager
     def evaluating(self) -> Iterator[None]:

@@ -34,8 +34,11 @@ Usage (RunLogger opens it through training.logger.open_dashboard)::
         board.update_validation(step, {"val_loss_4": 3.2, "val_loss": 3.1})
         board.set_status("saving checkpoint")
 
+DASHBOARD_SHOW_MICRO_BATCHES=1 adds a bar of the running optimizer step's micro-batches (rank 0's share, reset at
+every step; `board.update_micro_batch(completed, total)`), for large models whose steps take long enough to watch.
+
 open_dashboard builds the live dashboard when enabled (TRAINING_DASHBOARD not 0 and stdout a terminal),
-else the :class:`~training.ui.fallback.ConsoleFallbackDashboard` with the same four methods: one log line per
+else the :class:`~training.ui.fallback.ConsoleFallbackDashboard` with the same methods: one log line per
 log_step_interval steps, per validation and per event, the same log file, no capture. Their own lines go through
 training.ui.common.lines_log to the log file (and, for the fallback, the console).
 

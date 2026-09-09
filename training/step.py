@@ -18,7 +18,7 @@ loader at all. At world size 1 it is the stream itself.
 
 import logging
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -405,10 +405,13 @@ def run_one_optimizer_step(
     stage_manager: StageManager,
     batches: Iterator[PackedBatch],
     progress: TrainingProgress,
+    on_micro_batch: Callable[[int, int], None] | None = None,
 ) -> StepResult:
     """
     Run optimizer step `progress.step`: this rank's `micro_batches_per_rank` packed micro-batches from `batches`,
-    one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
+    one `optimizer.step()`. Does not advance `progress` (`train()` does, right after). `on_micro_batch(completed,
+    total)` is called after every micro-batch's backward was issued (the dashboard's micro-batch bar); on a GPU the
+    device may still be working on it, since nothing here synchronises.
 
     Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
@@ -442,6 +445,8 @@ def run_one_optimizer_step(
                 outputs = model(**inputs)
             backend.backward(outputs["loss"] / accumulation_steps)
         loss_sum += outputs["loss"].detach()
+        if on_micro_batch is not None:
+            on_micro_batch(micro_batch_index + 1, accumulation_steps)
     loss = backend.all_reduce(loss_sum / accumulation_steps)  # the world mean: every rank checks the same number
     if not torch.isfinite(loss):
         raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")

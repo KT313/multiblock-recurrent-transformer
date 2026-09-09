@@ -100,10 +100,12 @@ class TrainingDashboard(LiveDisplay):
         stream: TextIO | None = None,
         fallback_stream: TextIO | None = None,
         clock: Clock = time.monotonic,
+        show_micro_batches: bool = False,
     ) -> None:
         if len(stage_names) != len(steps_per_stage):
             raise ValueError(f"{len(stage_names)} stage names for {len(steps_per_stage)} step counts")
         self.run_name = run_name
+        self.show_micro_batches = show_micro_batches  # DASHBOARD_SHOW_MICRO_BATCHES: a bar of the running step's micro-batches
         self.stage_names = list(stage_names)
         self.steps_per_stage = list(steps_per_stage)
         self.total_steps = total_steps
@@ -130,6 +132,9 @@ class TrainingDashboard(LiveDisplay):
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
+        # the micro-batches of the running optimizer step (rank 0's share): filled by `update_micro_batch`, reset by
+        # `update_step`; total 0 until the first micro-batch is reported
+        self._micro = StageBar("micro-batches", 0, marker="", style="dim")
         self._open = False
         self.logger = log
         self._capture = TerminalCapture(self, already_attached=self.is_attached)
@@ -309,6 +314,17 @@ class TrainingDashboard(LiveDisplay):
         with self._lock:
             self._throughput.discount(seconds)
 
+    def update_micro_batch(self, completed: int, total: int) -> None:
+        """
+        completed of the total micro-batches of the running optimizer step are done on this rank (rank 0).
+        Shown as a bar under the overall bar with show_micro_batches (DASHBOARD_SHOW_MICRO_BATCHES), ignored
+        otherwise; update_step resets the bar for the next step. O(1), no log line.
+        """
+
+        if not self.show_micro_batches:
+            return
+        self._guarded(lambda: self._apply_micro_batch(completed, total))
+
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """
         The validation losses measured after step (per recurrence depth, e.g. val_loss_4, and per source,
@@ -344,6 +360,13 @@ class TrainingDashboard(LiveDisplay):
             self._stage_index = stage_index
             self._latest.update(known)
             self._refresh_bars(step, stage_index)
+            self._micro.completed = 0  # the step is done: the next step's micro-batches count from 0 again
+
+    def _apply_micro_batch(self, completed: int, total: int) -> None:
+        with self._lock:
+            self._micro.total = max(int(total), 0)
+            self._micro.completed = min(max(int(completed), 0), self._micro.total)
+            self._micro.note = f"of step {self._step}"
 
     def _refresh_bars(self, step: int, stage_index: int) -> None:
         last_index = len(self._bars) - 1
@@ -484,6 +507,15 @@ class TrainingDashboard(LiveDisplay):
                 f"{bar.completed:,}/{bar.total:,}",
                 f"{bar.percentage:>3.0f}%",
                 bar.note,
+            )
+        if self.show_micro_batches:
+            micro = self._micro  # an empty bar before the first micro-batch of the run, not a full one
+            grid.add_row(
+                line(micro.name, style=micro.style),
+                ProgressBar(total=max(micro.total, 1), completed=micro.completed),
+                f"{micro.completed}/{micro.total}",
+                f"{micro.percentage if micro.total > 0 else 0.0:>3.0f}%",
+                micro.note,
             )
         return grid
 
