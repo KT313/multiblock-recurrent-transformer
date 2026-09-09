@@ -476,7 +476,7 @@ def test_the_optimizer_and_schedule_names_are_checked_at_construction() -> None:
     assert OPTIMIZERS == BUILDABLE_OPTIMIZERS and LR_SCHEDULES == IMPLEMENTED_SCHEDULES  # torch-free copies
     for name in OPTIMIZERS:
         assert _settings(optimizer=name).optimizer == name
-    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, not 'Adam'"):
+    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, ELLISAdam8bit, not 'Adam'"):
         _settings(optimizer="Adam")
     with pytest.raises(ValueError, match="optimizer must be one of"):  # no dataset is read to get here
         _settings(optimizer="Adam", dataset_config="config/datasets/does_not_exist.yaml")

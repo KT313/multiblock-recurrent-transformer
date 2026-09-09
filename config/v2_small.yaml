@@ -61,14 +61,14 @@ tokens_per_micro_batch: 8192            # pack length in tokens, >= training_max
 micro_batches_per_step: 64              # packs per optimizer step, a multiple of the number of devices; 64 x 8192 = 524,288 tokens per step
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
-optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
+optimizer: ELLISAdam                 # optimizer class (training/optim: AdamW, ELLISAdam, or ELLISAdam8bit = ELLISAdam with 8-bit moments for every group but the embeddings, 2 instead of 8 bytes of state per parameter)
 optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
                                      # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
   lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation
   weight_decay: 4e-5  # decoupled
   betas: [0.9, 0.95]
   eps: null           # null: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)
-  update_clipping: true  # this and the three below exist only on ELLISAdam
+  update_clipping: true  # this and the three below exist only on ELLISAdam / ELLISAdam8bit
   atan_adam: true
   running_init: true
   decouple_wd: true

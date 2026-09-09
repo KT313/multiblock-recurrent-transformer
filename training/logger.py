@@ -41,6 +41,7 @@ from torch.optim import Optimizer
 
 from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
+from training.optim import dequantized_state
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
@@ -873,8 +874,8 @@ def _reverse_engineer_adam_effective_lr(
 
     grad = param.grad
     assert grad is not None, "effective LR needs a gradient"
-    exp_avg = param_state["exp_avg"].float()
-    denom = param_state["exp_avg_sq"].float().sqrt().add_(group["eps"])
+    exp_avg = dequantized_state(param_state["exp_avg"]).float()
+    denom = dequantized_state(param_state["exp_avg_sq"]).float().sqrt().add_(group["eps"])
     return torch.where(
         grad.float().abs() > group["eps"],
         exp_avg / denom / grad.float(),
@@ -946,7 +947,7 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
         if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
             continue
         # out of place: `.float()` aliases an fp32 buffer, an in-place clamp would edit the optimizer state
-        rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp(min=group["eps"] ** 2)).mean().sqrt()
+        rms = grad.float().pow(2).div_(dequantized_state(exp_avg_sq).float().clamp(min=group["eps"] ** 2)).mean().sqrt()
         total_rms += rms
         num_params_with_grad += 1
         if wte_weight is not None and param is wte_weight:

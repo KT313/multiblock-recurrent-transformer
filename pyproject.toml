@@ -65,7 +65,7 @@ norecursedirs = [".*", "*.egg", "dist", "node_modules", "venv", ".venv", "datase
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-exclude = [".git", "__pycache__", ".venv", ".claude", "outputs", "dataset"]
+exclude = [".git", "__pycache__", ".venv", ".claude", "outputs", "dataset", "training/optim/torchao"]  # vendored torchao code stays as upstream wrote it
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "C4", "PLC", "G", "PIE", "SIM", "W"]
@@ -77,6 +77,10 @@ files = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.
 exclude = ["\\.venv/", "\\.claude/", "outputs/", "dataset/"]
 strict = true
 warn_unreachable = true
+# vendored torchao code (training/optim/torchao/README.md): kept as upstream wrote it, untyped
+[[tool.mypy.overrides]]
+module = ["training.optim.torchao.*"]
+ignore_errors = true
 # third-party packages without (complete) stubs
 [[tool.mypy.overrides]]
 module = ["transformers.*", "datasets.*", "datasketch.*", "ijson.*", "wandb.*", "jsonargparse.*", "safetensors.*", "lm_eval.*"]
@@ -85,7 +89,7 @@ ignore_missing_imports = true
 [tool.basedpyright]
 pythonVersion = "3.11"
 include = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
-exclude = ["**/__pycache__", ".venv", ".claude", "outputs", "dataset"]
+exclude = ["**/__pycache__", ".venv", ".claude", "outputs", "dataset", "training/optim/torchao"]
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false
 reportMissingModuleSource = false

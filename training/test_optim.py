@@ -11,7 +11,18 @@ import pytest
 import torch
 
 from model import RecurrentGPT
-from training.optim import ELLISAdam, _single_tensor_modded_adamw, build_optimizer, get_param_groups, set_lr
+from training.optim import (
+    STATE_8BIT_BLOCK_SIZE,
+    STATE_8BIT_MIN_NUMEL,
+    ELLISAdam,
+    ELLISAdam8bit,
+    _single_tensor_modded_adamw,
+    build_optimizer,
+    dequantized_state,
+    get_param_groups,
+    is_quantized_state,
+    set_lr,
+)
 from training.settings import OptimizerConfig
 
 
@@ -436,3 +447,177 @@ def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
             results.append((p.detach().clone(), opt.state[p]["exp_avg"].clone(), opt.state[p]["exp_avg_sq"].clone()))
         for eager, fused in zip(*results, strict=True):
             torch.testing.assert_close(fused, eager, rtol=1e-6, atol=1e-7)  # a few fp32 ulps
+
+
+# ELLISAdam8bit: the same update on 8-bit block-quantised moments, embeddings pinned to fp32
+
+
+def _production_ellis_config() -> OptimizerConfig:
+    return OptimizerConfig(
+        lr=1e-3, weight_decay=0.1, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
+    )
+
+
+def _flat_params(model: torch.nn.Module) -> torch.Tensor:
+    return torch.cat([p.detach().flatten().clone() for p in model.parameters()])
+
+
+def _same_random_grads(models: list[torch.nn.Module], generator: torch.Generator, scale: float = 1e-2) -> None:
+    for params in zip(*(m.parameters() for m in models), strict=True):
+        grad = torch.randn(params[0].shape, generator=generator, device=params[0].device) * scale
+        for p in params:
+            p.grad = grad.clone()
+
+
+def test_ellis_adam_8bit_quantizes_matrices_only(tiny_model: RecurrentGPT) -> None:
+    """
+    After the first step the matrix group's moments are `OptimState8bit` (signed first moment, unsigned second,
+    one fp32 scale per block), the embedding group's stay fp32 although the table is large enough to quantise
+    (`build_optimizer` pins it), and the norm / bias group's stay fp32 because the tensors are below the size
+    threshold.
+    """
+
+    opt = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    assert isinstance(opt, ELLISAdam8bit)
+    for p in tiny_model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    matrices, embeddings, norms = opt.param_groups
+    assert (matrices["state_bits"], embeddings["state_bits"], norms["state_bits"]) == (8, 32, 8)
+    for p in matrices["params"]:
+        exp_avg, exp_avg_sq = opt.state[p]["exp_avg"], opt.state[p]["exp_avg_sq"]
+        assert is_quantized_state(exp_avg) and is_quantized_state(exp_avg_sq)
+        assert exp_avg.signed and not exp_avg_sq.signed
+        assert exp_avg.codes.dtype == torch.uint8 and exp_avg.scale.numel() == p.numel() // STATE_8BIT_BLOCK_SIZE
+        assert exp_avg.shape == p.shape and exp_avg.dtype == p.dtype
+    assert all(p.numel() >= STATE_8BIT_MIN_NUMEL for p in embeddings["params"])
+    assert all(p.numel() < STATE_8BIT_MIN_NUMEL for p in norms["params"])
+    for p in embeddings["params"] + norms["params"]:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert not is_quantized_state(opt.state[p][key]) and opt.state[p][key].dtype == torch.float32
+
+
+def test_ellis_adam_8bit_follows_the_fp32_trajectory(tiny_model: RecurrentGPT) -> None:
+    """
+    Same gradients into ELLISAdam and ELLISAdam8bit (production options, running init): every step's update
+    differs by a few percent in norm (the quantisation error of the moments, so the 8-bit path is really taken)
+    and the trajectories stay within one percent of the total movement of each other.
+    """
+
+    model32 = tiny_model
+    model8 = copy.deepcopy(tiny_model)
+    opt32 = build_optimizer("ELLISAdam", get_param_groups(model32, 0.1), _production_ellis_config())
+    opt8 = build_optimizer("ELLISAdam8bit", get_param_groups(model8, 0.1), _production_ellis_config())
+    theta0 = _flat_params(model32)
+    generator = torch.Generator().manual_seed(1)
+    for _ in range(10):
+        before = _flat_params(model32)
+        _same_random_grads([model32, model8], generator)
+        set_lr(opt32, 1e-3)
+        set_lr(opt8, 1e-3)
+        opt32.step()
+        opt8.step()
+        update32 = _flat_params(model32) - before
+        update8 = _flat_params(model8) - before
+        update_error = ((update8 - update32).norm() / update32.norm()).item()
+        assert 0.005 < update_error < 0.06, update_error  # measured 0.02 to 0.035
+    theta32, theta8 = _flat_params(model32), _flat_params(model8)
+    assert ((theta8 - theta32).norm() / (theta32 - theta0).norm()).item() < 0.01  # measured 0.002
+    for p32, p8 in zip(model32.parameters(), model8.parameters(), strict=True):
+        if is_quantized_state(opt8.state[p8]["exp_avg"]):
+            for key in ("exp_avg", "exp_avg_sq"):
+                moment32, moment8 = opt32.state[p32][key], dequantized_state(opt8.state[p8][key])
+                assert moment8.dtype == torch.float32 and not is_quantized_state(moment8)
+                assert ((moment8 - moment32).norm() / moment32.norm()).item() < 0.06  # measured 0.03 / 0.02
+
+
+def test_ellis_adam_8bit_state_dict_round_trip(tiny_model: RecurrentGPT) -> None:
+    """
+    The quantised moments travel through `torch.save` / `torch.load` (cpu) / `Optimizer.load_state_dict` as they
+    are: the restored optimizer takes the same next step bit for bit, its state keeps the 8-bit type and its
+    groups carry `state_bits`.
+    """
+
+    import io
+
+    opt = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    generator = torch.Generator().manual_seed(2)
+    for _ in range(3):
+        _same_random_grads([tiny_model], generator)
+        opt.step()
+    buffer = io.BytesIO()
+    torch.save(opt.state_dict(), buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, map_location="cpu", weights_only=False)
+    assert [group["state_bits"] for group in loaded["param_groups"]] == [8, 32, 8]
+
+    restored_model = copy.deepcopy(tiny_model)
+    restored = build_optimizer("ELLISAdam8bit", get_param_groups(restored_model, 0.1), _production_ellis_config())
+    restored.load_state_dict(loaded)
+    _same_random_grads([tiny_model, restored_model], generator)
+    set_lr(opt, 5e-4)
+    set_lr(restored, 5e-4)
+    opt.step()
+    restored.step()
+    for p, q in zip(tiny_model.parameters(), restored_model.parameters(), strict=True):
+        assert torch.equal(p, q)
+        assert is_quantized_state(opt.state[p]["exp_avg"]) == is_quantized_state(restored.state[q]["exp_avg"])
+
+
+def test_resume_refuses_switching_between_fp32_and_8bit_moments(tiny_model: RecurrentGPT) -> None:
+    """
+    `state_bits` is a parameter-group hyperparameter, so the resume check refuses a checkpoint of the other
+    optimizer in both directions (the two state layouts are not interchangeable).
+    """
+
+    from training.checkpoint import _group_hyperparameters, check_param_groups_unchanged
+
+    fp32 = build_optimizer("ELLISAdam", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    eight = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    with pytest.raises(ValueError, match="state_bits"):
+        check_param_groups_unchanged(_group_hyperparameters(fp32), _group_hyperparameters(eight))
+    with pytest.raises(ValueError, match="state_bits"):
+        check_param_groups_unchanged(_group_hyperparameters(eight), _group_hyperparameters(fp32))
+    check_param_groups_unchanged(_group_hyperparameters(eight), _group_hyperparameters(eight))
+
+
+def test_ellis_adam_8bit_needs_the_param_groups_and_valid_state_bits(tiny_model: RecurrentGPT) -> None:
+    with pytest.raises(ValueError, match="get_param_groups"):
+        build_optimizer("ELLISAdam8bit", tiny_model.parameters(), OptimizerConfig())
+    with pytest.raises(ValueError, match="state_bits"):
+        ELLISAdam8bit(tiny_model.parameters(), state_bits=16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled update is built for CUDA only")
+def test_compiled_cuda_8bit_update_matches_eager() -> None:
+    """
+    Dequantise, update and re-quantise fused by Inductor produce the same 8-bit codes as the eager path and
+    parameters within fp32 rounding, across LR changes without a recompile.
+    """
+
+    from training import optim
+
+    results = []
+    for compiled in (False, True):
+        torch.manual_seed(0)
+        p = torch.nn.Parameter(torch.randn(64, 64, device="cuda"))  # 4096 elements: quantised
+        opt = ELLISAdam8bit(
+            [p], lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, update_clipping=True, atan_adam=True, running_init=True
+        )
+        optim._compiled_group_update = None
+        original = optim._compiled_adamw_group_update
+        if not compiled:
+            optim._compiled_adamw_group_update = lambda: optim._adamw_group_update
+        try:
+            for step in range(4):
+                p.grad = torch.randn(64, 64, device="cuda") * 1e-2
+                set_lr(opt, 1e-3 * (step + 1))
+                opt.step()
+        finally:
+            optim._compiled_adamw_group_update = original
+        state = opt.state[p]
+        assert is_quantized_state(state["exp_avg"]) and is_quantized_state(state["exp_avg_sq"])
+        results.append((p.detach().clone(), state["exp_avg"].codes.clone(), state["exp_avg_sq"].codes.clone()))
+    (eager_p, eager_m, eager_v), (fused_p, fused_m, fused_v) = results
+    torch.testing.assert_close(fused_p, eager_p, rtol=1e-6, atol=1e-6)
+    assert torch.equal(fused_m, eager_m) and torch.equal(fused_v, eager_v)

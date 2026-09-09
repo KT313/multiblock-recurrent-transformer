@@ -20,7 +20,7 @@ CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
 # The optimizers `training.optim.build_optimizer` builds and the schedules `training.lr_schedule` implements. Both
 # modules import torch (directly or through the stage manager); this module stays framework-neutral, so the names
 # are copied here to be checked at construction time, and settings tests keep the copies equal to the originals.
-OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam")
+OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam", "ELLISAdam8bit")
 LR_SCHEDULES: tuple[str, ...] = ("trapezoid",)
 
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
@@ -59,7 +59,8 @@ class OptimizerConfig:
 
     A dataclass so jsonargparse merges per-field CLI overrides (`--optim_config.lr 3e-4`) and rejects unknown names.
     `lr` is NOT the schedule's LR (`stage_base_lrs` is); ELLISAdam keeps it as `init_lr`, the weight-decay reference.
-    The last four flags exist only on ELLISAdam; `build_optimizer` rejects non-default values for other optimizers.
+    The last four flags exist only on ELLISAdam and ELLISAdam8bit (the same optimizer with 8-bit moments for every
+    group but the embeddings); `build_optimizer` rejects non-default values for other optimizers.
     """
 
     lr: float = 1e-4  # constructor LR; for ELLISAdam the weight-decay reference (decay = lr / init_lr × weight_decay)

@@ -1,17 +1,26 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """
 The optimizer of the thesis runs, ELLISAdam (a port of the upstream implementation with its four options:
-`update_clipping`, `atan_adam`, `running_init`, `decouple_wd`), plus the parameter-group split.
+`update_clipping`, `atan_adam`, `running_init`, `decouple_wd`), its memory-saving twin ELLISAdam8bit, plus the
+parameter-group split.
+
+ELLISAdam8bit runs the same update but stores the two Adam moments block-wise quantised to 8 bits (torchao's
+`OptimState8bit`, vendored under `training/optim/torchao/`): 2 bytes per parameter of optimizer state instead of 8.
+The embedding group keeps fp32 moments (`build_optimizer` pins it: the 8-bit optimizer paper found embeddings the
+one layer that destabilises under quantised state), as do tensors too small for the block quantisation. The update
+maths dequantises into fp32 temporaries, so the ELLIS options apply unchanged; a checkpoint written by one of the
+two optimizers cannot resume the other (`state_bits` is a parameter-group hyperparameter, compared on resume).
 """
 
 from math import sqrt
-from typing import Any, Callable, Iterable, overload
+from typing import Any, Callable, Iterable, cast, overload
 
 import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
 
+from training.optim.torchao import OptimState8bit
 from training.settings import OptimizerConfig
 
 
@@ -21,7 +30,8 @@ def get_param_groups(
     """
     Split parameters into weights / embeddings / scale-and-norm groups, as upstream did.
 
-    Group order matters for checkpoints: 0 = matrices, 1 = embeddings (+ tied lm_head), 2 = norms and biases.
+    Group order matters for checkpoints: 0 = matrices, 1 = embeddings (+ tied lm_head, `EMBEDDING_GROUP`),
+    2 = norms and biases.
     """
 
     weights_group: list[Tensor] = []
@@ -54,7 +64,18 @@ ELLIS_ONLY_OPTIONS = ("update_clipping", "atan_adam", "running_init", "decouple_
 
 # The `optimizer:` values `build_optimizer` knows; `Settings.__post_init__` keeps a torch-free copy (OPTIMIZERS in
 # training/settings.py, a settings test keeps the two equal) so an unknown name fails before the dataset is touched.
-OPTIMIZERS = ("AdamW", "ELLISAdam")
+OPTIMIZERS = ("AdamW", "ELLISAdam", "ELLISAdam8bit")
+ELLIS_OPTIMIZERS = ("ELLISAdam", "ELLISAdam8bit")
+
+# Index of the embedding group in `get_param_groups`' output; ELLISAdam8bit keeps its moments in fp32.
+EMBEDDING_GROUP = 1
+
+# ELLISAdam8bit quantises a moment only when its tensor has at least `STATE_8BIT_MIN_NUMEL` elements and a size that
+# is a multiple of `STATE_8BIT_BLOCK_SIZE` (one absmax scale per block); smaller or odd-sized tensors (norm weights,
+# biases) stay fp32. torchao's rules and defaults. Module constants, not settings: the block size is recoverable
+# from the state itself and the threshold decides nothing a checkpoint has to agree on.
+STATE_8BIT_BLOCK_SIZE = 256
+STATE_8BIT_MIN_NUMEL = 4096
 
 
 def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig) -> Optimizer:
@@ -68,15 +89,11 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
     common: dict[str, Any] = {"lr": config.lr, "betas": config.betas, "weight_decay": config.weight_decay}
     if config.eps is not None:
         common["eps"] = config.eps
-    if name == "ELLISAdam":
-        return ELLISAdam(
-            params,
-            **common,
-            update_clipping=config.update_clipping,
-            atan_adam=config.atan_adam,
-            running_init=config.running_init,
-            decouple_wd=config.decouple_wd,
-        )
+    if name in ELLIS_OPTIMIZERS:
+        ellis_options = {option: getattr(config, option) for option in ELLIS_ONLY_OPTIONS}
+        if name == "ELLISAdam8bit":
+            return ELLISAdam8bit(_pin_embedding_group_to_fp32(params), **common, **ellis_options)
+        return ELLISAdam(params, **common, **ellis_options)
     defaults = OptimizerConfig()
     ellis_only_set = [option for option in ELLIS_ONLY_OPTIONS if getattr(config, option) != getattr(defaults, option)]
     if ellis_only_set:
@@ -84,6 +101,24 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
     if name == "AdamW":
         return torch.optim.AdamW(params, **common)
     raise ValueError(f"Invalid optimizer {name!r} requested (use one of {', '.join(map(repr, OPTIMIZERS))}).")
+
+
+def _pin_embedding_group_to_fp32(params: Iterable[Tensor] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    The `get_param_groups` list with `state_bits: 32` set on the embedding group (copies of the group dicts, the
+    caller's are left alone). Anything but that list is refused: ELLISAdam8bit needs to know which group holds the
+    embeddings.
+    """
+
+    groups = list(params)
+    if len(groups) != 3 or not all(isinstance(group, dict) for group in groups):
+        raise ValueError(
+            "ELLISAdam8bit needs the three parameter groups of get_param_groups (the embedding group keeps fp32 "
+            "moments), not a plain parameter iterable"
+        )
+    pinned = [dict(cast(dict[str, Any], group)) for group in groups]
+    pinned[EMBEDDING_GROUP]["state_bits"] = 32
+    return pinned
 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:
@@ -119,7 +154,21 @@ class ELLISAdam(Optimizer):
         atan_adam: bool = False,
         decouple_wd: bool = True,
     ) -> None:
-        defaults = dict(
+        super().__init__(params, self._defaults(**locals()))
+
+    @staticmethod
+    def _defaults(
+        lr: float | Tensor,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+        update_clipping: bool,
+        running_init: bool,
+        atan_adam: bool,
+        decouple_wd: bool,
+        **_: Any,  # `self`, `params`, `__class__` of the caller's `locals()`
+    ) -> dict[str, Any]:
+        return dict(
             lr=torch.tensor(lr, dtype=torch.float32),
             init_lr=lr,
             betas=betas,
@@ -130,7 +179,23 @@ class ELLISAdam(Optimizer):
             atan_adam=atan_adam,
             decouple_wd=decouple_wd,
         )
-        super().__init__(params, defaults)
+
+    def _new_state(self, param: Tensor, group: dict[str, Any], running_init: bool) -> tuple[Tensor, Tensor]:
+        """
+        The fresh (exp_avg, exp_avg_sq) of `param`: zeros, or the first gradient and its square (`running_init`).
+        """
+
+        grad = param.grad
+        assert grad is not None
+        if running_init:
+            return (
+                grad.clone().to(memory_format=torch.preserve_format),
+                grad.pow(2).clone().to(memory_format=torch.preserve_format),
+            )
+        return (
+            torch.zeros_like(param, memory_format=torch.preserve_format),
+            torch.zeros_like(param, memory_format=torch.preserve_format),
+        )
 
     @torch.no_grad()
     def _init_group(
@@ -153,12 +218,7 @@ class ELLISAdam(Optimizer):
             if len(state) == 0:
                 # `step` lives on the CPU: kernel launches are costly on CUDA
                 state["step"] = torch.tensor(0, dtype=torch.long)
-                if running_init:
-                    state["exp_avg"] = param.grad.clone().to(memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = param.grad.pow(2).clone().to(memory_format=torch.preserve_format)
-                else:
-                    state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state["exp_avg"], state["exp_avg_sq"] = self._new_state(param, group, running_init)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
@@ -210,6 +270,77 @@ class ELLISAdam(Optimizer):
             )
 
         return loss
+
+
+class ELLISAdam8bit(ELLISAdam):
+    """
+    ELLISAdam with the two moments stored block-wise quantised to 8 bits (`OptimState8bit`) wherever
+    `group["state_bits"]` is 8 (the default; `build_optimizer` sets 32 on the embedding group) and the tensor is
+    large enough for the block quantisation. Every other part is inherited: the update reads the moments through
+    `_dequantized`, so the ELLIS options run on fp32 values, and writes the new moments back with `copy_`, which
+    quantises. The state dict holds the quantised tensors as they are; `torch.load` knows the class (torchao
+    registers it as a safe global) and `Optimizer.load_state_dict` moves it to the parameter's device.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor] | list[dict[str, Any]],
+        lr: float | Tensor = 3e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        eps: float = 1e-6,
+        weight_decay: float = 1e-2,
+        *,
+        update_clipping: bool = False,
+        running_init: bool = False,
+        atan_adam: bool = False,
+        decouple_wd: bool = True,
+        state_bits: int = 8,
+    ) -> None:
+        if state_bits not in (8, 32):
+            raise ValueError(f"state_bits must be 8 or 32, not {state_bits!r}")
+        defaults = self._defaults(**locals()) | {"state_bits": state_bits}
+        Optimizer.__init__(self, params, defaults)
+
+    def _new_state(self, param: Tensor, group: dict[str, Any], running_init: bool) -> tuple[Tensor, Tensor]:
+        if group["state_bits"] != 8 or not _quantizable(param):
+            return super()._new_state(param, group, running_init)
+        exp_avg = _quantized_zeros(param, signed=True)
+        exp_avg_sq = _quantized_zeros(param, signed=False)
+        if running_init:
+            grad = param.grad
+            assert grad is not None
+            exp_avg.copy_(grad)
+            exp_avg_sq.copy_(grad.pow(2))
+        return exp_avg, exp_avg_sq
+
+
+def _quantizable(param: Tensor) -> bool:
+    return param.numel() >= STATE_8BIT_MIN_NUMEL and param.numel() % STATE_8BIT_BLOCK_SIZE == 0
+
+
+def _quantized_zeros(param: Tensor, signed: bool) -> Tensor:
+    # the appearance dtype is the parameter's: `Optimizer.load_state_dict` casts state to it, a no-op then
+    zeros = OptimState8bit.zeros(param.shape, signed, STATE_8BIT_BLOCK_SIZE, param.device, dtype=param.dtype)
+    return cast(Tensor, zeros)
+
+
+def is_quantized_state(tensor: Tensor) -> bool:
+    """
+    Whether `tensor` is an 8-bit moment of ELLISAdam8bit (a plain tensor otherwise).
+    """
+
+    return isinstance(tensor, OptimState8bit)
+
+
+def dequantized_state(tensor: Tensor) -> Tensor:
+    """
+    `tensor` as plain fp32 values: dequantised when it is an 8-bit moment, itself otherwise. For reading the state
+    (the gradient metrics of the logger); the optimizer step uses the same on its way into the update maths.
+    """
+
+    if is_quantized_state(tensor):
+        return tensor.dequantize()
+    return tensor
 
 
 def _single_tensor_modded_adamw(
@@ -299,12 +430,17 @@ def _adamw_group_update(
     (`atan_adam`) or the usual Adam quotient. `param.sub_(update * step_size)` rather than `add_(alpha=...)` on
     purpose: a tensor `alpha` is read back to the host, one sync per parameter. On CUDA this runs compiled
     (`_compiled_adamw_group_update`), so each parameter's chain of elementwise ops becomes two or three kernels.
+
+    8-bit moments (ELLISAdam8bit) are dequantised into fp32 temporaries first and written back at the end, so the
+    maths in between is the same for both optimizers; under torch.compile the dequantise, the update and the
+    re-quantise fuse into the same few kernels. fp32 moments are updated in place as before.
     """
 
     for i, param in enumerate(params):
         grad = grads[i]
-        exp_avg = exp_avgs[i]
-        exp_avg_sq = exp_avg_sqs[i]
+        quantized = is_quantized_state(exp_avgs[i])
+        exp_avg = dequantized_state(exp_avgs[i])
+        exp_avg_sq = dequantized_state(exp_avg_sqs[i])
         step_size = step_sizes[i]
 
         # Decay the first and second moment running average coefficient
@@ -324,6 +460,9 @@ def _adamw_group_update(
             param.sub_(torch.atan2(exp_avg, denom) * step_size)
         else:
             param.sub_(exp_avg.div(denom.add_(eps)) * step_size)
+        if quantized:
+            exp_avgs[i].copy_(exp_avg)
+            exp_avg_sqs[i].copy_(exp_avg_sq)
 
 
 _compiled_group_update: Callable[..., None] | None = None
