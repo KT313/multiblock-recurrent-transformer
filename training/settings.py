@@ -86,7 +86,7 @@ class Settings:
     # unit of the stage budgets and the throughput metrics. Validation batches are padded rows instead
     # (`validation_batch_size` below).
     tokens_per_micro_batch: int  # pack length; >= training_max_sequence_length (the longest document after truncation)
-    micro_batches_per_step: int  # packs per optimizer step (a multiple of the number of devices)
+    micro_batches_per_step: int  # packs per optimizer step over ALL ranks; a multiple of the number of ranks (`micro_batches_per_rank`)
 
     # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
@@ -131,7 +131,7 @@ class Settings:
     log_step_interval: int = 1
     log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
     eval_step_interval: int = 100
-    eval_iters: int = 50  # validation batches per depth
+    eval_iters: int = 50  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
     validation_batch_size: int = 4  # rows per validation forward
     validation_padding_multiple: Optional[int] = 128  # pad validation batches to a multiple of this many tokens (None: the longest row)
     partial_depth_eval: list[int] = field(default_factory=list)  # extra recurrence depths evaluated at validation
@@ -231,16 +231,24 @@ class Settings:
                 "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
             )
 
-    @property
-    def gradient_accumulation_steps(self) -> int:
+    def micro_batches_per_rank(self, world_size: int) -> int:
         """
-        Micro-batches per optimizer step on one device, `micro_batches_per_step` (divide by world_size once
-        distributed training exists; until then `train()` refuses `world_size != 1`, a second rank would double the
-        step). Whether the packs split evenly over the devices is checked where the world size is known
-        (`training.run.build_stage_manager`).
+        Packed micro-batches each rank runs per optimizer step: `micro_batches_per_step` split evenly over the
+        ranks. The step (`tokens_per_optimizer_step`) is the WORLD total, so step counts are independent of the
+        world size; a remainder is refused (`ValueError`), every rank must take the same share or the gradient
+        average would weigh the ranks unequally.
         """
 
-        return self.micro_batches_per_step
+        return split_over_ranks("micro_batches_per_step", self.micro_batches_per_step, world_size)
+
+    def eval_iters_per_rank(self, world_size: int) -> int:
+        """
+        Validation batches per depth each rank scores: `eval_iters` split evenly over the ranks, so an evaluation
+        scores the same number of batches whatever the world size and the mean of the per-rank means is exact. A
+        remainder is refused (`ValueError`).
+        """
+
+        return split_over_ranks("eval_iters", self.eval_iters, world_size)
 
     @property
     def tokens_per_optimizer_step(self) -> int:
@@ -250,6 +258,22 @@ class Settings:
         """
 
         return self.micro_batches_per_step * self.tokens_per_micro_batch
+
+
+def split_over_ranks(name: str, total: int, world_size: int) -> int:
+    """
+    `total // world_size` for a world-total count that every rank takes an equal share of; a remainder (or a world
+    size below 1) is a `ValueError` naming the setting.
+    """
+
+    if world_size < 1:
+        raise ValueError(f"the number of ranks must be at least 1, got {world_size}")
+    if total % world_size != 0:
+        raise ValueError(
+            f"{name} ({total}) must be a multiple of the number of ranks ({world_size}): every rank takes the same "
+            "share of every optimizer step and every evaluation"
+        )
+    return total // world_size
 
 
 def parse_settings(args: Optional[list[str]] = None) -> Settings:

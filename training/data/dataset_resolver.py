@@ -389,8 +389,9 @@ def check_validation_batches(
     """
     Fail (or warn) at setup about a validation split that cannot feed `training.evaluation.evaluate`.
 
-    No batch at all is an error naming the stage and its entries; fewer than `eval_iters` batches is a warning,
-    since `evaluate` averages the batches it gets.
+    `eval_iters` is the count PER RANK (`Settings.eval_iters_per_rank`), like the batches available per rank. No
+    batch at all is an error naming the stage and its entries; fewer than `eval_iters` batches is a warning, since
+    `evaluate` averages the batches it gets.
     """
 
     for stage in stages:
@@ -532,7 +533,9 @@ def resolve_dataset(
         )
     world_size = 1 if backend is None else backend.world_size
     check_entries(train_sources, stages, rows_on_disk, world_size)
-    check_validation_batches(stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters, world_size)
+    check_validation_batches(
+        stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
+    )
     return ResolvedDataset(
         config=dataset_config,
         config_hash=dataset_config.config_hash(),

@@ -833,7 +833,8 @@ def _metadata(config_hash: str, validation_rows: dict[str, int], source_rows: di
     return CheckpointMetadata(
         step=3,
         stage=0,
-        rng={},
+        world_size=1,
+        rng_states=[{}],
         settings={},
         model_config={},
         dataset_config_hash=config_hash,
