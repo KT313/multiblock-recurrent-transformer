@@ -101,6 +101,29 @@ def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, ti
     assert "older version" in str(excinfo.value)
 
 
+def test_metadata_reads_the_single_rank_layout_before_the_multi_rank_fields(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT
+) -> None:
+    """
+    The layout right before `world_size` / `rng_states` stored one `rng` dict; it is read as a one-rank checkpoint
+    (every other field is unchanged), so a run started before the multi-GPU support resumes. The legacy key alone
+    does not excuse any other missing field, and it is ignored when the current fields are present.
+    """
+
+    current = _metadata(backend, tiny_model)
+    legacy = current.to_state()
+    legacy["rng"] = legacy.pop("rng_states")[0]
+    del legacy["world_size"]
+    loaded = CheckpointMetadata.from_state(legacy)
+    assert loaded.world_size == 1 and loaded.rng_states == [legacy["rng"]]
+    assert loaded == current
+    del legacy["source_rows"]
+    with pytest.raises(KeyError, match=r"missing the metadata key\(s\) \['source_rows'\]"):
+        CheckpointMetadata.from_state(legacy)
+    both = current.to_state() | {"rng": {"python": "stale"}}
+    assert CheckpointMetadata.from_state(both) == current
+
+
 def test_metadata_field_order_matches_the_documented_layout() -> None:
     assert [f.name for f in fields(CheckpointMetadata)] == [
         "step",

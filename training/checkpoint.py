@@ -3,7 +3,10 @@
 Checkpoint schema, naming, search, and save/load through the backend. Steps in file names are OPTIMIZER steps.
 
 A checkpoint is one `torch.save` dict: the `"model"` and `"optimizer"` state dicts plus the `CheckpointMetadata`
-fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key.
+fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key. The one
+exception is the layout right before the multi-rank fields (`LEGACY_RNG_KEY`, one `rng` dict in place of `world_size`
+and `rng_states`): it is read as a one-rank checkpoint, since every other field is the same, so a run started before
+the multi-GPU support resumes; the resumed run writes the current layout.
 
 Per-rank state: the RNG state is stored for every rank (`rng_states`, indexed by rank, gathered through the
 backend), the data stream once (rank 0 reads and packs for the whole world). A resume needs the same `world_size`
@@ -26,6 +29,7 @@ from training.stage_manager import StageManager
 
 CHECKPOINT_SUBDIR = "checkpoints"
 CHECKPOINT_SUFFIX = ".pth"
+LEGACY_RNG_KEY = "rng"  # the single-rank layout before `world_size` / `rng_states`: one `Backend.rng_state()` dict
 
 
 @dataclass
@@ -55,9 +59,13 @@ class CheckpointMetadata:
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "CheckpointMetadata":
         """
-        Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored.
+        Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored. A
+        checkpoint of the single-rank layout (`LEGACY_RNG_KEY` instead of `world_size` and `rng_states`) is read as
+        written by one rank.
         """
 
+        if LEGACY_RNG_KEY in state and "world_size" not in state and "rng_states" not in state:
+            state = {**state, "world_size": 1, "rng_states": [state[LEGACY_RNG_KEY]]}
         missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(
