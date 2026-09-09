@@ -10,6 +10,9 @@ saves a checkpoint and exits 130; during the in-process dataset build it stops a
 (`BuildAborted`, also 130). A second Ctrl-C aborts right away. `resume: true` continues a stopped run.
 
 Console: one stderr handler on the `training` and `data_preparation` logger hierarchies (`configure_console_logging`).
+Under torchrun (`backend: ddp`, `make training-ddp`) every rank runs this CLI; rank 0 logs, shows the dashboard and
+prints the report, the other ranks (`RANK` in the environment) keep WARNING and above with a `[rank N]` prefix, so a
+failure on any rank is seen. `torchrun --redirects 3 --local-ranks-filter 0` silences them completely.
 `RunLogger` opens the terminal dashboard of `training/ui/` for the run (the live display on a TTY, the one-line
 fallback when piped or with `TRAINING_DASHBOARD=0`, `<out_dir>/<run_name>/train.log` in both cases, and the report as
 `train_report.json` next to it); it swaps the `training`
@@ -22,6 +25,7 @@ start time; `data_preparation/lib/build/lock.py`), 130 interrupted.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
@@ -96,13 +100,27 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
             signal.signal(signum, handler)
 
 
-def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
+def launch_rank() -> int:
+    """
+    This process's rank under torchrun (`RANK` in the environment), 0 for a plain launch.
+    """
+
+    return int(os.environ.get("RANK", "0"))
+
+
+def configure_console_logging(level: int = logging.INFO, rank: int = 0) -> logging.Logger:
     """
     Attach one stderr handler each to the `training` and `data_preparation` logger hierarchies (same handler type
     and line format); idempotent. Returns the `training` logger. The CLI's job: library code configures no logging.
+
+    `rank` above 0 (a non-main rank under torchrun) logs WARNING and above only, every line prefixed with
+    `[rank N]`: the main rank tells the story of the run, the others only speak up when something is wrong.
     """
 
-    configure_logging(level)  # the `data_preparation` hierarchy: the resolver's status table, split and build lines
+    if rank > 0:
+        level = max(level, logging.WARNING)
+    line_format = f"[rank {rank}] {LOG_FORMAT}" if rank > 0 else LOG_FORMAT
+    data_logger = configure_logging(level)  # the `data_preparation` hierarchy: the status table, split and build lines
     training_logger = logging.getLogger(TRAINING_LOGGER_NAME)
     training_logger.setLevel(level)
     handler = next(
@@ -110,19 +128,24 @@ def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
     )
     if handler is None:
         handler = ProgressStreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT))
         training_logger.addHandler(handler)
     handler.setLevel(level)
+    for owner in (training_logger, data_logger):
+        for existing in owner.handlers:
+            if isinstance(existing, ProgressStreamHandler):
+                existing.setFormatter(logging.Formatter(line_format))
     return training_logger
 
 
 def main(argv: list[str] | None = None) -> int:
     """
-    Parse `argv` (default: the command line), run, print the report; returns the exit code (module docstring).
+    Parse `argv` (default: the command line), run, print the report (the main rank; module docstring); returns the
+    exit code.
     """
 
     started_at = time.time()
-    configure_console_logging()
+    rank = launch_rank()
+    configure_console_logging(rank=rank)
     settings = parse_settings(argv)
     with stop_on_interrupt() as should_stop:
         try:
@@ -136,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             log.exception("training failed")
             return 1
-    print(report.summary())
+    if rank == 0:
+        print(report.summary())
     return EXIT_INTERRUPTED if report.stopped else 0
 
 

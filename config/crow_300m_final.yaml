@@ -44,7 +44,7 @@ model_overwrite: {}                  # RecurrentConfig keys overriding the archi
 training_max_sequence_length: 2048   # documents are cut to this many tokens at training time; <= dataset_max_sequence_length of the dataset config <= model_max_sequence_length of the architecture
 
 # --- Backend ----------------------------------------------------------------------------------------------------
-backend: single_device               # training backend (training/backend/); single_device = one GPU, CPU fallback
+backend: single_device               # training backend (training/backend/): single_device = one GPU (CPU fallback); ddp = one process per GPU, launched with torchrun (make training-ddp ... GPUS=n; docs/distributed_training.md)
 precision: bf16-mixed                # autocast precision of the forward/backward pass
 compile_model: true                  # torch.compile the model
 gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.

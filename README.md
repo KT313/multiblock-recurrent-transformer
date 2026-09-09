@@ -9,7 +9,7 @@ This repository contains the code for my thesis "Efficient Large Language Models
 The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, input norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
 Besides the architecture change, I added the following:
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
-- a compact single-GPU training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`; distributed training is meant to be re-added behind `training/backend/`)
+- a compact training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`), on one GPU or on every GPU of one machine (`backend: ddp` under torchrun, `docs/distributed_training.md`)
 - HuggingFace export path (`model/hf/modeling.py`)
 - dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, stages with token budgets and weights, and the tokenizer in one YAML; downloaded and built incrementally and verified before training
 
@@ -73,6 +73,9 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 
 # make shortcut for the same
 make training config/crow_300m_final.yaml
+
+# all GPUs of this machine (the config sets backend: ddp; see docs/distributed_training.md)
+make training-ddp config/crow_300m_final.yaml GPUS=8
 ```
 
 ![TUI Training](docs/screenshots/tui_training.png)
