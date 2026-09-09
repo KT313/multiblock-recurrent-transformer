@@ -33,6 +33,7 @@ The CLI around this is `training/train.py`; `TrainingReport` is defined next to 
 from __future__ import annotations
 
 import json
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -65,7 +66,7 @@ from training.data.tokenizer import Tokenizer
 from training.data.loader import build_run_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
 from training.evaluation import evaluate, is_evaluation_step
-from training.logger import RunLogger, TrainingReport
+from training.logger import RunLogger, TrainingReport, num_parameters
 from training.optim import build_optimizer, get_param_groups
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
@@ -359,9 +360,17 @@ def build_run_model(settings: Settings, dataset: ResolvedDataset, backend: Backe
 
     model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
     check_sequence_lengths(settings, dataset.config, model_config)
+    # the truncated-orthogonal init runs on the CPU, single-threaded per tensor: about 20 s for 300M parameters
+    log.info(
+        "building the model of %s: initialising the parameters on the CPU, which takes a while for a large model",
+        settings.model_architecture_config,
+    )
+    started = time.monotonic()
     model = RecurrentGPT(
         model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
     )
+    log.info("model built: %s parameters in %.1fs, moving it to %s%s", f"{num_parameters(model):,}",
+             time.monotonic() - started, backend.device, ", compiled on the first step" if settings.compile_model else "")
     if backend.is_main:
         model_config.to_json(run_directory / "model_config.json")
     return backend.setup_model(model, compile_model=settings.compile_model)
@@ -399,7 +408,10 @@ def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
         resume_path = find_latest_checkpoint(state.run_directory, settings.run_name)
     if resume_path is None:
         return None
+    log.info("loading the checkpoint %s (%.1f GB) into the model and the optimizer", resume_path, resume_path.stat().st_size / 1e9)
+    started = time.monotonic()
     metadata = load_training_checkpoint(state.backend, resume_path, state.model, state.optimizer)
+    log.info("checkpoint of step %d loaded in %.1fs", metadata.step, time.monotonic() - started)
     check_dataset_unchanged(metadata, state.dataset, settings.allow_dataset_change)
     model_config = state.backend.plain_model(state.model).config.to_dict()
     check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
