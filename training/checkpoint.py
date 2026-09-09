@@ -4,6 +4,10 @@ Checkpoint schema, naming, search, and save/load through the backend. Steps in f
 
 A checkpoint is one `torch.save` dict: the `"model"` and `"optimizer"` state dicts plus the `CheckpointMetadata`
 fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key.
+
+Per-rank state: the RNG state is stored for every rank (`rng_states`, indexed by rank, gathered through the
+backend), the data stream once (rank 0 reads and packs for the whole world). A resume needs the same `world_size`
+the checkpoint was written with (`training.run.restore_checkpoint_if_resuming`).
 """
 
 import re
@@ -16,7 +20,7 @@ import torch
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from training.backend.base import Backend, unwrap_compiled
+from training.backend.base import Backend
 from training.settings import Settings
 from training.stage_manager import StageManager
 
@@ -32,7 +36,8 @@ class CheckpointMetadata:
 
     step: int  # optimizer steps completed when the checkpoint was written
     stage: int  # stage the run is in at `step` (the one it enters next when written before a transition)
-    rng: dict[str, Any]  # `Backend.rng_state()` after evaluation and logging of `step`
+    world_size: int  # ranks the run had; a resume needs the same number
+    rng_states: list[dict[str, Any]]  # every rank's `Backend.rng_state()` after evaluation and logging of `step`, by rank
     settings: dict[str, Any]  # `asdict(Settings)` of the run (nested dataclasses like optim_config as plain dicts)
     model_config: dict[str, Any]  # `RecurrentConfig.to_dict()` of the trained model
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
@@ -248,7 +253,7 @@ def save_training_checkpoint(
     """
 
     state: dict[str, Any] = {
-        "model": unwrap_compiled(model).state_dict(),
+        "model": backend.plain_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         **metadata.to_state(),
     }
@@ -267,7 +272,7 @@ def load_training_checkpoint(
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
-    unwrap_compiled(model).load_state_dict(state["model"])
+    backend.plain_model(model).load_state_dict(state["model"])
     expected = _group_hyperparameters(optimizer)
     optimizer.load_state_dict(state["optimizer"])
     check_param_groups_unchanged(expected, _group_hyperparameters(optimizer))

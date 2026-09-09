@@ -7,8 +7,8 @@ Everything here is numerics, bit-identical to the thesis loop; the golden tests 
 fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
 run, the source of every document chosen deterministically so that the sources' TOKEN shares follow the stage
 weights (`BatchStream._pick_source`), and the documents packed into one row per micro-batch
-(`training.data.packing`). Steps are OPTIMIZER steps: `gradient_accumulation_steps` packed micro-batches, one
-`optimizer.step()`.
+(`training.data.packing`). Steps are OPTIMIZER steps: `micro_batches_per_step` packed micro-batches over all ranks
+(`Settings.micro_batches_per_rank` of them on each), one `optimizer.step()`.
 """
 
 import logging
@@ -24,7 +24,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from model.layers.attention import document_attention_mask
-from training.backend.base import Backend, plain_model
+from training.backend.base import Backend
 from training.data.collate import Sample
 from training.data.loader import RunDataloaders
 from training.data.packing import PackedBatch, PackPool, pack_samples, shifted_length
@@ -91,7 +91,7 @@ class StepResult:
 
 class BatchStream:
     """
-    Endless stream of packed micro-batches; every `gradient_accumulation_steps` of them form one optimizer step.
+    Endless stream of packed micro-batches; every `micro_batches_per_step` of them form one optimizer step.
 
     One reader per source for the whole run; stages only change the weights, so a source shared by two stages is
     never re-read. Every document goes into a `PackPool`: before every micro-batch the pool is refilled to
@@ -325,20 +325,21 @@ def run_one_optimizer_step(
     progress: TrainingProgress,
 ) -> StepResult:
     """
-    Run optimizer step `progress.step`: `gradient_accumulation_steps` packed micro-batches from `batches`, one
-    `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
+    Run optimizer step `progress.step`: this rank's `micro_batches_per_rank` packed micro-batches from `batches`,
+    one `optimizer.step()`. Does not advance `progress` (`train()` does, right after).
 
     Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
     any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
-    loss is all-reduced every step (a no-op on one device). The loss is the mean over the valid tokens of each pack,
+    loss is all-reduced every step (a no-op on one device) BEFORE it is checked for finiteness, so every rank sees
+    the same number and makes the same decision to raise. The loss is the mean over the valid tokens of each pack,
     averaged over the packs: with full packs the valid-token counts are nearly equal (they differ by the pack tails),
     so the step loss is close to token-weighted. Training on padded rows was removed for exactly this reason: the
     loader sorted a world batch by length, so a micro-batch of short rows weighed as much as one of full rows.
     """
 
     step = progress.step
-    accumulation_steps = settings.gradient_accumulation_steps
-    plain_model(model).step = step
+    accumulation_steps = settings.micro_batches_per_rank(backend.world_size)
+    backend.plain_model(model).step = step
     stage = stage_manager.get_stage_info(step)
     learning_rate = scheduled_learning_rate(settings, stage_manager, progress)
     set_lr(optimizer, learning_rate)
@@ -359,7 +360,7 @@ def run_one_optimizer_step(
                 outputs = model(**inputs)
             backend.backward(outputs["loss"] / accumulation_steps)
         loss_sum += outputs["loss"].detach()
-    loss = loss_sum / accumulation_steps
+    loss = backend.all_reduce(loss_sum / accumulation_steps)  # the world mean: every rank checks the same number
     if not torch.isfinite(loss):
         raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")
 
@@ -382,7 +383,7 @@ def run_one_optimizer_step(
     return StepResult(
         step=step,
         learning_rate=learning_rate,
-        loss=backend.all_reduce(loss),
+        loss=loss,
         grad_norm=grad_norm,
         stage=stage,
         data_ids=data_ids,
