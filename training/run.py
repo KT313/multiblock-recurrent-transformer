@@ -7,7 +7,7 @@
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
-    build_run_dataloaders             one train loader per SOURCE (whole run), one validation loader per stage
+    build_run_dataloaders             one train loader per SOURCE on the main rank (whole run), one validation loader per stage
     build_run_model                   architecture yaml + overrides, sequence-length check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     RunState                          the objects above in one place for the helpers below
@@ -17,6 +17,9 @@
 
 Steps are OPTIMIZER steps (one world batch each). `train()` touches no tensor, device, clock or `print`: numerics
 live in `step.py` and `evaluation.py`, device code in `backend/`, console lines and the dashboard in `logger.py`.
+Every rank of a multi-rank run (`backend: ddp`) runs this same function; what is the main rank's alone is the data
+stream (`RankBatches` scatters its packs), the run lock, the files it writes and the logging (the other ranks' logger
+is silent).
 The setup order is itself numerics: seed, dataset and loaders (no torch RNG draw), model (its init is the first RNG
 consumer), optimizer, resume (restores the stored RNG state). The golden run in `test_run.py` fails on any change.
 
@@ -68,7 +71,7 @@ from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
-from training.step import BatchStream, NonFiniteLossError, TrainingProgress, run_one_optimizer_step
+from training.step import BatchStream, NonFiniteLossError, RankBatches, TrainingProgress, run_one_optimizer_step
 
 
 log = get_logger(__name__)
@@ -168,7 +171,9 @@ def train(
                     logger.log_resume(resume.checkpoint, progress.step)
                 logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
                 logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
-                batches = BatchStream(settings, loaders, stage_manager, progress)
+                # the main rank owns the one data stream; every rank trains on its `RankBatches` view of it
+                stream = BatchStream(settings, loaders, stage_manager, progress) if backend.is_main else None
+                batches = RankBatches(backend, stream, settings.tokens_per_micro_batch)
                 if resume is not None and resume.data_stream is not None:
                     batches.load_state_dict(resume.data_stream)
                 logger.status("training")
@@ -194,11 +199,15 @@ def train(
                     if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
                         save_run_checkpoint(state, logger, batches)
                     # after the checkpoint: a failing benchmark (network, the missing extra) never costs one.
-                    # Samples, benchmarks and the export are the main rank's work (RNG-isolated inference, files)
-                    if backend.is_main and not stopped and sample_triggers.due(progress.step):
-                        write_samples(state, logger, loaders.tokenizer)
-                    if backend.is_main and not stopped and benchmark_triggers.due(progress.step):
-                        run_benchmarks(state, logger, loaders.tokenizer)
+                    # Samples and benchmarks are the main rank's work (RNG-isolated inference, files); the other
+                    # ranks wait at the barrier, a decision every rank takes alike (the triggers depend on the step)
+                    samples_due, benchmarks_due = sample_triggers.due(progress.step), benchmark_triggers.due(progress.step)
+                    if not stopped and (samples_due or benchmarks_due):
+                        if backend.is_main and samples_due:
+                            write_samples(state, logger, loaders.tokenizer)
+                        if backend.is_main and benchmarks_due:
+                            run_benchmarks(state, logger, loaders.tokenizer)
+                        backend.barrier()
                 export_dir = None if stopped or not backend.is_main else export_if_requested(state, logger)
                 return logger.close(progress, export_dir, stopped=stopped)
         finally:
@@ -414,7 +423,7 @@ def stop_requested(should_stop: StopCheck | None) -> bool:
     return should_stop is not None and should_stop()
 
 
-def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: BatchStream) -> str:
+def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: RankBatches) -> str:
     """
     A step that produced a non-finite loss or gradient norm did not update the model (`optimizer.step` never ran),
     so the model and optimizer state are those of the completed steps: save them, unless no step completed yet.
@@ -437,9 +446,11 @@ def _checkpoint_before_failed_step(state: RunState, logger: RunLogger, batches: 
     )
 
 
-def save_run_checkpoint(state: RunState, logger: RunLogger, batches: BatchStream, failed: bool = False) -> Path:
+def save_run_checkpoint(state: RunState, logger: RunLogger, batches: RankBatches, failed: bool = False) -> Path:
     """
-    Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger.
+    Write the checkpoint of `state.progress.step` completed optimizer steps and tell the logger. Every rank calls
+    this (the RNG states are gathered here); the backend writes the file on the main rank, whose `batches` hold the
+    data stream.
 
     Named `step-{step:08d}-{run_name}.pth`, plus `-stage-{i}_end` after the last plain step of stage i; `stage` is
     the stage the run is heading for (`StageManager.entering_stage_at`). Called after evaluation and logging; the
