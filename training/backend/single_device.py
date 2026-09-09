@@ -53,13 +53,7 @@ class SingleDeviceBackend:
     def __init__(self, device: str | None = None, precision: str = "bf16-mixed") -> None:
         if precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
-        launched_world = int(os.environ.get(WORLD_SIZE_ENV, "1"))
-        if launched_world > 1:
-            raise RuntimeError(
-                f"{WORLD_SIZE_ENV}={launched_world} in the environment (a torchrun launch with {launched_world} ranks) "
-                "but the run uses the single_device backend, which would train an independent copy of the run per "
-                "rank on the same device; set `backend: ddp` in the run config for a multi-GPU run"
-            )
+        self._check_launch_environment()
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda:0"
@@ -71,6 +65,20 @@ class SingleDeviceBackend:
         self.pin_memory = self.device.type == "cuda"
         self.wrappers: tuple[str, ...] = ()
         _set_torch_flags()
+
+    def _check_launch_environment(self) -> None:
+        """
+        Refuse a torchrun launch with several ranks: every rank would build this backend on the same device and
+        train its own copy of the run. The multi-rank backend (`training/backend/ddp.py`) overrides this.
+        """
+
+        launched_world = int(os.environ.get(WORLD_SIZE_ENV, "1"))
+        if launched_world > 1:
+            raise RuntimeError(
+                f"{WORLD_SIZE_ENV}={launched_world} in the environment (a torchrun launch with {launched_world} ranks) "
+                "but the run uses the single_device backend, which would train an independent copy of the run per "
+                "rank on the same device; set `backend: ddp` in the run config for a multi-GPU run"
+            )
 
     def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         model = model.to(self.device)
@@ -119,6 +127,11 @@ class SingleDeviceBackend:
 
     def any_flag(self, flag: bool) -> bool:
         return flag
+
+    def scatter_packs(self, packs: Tensor | None, slice_shape: tuple[int, ...]) -> Tensor:
+        if packs is None:
+            raise ValueError("the single device is the main rank and must pass the packs")
+        return packs[0]
 
     def shutdown(self) -> None:
         return None

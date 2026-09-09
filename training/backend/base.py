@@ -3,12 +3,12 @@
 Device/strategy/precision abstraction used by the training loop.
 
 The loop never touches CUDA, autocast, `torch.distributed` or rank checks directly; everything goes through a
-`Backend`. `single_device.py` is the only implementation for now; a DDP backend implements the same protocol later.
-Everything that is a collective on several ranks is already a member here with an identity body on one device:
-`all_reduce`, `barrier`, `all_gather_object`, `any_flag`. The loop uses them at the places a multi-rank run needs
-them (the checkpoint gathers every rank's RNG state, the stop request is decided by `any_flag` so all ranks stop
-after the same step, the validation losses are reduced), so the DDP backend later fills in bodies that already have
-call sites.
+`Backend`. Two implementations: `single_device.py` (one GPU or the CPU, every collective the identity) and `ddp.py`
+(one process per GPU under torchrun, `torch.distributed` collectives). The loop uses the collectives at the places
+a multi-rank run needs them: the checkpoint gathers every rank's RNG state (`all_gather_object`), the stop request
+is decided by `any_flag` so all ranks stop after the same step, the loss and the validation losses are reduced
+(`all_reduce`), and the main rank's packs reach the other ranks through `scatter_packs` (rank 0 owns the single
+data stream, `training.step.RankBatches`).
 
 Wrappers around the model (`torch.compile`, DDP later) are applied by `setup_model` and recorded in `wrappers`;
 `plain_model` unwraps exactly that layering (`unwrap_model`) and raises on anything else, so a wrapper the backend
@@ -135,6 +135,15 @@ class Backend(Protocol):
         """
         Whether any rank passed True (the flag itself on a single device). The stop request goes through this, so
         every rank stops after the same step.
+        """
+
+        ...
+
+    def scatter_packs(self, packs: Tensor | None, slice_shape: tuple[int, ...]) -> Tensor:
+        """
+        This rank's slice of the main rank's packs: rank 0 passes a `(world_size, *slice_shape)` tensor on its
+        device (the other ranks None) and every rank gets its `slice_shape` slice, on its device. The single device
+        returns `packs[0]`. One collective per micro-batch index (`training.step.RankBatches`).
         """
 
         ...

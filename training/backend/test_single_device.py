@@ -27,7 +27,7 @@ def test_registry_and_default_device() -> None:
     assert backend.device.type == expected
     assert (backend.world_size, backend.rank, backend.is_main) == (1, 0, True)
     assert backend.pin_memory == (expected == "cuda")
-    assert set(BACKENDS) == {"single_device"}
+    assert set(BACKENDS) == {"single_device", "ddp"}
 
 
 def test_single_device_backend_implements_the_protocol() -> None:
