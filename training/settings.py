@@ -131,7 +131,7 @@ class Settings:
     log_step_interval: int = 1
     log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
     eval_step_interval: int = 100
-    eval_iters: int = 50  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
+    eval_iters: int = 64  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
     validation_batch_size: int = 4  # rows per validation forward
     validation_padding_multiple: Optional[int] = 128  # pad validation batches to a multiple of this many tokens (None: the longest row)
     partial_depth_eval: list[int] = field(default_factory=list)  # extra recurrence depths evaluated at validation

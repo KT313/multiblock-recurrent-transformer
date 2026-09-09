@@ -208,8 +208,10 @@ class RunDataloaders:
 
     Data wait: `next_train_batch` times every pull from a loader (`clock`, monotonic) and adds the seconds to
     `wait_seconds` per source; `take_wait_seconds` hands them out and resets. A pull blocks only when the worker has
-    no batch ready, so this is the time the training process (and every GPU behind it) waits for data. A source's
-    first pull and every epoch restart include the worker start-up (process spawn, tokenizer load) and count too.
+    no batch ready, so this is the time the training process (and every GPU behind it) waits for data. The first
+    pull of a fresh iterator (a source's first batch, every epoch restart) is the worker start-up (process spawn,
+    tokenizer load) and is not counted: it would put nearly every run's first log interval over the warning
+    threshold and says nothing about the tokenization rate.
     """
 
     train_loaders: dict[str, Iterable[WorkerBatch]]
@@ -334,18 +336,21 @@ class RunDataloaders:
         """
 
         iterator = self._train_iterators[source]
+        fresh = iterator is None  # a fresh iterator's first pull is the worker start-up, not a wait on tokenization
         if iterator is None:
             iterator = self._start_train_iterator(source)
         while True:
             started = self.clock()
             batch = next(iterator, None)  # a sentinel, so the error below is not chained onto a StopIteration
-            self.wait_seconds[source] = self.wait_seconds.get(source, 0.0) + (self.clock() - started)
+            if not fresh:
+                self.wait_seconds[source] = self.wait_seconds.get(source, 0.0) + (self.clock() - started)
             if batch is not None:
                 self._count_batch(source, batch)
                 return batch
             # the epoch is over and the next one starts at row 0, so the second round either yields or raises
             self._end_of_epoch(source)
             iterator = self._start_train_iterator(source)
+            fresh = True
 
     def take_wait_seconds(self) -> dict[str, float]:
         """

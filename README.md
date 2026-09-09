@@ -75,7 +75,7 @@ uv run python training/train.py --config config/crow_300m_final.yaml
 make training config/crow_300m_final.yaml
 
 # all GPUs of this machine (the config sets backend: ddp; see docs/distributed_training.md)
-make training-ddp config/crow_300m_final.yaml GPUS=8
+make training-ddp config/crow_300m_final.yaml          # GPUS=2 for a subset
 ```
 
 ![TUI Training](docs/screenshots/tui_training.png)

@@ -130,89 +130,91 @@ def train(
 
     check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
-    backend.seed_everything(settings.seed)
-    run_directory = prepare_run_directory(settings)
-    # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
-    lock = run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training") if backend.is_main else nullcontext()
-    with lock:
-        dataset = resolve_dataset(settings, backend, should_stop=should_stop)
-        stage_manager = build_stage_manager(settings, dataset, backend.world_size)
-        sample_triggers = StepTriggers.from_settings(
-            settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps
-        )
-        benchmark_triggers = StepTriggers.from_settings(
-            settings.benchmark_step_interval, settings.benchmark_at_training_progress, stage_manager.total_steps
-        )
-        loaders = build_run_dataloaders(settings, dataset, backend)
-        try:
-            model = build_run_model(settings, dataset, backend, run_directory)
-            check_tokenizer_vocabulary(loaders.tokenizer, backend.plain_model(model).config)
-            optimizer = build_run_optimizer(settings, model, backend)
-            state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
-            resume = restore_checkpoint_if_resuming(state)
-            progress = state.progress
+    try:
+        backend.seed_everything(settings.seed)
+        run_directory = prepare_run_directory(settings)
+        # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
+        lock = run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training") if backend.is_main else nullcontext()
+        with lock:
+            dataset = resolve_dataset(settings, backend, should_stop=should_stop)
+            stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+            sample_triggers = StepTriggers.from_settings(
+                settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps
+            )
+            benchmark_triggers = StepTriggers.from_settings(
+                settings.benchmark_step_interval, settings.benchmark_at_training_progress, stage_manager.total_steps
+            )
+            loaders = build_run_dataloaders(settings, dataset, backend)
+            try:
+                model = build_run_model(settings, dataset, backend, run_directory)
+                check_tokenizer_vocabulary(loaders.tokenizer, backend.plain_model(model).config)
+                optimizer = build_run_optimizer(settings, model, backend)
+                state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
+                resume = restore_checkpoint_if_resuming(state)
+                progress = state.progress
 
-            with RunLogger.open(
-                settings,
-                run_directory,
-                dataset,
-                model,
-                stage_manager,
-                progress,
-                backend,
-                setup_started=started_at,
-                keep_history=keep_history,
-            ) as logger:
-                if backend.is_main and (resume is None or not (run_directory / "run_config.json").exists()):
-                    record_run_config(settings, run_directory)
-                if resume is None:
-                    logger.log_fresh_start()
-                else:
-                    logger.log_resume(resume.checkpoint, progress.step)
-                logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
-                logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
-                # the main rank owns the one data stream; every rank trains on its `RankBatches` view of it
-                stream = BatchStream(settings, loaders, stage_manager, progress) if backend.is_main else None
-                batches = RankBatches(backend, stream, settings.tokens_per_micro_batch)
-                if resume is not None and resume.data_stream is not None:
-                    batches.load_state_dict(resume.data_stream)
-                logger.status("training")
-                stopped = False
-                while progress.step < stage_manager.total_steps and not stopped:
-                    try:
-                        result = run_one_optimizer_step(
-                            settings, backend, model, optimizer, stage_manager, batches, progress
-                        )
-                    except NonFiniteLossError as error:
-                        raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
-                    progress.advance()
-                    if is_evaluation_step(settings, progress.step, stage_manager):
-                        validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
-                        with logger.evaluating():
-                            result.validation = evaluate(settings, backend, model, validation_loader)
-                    logger.log_step(result, progress, data_wait=loaders.take_wait_seconds())
-                    # a request arriving during the last step changes nothing: the run is finished, not stopped;
-                    # decided over all ranks, so every rank saves and stops after the same step
-                    stopped = backend.any_flag(stop_requested(should_stop)) and progress.step < stage_manager.total_steps
-                    if stopped:
-                        logger.status("stopping after this step, saving a checkpoint")
-                    if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
-                        save_run_checkpoint(state, logger, batches)
-                    # after the checkpoint: a failing benchmark (network, the missing extra) never costs one.
-                    # Samples and benchmarks are the main rank's work (RNG-isolated inference, files); the other
-                    # ranks wait at the barrier, a decision every rank takes alike (the triggers depend on the step)
-                    samples_due, benchmarks_due = sample_triggers.due(progress.step), benchmark_triggers.due(progress.step)
-                    if not stopped and (samples_due or benchmarks_due):
-                        if backend.is_main and samples_due:
-                            write_samples(state, logger, loaders.tokenizer)
-                        if backend.is_main and benchmarks_due:
-                            run_benchmarks(state, logger, loaders.tokenizer)
-                        backend.barrier()
-                export_dir = None if stopped or not backend.is_main else export_if_requested(state, logger)
-                return logger.close(progress, export_dir, stopped=stopped)
-        finally:
-            loaders.close()  # the loader workers stop now, not when the GC finds the iterators
-            backend.shutdown()
+                with RunLogger.open(
+                    settings,
+                    run_directory,
+                    dataset,
+                    model,
+                    stage_manager,
+                    progress,
+                    backend,
+                    setup_started=started_at,
+                    keep_history=keep_history,
+                ) as logger:
+                    if backend.is_main and (resume is None or not (run_directory / "run_config.json").exists()):
+                        record_run_config(settings, run_directory)
+                    if resume is None:
+                        logger.log_fresh_start()
+                    else:
+                        logger.log_resume(resume.checkpoint, progress.step)
+                    logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
+                    logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
+                    # the main rank owns the one data stream; every rank trains on its `RankBatches` view of it
+                    stream = BatchStream(settings, loaders, stage_manager, progress) if backend.is_main else None
+                    batches = RankBatches(backend, stream, settings.tokens_per_micro_batch)
+                    if resume is not None and resume.data_stream is not None:
+                        batches.load_state_dict(resume.data_stream)
+                    logger.status("training")
+                    stopped = False
+                    while progress.step < stage_manager.total_steps and not stopped:
+                        try:
+                            result = run_one_optimizer_step(
+                                settings, backend, model, optimizer, stage_manager, batches, progress
+                            )
+                        except NonFiniteLossError as error:
+                            raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
+                        progress.advance()
+                        if is_evaluation_step(settings, progress.step, stage_manager):
+                            validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
+                            with logger.evaluating():
+                                result.validation = evaluate(settings, backend, model, validation_loader)
+                        logger.log_step(result, progress, data_wait=loaders.take_wait_seconds())
+                        # a request arriving during the last step changes nothing: the run is finished, not stopped;
+                        # decided over all ranks, so every rank saves and stops after the same step
+                        stopped = backend.any_flag(stop_requested(should_stop)) and progress.step < stage_manager.total_steps
+                        if stopped:
+                            logger.status("stopping after this step, saving a checkpoint")
+                        if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
+                            save_run_checkpoint(state, logger, batches)
+                        # after the checkpoint: a failing benchmark (network, the missing extra) never costs one.
+                        # Samples and benchmarks are the main rank's work (RNG-isolated inference, files); the other
+                        # ranks wait at the barrier, a decision every rank takes alike (the triggers depend on the step)
+                        samples_due, benchmarks_due = sample_triggers.due(progress.step), benchmark_triggers.due(progress.step)
+                        if not stopped and (samples_due or benchmarks_due):
+                            if backend.is_main and samples_due:
+                                write_samples(state, logger, loaders.tokenizer)
+                            if backend.is_main and benchmarks_due:
+                                run_benchmarks(state, logger, loaders.tokenizer)
+                            backend.barrier()
+                    export_dir = None if stopped or not backend.is_main else export_if_requested(state, logger)
+                    return logger.close(progress, export_dir, stopped=stopped)
+            finally:
+                loaders.close()  # the loader workers stop now, not when the GC finds the iterators
+    finally:
+        backend.shutdown()  # the process group, on every way out (a setup failure included)
 
 
 # --- setup -----------------------------------------------------------------------------------------------------------

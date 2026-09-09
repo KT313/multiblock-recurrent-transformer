@@ -39,13 +39,12 @@ WRAPPERS: dict[str, tuple[type[Module], str]] = {
 }
 
 
-def unwrap_model(model: Module, layers: Sequence[str]) -> RecurrentGPT:
+def unwrap_layers(model: Module, layers: Sequence[str]) -> Module:
     """
-    The `RecurrentGPT` behind exactly the wrappers `layers` names, outermost first (`WRAPPERS` kinds, for example
-    `("ddp", "compile")` for a compiled model wrapped in DDP). Every layer must be the expected wrapper class and
-    the innermost module a `RecurrentGPT`; anything else raises `TypeError` naming the expected layering and the
-    chain of types found. Never peels off whatever wrapper happens to be there: a layering the backend did not
-    apply is a bug worth seeing.
+    The module behind exactly the wrappers `layers` names, outermost first (`WRAPPERS` kinds, for example
+    `("compile", "ddp")` for a DDP-wrapped model under torch.compile). Every layer must be the expected wrapper
+    class; anything else raises `TypeError` naming the expected layering and the chain of types found. Never peels
+    off whatever wrapper happens to be there: a layering the backend did not apply is a bug worth seeing.
     """
 
     current = model
@@ -61,12 +60,21 @@ def unwrap_model(model: Module, layers: Sequence[str]) -> RecurrentGPT:
             )
         current = getattr(current, attribute)
         chain.append(type(current).__name__)
-    if not isinstance(current, RecurrentGPT):
-        raise TypeError(
-            f"expected a RecurrentGPT behind the wrappers {tuple(layers)} but found {type(current).__name__}; "
-            f"chain {' -> '.join(chain)}"
-        )
     return current
+
+
+def unwrap_model(model: Module, layers: Sequence[str]) -> RecurrentGPT:
+    """
+    The `RecurrentGPT` behind exactly the wrappers `layers` names (`unwrap_layers`); a different innermost module
+    raises `TypeError` too.
+    """
+
+    plain = unwrap_layers(model, layers)
+    if not isinstance(plain, RecurrentGPT):
+        raise TypeError(
+            f"expected a RecurrentGPT behind the wrappers {tuple(layers)} but found {type(plain).__name__}"
+        )
+    return plain
 
 
 class Backend(Protocol):

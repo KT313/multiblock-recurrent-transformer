@@ -29,6 +29,7 @@ from torch import Tensor
 from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
 
+from training.backend.base import unwrap_layers
 from training.backend.single_device import DYNAMO_RECOMPILE_LIMIT, SingleDeviceBackend
 
 T = TypeVar("T")
@@ -96,10 +97,12 @@ class DDPBackend(SingleDeviceBackend):
 
     def _ddp_module(self, model: Module) -> DistributedDataParallel:
         """
-        The DDP wrapper inside `model` (behind the compile wrapper when there is one).
+        The DDP wrapper inside `model`: behind exactly the wrappers `setup_model` applied outside it (the compile
+        wrapper, when there is one), through the same `WRAPPERS` table as `plain_model`.
         """
 
-        candidate = getattr(model, "_orig_mod", model) if "compile" in self.wrappers else model
+        outer = self.wrappers[: self.wrappers.index("ddp")] if "ddp" in self.wrappers else self.wrappers
+        candidate = unwrap_layers(model, outer)
         if not isinstance(candidate, DistributedDataParallel):
             raise TypeError(f"expected the DDP wrapper, found {type(candidate).__name__}; layering {self.wrappers}")
         return candidate

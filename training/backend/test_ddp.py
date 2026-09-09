@@ -10,7 +10,6 @@ destroys the group after each test.
 """
 
 import json
-import socket
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,6 +26,7 @@ from training.backend.base import Backend
 from training.backend.ddp import DDP_TIMEOUT, TORCHRUN_VARIABLES, DDPBackend
 from training.run import run_directory_of, train
 from training.settings import parse_settings
+from training.testing.network import free_port
 from training.testing.golden import (
     GOLDEN_RUN_PATH,
     ReferenceRun,
@@ -39,12 +39,6 @@ from training.testing.golden import (
 )
 
 pytestmark = pytest.mark.xdist_group("ddp")
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 @pytest.fixture

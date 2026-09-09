@@ -42,10 +42,11 @@ training-autotune:
 	$(require_config)
 	TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 uv run python training/train.py --config $(CONFIG)
 
-GPUS ?= 2
-training-ddp:  ## train on every GPU of this machine: make training-ddp config/<run>.yaml GPUS=8 (the config needs backend: ddp)
+GPUS ?= gpu                    # torchrun's `gpu`: one rank per visible GPU; GPUS=2 for a subset
+SHUTDOWN_TIMEOUT ?= 1800       # seconds torchrun waits after Ctrl-C before it kills the ranks (the step plus the checkpoint write)
+training-ddp:  ## train on every GPU of this machine: make training-ddp config/<run>.yaml [GPUS=2] (the config needs backend: ddp)
 	$(require_config)
-	uv run torchrun --standalone --nproc_per_node=$(GPUS) training/train.py --config $(CONFIG)
+	uv run torchrun --standalone --nproc_per_node=$(GPUS) --shutdown-timeout=$(SHUTDOWN_TIMEOUT) training/train.py --config $(CONFIG)
 
 evaluate:  ## samples (and benchmarks with EVAL_TASKS=a,b) for a checkpoint: make evaluate <checkpoint.pth>
 	$(require_checkpoint)

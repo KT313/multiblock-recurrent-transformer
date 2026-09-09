@@ -4,9 +4,9 @@
 of scope.
 
 ```bash
-make training-ddp config/<run>.yaml GPUS=8
+make training-ddp config/<run>.yaml            # every visible GPU; GPUS=2 for a subset
 # the same without make
-uv run torchrun --standalone --nproc_per_node=8 training/train.py --config config/<run>.yaml
+uv run torchrun --standalone --nproc_per_node=gpu --shutdown-timeout=1800 training/train.py --config config/<run>.yaml
 ```
 
 The run config must say `backend: ddp`. The single-device backend refuses to start under torchrun (it would train
@@ -32,8 +32,15 @@ Every rank runs the same `train()`; the differences are these.
 - **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, checkpoints, samples, benchmarks,
   the export, `train.log`, wandb and the dashboard belong to rank 0. The other ranks print WARNING and above with a
   `[rank N]` prefix; `torchrun --redirects 3 --local-ranks-filter 0` silences them entirely.
-- **Stopping.** Ctrl-C (torchrun forwards it as SIGTERM) sets the stop flag on every rank; the flag is combined over
-  the ranks after each step, so all ranks save the same checkpoint and stop together.
+- **Stopping.** Ctrl-C reaches torchrun (the ranks run in their own session) and torchrun forwards the signal to every
+  rank; each rank sets its stop flag, the flags are combined after the step, so all ranks save the same checkpoint and
+  stop together. torchrun then waits `--shutdown-timeout` seconds (its default is 30) before it kills the ranks, and
+  a kill inside the last step or the checkpoint write loses the stop checkpoint. `make training-ddp` passes
+  `--shutdown-timeout=1800` (`SHUTDOWN_TIMEOUT=n` overrides); a launch by hand needs the flag too. A second Ctrl-C
+  makes torchrun signal the ranks again, which should end them right away. Ctrl-C during an `auto_prepare` build stops
+  at the next shard, which can take minutes, so the window is generous on purpose. torchrun itself always exits 1 with
+  a `SignalException` traceback after a Ctrl-C, even when every rank stopped cleanly; the confirmation of a clean stop
+  is rank 0's summary ("stopped on request after step N") and its checkpoint.
 
 ## Resuming
 
@@ -45,8 +52,8 @@ written with another count is refused. The backend name itself may change betwee
 
 Rank 0 tokenizes for every GPU. `data/wait_seconds` and `data/wait_fraction` (wandb, `train.log`) report the time
 rank 0 blocked waiting for a tokenizer worker per log interval; above five percent of the training time a warning
-names the slowest source. A wait that persists beyond a source's first batch and its epoch restarts means the
-tokenizer workers are the bottleneck.
+names the slowest source. Worker start-ups (a source's first batch, an epoch restart) are not counted, so a warning
+means the tokenizer workers are the bottleneck.
 
 ## Timeouts
 

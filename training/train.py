@@ -12,7 +12,11 @@ saves a checkpoint and exits 130; during the in-process dataset build it stops a
 Console: one stderr handler on the `training` and `data_preparation` logger hierarchies (`configure_console_logging`).
 Under torchrun (`backend: ddp`, `make training-ddp`) every rank runs this CLI; rank 0 logs, shows the dashboard and
 prints the report, the other ranks (`RANK` in the environment) keep WARNING and above with a `[rank N]` prefix, so a
-failure on any rank is seen. `torchrun --redirects 3 --local-ranks-filter 0` silences them completely.
+failure on any rank is seen. `torchrun --redirects 3 --local-ranks-filter 0` silences them completely. Ctrl-C reaches
+torchrun, which forwards the signal to every rank and kills what is still running after `--shutdown-timeout` seconds
+(30 by default, too short for a step plus a checkpoint write; `make training-ddp` passes 1800). torchrun then exits 1
+with a `SignalException` traceback even when every rank stopped cleanly; rank 0's summary and checkpoint are the
+confirmation.
 `RunLogger` opens the terminal dashboard of `training/ui/` for the run (the live display on a TTY, the one-line
 fallback when piped or with `TRAINING_DASHBOARD=0`, `<out_dir>/<run_name>/train.log` in both cases, and the report as
 `train_report.json` next to it); it swaps the `training`

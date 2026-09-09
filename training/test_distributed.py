@@ -17,7 +17,6 @@ refused, and rank 1 says nothing below WARNING.
 
 import json
 import os
-import socket
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -28,6 +27,7 @@ import pytest
 import torch
 
 from training.checkpoint import checkpoint_dir
+from training.testing.network import free_port
 from training.testing.golden import GOLDEN_RUN_PATH, optimizer_steps_taken, write_tiny_yaml
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
@@ -37,12 +37,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RANKS = 2
 LAUNCH_TIMEOUT_SECONDS = 600
 DDP_OPTIONS = {"backend": "ddp", "precision": "32", "wandb_enabled": False, "export_to_hf": False, "resume": False}
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 @dataclass(frozen=True)

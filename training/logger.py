@@ -794,8 +794,8 @@ class RunLogger:
             )
             self.console.warning(
                 "the run waited %.1fs for training data over the last %d step(s), %.0f%% of the training time "
-                "(slowest: %s): the loader workers do not keep up with the model. A source's first batch and every "
-                "epoch restart include a worker start-up; a wait that persists means tokenization is the bottleneck",
+                "(slowest: %s): the loader workers do not keep up with the model (worker start-ups are not counted), "
+                "tokenization is the bottleneck",
                 wait_seconds,
                 steps,
                 100 * fraction,

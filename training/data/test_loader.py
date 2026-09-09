@@ -452,8 +452,9 @@ class _SlowLoader:
 def test_next_train_batch_times_the_wait_for_a_worker_batch(tokenizer: Tokenizer) -> None:
     """
     Every pull is timed against the loaders' clock and booked per source; `take_wait_seconds` hands the seconds out
-    and resets, so the logger sees one interval at a time. The pull that finds an epoch over and the restart's first
-    pull count as well (a worker start-up is a wait too).
+    and resets, so the logger sees one interval at a time. The first pull of a fresh iterator is the worker start-up
+    and is not booked: neither a source's first batch nor the first batch after an epoch restart. The pull that finds
+    the epoch over is a wait like any other.
     """
 
     now = [0.0]
@@ -463,11 +464,13 @@ def test_next_train_batch_times_the_wait_for_a_worker_batch(tokenizer: Tokenizer
     assert rd.take_wait_seconds() == {}
     rd.next_train_batch("a")
     rd.next_train_batch("b")
-    assert rd.take_wait_seconds() == pytest.approx({"a": 0.5, "b": 0.1})
+    assert rd.take_wait_seconds() == {}  # the first batch of every source: worker start-up, not counted
+    rd.next_train_batch("b")
+    assert rd.take_wait_seconds() == pytest.approx({"b": 0.1})
     assert rd.take_wait_seconds() == {}  # reset
     rd.next_train_batch("a")
-    rd.next_train_batch("a")  # the epoch of a is over: the exhausted pull plus the restart's first pull
-    assert rd.take_wait_seconds() == pytest.approx({"a": 0.5 + 0.5 + 0.5})
+    rd.next_train_batch("a")  # the epoch of a is over: the exhausted pull counts, the restart's first pull does not
+    assert rd.take_wait_seconds() == pytest.approx({"a": 0.5 + 0.5})
     assert rd.epochs["a"].rows_read == 1
 
 

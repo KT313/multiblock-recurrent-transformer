@@ -77,7 +77,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "log_step_interval": 1,
     "log_gradient_metrics": True,
     "eval_step_interval": 16,
-    "eval_iters": 50,
+    "eval_iters": 64,
     "partial_depth_eval": [1, 2, 4, 8, 16],
     "save_step_interval": 128,
     "save_last_step": True,
