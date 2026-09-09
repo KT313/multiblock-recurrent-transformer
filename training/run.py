@@ -127,8 +127,6 @@ def train(
 
     check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
-    if backend.world_size != 1:
-        raise NotImplementedError(f"world_size {backend.world_size}: no multi-rank backend exists yet, the loop runs on one device")
     backend.seed_everything(settings.seed)
     run_directory = prepare_run_directory(settings)
     # the main rank holds the run lock (released on every way out, exception included); other ranks share its run

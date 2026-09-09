@@ -51,6 +51,7 @@ from training.step import (
     NonFiniteLossError,
     run_one_optimizer_step,
     scheduled_learning_rate,
+    RankBatches,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1451,6 +1452,87 @@ def test_batch_stream_drops_the_row_counter_of_a_source_that_is_gone(
         {"consumed_rows": {"a": 7, "gone": 11}, "pool_loaded": {"a": 3}, "pool_target": {"a": 3.0}, "buffers": {}, "pool": []}
     )
     assert stream.state_dict()["consumed_rows"] == {"a": 7}
+
+
+# --- RankBatches: the per-rank view of the stream -------------------------------------------------------------------
+
+
+def _pack_tensors_equal(a: PackedBatch, b: PackedBatch) -> bool:
+    return all(
+        torch.equal(getattr(a, name), getattr(b, name)) for name in ("input_ids", "labels", "position_ids", "document_ids")
+    )
+
+
+def test_rank_batches_at_world_size_one_is_the_stream_itself(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer, cpu_backend: SingleDeviceBackend
+) -> None:
+    """
+    One rank: `RankBatches` hands out exactly the stream's packs, statistics included, and its state is the
+    stream's. A non-main rank without a stream, or a main rank without one, is a construction error.
+    """
+
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    reference_stream = BatchStream(settings, RunDataloaders({t: _Repeat(t) for t in "abc"}, [], stream_tokenizer, {}), stage_manager, TrainingProgress())
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    batches = RankBatches(cpu_backend, stream, settings.tokens_per_micro_batch)
+    for _ in range(4):
+        expected, actual = _next_pack(reference_stream), next(batches)
+        assert _pack_tensors_equal(expected, actual)
+        assert (actual.data_ids, actual.data_tokens, actual.padding_tokens) == (expected.data_ids, expected.data_tokens, expected.padding_tokens)
+    assert batches.state_dict() == stream.state_dict() and batches.state_dict()["consumed_rows"]
+    with pytest.raises(ValueError, match="main rank owns the data stream"):
+        RankBatches(cpu_backend, None, settings.tokens_per_micro_batch)
+
+    class NonMain(SingleDeviceBackend):
+        is_main = False
+
+    with pytest.raises(ValueError, match="only the main rank reads data"):
+        RankBatches(NonMain(device="cpu", precision="32"), stream, settings.tokens_per_micro_batch)
+
+
+def test_rank_batches_scatters_one_pack_per_rank_and_keeps_the_world_statistics_on_the_main_rank(
+    tmp_path: Path, tiny_dataset_dir: Path, stream_tokenizer: Tokenizer
+) -> None:
+    """
+    Two ranks, simulated in one process: the main rank pulls two packs, scatters the stacked `(2, 4, L)` tensor and
+    trains on pack 0, its returned pack carrying both packs' data ids, tokens and padding; the other rank receives
+    pack 1 with empty statistics, int32 document ids and an empty state dict.
+    """
+
+    scattered: list[torch.Tensor] = []
+
+    class MainOfTwo(SingleDeviceBackend):
+        world_size = 2
+
+        def scatter_packs(self, packs: torch.Tensor | None, slice_shape: tuple[int, ...]) -> torch.Tensor:
+            assert packs is not None and tuple(packs.shape) == (2, *slice_shape) and packs.dtype == torch.int64
+            scattered.append(packs)
+            return packs[0]
+
+    class SecondOfTwo(SingleDeviceBackend):
+        world_size, rank, is_main = 2, 1, False
+
+        def scatter_packs(self, packs: torch.Tensor | None, slice_shape: tuple[int, ...]) -> torch.Tensor:
+            assert packs is None
+            return scattered[-1][1]
+
+    settings, loaders, stage_manager = _stream_setup(tmp_path, tiny_dataset_dir, stream_tokenizer)
+    reference_stream = BatchStream(settings, RunDataloaders({t: _Repeat(t) for t in "abc"}, [], stream_tokenizer, {}), stage_manager, TrainingProgress())
+    stream = BatchStream(settings, loaders, stage_manager, TrainingProgress())
+    main = RankBatches(MainOfTwo(device="cpu", precision="32"), stream, settings.tokens_per_micro_batch)
+    second = RankBatches(SecondOfTwo(device="cpu", precision="32"), None, settings.tokens_per_micro_batch)
+    for _ in range(3):
+        first_pack, second_pack = _next_pack(reference_stream), _next_pack(reference_stream)
+        mine, theirs = next(main), next(second)
+        assert _pack_tensors_equal(mine, first_pack) and _pack_tensors_equal(theirs, second_pack)
+        assert mine.data_ids == first_pack.data_ids + second_pack.data_ids
+        assert mine.data_tokens == first_pack.data_tokens + second_pack.data_tokens
+        assert mine.padding_tokens == first_pack.padding_tokens + second_pack.padding_tokens
+        assert (theirs.data_ids, theirs.data_tokens, theirs.padding_tokens) == ([], [], 0)
+        assert theirs.document_ids.dtype == torch.int32 and mine.document_ids.dtype == torch.int32
+        assert theirs.input_ids.shape == (1, settings.tokens_per_micro_batch)
+    assert second.state_dict() == {} and main.state_dict() == stream.state_dict()
+    second.load_state_dict({"anything": 1})  # nothing to restore on a rank without a stream
 
 
 def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> None:

@@ -248,7 +248,6 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "seed": 7,
     "training_max_sequence_length": 128,
     "validation_padding_multiple": 64,
-    "backend": "future_ddp",
     "precision": "32",
     "compile_model": True,
     "gradient_checkpointing": "full",
@@ -316,7 +315,7 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
     harmless = _settings(
         run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
         eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
-        wandb_enabled=False, export_to_hf=True, auto_prepare=False,
+        wandb_enabled=False, export_to_hf=True, auto_prepare=False, backend="ddp",  # the world size is compared on its own
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )
     check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)

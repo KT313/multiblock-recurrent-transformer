@@ -135,6 +135,9 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # the override flags themselves: comparing them would make the escape hatches refuse their own use
     "allow_settings_change",
     "allow_dataset_change",
+    # the backend name: the world size is compared on its own (`restore_checkpoint_if_resuming`), and with the same
+    # world size a `ddp` run of one rank and a `single_device` run are the same computation
+    "backend",
     # dataset reference: the dataset itself has its dedicated resume check (`check_dataset_unchanged` verifies the
     # dataset config HASH and the validation split), which a changed path or root alone does not trip
     "dataset_config",

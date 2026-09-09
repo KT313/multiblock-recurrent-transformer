@@ -410,27 +410,34 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
 
     Iterator seeds come from one private generator, so creating an iterator (first pull, epoch restart, each
     evaluation) never touches the global torch RNG and a resume replays the same latent noise.
+
+    Ranks: the train loaders exist on the main rank only, which reads every source as ONE shard and packs for the
+    whole world (`training.step.RankBatches`); the other ranks get no train loader (and raise no file limit). The
+    validation loaders exist on every rank, each reading its shard of the rows.
     """
 
-    if TRAIN_LOADER_NUM_WORKERS > 0:
-        raise_open_file_limit()
     tokenizer = Tokenizer(dataset.tokenizer_dir)
-    shard = (backend.rank, backend.world_size)
     generator = torch.Generator().manual_seed(settings.seed + backend.rank)  # the worker RNG is unused (no shuffle)
-    train_datasets = {entry.prefix: entry_dataset(entry, shard) for entry in dataset.train_sources}
-    train_loaders: dict[str, Iterable[WorkerBatch]] = {
-        source: dataloader_over(
-            parquet_dataset,
-            tokenizer,
-            training_max_sequence_length=settings.training_max_sequence_length,
-            batch_size=TRAIN_LOADER_BATCH_ROWS,
-            num_workers=TRAIN_LOADER_NUM_WORKERS,
-            pin_memory=False,
-            padded=False,
-            generator=generator,
-        )
-        for source, parquet_dataset in train_datasets.items()
-    }
+    train_datasets: dict[str, ParquetTextDataset] = {}
+    train_loaders: dict[str, Iterable[WorkerBatch]] = {}
+    if backend.is_main:
+        if TRAIN_LOADER_NUM_WORKERS > 0:
+            raise_open_file_limit()
+        train_datasets = {entry.prefix: entry_dataset(entry) for entry in dataset.train_sources}  # one shard
+        train_loaders = {
+            source: dataloader_over(
+                parquet_dataset,
+                tokenizer,
+                training_max_sequence_length=settings.training_max_sequence_length,
+                batch_size=TRAIN_LOADER_BATCH_ROWS,
+                num_workers=TRAIN_LOADER_NUM_WORKERS,
+                pin_memory=False,
+                padded=False,
+                generator=generator,
+            )
+            for source, parquet_dataset in train_datasets.items()
+        }
+    shard = (backend.rank, backend.world_size)
     val_loaders = [
         build_dataloader(
             stage.val_data,

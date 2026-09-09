@@ -42,6 +42,7 @@ from training.data.dataset_resolver import (
     build_command,
     check_dataset_unchanged,
     check_entries,
+    check_entry_shards,
     check_validation_batches,
     entry_rows_in_range,
     loader_shards,
@@ -480,8 +481,13 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
     stage = _stage([DataEntry("s-a", good, max_rows=1)])
     check_entries(train, [stage], rows)  # world size 1: one shard per loader, whatever the row count
     check_entries(train, [stage], rows, world_size=1)
-    # the training range is what counts, not the folder: the validation split narrows `narrow` to 2 rows
-    check_entries([DataEntry("narrow", good, skip_rows=total - 2)], [], rows, world_size=2)
+    # train sources are read by the main rank alone: one shard at any world size, so a 2-row source passes
+    narrow = DataEntry("narrow", good, skip_rows=total - 2)
+    check_entries([narrow], [], rows, world_size=2)
+    check_entries([narrow], [], rows, world_size=8)
+    # the shard check itself, given several shards: the training range is what counts, not the folder (the
+    # validation split narrows `narrow` to 2 rows)
+    check_entry_shards("train source 'narrow'", "train", narrow, total, world_size=2)
     with pytest.raises(
         ValueError,
         match=(
@@ -490,7 +496,7 @@ def test_check_entry_shards_fails_when_a_source_is_smaller_than_the_world(tiny_p
             r"empty and the run would fail during training\. Give the source more rows, or lower the world size"
         ),
     ):
-        check_entries([DataEntry("narrow", good, skip_rows=total - 2)], [], rows, world_size=3)
+        check_entry_shards("train source 'narrow'", "train", narrow, total, world_size=3)
     # validation loaders read in-process (`num_workers=0`): one shard per rank
     val_only = _stage([DataEntry("s-b", good, max_rows=2)])
     check_entries([], [val_only], rows, world_size=2)
