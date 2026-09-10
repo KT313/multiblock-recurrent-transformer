@@ -615,7 +615,7 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     """
 
     recorded = _record_wandb_logs(monkeypatch)
-    settings = reference_settings(log_step_interval=2)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=2)
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()
     run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
@@ -632,7 +632,7 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         clock.advance(1.0)
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
-    final_logger = open_run_logger(reference_settings(log_step_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
+    final_logger = open_run_logger(reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
     final_progress = TrainingProgress()
     while final_progress.step < stage_manager.total_steps:
         result = fake_result(stage_manager, final_progress.step, data_ids=["a"] * 4)
@@ -1142,7 +1142,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     """
 
     monkeypatch.setenv("TRAINING_DASHBOARD", "1")
-    settings = reference_settings(log_step_interval=2)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=2)
     stage_manager = two_stage_manager(settings)
     progress = TrainingProgress(step=4, resume_step=4)
     backend = SingleDeviceBackend(device="cpu", precision="32")
@@ -1175,7 +1175,7 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
     details, the log interval and the resume step; the fallback is chosen when the display is disabled.
     """
 
-    settings = reference_settings(log_step_interval=3, eval_step_interval=99)  # eval must be a multiple of log
+    settings = reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=99)  # eval must be a multiple of log
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
         assert isinstance(board, ConsoleFallbackDashboard)  # stdout is not a TTY under pytest
@@ -1202,7 +1202,7 @@ def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, mon
     """
 
     monkeypatch.setattr("training.logger.dashboard_enabled", lambda: True)
-    settings = reference_settings(log_step_interval=3, eval_step_interval=99)
+    settings = reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=99)
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cpu") as board:
         assert isinstance(board, TrainingDashboard) and _display_is_up(board) and board.enabled

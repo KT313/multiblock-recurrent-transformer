@@ -336,7 +336,7 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
 
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
-        run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
+        run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, log_gradient_metrics_interval=8, save_step_interval=3,
         eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
         wandb_enabled=False, export_to_hf=True, auto_prepare=False, backend="ddp",  # the world size is compared on its own
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
@@ -518,3 +518,19 @@ def test_check_param_groups_unchanged() -> None:
         check_param_groups_unchanged([{}], [{}, {}])
     with pytest.raises(ValueError, match="group 1: eps: checkpoint 1e-08 != current 1e-06"):
         check_param_groups_unchanged([{"eps": 1e-6}, {"eps": 1e-6}], [{"eps": 1e-6}, {"eps": 1e-8}])
+
+
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_old_gradient_logging_flag_does_not_block_resume(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT, legacy_enabled: bool,
+) -> None:
+    """
+    Logging settings do not affect training state; older checkpoints need no rewrite for the renamed interval.
+    """
+
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("log_gradient_metrics_interval")
+    metadata.settings["log_gradient_metrics"] = legacy_enabled
+    for interval in (0, 8):
+        settings = _settings(run_name="tiny", seed=42, log_gradient_metrics_interval=interval)
+        check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), False)

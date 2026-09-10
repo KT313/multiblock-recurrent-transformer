@@ -93,7 +93,7 @@ def reference_settings(**overrides: Any) -> Settings:
         warmup_steps=2,
         cooldown_steps=2,
         log_step_interval=1,
-        log_gradient_metrics=True,
+        log_gradient_metrics_interval=1,
         wandb_enabled=False,
     )
     values.update(overrides)
@@ -328,6 +328,7 @@ def test_stage_infos_and_metrics(settings: Settings, cpu_backend: SingleDeviceBa
     """
 
     settings.log_step_interval = 2
+    settings.log_gradient_metrics_interval = 2
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     stage_manager = reference_stage_manager(settings)
@@ -1596,7 +1597,7 @@ def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> N
 
 
 def test_padding_metric_only_at_log_steps(cpu_backend: SingleDeviceBackend) -> None:
-    settings = reference_settings(log_step_interval=2, log_gradient_metrics=False)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=0)
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     first, second = run_steps(settings, cpu_backend, model, optimizer, steps=2)
@@ -1644,3 +1645,44 @@ def test_golden_tiny_steps() -> None:
     exact = golden_exact_requested()
     mismatches = golden_mismatches(expected, json.loads(golden_run_json(actual)), exact=exact)
     assert not mismatches, "step reference changed:\n" + "\n".join(mismatches)
+
+
+@pytest.mark.parametrize("log_interval,gradient_interval,start,steps", [
+    (1, 0, 0, 5), (1, 1, 0, 4), (1, 4, 0, 5), (2, 4, 0, 5), (1, 4, 2, 3), (1, 100, 0, 5),
+])
+def test_gradient_metrics_have_independent_completed_step_cadence(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch,
+    log_interval: int, gradient_interval: int, start: int, steps: int,
+) -> None:
+    """
+    Expensive statistics run only on their own absolute step grid, before zero_grad; basic metrics keep their grid.
+    """
+
+    settings = reference_settings(log_step_interval=log_interval, log_gradient_metrics_interval=gradient_interval)
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    progress = TrainingProgress(step=start, resume_step=start if start else -1)
+    batches = scripted_batches(settings)
+    calls: list[int] = []
+
+    def record_metrics(plain: torch.nn.Module, opt: torch.optim.Optimizer) -> dict[str, torch.Tensor]:
+        assert plain is cpu_backend.plain_model(model) and opt is optimizer
+        assert any(parameter.grad is not None for parameter in plain.parameters())
+        completed = progress.step + 1
+        calls.append(completed)
+        return {"gradient_probe": torch.tensor(float(completed))}
+
+    monkeypatch.setattr("training.step.track_gradient_metrics", record_metrics)
+    expected_calls = []
+    for _ in range(steps):
+        result = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+        progress.advance()
+        completed = progress.step
+        due = gradient_interval > 0 and completed % gradient_interval == 0
+        if due:
+            expected_calls.append(completed)
+        assert ("gradient_probe" in result.metrics) == due
+        assert ("packing/padding_fraction" in result.metrics) == (completed % log_interval == 0)
+        assert torch.isfinite(result.loss) and torch.isfinite(result.grad_norm)
+    assert calls == expected_calls

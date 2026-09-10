@@ -459,9 +459,10 @@ def run_one_optimizer_step(
     if step > 0:
         optimizer.step()
     metrics: dict[str, Tensor] = {}
+    gradient_interval = settings.log_gradient_metrics_interval
+    if gradient_interval > 0 and (step + 1) % gradient_interval == 0:
+        metrics = track_gradient_metrics(backend.plain_model(model), optimizer)  # the DDP wrapper hides `.transformer`
     if (step + 1) % settings.log_step_interval == 0:
-        if settings.log_gradient_metrics:
-            metrics = track_gradient_metrics(backend.plain_model(model), optimizer)  # the DDP wrapper hides `.transformer`
         # packing efficiency: the share of the step's tokens that were pack tails
         metrics["packing/padding_fraction"] = torch.tensor(padding_tokens / settings.tokens_per_optimizer_step)
     optimizer.zero_grad(set_to_none=True)

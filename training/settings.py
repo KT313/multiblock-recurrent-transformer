@@ -31,8 +31,8 @@ REQUIRED_SETTINGS: dict[str, str] = {
     "stage_base_lrs": "one base LR per stage of the dataset config",
 }
 POSITIVE_SETTINGS: dict[str, str] = {
-    "log_step_interval": "save_step_interval is the only interval 0 disables",
-    "eval_step_interval": "save_step_interval is the only interval 0 disables",
+    "log_step_interval": "basic training metrics must have a positive interval",
+    "eval_step_interval": "validation must have a positive interval",
     "eval_iters": "validation batches per depth",
     "grad_clip": "0 would zero every gradient",
     "tokens_per_micro_batch": "the pack length; every micro-batch is one row of this many tokens",
@@ -43,6 +43,7 @@ POSITIVE_SETTINGS: dict[str, str] = {
     "benchmark_batch_size": "sequences per lm-eval forward",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
+    "log_gradient_metrics_interval",
     "save_step_interval",
     "warmup_steps",
     "cooldown_steps",
@@ -130,7 +131,7 @@ class Settings:
     # Evaluation / logging / checkpoints. Validation batches are padded rows (not packs): `validation_batch_size`
     # rows padded to the longest of them, rounded up to a multiple of `validation_padding_multiple`.
     log_step_interval: int = 1
-    log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
+    log_gradient_metrics_interval: int = 1  # expensive gradient/update statistics every N completed optimizer steps; 0 disables; a positive multiple of log_step_interval
     eval_step_interval: int = 100
     eval_iters: int = 64  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
     validation_batch_size: int = 4  # rows per validation forward
@@ -164,6 +165,8 @@ class Settings:
     benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
     def __post_init__(self) -> None:
+        if isinstance(self.log_gradient_metrics_interval, bool) or not isinstance(self.log_gradient_metrics_interval, int):
+            raise ValueError("log_gradient_metrics_interval must be an integer >= 0")
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name
         if not isinstance(self.optim_config, OptimizerConfig):
             raise ValueError(
@@ -211,6 +214,11 @@ class Settings:
             raise ValueError(
                 f"eval_step_interval ({self.eval_step_interval}) must be a multiple of log_step_interval "
                 f"({self.log_step_interval}): validation results would be computed and never logged"
+            )
+        if self.log_gradient_metrics_interval > 0 and self.log_gradient_metrics_interval % self.log_step_interval != 0:
+            raise ValueError(
+                f"log_gradient_metrics_interval ({self.log_gradient_metrics_interval}) must be a multiple of "
+                f"log_step_interval ({self.log_step_interval})"
             )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")

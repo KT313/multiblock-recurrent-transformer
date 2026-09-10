@@ -85,6 +85,21 @@ Training packs documents end to end: one row of `tokens_per_micro_batch` tokens 
 `micro_batches_per_step` of them per optimizer step, attention masked per document.
 Validation runs on padded rows, `validation_batch_size` per forward.
 
+Basic metrics follow `log_step_interval`; expensive per-parameter gradient/update statistics follow
+`log_gradient_metrics_interval` independently. Both count completed optimizer steps. The gradient interval must be
+an integer >= 0: `0` disables those statistics; a positive value must be a multiple of `log_step_interval`.
+For cheap metrics every step and gradient statistics every eighth step:
+
+```yaml
+log_step_interval: 1
+log_gradient_metrics_interval: 8
+```
+
+The default gradient interval is `1`. The ordinary scalar `grad_norm` is still part of basic logging because
+clipping already computes it. When migrating a YAML config, replace `log_gradient_metrics: true` with the previous
+`log_step_interval` value, or `false` with `0`, using the new key. Existing checkpoints remain resumable because
+logging cadence does not affect training state; saved historical run configurations are not rewritten.
+
 A run resumes by default (`resume: true`): the most recently written checkpoint of `run_name` in its run directory is
 loaded, or `resume_checkpoint_path` names one; a checkpoint written with other settings, model config or dataset config
 is refused unless `allow_settings_change` / `allow_dataset_change` say so. `compile_model: true` compiles the model with

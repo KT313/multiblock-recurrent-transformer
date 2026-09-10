@@ -41,7 +41,7 @@ cooldown_steps: 2
 min_lr: 0
 
 log_step_interval: 1
-log_gradient_metrics: true
+log_gradient_metrics_interval: 1
 eval_step_interval: 8
 eval_iters: 2
 partial_depth_eval: [1]

@@ -78,7 +78,7 @@ min_lr: 0                            # LR floor of warmup and cooldown
 
 # --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
 log_step_interval: 1                 # log training metrics every this many steps
-log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
+log_gradient_metrics_interval: 1     # expensive gradient/update statistics every N optimizer steps; 0 disables; otherwise a multiple of log_step_interval
 eval_step_interval: 16               # run validation every this many steps
 eval_iters: 64                       # validation batches per evaluated depth
 validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)

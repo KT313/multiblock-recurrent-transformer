@@ -75,7 +75,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "cooldown_steps": 64,
     "min_lr": 0.0,
     "log_step_interval": 1,
-    "log_gradient_metrics": True,
+    "log_gradient_metrics_interval": 1,
     "eval_step_interval": 16,
     "eval_iters": 64,
     "partial_depth_eval": [1, 2, 4, 8, 16],
@@ -350,7 +350,7 @@ def test_validation_misaligned_eval_and_log_intervals() -> None:
 
 @pytest.mark.parametrize("log,eval_", [(1, 1), (1, 100), (4, 4), (4, 16), (5, 100)])
 def test_validation_aligned_eval_and_log_intervals(log: int, eval_: int) -> None:
-    cfg = _settings(log_step_interval=log, eval_step_interval=eval_)
+    cfg = _settings(log_step_interval=log, eval_step_interval=eval_, log_gradient_metrics_interval=0)
     assert (cfg.log_step_interval, cfg.eval_step_interval) == (log, eval_)
 
 
@@ -551,3 +551,43 @@ def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
     assert cfg.micro_batches_per_rank(1) == 4 and cfg.tokens_per_optimizer_step == 2048
     overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
     assert overridden.micro_batches_per_rank(1) == 8
+
+
+@pytest.mark.parametrize("log_interval,gradient_interval", [(1, 0), (4, 0), (1, 1), (1, 8), (4, 4), (4, 12)])
+def test_gradient_metrics_interval_validation(log_interval: int, gradient_interval: int) -> None:
+    settings = _settings(log_step_interval=log_interval, eval_step_interval=log_interval * 4,
+                         log_gradient_metrics_interval=gradient_interval)
+    assert settings.log_gradient_metrics_interval == gradient_interval
+    assert "log_gradient_metrics" not in asdict(settings)
+
+
+@pytest.mark.parametrize("interval", [-1, 1.5, 2.0, True, False, "8"])
+def test_gradient_metrics_interval_rejects_invalid_values(interval: object) -> None:
+    with pytest.raises(ValueError, match="log_gradient_metrics_interval"):
+        _settings(log_gradient_metrics_interval=interval)
+
+
+@pytest.mark.parametrize("interval", [1, 2, 6])
+def test_gradient_metrics_interval_must_align_with_basic_logs(interval: int) -> None:
+    with pytest.raises(ValueError, match=rf"log_gradient_metrics_interval \({interval}\) must be a multiple of log_step_interval \(4\)"):
+        _settings(log_step_interval=4, eval_step_interval=8, log_gradient_metrics_interval=interval)
+
+
+@pytest.mark.parametrize("interval", [0, 8])
+def test_gradient_metrics_interval_cli_override(interval: int) -> None:
+    settings = parse_settings(["--config", str(TINY_YAML), "--log_gradient_metrics_interval", str(interval)])
+    assert settings.log_step_interval == 1 and settings.log_gradient_metrics_interval == interval
+
+
+def test_old_gradient_metrics_flag_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_settings(["--config", str(TINY_YAML), "--log_gradient_metrics", "true"])
+
+
+def test_gradient_metrics_interval_yaml_validation(tmp_path: Path) -> None:
+    values = yaml.safe_load(TINY_YAML.read_text())
+    values.update(log_step_interval=2, log_gradient_metrics_interval=3)
+    path = tmp_path / "misaligned.yaml"
+    path.write_text(yaml.safe_dump(values))
+    with pytest.raises(ValueError, match="log_gradient_metrics_interval.*must be a multiple"):
+        parse_settings(["--config", str(path)])

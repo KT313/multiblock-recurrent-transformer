@@ -161,7 +161,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "prepare_max_parallel_downloads",
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",
-    "log_gradient_metrics",
+    "log_gradient_metrics_interval",
     # validation cadence and width: `evaluate` runs under `torch.random.fork_rng` (training/evaluation.py), so how
     # often and how much validation runs leaves the training stream untouched; only the reported numbers change
     "eval_step_interval",

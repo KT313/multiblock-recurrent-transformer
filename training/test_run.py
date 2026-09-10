@@ -708,7 +708,7 @@ def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp
     (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
     original = json.loads((run_dir / "run_config.json").read_text())
     assert original["log_step_interval"] != 4
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4)
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4, log_gradient_metrics_interval=8)
     _run(yaml_path)  # log_step_interval is not numerics-relevant: the resume runs
     assert json.loads((run_dir / "run_config.json").read_text()) == original
 
@@ -1421,3 +1421,23 @@ def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs
     yaml_path = write_tiny_yaml(tmp_path / "b", tiny_dataset_dir, out_dir, benchmark_recurrences=[[1]])
     with pytest.raises(ValueError, match=r"benchmark_recurrences\[0\]"):
         train(parse_settings(["--config", str(yaml_path)]))
+
+
+@pytest.mark.parametrize("gradient_interval", [0, 8])
+def test_basic_logs_every_step_with_sparse_or_disabled_gradient_metrics(
+    tmp_path: Path, tiny_dataset_dir: Path, gradient_interval: int,
+) -> None:
+    """
+    Every cheap log reaches history; expensive metrics appear only at their interval, never forced at the final step.
+    """
+
+    path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", log_step_interval=1,
+                           log_gradient_metrics_interval=gradient_interval, precision="32")
+    report = _run(path, backend=SingleDeviceBackend(device="cpu", precision="32"))
+    assert sorted(report.history) == list(range(1, 21))
+    for completed, metrics in report.history.items():
+        assert "loss" in metrics and "lr" in metrics and "grad_norm" in metrics
+        due = gradient_interval > 0 and completed % gradient_interval == 0
+        assert ("l2_param_norm" in metrics) == due
+        assert ("query_grad_0" in metrics) == due
+    assert "l2_param_norm" not in report.history[20]
