@@ -523,18 +523,9 @@ def resolve_dataset(
     validation_rows = resolve_splits(dataset_config, layout, rows_on_disk)
 
     train_sources = resolve_train_sources(dataset_config, layout, validation_rows)
-    stages: list[ResolvedStage] = []
-    for stage, base_lr in zip(dataset_config.stages, settings.stage_base_lrs):
-        stages.append(
-            ResolvedStage(
-                name=stage.name,
-                tokens=stage.tokens,
-                base_lr=base_lr,
-                transition_pct=stage.transition_pct,
-                train_weights=dict(stage.train),
-                val_data=resolve_val_entries(dataset_config, layout, stage, validation_rows),
-            )
-        )
+    stages = resolve_stage_plan(settings, dataset_config)
+    for resolved, stage in zip(stages, dataset_config.stages):
+        resolved.val_data = resolve_val_entries(dataset_config, layout, stage, validation_rows)
     world_size = 1 if backend is None else backend.world_size
     check_entries(train_sources, stages, rows_on_disk, world_size)
     check_validation_batches(
@@ -590,3 +581,16 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
         log.warning("%s; continuing because allow_dataset_change is set", message)
         return
     raise RuntimeError(f"{message}. Set allow_dataset_change: true to resume anyway.")
+
+
+def resolve_stage_plan(settings: Settings, dataset_config: DatasetConfig) -> list[ResolvedStage]:
+    """
+    Resolve token budgets, weights and learning rates without touching dataset files. The resolver fills val_data.
+    """
+
+    validate_settings(settings, dataset_config)
+    return [
+        ResolvedStage(name=stage.name, tokens=stage.tokens, base_lr=lr, transition_pct=stage.transition_pct,
+                      train_weights=dict(stage.train), val_data=[])
+        for stage, lr in zip(dataset_config.stages, settings.stage_base_lrs)
+    ]

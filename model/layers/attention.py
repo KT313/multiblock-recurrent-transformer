@@ -187,14 +187,21 @@ class CausalSelfAttention(torch.nn.Module):
         q = q.view(B, S, self.n_head, self.head_dim)
         k = k.view(B, S, self.n_head, self.head_dim)
         v = v.view(B, S, self.n_head, self.head_dim)
-        if self.use_qk_bias:
-            q_bias, k_bias = self.qk_bias.split(1, dim=0)  # type: ignore[no-untyped-call]  # torch stub gap
-            # The bias is a float32 parameter; the sum is cast back so q/k keep the activation dtype under autocast.
-            q = (q + q_bias).to(q.dtype)
-            k = (k + k_bias).to(q.dtype)
-        q, k = apply_rotary_emb_complex_like(q, k, freqs_cis=freqs_cis)
+        q, k = qk_bias_rope(self.qk_bias if self.use_qk_bias else None, q, k, freqs_cis)
 
         y = attention(q, k, v, mask)
         y = y.reshape(B, S, E).contiguous()
         out: Tensor = self.proj(y)
         return out
+
+
+def qk_bias_rope(qk_bias: Tensor | None, q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Bias addition and rotation, shared by attention and component experiments. Preserve each activation rounding.
+    """
+
+    if qk_bias is not None:
+        q_bias, k_bias = qk_bias.split(1, dim=0)  # type: ignore[no-untyped-call]  # torch stub gap
+        q = (q + q_bias).to(q.dtype)
+        k = (k + k_bias).to(q.dtype)
+    return apply_rotary_emb_complex_like(q, k, freqs_cis=freqs_cis)

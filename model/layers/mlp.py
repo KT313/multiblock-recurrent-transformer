@@ -31,7 +31,16 @@ class GatedMLP(torch.nn.Module):
         self.nonlin = torch.nn.SiLU()
 
     def forward(self, x: Tensor) -> Tensor:
-        gate, up = self.fc(x).chunk(2, dim=-1)  # each (..., intermediate_size)
-        hidden = self.nonlin(gate) * up
+        hidden = swiglu(self.fc(x), self.nonlin)
         out: Tensor = self.proj(hidden)
         return out
+
+
+def swiglu(hidden: Tensor, nonlin: torch.nn.Module) -> Tensor:
+    """
+    Gate/up activation using the module's original nonlinearity, shared with component measurements.
+    """
+
+    gate, up = hidden.chunk(2, dim=-1)
+    result: Tensor = nonlin(gate) * up
+    return result

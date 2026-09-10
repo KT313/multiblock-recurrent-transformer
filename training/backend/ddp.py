@@ -30,7 +30,8 @@ from torch.nn import Module
 from torch.nn.parallel import DistributedDataParallel
 
 from training.backend.base import unwrap_layers
-from training.backend.single_device import DYNAMO_RECOMPILE_LIMIT, SingleDeviceBackend
+from training.backend.compilation import compile_module
+from training.backend.single_device import SingleDeviceBackend
 
 T = TypeVar("T")
 
@@ -90,8 +91,7 @@ class DDPBackend(SingleDeviceBackend):
         device_ids = [self.device.index] if self.device.type == "cuda" else None
         wrapped: Module = DistributedDataParallel(model, device_ids=device_ids)
         if compile_model:
-            torch._dynamo.config.recompile_limit = DYNAMO_RECOMPILE_LIMIT  # see the single-device backend
-            wrapped = cast(Module, torch.compile(wrapped, dynamic=True))
+            wrapped = compile_module(wrapped)
         self.wrappers = ("compile", "ddp") if compile_model else ("ddp",)
         return wrapped
 

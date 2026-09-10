@@ -5,7 +5,7 @@ Thin wrapper around a saved tokenizer directory (tokenizer.json + tokenizer_conf
 """
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
@@ -135,3 +135,15 @@ class Tokenizer:
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         return self._backend.decode(ids, skip_special_tokens=skip_special_tokens)
+
+
+class TokenMetadata(Protocol):
+    """
+    Vocabulary metadata consumed by tensor packing and masking; both a Tokenizer and synthetic metadata satisfy it.
+    """
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def eos_id(self) -> int: ...

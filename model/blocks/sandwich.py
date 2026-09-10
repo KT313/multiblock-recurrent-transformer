@@ -35,7 +35,7 @@ class SandwichBlock(torch.nn.Module):
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
         attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
-        x = self.norm_2(attn_out + x)
+        x = self.norm_2.residual(attn_out, x)
         mlp_out = self.mlp(self.norm_3(x))
-        x = self.norm_4(mlp_out + x)
+        x = self.norm_4.residual(mlp_out, x)
         return x

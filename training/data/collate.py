@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 import torch
 
 from training.data.formats import apply_formatting
-from training.data.tokenizer import IGNORE_INDEX, Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, TokenMetadata, Tokenizer
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
 
@@ -63,7 +63,7 @@ def shift_inputs_and_labels(inputs: torch.Tensor, labels: torch.Tensor) -> tuple
     return input_ids, label_ids
 
 
-def mask_label_ids(label_ids: torch.Tensor, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
+def mask_label_ids(label_ids: torch.Tensor, tokenizer: TokenMetadata, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
     """
     Shifted labels as the loss sees them: ids outside the tokenizer's vocabulary become `ignore_index`, in place;
     returns `label_ids`. `IGNORE_INDEX` (padding, masked prompts) is negative, so it passes through unchanged.

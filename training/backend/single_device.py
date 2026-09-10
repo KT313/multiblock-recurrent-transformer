@@ -21,12 +21,12 @@ from torch.optim import Optimizer
 from data_preparation.lib.storage.atomic import write_atomically
 from model import RecurrentGPT
 from training.backend.base import unwrap_model
+from training.backend.compilation import compile_module
 
 T = TypeVar("T")
 
 PRECISIONS = ("bf16-mixed", "32")
 WORLD_SIZE_ENV = "WORLD_SIZE"  # set by torchrun for every rank; more than 1 needs a multi-rank backend
-DYNAMO_RECOMPILE_LIMIT = 32  # per compiled frame; the default 8 is one above what the recurrence iteration needs
 
 
 def _set_torch_flags() -> None:
@@ -83,16 +83,7 @@ class SingleDeviceBackend:
     def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         model = model.to(self.device)
         if compile_model:
-            # The recurrence iteration is compiled as one frame with several legitimate variants (no-grad and grad
-            # iterations, the latent with and without gradient), the checkpointed iteration (`checkpointed_iteration`,
-            # its own frame holding the checkpoint call) likewise; past dynamo's default limit of 8 recompiles it
-            # silently runs the frame eagerly (a warning in the log, a 10 percent slower step).
-            torch._dynamo.config.recompile_limit = DYNAMO_RECOMPILE_LIMIT
-            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles. Packed
-            # training has one shape, but its validation is still padded: a static compile recompiled the forward for
-            # every validation length and ran past the limit into eager (measured: validation three times slower).
-            # torch.compile is typed as returning a bare callable; at runtime it is an OptimizedModule (a Module)
-            model = cast(Module, torch.compile(model, dynamic=True))
+            model = compile_module(model)
         self.wrappers = ("compile",) if compile_model else ()
         return model
 
