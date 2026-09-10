@@ -25,6 +25,7 @@ outputs/
 
 # local agent instructions, not part of the repo
 CLAUDE.md
+AGENTS.md
 reviews/
 tasks/
 .claude/

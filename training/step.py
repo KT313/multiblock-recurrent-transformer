@@ -195,9 +195,8 @@ class BatchStream:
         The next buffered sample of `source`, pulling worker batches until one is there; rows read (dropped rows
         included) are counted against the source at pull time.
 
-        Single-shard: `rows_read` counts the rows THIS rank's loader yielded, while `set_resume_offset` skips range rows
-        over all shards, so with several ranks a resume would rewind every rank by the world size. `train()` refuses
-        `world_size != 1` until this counts range rows.
+        Single reader: the train loaders read every source as ONE shard on the main rank (`RankBatches` scatters the
+        packs), so `rows_read` counts range rows and `set_resume_offset` skips exactly them on a resume.
         """
 
         buffer = self._buffers[source]
