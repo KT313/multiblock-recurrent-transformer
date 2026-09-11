@@ -3,8 +3,8 @@
 One optimizer step of the training loop: the micro-batch stream, the scheduled learning rate and
 `run_one_optimizer_step`, the only place with autocast / backward / clipping.
 
-Everything here is numerics, bit-identical to the thesis loop; the golden tests in `test_step.py` and `test_run.py`
-fail on any change. The stream is the reference for the data path: ONE continuous reader per source for the whole
+Everything here affects numerics; the golden tests in `test_step.py` and `test_run.py` pin the current depth schedule
+and accumulation arithmetic. The stream is the reference for the data path: ONE continuous reader per source for the whole
 run, the source of every document chosen deterministically so that the sources' TOKEN shares follow the stage
 weights (`BatchStream._pick_source`), and the documents packed into one row per micro-batch
 (`training.data.packing`). Steps are OPTIMIZER steps: `micro_batches_per_step` packed micro-batches over all ranks
@@ -412,8 +412,8 @@ def run_one_optimizer_step(
     total)` is called after every micro-batch's backward was issued (the dashboard's micro-batch bar); on a GPU the
     device may still be working on it, since nothing here synchronises.
 
-    Runs the same numerics as the thesis training loop; the golden tests in `test_step.py` and `test_run.py` fail on
-    any change. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
+    Recurrence depth is sampled per local microbatch; the golden tests in `test_step.py` and `test_run.py` pin the
+    numerics. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
     loss is all-reduced every step (a no-op on one device) BEFORE it is checked for finiteness, so every rank sees
     the same number and makes the same decision to raise. The loss is the mean over the valid tokens of each pack,
     averaged over the packs: with full packs the valid-token counts are nearly equal (they differ by the pack tails),
@@ -423,7 +423,8 @@ def run_one_optimizer_step(
 
     step = progress.step
     accumulation_steps = settings.micro_batches_per_rank(backend.world_size)
-    backend.plain_model(model).step = step
+    plain = backend.plain_model(model)
+    plain.step = step
     stage = stage_manager.get_stage_info(step)
     learning_rate = scheduled_learning_rate(settings, stage_manager, progress)
     set_lr(optimizer, learning_rate)
@@ -439,6 +440,8 @@ def run_one_optimizer_step(
             data_tokens[data_id] = data_tokens.get(data_id, 0) + tokens
         padding_tokens += batch.padding_tokens
         inputs = model_inputs(batch, backend)
+        # Same local index on every rank; rank-specific latent RNG remains independent of the depth schedule.
+        plain.micro_batch_index = micro_batch_index
         with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
             with backend.autocast():
                 outputs = model(**inputs)

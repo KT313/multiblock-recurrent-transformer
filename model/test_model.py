@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 import torch
 from torch import Tensor
+from torch._dynamo.testing import CompileCounter
 
 from model import build_model
 from model.test_config import TINY_ARCHITECTURE, tiny_config
@@ -846,6 +847,47 @@ def test_compile_smoke() -> None:
     out["loss"].backward()
 
 
+@pytest.mark.parametrize("mean", [1, 4])
+def test_compile_sampling_context_changes_without_new_graphs(monkeypatch: pytest.MonkeyPatch, mean: int) -> None:
+    """Changing eager metadata must not specialize compiled numerical frames, even beyond the cache limit."""
+    torch._dynamo.reset()
+    model = seeded_tiny(mean_recurrence=mean, mean_backprop_depth=min(mean, 2))
+    contexts: list[tuple[int, int, int]] = []
+    depths: list[int] = []
+    original = model.sample_block_depths
+
+    @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]
+    def record(block_idx: int = 0) -> tuple[Tensor, Tensor]:
+        contexts.append((model.step, model.micro_batch_index, block_idx))
+        steps: tuple[Tensor, Tensor] = original(block_idx)
+        depths.append(int(steps[0].item()) + int(steps[1].item()))
+        return steps
+
+    monkeypatch.setattr(model, "sample_block_depths", record)
+    counter = CompileCounter()
+    compiled = torch.compile(model, backend=counter, dynamic=True)
+    x = ids(1, 4)
+    counts = []
+    try:
+        # A plateau must mean graph reuse, never eager fallback after exhausting Dynamo's cache.
+        with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
+            for index in range(40):
+                model.step, model.micro_batch_index = divmod(index, 8)
+                compiled(x, labels=x)["loss"].backward()
+                model.zero_grad(set_to_none=True)
+                counts.append(counter.frame_count)
+        assert counts[0] > 0
+        # Different grad/no-grad tensor paths may compile during warmup; changing context must then plateau.
+        assert counts[-16:] == [counts[-1]] * 16
+        if mean == 1:
+            assert counts == [counts[0]] * 40
+        else:
+            assert len(set(depths)) > 1
+        assert contexts == [(step, micro, core) for step in range(5) for micro in range(8) for core in range(2)]
+    finally:
+        torch._dynamo.reset()
+
+
 # --- the bf16 residual stream ------------------------------------------------------------------------------------------
 
 
@@ -859,7 +901,7 @@ def norm_output_dtypes(model: RecurrentGPT, autocast: bool) -> dict[str, torch.d
     for name, module in model.named_modules():
         if isinstance(module, (RMSNorm, torch.nn.LayerNorm)):
             handles.append(
-                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, out.dtype))
+                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, cast(Tensor, out).dtype))
             )
     model.eval()
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):

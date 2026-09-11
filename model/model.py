@@ -115,7 +115,7 @@ class TransformerModules(torch.nn.ModuleDict):
 
 class RecurrentGPT(torch.nn.Module):
     """
-    Prelude, recurrent core blocks, coda, final norm and tied LM head; `step` seeds the recurrence sampler.
+    Prelude, recurrent cores, coda, final norm and tied LM head; step/local microbatch seed the depth sampler.
     """
 
     freqs_cis: Tensor  # registered buffer (declared here for the type checkers only)
@@ -185,8 +185,10 @@ class RecurrentGPT(torch.nn.Module):
         # not persistent: the table follows the config (`rope_base`, the length), a checkpoint never overrides it
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
-        # Set externally each optimizer step; seeds the recurrence sampler.
+        # Caller-owned sampling context, read only inside the eager sampler boundary. Standalone callers default
+        # to microbatch zero; accumulation callers must set the local index before each forward, including replay.
         self.step: int = 0
+        self.micro_batch_index: int = 0
         self.reset_parameters()
 
     def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> "RecurrentGPT":
@@ -546,8 +548,8 @@ class RecurrentGPT(torch.nn.Module):
     def sample_block_depths(self, block_idx: int = 0) -> tuple[Tensor, Tensor]:
         """
         (n no-grad, k backprop) iterations for core block `block_idx`: the poisson-lognormal-filling draw seeded by
-        `self.step` and `block_idx` in training (blocks draw independently; the golden test in `test_model.py` fails
-        on any change), (`mean_recurrence`, 0) in eval mode.
+        `self.step`, `self.micro_batch_index` and `block_idx` in training (blocks draw independently),
+        (`mean_recurrence`, 0) in eval mode. Mutable context stays outside compiled numerical frames.
         """
 
         assert isinstance(self.config.mean_recurrence, list)  # normalized by RecurrentConfig.__post_init__
@@ -557,6 +559,7 @@ class RecurrentGPT(torch.nn.Module):
             self.config.mean_recurrence[block_idx],
             self.config.mean_backprop_depth[block_idx],
             step=self.step,
+            micro_batch_index=self.micro_batch_index,
             block_idx=block_idx,
             training=self.training,
         )

@@ -263,7 +263,8 @@ def _hand_accumulation(
     copy_of_model.step = step
     torch.manual_seed(seed)
     losses = []
-    for _ in range(settings.micro_batches_per_rank(1)):
+    for micro_batch_index in range(settings.micro_batches_per_rank(1)):
+        copy_of_model.micro_batch_index = micro_batch_index
         loss = copy_of_model(**model_inputs(next(batches), backend))["loss"]
         assert loss is not None
         (loss / settings.micro_batches_per_rank(1)).backward()
@@ -291,6 +292,29 @@ def test_on_micro_batch_reports_every_micro_batch_of_the_step(settings: Settings
     progress.advance()
     run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
     assert len(reports) == per_rank, "no callback, no report"
+
+
+@pytest.mark.parametrize("rank", [0, 7])
+def test_optimizer_step_sets_local_microbatch_context_on_plain_model(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch, rank: int,
+) -> None:
+    settings = reference_settings(
+        micro_batches_per_step=64, training_max_sequence_length=16, tokens_per_micro_batch=16,
+    )
+    cpu_backend.rank, cpu_backend.world_size = rank, 8
+    model = fresh_tiny_model(cpu_backend)
+    plain = cpu_backend.plain_model(model)
+    calls: list[tuple[int, int, int]] = []
+    original = plain.sample_block_depths
+
+    def record(block_idx: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((plain.step, plain.micro_batch_index, block_idx))
+        steps: tuple[torch.Tensor, torch.Tensor] = original(block_idx)
+        return steps
+
+    monkeypatch.setattr(plain, "sample_block_depths", record)
+    run_steps(settings, cpu_backend, model, fresh_optimizer(settings, model, cpu_backend), steps=2)
+    assert calls == [(step, micro, core) for step in range(2) for micro in range(8) for core in range(2)]
 
 
 def test_loss_and_grad_norm_match_a_hand_computation(cpu_backend: SingleDeviceBackend) -> None:

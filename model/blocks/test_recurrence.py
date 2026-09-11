@@ -4,7 +4,8 @@ Tests for `model.blocks.recurrence`: step canonicalisation and broadcasting, the
 poisson-lognormal-filling depth sampler and the (no-grad, backprop) iteration loop.
 """
 
-from typing import Any
+import copy
+from typing import Any, cast
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from model.blocks.recurrence import (
     initialize_state,
     iterate_core_block,
     normalize_num_steps,
+    recurrence_seed,
     sample_recurrence_steps,
 )
 from model.model import RecurrentGPT
@@ -160,6 +162,95 @@ def test_sampler_on_meta_device_returns_the_expected_depths() -> None:
     assert (n, k) == (4, 8)
 
 
+def test_sampler_microbatch_schedule_replays_across_rank_rngs() -> None:
+    schedules: list[list[tuple[int, int]]] = []
+    latents: list[Tensor] = []
+    for rank in range(8):
+        torch.manual_seed(42 + rank)
+        latents.append(initialize_state(torch.zeros(2, 4, 8)))
+        schedule = []
+        for step in (0, 1):
+            for micro in range(8):
+                for block in range(3):
+                    n, k = sample_recurrence_steps(
+                        12, 8, step=step, micro_batch_index=micro, block_idx=block, training=True,
+                    )
+                    schedule.append((int(n.item()), int(k.item())))
+        schedules.append(schedule)
+    assert all(schedule == schedules[0] for schedule in schedules)
+    assert all(not torch.equal(latent, latents[0]) for latent in latents[1:])
+    # Fresh draws can coincide; compare schedules, never require every pair of counts to differ.
+    assert len(set(schedules[0][:24])) > 1
+    assert schedules[0][:24] != schedules[0][24:]
+    assert schedules[0][0::3] != schedules[0][1::3]
+
+
+def test_recurrence_seed_mixes_each_coordinate_and_checks_negative_inputs() -> None:
+    keys = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (2**24, 0, 0), (0, 2**32, 0)]
+    seeds = [recurrence_seed(step=s, micro_batch_index=m, block_idx=b) for s, m, b in keys]
+    assert seeds == [2530474308, 1331452466, 2370498770, 574480444, 1441205481, 1494029112]
+    assert len(set(seeds)) == len(keys)
+    assert all(0 <= seed < 2**32 for seed in seeds)
+    for step, micro, block in [(-1, 0, 0), (0, -1, 0), (0, 0, -1)]:
+        with pytest.raises(ValueError, match="must be nonnegative"):
+            recurrence_seed(step=step, micro_batch_index=micro, block_idx=block)
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_microbatch_context_preserves_sampler_global_rng_consumption(training: bool) -> None:
+    torch.manual_seed(72)
+    sample_recurrence_steps(12, 8, step=13, micro_batch_index=7, block_idx=2, training=training)
+    actual = torch.get_rng_state()
+    torch.manual_seed(72)
+    torch.rand((1,))
+    assert torch.equal(actual, torch.get_rng_state())
+
+
+def test_microbatch_context_does_not_change_eval_or_explicit_depths(tiny_model: RecurrentGPT) -> None:
+    x = torch.tensor([[1, 2, 3, 4]])
+    for training, explicit in [(False, None), (True, (1, 1))]:
+        tiny_model.train(training)
+        tiny_model.step, tiny_model.micro_batch_index = 0, 0
+        torch.manual_seed(19)
+        first = tiny_model(x, num_steps=explicit, return_logits=True)["logits"]
+        rng = torch.get_rng_state()
+        tiny_model.step, tiny_model.micro_batch_index = 42, 7
+        torch.manual_seed(19)
+        second = tiny_model(x, num_steps=explicit, return_logits=True)["logits"]
+        assert first is not None and second is not None
+        assert torch.equal(first, second) and torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_sampled_checkpoint_backward_does_not_reread_microbatch_context(
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    tiny_model.step, tiny_model.micro_batch_index = 9, 3
+    reference = copy.deepcopy(tiny_model)
+    tiny_model.gradient_checkpointing = recurrence.check_checkpoint_mode(mode)
+    calls: list[tuple[int, int, int]] = []
+    original = tiny_model.sample_block_depths
+
+    def record(block_idx: int = 0) -> tuple[Tensor, Tensor]:
+        calls.append((tiny_model.step, tiny_model.micro_batch_index, block_idx))
+        steps: tuple[Tensor, Tensor] = original(block_idx)
+        return steps
+
+    monkeypatch.setattr(tiny_model, "sample_block_depths", record)
+    x = torch.tensor([[1, 2, 3, 4]])
+    for model in (reference, tiny_model):
+        torch.manual_seed(83)
+        loss = model(x, labels=x)["loss"]
+        assert loss is not None
+        # The checkpointed iterations must only use their captured tensor inputs.
+        model.step, model.micro_batch_index = 123, 7
+        loss.backward()
+    assert calls == [(9, 3, 0), (9, 3, 1)]
+    for expected, actual in zip(reference.parameters(), tiny_model.parameters()):
+        assert expected.grad is not None and actual.grad is not None
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+
+
 # --- iteration -------------------------------------------------------------------------------------------------------
 
 
@@ -247,7 +338,7 @@ def count_checkpoint_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
 
 @pytest.mark.parametrize("mode", ["selective", "full"])
 def test_gradient_checkpointing_wraps_each_backprop_iteration(
-    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, mode: str
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, mode: recurrence.CheckpointMode
 ) -> None:
     calls = count_checkpoint_calls(monkeypatch)
     adapter, layers = block_parts(tiny_model, 0)
@@ -269,5 +360,6 @@ def test_gradient_checkpointing_mode_is_checked(tiny_model: RecurrentGPT) -> Non
     x = torch.randn(1, 4, 64)
     with pytest.raises(ValueError, match="gradient_checkpointing must be one of none, selective, full, not True"):
         iterate_core_block(
-            x, x, tiny_model.freqs_cis[:, :4], None, 1, 1, adapter=adapter, layers=layers, gradient_checkpointing=True
+            x, x, tiny_model.freqs_cis[:, :4], None, 1, 1, adapter=adapter, layers=layers,
+            gradient_checkpointing=cast(recurrence.CheckpointMode, True),  # deliberately invalid at runtime
         )

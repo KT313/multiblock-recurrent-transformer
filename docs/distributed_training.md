@@ -24,9 +24,13 @@ Every rank runs the same `train()`; the differences are these.
   the packing pool) and scatters each rank its pack for every micro-batch (`RankBatches` in `training/step.py`).
   The other ranks have no train loaders. The checkpoint therefore holds one stream state; a resume continues the
   stream exactly as on one GPU.
-- **Same recurrence depth on every rank.** The depth sampler is seeded by the optimizer step, so every rank runs the
-  same number of iterations and none waits for a deeper one. Only the random latent state differs per rank (the
-  global RNG is seeded with `seed + rank`); DDP broadcasts rank 0's parameters at start, so the model init is shared.
+- **Fresh recurrence depths per local microbatch, shared across ranks.** The sampler deterministically combines
+  the optimizer step, zero-based local microbatch index and core-block index, excluding rank. Each local microbatch
+  gets a fresh draw for every core; corresponding microbatches on all ranks get the same depth vector. For example,
+  64 global microbatches on 8 GPUs means 8 local microbatches per GPU: all ranks might use depths `8, 4, 6` at local
+  index 0 and `2, 7, 7` at index 1. Fresh draws can coincide. This balances recurrence work; other costs can still
+  cause timing differences. Latent values remain different per token and rank (the global RNG uses `seed + rank`);
+  DDP broadcasts rank 0's parameters at start, so the model initialization is shared.
 - **Validation is sharded.** Each rank scores its share of the validation rows; the per-depth losses are the mean of
   the per-rank means, the per-source losses are summed over the ranks.
 - **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, checkpoints, samples, benchmarks,
@@ -47,6 +51,16 @@ Every rank runs the same `train()`; the differences are these.
 A checkpoint stores one RNG state per rank and the number of ranks. Resume with the same number of GPUs; a checkpoint
 written with another count is refused. The backend name itself may change between `single_device` and a one-rank
 `ddp` run.
+
+Depth sampling needs no additional checkpoint state: checkpoints occur between optimizer steps, and the restored
+step starts at local microbatch index 0. Resuming with the same code and settings reproduces the depth schedule.
+The per-microbatch sampler uses a new versioned seed mapping, including for index 0. Checkpoints from the earlier
+per-optimizer-step sampler remain loadable, but their subsequent sampled depths and training trajectory change.
+Evaluation depths, explicit depth overrides and latent RNG consumption are unchanged.
+
+Raw `RecurrentGPT` callers own `step` and `micro_batch_index`; both default to 0. An accumulation loop outside
+the native trainer must set the local index before each forward. Replaying a forward uses the same context.
+The Hugging Face wrapper retains its separate per-forward depth counter; this change does not add HF resume state.
 
 ## Is the data reader keeping up?
 
