@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask, flex_attention
 
+from ..generation import KVCache
 from .init import Linear
 
 if TYPE_CHECKING:
@@ -181,18 +182,32 @@ class CausalSelfAttention(torch.nn.Module):
             self.qk_bias = torch.nn.Parameter(torch.zeros(2, 1, self.n_head, self.head_dim))
         self.proj = Linear(config.n_embd, config.n_embd, bias=False, init_method=config.init.fn("out_attn"))
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
+    def forward(
+        self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None, cache: KVCache | None = None,
+    ) -> Tensor:
         B, S, E = x.shape
-        q, k, v = self.Wqkv(x).split(E, dim=2)  # each (B, S, E)
-        q = q.view(B, S, self.n_head, self.head_dim)
-        k = k.view(B, S, self.n_head, self.head_dim)
-        v = v.view(B, S, self.n_head, self.head_dim)
-        q, k = qk_bias_rope(self.qk_bias if self.use_qk_bias else None, q, k, freqs_cis)
+        q, k, v = qkv_bias_rope(
+            self.qk_bias if self.use_qk_bias else None, self.Wqkv(x), freqs_cis, self.n_head,
+        )
 
+        if cache is not None:
+            k, v = cache.append(k, v)
         y = attention(q, k, v, mask)
         y = y.reshape(B, S, E).contiguous()
         out: Tensor = self.proj(y)
         return out
+
+
+def qkv_bias_rope(
+    qk_bias: Tensor | None, qkv: Tensor, freqs_cis: Tensor, n_head: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Split the original projection, rotate Q/K, and preserve V as a view of the projection."""
+    batch, length, width = qkv.shape
+    embd = width // 3
+    q, k, v = qkv.split(embd, dim=2)  # type: ignore[no-untyped-call]  # torch stub gap
+    shape = (batch, length, n_head, embd // n_head)
+    q, k = qk_bias_rope(qk_bias, q.view(shape), k.view(shape), freqs_cis)
+    return q, k, v.view(shape)
 
 
 def qk_bias_rope(qk_bias: Tensor | None, q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:

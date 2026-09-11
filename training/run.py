@@ -515,6 +515,7 @@ def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> l
                 prompts=load_prompts(),
                 max_new_tokens=settings.sample_max_new_tokens,
                 temperature=settings.sample_temperature,
+                use_cache=settings.sample_use_cache,
                 recurrences=settings.sample_recurrences or [None],
             )
     except Exception as error:  # a prompt the model cannot take, an OOM in generation: the run must not end on it

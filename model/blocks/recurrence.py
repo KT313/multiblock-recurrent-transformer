@@ -28,6 +28,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
 from ..layers.attention import AttentionMask
+from ..generation import KVCache
 
 # (num_steps_no_grad, num_steps_with_grad) for one core block.
 StepsPair = tuple[int, int]
@@ -175,6 +176,7 @@ def core_block_forward(
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
     base_proj: Tensor | None = None,
+    caches: list[KVCache] | None = None,
 ) -> Tensor:
     """
     One recurrence iteration: inject the (normalised) block input into the latent state, then run the layers.
@@ -190,8 +192,11 @@ def core_block_forward(
     weight = cast(Tensor, adapter.weight)
     n_embd = weight.shape[0]
     x_latent = torch.nn.functional.linear(x_latent, weight[:, :n_embd]) + base_proj  # (B, S, E)
-    for layer in layers:
-        x_latent = layer(x_latent, freqs_cis, mask)
+    for index, layer in enumerate(layers):
+        if caches is None:
+            x_latent = layer(x_latent, freqs_cis, mask)
+        else:
+            x_latent = layer(x_latent, freqs_cis, mask, caches[index])
     return x_latent
 
 

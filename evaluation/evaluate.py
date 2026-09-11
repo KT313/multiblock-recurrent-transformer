@@ -41,6 +41,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_samples", action="store_true", help="skip the sample generations")
     parser.add_argument("--prompts_file", default=None, help="prompts file (see evaluation/prompts.py)")
     parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--no_sample_cache", action="store_true", help="legacy full-prefix latent resampling (default: fixed per-token latents and per-recurrence KV cache)")
     parser.add_argument("--temperature", type=float, default=0.0, help="0: greedy")
     parser.add_argument("--tasks", default="", help="comma-separated lm-eval tasks; empty: no benchmarks")
     parser.add_argument("--limit", type=int, default=None, help="examples per task")
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             recurrences=recurrences,
             batch_size=arguments.batch_size,
             seed=arguments.seed,
+            use_cache=not arguments.no_sample_cache,
         )
         print(f"{len(samples)} samples written to {path}")
         for sample in samples:

@@ -181,6 +181,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "sample_at_training_progress",
     "sample_max_new_tokens",
     "sample_temperature",
+    "sample_use_cache",
     "sample_recurrences",
     "benchmark_step_interval",
     "benchmark_at_training_progress",

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from ..config import RecurrentConfig
+from ..generation import KVCache
 from ..layers.attention import AttentionMask, CausalSelfAttention
 from ..layers.mlp import GatedMLP
 from ..layers.norms import RMSNorm
@@ -33,8 +34,13 @@ class SandwichBlock(torch.nn.Module):
         self.norm_3 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
         self.norm_4 = RMSNorm(config.n_embd, eps=config.norm_eps, autocast_output=bf16_stream)
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
-        attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
+    def forward(
+        self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None, cache: KVCache | None = None,
+    ) -> Tensor:
+        if cache is None:
+            attn_out = self.attn(self.norm_1(x), freqs_cis, mask)
+        else:
+            attn_out = self.attn(self.norm_1(x), freqs_cis, mask, cache)
         x = self.norm_2.residual(attn_out, x)
         mlp_out = self.mlp(self.norm_3(x))
         x = self.norm_4.residual(mlp_out, x)

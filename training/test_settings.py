@@ -591,3 +591,8 @@ def test_gradient_metrics_interval_yaml_validation(tmp_path: Path) -> None:
     path.write_text(yaml.safe_dump(values))
     with pytest.raises(ValueError, match="log_gradient_metrics_interval.*must be a multiple"):
         parse_settings(["--config", str(path)])
+
+
+def test_sample_cache_default_and_legacy_override() -> None:
+    assert _settings().sample_use_cache
+    assert not _settings(sample_use_cache=False).sample_use_cache

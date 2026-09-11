@@ -544,7 +544,7 @@ def test_generate_runs(tmp_path: Path) -> None:
     prompt = ids(1, 8)
     torch.manual_seed(1)
     # transformers' `GenerativePreTrainedModel` protocol lists attributes PreTrainedModel only sets dynamically.
-    gen = loaded.generate(prompt, max_new_tokens=4, do_sample=False)  # type: ignore[misc]
+    gen = loaded.generate(prompt, max_new_tokens=4, do_sample=False)
     assert isinstance(gen, torch.Tensor)
     assert gen.shape == (1, 12)
     assert torch.equal(gen[:, :8], prompt)

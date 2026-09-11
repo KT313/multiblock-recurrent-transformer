@@ -534,3 +534,13 @@ def test_old_gradient_logging_flag_does_not_block_resume(
     for interval in (0, 8):
         settings = _settings(run_name="tiny", seed=42, log_gradient_metrics_interval=interval)
         check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), False)
+
+
+def test_sample_cache_policy_is_compatible_with_old_checkpoint_settings(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("sample_use_cache")
+    for policy in (False, True):
+        current = _settings(run_name="tiny", seed=42, sample_use_cache=policy)
+        check_settings_unchanged(metadata, current, tiny_model.config.to_dict(), False)

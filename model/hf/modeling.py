@@ -22,6 +22,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from ..config import RecurrentConfig, RoPESettings, broadcast_per_block
 from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
 from ..model import RecurrentGPT
+from ..generation import GenerationState
 
 # The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
@@ -157,7 +158,8 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
 
 class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore[no-untyped-call]  # see above
     """
-    Wraps `RecurrentGPT` for lm-eval / generation; no KV cache, the full sequence is recomputed per step.
+    Wraps `RecurrentGPT` for lm-eval / generation. Cached generation retains independent per-token/core latents;
+    use_cache=False keeps legacy full-prefix latent resampling. Direct forward/scoring defaults remain uncached.
     """
 
     config_class = RecurrentGPTConfig
@@ -188,8 +190,11 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
         num_steps: NumSteps = None,
+        logits_to_keep: int = 0,
+        use_cache: bool = False,
+        past_key_values: GenerationState | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, ...] | CausalLMOutputWithPast:
+    ) -> tuple[Any, ...] | CausalLMOutputWithPast:
         """
         `num_steps` as in `RecurrentGPT.forward`. When None: in eval mode `EVAL_RECURRENCE_STEPS` ("12" or
         "4,12,4") if set, else the config's `mean_recurrence` per block; in training mode always the sampler (the env
@@ -212,6 +217,18 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         (the depths are a distribution, not a schedule). The native training loop writes `step` itself
         (`training/step.py`) and never goes through this wrapper.
         """
+
+        if past_key_values is not None and not isinstance(past_key_values, GenerationState):
+            raise ValueError("past_key_values must be this model's GenerationState")
+        if past_key_values is not None and not use_cache:
+            raise ValueError("past_key_values requires use_cache=True")
+        if use_cache and (self.training or torch.is_grad_enabled() or labels is not None):
+            if past_key_values is not None:
+                past_key_values.invalidate()
+            raise ValueError("cached generation requires eval, no_grad/inference_mode, and no labels")
+        if labels is not None and logits_to_keep:
+            raise ValueError("logits_to_keep requires inference without labels")
+        state = (past_key_values or GenerationState()) if use_cache else None
 
         if return_dict is None:
             return_dict = self.config.return_dict
@@ -237,6 +254,9 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
             labels=None,  # the inner loss is unshifted; the HF contract shifts, below
             return_logits=True,
             num_steps=num_steps,
+            logits_to_keep=logits_to_keep,
+            generation_state=state,
+            use_cache=use_cache,
         )
         if sampler_step:
             self._training_forwards += 1
@@ -250,30 +270,86 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
 
         if return_dict:
             # transformers annotates the field as FloatTensor; ours is a plain float32 Tensor (there is no such subclass)
-            return CausalLMOutputWithPast(loss=loss, logits=logits)  # type: ignore[arg-type]
+            return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=state)  # type: ignore[arg-type]
         if loss is None:
-            return (logits,)
+            return (logits, state) if state is not None else (logits,)
         return (loss, logits)
 
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        # Shared layers need one slot per recurrence occurrence, and standard caches contain no fixed latents.
+        return False
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        """HF generation; cache sessions support ordinary greedy/multinomial decoding only.
+
+        Every call creates its own session. To resume an explicit cached prefix use forward, not generate; training
+        sample events must never accidentally inherit a cache from an earlier optimizer update.
+        """
+        generation = kwargs.get("generation_config") or (args[1] if len(args) > 1 else self.generation_config)
+
+        def setting(name: str, default: Any = None) -> Any:
+            if name in kwargs:
+                return kwargs[name]
+            value = getattr(generation, name, None)
+            if value is None:
+                value = getattr(self.generation_config, name, None)
+            return default if value is None else value
+
+        use_cache = setting("use_cache", True)
+        if use_cache:
+            if setting("num_beams", 1) != 1:
+                raise ValueError("cached generation does not support beams; use_cache=False selects legacy generation")
+            assistant = kwargs.get("assistant_model", args[6] if len(args) > 6 else None)
+            if assistant is not None or setting("prompt_lookup_num_tokens"):
+                raise ValueError("cached generation does not support assisted/speculative decoding")
+            if setting("guidance_scale", 1) != 1:
+                raise ValueError("cached generation does not support classifier-free guidance")
+            if setting("prefill_chunk_size") is not None:
+                raise ValueError("cached generation does not support HF chunked prefill")
+            if setting("cache_implementation") is not None:
+                raise ValueError("cached generation uses the model's own cache; omit cache_implementation")
+            if kwargs.get("inputs_embeds") is not None:
+                raise ValueError("cached generation requires input_ids, not inputs_embeds")
+            if kwargs.get("past_key_values") is not None:
+                raise ValueError("generate starts a fresh session; resume an explicit cache through forward")
+        kwargs.setdefault("logits_to_keep", 0 if use_cache is False else 1)
+        return super().generate(*args, **kwargs)  # type: ignore[misc]  # transformers dynamic model protocol
+
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """
-        The whole sequence every step (no KV cache), plus the padding mask and the positions.
+        """Derive left-padded row positions; pass only new tokens once the per-occurrence cache exists.
 
-        `generate` left-pads prompts of different lengths; without the mask the model would attend to the pads and
-        count them as positions. With it every row's positions are `cumsum(mask) - 1`, clamped at 0, so the first real
-        token of every row sits at position 0. Everything else `generate` passes (a cache, embeddings) is dropped.
-        `*args` / `**kwargs`: transformers' signature changes between versions and `generate` only passes keywords.
+        Legacy use_cache=False passes the entire sequence and continues resampling prefix latents. The full mask
+        always accompanies cached queries, because storage columns and each row's real RoPE positions differ.
         """
-
         attention_mask: torch.Tensor | None = kwargs.get("attention_mask")
         position_ids: torch.Tensor | None = kwargs.get("position_ids")
+        state: GenerationState | None = kwargs.get("past_key_values")
+        use_cache: bool = kwargs.get("use_cache", False)
+        if attention_mask is not None and position_ids is None:
+            position_ids = (attention_mask.to(torch.long).cumsum(-1) - 1).clamp(min=0)
+        if state is not None:
+            if not isinstance(state, GenerationState) or not use_cache:
+                raise ValueError("generation requires its own cache with use_cache=True")
+            try:
+                state.validate_prefix(input_ids, position_ids)
+            except Exception:
+                state.invalidate()
+                raise
+            start = state.get_seq_length()
+            input_ids = input_ids[:, start:]
+            if position_ids is not None:
+                position_ids = position_ids[..., start:]
         model_inputs: dict[str, Any] = {"input_ids": input_ids}
         if attention_mask is not None:
             model_inputs["attention_mask"] = attention_mask
-            if position_ids is None:
-                position_ids = (attention_mask.to(torch.long).cumsum(-1) - 1).clamp(min=0)
         if position_ids is not None:
             model_inputs["position_ids"] = position_ids
+        for key in ("logits_to_keep", "num_steps", "use_cache"):
+            if key in kwargs:
+                model_inputs[key] = kwargs[key]
+        if state is not None:
+            model_inputs["past_key_values"] = state
         return model_inputs
 
     def get_input_embeddings(self) -> torch.nn.Module:

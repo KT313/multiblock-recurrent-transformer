@@ -154,6 +154,7 @@ class Settings:
     sample_step_interval: int = 0  # write samples every this many steps (0: never)
     sample_at_training_progress: list[float] = field(default_factory=lambda: [100.0])  # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
     sample_max_new_tokens: int = 64
+    sample_use_cache: bool = True  # fixed per-token/core latents and per-recurrence K/V; False: legacy prefix resampling
     sample_temperature: float = 0.0  # 0: greedy decoding
     sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
     benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)

@@ -96,3 +96,10 @@ def test_cli_writes_samples_and_benchmarks_into_the_run_directory(
 
     assert main([*argv, "--no_samples", "--out_dir", str(tmp_path / "none")]) == 0
     assert not (tmp_path / "none").exists()
+
+
+def test_sample_cache_cli_default_and_legacy_override() -> None:
+    from evaluation.evaluate import parse_arguments
+
+    assert not parse_arguments(["--checkpoint", "unused.pth"]).no_sample_cache
+    assert parse_arguments(["--checkpoint", "unused.pth", "--no_sample_cache"]).no_sample_cache

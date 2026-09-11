@@ -3,7 +3,8 @@
 Sample generations: what the model writes after each prompt, saved as JSON lines.
 
 Greedy by default (`temperature 0`); prompts are left-padded into batches, so every batch is one `generate` call
-of the HuggingFace wrapper (no KV cache: the whole sequence is recomputed per token).
+of the HuggingFace wrapper. Cached decoding retains each token's random initial latent per core;
+`use_cache=False` selects the legacy full-prefix resampling semantics.
 """
 
 from __future__ import annotations
@@ -51,12 +52,16 @@ def generate_samples(
     recurrence: Recurrence = None,
     batch_size: int = 8,
     seed: int = 0,
+    use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
     One completion per prompt: greedy when temperature is 0, sampled at that temperature otherwise; at most
     max_new_tokens tokens, cut at the first EOS. recurrence (steps per core block, e.g. [4, 4, 4]) overrides the
     model's mean recurrence. A prompt whose tokens plus max_new_tokens do not fit the model's position table is
     skipped with a warning (`_fitting_prompts`) instead of crashing the run.
+
+    use_cache=True retains per-token/core latents and distinct per-recurrence K/V for this call only.
+    It changes historical seeded samples; False restores legacy prefix resampling and full-head projection.
 
     seed seeds the isolated RNG, which is reseeded to `seed + <index of the batch's first prompt>` before each
     batch (the initial latent state and the sampling are drawn from it). So: the same prompts in the same order,
@@ -66,6 +71,8 @@ def generate_samples(
     a different batch size, or twice in one batch, may complete differently.
     """
 
+    if batch_size < 1 or max_new_tokens < 1:
+        raise ValueError("batch_size and max_new_tokens must be positive")
     check_recurrence(recurrence, model)
     fitting = _fitting_prompts(prompts, tokenizer, max_new_tokens, model.config.model_max_sequence_length)
     samples: list[GeneratedSample] = []
@@ -82,8 +89,8 @@ def generate_samples(
                 input_ids[row, width - len(ids) :] = torch.tensor(ids, dtype=torch.long)
                 attention_mask[row, width - len(ids) :] = 1
             sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
-            # Reseed per batch (the RNG is the forked one of `isolated_inference`): every forward draws a fresh
-            # latent state, so without this a batch would depend on how many tokens the batches before it generated.
+            # Reseed each batch so prior batches cannot affect its latent seed or token sampling stream.
+            # Cached generation uses private normal generators; legacy forwards draw full-prefix latent states.
             torch.manual_seed(seed + start)
             output = generate(
                 input_ids.to(device),
@@ -91,6 +98,8 @@ def generate_samples(
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_id,
                 eos_token_id=tokenizer.eos_id,
+                use_cache=use_cache,
+                logits_to_keep=1 if use_cache else 0,
                 **sampling,
             )
             for row, (prompt, _) in enumerate(batch):
@@ -103,9 +112,8 @@ def _fitting_prompts(
 ) -> list[tuple[Prompt, list[int]]]:
     """
     The prompts that can be generated from, with their token ids: prompt tokens plus max_new_tokens must fit the
-    model's position table (`model_max_sequence_length`), because the whole sequence is recomputed per token and a
-    position beyond the RoPE table raises an `IndexError` deep in the model. A longer prompt is left out with a
-    warning naming it (a training run must not die on one entry of a prompts file).
+    model's position table (`model_max_sequence_length`). A longer prompt is left out with a warning naming it
+    (a training run must not die on one entry of a prompts file).
     """
 
     fitting: list[tuple[Prompt, list[int]]] = []
@@ -147,6 +155,7 @@ def generate_and_save_samples(
     recurrences: Sequence[Recurrence] = (None,),
     batch_size: int = 8,
     seed: int = 0,
+    use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
     `generate_samples` once per recurrence setting, then one JSON line per sample in out_path (parents created):
@@ -165,9 +174,15 @@ def generate_and_save_samples(
                 recurrence=recurrence,
                 batch_size=batch_size,
                 seed=seed,
+                use_cache=use_cache,
             )
         )
-    decoding = {"temperature": temperature, "max_new_tokens": max_new_tokens, "seed": seed}
+    decoding = {
+        "temperature": temperature, "max_new_tokens": max_new_tokens, "seed": seed, "batch_size": batch_size,
+        "use_cache": use_cache, "latent_policy": "fixed_per_token" if use_cache else "resample_prefix",
+        "latent_rng": "per_core_token_columns_v1" if use_cache else "global_prefix_v1",
+        "logits_to_keep": 1 if use_cache else 0,
+    }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as file:
         for sample in samples:

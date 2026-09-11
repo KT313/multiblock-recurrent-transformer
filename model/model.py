@@ -23,6 +23,7 @@ from .blocks.recurrence import (
     StepsPair,
     adapter_base_projection,
     check_checkpoint_mode,
+    core_block_forward,
     initialize_state,
     iterate_core_block,
     normalize_num_steps,
@@ -30,6 +31,7 @@ from .blocks.recurrence import (
 )
 from .blocks.sandwich import SandwichBlock
 from .config import RecurrentConfig
+from .generation import GenerationState
 from .layers.attention import AttentionMask, precompute_freqs_cis
 from .layers.init import Linear
 
@@ -229,6 +231,9 @@ class RecurrentGPT(torch.nn.Module):
         return_logits: bool = False,
         num_steps: NumSteps = None,
         return_token_losses_chunked_nograd: bool = False,
+        logits_to_keep: int = 0,
+        generation_state: GenerationState | None = None,
+        use_cache: bool = False,
     ) -> dict[str, Tensor | None]:
         """
         One forward pass: embedding, prelude, the recurrent core blocks, coda, final norm, LM head and, given
@@ -259,6 +264,19 @@ class RecurrentGPT(torch.nn.Module):
         `run_core_blocks` call (embedding and prelude; coda, final norm, LM head and loss). The core-block loop
         itself is eager by design, see `run_core_blocks`.
         """
+
+        if logits_to_keep < 0:
+            raise ValueError("logits_to_keep must be nonnegative")
+        if logits_to_keep and (labels is not None or return_token_losses_chunked_nograd):
+            raise ValueError("logits_to_keep requires inference without labels/token losses")
+        if use_cache and generation_state is None:
+            raise ValueError("use_cache requires an explicit generation_state")
+        if generation_state is not None:
+            if labels is not None or return_token_losses_chunked_nograd:
+                raise ValueError("generation state cannot compute training/scoring losses")
+            return self._forward_generation(
+                input_ids, attention_mask, position_ids, num_steps, generation_state, use_cache, logits_to_keep, return_logits,
+            )
 
         # On `shape[1]`, not on a tensor value: a static guard under `torch.compile(dynamic=True)`. Without it the
         # failure is a shape mismatch inside RoPE. Only for the path that takes the table's first S rows: with
@@ -293,7 +311,7 @@ class RecurrentGPT(torch.nn.Module):
         if return_token_losses_chunked_nograd and labels is not None and not return_logits:
             loss, token_losses = self.chunked_loss(x, labels)
         else:
-            logits = self.full_logits(x)  # (B, S, padded_vocab), float32
+            logits = self.full_logits(x[:, -logits_to_keep:] if logits_to_keep else x)  # fp32
             if labels is not None:
                 loss = self.loss(logits, labels)
                 if return_token_losses_chunked_nograd:
@@ -301,6 +319,73 @@ class RecurrentGPT(torch.nn.Module):
             if not return_logits:
                 logits = None
         return {"loss": loss, "logits": logits, "token_losses": token_losses, "log_ppl": loss.clone().detach()}
+
+    def _forward_generation(
+        self, input_ids: Tensor, attention_mask: AttentionMask, position_ids: Tensor | None,
+        num_steps: NumSteps, state: GenerationState, use_cache: bool, logits_to_keep: int, return_logits: bool,
+    ) -> dict[str, Tensor | None]:
+        """Inference with fixed per-token/core latents; optionally append per-occurrence K/V.
+
+        The default forward above never enters here: its training RNG/order and full scoring logits are unchanged.
+        A state with use_cache=False is the full-prefix fixed-latent reference, not legacy prefix resampling.
+        """
+        try:
+            specs = normalize_num_steps(num_steps, len(self.transformer.core_blocks))
+            means = self.config.mean_recurrence
+            assert isinstance(means, list)
+            steps = tuple(means[i] if spec is None else sum(spec) for i, spec in enumerate(specs))
+            start = state.get_seq_length() if use_cache else 0
+            total = start + input_ids.shape[1]
+            if attention_mask is None:
+                padding = torch.ones((input_ids.shape[0], total), device=input_ids.device, dtype=torch.bool)
+            elif isinstance(attention_mask, Tensor) and attention_mask.dim() == 2:
+                padding = attention_mask.to(torch.bool)
+            else:
+                raise ValueError("generation state supports only a (B, S) padding mask, not packed attention")
+            if position_ids is None:
+                position_ids = (padding.long().cumsum(-1) - 1).clamp(min=0)[:, start:]
+            elif position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
+            elif position_ids.dim() == 2 and position_ids.shape[0] == 1:
+                position_ids = position_ids.expand(input_ids.shape[0], -1)
+            start = state.begin(
+                self, input_ids, padding, position_ids, steps, use_cache=use_cache,
+                max_positions=self.config.model_max_sequence_length,
+            )
+            rotary, _ = prepare_attention_inputs(self.freqs_cis, input_ids, position_ids=position_ids)
+            query_columns = torch.arange(start, total, device=input_ids.device)[:, None]
+            key_columns = torch.arange(total, device=input_ids.device)[None, :]
+            # Explicit rectangular mask: each appended query sees all valid earlier keys and itself.
+            mask = (padding[:, None, None, :] & (key_columns <= query_columns)) | (key_columns == query_columns)
+            x = self.transformer.wte(input_ids)
+            if self.emb_scale != 1:
+                x = x * self.emb_scale
+            for index, block in enumerate(self.transformer.prelude):
+                cache = state.slot(("prelude", index, 0, 0)) if use_cache else None
+                x = block(x, rotary, mask, cache)
+            for core, count in enumerate(steps):
+                x_base = self.transformer.ln_fs[core](x)
+                latent = state.latent(core, x, start)
+                if self.core_bf16_stream and torch.is_autocast_enabled(x.device.type):
+                    latent = latent.to(torch.get_autocast_dtype(x.device.type))
+                adapter = self.transformer.adapters[core]
+                layers = cast(torch.nn.ModuleList, self.transformer.core_blocks[core])
+                base = adapter_base_projection(x_base, adapter)
+                for iteration in range(count):
+                    caches = [state.slot(("core", core, iteration, layer)) for layer in range(len(layers))] if use_cache else None
+                    latent = core_block_forward(latent, x_base, rotary, mask, adapter, layers, base, caches)
+                x = latent + x
+            for index, block in enumerate(self.transformer.coda):
+                cache = state.slot(("coda", index, 0, 0)) if use_cache else None
+                x = block(x, rotary, mask, cache)
+            x = self.transformer.ln_final(x)
+            logits = self.full_logits(x[:, -logits_to_keep:] if logits_to_keep else x) if return_logits else None
+            state.finish()
+            loss = torch.as_tensor(0.0)
+            return {"loss": loss, "logits": logits, "token_losses": None, "log_ppl": loss.clone().detach()}
+        except Exception:
+            state.invalidate()
+            raise
 
     def full_logits(self, x: Tensor) -> Tensor:
         """
