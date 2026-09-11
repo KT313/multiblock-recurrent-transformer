@@ -5,13 +5,14 @@
     create_backend                    device, precision, torch flags; then `seed_everything`
     prepare_run_directory             out_dir/<run_name>/checkpoints, run_config.json
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
+    resolve_resume_checkpoint         select latest / explicit checkpoint once, before parameter initialization
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE on the main rank (whole run), one validation loader per stage
     build_run_model                   architecture yaml + overrides, sequence-length check, model_config.json, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     RunState                          the objects above in one place for the helpers below
-    restore_checkpoint_if_resuming    latest / explicit checkpoint -> model, optimizer, RNG state, progress
+    restore_checkpoint                selected checkpoint -> model, optimizer, RNG state, progress
     loop                              run_one_optimizer_step -> advance -> evaluate -> log -> checkpoint (or stop)
     export_if_requested               the HuggingFace folder, once training finished
 
@@ -46,6 +47,7 @@ from data_preparation.dataset_config import DatasetConfig
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
+from model.layers.init import checkpoint_initialization
 from training.backend import get_backend
 from training.backend.base import Backend
 from training.checkpoint import (
@@ -137,6 +139,7 @@ def train(
         # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
         lock = run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training") if backend.is_main else nullcontext()
         with lock:
+            resume_path = resolve_resume_checkpoint(settings, run_directory)
             dataset = resolve_dataset(settings, backend, should_stop=should_stop)
             stage_manager = build_stage_manager(settings, dataset, backend.world_size)
             sample_triggers = StepTriggers.from_settings(
@@ -147,11 +150,11 @@ def train(
             )
             loaders = build_run_dataloaders(settings, dataset, backend)
             try:
-                model = build_run_model(settings, dataset, backend, run_directory)
+                model = build_run_model(settings, dataset, backend, run_directory, resume_checkpoint=resume_path)
                 check_tokenizer_vocabulary(loaders.tokenizer, backend.plain_model(model).config)
                 optimizer = build_run_optimizer(settings, model, backend)
                 state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
-                resume = restore_checkpoint_if_resuming(state)
+                resume = restore_checkpoint(state, resume_path) if resume_path is not None else None
                 progress = state.progress
 
                 with RunLogger.open(
@@ -352,28 +355,35 @@ def check_tokenizer_vocabulary(tokenizer: Tokenizer, model_config: RecurrentConf
         )
 
 
-def build_run_model(settings: Settings, dataset: ResolvedDataset, backend: Backend, run_directory: Path) -> Module:
+def build_run_model(
+    settings: Settings, dataset: ResolvedDataset, backend: Backend, run_directory: Path,
+    *, resume_checkpoint: Path | None = None,
+) -> Module:
     """
     The run's model: architecture yaml + `model_overwrite`, the sequence-length check against the dataset config,
     `RecurrentGPT`, `model_config.json`, then `backend.setup_model` (device, optional compile).
 
-    Numerics: the parameter init is the first consumer of the global torch RNG after `seed_everything`; nothing that
-    draws may run before it.
+    Fresh runs keep their original initialization/RNG order. A selected checkpoint uses cheap weight placeholders;
+    the caller must restore the complete checkpoint (including RNG) before training.
     """
 
     model_config = RecurrentConfig.from_yaml(
         settings.model_architecture_config, **(settings.model_overwrite | {"use_custom_kernels": settings.use_custom_kernels})
     )
     check_sequence_lengths(settings, dataset.config, model_config)
-    # the truncated-orthogonal init runs on the CPU, single-threaded per tensor: about 20 s for 300M parameters
-    log.info(
-        "building the model of %s: initialising the parameters on the CPU, which takes a while for a large model",
-        settings.model_architecture_config,
-    )
+    if resume_checkpoint is None:
+        log.info(
+            "building the model of %s: initialising the parameters on the CPU, which takes a while for a large model",
+            settings.model_architecture_config,
+        )
+    else:
+        log.info("building the model of %s: skipping orthogonal weight initialization; restoring %s",
+                 settings.model_architecture_config, resume_checkpoint)
     started = time.monotonic()
-    model = RecurrentGPT(
-        model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
-    )
+    with checkpoint_initialization() if resume_checkpoint is not None else nullcontext():
+        model = RecurrentGPT(
+            model_config, ignore_index=IGNORE_INDEX, gradient_checkpointing=settings.gradient_checkpointing
+        )
     log.info("model built: %s parameters in %.1fs, moving it to %s%s", f"{num_parameters(model):,}",
              time.monotonic() - started, backend.device, ", compiled on the first step" if settings.compile_model else "")
     if backend.is_main:
@@ -393,26 +403,35 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
     return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, settings.optim_config))
 
 
-def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
-    """
-    Restore the run from its checkpoint when it resumes and say where from; None for a fresh run.
+def resolve_resume_checkpoint(settings: Settings, run_directory: Path) -> Path | None:
+    """Select a checkpoint once, before initialization; no automatic checkpoint means a normal fresh run."""
+    if not settings.resume:
+        return None
+    path = Path(settings.resume_checkpoint_path) if settings.resume_checkpoint_path else find_latest_checkpoint(
+        run_directory, settings.run_name
+    )
+    if path is not None and not path.is_file():
+        raise FileNotFoundError(f"resume checkpoint does not exist or is not a file: {path}")
+    return path
 
-    With `settings.resume`: `resume_checkpoint_path` if set, else the most recently written checkpoint of `run_name`
-    in the run directory; none found means a fresh start. Restores model and optimizer state, verifies dataset and
-    settings against the checkpoint, refuses a checkpoint written with another number of ranks (its RNG states are
+
+def restore_checkpoint_if_resuming(state: RunState) -> ResumePoint | None:
+    """Select and restore a checkpoint for callers that already built their model."""
+    path = resolve_resume_checkpoint(state.settings, state.run_directory)
+    return restore_checkpoint(state, path) if path is not None else None
+
+
+def restore_checkpoint(state: RunState, resume_path: Path) -> ResumePoint:
+    """
+    Restore the checkpoint selected before model construction and say where from.
+
+    Restores model and optimizer state, verifies dataset and settings against the checkpoint, refuses a checkpoint
+    written with another number of ranks (its RNG states are
     per rank), restores this rank's RNG state and sets `progress.step = progress.resume_step = checkpoint step`. The
     returned data-stream state goes into `BatchStream.load_state_dict` once the stream exists.
     """
 
     settings = state.settings
-    if not settings.resume:
-        return None
-    if settings.resume_checkpoint_path:
-        resume_path: Path | None = Path(settings.resume_checkpoint_path)
-    else:
-        resume_path = find_latest_checkpoint(state.run_directory, settings.run_name)
-    if resume_path is None:
-        return None
     log.info("loading the checkpoint %s (%.1f GB) into the model and the optimizer", resume_path, resume_path.stat().st_size / 1e9)
     started = time.monotonic()
     metadata = load_training_checkpoint(state.backend, resume_path, state.model, state.optimizer)

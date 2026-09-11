@@ -92,6 +92,10 @@ and kernel failures raise an explanatory error with that setting; there is no au
 The setting is saved in model/Hugging Face configs. On resume, changing it follows the existing
 `allow_settings_change` policy; older checkpoints without the flag represent native execution.
 
+When a resume checkpoint is found, model construction skips the expensive orthogonal weight initialization and
+uses cheap placeholders until the checkpoint is loaded. Fresh runs, including `resume: true` with no checkpoint
+found, retain the original initialization. Resume restores the saved model, optimizer and RNG states as before.
+
 Basic metrics follow `log_step_interval`; expensive per-parameter gradient/update statistics follow
 `log_gradient_metrics_interval` independently. Both count completed optimizer steps. The gradient interval must be
 an integer >= 0: `0` disables those statistics; a positive value must be a multiple of `log_step_interval`.

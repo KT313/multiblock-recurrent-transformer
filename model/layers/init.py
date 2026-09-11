@@ -7,13 +7,32 @@ always zero. `Linear` is the thin `torch.nn.Linear` subclass whose `reset_parame
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from math import sqrt
 
 import torch
 
 # `torch.nn.init.*` return the tensor, the fused inits return None: the result is never used.
 InitFn = Callable[[torch.Tensor], object]
+
+_CHECKPOINT_INITIALIZATION: ContextVar[bool] = ContextVar("checkpoint_initialization", default=False)
+
+
+@contextmanager
+def checkpoint_initialization() -> Iterator[None]:
+    """Use cheap placeholders for weights about to be restored, without changing later reset_parameters calls.
+
+    Parameters remain allocated normally, preserving aliases and nonpersistent buffers. Embedding's own normal
+    initialization and small normalization/bias fills remain; all custom orthogonal initialization is skipped.
+    The caller must load a complete checkpoint before using the model.
+    """
+    token = _CHECKPOINT_INITIALIZATION.set(True)
+    try:
+        yield
+    finally:
+        _CHECKPOINT_INITIALIZATION.reset(token)
 
 
 @torch.no_grad()
@@ -146,7 +165,10 @@ class Init:
 
         weight = getattr(module, "weight", None)
         if weight is not None:
-            self.fn(name_of_layer)(weight)
+            if _CHECKPOINT_INITIALIZATION.get() and name_of_layer != "normalization":
+                torch.nn.init.zeros_(weight)
+            else:
+                self.fn(name_of_layer)(weight)
         bias = getattr(module, "bias", None)
         if bias is not None:
             torch.nn.init.zeros_(bias)
@@ -174,6 +196,9 @@ class Linear(torch.nn.Linear):
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
-        self.init_method(self.weight)
+        if _CHECKPOINT_INITIALIZATION.get():
+            self.weight.zero_()
+        else:
+            self.init_method(self.weight)
         if self.bias is not None:
             self.bias.data.zero_()

@@ -145,3 +145,25 @@ def test_init_is_seed_deterministic(init: Init) -> None:
     b = torch.empty(256, 256)
     init.fn("head")(b)
     assert torch.equal(a, b)
+
+
+def test_checkpoint_initialization_is_scoped_and_preserves_reset_behavior() -> None:
+    from model.layers.init import checkpoint_initialization
+    calls = []
+    def initialize(weight: torch.Tensor) -> None:
+        calls.append(1)
+        torch.nn.init.constant_(weight, 3)
+    with checkpoint_initialization():
+        layer = Linear(3, 4, bias=True, init_method=initialize)
+        assert calls == [] and torch.count_nonzero(layer.weight) == 0
+        assert layer.bias is not None and torch.count_nonzero(layer.bias) == 0
+        with pytest.raises(RuntimeError, match='inner'), checkpoint_initialization():
+            raise RuntimeError('inner')
+        layer.reset_parameters()
+        assert calls == []
+    layer.reset_parameters()
+    assert calls == [1] and torch.equal(layer.weight, torch.full_like(layer.weight, 3))
+    with pytest.raises(RuntimeError, match='outer'), checkpoint_initialization():
+        raise RuntimeError('outer')
+    layer.reset_parameters()
+    assert calls == [1, 1]

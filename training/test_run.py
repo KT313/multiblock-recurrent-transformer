@@ -1092,7 +1092,8 @@ def test_golden_tiny_run(reference_run: ReferenceRun) -> None:
 
 @pytest.mark.slow
 def test_resume_chain_reproduces_the_uninterrupted_run(
-    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     One run stopped after step 5 (a plain step of stage 0), resumed and stopped after step 7 (inside the 0 -> 1
@@ -1109,11 +1110,22 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False)
     with single_thread_deterministic():
         segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(5), keep_history=True)]
+        from model.layers import init as init_module
+        def unexpected_orthogonal(*args: object, **kwargs: object) -> None:
+            raise AssertionError("resume must not initialize orthogonal weights")
+        monkeypatch.setattr(init_module, "trunc_orthogonal_", unexpected_orthogonal)
+        selections = []
+        find_checkpoint = find_latest_checkpoint
+        def select_once(directory: Path, name: str) -> Path | None:
+            selections.append((directory, name))
+            return find_checkpoint(directory, name)
+        monkeypatch.setattr(run_module, "find_latest_checkpoint", select_once)
         resumed_yaml = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False, resume=True)
         for previous, stop in zip(stops, stops[1:]):
             should_stop = StopAfterPolls(stop - previous) if stop < 20 else None
             segments.append(train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, should_stop=should_stop, keep_history=True))
 
+    assert len(selections) == 3  # one selection per resume, reused after model construction
     assert [segment.completed_steps for segment in segments] == stops
     assert [segment.stopped for segment in segments] == [True, True, True, False]
     assert [sorted(segment.history) for segment in segments] == [[1, 2, 3, 4, 5], [6, 7], list(range(8, 15)), list(range(15, 21))]
@@ -1444,3 +1456,56 @@ def test_basic_logs_every_step_with_sparse_or_disabled_gradient_metrics(
         assert ("l2_param_norm" in metrics) == due
         assert ("query_grad_0" in metrics) == due
     assert "l2_param_norm" not in report.history[20]
+
+
+def test_resume_model_build_skips_orthogonal_and_restores_weights(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model.layers import init as init_module
+    directory = prepare_run_directory(tiny_settings)
+    original = cpu_backend.plain_model(build_run_model(tiny_settings, tiny_resolved, cpu_backend, directory))
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError('orthogonal initialization must be skipped')
+    monkeypatch.setattr(init_module, 'trunc_orthogonal_', unexpected)
+    model = cpu_backend.plain_model(build_run_model(
+        tiny_settings, tiny_resolved, cpu_backend, directory, resume_checkpoint=directory / 'selected.pth',
+    ))
+    assert model.lm_head.weight is model.transformer.wte.weight
+    assert model.freqs_cis.dtype == torch.float32 and torch.equal(model.freqs_cis, original.freqs_cis)
+    assert torch.count_nonzero(model.transformer.wte.weight) == 0
+    model.load_state_dict(original.state_dict(), strict=True)
+    assert model.state_dict().keys() == original.state_dict().keys()
+    for key, expected in original.state_dict().items():
+        assert torch.equal(model.state_dict()[key], expected), key
+
+
+def test_resume_without_checkpoint_keeps_fresh_initialization(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model.layers import init as init_module
+    directory = prepare_run_directory(tiny_settings)
+    tiny_settings.resume = True
+    selected = run_module.resolve_resume_checkpoint(tiny_settings, directory)
+    assert selected is None
+    calls = []
+    original = init_module.trunc_orthogonal_
+    def record(tensor: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
+        calls.append(1)
+        return original(tensor, gain)
+    monkeypatch.setattr(init_module, 'trunc_orthogonal_', record)
+    build_run_model(tiny_settings, tiny_resolved, cpu_backend, directory, resume_checkpoint=selected)
+    assert calls
+
+
+def test_missing_explicit_checkpoint_fails_before_model_build(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tiny_settings.resume = True
+    tiny_settings.resume_checkpoint_path = str(Path(tiny_settings.out_dir) / 'missing.pth')
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError('model should not be built')
+    monkeypatch.setattr(run_module, 'build_run_model', unexpected)
+    with pytest.raises(FileNotFoundError, match='resume checkpoint'):
+        train(tiny_settings, backend=cpu_backend)
