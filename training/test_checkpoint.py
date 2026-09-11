@@ -273,6 +273,7 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "validation_padding_multiple": 64,
     "precision": "32",
     "compile_model": True,
+    "use_custom_kernels": False,
     "gradient_checkpointing": "full",
     "validation_batch_size": 2,
     "tokens_per_micro_batch": 16384,
@@ -413,7 +414,7 @@ def test_save_load_forward_bit_identical(
     assert set(raw) == {"model", "optimizer", *metadata.to_state()}
 
     torch.manual_seed(999)
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     fresh_opt = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
     restored = load_training_checkpoint(backend, path, fresh, fresh_opt)
     assert restored.step == 1 and restored.stage == 0 and restored.settings["seed"] == 42
@@ -461,7 +462,7 @@ def test_load_of_an_older_layout_fails_before_touching_the_model(
     path = tmp_path / "old.pth"
     state = {"model": tiny_model.state_dict(), "optimizer": opt.state_dict(), "step": 1, "config": {}}
     backend.save_checkpoint(path, state)
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     before = [p.detach().clone() for p in fresh.parameters()]
     with pytest.raises(KeyError, match="missing the metadata key"):
         load_training_checkpoint(backend, path, fresh, ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3))
@@ -483,7 +484,7 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     save_training_checkpoint(backend, path, compiled, opt, _metadata(backend, tiny_model))
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     compiled_fresh = backend.setup_model(fresh, compile_model=True)
     load_training_checkpoint(backend, path, compiled_fresh, ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
@@ -501,7 +502,7 @@ def test_load_refuses_changed_optimizer_hyperparameters(
     path = checkpoint_path(tmp_path, "tiny", 1)
     save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model, step=1))
 
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     changed = ELLISAdam(get_param_groups(fresh, 0.5), lr=1e-3, betas=(0.8, 0.9))
     with pytest.raises(ValueError, match=r"group 0: betas: checkpoint \(0\.9, 0\.95\) != current \(0\.8, 0\.9\)") as info:
         load_training_checkpoint(backend, path, fresh, changed)
@@ -544,3 +545,19 @@ def test_sample_cache_policy_is_compatible_with_old_checkpoint_settings(
     for policy in (False, True):
         current = _settings(run_name="tiny", seed=42, sample_use_cache=policy)
         check_settings_unchanged(metadata, current, tiny_model.config.to_dict(), False)
+
+
+def test_legacy_checkpoint_kernel_flag_means_native(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop('use_custom_kernels')
+    metadata.model_config.pop('use_custom_kernels')
+    current = _settings(run_name='tiny', seed=42, use_custom_kernels=False)
+    config = tiny_model.config.to_dict() | {'use_custom_kernels': False}
+    check_settings_unchanged(metadata, current, config, False)
+    current.use_custom_kernels = True
+    config['use_custom_kernels'] = True
+    with pytest.raises(ValueError, match='use_custom_kernels'):
+        check_settings_unchanged(metadata, current, config, False)
+    check_settings_unchanged(metadata, current, config, True)

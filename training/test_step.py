@@ -75,6 +75,7 @@ def reference_settings(**overrides: Any) -> Settings:
     """
 
     values: dict[str, Any] = dict(
+        use_custom_kernels=False,
         dataset_config="config/datasets/tiny.yaml",
         model_architecture_config=str(TINY_MODEL_ARCHITECTURE),
         stage_base_lrs=[3e-4],
@@ -139,7 +140,7 @@ def scripted_batches(settings: Settings, seed: int = 0) -> Iterator[PackedBatch]
 
 def fresh_tiny_model(backend: SingleDeviceBackend, seed: int = 0) -> torch.nn.Module:
     torch.manual_seed(seed)
-    return backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE))
+    return backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False))
 
 
 def fresh_optimizer(settings: Settings, model: torch.nn.Module, backend: SingleDeviceBackend) -> torch.optim.Optimizer:
@@ -1710,3 +1711,27 @@ def test_gradient_metrics_have_independent_completed_step_cadence(
         assert ("packing/padding_fraction" in result.metrics) == (completed % log_interval == 0)
         assert torch.isfinite(result.loss) and torch.isfinite(result.grad_norm)
     assert calls == expected_calls
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_execution_failure_explains_explicit_native_option(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from model.kernels.runtime import CustomKernelError
+    settings = reference_settings(use_custom_kernels=enabled, tokens_per_micro_batch=16, training_max_sequence_length=16)
+    model = fresh_tiny_model(cpu_backend)
+    failure = RuntimeError('injected launch failure')
+    calls = []
+    def fail(**kwargs: object) -> None:
+        calls.append(1)
+        raise failure
+    monkeypatch.setattr(model, 'forward', fail)
+    with pytest.raises(RuntimeError) as info:
+        run_steps(settings, cpu_backend, model, fresh_optimizer(settings, model, cpu_backend), steps=1)
+    assert calls == [1]
+    if enabled:
+        assert isinstance(info.value, CustomKernelError)
+        assert 'use_custom_kernels: false' in str(info.value)
+        assert info.value.__cause__ is failure
+    else:
+        assert info.value is failure

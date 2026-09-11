@@ -110,6 +110,7 @@ class Settings:
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
+    use_custom_kernels: bool = True  # strict CUDA MLP, LM-head loss and RoPE kernels; false selects native operations
     training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and validation rows are sized by it; at most the dataset's and the model's length
 
     # Backend
@@ -166,6 +167,8 @@ class Settings:
     benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
     def __post_init__(self) -> None:
+        if not isinstance(self.use_custom_kernels, bool):
+            raise ValueError("use_custom_kernels must be a boolean")
         if isinstance(self.log_gradient_metrics_interval, bool) or not isinstance(self.log_gradient_metrics_interval, int):
             raise ValueError("log_gradient_metrics_interval must be an integer >= 0")
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name

@@ -26,6 +26,7 @@ from ..generation import GenerationState
 
 # The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
+    "use_custom_kernels",
     "model_max_sequence_length",
     "n_embd",
     "intermediate_size",

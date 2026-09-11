@@ -84,6 +84,7 @@ class RecurrentConfig:
     attn_impl: Literal["sdpa"] = "sdpa"
     norm_eps: float = 1e-6
     qk_bias: bool = True
+    use_custom_kernels: bool = True
     # The dtype of the residual stream under autocast: "none" keeps it fp32 (the RMSNorm outputs promote to the fp32
     # weight), "core" rounds the core blocks' RMSNorm outputs to the autocast dtype so the stream inside the recurrence
     # is bf16 (prelude, coda, the residual across blocks and the block input stay fp32), "all" rounds every RMSNorm.
@@ -106,6 +107,8 @@ class RecurrentConfig:
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
+        if not isinstance(self.use_custom_kernels, bool):
+            raise ValueError("use_custom_kernels must be a boolean")
         # Nested settings arrive as plain dicts from YAML / JSON.
         if isinstance(self.rope_settings, dict):
             self.rope_settings = RoPESettings(**self.rope_settings)

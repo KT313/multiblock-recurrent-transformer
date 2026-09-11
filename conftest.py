@@ -159,4 +159,4 @@ def tiny_model() -> RecurrentGPT:
     from model import build_model
 
     torch.manual_seed(0)
-    return build_model(TINY_MODEL_ARCHITECTURE)
+    return build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)

@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask, flex_attention
 
 from ..generation import KVCache
+from ..kernels.runtime import load_rope
 from .init import Linear
 
 if TYPE_CHECKING:
@@ -181,12 +182,14 @@ class CausalSelfAttention(torch.nn.Module):
             # One bias vector per head for q and one for k (index 0 / 1 of the first axis), added before RoPE.
             self.qk_bias = torch.nn.Parameter(torch.zeros(2, 1, self.n_head, self.head_dim))
         self.proj = Linear(config.n_embd, config.n_embd, bias=False, init_method=config.init.fn("out_attn"))
+        self._custom_rope = load_rope() if config.use_custom_kernels else None
 
     def forward(
         self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None, cache: KVCache | None = None,
     ) -> Tensor:
         B, S, E = x.shape
-        q, k, v = qkv_bias_rope(
+        rotate = self._custom_rope if self._custom_rope is not None else qkv_bias_rope
+        q, k, v = rotate(
             self.qk_bias if self.use_qk_bias else None, self.Wqkv(x), freqs_cis, self.n_head,
         )
 

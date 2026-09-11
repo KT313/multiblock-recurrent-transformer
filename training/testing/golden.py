@@ -43,12 +43,13 @@ GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
 
 def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
     """
-    `config/tiny.yaml` with `dataset_dir` / `out_dir` rewritten and `overrides` set as plain values (a key the
+    `config/tiny.yaml` with native execution for portable tests, `dataset_dir` / `out_dir` rewritten, and `overrides`
+    set as plain values (a key the
     file does not have is added at the end); returns the path of the written yaml (`tmp_path / tiny.yaml`).
     """
 
     settings: dict[str, Any] = yaml.safe_load(TINY_YAML.read_text())
-    settings.update({"out_dir": str(out_dir), "dataset_dir": str(tiny_dataset_dir), **overrides})
+    settings.update({"out_dir": str(out_dir), "dataset_dir": str(tiny_dataset_dir), "use_custom_kernels": False, **overrides})
     path = tmp_path / "tiny.yaml"
     path.write_text(yaml.safe_dump(settings, sort_keys=False))
     return path
@@ -127,7 +128,7 @@ def run_reference(tmp_path: Path, tiny_dataset_dir: Path) -> ReferenceRun:
     The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms): the golden configuration.
 
     `config/tiny.yaml` (packs of 512 tokens, two per step) with `precision: "32"`, `wandb_enabled: false`,
-    `export_to_hf: false`, `resume: false` and `out_dir` under `tmp_path`, through
+    `use_custom_kernels: false`, `export_to_hf: false`, `resume: false` and `out_dir` under `tmp_path`, through
     `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. The yaml is
     written to `tmp_path`. Nothing is probed inside the run.
     """

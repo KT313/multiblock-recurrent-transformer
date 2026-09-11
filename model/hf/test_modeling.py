@@ -498,7 +498,7 @@ def test_prepare_inputs_for_generation_forwards_the_mask_and_the_row_positions()
 
 def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir: Path) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_dir=tiny_tokenizer_dir)
     assert out_dir == tmp_path / "a" / "b"
     tok = AutoTokenizer.from_pretrained(out_dir)
@@ -508,7 +508,7 @@ def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir
 
 def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     names = {p.name for p in out_dir.iterdir()}
     assert {"config.json", "model.safetensors", "hf_modeling.py", "model.py", "config.py", "layers_norms.py"} <= names
@@ -538,7 +538,7 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
 
 def test_generate_runs(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     loaded = load_exported(out_dir)
     prompt = ids(1, 8)
@@ -558,7 +558,7 @@ def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> No
     """
 
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     out_dir = export_to_hf(model, model.config, tmp_path / "export")
     model.eval()
     x = ids()

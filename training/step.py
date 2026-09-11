@@ -29,6 +29,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from model.layers.attention import document_attention_mask
+from model.kernels.runtime import CustomKernelError, DISABLE_HINT
 from training.backend.base import Backend
 from training.data.collate import Sample
 from training.data.loader import RunDataloaders
@@ -443,9 +444,20 @@ def run_one_optimizer_step(
         # Same local index on every rank; rank-specific latent RNG remains independent of the depth schedule.
         plain.micro_batch_index = micro_batch_index
         with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
-            with backend.autocast():
-                outputs = model(**inputs)
-            backend.backward(outputs["loss"] / accumulation_steps)
+            try:
+                with backend.autocast():
+                    outputs = model(**inputs)
+                backend.backward(outputs["loss"] / accumulation_steps)
+            except CustomKernelError:
+                raise
+            except Exception as error:
+                # Compiled kernel launches can fail outside their original Python call site. Keep the original
+                # cause and explain the explicit native option; never retry a partially executed microbatch.
+                if settings.use_custom_kernels:
+                    raise CustomKernelError(
+                        f"Training forward/backward failed with custom kernels enabled: {error}. {DISABLE_HINT}"
+                    ) from error
+                raise
         loss_sum += outputs["loss"].detach()
         if on_micro_batch is not None:
             on_micro_batch(micro_batch_index + 1, accumulation_steps)

@@ -20,10 +20,10 @@ CROW_ARCHITECTURE = ARCHITECTURE_DIR / "crow_300m_final.yaml"
 
 def tiny_config(**overrides: Any) -> RecurrentConfig:
     """
-    `config/model_architecture/tiny.yaml` with overrides applied (the test-suite model).
+    `config/model_architecture/tiny.yaml` with native CPU execution by default; kernel tests opt in explicitly.
     """
 
-    return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **overrides)
+    return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | overrides))
 
 
 tiny = tiny_config

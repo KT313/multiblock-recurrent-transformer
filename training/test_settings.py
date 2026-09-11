@@ -596,3 +596,9 @@ def test_gradient_metrics_interval_yaml_validation(tmp_path: Path) -> None:
 def test_sample_cache_default_and_legacy_override() -> None:
     assert _settings().sample_use_cache
     assert not _settings(sample_use_cache=False).sample_use_cache
+
+
+@pytest.mark.parametrize('path', SHIPPED_RUN_CONFIGS)
+def test_custom_kernels_default_and_cli_override(path: Path) -> None:
+    assert parse_settings(['--config', str(path)]).use_custom_kernels is True
+    assert parse_settings(['--config', str(path), '--use_custom_kernels', 'false']).use_custom_kernels is False

@@ -34,6 +34,7 @@ from .config import RecurrentConfig
 from .generation import GenerationState
 from .layers.attention import AttentionMask, precompute_freqs_cis
 from .layers.init import Linear
+from .kernels.runtime import load_head
 
 # The chunked loss (validation) splits the tokens into this many pieces: a fixed count, so the loop is static under
 # `torch.compile(dynamic=True)` while the chunk lengths stay dynamic (see `RecurrentGPT.chunked_loss`).
@@ -42,6 +43,18 @@ LOSS_CHUNKS = 8
 # A chunk of the loss is recomputed in the backward instead of saving its logits (no RNG inside); a no-op without
 # gradients, which is how validation calls it.
 _checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False, determinism_check="none")
+
+
+def linear_cross_entropy(
+    x: Tensor, head: torch.nn.Module, labels: Tensor, logit_scale: float, ignore_index: int
+) -> Tensor:
+    """Native head and mean loss for already masked/shifted labels, without requiring returned logits."""
+    logits = head(x).float()
+    if logit_scale != 1:
+        logits = logits * logit_scale
+    return torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ignore_index
+    )
 
 
 def prepare_attention_inputs(
@@ -126,6 +139,7 @@ class RecurrentGPT(torch.nn.Module):
         super().__init__()
         self.config = config
         self.ignore_index = ignore_index
+        self._custom_head = load_head() if config.use_custom_kernels else None
         # activation checkpointing of the backprop iterations: none | selective | full (model/blocks/recurrence.py)
         self.gradient_checkpointing: CheckpointMode = check_checkpoint_mode(gradient_checkpointing)
 
@@ -312,6 +326,8 @@ class RecurrentGPT(torch.nn.Module):
         token_losses: Tensor | None = None
         if return_token_losses_chunked_nograd and labels is not None and not return_logits:
             loss, token_losses = self.chunked_loss(x, labels)
+        elif labels is not None and not return_logits and not return_token_losses_chunked_nograd:
+            loss = self.training_loss(x, labels)
         else:
             logits = self.full_logits(x[:, -logits_to_keep:] if logits_to_keep else x)  # fp32
             if labels is not None:
@@ -388,6 +404,13 @@ class RecurrentGPT(torch.nn.Module):
         except Exception:
             state.invalidate()
             raise
+
+    def training_loss(self, x: Tensor, labels: Tensor) -> Tensor:
+        """Shared head/loss operation for native loss-only callers; uses the original tied head module."""
+        operation = self._custom_head if self._custom_head is not None else linear_cross_entropy
+        return operation(
+            x, self.lm_head, self.mask_labels(labels), self.config.init.logit_scale, self.ignore_index
+        )
 
     def full_logits(self, x: Tensor) -> Tensor:
         """

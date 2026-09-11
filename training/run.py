@@ -281,7 +281,9 @@ def check_evaluation_recurrences(settings: Settings) -> None:
     architecture config (with `model_overwrite` applied).
     """
 
-    model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
+    model_config = RecurrentConfig.from_yaml(
+        settings.model_architecture_config, **(settings.model_overwrite | {"use_custom_kernels": settings.use_custom_kernels})
+    )
     blocks = len(cast(list[int], model_config.n_layers_in_recurrent_block))  # a list after __post_init__
     for name in ("sample_recurrences", "benchmark_recurrences"):
         for index, setting in enumerate(getattr(settings, name)):
@@ -359,7 +361,9 @@ def build_run_model(settings: Settings, dataset: ResolvedDataset, backend: Backe
     draws may run before it.
     """
 
-    model_config = RecurrentConfig.from_yaml(settings.model_architecture_config, **settings.model_overwrite)
+    model_config = RecurrentConfig.from_yaml(
+        settings.model_architecture_config, **(settings.model_overwrite | {"use_custom_kernels": settings.use_custom_kernels})
+    )
     check_sequence_lengths(settings, dataset.config, model_config)
     # the truncated-orthogonal init runs on the CPU, single-threaded per tensor: about 20 s for 300M parameters
     log.info(

@@ -85,6 +85,13 @@ Training packs documents end to end: one row of `tokens_per_micro_batch` tokens 
 `micro_batches_per_step` of them per optimizer step, attention masked per document.
 Validation runs on padded rows, `validation_batch_size` per forward.
 
+`use_custom_kernels: true` (default) enables the CUDA MLP, LM-head loss and RoPE/QKV kernels from
+[`model/kernels/`](model/kernels/README.md) with strict loading and input checks. Set it to `false` for native operations;
+it is independent of `compile_model` and `gradient_checkpointing`. Missing dependencies, CPU/unsupported inputs,
+and kernel failures raise an explanatory error with that setting; there is no automatic native retry.
+The setting is saved in model/Hugging Face configs. On resume, changing it follows the existing
+`allow_settings_change` policy; older checkpoints without the flag represent native execution.
+
 Basic metrics follow `log_step_interval`; expensive per-parameter gradient/update statistics follow
 `log_gradient_metrics_interval` independently. Both count completed optimizer steps. The gradient interval must be
 an integer >= 0: `0` disables those statistics; a positive value must be a multiple of `log_step_interval`.

@@ -47,7 +47,7 @@ def per_block(values: int | list[int]) -> list[int]:
 
 def seeded_tiny(seed: int = 0, **kwargs: Any) -> RecurrentGPT:
     torch.manual_seed(seed)
-    return build_model(TINY_ARCHITECTURE, **kwargs)
+    return build_model(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | kwargs))
 
 
 # --- structure -------------------------------------------------------------------------------------------------------
@@ -688,6 +688,31 @@ def test_out_of_range_labels_are_masked_too() -> None:
 
 
 # --- packed sequences ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('autocast', [False, True])
+def test_loss_only_hook_preserves_logits_path_and_tied_gradients(autocast: bool) -> None:
+    model = seeded_tiny(vocab_size=500)
+    tokens = ids(batch=1, seq=8) % 500
+    labels = tokens.clone()
+    labels[0, 0] = 505
+    labels[0, 1] = -100
+    results: list[tuple[Tensor, dict[str, Tensor]]] = []
+    for return_logits in (True, False):
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(99)
+        with torch.autocast('cpu', dtype=torch.bfloat16, enabled=autocast):
+            output = model(tokens, labels=labels, num_steps=(1, 1), return_logits=return_logits)
+        loss = output['loss']
+        assert loss is not None
+        loss.backward()
+        assert (output['logits'] is not None) == return_logits
+        results.append((loss.detach(), {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}))
+    torch.testing.assert_close(results[0][0], results[1][0], atol=0, rtol=0)
+    assert results[0][1].keys() == results[1][1].keys()
+    for name, grad in results[0][1].items():
+        torch.testing.assert_close(grad, results[1][1][name], atol=0, rtol=0)
+    assert model.lm_head.weight is model.transformer.wte.weight
 
 
 def _packed_inputs(documents: list[Tensor], pack_length: int) -> tuple[Tensor, Tensor, Tensor]:

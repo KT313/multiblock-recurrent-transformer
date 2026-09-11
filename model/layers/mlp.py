@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from .init import Linear
+from ..kernels.runtime import load_mlp
 
 if TYPE_CHECKING:
     from ..config import RecurrentConfig
@@ -29,11 +30,19 @@ class GatedMLP(torch.nn.Module):
         self.fc = Linear(config.n_embd, intermediate_size * 2, bias=False, init_method=config.init.fn("glu"))
         self.proj = Linear(intermediate_size, config.n_embd, bias=False, init_method=config.init.fn("out_proj"))
         self.nonlin = torch.nn.SiLU()
+        self._custom_mlp = load_mlp() if config.use_custom_kernels else None
 
     def forward(self, x: Tensor) -> Tensor:
-        hidden = swiglu(self.fc(x), self.nonlin)
-        out: Tensor = self.proj(hidden)
-        return out
+        if self._custom_mlp is not None:
+            return self._custom_mlp(x, self.fc, self.proj, self.nonlin)
+        return mlp_projection(x, self.fc, self.proj, self.nonlin)
+
+
+def mlp_projection(x: Tensor, fc: torch.nn.Module, proj: torch.nn.Module, nonlin: torch.nn.Module) -> Tensor:
+    """The complete gated MLP through the original projection modules; shared experimental integration point."""
+    hidden = swiglu(fc(x), nonlin)
+    out: Tensor = proj(hidden)
+    return out
 
 
 def swiglu(hidden: Tensor, nonlin: torch.nn.Module) -> Tensor:

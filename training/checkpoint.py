@@ -209,11 +209,15 @@ def check_settings_unchanged(
     """
 
     current = asdict(settings)
+    # Checkpoints predating kernel integration always used native operations. Treat an absent flag as false,
+    # while keeping changes subject to the same resume policy as precision and compilation.
+    stored_settings = {"use_custom_kernels": False} | metadata.settings
+    stored_model_config = {"use_custom_kernels": False} | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
-        key: f"checkpoint {metadata.settings[key]!r} != current {current[key]!r}"
+        key: f"checkpoint {stored_settings[key]!r} != current {current[key]!r}"
         for key in compared
-        if key in metadata.settings and metadata.settings[key] != current[key]
+        if key in stored_settings and stored_settings[key] != current[key]
     }
     if PARAM_GROUPING_SETTING in details:
         raise ValueError(
@@ -224,13 +228,13 @@ def check_settings_unchanged(
     details |= {
         key: "not stored in the checkpoint (written by an older version of the training code)"
         for key in compared
-        if key not in metadata.settings
+        if key not in stored_settings
     }
-    if model_config != metadata.model_config:
+    if model_config != stored_model_config:
         differing = sorted(
             key
-            for key in model_config.keys() | metadata.model_config.keys()
-            if model_config.get(key) != metadata.model_config.get(key)
+            for key in model_config.keys() | stored_model_config.keys()
+            if model_config.get(key) != stored_model_config.get(key)
         )
         details["model_config"] = f"differs from the stored model config in {differing}"
     if details and not allow_settings_change:

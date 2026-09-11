@@ -214,18 +214,21 @@ def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir:
         check_tokenizer_vocabulary(tokenizer, into_the_padding)
 
 
-def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:
+@pytest.mark.parametrize("custom_kernels", [False, True])
+def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend, custom_kernels: bool) -> None:
     """
     The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
     settings, `model_config.json` next to the checkpoints, the model on the backend's device.
     """
 
     tiny_settings.model_overwrite = {"n_embd": 32}
+    tiny_settings.use_custom_kernels = custom_kernels
     run_directory = prepare_run_directory(tiny_settings)
     model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
     assert isinstance(model, RecurrentGPT)
     assert model.config.n_embd == 32 and model.config.model_max_sequence_length == 256
     assert model.ignore_index == IGNORE_INDEX
+    assert model.config.use_custom_kernels is custom_kernels
     assert model.gradient_checkpointing == tiny_settings.gradient_checkpointing
     assert all(p.device == cpu_backend.device for p in model.parameters())
     written = json.loads((run_directory / "model_config.json").read_text())
