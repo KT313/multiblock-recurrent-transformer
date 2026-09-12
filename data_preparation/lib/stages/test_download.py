@@ -1563,3 +1563,34 @@ def test_legacy_sharegpt_identity_refuses_append_and_repair_without_confirmation
     with pytest.raises(ConfirmationRequired, match="row_semantics"):
         repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
     assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == manifest
+
+
+def test_tokenizer_parent_symlink_is_rejected_before_publication(
+    cfg_factory: CfgFactory, layout: DatasetLayout, tmp_path: Path,
+) -> None:
+    cfg = cfg_factory({"p": _synthetic()})
+    outside = tmp_path / "outside-tokenizers"
+    published = outside / cfg.tokenizer.name
+    published.mkdir(parents=True)
+    sentinel = published / "keep.txt"
+    sentinel.write_bytes(b"original tokenizer")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    (layout.root / "tokenizers").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="unexpected child symlink"):
+        prepare_tokenizer(cfg, layout)
+    assert sentinel.read_bytes() == b"original tokenizer"
+    assert sorted(item.name for item in outside.iterdir()) == [cfg.tokenizer.name]
+
+
+def test_tokenizer_staging_leaves_unowned_sibling_untouched(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+    cfg = cfg_factory({"p": _synthetic()})
+    published = layout.tokenizer_dir(cfg.tokenizer.name)
+    sibling = published.with_name(published.name + ".tmp")
+    sibling.mkdir(parents=True)
+    sentinel = sibling / "unrelated-data"
+    sentinel.write_bytes(b"do not remove")
+    prepare_tokenizer(cfg, layout)
+    cfg.tokenizer.revision = "replacement"
+    prepare_tokenizer(cfg, layout)
+    assert sentinel.read_bytes() == b"do not remove"
+    assert not list(published.parent.glob(".tokenizer-*"))

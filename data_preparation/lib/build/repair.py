@@ -189,6 +189,22 @@ def repair_broken_and_stale_folders(
     Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
     """
 
+    planned = inspect_repairs(config, layout, sources=sources, config_name=config_name)
+    if not dry_run:
+        authorize_repairs(planned, assume_yes=assume_yes, confirm=confirm, allow_foreign_raw=allow_foreign_raw)
+        perform_repairs(planned)
+    return planned
+
+
+def inspect_repairs(
+    config: DatasetConfig,
+    layout: DatasetLayout,
+    *,
+    sources: Iterable[str] | None = None,
+    config_name: str | None = None,
+) -> RepairReport:
+    """Read-only assessment. Callers must hold the dataset lock through authorization and execution."""
+
     config.validate_identifiers()
     planned = RepairReport()
     for name in config.sources if sources is None else sources:
@@ -203,8 +219,21 @@ def repair_broken_and_stale_folders(
         ))
         for action in planned.actions
     ]
-    if dry_run:
-        return planned
+    return planned
+
+
+def authorize_repairs(
+    planned: RepairReport,
+    *,
+    assume_yes: bool,
+    confirm: Confirm | None = None,
+    allow_foreign_raw: bool = False,
+) -> None:
+    """Apply the foreign-data guard and single confirmation without executing any repair.
+
+    A report carries no authorization: every preparation attempt must call this even when reusing a report.
+    """
+
     foreign = planned.foreign_deletions_planned()
     if foreign and not allow_foreign_raw:
         lines = [FOREIGN_HEADER, *(f"  {action.source}: {action.reason}" for action in foreign)]
@@ -212,8 +241,6 @@ def repair_broken_and_stale_folders(
     queued = planned.confirmations_planned()
     if queued:
         confirm_repairs(queued, planned, assume_yes=assume_yes, confirm=confirm)
-    perform_repairs(planned)
-    return planned
 
 
 # --- inspection (read-only) ----------------------------------------------------------------------------------------------

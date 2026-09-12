@@ -902,3 +902,30 @@ def test_check_dataset_unchanged_reports_every_difference_at_once() -> None:
     assert "hash abc, the current dataset config hashes to xyz; the rows per source differ" in message
     assert "'a': checkpoint 40, now 30); the validation split differs" in message
     assert "'a': checkpoint 4, now 3" in message
+
+
+
+def test_auto_prepare_tokenizer_change_refusal_preserves_published_data(
+    tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "data"
+    shutil.copytree(tiny_dataset_dir, root)
+    config = load_dataset_config(TINY_DATASET_YAML)
+    config.tokenizer.revision = "replacement"
+    path = _config_file(tmp_path, config)
+
+    def snapshot() -> dict[Path, bytes]:
+        return {
+            p.relative_to(root): p.read_bytes()
+            for directory in ("tokenizers", "sources", "processed")
+            for p in (root / directory).rglob("*") if p.is_file()
+        }
+
+    before = snapshot()
+    monkeypatch.setattr(
+        "data_preparation.lib.stages.download.write_synthetic_tokenizer", lambda _: pytest.fail("must not acquire"),
+    )
+    with pytest.raises(RuntimeError, match="auto-prepare never confirms a repair") as error:
+        resolve_dataset(_settings(path, root))
+    assert build_command(str(path), str(root)) + " --yes" in str(error.value)
+    assert snapshot() == before

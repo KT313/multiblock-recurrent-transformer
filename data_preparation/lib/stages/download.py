@@ -51,6 +51,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Literal, NamedTuple
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
@@ -73,7 +74,8 @@ from data_preparation.lib.sources.loaders import (
     read_github_code_group,
 )
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
-from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.storage.atomic import _fsync_directory
+from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS, estimate_tokens, truncate_many
@@ -357,8 +359,8 @@ def _tokenizer_label(name: str, kind: str | None, hf_id: str | None, revision: s
 def _stored_tokenizer_label(name: str | None, tokenizer_hash: str | None, layout: DatasetLayout) -> str:
     """
     The tokenizer a raw folder was counted with, as the manifest under tokenizers/<name> describes it, when that
-    manifest still is the one the rows were counted with: a same-named definition overwrites the folder in the
-    tokenizer step, which runs before the raw folders are inspected, so the hash decides.
+    manifest still is the one the rows were counted with. Preparation inspects before replacing a same-named
+    definition, but another configuration may already have replaced it, so the hash decides.
     """
 
     if name is None:
@@ -407,30 +409,67 @@ def reopen_raw(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
 # --- tokenizer ---------------------------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class TokenizerPlan:
+    """Read-only publication decision; valid while the caller holds the dataset lock."""
+
+    directory: Path
+    current: Manifest | None
+
+    @property
+    def needs_publication(self) -> bool:
+        return self.current is None
+
+
+def inspect_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> TokenizerPlan:
+    """Decide whether the tokenizer stage needs work without acquiring or changing any files."""
+
+    directory = layout.tokenizer_dir(config.tokenizer.name)
+    guarded_path(layout.root, directory)
+    manifest = current_manifest(directory, config.tokenizer_hash(), "tokenizer")
+    if not (directory / "tokenizer_config.json").is_file():
+        manifest = None
+    return TokenizerPlan(directory, manifest)
+
+
 def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout, *, hf_token: str | None = None) -> Manifest:
-    """
-    Save the config's tokenizer to layout.tokenizer_dir(name) (Hub download, with hf_token for a gated
-    repo, or the synthetic WordLevel one). The files are written to a sibling directory and swapped into place, so
-    a stale tokenizer's files never linger next to the new ones.
+    """Prepare and publish a tokenizer. Dataset orchestration authorizes repairs before calling this stage."""
+
+    return prepare_planned_tokenizer(config, inspect_tokenizer(config, layout), hf_token=hf_token)
+
+
+def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_token: str | None = None) -> Manifest:
+    """Acquire and validate privately, then publish the payload and its manifest together.
+
+    Acquisition, validation and manifest-writing failures preserve the published tokenizer. Only this attempt's
+    unique staging directory is cleaned. Publication replaces a nonempty directory by removing it first: failures
+    or crashes once removal begins are not rolled back. The orchestrator executes raw/processed repairs only after
+    publication succeeds; subsequent failures are likewise not a multi-directory rollback transaction.
     """
 
+    if plan.current is not None:
+        return plan.current
     tokenizer = config.tokenizer
-    tokenizer_dir = layout.tokenizer_dir(tokenizer.name)
-    source_hash = config.tokenizer_hash()
-    manifest = current_manifest(tokenizer_dir, source_hash, "tokenizer")
-    if manifest is not None and (tokenizer_dir / "tokenizer_config.json").is_file():
-        return manifest
-
+    tokenizer_dir = plan.directory
+    guarded_path(tokenizer_dir.parent.parent, tokenizer_dir)
     log.info("preparing tokenizer %s (%s) -> %s", tokenizer.name, tokenizer.kind, tokenizer_dir)
-    with write_atomically(tokenizer_dir) as temporary:
+    tokenizer_dir.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".tokenizer-", dir=tokenizer_dir.parent) as staging:
+        temporary = Path(staging) / "payload"
         if tokenizer.kind == "synthetic":
             write_synthetic_tokenizer(temporary)
         else:
             _auto_tokenizer().from_pretrained(tokenizer.hf_id, revision=tokenizer.revision, token=hf_token).save_pretrained(str(temporary))
-        shutil.rmtree(tokenizer_dir, ignore_errors=True)  # a non-empty directory cannot be replaced
-    manifest = new_manifest(config, tokenizer.name, source_hash, "tokenizer")
-    manifest.extra = {"kind": tokenizer.kind, "hf_id": tokenizer.hf_id, "revision": tokenizer.revision}
-    manifest.save(tokenizer_dir)
+        if not (temporary / "tokenizer_config.json").is_file():
+            raise ValueError(f"tokenizer {tokenizer.name!r}: prepared replacement has no tokenizer_config.json")
+        _load_tokenizer(temporary, tokenizer.name)  # verify it is usable before removing published data
+        manifest = new_manifest(config, tokenizer.name, config.tokenizer_hash(), "tokenizer")
+        manifest.extra = {"kind": tokenizer.kind, "hf_id": tokenizer.hf_id, "revision": tokenizer.revision}
+        manifest.save(temporary)
+        if tokenizer_dir.exists():
+            shutil.rmtree(tokenizer_dir)  # a non-empty directory cannot be replaced; failures must propagate
+        os.replace(temporary, tokenizer_dir)
+        _fsync_directory(tokenizer_dir.parent)
     return manifest
 
 

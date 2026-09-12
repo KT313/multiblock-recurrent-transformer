@@ -32,7 +32,9 @@ from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import RunLocked, build_lock
 from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
-from data_preparation.lib.build.repair import ConfirmationRequired
+from data_preparation.lib.build.repair import ConfirmationRequired, RepairReport, inspect_repairs, perform_repairs
+from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
+from data_preparation.lib.stages import download as download_stage
 from data_preparation.lib.stages.build import build_source as real_build
 from data_preparation.lib.stages.download import MalformedSourceError, download as real_download
 from data_preparation.lib.stages.download import download_github_code_group as real_group
@@ -1122,3 +1124,137 @@ def test_github_code_group_job_includes_satisfied_members_and_the_build_is_cappe
     assert grown is not None and grown.rows() > python_ledger.raw_rows  # Python stored the rows read for Java past its own target
     python_state = next(source for source in report.sources if source.name == "code_python")
     assert python_state.satisfaction()[0] and not python_state.build_pending and python_state.unbuilt_shards >= 1
+
+
+# --- tokenizer publication authorization -------------------------------------------------------------------------------
+
+
+def _published_bytes(root: Path) -> dict[Path, bytes]:
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file() and p.name != ".build.lock"}
+
+
+@pytest.mark.parametrize("refusal", ["decline", "noninteractive", "foreign"])
+def test_tokenizer_replacement_waits_for_repair_authorization(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, refusal: str,
+) -> None:
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=True)
+    if refusal == "foreign":
+        raw = Manifest.load(layout.raw_dir("p"))
+        assert raw is not None
+        raw.dataset_config = "other.yaml"
+        raw.save(layout.raw_dir("p"))
+        cfg.sources["p"].seed += 1
+    cfg.tokenizer.revision = "replacement"
+    path = config_file(cfg)
+    before = _published_bytes(layout.root)
+    plan = inspect_repairs(cfg, layout, config_name=path.name)
+    assert plan.confirmations_planned() and not plan.performed
+    assert _published_bytes(layout.root) == before
+    acquired: list[Path] = []
+    monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", lambda folder: acquired.append(folder))
+    monkeypatch.setattr("data_preparation.lib.build.repair.sys.stdin.isatty", lambda: False)
+    with pytest.raises(ConfirmationRequired, match="nothing was changed"):
+        prepare(path, layout.root, assume_yes=refusal == "foreign", confirm=(lambda _: False) if refusal == "decline" else None)
+    assert not acquired
+    assert _published_bytes(layout.root) == before
+    assert not list(layout.tokenizer_dir(cfg.tokenizer.name).parent.glob(".tokenizer-*"))
+
+
+@pytest.mark.parametrize("failure", ["acquire", "validate", "manifest"])
+def test_tokenizer_staging_failure_preserves_all_published_data(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=True)
+    cfg.tokenizer.revision = "replacement"
+    path = config_file(cfg)
+    before = _published_bytes(layout.root)
+    asked: list[str] = []
+    real_write = write_synthetic_tokenizer
+    real_save = Manifest.save
+
+    def acquire(folder: Path) -> None:
+        assert len(asked) == 1 and _published_bytes(layout.root) == before
+        real_write(folder)
+        if failure == "acquire":
+            raise RuntimeError("acquisition failed")
+        if failure == "validate":
+            (folder / "tokenizer.json").unlink()
+
+    def save(manifest: Manifest, folder: Path) -> None:
+        if manifest.stage == "tokenizer":
+            raise RuntimeError("manifest failed")
+        real_save(manifest, folder)
+
+    monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", acquire)
+    if failure == "manifest":
+        monkeypatch.setattr(Manifest, "save", save)
+    def approve(message: str) -> bool:
+        asked.append(message)
+        return True
+
+    with pytest.raises((RuntimeError, ValueError), match="acquisition failed|no tokenizer.json|manifest failed"):
+        prepare(path, layout.root, assume_yes=False, confirm=approve)
+    assert len(asked) == 1 and _published_bytes(layout.root) == before
+    assert not list(layout.tokenizer_dir(cfg.tokenizer.name).parent.glob(".tokenizer-*"))
+
+
+def test_approved_tokenizer_is_published_before_repairs_and_only_once(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=True)
+    old_raw = {p.name: p.read_bytes() for p in layout.raw_dir("p").glob("*.parquet")}
+    cfg.tokenizer.revision = "replacement"
+    path = config_file(cfg)
+    before = _published_bytes(layout.root)
+    events: list[str] = []
+    real_write = write_synthetic_tokenizer
+    real_perform = perform_repairs
+
+    def confirm(message: str) -> bool:
+        assert _published_bytes(layout.root) == before and "tokenizer changed" in message
+        events.append("authorize")
+        return True
+
+    def acquire(folder: Path) -> None:
+        assert events == ["authorize"]
+        events.append("acquire")
+        real_write(folder)
+
+    def perform(report: RepairReport) -> None:
+        manifest = Manifest.load(layout.tokenizer_dir(cfg.tokenizer.name))
+        assert manifest is not None and manifest.source_hash == cfg.tokenizer_hash()
+        if report.actions:
+            events.append("repair")
+        real_perform(report)
+
+    monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", acquire)
+    monkeypatch.setattr(runner, "perform_repairs", perform)
+    assert prepare(path, layout.root, assume_yes=False, confirm=confirm).complete
+    assert events == ["authorize", "acquire", "repair"]
+    raw = Manifest.load(layout.raw_dir("p"))
+    assert raw is not None and raw.tokenizer_hash == cfg.tokenizer_hash()
+    assert len(raw.extra["tokenizer_changes"]) == 1
+    assert {p.name: p.read_bytes() for p in layout.raw_dir("p").glob("*.parquet")} == old_raw
+    assert prepare(path, layout.root, assume_yes=False, confirm=confirm).complete
+    assert events == ["authorize", "acquire", "repair"]
+
+
+def test_changed_tokenizer_dry_run_and_status_never_acquire(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=True)
+    cfg.tokenizer.revision = "replacement"
+    path = config_file(cfg)
+    before = _published_bytes(layout.root)
+    monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", lambda _: pytest.fail("must not acquire"))
+    assert not prepare(path, layout.root, assume_yes=False, dry_run=True).complete
+    assert not status(path, layout.root).complete
+    assert _published_bytes(layout.root) == before

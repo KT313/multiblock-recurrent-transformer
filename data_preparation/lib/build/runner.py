@@ -2,11 +2,13 @@
 """
 prepare / status: the top-level data pipeline, readable top to bottom.
 
-prepare runs tokenizer, repair, (download + build) rounds, report, under the dataset directory's build lock::
+prepare runs inspection, authorization, tokenizer publication, repairs, and download/build rounds under the
+dataset directory's build lock::
 
-    prepare_tokenizer                                  tokenizers/<name>/ (downloads count tokens with it)
-    repair_broken_and_stale_folders                    truncate broken raw, delete stale processed, confirm before any raw
-                                                       folder is deleted (lib/build/repair.py)
+    inspect_repairs / inspect_tokenizer                read-only plan over the existing published content
+    authorize_repairs                                  foreign-data guard and single repair confirmation
+    prepare_planned_tokenizer                          privately acquire/validate, then publish tokenizers/<name>/
+    perform_repairs                                    truncate/adopt/delete raw, rebuild stale processed
     reopen_raw                                         clear the exhausted flag of the --reopen sources
     for round in 1..MAX_ROUNDS:
         plan_downloads                                 rows still missing per source (lib/build/planner.py: one
@@ -62,12 +64,16 @@ from data_preparation.lib.build.planner import (
     sources_with_pending_raw_shards,
     summarize_dataset_state,
 )
-from data_preparation.lib.build.repair import Confirm, RepairAction, RepairReport, repair_broken_and_stale_folders
+from data_preparation.lib.build.repair import (
+    Confirm, RepairAction, RepairReport, authorize_repairs, inspect_repairs, perform_repairs, repair_broken_and_stale_folders,
+)
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
 from data_preparation.lib.stages.build import build_source
-from data_preparation.lib.stages.download import download, download_github_code_group, prepare_tokenizer, reopen_raw
+from data_preparation.lib.stages.download import (
+    download, download_github_code_group, inspect_tokenizer, prepare_planned_tokenizer, reopen_raw,
+)
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
 log = get_logger(__name__)
@@ -132,7 +138,8 @@ def prepare(
 
     assume_yes answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
     cannot be parsed) without asking; otherwise confirm (or the terminal) is asked once and a refusal raises
-    :class:`ConfirmationRequired` before anything is changed. A raw folder another dataset config downloaded
+    :class:`ConfirmationRequired` before any dataset content changes (the lock holder metadata may be updated).
+    A raw folder another dataset config downloaded
     (raw folders are shared by name) is deleted only with allow_foreign_raw on top, whatever the answer;
     raw manifests written by this run carry the config's file name for that. dry_run reports what the repair and the first
     round would do and writes nothing (not even the lock file); its report is the one :func:`status` gives for the
@@ -152,12 +159,15 @@ def prepare(
     warn_about_overlaps(config)
 
     with build_lock(layout.root) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
-        if "tokenizer" in active_steps and not dry_run:
-            prepare_tokenizer(config, layout, hf_token=hf_token)
-        repair_report = repair_broken_and_stale_folders(
-            config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm, sources=selected,
-            config_name=config_name, allow_foreign_raw=allow_foreign_raw,
-        )
+        repair_report = inspect_repairs(config, layout, sources=selected, config_name=config_name)
+        tokenizer_plan = inspect_tokenizer(config, layout) if "tokenizer" in active_steps else None
+        if not dry_run:
+            authorize_repairs(repair_report, assume_yes=assume_yes, confirm=confirm, allow_foreign_raw=allow_foreign_raw)
+            # Validate and publish the intended tokenizer before changing raw/processed data. Staging failures
+            # preserve all published content; after publication starts there is no multi-directory rollback.
+            if tokenizer_plan is not None:
+                prepare_planned_tokenizer(config, tokenizer_plan, hf_token=hf_token)
+            perform_repairs(repair_report)
         log_repair(repair_report)
         reopen_sources(config, layout, reopened, dry_run=dry_run)
         for round_number in range(1, MAX_ROUNDS + 1):
