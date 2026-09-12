@@ -17,21 +17,57 @@ Slot: TypeAlias = tuple[str, int, int, int]
 
 
 class KVCache:
-    """One unrolled attention occurrence; K is already rotated, V is the original projected value."""
+    """One inference attention occurrence, with capacity grown in 256-token chunks.
+
+    K is already rotated, V is the original projected value. Public key/value tensors and returned tensors are
+    views of the populated prefix; unused capacity is never passed to attention. Treat these views as read-only.
+    """
+
+    _ALLOCATION_CHUNK = 256
 
     def __init__(self) -> None:
-        self.key: Tensor | None = None
-        self.value: Tensor | None = None
+        self._key_buffer: Tensor | None = None
+        self._value_buffer: Tensor | None = None
+        self._length = 0
 
-    def append(self, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
-        if self.key is None:
-            self.key, self.value = key.clone(), value.clone()
-        else:
-            assert self.value is not None
-            self.key = torch.cat((self.key, key), dim=1)
-            self.value = torch.cat((self.value, value), dim=1)
-        assert self.value is not None
-        return self.key, self.value
+    @property
+    def key(self) -> Tensor | None:
+        return None if self._key_buffer is None else self._key_buffer[:, :self._length]
+
+    @property
+    def value(self) -> Tensor | None:
+        return None if self._value_buffer is None else self._value_buffer[:, :self._length]
+
+    def append_and_get(self, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
+        """Append new (B, S, heads, head_dim) K/V and return the entire populated prefix without copying it."""
+        if key.ndim != 4 or value.ndim != 4 or key.shape[:2] != value.shape[:2]:
+            raise ValueError("cache K/V must be four-dimensional with matching batch and sequence lengths")
+        for incoming, stored in ((key, self._key_buffer), (value, self._value_buffer)):
+            if stored is not None and (
+                incoming.shape[:1] + incoming.shape[2:] != stored.shape[:1] + stored.shape[2:]
+                or incoming.dtype != stored.dtype or incoming.device != stored.device
+            ):
+                raise ValueError("cache K/V batch, head dimensions, dtype and device must remain unchanged")
+
+        used = self._length
+        needed = used + key.shape[1]
+        if self._key_buffer is None or needed > self._key_buffer.shape[1]:
+            capacity = ((needed + self._ALLOCATION_CHUNK - 1) // self._ALLOCATION_CHUNK) * self._ALLOCATION_CHUNK
+            key_buffer = key.new_empty((key.shape[0], capacity, *key.shape[2:]))
+            value_buffer = value.new_empty((value.shape[0], capacity, *value.shape[2:]))
+            if self._key_buffer is not None:
+                assert self._value_buffer is not None
+                key_buffer[:, :used].copy_(self._key_buffer[:, :used])
+                value_buffer[:, :used].copy_(self._value_buffer[:, :used])
+            self._key_buffer, self._value_buffer = key_buffer, value_buffer
+
+        assert self._value_buffer is not None
+        self._key_buffer[:, used:needed].copy_(key)
+        self._value_buffer[:, used:needed].copy_(value)
+        self._length = needed
+        populated_key, populated_value = self.key, self.value
+        assert populated_key is not None and populated_value is not None
+        return populated_key, populated_value
 
 
 class GenerationState:

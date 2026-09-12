@@ -194,7 +194,7 @@ class CausalSelfAttention(torch.nn.Module):
         )
 
         if cache is not None:
-            k, v = cache.append(k, v)
+            k, v = cache.append_and_get(k, v)
         y = attention(q, k, v, mask)
         y = y.reshape(B, S, E).contiguous()
         out: Tensor = self.proj(y)
