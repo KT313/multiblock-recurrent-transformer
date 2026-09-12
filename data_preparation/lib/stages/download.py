@@ -33,10 +33,11 @@ rows stays in the pass as a *passive* increment and stores every further row of 
 the others, and a language no source names gets a raw folder of its own (:func:`_extra_increment`; named by
 `loaders.github_code_extra_name`, so a later config entry of that name adopts it). Passive rows are truncated and
 counted like any other pretrain row and never bound the pass (`rows_to_keep` 0, never exhausted). A stop or a
-failure first stores everything the pass already consumed (the stop check is suspended, :class:`_StopGate`; the
-token worker drains its queue, the fetch thread's buffers are submitted, every writer publishes its buffered rows
-as a short final shard, :func:`_flush_partial_shards`), so every folder's offset is the frontier the pass reached:
-the file index only records row groups the pass consumed whole, and a passive folder resumes aligned from there.
+failure attempts to preserve everything the pass already consumed (the stop check is suspended,
+:class:`_StopGate`; pending batches are submitted, the input stream closed, the worker joined, then every writer
+attempts its buffered short final shard, :func:`_flush_partial_shards`). On an ordinary stop, every folder's
+offset is the frontier the pass reached: the file index only records row groups the pass consumed whole, and a
+passive folder resumes aligned from there. Storage errors propagate and offsets reflect only committed progress.
 """
 
 from __future__ import annotations
@@ -47,11 +48,13 @@ import os
 import queue
 import shutil
 import threading
+import traceback
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import TracebackType
 from typing import Any, Literal, NamedTuple
 
 from data_preparation.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
@@ -926,6 +929,45 @@ def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
             close()
 
 
+class _DownloadFailures:
+    """Keep exception identity and tracebacks; a substantive error takes precedence over cooperative stop."""
+
+    def __init__(self, gate: _StopGate) -> None:
+        self._gate = gate
+        self._errors: list[tuple[str, BaseException, TracebackType | None]] = []
+
+    @property
+    def primary(self) -> BaseException | None:
+        if not self._errors:
+            return None
+        return next((error for _, error, _ in self._errors if not isinstance(error, BuildAborted)), self._errors[0][1])
+
+    def record(self, phase: str, error: BaseException) -> None:
+        self._gate.suspend()
+        if not any(previous is error for _, previous, _ in self._errors):
+            self._errors.append((phase, error, error.__traceback__))
+
+    def attempt(self, phase: str, action: Callable[[], object]) -> None:
+        try:
+            action()
+        except BaseException as error:  # noqa: BLE001  # propagated after subsequent safe, sequential cleanup
+            self.record(phase, error)
+
+    def raise_if_failed(self) -> None:
+        primary = self.primary
+        if primary is None:
+            return
+        primary_tb = None
+        for phase, error, tb in self._errors:
+            if error is primary:
+                primary_tb = tb
+                primary.add_note(f"Download failure during {phase}")
+            else:
+                detail = "".join(traceback.format_exception(type(error), error, tb))
+                primary.add_note(f"Additional download failure during {phase}:\n{detail}")
+        raise primary.with_traceback(primary_tb)
+
+
 class _TokenWorker:
     """
     The tokenizing half of a download pass on its own thread: batches submitted by the fetch thread are tokenized
@@ -937,8 +979,9 @@ class _TokenWorker:
     or :meth:`close` (:attr:`failed` tells earlier). After a tokenizer or write error the worker only settles what
     is queued without storing it; after :class:`BuildAborted` (the stop check, raised by a shard publish) it
     stores on: the gate is suspended by then (:func:`_store`), and every row the pass consumed belongs on disk so
-    the folders' offsets stay the pass's frontier. close is what leaving the with block does: it joins the thread
-    whatever happened, so the shard writers are closed after the worker is done with them.
+    the folders' offsets stay the pass's frontier. A later substantive error takes precedence over that stop.
+    close is what leaving the with block does: it joins before reporting any stored failure. The fetch owner
+    verifies termination before writer cleanup; forced interruption cannot promise that cleanup is complete.
     """
 
     def __init__(self, name: str, writers: dict[str, ShardWriter], bar: Progress, gate: _StopGate) -> None:
@@ -949,12 +992,19 @@ class _TokenWorker:
         self._failure: BaseException | None = None
         self._storing = True  # False after an error other than the stop: the queued batches are settled unstored
         self._raised = False
+        self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"tokenize:{name}")
         self._thread.start()
 
     @property
     def failed(self) -> bool:
         return self._failure is not None
+
+    @property
+    def stopped(self) -> bool:
+        """The worker released writer ownership and its thread was joined (also after a stored failure)."""
+
+        return self._stopped.is_set() and not self._thread.is_alive()
 
     def submit(self, increment: _Increment, batch: list[StoredRow]) -> None:
         """
@@ -996,7 +1046,24 @@ class _TokenWorker:
             self._raised = True
             raise self._failure
 
+    def _remember_failure(self, error: BaseException) -> None:
+        previous = self._failure
+        if previous is None:
+            self._failure = error
+        elif isinstance(previous, BuildAborted) and not isinstance(error, BuildAborted):
+            error.add_note("Token worker previously stopped:\n" + "".join(traceback.format_exception(previous)))
+            self._failure = error
+            self._raised = False  # a stop already reported must not hide this later storage failure
+        elif error is not previous:
+            previous.add_note("Additional token worker failure:\n" + "".join(traceback.format_exception(error)))
+
     def _run(self) -> None:
+        try:
+            self._process()
+        finally:
+            self._stopped.set()  # no writer access after this point, even if join itself is interrupted
+
+    def _process(self) -> None:
         while True:
             item = self._queue.get()
             try:
@@ -1007,9 +1074,9 @@ class _TokenWorker:
                     try:
                         _store(increment, self._writers[increment.name], increment.token_step.tokenize(batch), self._bar, self._gate)
                     except BuildAborted as stop:  # the gate is suspended now: keep storing what is queued
-                        self._failure = self._failure or stop
+                        self._remember_failure(stop)
                     except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
-                        self._failure = self._failure or error
+                        self._remember_failure(error)
                         self._storing = False
                 increment.settled += len(batch)  # after the store: `kept` is up to date before the rows leave `in_flight`
             finally:
@@ -1035,10 +1102,11 @@ def _fetch(
     current repo file; the bytes fetched are the counter the bar was created with).
 
     increments may grow while the pass runs (a group pass discovers languages): a row of a name not seen before
-    finds its increment in the list and gets a shard writer then. On a stop or a failure everything consumed so far
-    is stored before the error propagates: the stop check is suspended (gate), the rows still buffered here are
-    submitted, the worker drains its queue, and every writer publishes its buffered rows as a short final shard
-    (:func:`_flush_partial_shards`).
+    finds its increment in the list and gets a shard writer then. Cleanup settles pending batches, closes rows,
+    joins the worker, salvages partial shards on failure, and finalizes writers, in that order. Every applicable
+    action is attempted once, sequentially, even if an earlier action failed. Storage failure may prevent salvage;
+    only persisted progress counts. The original substantive failure takes precedence over cooperative stop,
+    with secondary failures attached as traceback notes. Writers are never finalized while the worker is live.
     """
 
     increments_by_name: dict[str, _Increment] = {}
@@ -1054,11 +1122,12 @@ def _fetch(
             writers[name] = ShardWriter(increment.folder.directory, size, start_shard=increment.folder.shard_count, on_shard=increment.folder.record_shard).__enter__()
         return increment
 
-    for increment in increments:
-        increment_named(increment.name)
-    worker = _TokenWorker(",".join(writers), writers, bar, gate)
-    failure: BaseException | None = None
+    failures = _DownloadFailures(gate)
+    worker: _TokenWorker | None = None
     try:
+        for increment in increments:
+            increment_named(increment.name)
+        worker = _TokenWorker(",".join(writers), writers, bar, gate)
         for name, raw in rows:
             if worker.failed:
                 worker.drain()  # raises: stop pulling rows for a worker that stores nothing anymore
@@ -1084,50 +1153,57 @@ def _fetch(
                 worker.submit(increment, increment.token_step.take())
                 worker.drain()
             if all(increment.done for increment in increments):
-                break  # enough: stop pulling (the finally closes the stream)
+                break  # enough: stop pulling; the ordered cleanup below closes the stream
+    except BaseException as error:  # noqa: BLE001  # preserve the processing failure through cleanup
+        failures.record("processing", error)
+
+    # Every phase is sequential. A failed action cannot bypass later safe actions, and writers remain
+    # worker-owned until shutdown is confirmed. Never retry a taken batch or a failed publication.
+    if worker is not None:
+        active_worker = worker
+
+        def settle_pending(increment: _Increment) -> None:
+            active_worker.submit(increment, increment.token_step.take())
+
         for increment in increments:
-            worker.submit(increment, increment.token_step.take())
-    except BaseException as error:  # noqa: BLE001  # re-raised below, after the buffered rows were saved
-        failure = error
-        gate.suspend()
-        for increment in increments:  # the rows consumed but not handed over yet (submit raises nothing: the failure was raised)
-            worker.submit(increment, increment.token_step.take())
-    finally:
-        close = getattr(rows, "close", None)
-        if close is not None:
-            close()
-    try:
-        worker.close()  # joins the thread; raises the worker's own failure if none was raised yet
-    except BaseException as error:  # noqa: BLE001
-        failure = failure or error
-    if failure is None:
-        for writer in writers.values():
-            writer.__exit__(None, None, None)  # the last partial shards
-        for increment in increments:
-            if not increment.passive and increment.counters.kept < increment.rows_to_keep:
-                increment.counters.exhausted = True  # the loader ran dry (or the budget was spent) before `rows_to_keep` rows were kept
-        return
-    _flush_partial_shards(writers)
-    for writer in writers.values():
-        writer.__exit__(type(failure), failure, failure.__traceback__)
-    raise failure
+            failures.attempt(f"pending settlement for {increment.name}", functools.partial(settle_pending, increment))
+    close = getattr(rows, "close", None)
+    if close is not None:
+        failures.attempt("row iterator close", close)
+    if worker is not None:
+        failures.attempt("token worker close/join", worker.close)
+        if not worker.stopped:
+            failures.record(
+                "token worker shutdown",
+                RuntimeError("Token worker termination could not be established; writer cleanup is incomplete to avoid live worker access"),
+            )
+            failures.raise_if_failed()
+            return
+
+    failure = failures.primary
+    if failure is not None:
+        _flush_partial_shards(writers, failures)
+        failure = failures.primary  # salvage may reveal a substantive failure after cooperative cancellation
+    exit_args = (type(failure), failure, failure.__traceback__) if failure is not None else (None, None, None)
+    for name, writer in writers.items():
+        # On an initially successful pass every writer still gets its ordinary final flush, even if an
+        # earlier writer's exit fails. On failure, salvage already ran once and exit only releases ownership.
+        failures.attempt(f"writer exit for {name}", functools.partial(writer.__exit__, *exit_args))
+    failures.raise_if_failed()
+    for increment in increments:
+        if not increment.passive and increment.counters.kept < increment.rows_to_keep:
+            increment.counters.exhausted = True  # only a successful pass can establish exhaustion
 
 
-def _flush_partial_shards(writers: dict[str, ShardWriter]) -> None:
+def _flush_partial_shards(writers: dict[str, ShardWriter], failures: _DownloadFailures) -> None:
     """
-    After a stop or a failure: publish every writer's buffered rows as a short shard, so each folder's offset is
-    where its increment really stood (a rare language's shard fills over millions of scanned rows, and every
-    passive increment has to resume at the same frontier as the active ones). Best effort: a writer whose publish
-    fails (or raises the stop again, which `RawFolder.record_shard` does after recording) is logged and skipped.
+    After a stop or failure, attempt each buffered shard once in writer insertion order. All failures remain
+    visible; callbacks may already have published/recorded a shard, so no failed flush is retried. The worker
+    must have terminated before this phase begins. Final writer exits follow after every salvage attempt.
     """
 
     for name, writer in writers.items():
-        try:
-            writer.flush()
-        except BuildAborted:
-            pass  # the shard was published and recorded before the stop check raised again
-        except Exception as error:  # noqa: BLE001
-            log.warning("%s: could not publish the buffered rows after the failure: %s", name, error)
+        failures.attempt(f"partial shard flush for {name}", writer.flush)
 
 
 def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], bar: Progress, gate: _StopGate) -> None:
