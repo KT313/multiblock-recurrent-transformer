@@ -15,6 +15,11 @@ CustomKernelError with guidance to disable the flag. Loading and execution error
 no partially executed operation or microbatch is retried with native operations. MLP currently requires CUDA BF16 autocast; the LM head accepts supported BF16 inputs or
 BF16 autocast. Requests returning logits and chunked validation loss retain their existing paths.
 
+The LM-head forward computes cross-entropy entirely from maximum-shifted FP32 scores, including the target
+subtraction. This preserves small losses under large finite common offsets (for example, equal logits of
+either sign still yield `log(vocab_size)`). The BF16 projection rounding, padded-vocabulary denominator,
+ignored-label mean behavior and backward are unchanged; differences already lost in BF16 are not recovered.
+
 `runtime.py` loads implementations during construction, before compilation, without initializing CUDA. Operator
 namespaces are stable per imported module and distinct for independent HF exports. All production dependencies
 stay under `model/`; none import `tools/`. Model parameter/state-dict keys are unchanged. CPU or FP32 reference runs must explicitly disable the flag.

@@ -1,5 +1,6 @@
 """Behavioral contracts for chunked linear CE and its bounded custom backward."""
 from collections.abc import Callable
+import math
 from typing import cast
 
 import pytest
@@ -9,7 +10,70 @@ import torch
 from torch import Tensor
 
 from model.model import linear_cross_entropy
-from .lm_head import fused_linear_cross_entropy, supports
+from .lm_head import _cross_entropy, fused_linear_cross_entropy, supports
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('offset', [2.0**28, -(2.0**28)])
+@pytest.mark.parametrize('compiled', [False, True])
+def test_equal_large_logits(offset: float, compiled: bool) -> None:
+    """Representable BF16 projections must retain the analytic log(V) loss."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    x = torch.full((1, 5, 1), offset, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    head = torch.nn.Linear(1, 4, bias=False, device='cuda', dtype=torch.bfloat16)
+    with torch.no_grad():
+        head.weight.fill_(1)
+    labels = torch.tensor([[0, 0, 0, 0, -100]], device='cuda')
+    function: Callable[..., Tensor] = fused_linear_cross_entropy
+    if compiled:
+        function = torch.compile(function, fullgraph=True)
+    expected = linear_cross_entropy(x, head, labels, 1.0, -100)
+    actual = function(x, head, labels, 1.0, -100)
+    assert actual.item() == pytest.approx(math.log(4), rel=2e-6, abs=2e-6)
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    eg = torch.autograd.grad(expected * 0.37, (x, head.weight))
+    ag = torch.autograd.grad(actual * 0.37, (x, head.weight))
+    for candidate, reference in zip(ag, eg, strict=True):
+        torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+    assert torch.count_nonzero(ag[1]) == head.weight.numel()
+    assert torch.count_nonzero(ag[0][:, -1]) == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('scale', [1.0, 0.25])
+def test_fp32_ce_gaps_offsets_and_padding(scale: float) -> None:
+    """Isolate CE arithmetic from BF16 projection rounding using a FP64 oracle."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    # Each score vector covers every target and an ignored row. The third
+    # column remains in the denominator, while the fourth Triton lane is masked.
+    scores = torch.tensor([
+        [1000, 999, 0], [1000, 0, 0],
+        [3, 2, 1], [0, -1, -2], [259, 258, 257], [-253, -254, -255],
+    ], device='cuda', dtype=torch.float32)
+    logits = scores.repeat_interleave(4, dim=0).requires_grad_()
+    labels = torch.tensor([0, 1, 2, -100], device='cuda').repeat(scores.shape[0])
+    count = (labels != -100).sum()
+    upstream = torch.tensor(0.37, device='cuda')
+    losses = torch.empty(labels.shape, device='cuda', dtype=torch.float32)
+    gradients = torch.empty_like(logits)
+    for backward in (False, True):
+        _cross_entropy[(labels.numel(),)](
+            logits, labels, losses, gradients, count, upstream,
+            3, scale, -100, backward, 4,
+            num_warps=8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
+        )
+    expected = torch.nn.functional.cross_entropy(
+        (logits * scale).double(), labels, ignore_index=-100, reduction='none',
+    )
+    expected_gradient, = torch.autograd.grad(expected.sum() / count * upstream, logits)
+    torch.testing.assert_close(losses.double(), expected, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(gradients, expected_gradient, rtol=2e-6, atol=2e-6)
+    assert torch.isfinite(losses).all()
+    assert torch.count_nonzero(gradients[labels == -100]) == 0
+    ordinary_losses = losses.reshape(-1, 4)[2:]
+    torch.testing.assert_close(ordinary_losses, ordinary_losses[:1].expand_as(ordinary_losses), rtol=0, atol=0)
 
 
 def test_cpu_inputs_raise_with_disable_guidance() -> None:

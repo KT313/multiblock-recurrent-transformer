@@ -50,8 +50,10 @@ def _cross_entropy(  # type: ignore[no-untyped-def]
         dz = tl.where(valid, dz * SCALE, 0.0)
         tl.store(GRAD + row * VOCAB + cols, dz, cols < VOCAB)
     else:
-        target_logit = tl.sum(tl.where(cols == target, z, 0.0), 0)
-        loss = tl.where(valid, maximum + log_denom - target_logit, 0.0)  # pyright: ignore[reportOperatorIssue]
+        # Stay in shifted coordinates: adding the maximum back can round away
+        # log_denom before a similarly large target score is subtracted.
+        target_shifted = tl.sum(tl.where(cols == target, shifted, 0.0), 0)
+        loss = tl.where(valid, log_denom - target_shifted, 0.0)
         tl.store(LOSSES + row, loss)
 
 
