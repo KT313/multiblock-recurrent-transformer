@@ -74,6 +74,7 @@ from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
+from training.stopping import StopController, complete_main_phase
 from training.step import BatchStream, NonFiniteLossError, RankBatches, TrainingProgress, run_one_optimizer_step
 
 
@@ -120,8 +121,8 @@ def train(
     Run the training run described by `settings` and return its report.
 
     `backend`: created from the settings unless given (tests inject the CPU backend); seeded here either way.
-    `should_stop`: the run's stop request (the CLI's Ctrl-C), polled between build shards and after every optimizer
-    step; the loop then saves a checkpoint, skips the export and returns with `report.stopped`.
+    `should_stop`: the run's stop request (the CLI's Ctrl-C), polled between build shards and at completed training phase
+    boundaries; the loop saves the completed state and skips optional work. Incomplete runs set `report.stopped`.
     `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
     `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
@@ -134,6 +135,7 @@ def train(
     check_evaluation_recurrences(settings)  # before anything is created or built
     backend = backend or create_backend(settings)
     try:
+        settings.validate_world_size(backend.world_size)
         backend.seed_everything(settings.seed)
         run_directory = prepare_run_directory(settings)
         # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
@@ -182,8 +184,14 @@ def train(
                     if resume is not None and resume.data_stream is not None:
                         batches.load_state_dict(resume.data_stream)
                     logger.status("training")
-                    stopped = False
-                    while progress.step < stage_manager.total_steps and not stopped:
+                    stop = StopController(backend, should_stop)
+                    # Restoring a checkpoint can change settings/stream metadata. Conservatively publish the
+                    # current restored state on an immediate stop instead of assuming the source file is exact.
+                    checkpoint_fresh = False
+                    while progress.step < stage_manager.total_steps:
+                        if stop.poll("before optimizer step"):
+                            break
+                        checkpoint_fresh = False
                         try:
                             result = run_one_optimizer_step(
                                 settings, backend, model, optimizer, stage_manager, batches, progress,
@@ -192,29 +200,41 @@ def train(
                         except NonFiniteLossError as error:
                             raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
                         progress.advance()
-                        if is_evaluation_step(settings, progress.step, stage_manager):
+                        stop.poll("after optimizer step")
+                        if not stop.requested and is_evaluation_step(settings, progress.step, stage_manager):
                             validation_loader = loaders.val_loaders[stage_manager.entering_stage_at(progress.step)]
                             with logger.evaluating():
                                 result.validation = evaluate(settings, backend, model, validation_loader)
+                            stop.poll("after validation")
                         logger.log_step(result, progress, data_wait=loaders.take_wait_seconds())
-                        # a request arriving during the last step changes nothing: the run is finished, not stopped;
-                        # decided over all ranks, so every rank saves and stops after the same step
-                        stopped = backend.any_flag(stop_requested(should_stop)) and progress.step < stage_manager.total_steps
-                        if stopped:
-                            logger.status("stopping after this step, saving a checkpoint")
-                        if is_checkpoint_step(settings, progress.step, stage_manager) or stopped:
+                        if stop.requested:
+                            break
+                        if is_checkpoint_step(settings, progress.step, stage_manager):
                             save_run_checkpoint(state, logger, batches)
-                        # after the checkpoint: a failing benchmark (network, the missing extra) never costs one.
-                        # Samples and benchmarks are the main rank's work (RNG-isolated inference, files); the other
-                        # ranks wait at the barrier, a decision every rank takes alike (the triggers depend on the step)
-                        samples_due, benchmarks_due = sample_triggers.due(progress.step), benchmark_triggers.due(progress.step)
-                        if not stopped and (samples_due or benchmarks_due):
-                            if backend.is_main and samples_due:
-                                write_samples(state, logger, loaders.tokenizer)
-                            if backend.is_main and benchmarks_due:
-                                run_benchmarks(state, logger, loaders.tokenizer)
-                            backend.barrier()
-                    export_dir = None if stopped or not backend.is_main else export_if_requested(state, logger)
+                            checkpoint_fresh = True
+                            if stop.poll("after checkpoint publication"):
+                                break
+                        # Each rank-zero phase completes before any rank samples its flag. Inference can
+                        # change third-party RNG state, so a checkpoint before it is conservatively stale.
+                        if sample_triggers.due(progress.step):
+                            checkpoint_fresh = False
+                            complete_main_phase(backend, "sample generation", lambda: write_samples(state, logger, loaders.tokenizer))
+                            if stop.poll("after samples"):
+                                break
+                        if benchmark_triggers.due(progress.step):
+                            checkpoint_fresh = False
+                            complete_main_phase(backend, "benchmarking", lambda: run_benchmarks(state, logger, loaders.tokenizer))
+                            if stop.poll("after benchmarks"):
+                                break
+                    if not stop.requested:
+                        stop.poll("before final export")
+                    stopped = stop.requested and progress.step < stage_manager.total_steps
+                    if stop.requested:
+                        logger.status("stopping, saving the completed state" if stopped else
+                                      "training updates completed; skipping optional work on request")
+                        if not checkpoint_fresh:
+                            save_run_checkpoint(state, logger, batches)
+                    export_dir = None if stop.requested or not backend.is_main else export_if_requested(state, logger)
                     return logger.close(progress, export_dir, stopped=stopped)
             finally:
                 loaders.close()  # the loader workers stop now, not when the GC finds the iterators
@@ -513,9 +533,14 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: RankBatches
         source_rows=state.dataset.source_rows,
         data_stream=batches.state_dict(),
     )
-    with logger.saving_checkpoint():
-        save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
-    logger.log_checkpoint(path)
+    def publish() -> None:
+        with logger.saving_checkpoint():
+            save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
+        logger.log_checkpoint(path)
+
+    complete_main_phase(state.backend, "checkpoint publication", publish)
+    if not state.backend.is_main:
+        logger.log_checkpoint(path)
     return path
 
 

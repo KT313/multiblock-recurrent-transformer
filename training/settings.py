@@ -244,6 +244,11 @@ class Settings:
                 "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
             )
 
+    def validate_world_size(self, world_size: int) -> None:
+        """Refuse unsplittable training and validation counts before any run setup work."""
+        self.micro_batches_per_rank(world_size)
+        self.eval_iters_per_rank(world_size)
+
     def micro_batches_per_rank(self, world_size: int) -> int:
         """
         Packed micro-batches each rank runs per optimizer step: `micro_batches_per_step` split evenly over the

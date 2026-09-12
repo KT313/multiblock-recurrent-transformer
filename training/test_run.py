@@ -59,7 +59,7 @@ from training.run import (
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.step import TrainingProgress
+from training.step import TrainingProgress, run_one_optimizer_step
 from evaluation.prompts import DEFAULT_PROMPTS
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
@@ -443,7 +443,7 @@ def test_non_finite_loss_writes_a_failed_checkpoint_beside_the_regular_one(
             resume=True,
             resume_checkpoint_path=str(checkpoint),
         )
-        report = _run(resumed_yaml, cpu_backend, should_stop=lambda: True)  # one step, then the stop checkpoint
+        report = _run(resumed_yaml, cpu_backend, should_stop=StopAfterSteps(monkeypatch, 1))  # one completed step, then stop
         assert report.resumed_from == checkpoint and report.completed_steps == 4
         return stream_of(checkpoint_dir(resumed_out / "tiny") / "step-00000004-tiny.pth")
 
@@ -984,24 +984,28 @@ def _short_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrid
     )
 
 
-class StopAfterPolls:
-    """
-    A `StopCheck` that says stop from its n-th poll on; `train()` polls once per completed optimizer step, so
-    `StopAfterPolls(5)` stops the run after step 5.
-    """
+class StopAfterSteps:
+    """Latch a request from a completed-step hook, independently of the number of safe-boundary polls."""
 
-    def __init__(self, polls: int) -> None:
-        self.polls = polls
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
+        self.steps = steps
         self.count = 0
+        step = run_one_optimizer_step
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            result = step(*args, **kwargs)
+            self.count += 1
+            return result
+
+        monkeypatch.setattr(run_module, "run_one_optimizer_step", counted)
 
     def __call__(self) -> bool:
-        self.count += 1
-        return self.count >= self.polls
+        return self.count >= self.steps
 
 
 @pytest.mark.slow
 def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
-    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
     A stop request after step 2 (inside stage 0 of the 13-step config): the loop saves `step-00000002-tiny.pth`,
@@ -1012,9 +1016,9 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
     yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir, export_to_hf=True)
-    should_stop = StopAfterPolls(2)
+    should_stop = StopAfterSteps(monkeypatch, 2)
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
-    assert should_stop.count == 2  # polled once per completed step, nothing before the loop
+    assert should_stop.count == 2  # two completed steps, regardless of boundary polling
     assert report.stopped is True
     assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (2, 2, None)
     assert sorted(report.history) == [1, 2]
@@ -1040,7 +1044,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
 
 @pytest.mark.slow
 def test_stop_request_at_a_checkpoint_step_saves_once(
-    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
     A stop request after step 4 of the 13-step config, the step the stage-0 end checkpoint is written at: that
@@ -1050,7 +1054,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
     yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir)
-    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(4))
+    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 4))
     assert report.stopped and report.completed_steps == 4
     assert [p.name for p in report.checkpoints_written] == ["step-00000004-tiny-stage-0_end.pth"]
     assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000004-tiny-stage-0_end.pth"]
@@ -1109,7 +1113,7 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
     stops = [5, 7, 14, 20]  # the last segment runs to the end
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False)
     with single_thread_deterministic():
-        segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(5), keep_history=True)]
+        segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 5), keep_history=True)]
         from model.layers import init as init_module
         def unexpected_orthogonal(*args: object, **kwargs: object) -> None:
             raise AssertionError("resume must not initialize orthogonal weights")
@@ -1122,7 +1126,7 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
         monkeypatch.setattr(run_module, "find_latest_checkpoint", select_once)
         resumed_yaml = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False, resume=True)
         for previous, stop in zip(stops, stops[1:]):
-            should_stop = StopAfterPolls(stop - previous) if stop < 20 else None
+            should_stop = StopAfterSteps(monkeypatch, stop - previous) if stop < 20 else None
             segments.append(train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, should_stop=should_stop, keep_history=True))
 
     assert len(selections) == 3  # one selection per resume, reused after model construction
@@ -1146,7 +1150,10 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
             assert metrics["grad_norm"] == full[done]["grad_norm"], done
             assert metrics["lr"] == full[done]["lr"], done
             for key in (k for k in full[done] if k.startswith("val_loss")):
-                assert metrics[key] == full[done][key], (done, key)
+                if segment.stopped and done == segment.completed_steps:
+                    assert key not in metrics  # a request during this step now skips its due validation
+                else:
+                    assert metrics[key] == full[done][key], (done, key)
 
 
 @pytest.mark.slow
@@ -1201,7 +1208,7 @@ def test_packed_tiny_run_finishes_and_resumes_exactly(
 
 @pytest.mark.slow
 def test_plain_resume_picks_the_newest_file_over_an_abandoned_higher_step(
-    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+    monkeypatch: pytest.MonkeyPatch, full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
     """
     An explicit resume from step 6 into a directory that still holds steps 14 and 20 writes step 9 and stops; the
@@ -1217,7 +1224,7 @@ def test_plain_resume_picks_the_newest_file_over_an_abandoned_higher_step(
     redo_yaml = write_tiny_yaml(
         tmp_path / "redo", tiny_dataset_dir, out_dir, resume=True, resume_checkpoint_path=str(step6), export_to_hf=False
     )
-    redo = _run(redo_yaml, should_stop=StopAfterPolls(3))
+    redo = _run(redo_yaml, should_stop=StopAfterSteps(monkeypatch, 3))
     assert redo.stopped and redo.completed_steps == 9 and redo.resumed_from == step6
     assert [p.name for p in redo.checkpoints_written] == ["step-00000009-tiny.pth"]
 
@@ -1283,7 +1290,9 @@ def test_resume_from_the_final_checkpoint_runs_no_step_and_exports_again(
 # A plain skip, not `@pytest.mark.gpu`, on purpose: the marker would put this test into the `gpu` xdist group, whose
 # worker is already the longest; the tiny model leaves the device room to share (about 300 MiB at peak).
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path,
+) -> None:
     """
     The real run path (settings backend on CUDA, bf16 autocast, `compile_model`): a run stopped after step 5 leaves
     a checkpoint whose model and optimizer tensors are what a fresh setup restores from it, and the resumed run
@@ -1301,7 +1310,7 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
         tmp_path, tiny_dataset_dir, out_dir, precision="bf16-mixed", compile_model=True, export_to_hf=False,
         model_overwrite={"n_layers_in_prelude": 1, "n_layers_in_recurrent_block": [1, 1], "mean_recurrence": [1, 1], "mean_backprop_depth": [1, 1]},
     )
-    stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterPolls(5), keep_history=True)
+    stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterSteps(monkeypatch, 5), keep_history=True)
     assert stopped.stopped and stopped.completed_steps == 5
     checkpoint = checkpoint_dir(run_dir) / "step-00000005-tiny.pth"
     assert stopped.checkpoints_written == [checkpoint]
@@ -1415,7 +1424,7 @@ def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
         tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", export_to_hf=False,
         sample_at_training_progress=[], benchmark_step_interval=1, benchmark_at_training_progress=[], benchmark_tasks=["arc_easy"],
     )
-    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, should_stop=StopAfterPolls(3), keep_history=True)
+    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 3), keep_history=True)
     assert failing.completed_steps == 3 and failing.last_benchmarks == {} and failing.stopped
     assert not (tmp_path / "failing" / "out" / "tiny" / "benchmarks").exists()
     log_text = (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
