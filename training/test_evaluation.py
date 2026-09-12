@@ -243,7 +243,7 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
 ) -> None:
     """
     `val_loss/<data id>` is the token-weighted mean loss of that source's rows at the mean recurrence, over the
-    batches seen; `val_loss` itself (the mean of the batch means) is unchanged by the bookkeeping.
+    batches seen; their count-weighted aggregate agrees with the overall token mean.
     """
 
     settings.partial_depth_eval = [1]
@@ -274,7 +274,8 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
                 sums[data_id][1] += int((y[row] != -100).sum())
     for data_id, (loss_sum, count) in sums.items():
         assert metrics[f"val_loss/{data_id}"].item() == pytest.approx(loss_sum / count, rel=1e-5)
-    assert metrics["val_loss"].item() == pytest.approx(torch.stack(batch_means).mean().item(), rel=1e-5)
+    expected_overall = sum(entry[0] for entry in sums.values()) / sum(entry[1] for entry in sums.values())
+    assert metrics["val_loss"].item() == pytest.approx(expected_overall, rel=1e-5)
     assert metrics["val_loss/a"] != metrics["val_loss/b"]
 
 
@@ -289,7 +290,7 @@ def test_per_source_losses_are_summed_over_the_ranks_whatever_sources_each_saw(
 
     class TwoRankBackend(SingleDeviceBackend):
         def all_gather_object(self, obj: Any) -> list[Any]:  # a second rank that saw source b with 10 tokens and source c
-            other = {"b": torch.tensor([20.0, 10.0]), "c": torch.tensor([3.0, 3.0])}
+            other = {"b": (torch.tensor(20.0), torch.tensor(10)), "c": (torch.tensor(3.0), torch.tensor(3))}
             return [obj, other]
 
     settings.eval_iters = 1

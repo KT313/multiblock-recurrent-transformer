@@ -101,6 +101,9 @@ class Settings:
     allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config
     allow_settings_change: bool = False  # resume although settings / model config differ (see training/checkpoint.py)
 
+    # Versioned objective, recorded in run/checkpoint/measurement settings; no legacy execution mode.
+    loss_normalization: Literal["supervised_token_v1"] = "supervised_token_v1"
+
     # Run
     run_name: str = "crow-300m"
     out_dir: str = "outputs"  # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log, run_config.json
@@ -204,6 +207,8 @@ class Settings:
                 "LR and, for ELLISAdam, the reference of the decoupled weight decay (decay = lr / init_lr x "
                 "weight_decay). The schedule's learning rate is stage_base_lrs"
             )
+        if self.loss_normalization != "supervised_token_v1":
+            raise ValueError("loss_normalization must be supervised_token_v1; legacy pack weighting is unsupported")
         if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
             raise ValueError(
                 f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {self.gradient_checkpointing!r}"

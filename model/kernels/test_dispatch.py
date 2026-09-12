@@ -78,6 +78,8 @@ def test_integrated_compiled_training_trio(checkpoint: str) -> None:
     from model.layers.attention import document_attention_mask
     positions = torch.arange(32, device='cuda').view(1, -1) % 8
     mask = document_attention_mask(torch.arange(32, device='cuda').view(1, -1) // 8)
+    labels = tokens.clone()
+    labels[:, ::3] = -100
     models = []
     for enabled in (False, True):
         torch.manual_seed(5)
@@ -101,8 +103,9 @@ def test_integrated_compiled_training_trio(checkpoint: str) -> None:
             for micro in range(2):
                 model.micro_batch_index = micro
                 with torch.autocast('cuda', dtype=torch.bfloat16):
-                    loss = compiled(tokens, labels=tokens, position_ids=positions,
-                                    attention_mask=mask, return_logits=False)['loss'] / 2
+                    output = compiled(tokens, labels=labels, position_ids=positions, attention_mask=mask,
+                                      return_logits=False, return_loss_statistics=True)
+                    loss = output['loss_sum'] / (2 * output['supervised_count'])
                 loss.backward()
             optimizer.step()
         assert loss is not None
@@ -146,3 +149,26 @@ def test_exported_cuda_model_can_coexist_with_original(tmp_path: Path) -> None:
     for left, right in zip(results[0][1], results[1][1], strict=True):
         assert left is not None and right is not None
         torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.parametrize('enabled', [False, True])
+def test_compiled_empty_model_statistics_have_zero_gradients(enabled: bool) -> None:
+    """Unused public NaN means must not poison AOT gradients of the separately returned zero sum."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    torch.manual_seed(31)
+    model = RecurrentGPT(tiny_config(use_custom_kernels=enabled, num_attention_heads=2)).cuda().train()
+    tokens = torch.randint(0, 512, (1, 8), device='cuda')
+    labels = torch.full_like(tokens, -100)
+    compiled = torch.compile(model, dynamic=True)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        output = compiled(tokens, labels=labels, num_steps=[(1, 0), (1, 0)], return_loss_statistics=True)
+    assert torch.isnan(output['loss'])
+    assert output['supervised_count'].item() == 0
+    assert output['loss_sum'].item() == 0
+    output['loss_sum'].backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() and torch.count_nonzero(gradient) == 0 for gradient in gradients)

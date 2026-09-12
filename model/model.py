@@ -10,7 +10,7 @@ module assembles them into `RecurrentGPT` and binds the recurrence to the model'
 """
 
 from functools import partial
-from typing import Callable, cast
+from typing import Callable, Literal, cast
 
 import torch
 from torch import Tensor
@@ -46,14 +46,17 @@ _checkpoint = partial(checkpoint, use_reentrant=False, preserve_rng_state=False,
 
 
 def linear_cross_entropy(
-    x: Tensor, head: torch.nn.Module, labels: Tensor, logit_scale: float, ignore_index: int
+    x: Tensor, head: torch.nn.Module, labels: Tensor, logit_scale: float, ignore_index: int,
+    reduction: Literal["mean", "sum"] = "mean",
 ) -> Tensor:
-    """Native head and mean loss for already masked/shifted labels, without requiring returned logits."""
+    """Native head and mean/sum CE for already masked/shifted labels, without returning logits."""
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"unsupported loss reduction: {reduction!r}")
     logits = head(x).float()
     if logit_scale != 1:
         logits = logits * logit_scale
     return torch.nn.functional.cross_entropy(
-        logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ignore_index
+        logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=ignore_index, reduction=reduction
     )
 
 
@@ -250,6 +253,7 @@ class RecurrentGPT(torch.nn.Module):
         logits_to_keep: int = 0,
         generation_state: GenerationState | None = None,
         use_cache: bool = False,
+        return_loss_statistics: bool = False,
     ) -> dict[str, Tensor | None]:
         """
         One forward pass: embedding, prelude, the recurrent core blocks, coda, final norm, LM head and, given
@@ -270,6 +274,10 @@ class RecurrentGPT(torch.nn.Module):
         `token_losses`: the `(B, S)` fp32 per-token losses (zero at ignored positions) when
         `return_token_losses_chunked_nograd`, else None.
 
+        `return_loss_statistics` adds a differentiable `loss_sum` and int64 `supervised_count` for the trainer;
+        it uses the selected native/custom head with sum reduction, including a graph-safe all-ignored zero.
+        The public `loss` remains a mean (NaN when all ignored). Labels are already shifted.
+
         Two loss paths. Training and every `return_logits` caller build the full logits and take the loss from
         them. `return_token_losses_chunked_nograd` (validation only, under `no_grad`) takes `chunked_loss` instead,
         which never holds the full logits (1 GiB at batch 4): validation used to keep them alive for the
@@ -281,6 +289,8 @@ class RecurrentGPT(torch.nn.Module):
         itself is eager by design, see `run_core_blocks`.
         """
 
+        if return_loss_statistics and (labels is None or return_logits or return_token_losses_chunked_nograd):
+            raise ValueError("return_loss_statistics requires labels and the loss-only training path")
         if logits_to_keep < 0:
             raise ValueError("logits_to_keep must be nonnegative")
         if logits_to_keep and (labels is not None or return_token_losses_chunked_nograd):
@@ -321,13 +331,24 @@ class RecurrentGPT(torch.nn.Module):
             x = block(x, freqs_cis, mask)
         x = self.transformer.ln_final(x)
 
+        loss_sum: Tensor | None = None
+        supervised_count: Tensor | None = None
         loss = torch.as_tensor(0.0)
         logits: Tensor | None = None
         token_losses: Tensor | None = None
         if return_token_losses_chunked_nograd and labels is not None and not return_logits:
             loss, token_losses = self.chunked_loss(x, labels)
         elif labels is not None and not return_logits and not return_token_losses_chunked_nograd:
-            loss = self.training_loss(x, labels)
+            if return_loss_statistics:
+                effective_labels = self.mask_labels(labels)
+                supervised_count = (effective_labels != self.ignore_index).sum()
+                operation = self._custom_head if self._custom_head is not None else linear_cross_entropy
+                loss_sum = operation(
+                    x, self.lm_head, effective_labels, self.config.init.logit_scale, self.ignore_index, reduction="sum"
+                )
+                loss = loss_sum / supervised_count  # preserve the public all-ignored mean (NaN)
+            else:
+                loss = self.training_loss(x, labels)
         else:
             logits = self.full_logits(x[:, -logits_to_keep:] if logits_to_keep else x)  # fp32
             if labels is not None:
@@ -336,7 +357,10 @@ class RecurrentGPT(torch.nn.Module):
                     token_losses = self.token_losses(logits, labels)
             if not return_logits:
                 logits = None
-        return {"loss": loss, "logits": logits, "token_losses": token_losses, "log_ppl": loss.clone().detach()}
+        output = {"loss": loss, "logits": logits, "token_losses": token_losses, "log_ppl": loss.clone().detach()}
+        if return_loss_statistics:
+            output.update(loss_sum=loss_sum, supervised_count=supervised_count)
+        return output
 
     def _forward_generation(
         self, input_ids: Tensor, attention_mask: AttentionMask, position_ids: Tensor | None,

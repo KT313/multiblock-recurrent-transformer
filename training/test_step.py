@@ -372,8 +372,8 @@ def test_non_finite_loss_raises_with_the_exact_message(
 
     def nan_forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
-        assert out["loss"] is not None
-        out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        assert out["loss_sum"] is not None
+        out["loss_sum"] = out["loss_sum"] * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
@@ -1315,6 +1315,7 @@ def step_reference_metrics() -> dict[str, Any]:
         optimizer = fresh_optimizer(settings, model, backend)
         results = run_steps(settings, backend, model, optimizer, steps=REFERENCE_STEPS)
     return {
+        "loss_normalization": settings.loss_normalization,
         "steps": {
             str(result.step): {
                 "loss": float(result.loss),

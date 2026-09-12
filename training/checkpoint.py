@@ -13,6 +13,7 @@ backend), the data stream once (rank 0 reads and packs for the whole world). A r
 the checkpoint was written with (`training.run.restore_checkpoint_if_resuming`).
 """
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
@@ -26,6 +27,8 @@ from torch.optim import Optimizer
 from training.backend.base import Backend
 from training.settings import Settings
 from training.stage_manager import StageManager
+
+log = logging.getLogger(__name__)
 
 CHECKPOINT_SUBDIR = "checkpoints"
 CHECKPOINT_SUFFIX = ".pth"
@@ -211,7 +214,7 @@ def check_settings_unchanged(
     current = asdict(settings)
     # Checkpoints predating kernel integration always used native operations. Treat an absent flag as false,
     # while keeping changes subject to the same resume policy as precision and compilation.
-    stored_settings = {"use_custom_kernels": False} | metadata.settings
+    stored_settings = {"use_custom_kernels": False, "loss_normalization": "legacy_pack_v0"} | metadata.settings
     stored_model_config = {"use_custom_kernels": False} | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
@@ -237,12 +240,20 @@ def check_settings_unchanged(
             if model_config.get(key) != stored_model_config.get(key)
         )
         details["model_config"] = f"differs from the stored model config in {differing}"
+    if "loss_normalization" in details:
+        details["loss_normalization"] += (
+            "; this changes the training objective and validation metric; continuation preserves optimizer moments "
+            "and data/RNG state but differs from the legacy trajectory"
+        )
     if details and not allow_settings_change:
         listed = "; ".join(f"{key}: {details[key]}" for key in sorted(details))
         raise ValueError(
             f"resuming with changed {sorted(details)}: {listed}; set allow_settings_change: true to continue "
             "anyway (the run becomes a mix of two configurations)"
         )
+
+    if "loss_normalization" in details and allow_settings_change:
+        log.warning("Acknowledged loss normalization transition: %s", details["loss_normalization"])
 
 
 

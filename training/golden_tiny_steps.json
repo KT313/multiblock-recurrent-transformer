@@ -1,11 +1,12 @@
 {
+  "loss_normalization": "supervised_token_v1",
   "parameter_norms": {
     "lm_head.weight": 14.287460327148438,
     "transformer.adapters.0.weight": 7.152810573577881,
     "transformer.adapters.1.weight": 7.153148651123047,
     "transformer.coda.0.attn.Wqkv.weight": 8.761515617370605,
     "transformer.coda.0.attn.proj.weight": 1.3519082069396973,
-    "transformer.coda.0.attn.qk_bias": 0.010961702093482018,
+    "transformer.coda.0.attn.qk_bias": 0.010961699299514294,
     "transformer.coda.0.mlp.fc.weight": 10.116218566894531,
     "transformer.coda.0.mlp.proj.weight": 1.9134135246276855,
     "transformer.coda.0.norm_1.weight": 8.000563621520996,
@@ -23,22 +24,22 @@
     "transformer.core_blocks.0.0.norm_4.weight": 8.00228214263916,
     "transformer.core_blocks.1.0.attn.Wqkv.weight": 8.759103775024414,
     "transformer.core_blocks.1.0.attn.proj.weight": 1.3511759042739868,
-    "transformer.core_blocks.1.0.attn.qk_bias": 0.00992601364850998,
+    "transformer.core_blocks.1.0.attn.qk_bias": 0.009926012717187405,
     "transformer.core_blocks.1.0.mlp.fc.weight": 10.11331844329834,
     "transformer.core_blocks.1.0.mlp.proj.weight": 1.9119222164154053,
     "transformer.core_blocks.1.0.norm_1.weight": 7.998874187469482,
     "transformer.core_blocks.1.0.norm_2.weight": 7.999687671661377,
     "transformer.core_blocks.1.0.norm_3.weight": 7.997974395751953,
     "transformer.core_blocks.1.0.norm_4.weight": 8.000085830688477,
-    "transformer.ln_final.bias": 0.007555675692856312,
+    "transformer.ln_final.bias": 0.007555677089840174,
     "transformer.ln_final.weight": 7.991450786590576,
-    "transformer.ln_fs.0.bias": 0.006785980891436338,
+    "transformer.ln_fs.0.bias": 0.006785982754081488,
     "transformer.ln_fs.0.weight": 7.999622821807861,
-    "transformer.ln_fs.1.bias": 0.007191742770373821,
+    "transformer.ln_fs.1.bias": 0.007191740907728672,
     "transformer.ln_fs.1.weight": 7.9995317459106445,
     "transformer.prelude.0.attn.Wqkv.weight": 8.758708000183105,
     "transformer.prelude.0.attn.proj.weight": 1.3525205850601196,
-    "transformer.prelude.0.attn.qk_bias": 0.010233072564005852,
+    "transformer.prelude.0.attn.qk_bias": 0.010233071632683277,
     "transformer.prelude.0.mlp.fc.weight": 10.114389419555664,
     "transformer.prelude.0.mlp.proj.weight": 1.9125993251800537,
     "transformer.prelude.0.norm_1.weight": 7.998740196228027,
@@ -47,7 +48,7 @@
     "transformer.prelude.0.norm_4.weight": 8.000618934631348,
     "transformer.prelude.1.attn.Wqkv.weight": 8.761031150817871,
     "transformer.prelude.1.attn.proj.weight": 1.354831576347351,
-    "transformer.prelude.1.attn.qk_bias": 0.009910372085869312,
+    "transformer.prelude.1.attn.qk_bias": 0.009910376742482185,
     "transformer.prelude.1.mlp.fc.weight": 10.115331649780273,
     "transformer.prelude.1.mlp.proj.weight": 1.9124892950057983,
     "transformer.prelude.1.norm_1.weight": 8.002212524414062,
@@ -59,7 +60,7 @@
   "steps": {
     "0": {
       "grad_norm": 0.6792787909507751,
-      "loss": 6.4492292404174805,
+      "loss": 6.449229717254639,
       "lr": 0.0
     },
     "1": {
@@ -78,7 +79,7 @@
       "lr": 0.0003
     },
     "4": {
-      "grad_norm": 0.6597710251808167,
+      "grad_norm": 0.6597710847854614,
       "loss": 6.449536323547363,
       "lr": 0.0003
     }

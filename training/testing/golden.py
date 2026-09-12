@@ -161,6 +161,7 @@ def reference_metrics(reference: ReferenceRun) -> dict[str, Any]:
     assert final_checkpoint is not None
     final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
     return {
+        "loss_normalization": settings.loss_normalization,
         "steps": steps,
         "checkpoints": sorted(p.name for p in checkpoint_dir(reference.run_directory).glob("*.pth")),
         "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),

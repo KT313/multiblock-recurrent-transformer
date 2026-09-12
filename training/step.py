@@ -86,7 +86,7 @@ class StepResult:
 
     step: int  # the optimizer step that was run
     learning_rate: float  # scheduled LR of that step
-    loss: Tensor  # mean of the micro-batch losses, all-reduced (identity on one device)
+    loss: Tensor  # global supervised-token mean over the entire optimizer update
     grad_norm: Tensor  # pre-clip gradient norm
     stage: StageInfo  # stage info at `step` (what the step trained on)
     data_ids: list[str]  # one entry per document of the step's packs (document count per source)
@@ -421,10 +421,9 @@ def run_one_optimizer_step(
     Recurrence depth is sampled per local microbatch; the golden tests in `test_step.py` and `test_run.py` pin the
     numerics. Non-obvious parts: step 0 skips `optimizer.step()`, `grad_norm` is measured before clipping, and the
     loss is all-reduced every step (a no-op on one device) BEFORE it is checked for finiteness, so every rank sees
-    the same number and makes the same decision to raise. The loss is the mean over the valid tokens of each pack,
-    averaged over the packs: with full packs the valid-token counts are nearly equal (they differ by the pack tails),
-    so the step loss is close to token-weighted. Training on padded rows was removed for exactly this reason: the
-    loader sorted a world batch by length, so a micro-batch of short rows weighed as much as one of full rows.
+    the same number and makes the same decision to raise. Backwards accumulate token sums scaled by the fixed
+    local physical capacity C. DDP averages these gradients across W ranks; multiplying by W*C/N after all
+    backwards yields the global supervised-token mean, before clipping. Counts remain int64 until division.
     """
 
     step = progress.step
@@ -436,6 +435,8 @@ def run_one_optimizer_step(
     set_lr(optimizer, learning_rate)
 
     loss_sum = torch.zeros((), device=backend.device)
+    supervised_count = torch.zeros((), device=backend.device, dtype=torch.int64)
+    local_capacity = accumulation_steps * settings.tokens_per_micro_batch
     data_ids: list[str] = []
     data_tokens: dict[str, int] = {}  # document slots per data id, the pack tails left out
     padding_tokens = 0  # the tail positions without a document, over the step's packs
@@ -451,8 +452,8 @@ def run_one_optimizer_step(
         with backend.no_sync(model) if micro_batch_index < accumulation_steps - 1 else nullcontext():
             try:
                 with backend.autocast():
-                    outputs = model(**inputs)
-                backend.backward(outputs["loss"] / accumulation_steps)
+                    outputs = model(**inputs, return_loss_statistics=True)
+                backend.backward(outputs["loss_sum"] / local_capacity)
             except CustomKernelError:
                 raise
             except Exception as error:
@@ -463,13 +464,21 @@ def run_one_optimizer_step(
                         f"Training forward/backward failed with custom kernels enabled: {error}. {DISABLE_HINT}"
                     ) from error
                 raise
-        loss_sum += outputs["loss"].detach()
+        loss_sum += outputs["loss_sum"].detach()
+        supervised_count += outputs["supervised_count"].detach()
         if on_micro_batch is not None:
             on_micro_batch(micro_batch_index + 1, accumulation_steps)
-    loss = backend.all_reduce(loss_sum / accumulation_steps)  # the world mean: every rank checks the same number
+    loss_sum = backend.all_reduce(loss_sum, op="sum")
+    supervised_count = backend.all_reduce(supervised_count, op="sum")
+    if supervised_count.item() == 0:
+        raise RuntimeError(f"No supervised target tokens across the optimizer update at step {step}")
+    loss = loss_sum / supervised_count
     if not torch.isfinite(loss):
         raise NonFiniteLossError(f"Loss is {loss.item()} at step {step}")
 
+    correction = (backend.world_size * local_capacity) / supervised_count
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    torch._foreach_mul_(gradients, correction)  # pyright: ignore[reportPrivateImportUsage]  # in-place multi-tensor scaling
     grad_norm = backend.clip_grad_norm(model, settings.grad_clip)
     if not torch.isfinite(grad_norm):
         raise NonFiniteLossError(f"Gradient norm is non-finite at step {step}")

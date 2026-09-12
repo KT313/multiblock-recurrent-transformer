@@ -2,7 +2,7 @@
 """Larger bounded CE chunks with vendor FP32 GEMM accumulation for dW."""
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -16,7 +16,7 @@ except ImportError as error:
 from ..layers.init import Linear
 from .runtime import CustomKernelError, DISABLE_HINT, kernel_errors, kernel_namespace, require_supported
 
-_NAMESPACE = kernel_namespace(__name__, "lm_head")
+_NAMESPACE = kernel_namespace(__name__, "lm_head_stats_v1")
 
 
 __all__ = ['fused_linear_cross_entropy', 'supports']
@@ -57,7 +57,12 @@ def _cross_entropy(  # type: ignore[no-untyped-def]
         tl.store(LOSSES + row, loss)
 
 
-def supports(x: Tensor, head: Module, labels: Tensor, logit_scale: float, ignore_index: int) -> bool:
+def supports(
+    x: Tensor, head: Module, labels: Tensor, logit_scale: float, ignore_index: int,
+    reduction: Literal["mean", "sum"] = "mean",
+) -> bool:
+    if reduction not in ("mean", "sum"):
+        return False
     if not isinstance(head, torch.nn.Linear):
         return False
     if type(head) not in (torch.nn.Linear, Linear) or cast(Tensor | None, head.bias) is not None:
@@ -81,7 +86,7 @@ def supports(x: Tensor, head: Module, labels: Tensor, logit_scale: float, ignore
 
 @torch.library.custom_op(f"{_NAMESPACE}::loss_forward", mutates_args=())
 @kernel_errors("LM head")
-def loss_forward(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore: int) -> Tensor:
+def loss_forward(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore: int, sum_loss: bool = False) -> Tensor:
     rows, width = x.shape
     vocab = weight.shape[0]
     losses = torch.empty(rows, device=x.device, dtype=torch.float32)
@@ -95,24 +100,24 @@ def loss_forward(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore
                 num_warps=32 if vocab >= 16384 else 8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
             )
             del logits
-    return losses.sum() / count
+    return losses.sum() if sum_loss else losses.sum() / count
 
 
 @loss_forward.register_fake
-def _forward_fake(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore: int) -> Tensor:
+def _forward_fake(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore: int, sum_loss: bool = False) -> Tensor:
     return torch.empty((), device=x.device, dtype=torch.float32)
 
 
 @torch.library.custom_op(f"{_NAMESPACE}::loss_backward", mutates_args=())
 @kernel_errors("LM head")
 def loss_backward(
-    x: Tensor, weight: Tensor, labels: Tensor, upstream: Tensor, scale: float, ignore: int,
+    x: Tensor, weight: Tensor, labels: Tensor, upstream: Tensor, scale: float, ignore: int, sum_loss: bool = False,
 ) -> tuple[Tensor, Tensor]:
     rows, width = x.shape
     vocab = weight.shape[0]
     dx = torch.empty_like(x)
     dw = torch.empty(weight.shape, device=weight.device, dtype=torch.float32)
-    count = (labels != ignore).sum()
+    count = torch.ones((), device=labels.device, dtype=torch.int64) if sum_loss else (labels != ignore).sum()
     with torch.autocast('cuda', enabled=False):
         for start in range(0, rows, CHUNK_TOKENS):
             chunk = x[start:start + CHUNK_TOKENS]
@@ -134,22 +139,23 @@ def loss_backward(
 
 @loss_backward.register_fake
 def _backward_fake(
-    x: Tensor, weight: Tensor, labels: Tensor, upstream: Tensor, scale: float, ignore: int,
+    x: Tensor, weight: Tensor, labels: Tensor, upstream: Tensor, scale: float, ignore: int, sum_loss: bool = False,
 ) -> tuple[Tensor, Tensor]:
     return torch.empty_like(x), torch.empty_like(weight)
 
 
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Tensor) -> None:
-    x, weight, labels, scale, ignore = inputs
+    x, weight, labels, scale, ignore, sum_loss = inputs
     ctx.save_for_backward(x, weight, labels)
     ctx.scale = scale
     ctx.ignore = ignore
+    ctx.sum_loss = sum_loss
 
 
-def _backward(ctx: Any, upstream: Tensor) -> tuple[Tensor, Tensor, None, None, None]:
+def _backward(ctx: Any, upstream: Tensor) -> tuple[Tensor, Tensor, None, None, None, None]:
     x, weight, labels = ctx.saved_tensors
-    dx, dw = loss_backward(x, weight, labels, upstream, ctx.scale, ctx.ignore)
-    return dx, dw, None, None, None
+    dx, dw = loss_backward(x, weight, labels, upstream, ctx.scale, ctx.ignore, ctx.sum_loss)
+    return dx, dw, None, None, None, None
 
 
 torch.library.register_autograd(loss_forward, _backward, setup_context=_setup_context)
@@ -157,14 +163,17 @@ torch.library.register_autograd(loss_forward, _backward, setup_context=_setup_co
 
 def fused_linear_cross_entropy(
     x: Tensor, head: Module, labels: Tensor, logit_scale: float, ignore_index: int,
+    reduction: Literal["mean", "sum"] = "mean",
 ) -> Tensor:
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"unsupported loss reduction: {reduction!r}")
     try:
         require_supported(supports(x, head, labels, logit_scale, ignore_index), "LM head",
                           "Requires contiguous CUDA BF16 projection inputs (or BF16 autocast), int64 labels and a supported biasless head without hooks.")
         weight = cast(torch.nn.Linear, head).weight
         return cast(Tensor, loss_forward(
             x.reshape(-1, x.shape[-1]).to(torch.bfloat16), weight.to(torch.bfloat16),
-            labels.reshape(-1).contiguous(), logit_scale, ignore_index,
+            labels.reshape(-1).contiguous(), logit_scale, ignore_index, reduction == "sum",
         ))
     except CustomKernelError:
         raise

@@ -201,3 +201,32 @@ def test_strided_labels_forward_backward(compiled: bool) -> None:
         assert (candidate - reference).abs().max() <= 2e-6 + 0.01 * reference.abs().max()
         assert candidate.dtype == reference.dtype
     assert torch.count_nonzero(ag[0][:, ::11]) == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('compiled', [False, True])
+@pytest.mark.parametrize('empty', [False, True])
+def test_sum_reduction_statistics(compiled: bool, empty: bool) -> None:
+    """Additive statistics preserve bounded custom dispatch and graph-safe empty contributions."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    torch.manual_seed(72)
+    x = torch.randn(1, 17, 64, device='cuda', requires_grad=True)
+    head = torch.nn.Linear(64, 127, bias=False, device='cuda')
+    labels = torch.randint(0, 120, (1, 17), device='cuda')
+    labels[:, ::3] = -100
+    if empty:
+        labels.fill_(-100)
+    function: Callable[..., Tensor] = fused_linear_cross_entropy
+    if compiled:
+        function = torch.compile(function, fullgraph=True)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        expected = linear_cross_entropy(x, head, labels, 0.5, -100, reduction='sum')
+        actual = function(x, head, labels, 0.5, -100, reduction='sum')
+    eg = torch.autograd.grad(expected / 32, (x, head.weight))
+    ag = torch.autograd.grad(actual / 32, (x, head.weight))
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    for candidate, reference in zip(ag, eg):
+        assert (candidate - reference).abs().max() <= 2e-6 + 0.01 * reference.abs().max()
+        if empty:
+            assert torch.count_nonzero(candidate) == 0

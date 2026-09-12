@@ -2,13 +2,18 @@
 import hashlib
 import importlib.util
 from functools import wraps
-from typing import Callable, ParamSpec, TypeVar
+from typing import Callable, Literal, ParamSpec, Protocol, TypeVar
 
 import torch
 from torch import Tensor
 
 MLPKernel = Callable[[Tensor, torch.nn.Module, torch.nn.Module, torch.nn.Module], Tensor]
-HeadKernel = Callable[[Tensor, torch.nn.Module, Tensor, float, int], Tensor]
+class HeadKernel(Protocol):
+    def __call__(
+        self, x: Tensor, head: torch.nn.Module, labels: Tensor, logit_scale: float, ignore_index: int,
+        reduction: Literal["mean", "sum"] = "mean",
+    ) -> Tensor: ...
+
 RoPEKernel = Callable[[Tensor | None, Tensor, Tensor, int], tuple[Tensor, Tensor, Tensor]]
 DISABLE_HINT = 'Set use_custom_kernels: false in the run/model config to use native PyTorch operations.'
 P = ParamSpec('P')

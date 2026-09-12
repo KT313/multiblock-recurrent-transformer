@@ -267,6 +267,7 @@ def test_is_checkpoint_step_table() -> None:
 # a constructed `Settings`, not passed to it: `lr_schedule` has exactly one legal value, so no differing schedule
 # survives `Settings.__post_init__`, and what is under test here is the resume comparison, not the value rules.
 CHANGED_COMPARED_VALUES: dict[str, Any] = {
+    "loss_normalization": "legacy_pack_v0",
     "stage_base_lrs": [2e-3],
     "seed": 7,
     "training_max_sequence_length": 128,
@@ -561,3 +562,19 @@ def test_legacy_checkpoint_kernel_flag_means_native(
     with pytest.raises(ValueError, match='use_custom_kernels'):
         check_settings_unchanged(metadata, current, config, False)
     check_settings_unchanged(metadata, current, config, True)
+
+
+def test_legacy_objective_requires_acknowledgement(backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+                                                  caplog: pytest.LogCaptureFixture) -> None:
+    settings = _settings(run_name="tiny", seed=42)
+    metadata = _metadata(backend, tiny_model)
+    assert metadata.settings.pop("loss_normalization") == "supervised_token_v1"
+    original_rng = metadata.rng_states
+    with pytest.raises(ValueError, match="legacy_pack_v0.*training objective"):
+        check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), False)
+    check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), True)
+    assert "Acknowledged loss normalization transition" in caplog.text
+    assert metadata.rng_states is original_rng
+    assert "loss_normalization" not in metadata.settings  # historical provenance is never relabeled
+    with pytest.raises(ValueError, match="legacy pack weighting is unsupported"):
+        _settings(loss_normalization="legacy_pack_v0")
