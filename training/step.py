@@ -186,6 +186,11 @@ class BatchStream:
         self._loaded = {source: int(state["pool_loaded"].get(source, 0)) for source in self.loaders.train_sources}
         self._target = {source: float(state["pool_target"].get(source, 0.0)) for source in self.loaders.train_sources}
         self.loaders.set_resume_offsets(self.consumed_rows)
+        # Intentional resume policy: drain saved samples unchanged after explicitly allowed config changes.
+        # The pool may retain removed sources; buffers/pool retain old document lengths. This bounded
+        # carry-over is accepted for rare mid-run changes, so do not filter/retruncate these samples.
+        # Old lengths must still fit model_max_sequence_length: lowering that bound can cause a failure.
+        # Pool.restore separately drops documents exceeding the current pack length.
         for source, samples in state["buffers"].items():
             if source in self._buffers:
                 self._buffers[source].extend(samples)
