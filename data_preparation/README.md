@@ -501,8 +501,25 @@ Pretrain sources need a text column (`text_field`, default `text`); instruct sou
 `check_limit` bounds the rows inspected). Write a new converter when the source's schema is not a simple column
 mapping: add a function `(row) -> row` to `converters.py`, register it in `CONVERTERS` (or `FILTERS`), test it on a
 hand-written row in `test_sources.py`, and reference it by name in the YAML. For an instruct source a converter
-raising `ValueError` skips the row (counted in the manifest as `skipped_malformed`); for a pretrain source it fails the
+or filter raising `ValueError` skips the row (counted in the manifest as `skipped_malformed`); for a pretrain source it fails the
 download (a pretrain converter maps whole columns, a failing row means a wrong mapping).
+
+`sharegpt_conversations` deliberately keeps **the first complete opening exchange**, optionally preceded by one
+system turn: `[system,] human, gpt`. It emits one instruction/input/output row. Later turns are ignored,
+including unanswered questions and later system messages; they cannot replace either side or its context.
+Malformed openings (missing keys, unsupported roles/value containers, repeated roles, orphan answers, incomplete
+pairs) raise `ValueError`; the converter does not search forward for a usable pair. Scalar values retain text
+conversion and null becomes empty. `sharegpt_quality` checks that same pair and retains its original eligibility:
+a system-prefixed row is rejected, each side must have 50–2000 characters, and the answer must not contain the
+listed Python/Java/C++/JavaScript code-block markers. The filter requires this converter without a fields override.
+Malformed input uses the warning/counter mechanism and repeated malformed rows fail the source, while ordinary
+quality rejections do not count as malformed.
+
+This policy is recorded as `row_semantics.sharegpt_exchange: first_opening_exchange_v2` in affected raw identities;
+unrelated sources keep their fingerprints. Existing ShareGPT/SlimOrca normalized raw folders become stale and
+cannot be reused or appended to. The existing repair flow requires explicit rebuild confirmation. Rebuilding
+processed shards alone cannot recover conversation history already discarded by the old conversion: reread the
+upstream source to produce corrected raw rows, then rebuild processed rows. No existing data are relabelled as fixed.
 
 ### A local dataset
 

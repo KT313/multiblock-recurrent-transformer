@@ -460,7 +460,7 @@ class _IncrementCounters:
 
     consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
     kept: int = 0  # rows written to disk
-    skipped_malformed: int = 0  # instruct rows whose converter raised ValueError or left out instruction / output
+    skipped_malformed: int = 0  # instruct rows whose filter/converter raised ValueError or left out instruction / output
     dropped_too_long: int = 0  # instruct rows with more than `dataset_max_sequence_length` tokens
     exhausted: bool = False  # the loader ran dry, or check_limit was reached
 
@@ -804,7 +804,7 @@ class _Increment:
 
     def convert(self, name: str, raw: Row) -> Row | None:
         """
-        The row to store for source row raw, or None when the filter rejects it or the converter finds it
+        The row to store for source row raw, or None when the filter rejects it or the filter/converter finds it
         malformed (ValueError: logged at WARNING, counted in skipped_malformed). A converted row ends a run of
         malformed ones; a filter rejection neither extends nor ends it. The :data:`MAX_CONSECUTIVE_MALFORMED`-th
         malformed row in a row raises :class:`MalformedSourceError`.
@@ -812,9 +812,9 @@ class _Increment:
 
         if not self.is_instruct:
             return text_row(self.source, raw, name)
-        if self.row_filter is not None and not self.row_filter(raw):
-            return None
         try:
+            if self.row_filter is not None and not self.row_filter(raw):
+                return None
             row = _instruct_row(raw, self.converter)
         except ValueError as err:
             self._malformed(name, raw, str(err))

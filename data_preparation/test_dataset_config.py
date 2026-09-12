@@ -579,6 +579,8 @@ def test_source_processing_override() -> None:
 # stores to detect a resume against different data. Refactoring *how* the hashes are derived must keep every value
 # below byte-identical; only a deliberate change of *what* a hash counts may re-record them, in a commit that says so
 # and accepts that the data on disk are invalidated.
+# 2026-09-12: only ShareGPT/SlimOrca raw/processed and enclosing config pins change for the opening-exchange
+# policy v2; old normalized raw rows require an explicitly authorized reread of upstream conversations.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
         "config": "086e3cbcd55d23a5",
@@ -589,7 +591,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_final": {
-        "config": "35de247a7878e845",
+        "config": "822b2e35c4b3b067",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("9ff1cc2140a2b822", "ca1ab0beb98b43f7"),
@@ -616,15 +618,15 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
             "orca_math": ("381878828be6e63e", "b96faabbf8e755a2"),
             "evol_code": ("cb646fa51c648585", "d39756fbe8890177"),
             "code_alpaca": ("ab159c3c08e77fd9", "382c34ee68619be9"),
-            "slimorca": ("b18dbd772a5a446e", "9f81da060897f48f"),
-            "sharegpt": ("da3c0a21cdeef944", "f504645e2fbb2aa5"),
+            "slimorca": ("1008180f9ff17ce6", "32be05e5c416aedd"),
+            "sharegpt": ("d9695c8ec7a208f7", "abd6da4cd2d78dda"),
             "wizardlm": ("2350f2ca1c56dce9", "25d3f26f05f3359f"),
         },
     },
 }
 # The mini and the v2 config are the final config's sources with other budgets: the same raw and processed hashes.
-PINNED_HASHES["crow_300m_mini"] = {"config": "ad36dd19cd915340", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
-PINNED_HASHES["v2_50M_tokens"] = {"config": "ef5b0671149a5938", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["crow_300m_mini"] = {"config": "19a97bee362aac7a", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["v2_50M_tokens"] = {"config": "c979b088fdc5c40b", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
 
 
 @pytest.mark.parametrize("name", list(PINNED_HASHES))
@@ -1123,3 +1125,39 @@ def test_raw_hash_of_a_source_outside_the_config_matches_raw_hash() -> None:
     assert cfg.raw_hash_of(source) == cfg.raw_hash(name)
     assert cfg.raw_hash_of(dataclasses.replace(source, seed=source.seed + 1)) != cfg.raw_hash(name)  # synthetic: seed is raw identity
     assert cfg.raw_hash_of(dataclasses.replace(source, describe_tokens_per_row=7)) == cfg.raw_hash(name)  # not hashed
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sharegpt_policy_versions_only_affected_persisted_identities(filtered: bool) -> None:
+    d = _minimal()
+    source = d["sources"]["ins"]
+    source.pop("fields")
+    source["converter"] = "sharegpt_conversations"
+    if filtered:
+        source["filter"] = "sharegpt_quality"
+    cfg = _build(d)
+    payload = cfg.raw_hash_payload("ins")
+    assert payload["row_semantics"] == {"sharegpt_exchange": "first_opening_exchange_v2"}
+    legacy_payload = {"source": dc.hash_payload(cfg.sources["ins"], "raw")}
+    legacy_raw = dc._stable_hash(legacy_payload)
+    assert cfg.raw_hash("ins") != legacy_raw
+    legacy_processed = {**cfg.processed_hash_payload("ins"), "raw": legacy_raw}
+    assert cfg.processed_hash("ins") != dc._stable_hash(legacy_processed)
+    unaffected = _build(_minimal())
+    for name in ("pre", "hold"):
+        assert cfg.raw_hash(name) == unaffected.raw_hash(name)
+        assert cfg.processed_hash(name) == unaffected.processed_hash(name)
+    assert unaffected.raw_hash_payload("ins") == {"source": dc.hash_payload(unaffected.sources["ins"], "raw")}
+    if not filtered:
+        overridden = dataclasses.replace(cfg.sources["ins"], fields={"instruction": "q", "output": "a"})
+        assert cfg.raw_hash_payload_of(overridden) == {"source": dc.hash_payload(overridden, "raw")}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"converter": "first_two_turns"},
+    {"fields": {"instruction": "q", "output": "a"}},
+    {"converter": "sharegpt_conversations", "fields": {"instruction": "q", "output": "a"}},
+])
+def test_sharegpt_filter_requires_the_matching_exchange_converter(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="sharegpt_quality requires converter sharegpt_conversations without a fields override"):
+        SourceConfig(kind="instruct", loader="local", path="fixture", filter="sharegpt_quality", **kwargs)

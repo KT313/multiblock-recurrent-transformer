@@ -1485,3 +1485,81 @@ def test_download_github_code_group_bar_counts_only_rows_towards_a_target(
     assert second["java"].rows() > 1, "the passive member stored what the pass read on"
     assert layout.raw_dir("name_go").exists(), "the extra language got a folder"
     assert [(bar.initial, bar.total, bar.n) for bar in bars][1] == (1, 4, 4), "java (passive) and Go count for neither total nor n"
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sharegpt_pipeline_stores_the_exchange_it_checks_and_counts_malformed(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader,
+    caplog: pytest.LogCaptureFixture, filtered: bool,
+) -> None:
+    first = _sharegpt("h" * 60, "a" * 60)
+    first["conversations"].append({"from": "human", "value": "unanswered B"})
+    later_bad = _sharegpt("j" * 60, "b" * 60)
+    later_bad["conversations"].extend(_sharegpt("q" * 60, "```python" + "x" * 60)["conversations"])
+    first_bad = _sharegpt("short", "a" * 60)
+    first_bad["conversations"].extend(_sharegpt("q" * 60, "good" * 20)["conversations"])
+    system = _sharegpt("k" * 60, "c" * 60)
+    system["conversations"].insert(0, {"from": "system", "value": "initial"})
+    system["conversations"].append({"from": "system", "value": "later"})
+    malformed = {"conversations": [{"from": "human", "value": "q"}, {"from": "human", "value": "q2"}]}
+    src_dir = layout.root.parent / "opening"
+    write_local(src_dir, [first, later_bad, first_bad, system, malformed], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifest = download(cfg, "s", layout, rows_needed=10)
+    assert manifest.rows_fetched == 5 and manifest.skipped_malformed == 1 and manifest.exhausted
+    stored = [{key: value for key, value in row.items() if key != "tokens"} for row in read_rows(layout.raw_dir("s"))]
+    expected = [
+        {"instruction": "h" * 60, "input": "", "output": "a" * 60},
+        {"instruction": "j" * 60, "input": "", "output": "b" * 60},
+    ]
+    if not filtered:
+        expected.extend([
+            {"instruction": "short", "input": "", "output": "a" * 60},
+            {"instruction": "k" * 60, "input": "initial", "output": "c" * 60},
+        ])
+    assert stored == expected
+    assert "opening turn 1 must be gpt" in caplog.text
+
+
+def test_sharegpt_filter_malformed_openings_use_existing_failure_threshold(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+) -> None:
+    src_dir = layout.root.parent / "malformed_openings"
+    wrong = {"conversations": [{"from": "gpt", "value": "orphan"}]}
+    write_local(src_dir, [wrong] * MAX_CONSECUTIVE_MALFORMED, "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with pytest.raises(MalformedSourceError, match="10 consecutive rows") as info:
+        download(cfg, "s", layout, rows_needed=10)
+    assert len(info.value.samples) == MAX_CONSECUTIVE_MALFORMED
+    assert all("must be human" in reason for _, reason in info.value.samples)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_legacy_sharegpt_identity_refuses_append_and_repair_without_confirmation(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+    read_rows: Reader, mtimes: Mtimes, filtered: bool,
+) -> None:
+    from data_preparation.dataset_config import _stable_hash
+    from data_preparation.lib.build.repair import ConfirmationRequired, repair_broken_and_stale_folders
+
+    src_dir = layout.root.parent / "legacy_sharegpt"
+    write_local(src_dir, [_sharegpt("h" * 60, "a" * 60)] * 3, "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    manifest = download(cfg, "s", layout, rows_needed=1)
+    # Emulate the exact unversioned raw identity written by the previous conversion implementation.
+    manifest.hash_payload = {"source": cfg.raw_hash_payload("s")["source"]}
+    manifest.source_hash = _stable_hash(manifest.hash_payload)
+    raw = layout.raw_dir("s")
+    manifest.save(raw)
+    before, rows_before = mtimes(raw), read_rows(raw)
+    inspection = inspect_raw(cfg, "s", layout)
+    assert inspection.state == "stale" and "row_semantics" in inspection.reason
+    with pytest.raises(RawFolderError, match="stale.*row_semantics"):
+        download(cfg, "s", layout, rows_needed=3)
+    with pytest.raises(ConfirmationRequired, match="row_semantics"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
+    assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == manifest

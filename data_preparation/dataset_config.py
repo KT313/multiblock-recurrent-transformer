@@ -29,6 +29,7 @@ from typing import Any, Literal, Optional
 
 from jsonargparse import ArgumentError, ArgumentParser
 
+from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
 from data_preparation.lib.stages.benchmarks import benchmark_revisions
 from data_preparation.lib.stages.truncation import TOKEN_RULE
 
@@ -367,6 +368,8 @@ class SourceConfig:
             raise ValueError("kind instruct requires fields or converter")
         if self.fields is not None and not {"instruction", "output"} <= set(self.fields):
             raise ValueError("fields must map at least instruction and output")
+        if self.filter == "sharegpt_quality" and (self.converter != "sharegpt_conversations" or self.fields is not None):
+            raise ValueError("filter sharegpt_quality requires converter sharegpt_conversations without a fields override")
         if self.check_limit is not None and self.check_limit <= 0:
             raise ValueError("check_limit must be positive (omit it to read the whole source)")
         if self.rows is not None and self.rows <= 0:
@@ -711,7 +714,11 @@ class DatasetConfig:
         return self.raw_hash_payload_of(self.sources[source_name])
 
     def raw_hash_payload_of(self, source: SourceConfig) -> dict[str, Any]:
-        return {"source": hash_payload(source, "raw")}
+        payload = {"source": hash_payload(source, "raw")}
+        # Keep unrelated source fingerprints unchanged. A fields override bypasses the named converter.
+        if (source.converter == "sharegpt_conversations" and source.fields is None) or source.filter == "sharegpt_quality":
+            payload["row_semantics"] = {"sharegpt_exchange": SHAREGPT_EXCHANGE_POLICY}
+        return payload
 
     def processed_hash(self, source_name: str) -> str:
         """
