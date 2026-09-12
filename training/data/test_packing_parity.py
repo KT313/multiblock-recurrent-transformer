@@ -10,7 +10,7 @@ import torch
 
 import model.model as model_module
 from model import build_model
-from model.layers.attention import document_attention_mask
+from model.layers.attention import AttentionMask, document_attention_mask
 from model.test_config import TINY_ARCHITECTURE
 from training.data.collate import Sample, pad_and_shift
 from training.data.packing import pack_samples
@@ -38,10 +38,13 @@ def test_padded_and_packed_batches_give_the_same_gradients(
     samples = _documents(tokenizer)
     steps = (1, 2)
 
-    def loss_and_grads(**inputs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def loss_and_grads(
+        input_ids: torch.Tensor, labels: torch.Tensor, position_ids: torch.Tensor | None = None,
+        attention_mask: AttentionMask = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         torch.manual_seed(0)
-        model = build_model(TINY_ARCHITECTURE).train()
-        out = model(**inputs, num_steps=steps)
+        model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False).train()
+        out = model(input_ids, labels=labels, position_ids=position_ids, attention_mask=attention_mask, num_steps=steps)
         out["loss"].backward()
         return out["loss"].detach(), {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
 

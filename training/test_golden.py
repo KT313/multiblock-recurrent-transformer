@@ -92,5 +92,6 @@ def test_golden_mismatches_reports_every_difference() -> None:
 
 def test_golden_fixture_is_committed() -> None:
     golden = json.loads(GOLDEN_RUN_PATH.read_text())
-    assert set(golden) == {"steps", "checkpoints", "optimizer_steps", "parameter_norms"}
+    assert set(golden) == {"steps", "checkpoints", "optimizer_steps", "parameter_norms", "loss_normalization"}
+    assert golden["loss_normalization"] == "supervised_token_v1"
     assert golden["optimizer_steps"] == 19 and len(golden["steps"]) == 20

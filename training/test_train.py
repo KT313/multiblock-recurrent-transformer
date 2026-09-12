@@ -408,7 +408,8 @@ def _tiny_cli_arguments(tiny_dataset_dir: Path, out_dir: Path, *overrides: str) 
     `config/tiny.yaml` on the prepared tiny dataset, fp32 (bf16 autocast is slow on the CPU), no wandb.
     """
 
-    return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir), "--precision", "32", *overrides]
+    return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir),
+            "--precision", "32", "--use_custom_kernels", "false", *overrides]
 
 
 def _assert_clean_terminal(text: str, width: int) -> str:

@@ -345,8 +345,10 @@ def test_non_finite_loss_terminates(
 
     def nan_forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
-        assert out["loss"] is not None
-        out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+        objective_loss = out[objective]
+        assert objective_loss is not None
+        out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
@@ -369,8 +371,10 @@ def test_non_finite_loss_after_the_first_step_checkpoints_the_model_before_it(
     def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
         if self.step == 3:
-            assert out["loss"] is not None
-            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+            objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+            objective_loss = out[objective]
+            assert objective_loss is not None
+            out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
@@ -403,8 +407,10 @@ def test_non_finite_loss_writes_a_failed_checkpoint_beside_the_regular_one(
     def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
         if self.step == 3:
-            assert out["loss"] is not None
-            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+            objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+            objective_loss = out[objective]
+            assert objective_loss is not None
+            out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
