@@ -67,6 +67,22 @@ def _three_sources(cfg_factory: CfgFactory) -> DatasetConfig:
     return cfg_factory(sources, tokens=TOKENS)
 
 
+@pytest.mark.parametrize("operation", ["prepare", "status"])
+def test_configuration_revalidated_before_dataset_mutation(
+    cfg_factory: CfgFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    config = _three_sources(cfg_factory)
+    config.tokenizer.name = "../outside"
+    monkeypatch.setattr(runner, "load_dataset_config", lambda path: config)
+    root = tmp_path / "dataset"
+    with pytest.raises(ValueError, match="tokenizer.name"):
+        if operation == "prepare":
+            prepare(TINY, root, assume_yes=False)
+        else:
+            status(TINY, root)
+    assert not root.exists()
+
+
 # --- end to end ------------------------------------------------------------------------------------------------------
 
 

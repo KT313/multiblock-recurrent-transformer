@@ -598,8 +598,9 @@ def test_leftover_temporary_folder_is_removed(cfg_factory: CfgFactory, with_toke
     leftover = layout.processed_dir("a").with_name("a.tmp")
     leftover.mkdir()
     (leftover / "data-00000.parquet").write_bytes(b"junk")
+    Manifest(source="a", source_hash="incomplete", stage="processed").save(leftover)
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
-    assert report.actions == [RepairAction("a", leftover, "processed", "delete", "leftover of an interrupted all-at-once build")]
+    assert report.actions == [RepairAction("a", leftover, "processed", "delete", "leftover of an interrupted all-at-once build", destination=layout.processed_dir("a"), artifact_role="temporary")]
     assert not leftover.exists() and layout.processed_dir("a").exists()
 
 
@@ -623,6 +624,7 @@ def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
     old = processed.with_name("a.old")
     old.mkdir()
     (old / "data-00000.parquet").write_bytes(b"replaced")
+    Manifest(source="a", source_hash="previous", stage="processed").save(old)
     tmp_snapshot = _snapshot(temporary)
 
     dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
@@ -633,17 +635,17 @@ def test_complete_tmp_next_to_missing_processed_finishes_the_swap(
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
     assert calls == [], "derived data: no confirmation"
     assert _kinds(report) == [("a", "processed", "swap"), ("a", "processed", "delete")]
-    assert report.actions[0] == RepairAction("a", temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place")
-    assert report.actions[1] == RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")
+    assert report.actions[0] == RepairAction("a", temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place", destination=processed, artifact_role="temporary")
+    assert report.actions[1] == RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap", destination=processed, artifact_role="backup")
     assert processed.exists() and not temporary.exists() and not old.exists()
     assert _snapshot(processed) == tmp_snapshot and read_rows(processed) == rows_before, "renamed, not rewritten: no data lost"
     assert repair_broken_and_stale_folders(cfg, layout, assume_yes=False).actions == []
 
 
-def test_incomplete_tmp_next_to_missing_processed_is_still_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
+def test_unowned_tmp_next_to_missing_processed_is_preserved(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
     """
     Only a .tmp whose own manifest says the build finished (current hash, every shard verifies) is swapped
-    into place; one without a manifest is the leftover of an interrupted build as before.
+    into place; one without ownership evidence must be preserved for inspection.
     """
 
     cfg = _prepared(cfg_factory, with_tokenizer, layout)
@@ -651,10 +653,10 @@ def test_incomplete_tmp_next_to_missing_processed_is_still_deleted(cfg_factory: 
     temporary = processed.with_name("a.tmp")
     processed.rename(temporary)
     (temporary / MANIFEST_NAME).unlink()  # nothing says the build finished
-    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
-    assert _kinds(report) == [("a", "processed", "delete")]
-    assert report.actions[0].reason == "leftover of an interrupted all-at-once build"
-    assert not temporary.exists() and not processed.exists()
+    before = _snapshot(temporary)
+    with pytest.raises(RepairError, match="ownership evidence"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    assert _snapshot(temporary) == before and not processed.exists()
 
 
 def test_complete_tmp_next_to_an_existing_processed_folder_is_deleted(cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout) -> None:
@@ -685,13 +687,14 @@ def test_leftover_old_folder_is_removed_without_confirmation(cfg_factory: CfgFac
     old = processed.with_name("a.old")
     old.mkdir()
     (old / "data-00000.parquet").write_bytes(b"replaced")
+    Manifest(source="a", source_hash="previous", stage="processed").save(old)
     before = _snapshot(processed)
     dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
-    assert dry.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")]
+    assert dry.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap", destination=processed, artifact_role="backup")]
     assert old.exists()
     calls: list[str] = []
     report = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=_recording_confirm(calls, False))
-    assert calls == [] and report.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap")]
+    assert calls == [] and report.actions == [RepairAction("a", old, "processed", "delete", "leftover of a completed folder swap", destination=processed, artifact_role="backup")]
     assert not old.exists() and _snapshot(processed) == before
 
 
@@ -796,6 +799,7 @@ def test_dry_run_reports_everything_and_touches_nothing(
     _edit_manifest(layout.processed_dir("c"), source_hash="stale")
     leftover = layout.processed_dir("c").with_name("c.tmp")
     leftover.mkdir()
+    Manifest(source="c", source_hash="incomplete", stage="processed").save(leftover)
     monkeypatch.setattr(sys, "stdin", io.StringIO())
     before = _snapshot(layout.root)
     listing_before = sorted(str(path) for path in layout.root.rglob("*"))
@@ -845,3 +849,97 @@ def test_report_describe_and_helpers(tmp_path: Path) -> None:
     assert raw_deleted(planned) == [] and raw_deletions_planned(planned) == planned.actions[:1]
     assert RepairReport().describe() == "nothing to repair"
     assert json.dumps([action.reason for action in planned.actions])  # reasons are plain strings for the status output
+
+
+@pytest.mark.parametrize("collision", ["a.old", "a.tmp"])
+def test_selected_sources_cannot_bypass_full_identifier_validation(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, collision: str,
+) -> None:
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    cfg.sources[collision] = cfg.sources["a"]  # simulate mutation after config loading
+    collision_dir = layout.root / "processed" / collision
+    collision_dir.mkdir()
+    (collision_dir / "sentinel").write_bytes(b"healthy other source")
+    before = _snapshot(layout.root)
+    with pytest.raises(ValueError, match="sources key"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=True, sources=["a"])
+    assert _snapshot(layout.root) == before
+
+
+def test_new_owned_swap_recovers_after_first_rename(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+) -> None:
+    from data_preparation.lib.storage.ownership import BuildWorkspace, OWNER_NAME
+
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    workspace = BuildWorkspace(layout.processed_dir("a"))
+    original = _snapshot(workspace.final)
+    temporary = workspace.create_temporary()
+    shutil.copytree(workspace.final, temporary, dirs_exist_ok=True)
+    build_id = workspace.evidence(temporary, "temporary")
+    workspace.mark(workspace.final, "backup", build_id)
+    workspace.final.rename(workspace.path("backup"))
+    before = _snapshot(layout.root)
+    dry = repair_broken_and_stale_folders(cfg, layout, assume_yes=False, dry_run=True)
+    assert _snapshot(layout.root) == before
+    assert [action.action for action in dry.actions] == ["swap", "delete"]
+    repair_broken_and_stale_folders(cfg, layout, assume_yes=False)
+    restored = _snapshot(workspace.final)
+    restored.pop(OWNER_NAME)
+    assert restored == original
+    assert not temporary.exists() and not workspace.path("backup").exists()
+
+
+def test_mismatched_build_generations_are_not_cleaned(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+) -> None:
+    from uuid import uuid4
+    from data_preparation.lib.storage.ownership import BuildWorkspace
+
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    workspace = BuildWorkspace(layout.processed_dir("a"))
+    temporary = workspace.create_temporary()
+    shutil.copytree(workspace.final, temporary, dirs_exist_ok=True)
+    workspace.mark(workspace.final, "backup", str(uuid4()))
+    workspace.final.rename(workspace.path("backup"))
+    before = _snapshot(layout.root)
+    with pytest.raises(RepairError, match="another build"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
+    assert _snapshot(layout.root) == before
+
+
+def test_owner_changed_after_planning_preserves_every_folder(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+) -> None:
+    from uuid import uuid4
+    from data_preparation.lib.build.repair import perform_repairs
+    from data_preparation.lib.storage.ownership import BuildWorkspace
+
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    workspace = BuildWorkspace(layout.processed_dir("a"))
+    temporary = workspace.create_temporary()
+    (temporary / "sentinel").write_bytes(b"keep this generation")
+    report = repair_broken_and_stale_folders(cfg, layout, assume_yes=True, dry_run=True)
+    workspace.mark(temporary, "temporary", str(uuid4()))
+    before = _snapshot(layout.root)
+    with pytest.raises(RepairError, match="changed since inspection"):
+        perform_repairs(report)
+    assert _snapshot(layout.root) == before
+    assert (temporary / "sentinel").read_bytes() == b"keep this generation"
+
+
+def test_symlinked_processed_folder_is_never_repaired(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+) -> None:
+    from data_preparation.lib.storage.ownership import OwnershipError
+
+    cfg = _prepared(cfg_factory, with_tokenizer, layout)
+    processed = layout.processed_dir("a")
+    outside = layout.root.parent / "outside"
+    processed.rename(outside)
+    processed.symlink_to(outside, target_is_directory=True)
+    before = _snapshot(outside)
+    with pytest.raises(OwnershipError, match="symlink"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=True)
+    assert _snapshot(outside) == before
+    assert processed.is_symlink()

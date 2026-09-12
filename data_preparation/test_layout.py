@@ -57,3 +57,11 @@ def test_frozen_and_hashable() -> None:
     assert layout == DatasetLayout(Path("a")) and hash(layout) == hash(DatasetLayout(Path("a")))
     with pytest.raises(AttributeError):
         layout.root = Path("b")  # type: ignore[misc]  # frozen dataclass: assignment must fail
+
+
+@pytest.mark.parametrize("name", ["../outside", "a/b", "a\\b", "a.old", "a.tmp", ".build-work"])
+def test_layout_rejects_unsafe_components(name: str) -> None:
+    layout = DatasetLayout()
+    for method in (layout.raw_dir, layout.processed_dir, layout.tokenizer_dir):
+        with pytest.raises(ValueError, match="safe path component"):
+            method(name)

@@ -18,7 +18,7 @@ Two write modes:
   build, so the rows kept are exactly those of one full pass.
 * all at once (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash): every
   raw shard is read, the survivors are shuffled with random.Random(source.seed) (or, for minhash, run through
-  the LSH index), written into processed/<name>.tmp and swapped into place rename-aside
+  the LSH index), written into a private owned build slot and swapped into place rename-aside
   (:func:`_swap_into_place`; the repair step finishes an interrupted swap). Why shuffle: the training loader reads
   a source's shards in order and only mixes between sources; instruct repositories are sorted by task, so without
   a shuffle the model would see one task for thousands of steps. Instruct sources are small, so rebuilding them
@@ -45,6 +45,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from data_preparation.lib.storage.ownership import BuildWorkspace, guarded_path
 from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
 from data_preparation.layout import DatasetLayout, processed_columns
 from data_preparation.lib.abort import StopCheck, check_stop
@@ -102,6 +103,8 @@ def build_source(
     without a current raw manifest (run the download first).
     """
 
+    config.validate_identifiers()
+    guarded_path(layout.root, layout.processed_dir(name))
     source = config.sources[name]
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
@@ -119,6 +122,7 @@ def build_source(
         )
 
     if all_at_once:
+        BuildWorkspace(processed_dir).check_start()
         if assessment.problem == "none" and assessment.manifest is not None:
             return assessment.manifest  # built from exactly the current raw shards
         # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
@@ -207,7 +211,7 @@ def _build_all_at_once(
 ) -> None:
     """
     Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
-    it, written into output.directory (the .tmp sibling) and swapped over processed_dir rename-aside
+    it, written into output.directory (the owned temporary slot) and swapped over processed_dir rename-aside
     (:func:`_swap_into_place`).
     """
 
@@ -223,7 +227,8 @@ def _build_all_at_once(
     temporary = output.directory
     if temporary.exists():
         log.warning("removing leftover %s of an interrupted build", temporary)
-        shutil.rmtree(temporary)
+        BuildWorkspace(processed_dir).remove(temporary, "temporary")
+    BuildWorkspace(processed_dir).create_temporary()
     output.publish(survivors, shard_size)
     output.save(shard_list(raw.shards))
     _swap_into_place(temporary, processed_dir)
@@ -246,37 +251,21 @@ def _record_filter_load(dedup_stats: dict[str, Any], seen: SeenDocuments) -> Non
 def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
     """
     Replace processed_dir by the complete temporary folder without a moment where neither exists: the
-    old folder steps aside (processed/<name>.old), the new one is renamed into place, and only then is anything
-    deleted. A crash between the renames leaves the .old next to the complete .tmp (the repair step
-    finishes the swap), one after them leaves the new folder in place next to a stale .old (the repair step
+    old folder steps aside (the owned backup slot), the new one is renamed into place, and only then is anything
+    deleted. A crash between the renames leaves the backup next to the complete temporary (the repair step
+    finishes the swap), one after them leaves the new folder in place next to a stale backup (the repair step
     removes it).
     """
 
-    old = _old_dir(processed_dir)
-    if old.exists():
-        shutil.rmtree(old)  # leftover of an earlier crashed swap; the folder that replaced it is in place or in `temporary`
-    if processed_dir.exists():
-        processed_dir.rename(old)
-    temporary.rename(processed_dir)
-    if old.exists():
-        shutil.rmtree(old)
+    BuildWorkspace(processed_dir).publish(temporary)
 
 
 def _temporary_dir(processed_dir: Path) -> Path:
-    """
-    processed/<name>.tmp: where an all-at-once build writes before the swap into place.
-    """
-
-    return processed_dir.with_name(processed_dir.name + ".tmp")
+    return BuildWorkspace(processed_dir).path("temporary")
 
 
 def _old_dir(processed_dir: Path) -> Path:
-    """
-    processed/<name>.old: where :func:`_swap_into_place` parks the folder it replaces until the new one is
-    in place.
-    """
-
-    return processed_dir.with_name(processed_dir.name + ".old")
+    return BuildWorkspace(processed_dir).path("backup")
 
 
 # --- the processed folder ------------------------------------------------------------------------------------------------
@@ -286,7 +275,7 @@ def _old_dir(processed_dir: Path) -> Path:
 class ProcessedOutput:
     """
     The processed folder of one build: its manifest, the directory shards are published into (the final folder,
-    or the .tmp sibling of an all-at-once build) and whether the manifest was created by this call (a new
+    or the owned temporary slot of an all-at-once build) and whether the manifest was created by this call (a new
     manifest is saved even when nothing is appended, so an empty source still counts as built).
     """
 
@@ -309,6 +298,7 @@ class ProcessedOutput:
             log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
         if processed_dir.exists():
             log.info("%s: removing %s before the rebuild", name, processed_dir)
+            guarded_path(processed_dir.parent.parent, processed_dir)
             shutil.rmtree(processed_dir)
         return cls(_fresh_manifest(config, name, source_hash), processed_dir, is_new=True)
 

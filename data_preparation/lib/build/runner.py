@@ -142,6 +142,7 @@ def prepare(
     """
 
     config = load_dataset_config(config_path)
+    config.validate_identifiers()
     config_name = Path(config_path).name
     layout = DatasetLayout(Path(dataset_dir))
     active_steps = checked_steps(steps)
@@ -186,6 +187,7 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     """
 
     config = load_dataset_config(config_path)
+    config.validate_identifiers()
     layout = DatasetLayout(Path(dataset_dir))
     warn_about_overlaps(config)
     with unreadable_shard_remedy(config_path, dataset_dir):

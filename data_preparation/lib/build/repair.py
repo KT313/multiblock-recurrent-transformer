@@ -24,8 +24,8 @@ processed/ folder of every source the config uses and decides what has to go:
   every other rebuild (broken or stray shards, no manifest, raw shards gone or being deleted) goes without asking.
   A crash leftover (one unlisted file that is exactly the next shard the resumed build writes) is left alone.
   Leftovers of an interrupted rename-aside swap (lib/stages/build.py:_swap_into_place): a complete
-  processed/<name>.tmp next to a missing processed folder is renamed into place, an incomplete .tmp and a
-  processed/<name>.old are removed without asking.
+  owned complete temporary next to a missing processed folder is renamed into place. Owned incomplete
+  temporaries and replaced backups are removed without asking; ambiguous legacy .tmp/.old folders are refused.
 
 Nothing is touched until every folder was inspected; the queued raw deletions and adoptions, healthy-shard-dropping
 truncations and stale / unparsable-manifest processed deletions are then confirmed once with one list. dry_run=True
@@ -46,10 +46,11 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from data_preparation.lib.storage.ownership import BuildWorkspace, OwnershipError, Role, guarded_path
 from data_preparation.dataset_config import DatasetConfig
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ShardList, assess_processed_folder
@@ -114,6 +115,11 @@ class RepairAction:
     keep_shards: int | None = None  # truncations: the good prefix the inspection found (`good_prefix_length`)
     foreign_config: str | None = None  # raw deletions: the dataset config the folder was downloaded under, when it is another one
     adopt: dict[str, Any] | None = None  # adoptions: the manifest's new token_count / tokenizer / tokenizer_hash (`token_measure`)
+
+    destination: Path | None = None
+    artifact_role: Role | None = None
+    dataset_root: Path | None = field(default=None, compare=False, repr=False)
+    owner_build_id: str | None = field(default=None, compare=False, repr=False)
 
     def describe(self) -> str:
         return f"{self.action} {self.kind} {self.folder} ({self.source}): {self.reason}"
@@ -183,9 +189,20 @@ def repair_broken_and_stale_folders(
     Raises :class:`RepairError` for a raw folder that holds shards but no manifest.
     """
 
+    config.validate_identifiers()
     planned = RepairReport()
     for name in config.sources if sources is None else sources:
         inspect_source(config, name, layout, planned, config_name=config_name)
+    for action in planned.actions:
+        if action.action != "leave":
+            guarded_path(layout.root, action.folder)
+    planned.actions = [
+        replace(action, dataset_root=layout.root, owner_build_id=(
+            BuildWorkspace(action.destination).evidence(action.folder, action.artifact_role)
+            if action.destination is not None and action.artifact_role is not None else None
+        ))
+        for action in planned.actions
+    ]
     if dry_run:
         return planned
     foreign = planned.foreign_deletions_planned()
@@ -209,6 +226,8 @@ def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, repo
     the processed folder is not judged against raw shards nobody knows.
     """
 
+    guarded_path(layout.root, layout.raw_dir(name))
+    guarded_path(layout.root, layout.processed_dir(name))
     inspection = inspect_raw(config, name, layout)
     if inspection.state == "unreadable":
         _plan(report, name, layout.raw_dir(name), "raw", "leave", inspection.reason)
@@ -283,32 +302,66 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
 
 def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
     """
-    Plan the cleanup after an interrupted rename-aside swap of an all-at-once build
-    (lib/stages/build.py:_swap_into_place): a complete processed/<name>.tmp (verdict ok: current
-    manifest, every shard verifies) next to a missing processed folder is the swap's data and is renamed into
-    place; any other leftover .tmp is removed as an interrupted build's; a leftover processed/<name>.old
-    (the folder a swap already replaced) is removed without asking.
+    Inspect private build slots and legacy siblings without mutation. Each needs explicit ownership or a
+    legacy processed manifest naming this source. A complete temporary replaces an absent final directory;
+    otherwise preserve a complete backup when it is the last generation. Ambiguity aborts the entire plan.
     """
 
-    temporary = processed_dir.with_name(processed_dir.name + ".tmp")
-    if temporary.exists():
-        if not processed_dir.exists() and assess_processed_folder(config, name, temporary, raw_shards).problem == "none":
-            _plan(report, name, temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place")
+    workspace = BuildWorkspace(processed_dir)
+    leftovers: dict[Role, Path] = {}
+    for role in ("temporary", "backup"):
+        candidates = [path for path in (workspace.path(role), workspace.legacy_path(role)) if path.exists() or path.is_symlink()]
+        if len(candidates) > 1:
+            raise RepairError(f"{name}: conflicting new and legacy {role} artifacts; preserving both")
+        if candidates:
+            path = candidates[0]
+            try:
+                workspace.evidence(path, role)
+            except OwnershipError as error:
+                raise RepairError(str(error)) from error
+            leftovers[role] = path
+    temporary, old = leftovers.get("temporary"), leftovers.get("backup")
+    final_survives = processed_dir.exists() and not any(
+        action.folder == processed_dir and action.action == "delete" for action in report.actions
+    )
+    if old is not None:
+        replacement = processed_dir if final_survives else temporary
+        if replacement is not None:
+            try:
+                workspace.verify_replacement(old, replacement)
+            except OwnershipError as error:
+                raise RepairError(str(error)) from error
+    adopted = False
+    if temporary is not None:
+        if not final_survives and assess_processed_folder(config, name, temporary, raw_shards).problem == "none":
+            _plan(report, name, temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place",
+                  destination=processed_dir, artifact_role="temporary")
+            adopted = True
         else:
-            _plan(report, name, temporary, "processed", "delete", "leftover of an interrupted all-at-once build")
-    old = processed_dir.with_name(processed_dir.name + ".old")
-    if old.exists():
-        _plan(report, name, old, "processed", "delete", "leftover of a completed folder swap")
+            _plan(report, name, temporary, "processed", "delete", "leftover of an interrupted all-at-once build",
+                  destination=processed_dir, artifact_role="temporary")
+    if old is not None:
+        if not final_survives and not adopted:
+            # Retain the last complete generation when a new build cannot be adopted.
+            if assess_processed_folder(config, name, old, raw_shards).problem != "none":
+                raise RepairError(f"{old}: last backup has no complete current replacement; preserving it for inspection")
+            _plan(report, name, old, "processed", "swap", "restoring the complete backup of an interrupted swap",
+                  destination=processed_dir, artifact_role="backup")
+        else:
+            _plan(report, name, old, "processed", "delete", "leftover of a completed folder swap",
+                  destination=processed_dir, artifact_role="backup")
 
 
 def _plan(
     report: RepairReport, source: str, folder: Path, kind: FolderKind, action: RepairVerb, reason: str, *,
     needs_confirmation: bool = False, keep_shards: int | None = None, foreign_config: str | None = None, adopt: dict[str, Any] | None = None,
+    destination: Path | None = None, artifact_role: Role | None = None,
 ) -> None:  # fmt: skip
     report.actions.append(
         RepairAction(
             source=source, folder=folder, kind=kind, action=action, reason=reason, needs_confirmation=needs_confirmation,
             keep_shards=keep_shards, foreign_config=foreign_config, adopt=adopt,
+            destination=destination, artifact_role=artifact_role,
         )
     )
 
@@ -361,6 +414,23 @@ def perform_repairs(report: RepairReport) -> None:
 
     processed = [action for action in report.actions if action.kind == "processed"]
     raw = [action for action in report.actions if action.kind == "raw"]
+    # Recheck every target and ownership before the first mutation, including after a confirmation callback.
+    for action in processed + raw:
+        if action.dataset_root is not None and action.action != "leave":
+            guarded_path(action.dataset_root, action.folder)
+        if action.artifact_role is not None:
+            if action.destination is None:
+                raise RepairError(f"{action.folder}: missing artifact destination")
+            workspace = BuildWorkspace(action.destination)
+            build_id = workspace.evidence(action.folder, action.artifact_role)
+            if action.owner_build_id is not None and build_id != action.owner_build_id:
+                raise RepairError(f"{action.folder}: build ownership changed since inspection; preserving contents")
+            if action.artifact_role == "backup" and action.action == "delete":
+                replacement = next((
+                    candidate.folder for candidate in processed
+                    if candidate.action == "swap" and candidate.destination == action.destination
+                ), action.destination)
+                workspace.verify_replacement(action.folder, replacement)
     for action in processed + raw:
         if action.action == "leave":
             log.warning("%s: leaving %s alone (%s)", action.source, action.folder, action.reason)
@@ -375,7 +445,12 @@ def perform_repairs(report: RepairReport) -> None:
             _adopt_raw(action)
         else:
             log.warning("%s: renaming %s into place (%s)", action.source, action.folder, action.reason)
-            action.folder.rename(action.folder.with_name(action.folder.name.removesuffix(".tmp")))
+            if action.destination is None:
+                raise RepairError(f"{action.folder}: missing swap destination")
+            if action.destination.exists():
+                raise RepairError(f"{action.destination}: swap destination now exists; preserving both folders")
+            action.destination.parent.mkdir(parents=True, exist_ok=True)
+            action.folder.rename(action.destination)
     report.performed = True
 
 

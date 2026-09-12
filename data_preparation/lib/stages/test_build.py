@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from data_preparation import dataset_config as dc
+from data_preparation.lib.storage.ownership import BuildWorkspace, OwnershipError
 from data_preparation.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
@@ -715,8 +716,7 @@ def test_instruct_build_starts_over_when_its_tmp_folder_is_left_behind(
     write_local(src_dir, [_instruct_row(i) for i in range(4)], "jsonl")
     cfg = _instruct_cfg(cfg_factory, with_tokenizer, src_dir)
     download(cfg, "i", layout, rows_needed=4)
-    leftover = layout.processed_dir("i").with_name("i.tmp")
-    leftover.mkdir(parents=True)
+    leftover = BuildWorkspace(layout.processed_dir("i")).create_temporary()
     (leftover / "data-00000.parquet").write_bytes(b"junk")
     with caplog.at_level(logging.WARNING, logger="data_preparation"):
         m = build_source(cfg, "i", layout)
@@ -729,30 +729,31 @@ def test_swap_into_place_is_rename_aside(tmp_path: Path) -> None:
     Old aside, new in place, only then a deletion; without an old folder the aside step is skipped.
     """
 
-    processed = tmp_path / "i"
-    processed.mkdir()
+    processed = tmp_path / "processed" / "i"
+    processed.mkdir(parents=True)
     (processed / "data-00000.parquet").write_bytes(b"old")
-    temporary = tmp_path / "i.tmp"
-    temporary.mkdir()
+    workspace = BuildWorkspace(processed)
+    temporary = workspace.create_temporary()
     (temporary / "data-00000.parquet").write_bytes(b"new")
     stages_build._swap_into_place(temporary, processed)
     assert (processed / "data-00000.parquet").read_bytes() == b"new"
-    assert not temporary.exists() and not (tmp_path / "i.old").exists()
-    # first build: no old folder to step aside
-    fresh = tmp_path / "j.tmp"
-    fresh.mkdir()
+    assert not temporary.exists() and not workspace.path("backup").exists()
+    fresh_workspace = BuildWorkspace(tmp_path / "processed" / "j")
+    fresh = fresh_workspace.create_temporary()
     (fresh / "data-00000.parquet").write_bytes(b"only")
-    stages_build._swap_into_place(fresh, tmp_path / "j")
-    assert (tmp_path / "j" / "data-00000.parquet").read_bytes() == b"only" and not fresh.exists()
-    # a stale .old of an earlier crashed swap is cleared before the renames
-    stale_old = tmp_path / "i.old"
+    stages_build._swap_into_place(fresh, fresh_workspace.final)
+    assert (fresh_workspace.final / "data-00000.parquet").read_bytes() == b"only" and not fresh.exists()
+    # Anonymous leftovers cannot be removed just to make publication fit.
+    stale_old = workspace.path("backup")
     stale_old.mkdir()
     (stale_old / "data-00000.parquet").write_bytes(b"stale")
-    again = tmp_path / "i.tmp"
-    again.mkdir()
+    again = workspace.create_temporary()
     (again / "data-00000.parquet").write_bytes(b"newer")
-    stages_build._swap_into_place(again, processed)
-    assert (processed / "data-00000.parquet").read_bytes() == b"newer" and not stale_old.exists()
+    with pytest.raises(OwnershipError, match="unresolved backup"):
+        stages_build._swap_into_place(again, processed)
+    assert (processed / "data-00000.parquet").read_bytes() == b"new"
+    assert (stale_old / "data-00000.parquet").read_bytes() == b"stale"
+    assert (again / "data-00000.parquet").read_bytes() == b"newer"
 
 
 def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
@@ -774,7 +775,7 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     real_rmtree = shutil.rmtree
 
     def crash_on_old(path: str | Path, *args: Any, **kwargs: Any) -> None:
-        if str(path).endswith(".old"):
+        if Path(path).name == "backup":
             raise RuntimeError("crash while deleting the old folder")
         real_rmtree(path, *args, **kwargs)
 
@@ -782,7 +783,7 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
     with pytest.raises(RuntimeError, match="crash while deleting the old folder"):
         build_source(cfg, "i", layout)
     processed = layout.processed_dir("i")
-    old = processed.with_name("i.old")
+    old = BuildWorkspace(processed).path("backup")
     assert len(read_rows(processed)) == 8, "the new folder is in place"
     assert len(read_rows(old)) == 4, "the replaced folder survived the crash aside"
     assert not processed.with_name("i.tmp").exists()

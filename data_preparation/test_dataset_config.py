@@ -1161,3 +1161,37 @@ def test_sharegpt_policy_versions_only_affected_persisted_identities(filtered: b
 def test_sharegpt_filter_requires_the_matching_exchange_converter(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="sharegpt_quality requires converter sharegpt_conversations without a fields override"):
         SourceConfig(kind="instruct", loader="local", path="fixture", filter="sharegpt_quality", **kwargs)
+
+
+@pytest.mark.parametrize("name", ["", None, 7, ".", "..", "../outside", "/absolute", "a/b", "a\\b", "a\0b", "a.old", "a.tmp", ".build-work", "C:drive"])
+@pytest.mark.parametrize("field_name", ["sources", "tokenizer"])
+def test_unsafe_filesystem_identifiers_fail(name: Any, field_name: str) -> None:
+    config = _minimal()
+    if field_name == "sources":
+        config["sources"][name] = config["sources"]["pre"]
+    else:
+        config["tokenizer"]["name"] = name
+    with pytest.raises(ValueError, match="sources key|tokenizer.name"):
+        _build(config)
+
+
+@pytest.mark.parametrize("name", ["Books", "my books", "日本語", "C++", "a.b", "a-old", "_x"])
+def test_valid_filesystem_identifiers_preserve_identity(name: str) -> None:
+    config = _minimal()
+    config["sources"][name] = config["sources"].pop("pre")
+    for stage in config["stages"]:
+        for split in ("train", "val"):
+            if "pre" in stage[split]:
+                stage[split][name] = stage[split].pop("pre")
+    assert name in _build(config).sources
+
+
+@pytest.mark.parametrize("name", ["a.old", "a.tmp", "../outside", 7])
+def test_yaml_source_identifiers_rejected_before_layout_mutation(tmp_path: Path, name: Any) -> None:
+    config = _minimal()
+    config["sources"][name] = config["sources"]["pre"]
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match="sources|key"):
+        load_dataset_config(path)
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["invalid.yaml"]

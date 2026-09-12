@@ -56,6 +56,12 @@ training source with `rows`, and so on. The keys of the earlier schema (`instruc
 mixing and the validation split are the training dataloader's job, rows are truncated to `dataset_max_sequence_length` tokens at
 download, and the planner counts tokens (`describe_tokens_per_row` is its starting rate, not a description).
 
+Source keys and `tokenizer.name` are filesystem identities and must be nonempty single path components.
+Absolute paths, drive-qualified names, `/`, `\`, NULs, `.` and `..` are rejected. `.build-work` and the
+legacy `.tmp`/`.old` suffixes are reserved, so `books` and `books.old` cannot coexist as declared sources.
+Valid names retain their exact spelling and case; repository IDs, input paths and stage labels have separate
+rules. Generated GitHub-code source names are checked before their directories are published.
+
 The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
 generated from it), `config/datasets/crow_300m_mini.yaml` (the same sources with tiny budgets: a real-source smoke
 build of a few MB that exercises every loader; needs `HF_TOKEN` for `mini-peS2o`) and `config/datasets/tiny.yaml`
@@ -70,12 +76,23 @@ dataset/
 │                                                              append-only; the ONLY tree the download step writes
 ├── processed/<source>/       MANIFEST.json + data-*.parquet   rows after cleaning; derived from raw, cheap to rebuild;
 │                                                              the ONLY tree the build step writes  <- training reads this
+├── .build-work/processed/<source>/{temporary,backup}/       private, owned build generations
 ├── tokenizers/<name>/        MANIFEST.json + tokenizer files
 ├── hub_index/<repo>@<rev>/   file lists, row counts and row-group layout of `hf_files` / `github_code` repos (safe to delete)
 ├── benchmarks/               cached benchmark test sets (decontamination only)
 ├── build.log                 every log line of every prepare run
 └── .build.lock               one build per directory
 ```
+
+All-at-once processed builds publish from the private work tree. `BUILD_OWNER.json` records the source,
+canonical final path, role and build UUID separately from content manifests, so temporary names do not change
+content hashes. Recovery verifies ownership before removing a partial build, adopting a completed build, or
+removing its replaced backup. A dataset-root symlink is allowed; child/artifact symlinks are rejected.
+
+Legacy `processed/<source>.tmp` and `.old` folders are recovered only when a parseable processed manifest
+identifies the expected source (or valid explicit ownership metadata is present). Anonymous, wrong-source or
+conflicting leftovers are preserved and preparation fails with their path; inspect those folders manually.
+Status/dry-run only inspects ownership and never creates, deletes or adopts artifacts.
 
 Both trees are shared by every dataset config (stages 1 and 2 of the thesis config draw from the same
 `processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
@@ -119,7 +136,7 @@ Shards are published **one at a time** (written to a `.tmp` file, renamed, recor
 with the loader offset **and** the rejected-row totals as of their last row), so a network error, a crash or Ctrl-C
 keeps everything fetched so far and the next run resumes behind the last complete shard without counting a skipped
 or dropped source row twice. All-at-once builds (shuffled sources, minhash) write into
-`processed/<source>.tmp` and rename it into place.
+`.build-work/processed/<source>/temporary` and rename it into place.
 
 ## Commands
 
@@ -270,7 +287,7 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
   satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
   budget, or a lower measured tokens-per-row rate, builds the next shards.
 - **all at once** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw shard is read,
-  the survivors are shuffled with `random.Random(seed)`, written into `processed/<source>.tmp` and renamed into
+  the survivors are shuffled with `random.Random(seed)`, written into `.build-work/processed/<source>/temporary` and renamed into
   place; a top-up rebuilds the folder whole. Why shuffle at all: the training loader reads a source's shards **in
   order** and only mixes *between* sources; instruct repositories are sorted by task, so without a shuffle the model
   would see one task for thousands of steps and the "first k rows" validation split (below) would be a single task.
@@ -332,7 +349,8 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
   tokenizer, `dataset_max_sequence_length`, ...; the prompt lists the fields) joins the confirmation like a raw
   deletion, as does a manifest that cannot be parsed (the build refuses such a folder until then). Broken shards,
   unlisted shards, a missing manifest, a folder built from raw shards that no longer exist or whose raw folder is
-  being deleted, and a leftover `.tmp` folder are deleted without asking.
+  being deleted, and proven owned incomplete build artifacts are deleted without asking. Ambiguous legacy
+  `.tmp`/`.old` folders are preserved and reported as errors.
 
 Nothing is touched until every folder was inspected; the queued confirmations are answered **once**, with one
 list ("The following folders will be deleted, truncated or re-labelled (...): fineweb_edu: outdated:

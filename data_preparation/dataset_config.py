@@ -30,6 +30,9 @@ from typing import Any, Literal, Optional
 from jsonargparse import ArgumentError, ArgumentParser
 
 from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
+
+
+from data_preparation.identifiers import validate_identifier
 from data_preparation.lib.stages.benchmarks import benchmark_revisions
 from data_preparation.lib.stages.truncation import TOKEN_RULE
 
@@ -163,6 +166,7 @@ class TokenizerConfig:
     revision: Optional[str] = field(default=None, metadata=_TOKENIZER)  # Hub commit sha; pin it
 
     def __post_init__(self) -> None:
+        validate_identifier(self.name, field="tokenizer.name")
         if self.kind == "hf" and not self.hf_id:
             raise ValueError(f"tokenizer {self.name!r}: kind=hf requires hf_id")
 
@@ -448,6 +452,7 @@ class DatasetConfig:
     # --- validation ------------------------------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
+        self.validate_identifiers()
         if self.dataset_max_sequence_length <= 0:
             raise ValueError("dataset_max_sequence_length must be positive")
         if not 0 < self.training_target_sequence_length <= self.dataset_max_sequence_length:
@@ -467,6 +472,11 @@ class DatasetConfig:
         self._check_source_usage()
         self._check_dedup_modes()
         self._check_shuffled_build_sizes()
+
+    def validate_identifiers(self) -> None:
+        validate_identifier(self.tokenizer.name, field="tokenizer.name")
+        for name in self.sources:
+            validate_identifier(name, field="sources key")
 
     def _check_stage_key(self, stage_name: str, key: str) -> None:
         """

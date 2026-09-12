@@ -13,6 +13,7 @@ The tree shows the download/build boundary: sources/ holds only downloaded data,
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination
     <root>/hub_index/<repo>@<revision>/<glob hash>.json  file lists + row counts of `hf_files` / `github_code` repos
+    <root>/.build-work/processed/<source>/{temporary,backup}/  owned disposable build slots
     <root>/.build.lock                                   one build per directory
 """
 
@@ -20,6 +21,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+
+from data_preparation.identifiers import validate_identifier
 
 # columns of a processed shard per source kind; `hash` (int64 exact-dedup key) lets the build append new shards
 # instead of rewriting, and refills the dedup filter from disk
@@ -54,6 +57,7 @@ class DatasetLayout:
         Downloaded rows of source name (the only tree the download step writes).
         """
 
+        validate_identifier(name, field="source name")
         return self.root / "sources" / name / "raw"
 
     def processed_dir(self, name: str) -> Path:
@@ -61,9 +65,11 @@ class DatasetLayout:
         Cleaned rows of source name (the only tree the build step writes).
         """
 
+        validate_identifier(name, field="source name")
         return self.root / "processed" / name
 
     def tokenizer_dir(self, name: str) -> Path:
+        validate_identifier(name, field="tokenizer.name")
         return self.root / "tokenizers" / name
 
     def benchmark_cache_dir(self) -> Path:
