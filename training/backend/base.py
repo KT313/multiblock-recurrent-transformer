@@ -29,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 
 from model import RecurrentGPT
+from model.execution import ExecutionPolicy
 
 T = TypeVar("T")
 
@@ -88,6 +89,11 @@ class Backend(Protocol):
     is_main: bool
     pin_memory: bool  # whether dataloaders should pin host memory (true on CUDA)
     wrappers: tuple[str, ...]  # the wrapper kinds `setup_model` applied, outermost first (`WRAPPERS`)
+
+    @property
+    def execution_policy(self) -> ExecutionPolicy:
+        """The backend's current validated precision policy."""
+        ...
 
     def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         """

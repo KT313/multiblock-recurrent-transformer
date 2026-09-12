@@ -261,11 +261,15 @@ def test_legacy_decoding_metadata(tiny_model: RecurrentGPT, tokenizer: Tokenizer
     assert decoding["logits_to_keep"] == 0
 
 
+@pytest.mark.parametrize("precision", ["32", "bf16-mixed"])
 @pytest.mark.parametrize("use_cache", [False, True])
 def test_sampling_leaves_the_next_training_update_identical(
-    tiny_model: RecurrentGPT, tokenizer: Tokenizer, use_cache: bool,
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, use_cache: bool, precision: str,
 ) -> None:
     from copy import deepcopy
+    from model.execution import ExecutionPolicy
+
+    policy = ExecutionPolicy(precision)
 
     plain = deepcopy(tiny_model).train()
     sampled = deepcopy(tiny_model).train()
@@ -276,8 +280,10 @@ def test_sampling_leaves_the_next_training_update_identical(
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
         torch.manual_seed(38)
         if model is sampled:
-            generate_samples(model, tokenizer, IN_VOCAB_PROMPTS[:2], max_new_tokens=3, use_cache=use_cache)
-        loss = model(ids, labels=ids)["loss"]
+            generate_samples(model, tokenizer, IN_VOCAB_PROMPTS[:2], max_new_tokens=3, use_cache=use_cache,
+                             execution_policy=policy)
+        with policy.autocast("cpu"):
+            loss = model(ids, labels=ids)["loss"]
         assert loss is not None
         loss.backward()
         optimizer.step()

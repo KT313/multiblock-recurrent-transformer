@@ -23,6 +23,7 @@ from ..config import RecurrentConfig, RoPESettings, broadcast_per_block
 from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
 from ..model import RecurrentGPT
 from ..generation import GenerationState
+from ..execution import ExecutionPolicy
 
 # The `RecurrentConfig` fields stored in config.json (all of them except `name` and the nested `rope_settings`).
 _MODEL_FIELDS = (
@@ -101,6 +102,8 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         self,
         rope_base: int | None = None,
         rope_settings: dict[str, Any] | RoPESettings | None = None,
+        *,
+        execution_precision: str | None = None,
         **kwargs: Any,
     ) -> None:
         # `rope_settings` is the nested form of the same field: `RecurrentGPTConfig(**recurrent_config.to_dict())`
@@ -132,6 +135,7 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         for name, value in values.items():
             setattr(self, name, value)
         self.rope_base = rope_base
+        self.execution_precision = ExecutionPolicy(execution_precision).precision
 
         # Standard HF attribute names, derived from ours (`num_hidden_layers` = the expected unrolled depth).
         self.hidden_size = self.n_embd
@@ -177,6 +181,10 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
         self.num_recurrent_blocks = len(self.model.transformer.core_blocks)
         self._training_forwards = 0  # the inner model's sampler step, see `forward`
         self.post_init()  # type: ignore[no-untyped-call]  # untyped in transformers
+
+    def execution_policy(self) -> ExecutionPolicy:
+        """Optional export precision, explicitly entered by the caller; forward/Trainer semantics stay unchanged."""
+        return ExecutionPolicy(self.config.execution_precision)
 
     def _init_weights(self, module: torch.nn.Module) -> None:
         """
@@ -436,7 +444,8 @@ def export_sources(package_dir: Path, out_dir: Path) -> list[Path]:
 
 
 def export_to_hf(
-    model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_dir: str | Path | None = None
+    model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_dir: str | Path | None = None,
+    *, execution_policy: ExecutionPolicy | None = None,
 ) -> Path:
     """
     Write `model` as a self-contained `trust_remote_code` folder (safetensors, config.json, model sources).
@@ -446,7 +455,9 @@ def export_to_hf(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     this_module = flat_module_name(Path(__file__).resolve().relative_to(_PACKAGE_DIR))
-    hf_config = RecurrentGPTConfig.from_recurrent_config(config)
+    hf_config = RecurrentGPTConfig.from_recurrent_config(
+        config, execution_precision=execution_policy.precision if execution_policy is not None else None,
+    )
     hf_config.auto_map = {
         "AutoConfig": f"{this_module}.RecurrentGPTConfig",
         "AutoModelForCausalLM": f"{this_module}.RecurrentGPTForCausalLM",

@@ -19,7 +19,9 @@ import torch
 
 from data_preparation.lib.log import get_logger
 from evaluation.prompts import DEFAULT_PROMPTS, Prompt
-from evaluation.wrapper import Recurrence, check_recurrence, hf_wrapper_around, isolated_inference
+from evaluation.wrapper import Recurrence, check_recurrence
+from evaluation.session import inference_session
+from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 
@@ -52,6 +54,7 @@ def generate_samples(
     recurrence: Recurrence = None,
     batch_size: int = 8,
     seed: int = 0,
+    execution_policy: ExecutionPolicy | None = None,
     use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
@@ -76,10 +79,10 @@ def generate_samples(
     check_recurrence(recurrence, model)
     fitting = _fitting_prompts(prompts, tokenizer, max_new_tokens, model.config.model_max_sequence_length)
     samples: list[GeneratedSample] = []
-    with isolated_inference(model, recurrence, seed=seed):
-        wrapper = hf_wrapper_around(model, tokenizer)
+    with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
+        wrapper = session.hf_wrapper(tokenizer)
         generate = cast(Any, wrapper).generate  # set dynamically by transformers, invisible to the type checkers
-        device = next(model.parameters()).device
+        device = session.device
         for start in range(0, len(fitting), batch_size):
             batch = fitting[start : start + batch_size]
             width = max(len(ids) for _, ids in batch)
@@ -155,6 +158,7 @@ def generate_and_save_samples(
     recurrences: Sequence[Recurrence] = (None,),
     batch_size: int = 8,
     seed: int = 0,
+    execution_policy: ExecutionPolicy | None = None,
     use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
@@ -174,15 +178,18 @@ def generate_and_save_samples(
                 recurrence=recurrence,
                 batch_size=batch_size,
                 seed=seed,
+                execution_policy=execution_policy,
                 use_cache=use_cache,
             )
         )
-    decoding = {
+    decoding: dict[str, float | str | int | None] = {
         "temperature": temperature, "max_new_tokens": max_new_tokens, "seed": seed, "batch_size": batch_size,
         "use_cache": use_cache, "latent_policy": "fixed_per_token" if use_cache else "resample_prefix",
         "latent_rng": "per_core_token_columns_v1" if use_cache else "global_prefix_v1",
         "logits_to_keep": 1 if use_cache else 0,
     }
+    if execution_policy is not None:
+        decoding["execution_precision"] = execution_policy.precision
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as file:
         for sample in samples:

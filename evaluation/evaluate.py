@@ -28,6 +28,7 @@ from evaluation.benchmarks import TASK_DEFAULT_FEWSHOT, benchmarks_path, evaluat
 from evaluation.prompts import load_prompts
 from evaluation.samples import generate_and_save_samples, samples_path
 from model.config import RecurrentConfig
+from model.execution import PRECISIONS, ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 
@@ -38,6 +39,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out_dir", default=None, help="default: the checkpoint's run directory")
     parser.add_argument("--tokenizer_dir", default=None, help="default: from the checkpoint's dataset config")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--precision", choices=PRECISIONS, default=None,
+                        help="override stored run precision; old checkpoints preserve caller-controlled precision")
     parser.add_argument("--no_samples", action="store_true", help="skip the sample generations")
     parser.add_argument("--prompts_file", default=None, help="prompts file (see evaluation/prompts.py)")
     parser.add_argument("--max_new_tokens", type=int, default=64)
@@ -96,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parse_arguments(argv)
     checkpoint = Path(arguments.checkpoint)
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    execution_policy = ExecutionPolicy(arguments.precision if arguments.precision is not None
+                                       else state.get("settings", {}).get("precision"))
     step = int(state["step"])
     out_dir = Path(arguments.out_dir) if arguments.out_dir else checkpoint.parent.parent
     model = load_checkpoint_model(state, arguments.device)
@@ -116,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             recurrences=recurrences,
             batch_size=arguments.batch_size,
             seed=arguments.seed,
+            execution_policy=execution_policy,
             use_cache=not arguments.no_sample_cache,
         )
         print(f"{len(samples)} samples written to {path}")
@@ -136,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             out_path=path,
             step=step,
             seed=arguments.seed,
+            execution_policy=execution_policy,
         )
         print(f"benchmark results written to {path}")
         for name, value in metrics.items():

@@ -20,12 +20,13 @@ from torch.optim import Optimizer
 
 from data_preparation.lib.storage.atomic import write_atomically
 from model import RecurrentGPT
+from model.execution import PRECISIONS as SUPPORTED_PRECISIONS, ExecutionPolicy
 from training.backend.base import unwrap_model
 from training.backend.compilation import compile_module
 
 T = TypeVar("T")
+PRECISIONS = SUPPORTED_PRECISIONS  # compatibility export
 
-PRECISIONS = ("bf16-mixed", "32")
 WORLD_SIZE_ENV = "WORLD_SIZE"  # set by torchrun for every rank; more than 1 needs a multi-rank backend
 
 
@@ -51,8 +52,7 @@ class SingleDeviceBackend:
     is_main: bool = True
 
     def __init__(self, device: str | None = None, precision: str = "bf16-mixed") -> None:
-        if precision not in PRECISIONS:
-            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self.precision = precision
         self._check_launch_environment()
         if device is None:
             if torch.cuda.is_available():
@@ -61,10 +61,26 @@ class SingleDeviceBackend:
                 warnings.warn("No CUDA device available, falling back to CPU.", stacklevel=2)
                 device = "cpu"
         self.device = torch.device(device)
-        self.precision = precision
         self.pin_memory = self.device.type == "cuda"
         self.wrappers: tuple[str, ...] = ()
         _set_torch_flags()
+
+    @property
+    def execution_policy(self) -> ExecutionPolicy:
+        """The current validated policy; precision assignments replace it atomically."""
+        return self._execution_policy
+
+    @property
+    def precision(self) -> str:
+        precision = self._execution_policy.precision
+        assert precision is not None  # the setter forbids legacy/missing precision for a training backend
+        return precision
+
+    @precision.setter
+    def precision(self, precision: str) -> None:
+        if precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self._execution_policy = ExecutionPolicy(precision)
 
     def _check_launch_environment(self) -> None:
         """
@@ -94,12 +110,7 @@ class SingleDeviceBackend:
         return optimizer
 
     def autocast(self) -> AbstractContextManager[None]:
-        if self.precision == "bf16-mixed":
-            # torch.autocast is a context manager by protocol only (no AbstractContextManager base in the stubs)
-            return cast(
-                AbstractContextManager[None], torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
-            )
-        return nullcontext()
+        return self.execution_policy.autocast(self.device)
 
     def backward(self, loss: Tensor) -> None:
         loss.backward()  # type: ignore[no-untyped-call]  # Tensor.backward is unannotated in torch

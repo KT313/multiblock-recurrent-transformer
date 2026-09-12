@@ -572,6 +572,9 @@ import torch
 from transformers import AutoModelForCausalLM
 loaded = AutoModelForCausalLM.from_pretrained({str(out_dir)!r}, trust_remote_code=True).train(False)
 assert type(loaded).__module__.startswith("transformers_modules"), type(loaded).__module__
+assert loaded.execution_policy().precision is None
+with loaded.execution_policy().autocast("cpu"):
+    assert not torch.is_autocast_enabled("cpu")
 data = torch.load({str(tmp_path / "ref.pt")!r}, weights_only=True)
 torch.manual_seed(1)
 got = loaded(data["x"]).logits
@@ -597,3 +600,25 @@ def test_hf_config_carries_bf16_residual_stream(tmp_path: Path) -> None:
     core_norm = cast(RMSNorm, model.model.get_submodule("transformer.core_blocks.0.0.norm_1"))
     prelude_norm = cast(RMSNorm, model.model.get_submodule("transformer.prelude.0.norm_1"))
     assert core_norm.autocast_output is True and prelude_norm.autocast_output is False
+
+
+@pytest.mark.parametrize("precision", [None, "32", "bf16-mixed"])
+def test_export_execution_metadata_is_optional_and_nonarchitectural(tmp_path: Path, precision: str | None) -> None:
+    from model.execution import ExecutionPolicy
+
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    policy = None if precision is None else ExecutionPolicy(precision)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", execution_policy=policy)
+    loaded = load_exported(out_dir)
+    assert loaded.config.execution_precision == precision
+    assert loaded.model.config == model.config
+    assert loaded.execution_policy() == ExecutionPolicy(precision)
+    assert (out_dir / "execution.py").is_file()
+    assert "execution_precision" not in loaded.model.config.to_dict()
+    with loaded.execution_policy().autocast("cpu"):
+        assert torch.is_autocast_enabled("cpu") == (precision == "bf16-mixed")
+
+
+def test_execution_metadata_preserves_positional_rope_configuration() -> None:
+    config = RecurrentGPTConfig(None, {"rope_base": 1234}, execution_precision="bf16-mixed")
+    assert config.rope_base == 1234 and config.execution_precision == "bf16-mixed"

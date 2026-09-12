@@ -14,7 +14,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from evaluation.wrapper import Recurrence, check_recurrence, hf_wrapper_around, isolated_inference, recurrence_label
+from evaluation.wrapper import Recurrence, check_recurrence, recurrence_label
+from evaluation.session import inference_session
+from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
 from training.settings import DEFAULT_BENCHMARK_TASKS
@@ -43,6 +45,7 @@ def evaluate_on_benchmarks(
     out_path: Path | None = None,
     step: int | None = None,
     seed: int = 0,
+    execution_policy: ExecutionPolicy | None = None,
 ) -> dict[str, float]:
     """
     Score the model on tasks with lm-eval-harness, once per recurrence setting (steps per core block, None: the
@@ -67,11 +70,12 @@ def evaluate_on_benchmarks(
     versions: dict[str, Any] = {}
     n_shot: dict[str, Any] = {}
     for recurrence in recurrences:
-        with isolated_inference(model, recurrence, seed=seed):
-            wrapper = hf_wrapper_around(model, tokenizer)
+        with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
+            wrapper = session.hf_wrapper(tokenizer)
             language_model = hf_models.HFLM(  # BOS as in training and sampling; the table length caps the few-shot prompts
                 pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size, add_bos_token=True,
                 max_length=model.config.model_max_sequence_length,
+                mixed_precision_dtype=session.mixed_precision_dtype,
             )
             results: dict[str, Any] = lm_eval.simple_evaluate(  # log_samples: the per-sample logs are held in memory and never read
                 model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
@@ -84,7 +88,7 @@ def evaluate_on_benchmarks(
         versions = results.get("versions", versions)
         n_shot = results.get("n-shot", n_shot)
     if out_path is not None:
-        record = {
+        record: dict[str, Any] = {
             "step": step,
             "tasks": list(tasks),
             "num_fewshot": num_fewshot,
@@ -96,6 +100,8 @@ def evaluate_on_benchmarks(
             "versions": versions,
             "n-shot": n_shot,
         }
+        if execution_policy is not None:
+            record["execution_precision"] = execution_policy.precision
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
     return metrics

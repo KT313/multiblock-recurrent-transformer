@@ -540,6 +540,7 @@ def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> l
                 temperature=settings.sample_temperature,
                 use_cache=settings.sample_use_cache,
                 recurrences=settings.sample_recurrences or [None],
+                execution_policy=state.backend.execution_policy,
             )
     except Exception as error:  # a prompt the model cannot take, an OOM in generation: the run must not end on it
         log.warning("sample generation failed, the run continues: %s", error)
@@ -569,6 +570,7 @@ def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> 
                 out_path=path,
                 step=step,
                 seed=settings.seed,
+                execution_policy=state.backend.execution_policy,
             )
     except Exception as error:  # the harness needs the extra and the network; the run must not end on it
         logger.log_benchmark_failure(error)
@@ -594,6 +596,9 @@ def export_if_requested(state: RunState, logger: RunLogger) -> Path | None:
     trained_model = state.backend.plain_model(state.model)
     from model.hf import export_to_hf  # transformers behind it: imported when a run exports, not at start-up
 
-    export_to_hf(trained_model, trained_model.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir)
+    export_to_hf(
+        trained_model, trained_model.config, export_dir, tokenizer_dir=state.dataset.tokenizer_dir,
+        execution_policy=state.backend.execution_policy,
+    )
     logger.log_export(export_dir)
     return export_dir
