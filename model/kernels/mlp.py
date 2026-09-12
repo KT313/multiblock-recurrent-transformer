@@ -51,12 +51,13 @@ def _activation(GU, H, DH, DGU, N, I: tl.constexpr, BACKWARD: tl.constexpr, BLOC
 @torch.library.custom_op(f"{_NAMESPACE}::forward", mutates_args=())
 @kernel_errors("MLP")
 def _forward(x: Tensor, fc: Tensor, proj: Tensor) -> tuple[Tensor, Tensor]:
-    gu = torch.mm(x, fc.t())
-    h = torch.empty((x.shape[0], proj.shape[1]), device=x.device, dtype=x.dtype)
-    _activation[(triton.cdiv(h.numel(), 4096),)](
-        gu, h, h, gu, h.numel(), proj.shape[1], False, 4096, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]  # Triton launch option
-    )
-    return torch.mm(h, proj.t()), gu
+    with torch.cuda.device(x.device):
+        gu = torch.mm(x, fc.t())
+        h = torch.empty((x.shape[0], proj.shape[1]), device=x.device, dtype=x.dtype)
+        _activation[(triton.cdiv(h.numel(), 4096),)](
+            gu, h, h, gu, h.numel(), proj.shape[1], False, 4096, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]  # Triton launch option
+        )
+        return torch.mm(h, proj.t()), gu
 
 
 @_forward.register_fake
@@ -67,18 +68,19 @@ def _forward_fake(x: Tensor, fc: Tensor, proj: Tensor) -> tuple[Tensor, Tensor]:
 @torch.library.custom_op(f"{_NAMESPACE}::backward", mutates_args=())
 @kernel_errors("MLP")
 def _backward_op(dy: Tensor, x: Tensor, fc: Tensor, proj: Tensor, gu: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    dy = dy.contiguous()
-    dh = torch.mm(dy, proj)
-    h = dh  # Recompute H in the dead DH allocation; neither is retained for backward.
-    dgu = torch.empty_like(gu)
-    _activation[(triton.cdiv(h.numel(), 4096),)](
-        gu, h, dh, dgu, h.numel(), proj.shape[1], True, 4096, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]  # Triton launch option
-    )
-    dproj = torch.mm(dy.t(), h)
-    del h, dh
-    dx = torch.mm(dgu, fc)
-    dfc = torch.mm(dgu.t(), x)
-    return dx, dfc, dproj
+    with torch.cuda.device(x.device):
+        dy = dy.contiguous()
+        dh = torch.mm(dy, proj)
+        h = dh  # Recompute H in the dead DH allocation; neither is retained for backward.
+        dgu = torch.empty_like(gu)
+        _activation[(triton.cdiv(h.numel(), 4096),)](
+            gu, h, dh, dgu, h.numel(), proj.shape[1], True, 4096, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]  # Triton launch option
+        )
+        dproj = torch.mm(dy.t(), h)
+        del h, dh
+        dx = torch.mm(dgu, fc)
+        dfc = torch.mm(dgu.t(), x)
+        return dx, dfc, dproj
 
 
 @_backward_op.register_fake

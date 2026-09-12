@@ -87,20 +87,21 @@ def supports(
 @torch.library.custom_op(f"{_NAMESPACE}::loss_forward", mutates_args=())
 @kernel_errors("LM head")
 def loss_forward(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignore: int, sum_loss: bool = False) -> Tensor:
-    rows, width = x.shape
-    vocab = weight.shape[0]
-    losses = torch.empty(rows, device=x.device, dtype=torch.float32)
-    count = (labels != ignore).sum()
-    with torch.autocast('cuda', enabled=False):
-        for start in range(0, rows, CHUNK_TOKENS):
-            logits = torch.mm(x[start:start + CHUNK_TOKENS], weight.t())
-            _cross_entropy[(logits.shape[0],)](
-                logits, labels[start:], losses[start:], logits, count, count,
-                vocab, scale, ignore, False, triton.next_power_of_2(vocab),
-                num_warps=32 if vocab >= 16384 else 8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
-            )
-            del logits
-    return losses.sum() if sum_loss else losses.sum() / count
+    with torch.cuda.device(x.device):
+        rows, width = x.shape
+        vocab = weight.shape[0]
+        losses = torch.empty(rows, device=x.device, dtype=torch.float32)
+        count = (labels != ignore).sum()
+        with torch.autocast('cuda', enabled=False):
+            for start in range(0, rows, CHUNK_TOKENS):
+                logits = torch.mm(x[start:start + CHUNK_TOKENS], weight.t())
+                _cross_entropy[(logits.shape[0],)](
+                    logits, labels[start:], losses[start:], logits, count, count,
+                    vocab, scale, ignore, False, triton.next_power_of_2(vocab),
+                    num_warps=32 if vocab >= 16384 else 8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
+                )
+                del logits
+        return losses.sum() if sum_loss else losses.sum() / count
 
 
 @loss_forward.register_fake
@@ -113,28 +114,29 @@ def _forward_fake(x: Tensor, weight: Tensor, labels: Tensor, scale: float, ignor
 def loss_backward(
     x: Tensor, weight: Tensor, labels: Tensor, upstream: Tensor, scale: float, ignore: int, sum_loss: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    rows, width = x.shape
-    vocab = weight.shape[0]
-    dx = torch.empty_like(x)
-    dw = torch.empty(weight.shape, device=weight.device, dtype=torch.float32)
-    count = torch.ones((), device=labels.device, dtype=torch.int64) if sum_loss else (labels != ignore).sum()
-    with torch.autocast('cuda', enabled=False):
-        for start in range(0, rows, CHUNK_TOKENS):
-            chunk = x[start:start + CHUNK_TOKENS]
-            logits = torch.mm(chunk, weight.t())
-            # Safe in-place overwrite: one program owns the entire vocabulary row.
-            _cross_entropy[(chunk.shape[0],)](
-                logits, labels[start:], upstream, logits, count, upstream,
-                vocab, scale, ignore, True, triton.next_power_of_2(vocab),
-                num_warps=32 if vocab >= 16384 else 8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
-            )
-            torch.mm(logits, weight, out=dx[start:start + CHUNK_TOKENS])
-            # FP32 beta accumulation keeps chunk partials unrounded without a
-            # separate partial buffer/add kernel. The final BF16 cast is native.
-            torch.addmm(dw, logits.t(), chunk, out_dtype=torch.float32,
-                        beta=0 if start == 0 else 1, out=dw)
-            del logits
-    return dx, dw.to(weight.dtype)
+    with torch.cuda.device(x.device):
+        rows, width = x.shape
+        vocab = weight.shape[0]
+        dx = torch.empty_like(x)
+        dw = torch.empty(weight.shape, device=weight.device, dtype=torch.float32)
+        count = torch.ones((), device=labels.device, dtype=torch.int64) if sum_loss else (labels != ignore).sum()
+        with torch.autocast('cuda', enabled=False):
+            for start in range(0, rows, CHUNK_TOKENS):
+                chunk = x[start:start + CHUNK_TOKENS]
+                logits = torch.mm(chunk, weight.t())
+                # Safe in-place overwrite: one program owns the entire vocabulary row.
+                _cross_entropy[(chunk.shape[0],)](
+                    logits, labels[start:], upstream, logits, count, upstream,
+                    vocab, scale, ignore, True, triton.next_power_of_2(vocab),
+                    num_warps=32 if vocab >= 16384 else 8, enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
+                )
+                torch.mm(logits, weight, out=dx[start:start + CHUNK_TOKENS])
+                # FP32 beta accumulation keeps chunk partials unrounded without a
+                # separate partial buffer/add kernel. The final BF16 cast is native.
+                torch.addmm(dw, logits.t(), chunk, out_dtype=torch.float32,
+                            beta=0 if start == 0 else 1, out=dw)
+                del logits
+        return dx, dw.to(weight.dtype)
 
 
 @loss_backward.register_fake

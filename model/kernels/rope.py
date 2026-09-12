@@ -5,10 +5,12 @@ Rotation and deterministic bias reduction preserve the native rounding boundarie
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, cast
 
 import torch
 from torch import Tensor
+from torch._subclasses.fake_tensor import is_fake
 from torch.library import register_autograd, triton_op, wrap_triton
 try:
     import triton  # type: ignore[import-untyped]
@@ -292,52 +294,56 @@ def _split(qkv: Tensor, n_head: int) -> tuple[Tensor, Tensor, Tensor]:
 
 # Version both opaque op identities when changing registered backward structure:
 # persisted AOT graphs can otherwise reuse the previous backward decomposition.
+# triton_op also runs these bodies for fake tensors and AOT decomposition. Only
+# real launches need a device scope; compiled kernels receive Inductor guards.
 @triton_op(f"{_NAMESPACE}::forward", mutates_args=())
 def packed_forward(qkv: Tensor, bias: Tensor | None, freqs: Tensor, n_head: int) -> tuple[Tensor, Tensor, Tensor]:
-    q, k, v = _split(qkv, n_head)
-    batch, length, heads, dim = q.shape
-    outputs = [torch.empty(q.shape, dtype=q.dtype, device=q.device) for _ in range(3)]
-    qo, ko, vo = outputs
-    block, warps = _tile(heads * dim)
-    wrap_triton(_forward_kernel)[(_cdiv(batch * length, block),)](
-        q, k, v, vo, bias.contiguous() if bias is not None else q, freqs, qo, ko,
-        *_row_strides(q), *_row_strides(k), *_row_strides(v),
-        freqs.stride(0) if freqs.shape[0] != 1 else 0, freqs.stride(1),
-        *_row_strides(qo), length, batch * length, heads,
-        HAS_BIAS=bias is not None, BLOCK_S=block, NH_PAD=triton.next_power_of_2(heads), HD=dim,
-        num_warps=warps,  # pyright: ignore[reportCallIssue]  # Triton launch option
-    )
-    return qo, ko, vo
+    with torch.cuda.device(qkv.device) if qkv.device.type != "meta" and not is_fake(qkv) else nullcontext():
+        q, k, v = _split(qkv, n_head)
+        batch, length, heads, dim = q.shape
+        outputs = [torch.empty(q.shape, dtype=q.dtype, device=q.device) for _ in range(3)]
+        qo, ko, vo = outputs
+        block, warps = _tile(heads * dim)
+        wrap_triton(_forward_kernel)[(_cdiv(batch * length, block),)](
+            q, k, v, vo, bias.contiguous() if bias is not None else q, freqs, qo, ko,
+            *_row_strides(q), *_row_strides(k), *_row_strides(v),
+            freqs.stride(0) if freqs.shape[0] != 1 else 0, freqs.stride(1),
+            *_row_strides(qo), length, batch * length, heads,
+            HAS_BIAS=bias is not None, BLOCK_S=block, NH_PAD=triton.next_power_of_2(heads), HD=dim,
+            num_warps=warps,  # pyright: ignore[reportCallIssue]  # Triton launch option
+        )
+        return qo, ko, vo
 
 
 @triton_op(f"{_NAMESPACE}::backward", mutates_args=())
 def packed_backward(
     dqo: Tensor, dko: Tensor, dvo: Tensor, freqs: Tensor, bias_grad: bool, in_dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor]:
-    batch, length, heads, dim = dqo.shape
-    # FlexAttention can return heads-first gradients; read their real strides.
-    dqo = dqo.contiguous() if dqo.stride(-1) != 1 else dqo
-    dko = dko.contiguous() if dko.stride(-1) != 1 else dko
-    dvo = dvo.contiguous() if dvo.stride(-1) != 1 else dvo
-    # Compiled consumers can promote tangents. Rotation must still round to the
-    # original projection dtype before both dQKV storage and the bias reduction.
-    dqkv = torch.empty((batch, length, 3 * heads * dim), dtype=in_dtype, device=dqo.device)
-    block, warps = _tile(heads * dim)
-    n_blocks = _cdiv(batch * length, block)
-    programs = min(n_blocks, BACKWARD_PROGRAMS)
-    partial = torch.empty((programs, 2, heads, dim) if bias_grad else (0,), dtype=torch.float32, device=dqo.device)
-    wrap_triton(_backward_kernel)[(programs,)](
-        # One output pointer is essential: separate aliased view arguments cause
-        # functionalization to clone each strided storage span and reassemble it.
-        dqo, dko, dvo, freqs, dqkv, partial,
-        *_row_strides(dqo), *_row_strides(dko), *_row_strides(dvo),
-        freqs.stride(0) if freqs.shape[0] != 1 else 0, freqs.stride(1),
-        dqkv.stride(0), dqkv.stride(1), dim, length, batch * length, heads, n_blocks,
-        BIAS_GRAD=bias_grad, BLOCKS_PER_PROGRAM=_cdiv(n_blocks, programs),
-        BLOCK_S=block, NH_PAD=triton.next_power_of_2(heads), HD=dim,
-        num_warps=warps,  # pyright: ignore[reportCallIssue]  # Triton launch option
-    )
-    return dqkv, partial
+    with torch.cuda.device(dqo.device) if dqo.device.type != "meta" and not is_fake(dqo) else nullcontext():
+        batch, length, heads, dim = dqo.shape
+        # FlexAttention can return heads-first gradients; read their real strides.
+        dqo = dqo.contiguous() if dqo.stride(-1) != 1 else dqo
+        dko = dko.contiguous() if dko.stride(-1) != 1 else dko
+        dvo = dvo.contiguous() if dvo.stride(-1) != 1 else dvo
+        # Compiled consumers can promote tangents. Rotation must still round to the
+        # original projection dtype before both dQKV storage and the bias reduction.
+        dqkv = torch.empty((batch, length, 3 * heads * dim), dtype=in_dtype, device=dqo.device)
+        block, warps = _tile(heads * dim)
+        n_blocks = _cdiv(batch * length, block)
+        programs = min(n_blocks, BACKWARD_PROGRAMS)
+        partial = torch.empty((programs, 2, heads, dim) if bias_grad else (0,), dtype=torch.float32, device=dqo.device)
+        wrap_triton(_backward_kernel)[(programs,)](
+            # One output pointer is essential: separate aliased view arguments cause
+            # functionalization to clone each strided storage span and reassemble it.
+            dqo, dko, dvo, freqs, dqkv, partial,
+            *_row_strides(dqo), *_row_strides(dko), *_row_strides(dvo),
+            freqs.stride(0) if freqs.shape[0] != 1 else 0, freqs.stride(1),
+            dqkv.stride(0), dqkv.stride(1), dim, length, batch * length, heads, n_blocks,
+            BIAS_GRAD=bias_grad, BLOCKS_PER_PROGRAM=_cdiv(n_blocks, programs),
+            BLOCK_S=block, NH_PAD=triton.next_power_of_2(heads), HD=dim,
+            num_warps=warps,  # pyright: ignore[reportCallIssue]  # Triton launch option
+        )
+        return dqkv, partial
 
 
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
