@@ -70,7 +70,7 @@ from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchan
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport, num_parameters
 from training.optim import build_optimizer, get_param_groups
-from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, run_lock
+from training.data.ownership import training_dataset_access
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
@@ -139,10 +139,9 @@ def train(
         backend.seed_everything(settings.seed)
         run_directory = prepare_run_directory(settings)
         # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
-        lock = run_lock(Path(settings.out_dir) / TRAIN_LOCK_NAME, "training") if backend.is_main else nullcontext()
-        with lock:
+        with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as dataset_lease:
             resume_path = resolve_resume_checkpoint(settings, run_directory)
-            dataset = resolve_dataset(settings, backend, should_stop=should_stop)
+            dataset = resolve_dataset(settings, backend, should_stop=should_stop, dataset_lease=dataset_lease)
             stage_manager = build_stage_manager(settings, dataset, backend.world_size)
             sample_triggers = StepTriggers.from_settings(
                 settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps

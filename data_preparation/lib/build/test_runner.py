@@ -30,7 +30,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status
-from data_preparation.lib.build.lock import RunLocked, build_lock
+from data_preparation.lib.build.lock import RunLocked, build_lock, dataset_lock
 from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
 from data_preparation.lib.build.repair import ConfirmationRequired, RepairReport, inspect_repairs, perform_repairs
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
@@ -1258,3 +1258,27 @@ def test_changed_tokenizer_dry_run_and_status_never_acquire(
     assert not prepare(path, layout.root, assume_yes=False, dry_run=True).complete
     assert not status(path, layout.root).complete
     assert _published_bytes(layout.root) == before
+
+
+@pytest.mark.parametrize("steps", [("tokenizer",), ("download",), ("build",)])
+def test_training_lease_excludes_every_preparation_mode(
+    layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, steps: tuple[str, ...]
+) -> None:
+    called: list[str] = []
+    for name in ("prepare_planned_tokenizer", "perform_repairs", "reopen_sources", "download_and_build_missing"):
+        monkeypatch.setattr(runner, name, lambda *a, **k: called.append("mutation"))
+    with dataset_lock(layout.root, "training"), pytest.raises(RunLocked, match="training"):
+        prepare(TINY, layout.root, assume_yes=False, steps=steps)
+    assert called == []
+
+
+def test_prepare_borrows_training_lease_without_unlocking(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile
+) -> None:
+    path = config_file(cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=TOKENS))
+    with dataset_lock(layout.root, "training") as lease:
+        assert prepare(path, layout.root, assume_yes=False, dataset_lease=lease).complete
+        with pytest.raises(RunLocked), build_lock(layout.root):
+            pass
+    with build_lock(layout.root):
+        pass

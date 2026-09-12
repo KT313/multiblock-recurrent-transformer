@@ -51,7 +51,7 @@ from types import TracebackType
 from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck, check_stop
-from data_preparation.lib.build.lock import build_lock
+from data_preparation.lib.build.lock import DatasetLease, dataset_lock
 from data_preparation.lib.build.planner import (
     DatasetReport,
     DownloadPlan,
@@ -131,10 +131,11 @@ def prepare(
     should_stop: StopCheck | None = None,
     confirm: Confirm | None = None,
     allow_foreign_raw: bool = False,
+    dataset_lease: DatasetLease | None = None,
 ) -> DatasetReport:
     """
     Materialise the dataset config at config_path under dataset_dir (see the module docstring) and return
-    its status.
+    its status. Training auto-prepare may borrow an active dataset_lease; it never releases that ownership.
 
     assume_yes answers the repair confirmation (stale / outdated raw folders, processed folders whose manifest
     cannot be parsed) without asking; otherwise confirm (or the terminal) is asked once and a refusal raises
@@ -158,7 +159,7 @@ def prepare(
     check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
     warn_about_overlaps(config)
 
-    with build_lock(layout.root) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
+    with dataset_lock(layout.root, lease=dataset_lease) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
         repair_report = inspect_repairs(config, layout, sources=selected, config_name=config_name)
         tokenizer_plan = inspect_tokenizer(config, layout) if "tokenizer" in active_steps else None
         if not dry_run:
@@ -224,6 +225,8 @@ def download_and_build_missing(
     config_name: str | None = None,
 ) -> None:
     """
+    Internal mutation helper: caller must own the dataset lock until all job pools have stopped.
+
     One round: download the rows :func:`plan_downloads` found missing and build the sources whose raw shards are
     not all processed yet, at the same time. A pool of max_parallel_downloads download jobs (the github_code
     sources of one repo are one job, :func:`download_github_code_group`) and a pool of num_workers build jobs

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from data_preparation.lib.build.lock import BUILD_LOCK_NAME, TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
+from data_preparation.lib.build.lock import BUILD_LOCK_NAME, TRAIN_LOCK_NAME, DatasetLease, RunLocked, build_lock, dataset_lock, run_lock
 
 
 def test_build_lock_is_exclusive_and_names_the_holder(tmp_path: Path) -> None:
@@ -26,6 +26,7 @@ def test_build_lock_is_exclusive_and_names_the_holder(tmp_path: Path) -> None:
             pass
         message = str(exc.value)
         assert message.startswith("data preparation expects one run at a time on this system; one is already running (started 20")
+        assert str(root) in message
         assert message.endswith(f"). Wait for it to finish, or stop it with: kill -INT {os.getpid()}")
         assert exc.value.holder is not None and exc.value.holder.started() == datetime.fromisoformat(record["since"]).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     assert (root / BUILD_LOCK_NAME).read_text() == ""  # released and cleared
@@ -86,3 +87,69 @@ def test_a_lock_file_left_by_a_dead_holder_is_simply_taken(tmp_path: Path) -> No
     path.write_text(json.dumps({"program": "training", "pid": 999999, "host": "dead-host", "since": "2020-01-01T00:00:00+00:00"}))
     with run_lock(path, "training"):
         assert json.loads(path.read_text())["pid"] == os.getpid()
+
+
+def test_aliases_borrowing_and_continuous_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    with dataset_lock(Path("dataset"), "training") as lease:
+        inode = (root / BUILD_LOCK_NAME).stat().st_ino
+        with dataset_lock(alias, lease=lease) as borrowed:
+            assert borrowed is lease
+            with pytest.raises(RunLocked, match=str(root)), build_lock(alias):
+                pass
+        with pytest.raises(RunLocked), build_lock(root):
+            pass
+        with dataset_lock(tmp_path / "independent"):
+            pass
+    with build_lock(root):
+        assert (root / BUILD_LOCK_NAME).stat().st_ino == inode
+
+
+def test_invalid_borrowed_leases_fail(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="cannot be constructed"):
+        DatasetLease()
+    forged = object.__new__(DatasetLease)
+    with pytest.raises(ValueError, match="invalid dataset lease"), dataset_lock(tmp_path, lease=forged):
+        pass
+    with dataset_lock(tmp_path) as lease, pytest.raises(ValueError, match="invalid dataset lease"), dataset_lock(tmp_path / "other", lease=lease):
+        pass
+    with pytest.raises(ValueError, match="invalid dataset lease"), dataset_lock(tmp_path, lease=lease):
+        pass
+
+
+@pytest.mark.timeout(15)
+def test_forked_child_cannot_borrow_parent_lease(tmp_path: Path) -> None:
+    with dataset_lock(tmp_path) as lease:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with dataset_lock(tmp_path, lease=lease):
+                    os._exit(2)
+            except ValueError:
+                os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+
+
+@pytest.mark.timeout(15)
+def test_dead_standalone_holder_releases_same_inode(tmp_path: Path) -> None:
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import sys; from pathlib import Path; from data_preparation.lib.build.lock import dataset_lock\n"
+         f"with dataset_lock(Path({str(tmp_path)!r}), 'training'):\n    print('locked', flush=True); sys.stdin.readline()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "locked"
+        inode = (tmp_path / BUILD_LOCK_NAME).stat().st_ino
+        holder.kill()
+        holder.wait(timeout=5)
+        with build_lock(tmp_path):
+            assert (tmp_path / BUILD_LOCK_NAME).stat().st_ino == inode
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)

@@ -56,7 +56,7 @@ from training.run import (
     stop_requested,
     train,
 )
-from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
+from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress, run_one_optimizer_step
@@ -1518,3 +1518,17 @@ def test_missing_explicit_checkpoint_fails_before_model_build(
     monkeypatch.setattr(run_module, 'build_run_model', unexpected)
     with pytest.raises(FileNotFoundError, match='resume checkpoint'):
         train(tiny_settings, backend=cpu_backend)
+
+
+
+def test_dataset_conflict_precedes_resolution_and_model_setup(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(run_module, "resolve_dataset", lambda *a, **k: called.append("resolve"))
+    monkeypatch.setattr(run_module, "build_run_model", lambda *a, **k: called.append("model"))
+    with build_lock(Path(tiny_settings.dataset_dir)), pytest.raises(RunLocked):
+        train(tiny_settings, backend=cpu_backend)
+    assert called == []
+    with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"):
+        pass  # dataset refusal also releases the output lock

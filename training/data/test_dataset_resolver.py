@@ -690,7 +690,7 @@ def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path)
     assert build_command(str(TINY_DATASET_YAML), str(empty)) in message
     assert f"python data_preparation/prepare.py prepare --dataset_config {TINY_DATASET_YAML} --dataset_dir {empty}" in message
     assert "Missing: synthetic_pretrain, synthetic_instruct, tokenizer" in message and "raw missing" in message
-    assert not empty.exists() or not any(empty.iterdir())  # nothing was written
+    assert {p.name for p in empty.iterdir()} == {".build.lock"}  # only ownership metadata was written
 
 
 @pytest.mark.slow
@@ -732,16 +732,15 @@ class _FakeBackend:
         self.world_size = 1  # the resolver reads it for `check_validation_batches`
         self.barriers = 0
 
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        return [obj]
+
     def barrier(self) -> None:
         self.barriers += 1
 
 
 @pytest.mark.slow
 def test_auto_prepare_builds_on_main_rank_only_and_barriers(tmp_path: Path) -> None:
-    worker = _FakeBackend(is_main=False)
-    with pytest.raises(RuntimeError, match="still incomplete after preparing"):
-        resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "worker"), worker)  # nobody built it
-    assert worker.barriers == 1 and not (tmp_path / "worker" / "sources").exists()
     main = _FakeBackend(is_main=True)
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "main"), main)
     assert main.barriers == 1 and Path(resolved.tokenizer_dir).is_dir()
@@ -929,3 +928,17 @@ def test_auto_prepare_tokenizer_change_refusal_preserves_published_data(
         resolve_dataset(_settings(path, root))
     assert build_command(str(path), str(root)) + " --yes" in str(error.value)
     assert snapshot() == before
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_resolution_takes_lock_before_complete_dataset_assessment(
+    tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, auto_prepare: bool
+) -> None:
+    from data_preparation.lib.build.lock import RunLocked, build_lock
+    import training.data.dataset_resolver as resolver_module
+
+    called: list[str] = []
+    monkeypatch.setattr(resolver_module, "status", lambda *a, **k: called.append("assessment"))
+    with build_lock(tiny_dataset_dir), pytest.raises(RunLocked):
+        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=auto_prepare))
+    assert called == []

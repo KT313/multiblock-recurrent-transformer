@@ -159,11 +159,15 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
   (`make prepare`) builds them from the raw shards without downloading again.
   Exit codes: 0 ok, 1 a failed source (logged with its traceback; the other jobs stop at their next shard: a
   failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 3
-  another data preparation still running, 130 Ctrl-C (every running step stops at its next shard, everything
+  another preparation or training job using the dataset, 130 Ctrl-C (every running step stops at its next shard, everything
   published is kept; rerun to resume). One run at a time (`dataset/.build.lock`, `lib/build/lock.py`; training holds
-  `<out_dir>/.train.lock` the same way): a second `prepare` or a `train.py` auto-prepare on the same directory exits 3
-  right away, naming the running one's start time and pid and how to stop it (`kill -INT <pid>`); the lock is the
-  OS's, released when the holder ends, so it never goes stale.
+  `<out_dir>/.train.lock` first, then the same dataset lock): independent preparation and training on the same
+  canonical dataset root are mutually exclusive, even with different config files or output directories. A
+  conflict exits promptly, naming the root and holder. Relative, absolute and symlink aliases coordinate.
+  Rank zero owns the lock continuously through assessment, auto-prepare, training, validation, final work and
+  every rank's reader cleanup. Auto-prepare borrows a validated process-local lease without unlocking.
+  Never delete the lock file to recover: its inode must stay stable. The OS releases ownership when all owning
+  descriptors close (forked children may retain descriptors after the parent dies). Different roots are independent.
 - `status` is read-only: what the repair step *would* do plus the status table (rows needed / tokens per row / raw /
   processed / epochs / state / reason per source and the tokenizer); exit 0 iff the dataset is complete. A source the
   repair step would touch counts as incomplete.
@@ -171,6 +175,19 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
   (weights, token budgets, the tokens-per-row estimate and the rows it makes of them), the validation split per
   source and the source registry. The comment block at the top of the YAML becomes its "Notes" section. `docs/data_mixture.md` is that
   output for the crow config; regenerate it after editing the config.
+
+`lib/build/lock.py:dataset_lock(root, program, lease=...)` is the ownership API; `build_lock` remains a compatibility
+entry point using the same `.build.lock`. `prepare(..., dataset_lease=lease)` accepts only a live lease for the
+same canonical root and process. Internal mutation helpers require their caller to hold ownership through worker
+shutdown. A standalone `resolve_dataset` borrows/acquires while resolving metadata and releases on return; code
+that subsequently starts readers must retain an outer `dataset_access` context through reader cleanup.
+
+`status` and `--dry_run` remain read-only, unlocked observations, which may change during another operation.
+Advisory locks protect cooperating current entry points, not arbitrary external writers or older training binaries.
+Distributed acquisition/setup errors are exchanged before peers continue. Normal reader cleanup has a completion
+boundary before rank zero unlocks; fatal peer loss instead requires the distributed launcher's teardown. A local
+`flock` is not a crash-proof distributed lease if rank zero dies while peers are still alive. Network filesystems
+must provide working cross-process/cross-host `flock` semantics; no timeout-based lock stealing is implemented.
 
 ## What `prepare` does
 

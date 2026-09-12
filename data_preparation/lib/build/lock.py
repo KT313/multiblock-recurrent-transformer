@@ -2,10 +2,9 @@
 """
 One run per program at a time: an advisory flock on a lock file held for the whole run.
 
-<dataset_dir>/.build.lock guards a build (a second build, or a training run's auto-prepare, would otherwise
-interleave directory removals, shard writes and manifest saves); <out_dir>/.train.lock guards a training run.
-The file records who holds it (program, pid, host, since) for the error message. The OS releases the lock when the
-holder dies, so a lock file is never stale; a run that lost its terminal and continues headless holds it until it
+<dataset_dir>/.build.lock guards preparation and the entire training reader lifetime; <out_dir>/.train.lock guards a training run.
+The file records who holds it (program, pid, host, since) for the error message. The OS releases ownership once every owning descriptor closes (a forked child can retain one), so an unused
+lock file is never stale; a run that lost its terminal and continues headless holds it until it
 finishes. status and --dry_run do not take it.
 """
 
@@ -61,7 +60,8 @@ class RunLocked(RuntimeError):
         else:
             message = (
                 f"{holder.program} expects one run at a time on this system; one is already running (started "
-                f"{holder.started()}, pid {holder.pid} on {holder.host}). Wait for it to finish, or stop it with: "
+                f"{holder.started()}, pid {holder.pid} on {holder.host}; protected root {path.parent}). "
+                "Wait for it to finish, or stop it with: "
                 f"kill -INT {holder.pid}"
             )
         super().__init__(message)
@@ -92,12 +92,56 @@ def run_lock(path: Path, program: str) -> Iterator[None]:
         os.close(fd)
 
 
-def build_lock(root: Path) -> AbstractContextManager[None]:
-    """
-    The build lock of the dataset directory root (root/.build.lock).
+class DatasetLease:
+    """Opaque, process-local ownership, issued only by :func:`dataset_lock`. Never send to workers."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("DatasetLease is issued by dataset_lock; it cannot be constructed directly")
+
+
+# Identity membership prevents an ordinary constructed/copied token bypassing the lock. PID rejects fork copies.
+_ACTIVE_LEASES: dict[DatasetLease, tuple[Path, int]] = {}
+
+
+def validate_dataset_lease(lease: DatasetLease, root: Path) -> None:
+    """Reject expired, foreign-root, forged or fork-inherited ownership before any dataset access."""
+
+    expected = (root.resolve(), os.getpid())
+    if type(lease) is not DatasetLease or _ACTIVE_LEASES.get(lease) != expected:
+        raise ValueError(f"invalid dataset lease for {expected[0]}: ownership must be active in this process")
+
+
+@contextmanager
+def dataset_lock(
+    root: Path, program: str = "data preparation", *, lease: DatasetLease | None = None
+) -> Iterator[DatasetLease]:
+    """Hold canonical root/.build.lock exclusively, or borrow a validated lease without releasing it.
+
+    The inode is never replaced or removed. Cooperating training and all preparation selections use this same
+    lock; status/dry-run remain best-effort read-only observations. Advisory locking cannot restrain external
+    writers. A fork inherits the descriptor, but cannot borrow the parent's lease.
     """
 
-    return run_lock(root / BUILD_LOCK_NAME, "data preparation")
+    root = root.resolve()
+    if lease is not None:
+        validate_dataset_lease(lease, root)
+        yield lease
+        return
+    with run_lock(root / BUILD_LOCK_NAME, program):
+        owned = object.__new__(DatasetLease)
+        _ACTIVE_LEASES[owned] = (root, os.getpid())
+        try:
+            yield owned
+        finally:
+            del _ACTIVE_LEASES[owned]
+
+
+def build_lock(root: Path) -> AbstractContextManager[DatasetLease]:
+    """Compatibility entry point for the common exclusive dataset-operation lock."""
+
+    return dataset_lock(root)
 
 
 def _holder_record(program: str) -> str:
