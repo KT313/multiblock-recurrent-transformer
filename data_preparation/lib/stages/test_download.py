@@ -830,10 +830,19 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     with pytest.raises(BuildAborted):
         download(cfg, "d", layout, rows_needed=10, shard_size=4, should_stop=lambda: True)  # checked after each shard
     partial = Manifest.load(layout.raw_dir("d"))
-    # kept rows i = 2, 5, 8, 11 in the shard that tripped the stop, then the row consumed before the stop was seen
-    # (i = 14, published as a short shard): everything consumed is stored, the offset is where the fetch stood
-    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12), (1, 15)]
-    assert partial.rows_fetched == 15 and (partial.skipped_malformed, partial.dropped_too_long) == (5, 5)
+    # The first shard trips the stop. The producer may already have queued more rows; how many depends on thread
+    # scheduling. Verify the exact saved prefix and per-shard counters, rather than assuming one extra stored row.
+    assert partial is not None and (partial.shards[0].rows, partial.shards[0].offset) == (4, 12)
+    kept = partial.rows()
+    assert 4 <= kept <= 10
+    assert partial.rows_fetched == 3 * kept
+    assert (partial.skipped_malformed, partial.dropped_too_long) == (kept, kept)
+    stored = 0
+    for shard in partial.shards:
+        stored += shard.rows
+        assert shard.offset == 3 * stored
+        assert (shard.skipped_malformed, shard.dropped_too_long) == (stored, stored)
+    assert [row["instruction"] for row in read_rows(layout.raw_dir("d"))] == [f"i{i}" for i in range(2, 3 * kept, 3)]
 
     m = download(cfg, "d", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 10 and m.rows_fetched == 30 and m.skipped_malformed == 10 and m.dropped_too_long == 10

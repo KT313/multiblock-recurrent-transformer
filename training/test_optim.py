@@ -415,7 +415,7 @@ def test_cpu_update_stays_eager_and_scalars_come_as_tensors() -> None:
         assert all(t.device.type == "cpu" and t.dtype == torch.float32 and t.ndim == 0 for t in seen[key]), key
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled update is built for CUDA only")
+@pytest.mark.gpu
 def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
     """
     The `torch.compile`d group update on CUDA reproduces the eager kernel to fp32 rounding (Inductor fuses and may
@@ -588,7 +588,7 @@ def test_ellis_adam_8bit_needs_the_param_groups_and_valid_state_bits(tiny_model:
         ELLISAdam8bit(tiny_model.parameters(), state_bits=16)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled update is built for CUDA only")
+@pytest.mark.gpu
 def test_compiled_cuda_8bit_update_matches_eager() -> None:
     """
     Dequantise, update and re-quantise fused by Inductor produce the same 8-bit codes as the eager path and

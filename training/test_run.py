@@ -70,10 +70,13 @@ def _run(
     yaml_path: Path, backend: SingleDeviceBackend | None = None, should_stop: Callable[[], bool] | None = None
 ) -> TrainingReport:
     """
-    Run training on the yaml (the backend of the settings unless one is given) and return its report.
+    Run training on the CPU at the yaml's precision unless an explicit backend is supplied.
     """
 
-    return train(parse_settings(["--config", str(yaml_path)]), backend=backend, should_stop=should_stop, keep_history=True)
+    settings = parse_settings(["--config", str(yaml_path)])
+    if backend is None:
+        backend = SingleDeviceBackend(device="cpu", precision=settings.precision)
+    return train(settings, backend=backend, should_stop=should_stop, keep_history=True)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -1263,9 +1266,9 @@ def test_resume_with_changed_optim_config_is_refused_even_when_settings_changes_
     original = parse_settings(["--config", str(yaml_path)]).optim_config.weight_decay
     changed = parse_settings(["--config", str(yaml_path), "--optim_config.weight_decay", str(original * 2 + 0.01)])
     with pytest.raises(ValueError, match="resuming with changed optimizer hyperparameters") as excinfo:
-        train(changed)
+        train(changed, backend=SingleDeviceBackend(device="cpu", precision=changed.precision))
     assert "weight_decay" in str(excinfo.value) and "allow_settings_change cannot override" in str(excinfo.value)
-    report = train(parse_settings(["--config", str(yaml_path)]), keep_history=True)
+    report = _run(yaml_path)
     assert sorted(report.history) == list(range(15, 21))
 
 
@@ -1293,9 +1296,7 @@ def test_resume_from_the_final_checkpoint_runs_no_step_and_exports_again(
 
 
 @pytest.mark.slow
-# A plain skip, not `@pytest.mark.gpu`, on purpose: the marker would put this test into the `gpu` xdist group, whose
-# worker is already the longest; the tiny model leaves the device room to share (about 300 MiB at peak).
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.gpu
 def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path,
 ) -> None:
