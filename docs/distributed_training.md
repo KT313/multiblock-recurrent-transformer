@@ -33,7 +33,7 @@ Every rank runs the same `train()`; the differences are these.
   DDP broadcasts rank 0's parameters at start, so the model initialization is shared.
 - **Validation is sharded.** Each rank scores its share of the validation rows; the per-depth losses are the mean of
   the per-rank means, the per-source losses are summed over the ranks.
-- **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, checkpoints, samples, benchmarks,
+- **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, accepted resume history, checkpoints, samples, benchmarks,
   the export, `train.log`, wandb and the dashboard belong to rank 0. The other ranks print WARNING and above with a
   `[rank N]` prefix; `torchrun --redirects 3 --local-ranks-filter 0` silences them entirely.
 - **Stopping.** Ctrl-C reaches torchrun (the ranks run in their own session) and torchrun forwards the signal to every
@@ -81,3 +81,5 @@ The DDP backend runs on the CPU with gloo, which is how the multi-rank loop is t
 in-process at world size 1, where it must reproduce the golden run bit for bit; `training/test_distributed.py`
 launches two ranks through torchrun). What the CPU path does not cover: NCCL, bf16 autocast under DDP,
 `torch.compile` with the DDP wrapper, and throughput.
+
+Configuration sidecars and accepted resume records are described in [resume configuration history](resume_configuration_history.md).

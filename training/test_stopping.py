@@ -1,7 +1,9 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """Phase-driven stop regressions, including bounded real gloo completion ordering."""
 
+import json
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -9,6 +11,7 @@ from typing import Any
 import pytest
 import torch
 
+from data_preparation.dataset_config import load_dataset_config
 from training import run as run_module
 from training.backend.single_device import SingleDeviceBackend
 from training.run import train
@@ -31,10 +34,17 @@ def settings(tmp_path: Path, tiny_dataset_dir: Path) -> Settings:
 
 @pytest.mark.parametrize("train_count,eval_count", [(64, 1), (64, 12), (63, 8)])
 def test_invalid_counts_precede_setup_and_cleanup(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch, train_count: int, eval_count: int,
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, train_count: int, eval_count: int, tmp_path: Path,
 ) -> None:
     settings.micro_batches_per_step = train_count
     settings.eval_iters = eval_count
+    # Keep the schedule valid at these larger global batch sizes so this test reaches count validation.
+    config = load_dataset_config(settings.dataset_config)
+    for stage in config.stages:
+        stage.tokens = 20 * settings.tokens_per_optimizer_step
+    config_path = tmp_path / "valid_schedule.yaml"
+    config_path.write_text(json.dumps(asdict(config)))
+    settings.dataset_config = str(config_path)
     backend = SingleDeviceBackend(device="cpu", precision="32")
     backend.world_size = 8
     closed = []
@@ -215,7 +225,7 @@ def test_two_rank_stop_agreement_completion_errors_and_exact_resume(
         tmp_path, tiny_dataset_dir, tmp_path / "out", backend="ddp", precision="32", export_to_hf=False,
         sample_at_training_progress=[], benchmark_at_training_progress=[],
     )
-    for mode in ("stop", "resume", "full"):
+    for mode in ("stop", "provenance_failure", "resume", "full"):
         command = [sys.executable, "-m", "torch.distributed.run", "--nnodes=1", "--nproc_per_node=2",
                    "--max-restarts=0", "--rdzv-backend=c10d", f"--rdzv-endpoint=127.0.0.1:{free_port()}",
                    "-m", "training.testing.stopping_worker", str(config), str(tmp_path), mode]

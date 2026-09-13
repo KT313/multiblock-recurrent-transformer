@@ -98,6 +98,27 @@ def main() -> None:
         state = torch.load(checkpoint, weights_only=False)
         assert state["step"] == 2 and len(state["rng_states"]) == 2
         assert state["data_stream"]["consumed_rows"]
+    elif mode == "provenance_failure":
+        settings.resume = True
+        directory = Path(settings.out_dir) / settings.run_name
+        before = {path: path.read_bytes() for path in directory.glob("*config.json")}
+        def fail_publication(*args: Any, **kwargs: Any) -> None:
+            raise OSError("configuration publication refused")
+
+        def unexpected_step(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("publication failure reached an optimizer update")
+
+        with patch.object(run_module, "publish_configuration", fail_publication), \
+                patch.object(run_module, "run_one_optimizer_step", unexpected_step):
+            try:
+                run_module.train(settings, backend=backend)
+            except (OSError, RuntimeError) as error:
+                expected = "configuration publication refused" if rank == 0 else "rank zero failed during configuration publication"
+                assert str(error) == expected
+            else:
+                raise AssertionError("configuration publication failure was swallowed")
+        assert all(path.read_bytes() == content for path, content in before.items())
+        assert not list((directory / "resumes").glob("*.json"))
     elif mode == "resume":
         settings.resume = True
         resumed = run_module.train(settings, backend=backend)

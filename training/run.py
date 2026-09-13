@@ -4,13 +4,13 @@
 
     build_stage_manager               validate the configured schedule from YAML before backend/data setup
     create_backend                    device, precision, torch flags; then `seed_everything`
-    prepare_run_directory             out_dir/<run_name>/checkpoints, run_config.json
+    prepare_run_directory             out_dir/<run_name>/checkpoints
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
-    resolve_resume_checkpoint         select latest / explicit checkpoint once, before parameter initialization
+    resolve_resume_checkpoint         select checkpoint once; reject fresh reuse of established run evidence
     resolve_dataset                   verify / auto-prepare the dataset config, validation split, tokenizer dir
     build_stage_manager               token budgets -> optimizer-step boundaries, transitions, per-stage base LR/weights
     build_run_dataloaders             one train loader per SOURCE on the main rank (whole run), one validation loader per stage
-    build_run_model                   architecture yaml + overrides, sequence-length check, model_config.json, to device
+    build_run_model                   architecture yaml + overrides, sequence-length check, to device
     build_run_optimizer               parameter groups, optimizer, backend wrap
     RunState                          the objects above in one place for the helpers below
     restore_checkpoint                selected checkpoint -> model, optimizer, RNG state, progress
@@ -34,9 +34,8 @@ The CLI around this is `training/train.py`; `TrainingReport` is defined next to 
 
 from __future__ import annotations
 
-import json
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast, Any
@@ -72,6 +71,7 @@ from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport, num_parameters
 from training.optim import build_optimizer, get_param_groups
 from training.data.ownership import main_rank_phase, training_dataset_access
+from training.provenance import check_fresh_run_directory, publish_configuration, record_run_config as _record_run_config
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
@@ -108,6 +108,7 @@ class ResumePoint:
 
     checkpoint: Path
     data_stream: dict[str, Any] | None
+    metadata: CheckpointMetadata
 
 
 def train(
@@ -144,7 +145,10 @@ def train(
         run_directory = prepare_run_directory(settings)
         # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
         with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as dataset_lease:
-            resume_path = resolve_resume_checkpoint(settings, run_directory)
+            with main_rank_phase(backend, "run directory selection"):
+                resume_path = resolve_resume_checkpoint(settings, run_directory)
+                if backend.is_main and resume_path is None:
+                    check_fresh_run_directory(run_directory)
             dataset = resolve_dataset(settings, backend, should_stop=should_stop, dataset_lease=dataset_lease)
             with main_rank_phase(backend, "learning-rate schedule validation"):
                 stage_manager = build_stage_manager(settings, dataset, backend.world_size)
@@ -168,31 +172,33 @@ def train(
                 resume = restore_checkpoint(state, resume_path) if resume_path is not None else None
                 progress = state.progress
 
-                with RunLogger.open(
-                    settings,
-                    run_directory,
-                    dataset,
-                    model,
-                    stage_manager,
-                    progress,
-                    backend,
-                    setup_started=started_at,
-                    keep_history=keep_history,
-                ) as logger:
-                    if backend.is_main and (resume is None or not (run_directory / "run_config.json").exists()):
-                        record_run_config(settings, run_directory)
-                    if resume is None:
-                        logger.log_fresh_start()
-                    else:
-                        logger.log_resume(resume.checkpoint, progress.step)
-                    logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
-                    logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
-                    # the main rank owns the one data stream; every rank trains on its `RankBatches` view of it
-                    stream = BatchStream(settings, loaders, stage_manager, progress) if backend.is_main else None
-                    batches = RankBatches(backend, stream, settings.tokens_per_micro_batch)
-                    if resume is not None and resume.data_stream is not None:
-                        batches.load_state_dict(resume.data_stream)
-                    logger.status("training")
+                with ExitStack() as logger_stack:
+                    with main_rank_phase(backend, "run logger initialization"):
+                        logger = logger_stack.enter_context(RunLogger.open(
+                            settings,
+                            run_directory,
+                            dataset,
+                            model,
+                            stage_manager,
+                            progress,
+                            backend,
+                            setup_started=started_at,
+                            keep_history=keep_history,
+                        ))
+                    with main_rank_phase(backend, "run stream and logging setup"):
+                        if resume is None:
+                            logger.log_fresh_start()
+                        else:
+                            logger.log_resume(resume.checkpoint, progress.step)
+                        logger.log_triggers("samples", sample_triggers.listed(stage_manager.total_steps))
+                        logger.log_triggers("benchmarks", benchmark_triggers.listed(stage_manager.total_steps))
+                        # the main rank owns the one data stream; every rank trains on its `RankBatches` view of it
+                        stream = BatchStream(settings, loaders, stage_manager, progress) if backend.is_main else None
+                        batches = RankBatches(backend, stream, settings.tokens_per_micro_batch)
+                        if resume is not None and resume.data_stream is not None:
+                            batches.load_state_dict(resume.data_stream)
+                        logger.status("training")
+                    complete_main_phase(backend, "configuration publication", lambda: publish_configuration(state, resume))
                     stop = StopController(backend, should_stop)
                     # Restoring a checkpoint can change settings/stream metadata. Conservatively publish the
                     # current restored state on an immediate stop instead of assuming the source file is exact.
@@ -282,13 +288,8 @@ def prepare_run_directory(settings: Settings) -> Path:
 
 
 def record_run_config(settings: Settings, run_directory: Path) -> None:
-    """
-    Write `run_config.json` (the settings as parsed). A fresh run always writes it; a resume only into a run
-    directory without one (an explicit `resume_checkpoint_path` into a new directory) and keeps it otherwise.
-    """
-
-    with open(run_directory / "run_config.json", "w") as file:
-        json.dump(asdict(settings), file, indent=4)
+    """Publish fresh settings only when absent; retained as a public setup helper."""
+    _record_run_config(settings, run_directory)
 
 
 def build_stage_manager(settings: Settings, dataset: DatasetConfig | ResolvedDataset, world_size: int) -> StageManager:
@@ -391,7 +392,7 @@ def build_run_model(
 ) -> Module:
     """
     The run's model: architecture yaml + `model_overwrite`, the sequence-length check against the dataset config,
-    `RecurrentGPT`, `model_config.json`, then `backend.setup_model` (device, optional compile).
+    `RecurrentGPT`, then `backend.setup_model` (device, optional compile).
 
     Fresh runs keep their original initialization/RNG order. A selected checkpoint uses cheap weight placeholders;
     the caller must restore the complete checkpoint (including RNG) before training.
@@ -416,8 +417,6 @@ def build_run_model(
         )
     log.info("model built: %s parameters in %.1fs, moving it to %s%s", f"{num_parameters(model):,}",
              time.monotonic() - started, backend.device, ", compiled on the first step" if settings.compile_model else "")
-    if backend.is_main:
-        model_config.to_json(run_directory / "model_config.json")
     return backend.setup_model(model, compile_model=settings.compile_model)
 
 
@@ -434,7 +433,7 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
 
 
 def resolve_resume_checkpoint(settings: Settings, run_directory: Path) -> Path | None:
-    """Select a checkpoint once, before initialization; no automatic checkpoint means a normal fresh run."""
+    """Select a checkpoint once; None requests fresh setup, whose destination the caller must validate."""
     if not settings.resume:
         return None
     path = Path(settings.resume_checkpoint_path) if settings.resume_checkpoint_path else find_latest_checkpoint(
@@ -477,7 +476,7 @@ def restore_checkpoint(state: RunState, resume_path: Path) -> ResumePoint:
         )
     state.progress.step = state.progress.resume_step = metadata.step
     state.backend.set_rng_state(metadata.rng_states[state.backend.rank])
-    return ResumePoint(resume_path, metadata.data_stream)
+    return ResumePoint(resume_path, metadata.data_stream, metadata)
 
 
 # --- inside the loop -------------------------------------------------------------------------------------------------

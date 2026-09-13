@@ -318,7 +318,7 @@ def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir:
 def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend, custom_kernels: bool) -> None:
     """
     The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
-    settings, `model_config.json` next to the checkpoints, the model on the backend's device.
+    settings and the model on the backend's device; construction does not publish configuration.
     """
 
     tiny_settings.model_overwrite = {"n_embd": 32}
@@ -331,8 +331,7 @@ def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: Resolve
     assert model.config.use_custom_kernels is custom_kernels
     assert model.gradient_checkpointing == tiny_settings.gradient_checkpointing
     assert all(p.device == cpu_backend.device for p in model.parameters())
-    written = json.loads((run_directory / "model_config.json").read_text())
-    assert written == model.config.to_dict() and written["n_embd"] == 32
+    assert not (run_directory / "model_config.json").exists()
     tiny_settings.model_overwrite = {"model_max_sequence_length": 128}
     with pytest.raises(ValueError, match="training_max_sequence_length 256 .* must be at most model_max_sequence_length 128 "):
         build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
@@ -1014,7 +1013,9 @@ def test_resume_from_explicit_checkpoint_path(full_run: dict[str, Any], tmp_path
     ]
     for name in ("run_config.json", "model_config.json", TRAIN_LOG_NAME, TRAIN_REPORT_NAME):
         assert (fresh_dir / name).is_file(), name
-    assert json.loads((fresh_dir / "run_config.json").read_text())["resume_checkpoint_path"] == str(ckpt)
+    recorded = json.loads((fresh_dir / "run_config.json").read_text())
+    assert recorded["resume_checkpoint_path"] == torch.load(ckpt, weights_only=False)["settings"]["resume_checkpoint_path"]
+    assert recorded["_provenance"]["source_checkpoint"] == str(ckpt.resolve())
 
 
 @pytest.mark.slow
