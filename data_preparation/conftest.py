@@ -119,17 +119,17 @@ class FakeHub:
         return self.sha
 
     def paths_info(self, repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.size_lookups += 1
         return {p: self.files[p].stat().st_size for p in paths}
 
     def hub_download(self, repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.downloads.append(filename)
         return self.files[filename]
 
     def open_remote(self, repo_id: str, filename: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.streams.append(filename)
         handle = RecordingFile(self.files[filename])
         self.handles[filename] = handle

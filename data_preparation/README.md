@@ -595,6 +595,14 @@ last a `SharedLoaderParameters`: token, index directory, file callback, download
 | `local` | your own data | `path:` directory of `*.parquet`, `*.jsonl` (plain, `.zst` or `.gz`), `*.json.gz` or `*.json` files (the Hub reader's formats), read in sorted file order |
 | `synthetic` | tests / smoke runs | random-word rows from `seed:` |
 
+For `hf_files` / `github_code`, each active file index reads sizes, cached files and remote ranges at the
+immutable commit returned with its listing. A branch moving during a preparation session cannot change
+that session's input files. Reopening a persisted index in a fresh process still checks the requested revision
+and fails with repair/pinning instructions if it moved; legacy indexes adopt and record the current commit
+once before reads. Requested revisions and index cache paths retain their existing meaning. Hub HTTP
+clients receive a 30-second default timeout when created, including after connection-error replacement;
+explicit library request timeouts take precedence.
+
 Pretrain sources need a text column (`text_field`, default `text`); instruct sources need either
 `fields: {instruction: <col>, input: <col>, output: <col>}` (input optional) or a `converter`. Converters and filters
 (`lib/sources/converters.py`) turn one source row into the row the pipeline expects: `gsm8k_question_answer`
