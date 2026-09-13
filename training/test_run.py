@@ -11,9 +11,10 @@ import logging
 import math
 import shutil
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -57,6 +58,7 @@ from training.run import (
     train,
 )
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
+from data_preparation.dataset_config import load_dataset_config
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress, run_one_optimizer_step
@@ -133,6 +135,101 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
     assert build_stage_manager(tiny_settings, tiny_resolved, world_size=2).total_steps == 20  # 2 packed micro-batches, one each
     with pytest.raises(ValueError, match=r"micro_batches_per_step \(2\) must be a multiple of the number of ranks \(3\)"):
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
+
+
+def test_configured_and_resolved_schedules_match(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
+    configured = build_stage_manager(tiny_settings, tiny_resolved.config, world_size=1)
+    runtime = build_stage_manager(tiny_settings, tiny_resolved, world_size=2)
+    assert configured.boundaries == runtime.boundaries
+    assert configured.stages == [replace(stage, val_data=[]) for stage in runtime.stages]
+    assert (configured.total_steps, configured.tokens_per_step) == (runtime.total_steps, runtime.tokens_per_step)
+
+
+def test_configured_schedule_floors_each_stage_independently(tiny_settings: Settings) -> None:
+    config = load_dataset_config(tiny_settings.dataset_config)
+    for stage in config.stages:
+        stage.tokens += 1000
+    manager = build_stage_manager(tiny_settings, config, world_size=2)
+    assert [(b.start_step, b.end_step, b.transition_start_step) for b in manager.boundaries] == [
+        (0, 8, 6), (8, 16, 14), (16, 20, 20),
+    ]
+    assert manager.total_steps == 20  # flooring the sum would incorrectly give 22
+
+
+@pytest.mark.parametrize("backend_kind", ["single", "ddp_rank_0", "ddp_rank_1", "injected"])
+@pytest.mark.parametrize("tokens,warmup,cooldown,match", [
+    (10 * 1024 + 1000, 8, 8, r"warmup_steps \(8\) \+ cooldown_steps \(8\).*total optimizer steps \(10\)"),
+    (10 * 1024, 10, 0, "warmup_steps.*must be less than"),
+    (10 * 1024, 0, 10, "cooldown_steps.*must be less than"),
+    (100, 0, 0, "shorter than one optimizer step"),
+])
+def test_invalid_schedule_fails_before_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str,
+    tokens: int, warmup: int, cooldown: int, match: str,
+) -> None:
+    # This fixture creates YAML only, without even preparing the synthetic dataset.
+    config = load_dataset_config(TINY_DATASET_YAML)
+    config.sources = {"synthetic_pretrain": config.sources["synthetic_pretrain"]}
+    config.stages = [replace(config.stages[0], tokens=tokens, transition_pct=0.0)]
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text(json.dumps(asdict(config)))  # JSON is also valid YAML
+    settings = parse_settings(["--config", str(write_tiny_yaml(
+        tmp_path, tmp_path / "missing_dataset", tmp_path / "out", dataset_config=str(dataset_yaml),
+        stage_base_lrs=[3e-4], warmup_steps=warmup, cooldown_steps=cooldown,
+        backend="ddp" if backend_kind.startswith("ddp") else "single_device",
+    ))])
+    if backend_kind.startswith("ddp"):
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("RANK", backend_kind[-1])
+        monkeypatch.setenv("LOCAL_RANK", backend_kind[-1])
+    forbidden = Mock(side_effect=AssertionError("invalid schedule reached expensive startup"))
+    for name in (
+        "create_backend", "prepare_run_directory", "resolve_resume_checkpoint", "resolve_dataset",
+        "build_run_dataloaders", "build_run_model", "build_run_optimizer", "record_run_config",
+    ):
+        monkeypatch.setattr(run_module, name, forbidden)
+    injected = Mock(spec=SingleDeviceBackend)
+    with pytest.raises(ValueError, match=match):
+        train(settings, backend=cast(SingleDeviceBackend, injected) if backend_kind == "injected" else None)
+    forbidden.assert_not_called()
+    assert injected.mock_calls == []
+    assert not Path(settings.dataset_dir).exists()
+    assert not Path(settings.out_dir).exists()
+
+
+def test_changed_stage_plan_is_rejected_before_loaders(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tiny_resolved.stages[0].tokens += 1024  # a valid but different runtime schedule must not silently replace preflight
+    monkeypatch.setattr(run_module, "resolve_dataset", lambda *args, **kwargs: tiny_resolved)
+    loaders = Mock(side_effect=AssertionError("changed schedule reached loaders"))
+    monkeypatch.setattr(run_module, "build_run_dataloaders", loaders)
+    with pytest.raises(ValueError, match="stage plan changed after learning-rate schedule validation"):
+        train(tiny_settings, backend=cpu_backend)
+    loaders.assert_not_called()
+    assert not (run_directory_of(tiny_settings) / "run_config.json").exists()
+
+
+def test_runtime_schedule_failure_on_a_peer_is_rejected_before_loaders(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = Mock(return_value=[None, ("error", "ValueError: The dataset stage plan changed")])
+
+    def resolved(*args: object, **kwargs: object) -> ResolvedDataset:
+        # Inject a peer's schedule failure after the existing coordinated dataset phases have completed.
+        monkeypatch.setattr(cpu_backend, "all_gather_object", exchange)
+        return tiny_resolved
+
+    monkeypatch.setattr(run_module, "resolve_dataset", resolved)
+    loaders = Mock(side_effect=AssertionError("peer's schedule failure reached loaders"))
+    monkeypatch.setattr(run_module, "build_run_dataloaders", loaders)
+    with pytest.raises(RuntimeError, match="learning-rate schedule validation failed on another rank.*stage plan changed"):
+        train(tiny_settings, backend=cpu_backend)
+    exchange.assert_called_once_with(None)
+    loaders.assert_not_called()
+    assert not (run_directory_of(tiny_settings) / "run_config.json").exists()
 
 
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:

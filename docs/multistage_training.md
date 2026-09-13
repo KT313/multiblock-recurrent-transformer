@@ -43,6 +43,14 @@ Global `warmup_steps` apply at the start of the first stage and
 named `step-XXXXXXXX-{run_name}-stage-N_end`, so runs can be resumed from any
 stage boundary.
 
+The schedule is validated from configuration before backend initialization,
+dataset assessment or auto-preparation, loaders, and model/optimizer construction.
+Warmup must be shorter than the first stage's steps before its transition;
+cooldown must be shorter than the last stage. For a single-stage run,
+`warmup_steps + cooldown_steps <= total_steps` is also required: ten steps with
+warmup 8 and cooldown 8 is rejected, while warmup 4 and cooldown 6 is allowed.
+Windows are never shortened automatically; zero windows remain supported.
+
 ## Monitoring
 
 Logged per step (wandb): `stage/current_stage`, `stage/base_lr`,
@@ -56,7 +64,7 @@ validation metrics `val_loss`, `val_ppl`,
 ## Step accounting
 
 Steps are optimizer steps of `micro_batches_per_step × tokens_per_micro_batch` tokens:
-`total steps = Σ stage.tokens / (micro_batches_per_step × tokens_per_micro_batch)`, independent of the number of
+`total steps = Σ floor(stage.tokens / (micro_batches_per_step × tokens_per_micro_batch))`, independent of the number of
 devices (`micro_batches_per_step` must be a multiple of it). Both settings are required: training packs documents
 end to end, only validation runs on padded rows (`validation_batch_size` per forward).
 The stage boundary summary is printed at startup; check it before long runs.

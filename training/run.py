@@ -2,6 +2,7 @@
 """
 `train()`: one training run as a readable entry function, plus the setup helpers it is made of.
 
+    build_stage_manager               validate the configured schedule from YAML before backend/data setup
     create_backend                    device, precision, torch flags; then `seed_everything`
     prepare_run_directory             out_dir/<run_name>/checkpoints, run_config.json
     run_lock                          one training run per out_dir (`data_preparation/lib/build/lock.py`)
@@ -36,14 +37,14 @@ from __future__ import annotations
 import json
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast, Any
 
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from data_preparation.dataset_config import DatasetConfig
+from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT
@@ -66,11 +67,11 @@ from evaluation.prompts import load_prompts
 from evaluation.samples import GeneratedSample, generate_and_save_samples, samples_path
 from training.data.tokenizer import Tokenizer
 from training.data.loader import build_run_dataloaders
-from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset
+from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset, resolve_stage_plan
 from training.evaluation import evaluate, is_evaluation_step
 from training.logger import RunLogger, TrainingReport, num_parameters
 from training.optim import build_optimizer, get_param_groups
-from training.data.ownership import training_dataset_access
+from training.data.ownership import main_rank_phase, training_dataset_access
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.triggers import StepTriggers
@@ -133,6 +134,9 @@ def train(
     """
 
     check_evaluation_recurrences(settings)  # before anything is created or built
+    # Every rank checks the same pure plan before process-group/device initialization. Optimizer-step sizes
+    # already count global micro-batches; the actual world-size divisibility check follows backend creation.
+    configured_schedule = build_stage_manager(settings, load_dataset_config(settings.dataset_config), world_size=1)
     backend = backend or create_backend(settings)
     try:
         settings.validate_world_size(backend.world_size)
@@ -142,7 +146,13 @@ def train(
         with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as dataset_lease:
             resume_path = resolve_resume_checkpoint(settings, run_directory)
             dataset = resolve_dataset(settings, backend, should_stop=should_stop, dataset_lease=dataset_lease)
-            stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+            with main_rank_phase(backend, "learning-rate schedule validation"):
+                stage_manager = build_stage_manager(settings, dataset, backend.world_size)
+                if configured_schedule.stages != [replace(stage, val_data=[]) for stage in dataset.stages]:
+                    raise ValueError(
+                        "The dataset stage plan changed after learning-rate schedule validation; "
+                        "restart training with a stable dataset configuration."
+                    )
             sample_triggers = StepTriggers.from_settings(
                 settings.sample_step_interval, settings.sample_at_training_progress, stage_manager.total_steps
             )
@@ -281,15 +291,16 @@ def record_run_config(settings: Settings, run_directory: Path) -> None:
         json.dump(asdict(settings), file, indent=4)
 
 
-def build_stage_manager(settings: Settings, dataset: ResolvedDataset, world_size: int) -> StageManager:
+def build_stage_manager(settings: Settings, dataset: DatasetConfig | ResolvedDataset, world_size: int) -> StageManager:
     """
     The run's `StageManager`: the dataset's stage budgets turned into optimizer-step boundaries of
     `micro_batches_per_step x tokens_per_micro_batch` tokens; the packs of a step must split evenly over the devices.
+    A `DatasetConfig` provides the same schedule before dataset I/O; a `ResolvedDataset` includes validation entries.
     """
 
     settings.micro_batches_per_rank(world_size)  # refuses packs that do not split evenly over the ranks
     return StageManager(
-        dataset.stages,
+        resolve_stage_plan(settings, dataset) if isinstance(dataset, DatasetConfig) else dataset.stages,
         tokens_per_step=settings.tokens_per_optimizer_step,
         world_size=world_size,
         warmup_steps=settings.warmup_steps,
