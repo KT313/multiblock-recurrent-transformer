@@ -586,3 +586,21 @@ def test_legacy_checkpoint_has_unknown_build_identity(backend: SingleDeviceBacke
     state = _metadata(backend, tiny_model).to_state()
     state.pop("dataset_build_id")
     assert CheckpointMetadata.from_state(state).dataset_build_id is None
+
+
+@pytest.mark.parametrize(("key", "value"), [("betas", (0.9, 1.0)), ("init_lr", 0.0), ("lr", float("nan"))])
+def test_invalid_optimizer_metadata_fails_before_restore(
+    tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT, key: str, value: Any
+) -> None:
+    opt, _ = _train_one_step(tiny_model)
+    path = checkpoint_path(tmp_path, "tiny", 1)
+    save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model))
+    raw = backend.load_checkpoint(path)
+    raw["optimizer"]["param_groups"][0][key] = value
+    torch.save(raw, path)
+    original_group = opt.param_groups[0]
+    with pytest.raises(ValueError, match=key):
+        load_training_checkpoint(backend, path, tiny_model, opt)
+    assert opt.param_groups[0] is original_group
+    saved_value = backend.load_checkpoint(path)["optimizer"]["param_groups"][0][key]
+    assert repr(saved_value) == repr(value)  # rejected checkpoint remains intact

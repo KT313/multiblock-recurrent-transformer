@@ -504,7 +504,7 @@ def test_optim_config_lr_must_be_positive() -> None:
     """
 
     for lr in (0.0, -1e-4):
-        with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+        with pytest.raises(ValueError, match="optim_config.lr must be (positive|non-negative)"):
             _settings(optim_config=OptimizerConfig(lr=lr))
     assert _settings(optim_config=OptimizerConfig(lr=1e-4)).optim_config.lr == 1e-4
 
@@ -602,3 +602,44 @@ def test_sample_cache_default_and_legacy_override() -> None:
 def test_custom_kernels_default_and_cli_override(path: Path) -> None:
     assert parse_settings(['--config', str(path)]).use_custom_kernels is True
     assert parse_settings(['--config', str(path), '--use_custom_kernels', 'false']).use_custom_kernels is False
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("betas", ()), ("betas", (0.9,)), ("betas", (0.9, 0.95, 0.99)), ("betas", "ab"),
+    ("betas", (True, 0.95)), ("betas", (0.9, "0.95")),
+    *[("betas", (bad, 0.95)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[("betas", (0.9, bad)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[(key, bad) for key in ("lr", "eps", "weight_decay")
+      for bad in (-1.0, float("nan"), float("inf"), True, "0.1")],
+])
+def test_optimizer_config_rejects_invalid_scalars(key: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=key):
+        OptimizerConfig(**{key: value})
+
+
+@pytest.mark.parametrize("optimizer", ["ELLISAdam", "ELLISAdam8bit"])
+def test_ellis_reference_lr_is_positive_but_adamw_can_start_at_zero(optimizer: str) -> None:
+    with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+        _settings(optimizer=optimizer, optim_config=OptimizerConfig(lr=0.0))
+    cfg = OptimizerConfig(lr=0.0, betas=(0.0, 0.0), eps=0.0, weight_decay=0.0)
+    assert _settings(optimizer="AdamW", optim_config=cfg).optim_config is cfg
+    assert OptimizerConfig().eps is None
+
+
+@pytest.mark.parametrize("optimizer", ["AdamW", "ELLISAdam", "ELLISAdam8bit"])
+def test_settings_revalidate_mutated_optimizer_config_before_dataset_access(optimizer: str) -> None:
+    cfg = OptimizerConfig()
+    cfg.betas = (0.9, 1.0)
+    with pytest.raises(ValueError, match="optim_config.betas"):
+        _settings(optimizer=optimizer, optim_config=cfg, dataset_config="does-not-exist.yaml")
+
+
+def test_yaml_invalid_optimizer_fails_before_nonexistent_dataset_or_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(TINY_YAML.read_text().replace("betas: [0.9, 0.95]", "betas: [0.9, 1.0]"))
+    with pytest.raises((ValueError, SystemExit)) as error:
+        parse_settings(["--config", str(path), "--dataset_config", "missing-data.yaml",
+                        "--model_architecture_config", "missing-model.yaml"])
+    assert "betas" in str(error.value) + capsys.readouterr().err

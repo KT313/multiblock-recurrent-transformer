@@ -21,6 +21,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from training.optim.torchao import OptimState8bit
+from training.optimizer_validation import validate_adam_hyperparameters, validate_scalar
 from training.settings import OptimizerConfig
 
 
@@ -86,6 +87,7 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
     torch AdamW 1e-8), exactly as a config that never mentioned `eps` did.
     """
 
+    config.validate(name)
     common: dict[str, Any] = {"lr": config.lr, "betas": config.betas, "weight_decay": config.weight_decay}
     if config.eps is not None:
         common["eps"] = config.eps
@@ -133,12 +135,24 @@ def set_lr(optimizer: Optimizer, lr: float) -> None:
         group["lr"] = value
 
 
+def _validate_lr(value: object, name: str, *, positive: bool) -> None:
+    # Tensor LR is a public ELLIS API. A one-time scalar read is allowed at construction/restore,
+    # never in set_lr or step (which would introduce a device synchronization on every update).
+    if isinstance(value, Tensor):
+        if value.ndim != 0:
+            raise ValueError(f"{name} must be a scalar learning rate, got shape {tuple(value.shape)}")
+        value = value.item()
+    validate_scalar(value, name, positive=positive)
+
+
 class ELLISAdam(Optimizer):
     """
     AdamW variant with optional RMS update clipping, atan2 update, running init and decoupled weight decay.
 
     `lr` is stored as a float32 tensor; `init_lr` (the constructor LR) is the reference for decoupled weight decay,
-    i.e. the decay applied per step is `lr / init_lr * weight_decay`.
+    i.e. the decay applied per step is `lr / init_lr * weight_decay`. Constructors and added/restored groups
+    validate numerical metadata before registration. Constructor/reference LRs must be positive; a restored
+    scheduled LR may be zero. Scheduled updates incur no extra scalar reads or validation.
     """
 
     def __init__(
@@ -168,6 +182,8 @@ class ELLISAdam(Optimizer):
         decouple_wd: bool,
         **_: Any,  # `self`, `params`, `__class__` of the caller's `locals()`
     ) -> dict[str, Any]:
+        _validate_lr(lr, "ELLISAdam.lr", positive=True)
+        validate_adam_hyperparameters(betas=betas, eps=eps, weight_decay=weight_decay, prefix="ELLISAdam")
         return dict(
             lr=torch.tensor(lr, dtype=torch.float32),
             init_lr=lr,
@@ -179,6 +195,33 @@ class ELLISAdam(Optimizer):
             atan_adam=atan_adam,
             decouple_wd=decouple_wd,
         )
+
+    def _validate_group(self, group: dict[str, Any], *, restored: bool) -> None:
+        prefix = f"{type(self).__name__} parameter group"
+        required = ("lr", "init_lr", "betas", "eps", "weight_decay")
+        missing = [key for key in required if key not in group]
+        if missing:
+            raise ValueError(f"{prefix} is missing hyperparameters: {missing}")
+        # Restored LR is scheduled and may be zero; init_lr is always the positive decay reference.
+        _validate_lr(group["lr"], f"{prefix}.lr", positive=not restored)
+        _validate_lr(group["init_lr"], f"{prefix}.init_lr", positive=True)
+        validate_adam_hyperparameters(
+            betas=group["betas"], eps=group["eps"], weight_decay=group["weight_decay"], prefix=prefix
+        )
+        if "state_bits" in self.defaults and group.get("state_bits") not in (8, 32):
+            raise ValueError(f"{prefix}.state_bits must be 8 or 32, not {group.get('state_bits')!r}")
+
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        # Merge metadata only. Do not materialize or traverse the caller's parameter generator twice.
+        self._validate_group(self.defaults | param_group, restored=False)
+        super().add_param_group(param_group)
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # Validate the checkpoint evidence before PyTorch replaces live groups or casts state tensors.
+        # Do not fill missing saved metadata from current defaults: that would conceal an invalid checkpoint.
+        for group in state_dict["param_groups"]:
+            self._validate_group(group, restored=True)
+        super().load_state_dict(state_dict)
 
     def _new_state(self, param: Tensor, group: dict[str, Any], running_init: bool) -> tuple[Tensor, Tensor]:
         """

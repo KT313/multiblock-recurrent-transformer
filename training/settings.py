@@ -13,6 +13,8 @@ from typing import Any, Literal, Optional
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
 
+from training.optimizer_validation import validate_adam_hyperparameters, validate_scalar
+
 # The activation-checkpointing modes of the recurrence iterations, `model.blocks.recurrence.CHECKPOINT_MODES` (which
 # imports torch; this module stays framework-neutral, a settings test keeps the two equal).
 CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
@@ -72,6 +74,19 @@ class OptimizerConfig:
     atan_adam: bool = False  # ELLISAdam only: atan2 update instead of the eps-guarded division
     running_init: bool = False  # ELLISAdam only: initialise the moments from the first gradient
     decouple_wd: bool = True  # ELLISAdam only: weight decay relative to init_lr instead of multiplied by lr
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self, optimizer: str | None = None) -> None:
+        """Validate again at use time: callers may have edited this mutable config."""
+
+        validate_scalar(self.lr, "optim_config.lr", positive=optimizer in ("ELLISAdam", "ELLISAdam8bit"))
+        # None remains a default-selection sentinel; validate the selected value without replacing it.
+        eps = self.eps if self.eps is not None else (1e-8 if optimizer == "AdamW" else 1e-6)
+        validate_adam_hyperparameters(
+            betas=self.betas, eps=eps, weight_decay=self.weight_decay, prefix="optim_config"
+        )
 
 
 @dataclass
@@ -201,12 +216,7 @@ class Settings:
             raise ValueError(
                 f"partial_depth_eval must list positive recurrence depths, got {self.partial_depth_eval}"
             )
-        if self.optim_config.lr <= 0:  # ELLISAdam divides by it (the decoupled-decay reference init_lr)
-            raise ValueError(
-                f"optim_config.lr must be positive, got {self.optim_config.lr}: it is the optimizer's constructor "
-                "LR and, for ELLISAdam, the reference of the decoupled weight decay (decay = lr / init_lr x "
-                "weight_decay). The schedule's learning rate is stage_base_lrs"
-            )
+        self.optim_config.validate(self.optimizer)
         if self.loss_normalization != "supervised_token_v1":
             raise ValueError("loss_normalization must be supervised_token_v1; legacy pack weighting is unsupported")
         if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
