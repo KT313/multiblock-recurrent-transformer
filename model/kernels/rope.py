@@ -2,6 +2,9 @@
 """Fresh Q/K/V storage and direct packed projection gradients.
 
 Rotation and deterministic bias reduction preserve the native rounding boundaries.
+Direct eager autograd translates synchronous backward failures with disable guidance.
+Compiled runtime errors and later asynchronous CUDA failures can bypass this Python
+boundary; the training-step error protection remains in place.
 """
 from __future__ import annotations
 
@@ -356,11 +359,20 @@ def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
 
 
 def _backward(ctx: Any, dq: Tensor, dk: Tensor, dv: Tensor) -> tuple[Tensor, Tensor | None, None, None]:
-    (freqs,) = ctx.saved_tensors
-    bias_grad = ctx.bias_shape is not None and ctx.needs_input_grad[1]
-    dqkv, partial = packed_backward(dq, dk, dv, freqs, bias_grad, ctx.in_dtype)
-    dbias = partial.sum(0).view(cast(tuple[int, ...], ctx.bias_shape)).to(ctx.bias_dtype) if bias_grad else None
-    return dqkv, dbias, None, None
+    # Keep the Triton operation traceable and include the separate bias reduction
+    # in the eager error boundary. AOT traces the successful tensor operations;
+    # generated runtime code and later asynchronous CUDA failures can bypass this
+    # Python handler, so the training-step error boundary remains necessary.
+    try:
+        (freqs,) = ctx.saved_tensors
+        bias_grad = ctx.bias_shape is not None and ctx.needs_input_grad[1]
+        dqkv, partial = packed_backward(dq, dk, dv, freqs, bias_grad, ctx.in_dtype)
+        dbias = partial.sum(0).view(cast(tuple[int, ...], ctx.bias_shape)).to(ctx.bias_dtype) if bias_grad else None
+        return dqkv, dbias, None, None
+    except CustomKernelError:
+        raise
+    except Exception as error:
+        raise CustomKernelError(f"RoPE/QKV backward custom kernel failed: {error}. {DISABLE_HINT}") from error
 
 
 register_autograd(f"{_NAMESPACE}::forward", _backward, setup_context=_setup_context)
