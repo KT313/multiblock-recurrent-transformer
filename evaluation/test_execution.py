@@ -151,3 +151,19 @@ def test_actual_cuda_samples_and_hflm_use_strict_kernels(
     with pytest.raises(CustomKernelError, match="BF16 autocast"):
         generate_samples(model, tokenizer, [Prompt("tok_3", "test")], max_new_tokens=2,
                          execution_policy=ExecutionPolicy("32"))
+
+
+@pytest.mark.parametrize("training", [True, False])
+@pytest.mark.parametrize("fail", [False, True])
+def test_session_restores_mixed_module_modes(tiny_model: RecurrentGPT, training: bool, fail: bool) -> None:
+    tiny_model.train(training)
+    tiny_model.transformer.wte.train(not training)
+    flags = [module.training for module in tiny_model.modules()]
+    try:
+        with inference_session(tiny_model):
+            assert not any(module.training for module in tiny_model.modules())
+            if fail:
+                raise RuntimeError("session failed")
+    except RuntimeError as error:
+        assert fail and str(error) == "session failed"
+    assert [module.training for module in tiny_model.modules()] == flags

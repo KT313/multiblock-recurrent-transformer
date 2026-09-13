@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from evaluation.metadata import METADATA_VERSION, benchmark_execution_metadata, dependency_versions
 from evaluation.rng import preserve_rng, seed_model_rng
 from evaluation.wrapper import Recurrence, check_recurrence, recurrence_label
 from evaluation.session import inference_session
@@ -45,7 +46,7 @@ def evaluate_on_benchmarks(
     *,
     num_fewshot: int = TASK_DEFAULT_FEWSHOT,
     limit: int | None = None,
-    batch_size: int = 8,
+    batch_size: int | str = 8,
     recurrences: Sequence[Recurrence] = (None,),
     out_path: Path | None = None,
     step: int | None = None,
@@ -77,6 +78,7 @@ def evaluate_on_benchmarks(
     raw_results: dict[str, Any] = {}
     versions: dict[str, Any] = {}
     n_shot: dict[str, Any] = {}
+    execution_settings: dict[str, Any] = {}
     for recurrence in recurrences:
         with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
             wrapper = session.hf_wrapper(tokenizer)
@@ -96,6 +98,11 @@ def evaluate_on_benchmarks(
                 random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
                 torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
             )
+            if out_path is not None:
+                execution_settings[recurrence_label(recurrence)] = benchmark_execution_metadata(
+                    session, language_model, wrapper, results, lm_eval.simple_evaluate, batch_size=batch_size,
+                    context_cap=model.config.model_max_sequence_length, custom_kernels=model.config.use_custom_kernels,
+                )
         label = recurrence_label(recurrence)
         metrics |= flatten_results(results["results"], label)
         raw_results[label] = results["results"]
@@ -118,6 +125,11 @@ def evaluate_on_benchmarks(
             "results": raw_results,
             "versions": versions,
             "n-shot": n_shot,
+            "execution_metadata": {
+                "schema_version": METADATA_VERSION,
+                "dependencies": dependency_versions(custom_kernels=model.config.use_custom_kernels),
+                "recurrences": execution_settings,
+            },
         }
         if execution_policy is not None:
             record["execution_precision"] = execution_policy.precision

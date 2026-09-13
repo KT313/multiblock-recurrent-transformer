@@ -34,3 +34,23 @@ with torch.inference_mode(), model.execution_policy().autocast(model.device):
 An export with missing metadata uses the same caller-controlled rule. Supply an explicit policy context to run
 such an export with BF16. Do not cast the entire model to BF16 as a substitute: strict MLP kernels require active
 CUDA BF16 autocast. The policy and session do not change the process's TF32 settings or initialize a backend.
+
+Benchmark JSON also contains `execution_metadata` with `schema_version: 1`. Settings are recorded per
+recurrence after the harness finishes: requested and configured batch size, retained automatic batch-size
+selections, session and HFLM inner autocast dtypes, parameter dtypes, custom-kernel selection, context cap,
+logits/request/response cache settings, and generation-cache/latent policy. Existing score, task, seed,
+recurrence and `execution_precision` fields are unchanged. Python callers can pass the harness's `"auto"`
+or `"auto:N"` batch-size setting; the default remains 8.
+
+Observed harness settings carry a `source`. `source: "unavailable"` means the wrapper/harness did not
+expose the value; it differs from an observed `null`, such as a disabled inner autocast dtype. Automatic
+batch-size schedules may contain only the last scoring pass, so they are not a complete batch-length trace.
+Generation records distinguish the wrapper's generation-config default from unobserved per-request
+harness/task overrides and explain both cached persistent-latent and legacy uncached policies. An unset
+wrapper config is not assumed to disable caching. Response-cache paths are reduced to an enabled flag.
+Torch, Transformers, lm-eval and applicable loaded Triton distribution versions are recorded without
+importing optional packages solely for metadata.
+
+Both loss validation and inference sessions restore every incoming module's training flag, including a
+child deliberately kept in eval mode inside a training model, on successful and exceptional exits. Loss
+validation retains its existing no-grad, backend-autocast and forked-Torch-RNG behavior.

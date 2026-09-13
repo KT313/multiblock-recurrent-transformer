@@ -321,3 +321,61 @@ def test_is_evaluation_step_table(settings: Settings) -> None:
     settings.eval_step_interval = 7
     evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, done, stage_manager)]
     assert evaluated == [7, 14, 20]
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_evaluation_restores_exact_module_modes(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch, training: bool, mixed: bool, fail: bool,
+) -> None:
+    tiny_model.train(training)
+    if mixed:
+        tiny_model.transformer.wte.train(not training)
+    flags = [module.training for module in tiny_model.modules()]
+    settings.eval_iters, settings.partial_depth_eval = 1, [1]
+    batches = _batches(1)
+    rng = torch.get_rng_state()
+    original = RecurrentGPT.forward
+
+    def forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
+        assert not any(module.training for module in self.modules())
+        assert not torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+        result = original(self, *args, **kwargs)
+        if fail:
+            raise RuntimeError("validation failure after forward")
+        return result
+
+    monkeypatch.setattr(RecurrentGPT, "forward", forward)
+    if fail:
+        with pytest.raises(RuntimeError, match="validation failure after forward"):
+            evaluate(settings, cpu_backend, tiny_model, batches)
+    else:
+        evaluate(settings, cpu_backend, tiny_model, batches)
+    assert [module.training for module in tiny_model.modules()] == flags
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+def test_validation_leaves_next_training_update_identical(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend,
+) -> None:
+    from copy import deepcopy
+
+    reference, validated = deepcopy(tiny_model), deepcopy(tiny_model)
+    settings.eval_iters, settings.partial_depth_eval = 1, [1]
+    batches = _batches(1)
+    for model in (reference, validated):
+        model.transformer.wte.eval()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        torch.manual_seed(51)
+        if model is validated:
+            evaluate(settings, cpu_backend, model, batches)
+        output = model(batches[0].input_ids, labels=batches[0].labels)
+        assert output["loss"] is not None
+        output["loss"].backward()
+        optimizer.step()
+    for left, right in zip(reference.parameters(), validated.parameters(), strict=True):
+        assert torch.equal(left, right)
+        assert left.grad is not None and right.grad is not None and torch.equal(left.grad, right.grad)
+    assert [module.training for module in reference.modules()] == [module.training for module in validated.modules()]

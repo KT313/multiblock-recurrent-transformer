@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
+from evaluation.mode import evaluation_mode
 from evaluation.wrapper import recurrence_label
 from model.model import RecurrentGPT
 from training.backend.base import Backend
@@ -54,11 +55,8 @@ def evaluate(settings: Settings, backend: Backend, model: Module, val_loader: It
 
 
 def _evaluate(settings: Settings, backend: Backend, model: Module, val_loader: Iterable[Batch]) -> dict[str, Tensor]:
-    model.eval()
-    try:
+    with evaluation_mode(model):
         return _evaluate_in_eval_mode(settings, backend, model, val_loader)
-    finally:
-        model.train()  # leave the model as it was found, whichever way this returns
 
 
 def _evaluate_in_eval_mode(

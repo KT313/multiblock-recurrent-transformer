@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from evaluation.mode import evaluation_mode
 from evaluation.rng import preserve_rng, seed_model_rng
 from evaluation.wrapper import RECURRENCE_ENV, Recurrence, check_recurrence, hf_wrapper_around, recurrence_env
 from model.execution import ExecutionPolicy
@@ -50,7 +51,6 @@ def inference_session(
     device = next(model.parameters()).device
     if isinstance(model, RecurrentGPT):
         check_recurrence(recurrence, model)
-    was_training = model.training
     previous = os.environ.get(RECURRENCE_ENV)
     env_value = recurrence_env(recurrence)
     if env_value is None:
@@ -60,13 +60,12 @@ def inference_session(
     try:
         with preserve_rng(device), torch.inference_mode(), policy.autocast(device):
             seed_model_rng(seed, device)
-            model.eval()
-            if isinstance(model, RecurrentGPT) and policy.precision is not None:
-                # Legacy callers can enter their own autocast inside this context; kernels still enforce support.
-                policy.check_custom_kernels(device, enabled=model.config.use_custom_kernels)
-            yield InferenceSession(model, device, policy)
+            with evaluation_mode(model):
+                if isinstance(model, RecurrentGPT) and policy.precision is not None:
+                    # Legacy callers can enter their own autocast inside this context; kernels still enforce support.
+                    policy.check_custom_kernels(device, enabled=model.config.use_custom_kernels)
+                yield InferenceSession(model, device, policy)
     finally:
-        model.train(was_training)
         if previous is None:
             os.environ.pop(RECURRENCE_ENV, None)
         else:
