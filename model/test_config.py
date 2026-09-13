@@ -336,3 +336,49 @@ def test_bf16_residual_stream_rejects_other_values() -> None:
 def test_bf16_residual_stream_default_is_off_in_every_architecture_yaml() -> None:
     for path in (TINY_ARCHITECTURE, CROW_ARCHITECTURE):
         assert RecurrentConfig.from_yaml(path).bf16_residual_stream == "none", path
+
+
+@pytest.mark.parametrize("field", ["tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"])
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
+@pytest.mark.parametrize("source", ["direct", "yaml", "json", "override"])
+def test_architecture_switches_require_booleans(tmp_path: Path, field: str, invalid: Any, source: str) -> None:
+    values = {field: invalid}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match=field + " must be a boolean"):
+        if source == "direct":
+            RecurrentConfig(**values)
+        elif source == "yaml":
+            RecurrentConfig.from_yaml(path)
+        elif source == "json":
+            RecurrentConfig.from_json(path)
+        else:
+            RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **values)
+
+
+@pytest.mark.parametrize("field", ["norm_eps", "rope_base"])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf"), True, "1e-6", None, [], 1j])
+@pytest.mark.parametrize("source", ["direct", "yaml", "json", "override"])
+def test_scales_require_positive_finite_reals(tmp_path: Path, field: str, invalid: Any, source: str) -> None:
+    if source in ("yaml", "json") and isinstance(invalid, complex):
+        pytest.skip("complex values have no standard JSON representation")
+    values: dict[str, Any] = {field: invalid} if field == "norm_eps" else {"rope_settings": {field: invalid}}
+    path = tmp_path / "config.json"
+    if source in ("yaml", "json"):
+        path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match=field + " must be > 0 and a finite real scalar"):
+        if source == "direct":
+            RecurrentConfig(**values)
+        elif source == "yaml":
+            RecurrentConfig.from_yaml(path)
+        elif source == "json":
+            RecurrentConfig.from_json(path)
+        else:
+            RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **values)
+
+
+def test_valid_scalars_and_false_switches_are_preserved() -> None:
+    config = tiny(norm_eps=1, rope_settings={"rope_base": 12.5}, tie_embeddings=False, qk_bias=False)
+    assert config.norm_eps == 1 and isinstance(config.norm_eps, int)
+    assert config.rope_settings.rope_base == 12.5
+    assert config.tie_embeddings is False and config.qk_bias is False

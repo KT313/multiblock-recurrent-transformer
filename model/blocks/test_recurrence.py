@@ -363,3 +363,40 @@ def test_gradient_checkpointing_mode_is_checked(tiny_model: RecurrentGPT) -> Non
             x, x, tiny_model.freqs_cis[:, :4], None, 1, 1, adapter=adapter, layers=layers,
             gradient_checkpointing=cast(recurrence.CheckpointMode, True),  # deliberately invalid at runtime
         )
+
+
+@pytest.mark.parametrize("values", [[], [1, 2, 3], [True], [1.5], [float("nan")], [float("inf")], [1j], [1, False]])
+@pytest.mark.parametrize("form", ["list", "tuple", "tensor"])
+def test_canon_steps_rejects_malformed_depths(values: list[Any], form: str) -> None:
+    if form == "tensor":
+        steps: object = torch.tensor(values, dtype=torch.bool if any(isinstance(v, bool) for v in values) else None)
+    else:
+        steps = tuple(values) if form == "tuple" else values
+    with pytest.raises(ValueError, match="num_steps"):
+        canon_steps(steps)
+
+
+@pytest.mark.parametrize("steps", [True, False, 1.5, float("nan"), float("inf"), 1j, "2", None])
+def test_canon_steps_rejects_malformed_scalars(steps: object) -> None:
+    with pytest.raises(ValueError, match="num_steps"):
+        canon_steps(steps)
+
+
+def test_integral_real_depths_and_list_disambiguation() -> None:
+    assert canon_steps(3.0) == (3, 0)
+    assert canon_steps([3.0]) == (3, 0)
+    assert canon_steps((0.0, 2.0)) == (0, 2)
+    assert canon_steps(torch.tensor([[[3.0, 2.0]]])) == (3, 2)
+    assert normalize_num_steps([3, 2], 2) == [(3, 0), (2, 0)]
+    assert normalize_num_steps((3, 2), 2) == [(3, 2), (3, 2)]
+
+
+@pytest.mark.parametrize("steps", [(1, 2, 3), torch.tensor([1.5]), [(1, 0), (True, 0)]])
+def test_invalid_explicit_depth_precedes_recurrent_execution(
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch, steps: Any,
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid explicit depth reached recurrence")
+    monkeypatch.setattr(tiny_model, "run_core_blocks", forbidden)
+    with pytest.raises(ValueError, match="num_steps"):
+        tiny_model(torch.zeros((1, 2), dtype=torch.long), num_steps=steps)

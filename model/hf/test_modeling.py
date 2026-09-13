@@ -820,3 +820,44 @@ def test_export_execution_metadata_is_optional_and_nonarchitectural(tmp_path: Pa
 def test_execution_metadata_preserves_positional_rope_configuration() -> None:
     config = RecurrentGPTConfig(None, {"rope_base": 1234}, execution_precision="bf16-mixed")
     assert config.rope_base == 1234 and config.execution_precision == "bf16-mixed"
+
+
+@pytest.mark.parametrize("values,field", [
+    ({"tie_embeddings": "false"}, "tie_embeddings"),
+    ({"qk_bias": 1}, "qk_bias"),
+    ({"norm_eps": float("nan")}, "norm_eps"),
+    ({"rope_base": True}, "rope_base"),
+    ({"rope_base": "50000"}, "rope_base"),
+    ({"rope_base": float("inf")}, "rope_base"),
+    ({"rope_base": True, "rope_settings": {"rope_base": 1}}, "rope_base"),
+    ({"rope_settings": {"rope_base": float("nan")}}, "rope_base"),
+])
+def test_hf_config_rejects_invalid_native_values(values: dict[str, Any], field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        RecurrentGPTConfig(**values)
+
+
+def test_hf_config_preserves_fractional_rope_base_and_rejects_close_conflicts() -> None:
+    config = RecurrentGPTConfig(rope_base=12.5)
+    assert config.to_recurrent_config().rope_settings.rope_base == 12.5
+    with pytest.raises(ValueError, match="disagree"):
+        RecurrentGPTConfig(rope_base=12.5, rope_settings={"rope_base": 12.6})
+    config.rope_base = True
+    with pytest.raises(ValueError, match="rope_base"):
+        config.to_recurrent_config()
+
+
+@pytest.mark.parametrize("text", ["0", "-1", "4,0", "1.5", "true", "nan", "1,2,3"])
+def test_hf_text_depth_rejects_invalid_specifications(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_recurrence_steps(text, 2)
+
+
+@pytest.mark.parametrize("steps", [True, 1.5, torch.tensor([1, 2, 3]), [(1, 0), (False, 0)]])
+def test_hf_invalid_depth_precedes_recurrence(monkeypatch: pytest.MonkeyPatch, steps: Any) -> None:
+    model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(tiny_config()))
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid explicit depth reached recurrence")
+    monkeypatch.setattr(model.model, "run_core_blocks", forbidden)
+    with pytest.raises(ValueError, match="num_steps"):
+        model(ids(1, 2), num_steps=steps)

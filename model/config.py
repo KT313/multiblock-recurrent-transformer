@@ -5,7 +5,9 @@ Architecture configuration of the multi-block recurrent transformer (the `crow-3
 """
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, fields
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,9 +26,18 @@ def find_multiple(value: int, multiple: int) -> int:
     return value + multiple - (value % multiple)
 
 
+def validate_positive_real(name: str, value: object) -> None:
+    """Reject coercible strings, booleans and nonfinite scalars without changing valid values."""
+    if isinstance(value, bool) or not isinstance(value, Real) or value <= 0 or (not isinstance(value, Integral) and not math.isfinite(value)):
+        raise ValueError(f"{name} must be > 0 and a finite real scalar, got {value!r}")
+
+
 @dataclass
 class RoPESettings:
-    rope_base: int = 50_000
+    rope_base: float = 50_000
+
+    def __post_init__(self) -> None:
+        validate_positive_real("rope_base", self.rope_base)
 
 
 # The accepted values of `bf16_residual_stream` (see the field).
@@ -67,6 +78,9 @@ def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> l
 class RecurrentConfig:
     """
     Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block.
+
+    Architecture switches require actual booleans, including in YAML/JSON and overrides. `norm_eps` and
+    `rope_settings.rope_base` require positive finite real scalars; strings, booleans and nonfinite values fail.
     """
 
     # Core
@@ -107,8 +121,9 @@ class RecurrentConfig:
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
-        if not isinstance(self.use_custom_kernels, bool):
-            raise ValueError("use_custom_kernels must be a boolean")
+        for name in ("tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         # Nested settings arrive as plain dicts from YAML / JSON.
         if isinstance(self.rope_settings, dict):
             self.rope_settings = RoPESettings(**self.rope_settings)
@@ -184,10 +199,10 @@ class RecurrentConfig:
         # None means "4 * n_embd", filled in below.
         if self.intermediate_size is not None and self.intermediate_size < 1:
             raise ValueError(f"intermediate_size must be >= 1, got {self.intermediate_size}")
-        if self.norm_eps <= 0:
-            raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
-        if self.rope_settings.rope_base <= 0:
-            raise ValueError(f"rope_base must be > 0, got {self.rope_settings.rope_base}")
+        validate_positive_real("norm_eps", self.norm_eps)
+        if not isinstance(self.rope_settings, RoPESettings):
+            raise ValueError("rope_settings must be a RoPESettings instance or mapping")
+        validate_positive_real("rope_base", self.rope_settings.rope_base)
 
     def _validate_recurrence(self) -> None:
         """

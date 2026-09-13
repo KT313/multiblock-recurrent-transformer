@@ -20,8 +20,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Pretra
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ..config import RecurrentConfig, RoPESettings, broadcast_per_block
-from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec
+from ..config import RecurrentConfig, RoPESettings
+from ..blocks.recurrence import NumSteps, StepsPair, StepsSpec, canon_steps
 from ..model import RecurrentGPT
 from ..generation import GenerationState
 from ..execution import ExecutionPolicy
@@ -112,11 +112,11 @@ def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[
     if not steps_str:
         return None
     if "," not in steps_str:
-        return (int(steps_str), 0)
+        return canon_steps(int(steps_str))
 
     per_block: list[StepsSpec] = []
     for value in steps_str.split(","):
-        per_block.append((int(value.strip()), 0))
+        per_block.append(canon_steps(int(value.strip())))
     if len(per_block) != num_blocks:
         raise ValueError(f"got {len(per_block)} recurrence values but the model has {num_blocks} recurrent blocks")
     return per_block
@@ -149,7 +149,7 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
 
     def __init__(
         self,
-        rope_base: int | None = None,
+        rope_base: float | None = None,
         rope_settings: dict[str, Any] | RoPESettings | None = None,
         *,
         execution_precision: str | None = None,
@@ -157,12 +157,14 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
     ) -> None:
         # `rope_settings` is the nested form of the same field: `RecurrentGPTConfig(**recurrent_config.to_dict())`
         # passes it instead of `rope_base`, and dropping it silently would leave the RoPE base at its default.
+        if rope_base is not None:
+            RoPESettings(rope_base=rope_base)
         if rope_settings is not None:
             if isinstance(rope_settings, RoPESettings):
                 nested_rope_base = rope_settings.rope_base
             else:
                 nested_rope_base = RoPESettings(**rope_settings).rope_base
-            if rope_base is not None and int(rope_base) != int(nested_rope_base):
+            if rope_base is not None and rope_base != nested_rope_base:
                 raise ValueError(f"rope_base ({rope_base}) and rope_settings ({nested_rope_base}) disagree")
             rope_base = nested_rope_base
         if rope_base is None:
@@ -174,13 +176,10 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         values: dict[str, Any] = {}
         for name in _MODEL_FIELDS:
             values[name] = kwargs.pop(name, getattr(defaults, name))
-        # Per-block fields take the int shorthand of `RecurrentConfig` (`mean_recurrence: 12` = every block) and are
-        # broadcast the way `RecurrentConfig.__post_init__` does; everything below reads one entry per core block.
-        layers_per_block = values["n_layers_in_recurrent_block"]
-        values["n_layers_in_recurrent_block"] = [layers_per_block] if isinstance(layers_per_block, int) else list(layers_per_block)
-        num_blocks = len(values["n_layers_in_recurrent_block"])
-        for name in ("mean_recurrence", "mean_backprop_depth"):
-            values[name] = broadcast_per_block(name, values[name], num_blocks)
+        # Validate raw API/serialized values before HF or numeric coercion can hide malformed settings.
+        validated = RecurrentConfig(rope_settings=RoPESettings(rope_base=rope_base), **values)
+        for name in ("n_layers_in_recurrent_block", "mean_recurrence", "mean_backprop_depth"):
+            values[name] = getattr(validated, name)
         for name, value in values.items():
             setattr(self, name, value)
         self.rope_base = rope_base
@@ -210,7 +209,7 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         field_values: dict[str, Any] = {}
         for name in _MODEL_FIELDS:
             field_values[name] = getattr(self, name)
-        return RecurrentConfig(rope_settings=RoPESettings(rope_base=int(self.rope_base)), **field_values)
+        return RecurrentConfig(rope_settings=RoPESettings(rope_base=self.rope_base), **field_values)
 
 
 class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore[no-untyped-call]  # see above

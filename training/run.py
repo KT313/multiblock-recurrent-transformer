@@ -134,7 +134,7 @@ def train(
     (`training/evaluation.py`), so it draws nothing the training stream would miss.
     """
 
-    check_evaluation_recurrences(settings)  # before anything is created or built
+    model_config = check_evaluation_recurrences(settings)  # before anything is created or built
     # Every rank checks the same pure plan before process-group/device initialization. Optimizer-step sizes
     # already count global micro-batches; the actual world-size divisibility check follows backend creation.
     configured_schedule = build_stage_manager(settings, load_dataset_config(settings.dataset_config), world_size=1)
@@ -165,7 +165,9 @@ def train(
             )
             loaders = build_run_dataloaders(settings, dataset, backend)
             try:
-                model = build_run_model(settings, dataset, backend, run_directory, resume_checkpoint=resume_path)
+                model = build_run_model(
+                    settings, dataset, backend, run_directory, resume_checkpoint=resume_path, model_config=model_config
+                )
                 check_tokenizer_vocabulary(loaders.tokenizer, backend.plain_model(model).config)
                 optimizer = build_run_optimizer(settings, model, backend)
                 state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
@@ -309,10 +311,10 @@ def build_stage_manager(settings: Settings, dataset: DatasetConfig | ResolvedDat
     )
 
 
-def check_evaluation_recurrences(settings: Settings) -> None:
+def check_evaluation_recurrences(settings: Settings) -> RecurrentConfig:
     """
     Every `sample_recurrences` / `benchmark_recurrences` setting must name one step count per core block of the
-    architecture config (with `model_overwrite` applied).
+    architecture config (with `model_overwrite` applied). Return that validated config for weight construction.
     """
 
     model_config = RecurrentConfig.from_yaml(
@@ -326,6 +328,8 @@ def check_evaluation_recurrences(settings: Settings) -> None:
                     f"{name}[{index}] = {setting} has {len(setting)} entries but the model architecture "
                     f"{settings.model_architecture_config} has {blocks} recurrent blocks"
                 )
+
+    return model_config
 
 
 def check_sequence_lengths(settings: Settings, dataset_config: DatasetConfig, model_config: RecurrentConfig) -> None:
@@ -388,7 +392,7 @@ def check_tokenizer_vocabulary(tokenizer: Tokenizer, model_config: RecurrentConf
 
 def build_run_model(
     settings: Settings, dataset: ResolvedDataset, backend: Backend, run_directory: Path,
-    *, resume_checkpoint: Path | None = None,
+    *, resume_checkpoint: Path | None = None, model_config: RecurrentConfig | None = None,
 ) -> Module:
     """
     The run's model: architecture yaml + `model_overwrite`, the sequence-length check against the dataset config,
@@ -398,9 +402,8 @@ def build_run_model(
     the caller must restore the complete checkpoint (including RNG) before training.
     """
 
-    model_config = RecurrentConfig.from_yaml(
-        settings.model_architecture_config, **(settings.model_overwrite | {"use_custom_kernels": settings.use_custom_kernels})
-    )
+    if model_config is None:
+        model_config = check_evaluation_recurrences(settings)
     check_sequence_lengths(settings, dataset.config, model_config)
     if resume_checkpoint is None:
         log.info(

@@ -22,7 +22,8 @@ FlexAttention's forward again: 2.1 times the step time of `none` for the same me
 import hashlib
 import math
 from functools import partial
-from typing import Any, Callable, Literal, cast
+from numbers import Integral, Real
+from typing import Any, Callable, Literal, SupportsInt, cast
 
 import torch
 from torch import Tensor
@@ -67,18 +68,32 @@ def check_checkpoint_mode(mode: str) -> CheckpointMode:
     return cast(CheckpointMode, mode)
 
 
-def canon_steps(steps: StepsSpec) -> StepsPair:
-    """
-    Turn one `StepsSpec` into an (n, k) pair of plain ints; a missing k means 0.
-    """
+def canon_steps(steps: object) -> StepsPair:
+    """Validate one explicit depth, returning (n no-grad, k backprop) as plain ints.
 
+    Scalars and one-element sequences mean (n, 0); pairs mean (n, k). Tensor shapes are flattened, but must
+    contain exactly one or two elements. Only finite, integral real values are accepted; no truncation occurs.
+    This eager boundary only handles explicit depths, leaving the training sampler and iteration loop untouched.
+    """
+    values: list[object]
     if isinstance(steps, torch.Tensor):
-        values = steps.detach().reshape(-1)
-        pair = (int(values[0].item()), int(values[1].item()) if values.numel() > 1 else 0)
+        if steps.numel() not in (1, 2):
+            raise ValueError(f"num_steps must contain one or two values, got {steps.numel()}")
+        values = steps.detach().reshape(-1).tolist()
     elif isinstance(steps, (list, tuple)):
-        pair = (int(steps[0]), int(steps[1]) if len(steps) > 1 else 0)
+        values = list(steps)
     else:
-        pair = (int(steps), 0)
+        values = [steps]
+    if len(values) not in (1, 2):
+        raise ValueError(f"num_steps must contain one or two values, got {len(values)}")
+    integers: list[int] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"num_steps[{index}] must be a finite integer-valued real scalar, got {value!r}")
+        if not isinstance(value, Integral) and (not math.isfinite(value) or value % 1 != 0):
+            raise ValueError(f"num_steps[{index}] must be a finite integer-valued real scalar, got {value!r}")
+        integers.append(int(cast(SupportsInt, value)))
+    pair = (integers[0], integers[1] if len(integers) == 2 else 0)
     if min(pair) < 0 or sum(pair) < 1:
         raise ValueError(f"num_steps {steps!r}: a block runs at least one recurrent step (n + k >= 1, both >= 0), else its output is the random initial state")
     return pair
@@ -87,7 +102,8 @@ def canon_steps(steps: StepsSpec) -> StepsPair:
 def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair | None]:
     """
     One entry per core block: None (sample per block), one (n_no_grad, k_with_grad) pair broadcast to all blocks,
-    or a list of pairs with one entry per block.
+    or a list of pairs with one entry per block. An outer list always means per-block specifications; a tuple
+    or tensor is broadcast. Each explicit specification is validated by `canon_steps` before recurrence begins.
     """
 
     if num_steps is None:

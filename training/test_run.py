@@ -1641,3 +1641,44 @@ def test_dataset_conflict_precedes_resolution_and_model_setup(
     assert called == []
     with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"):
         pass  # dataset refusal also releases the output lock
+
+
+@pytest.mark.parametrize("overwrite,field", [
+    ({"tie_embeddings": "false"}, "tie_embeddings"),
+    ({"qk_bias": 1}, "qk_bias"),
+    ({"norm_eps": float("nan")}, "norm_eps"),
+    ({"rope_settings": {"rope_base": float("inf")}}, "rope_base"),
+])
+@pytest.mark.parametrize("source", ["architecture", "override"])
+def test_invalid_model_config_fails_before_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overwrite: dict[str, Any], field: str, source: str,
+) -> None:
+    settings = parse_settings(["--config", str(write_tiny_yaml(
+        tmp_path, tmp_path / "missing_dataset", tmp_path / "out",
+    ))])
+    if source == "override":
+        settings.model_overwrite.update(overwrite)
+    else:
+        architecture = tmp_path / "invalid_architecture.yaml"
+        architecture.write_text(json.dumps(overwrite))
+        settings.model_architecture_config = str(architecture)
+    forbidden = Mock(side_effect=AssertionError("invalid model config reached expensive startup"))
+    for name in ("create_backend", "resolve_dataset", "build_run_model", "build_run_dataloaders", "RecurrentGPT"):
+        monkeypatch.setattr(run_module, name, forbidden)
+    with pytest.raises(ValueError, match=field):
+        train(settings)
+    forbidden.assert_not_called()
+    assert not Path(settings.dataset_dir).exists()
+    assert not Path(settings.out_dir).exists()
+
+
+def test_build_run_model_reuses_preflight_config(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = run_module.check_evaluation_recurrences(tiny_settings)
+    forbidden = Mock(side_effect=AssertionError("validated architecture was read twice"))
+    monkeypatch.setattr(RecurrentConfig, "from_yaml", forbidden)
+    model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, Path(tiny_settings.out_dir), model_config=config)
+    assert cpu_backend.plain_model(model).config is config
+    forbidden.assert_not_called()
