@@ -254,6 +254,10 @@ def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: Data
     path = config_file(cfg)
     prepare(path, layout.root, assume_yes=False)
     (layout.raw_dir("b") / "MANIFEST.json").write_text("{ not json")
+    processed = Manifest.load(layout.processed_dir("b"))
+    assert processed is not None
+    processed.generation_complete = False
+    processed.save(layout.processed_dir("b"))  # unfinished output still cannot build without current raw input
     reason = "raw unreadable manifest next to shards; fix or delete the directory by hand"
 
     b = source_ledger(cfg, "b", layout)

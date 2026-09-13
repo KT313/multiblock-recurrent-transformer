@@ -142,8 +142,13 @@ def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) ->
     nothing to build from.
     """
 
+    ledger = source_ledger(config, name, layout)
+    if ledger.raw_state != "current" or ledger.build_pending:
+        # Preserve the ledger's repair verdict, including unreadable processed manifests. Without current
+        # raw input there is nothing to build, even when an old output generation was interrupted.
+        return ledger.build_pending
     manifest = Manifest.load(layout.processed_dir(name))
-    return (manifest is not None and not manifest.generation_complete) or source_ledger(config, name, layout).build_pending
+    return manifest is not None and not manifest.generation_complete
 
 
 def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
