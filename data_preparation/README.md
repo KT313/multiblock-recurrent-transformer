@@ -626,6 +626,12 @@ listed Python/Java/C++/JavaScript code-block markers. The filter requires this c
 Malformed input uses the warning/counter mechanism and repeated malformed rows fail the source, while ordinary
 quality rejections do not count as malformed.
 
+An opening GPT answer (also after one initial system turn) is a known unsuitable conversation: download skips
+the entire sample and logs a warning, even for a long run of such rows. These skips remain in the manifest's
+`skipped_malformed` count but neither extend nor reset the source-schema failure streak. Missing keys, unsupported
+roles and invalid value types still use the existing failure threshold. Accepted pairs and stored row contents
+are unchanged, so this diagnostic change does not invalidate existing raw folders.
+
 This policy is recorded as `row_semantics.sharegpt_exchange: first_opening_exchange_v2` in affected raw identities;
 unrelated sources keep their fingerprints. Existing ShareGPT/SlimOrca normalized raw folders become stale and
 cannot be reused or appended to. The existing repair flow requires explicit rebuild confirmation. Rebuilding

@@ -10,6 +10,10 @@ from typing import Any
 SHAREGPT_EXCHANGE_POLICY = "first_opening_exchange_v2"
 
 
+class OrphanAssistantOpening(ValueError):
+    """A recognized GPT opening with no preceding question; skip the row without declaring schema failure."""
+
+
 @dataclass(frozen=True)
 class OpeningExchange:
     question: str
@@ -53,7 +57,8 @@ def opening_exchange(row: dict[str, Any]) -> OpeningExchange:
         index = 1
         role, question = turn(index)
     if role != "human":
-        raise ValueError(f"sharegpt_conversations: opening turn {index} must be human, got {role!r}")
+        error = OrphanAssistantOpening if role == "gpt" else ValueError
+        raise error(f"sharegpt_conversations: opening turn {index} must be human, got {role!r}")
     answer_role, answer = turn(index + 1)
     if answer_role != "gpt":
         raise ValueError(f"sharegpt_conversations: opening turn {index + 1} must be gpt, got {answer_role!r}")

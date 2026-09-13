@@ -62,6 +62,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
+from data_preparation.lib.sources.conversations import OrphanAssistantOpening
 from data_preparation.lib.sources.converters import Filter, expected_format, get_converter, get_filter, text_or_empty
 from data_preparation.lib.sources.hub_files import FetchStats, ReadRequest
 from data_preparation.lib.sources.loaders import (
@@ -856,6 +857,8 @@ class _Increment:
         malformed (ValueError: logged at WARNING, counted in skipped_malformed). A converted row ends a run of
         malformed ones; a filter rejection neither extends nor ends it. The :data:`MAX_CONSECUTIVE_MALFORMED`-th
         malformed row in a row raises :class:`MalformedSourceError`.
+
+        Orphan GPT openings are counted and warned about, but neither extend nor reset the schema-error streak.
         """
 
         if not self.is_instruct:
@@ -864,6 +867,12 @@ class _Increment:
             if self.row_filter is not None and not self.row_filter(raw):
                 return None
             row = _instruct_row(raw, self.converter)
+        except OrphanAssistantOpening as err:
+            # Preserve the existing manifest counter/offset contract without treating a known unsuitable
+            # conversation as evidence of a changed source schema. Never search later turns for another pair.
+            self.counters.skipped_malformed += 1
+            log.warning("%s: orphan assistant opening skipped (%s)", name, err)
+            return None
         except ValueError as err:
             self._malformed(name, raw, str(err))
             return None

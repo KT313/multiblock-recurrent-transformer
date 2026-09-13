@@ -1561,14 +1561,59 @@ def test_sharegpt_filter_malformed_openings_use_existing_failure_threshold(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
 ) -> None:
     src_dir = layout.root.parent / "malformed_openings"
-    wrong = {"conversations": [{"from": "gpt", "value": "orphan"}]}
+    wrong = {"conversations": [{"from": "gpt"}]}  # missing value is still a schema error
     write_local(src_dir, [wrong] * MAX_CONSECUTIVE_MALFORMED, "jsonl")
     src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
     cfg = with_tokenizer(cfg_factory({"s": src}))
     with pytest.raises(MalformedSourceError, match="10 consecutive rows") as info:
         download(cfg, "s", layout, rows_needed=10)
     assert len(info.value.samples) == MAX_CONSECUTIVE_MALFORMED
-    assert all("must be human" in reason for _, reason in info.value.samples)
+    assert all("needs 'from'/'value' keys" in reason for _, reason in info.value.samples)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("system_prefix", [False, True])
+def test_sharegpt_orphan_openings_are_warned_and_skipped_without_aborting(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+    read_rows: Reader, caplog: pytest.LogCaptureFixture, filtered: bool, system_prefix: bool,
+) -> None:
+    count = MAX_CONSECUTIVE_MALFORMED + 2
+    opening = [{"from": "gpt", "value": "orphan answer"}]
+    if system_prefix:
+        opening.insert(0, {"from": "system", "value": "context"})
+    # A later valid pair must not be salvaged from a rejected conversation.
+    orphan = {"conversations": opening + _sharegpt("x" * 60, "y" * 60)["conversations"]}
+    good = _sharegpt("h" * 60, "a" * 60)
+    src_dir = layout.root.parent / "orphan_openings"
+    write_local(src_dir, [orphan] * count + [good], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations",
+                 filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifest = download(cfg, "s", layout, rows_needed=2)
+    assert manifest.rows() == 1 and manifest.rows_fetched == count + 1 and manifest.exhausted
+    assert manifest.skipped_malformed == count
+    stored = read_rows(layout.raw_dir("s"))
+    assert [(row["instruction"], row["input"], row["output"]) for row in stored] == [("h" * 60, "", "a" * 60)]
+    warnings = [r for r in caplog.records if "orphan assistant opening skipped" in r.getMessage()]
+    assert len(warnings) == count and all(r.levelno == logging.WARNING for r in warnings)
+    # Existing source identity and committed offsets remain reusable, without recounting rejected rows.
+    resumed = download(cfg, "s", layout, rows_needed=2)
+    assert resumed.rows_fetched == manifest.rows_fetched and resumed.skipped_malformed == count
+
+
+def test_sharegpt_orphan_skip_does_not_reset_schema_failure_streak(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+) -> None:
+    broken = {"conversations": [{"from": "gpt"}]}
+    orphan = {"conversations": [{"from": "gpt", "value": "orphan answer"}]}
+    src_dir = layout.root.parent / "mixed_openings"
+    write_local(src_dir, [broken] * (MAX_CONSECUTIVE_MALFORMED - 1) + [orphan, broken], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with pytest.raises(MalformedSourceError, match="10 consecutive rows") as info:
+        download(cfg, "s", layout, rows_needed=1)
+    assert all("needs 'from'/'value' keys" in reason for _, reason in info.value.samples)
 
 
 @pytest.mark.parametrize("filtered", [False, True])
