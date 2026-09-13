@@ -431,7 +431,9 @@ def inspect_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Tokenizer
     directory = layout.tokenizer_dir(config.tokenizer.name)
     guarded_path(layout.root, directory)
     assessment = assess_tokenizer_folder(directory, config.tokenizer_hash())
-    if not assessment.ready:
+    # No artifacts is normal first-time preparation, including a precreated empty directory.
+    # Keep warnings for existing incomplete/stale tokenizer artifacts: the dashboard retains them.
+    if not assessment.ready and directory.exists() and any(directory.iterdir()):
         log.warning("%s; rebuilding from scratch", assessment.problem)
     return TokenizerPlan(directory, assessment.manifest if assessment.ready else None)
 

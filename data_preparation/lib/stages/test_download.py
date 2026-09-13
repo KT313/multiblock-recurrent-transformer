@@ -45,6 +45,7 @@ from data_preparation.lib.stages.download import (
     download,
     download_github_code_group,
     inspect_raw,
+    inspect_tokenizer,
     prepare_tokenizer,
     reopen_raw,
 )
@@ -89,6 +90,30 @@ def test_prepare_tokenizer_synthetic_is_idempotent(cfg_factory: CfgFactory, layo
     before = (out / "tokenizer.json").stat().st_mtime_ns
     assert prepare_tokenizer(cfg, layout) == manifest
     assert (out / "tokenizer.json").stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize('state', ['absent', 'empty', 'missing_manifest', 'missing_payload'])
+def test_tokenizer_inspection_warns_only_when_existing_artifacts_need_repair(
+    cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture, state: str,
+) -> None:
+    cfg = cfg_factory({'p': _synthetic()})
+    directory = layout.tokenizer_dir(cfg.tokenizer.name)
+    if state == 'empty':
+        directory.mkdir(parents=True)
+    elif state.startswith('missing_'):
+        prepare_tokenizer(cfg, layout)
+        (directory / ('MANIFEST.json' if state == 'missing_manifest' else 'tokenizer.json')).unlink()
+    existed = directory.exists()
+    before = {p.name: p.read_bytes() for p in directory.iterdir()} if existed else {}
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger='data_preparation'):
+        plan = inspect_tokenizer(cfg, layout)
+    assert plan.needs_publication
+    assert bool(caplog.records) == state.startswith('missing_')
+    if state.startswith('missing_'):
+        assert 'rebuilding from scratch' in caplog.text
+    assert directory.exists() == existed
+    assert ({p.name: p.read_bytes() for p in directory.iterdir()} if existed else {}) == before
 
 
 def test_prepare_tokenizer_rebuilds_on_stale_hash(
