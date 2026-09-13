@@ -792,6 +792,9 @@ def test_data_wait_metrics_and_the_rate_limited_warning(
     assert len(warnings) == 1 and getattr(warnings[0], "keep", False) is True
     assert "waited 0.2s for training data over the last 1 step(s), 20% of the training time" in warnings[0].getMessage()
     assert "(slowest: a 0.1s, b 0.1s)" in warnings[0].getMessage()  # per-source seconds, largest first
+    assert "loader waiting (worker start-ups are not counted); possible causes include storage" in warnings[0].getMessage()
+    assert "decompression, tokenization, collation, worker scheduling and inter-process transfer" in warnings[0].getMessage()
+    assert "tokenization is the bottleneck" not in warnings[0].getMessage()
     assert recording(run_logger).events[-1] == "waiting for training data: 20% of the training time (a 0.1s, b 0.1s)"
 
     step(1.0, {"a": 0.5})  # still above the threshold, but inside the quiet interval: no second warning

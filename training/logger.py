@@ -810,8 +810,8 @@ class RunLogger:
             )
             self.console.warning(
                 "the run waited %.1fs for training data over the last %d step(s), %.0f%% of the training time "
-                "(slowest: %s): the loader workers do not keep up with the model (worker start-ups are not counted), "
-                "tokenization is the bottleneck",
+                "(slowest: %s): loader waiting (worker start-ups are not counted); possible causes include storage, "
+                "decompression, tokenization, collation, worker scheduling and inter-process transfer",
                 wait_seconds,
                 steps,
                 100 * fraction,

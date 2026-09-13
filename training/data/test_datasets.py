@@ -3,13 +3,14 @@ import itertools
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Any, Callable, Iterator, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from torch.utils.data import DataLoader
 
+from data_preparation.layout import DatasetLayout
 from training.data import datasets as datasets_module
 from training.data.datasets import DEFAULT_DATA_SIGNATURE, ParquetTextDataset, WeightedMixtureDataset
 
@@ -488,3 +489,183 @@ def test_resume_offset_is_shared_by_the_shards(small_dir: Path) -> None:
 def test_resume_offset_rejects_a_negative_value(small_dir: Path) -> None:
     with pytest.raises(ValueError, match="non-negative"):
         ParquetTextDataset(small_dir, "small").set_resume_offset(-1)
+
+
+@pytest.mark.parametrize(
+    ("offset", "groups", "decoded_rows"),
+    [
+        (0, [(0, [0, 1]), (1, [0, 1, 2]), (2, [0])], 23),
+        (4, [(1, [0, 1, 2]), (2, [0])], 16),  # absolute row 7: file boundary
+        (5, [(1, [0, 1, 2]), (2, [0])], 16),  # inside that file's first group
+        (8, [(1, [1, 2]), (2, [0])], 12),  # absolute row 11: group boundary
+        (12, [(1, [2]), (2, [0])], 8),
+        (16, [(2, [0])], 4),  # absolute row 19: next file boundary
+        (17, [(2, [0])], 4),  # last row of the logical range
+        (18, [(0, [0, 1]), (1, [0, 1, 2]), (2, [0])], 23),  # exact end wraps to zero
+        (44, [(1, [1, 2]), (2, [0])], 12),  # multiple epochs plus offset 8
+    ],
+)
+def test_resume_skips_consumed_files_and_groups_before_reading(
+    ranged_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    offset: int, groups: list[tuple[int, list[int]]], decoded_rows: int,
+) -> None:
+    dataset = ParquetTextDataset(ranged_dir, "p", skip_rows=3, max_rows=18)
+    dataset.set_resume_offset(offset)
+    opened: list[str] = []
+    selected: list[tuple[str, list[int]]] = []
+    decoded: list[int] = []
+    real = pq.ParquetFile
+
+    def spy(path: Path) -> pq.ParquetFile:
+        opened.append(path.name)
+        parquet = real(path)
+        read = parquet.iter_batches
+
+        def batches(*, batch_size: int, columns: list[str], row_groups: list[int]) -> Iterator[pa.RecordBatch]:
+            selected.append((path.name, row_groups))
+            for batch in read(batch_size=batch_size, columns=columns, row_groups=row_groups):
+                decoded.append(batch.num_rows)
+                yield batch
+
+        monkeypatch.setattr(parquet, "iter_batches", batches)
+        return parquet
+
+    # Initialization reads all footers once. Measure only the epoch's physical reads after that metadata pass.
+    monkeypatch.setattr(pq, "ParquetFile", spy)
+    assert _texts(dataset) == _docs(3 + offset % 18, 21)
+    assert selected == [(f"data-{file:05d}.parquet", indices) for file, indices in groups]
+    assert opened == [name for name, _ in selected]
+    assert sum(decoded) == decoded_rows
+    assert (dataset.start, dataset.stop, dataset.resume_offset) == (3, 21, offset % 18)
+
+
+@pytest.mark.parametrize(("world", "workers"), [(1, 1), (1, 3), (2, 2), (3, 2)])
+@pytest.mark.parametrize("offset", [0, 1, 4, 8, 16, 17, 18, 44])
+@pytest.mark.parametrize("batch_rows", [3, 1024])
+def test_resumed_shards_keep_original_range_indices(
+    ranged_dir: Path, monkeypatch: pytest.MonkeyPatch, world: int, workers: int, offset: int, batch_rows: int,
+) -> None:
+    monkeypatch.setattr(datasets_module, "PARQUET_READ_BATCH_ROWS", batch_rows)
+    seen: list[str] = []
+    for rank in range(world):
+        dataset = ParquetTextDataset(ranged_dir, "p", shard=(rank, world), skip_rows=3, max_rows=18)
+        dataset.set_resume_offset(offset)
+        rank_rows = 0
+        for worker in range(workers):
+            monkeypatch.setattr(
+                datasets_module, "get_worker_info", lambda w=worker: SimpleNamespace(id=w, num_workers=workers)
+            )
+            rows = _texts(dataset)
+            expected = [
+                f"doc {3 + index}" for index in range(offset % 18, 18)
+                if index % (world * workers) == rank * workers + worker
+            ]
+            assert rows == expected
+            rank_rows += len(rows)
+            seen.extend(rows)
+        assert rank_rows == dataset.epoch_rows(workers)
+    assert Counter(seen) == Counter(_docs(3 + offset % 18, 21))
+
+
+@pytest.mark.parametrize("offset", [0, 5])
+@pytest.mark.parametrize("shards", [1, 6])
+def test_shards_convert_only_assigned_arrow_rows(
+    monkeypatch: pytest.MonkeyPatch, ranged_dir: Path, offset: int, shards: int,
+) -> None:
+    converted: list[int] = []
+    selections: list[int] = []
+
+    class TrackedBatch:
+        def __init__(self, batch: pa.RecordBatch) -> None:
+            self.batch = batch
+            self.num_rows = batch.num_rows
+
+        def take(self, indices: "pa.Array[Any]") -> "TrackedBatch":
+            selections.append(len(indices))
+            return TrackedBatch(self.batch.take(indices))
+
+        def to_pylist(self) -> list[dict[str, Any]]:
+            converted.append(self.num_rows)
+            return self.batch.to_pylist()
+
+    for shard in range(shards):
+        dataset = ParquetTextDataset(ranged_dir, "p", shard=(shard, shards), skip_rows=3, max_rows=18)
+        dataset.set_resume_offset(offset)
+        read = dataset._range_batches
+
+        def tracked(
+            keys: list[str], offset: int,
+            reader: Callable[[list[str], int], Iterator[tuple[int, pa.RecordBatch]]] = read,
+        ) -> Iterator[tuple[int, pa.RecordBatch]]:
+            for index, batch in reader(keys, offset):
+                yield index, cast(pa.RecordBatch, TrackedBatch(batch))
+
+        monkeypatch.setattr(dataset, "_range_batches", tracked)
+        assert _texts(dataset) == [f"doc {3 + i}" for i in range(offset, 18) if i % shards == shard]
+    # Shards decode overlapping data, but together convert each remaining row to a Python dict just once.
+    assert sum(converted) == 18 - offset
+    assert sum(selections) == (18 - offset if shards > 1 else 0)
+    assert all(size > 0 for size in converted)
+
+
+@pytest.mark.parametrize("offset", [0, 1, 3, 5, 6])
+def test_resume_handles_empty_files_and_groups(tmp_path: Path, offset: int) -> None:
+    empty = pa.table({"text": pa.array([], type=pa.string())})
+    pq.write_table(empty, tmp_path / "data-00000.parquet")
+    with pq.ParquetWriter(tmp_path / "data-00001.parquet", empty.schema) as writer:
+        writer.write_table(empty)
+        writer.write_table(pa.table({"text": _docs(0, 3)}))
+        writer.write_table(empty)
+        writer.write_table(pa.table({"text": _docs(3, 6)}))
+        writer.write_table(empty)
+    pq.write_table(empty, tmp_path / "data-00002.parquet")
+    dataset = ParquetTextDataset(tmp_path, "p")
+    dataset.set_resume_offset(offset)
+    assert _texts(dataset) == _docs(offset % 6, 6)
+
+
+def test_empty_range_reads_no_file(ranged_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = ParquetTextDataset(ranged_dir, "p", skip_rows=3, max_rows=0)
+    dataset.set_resume_offset(100)
+
+    def unexpected(path: Path) -> pq.ParquetFile:
+        raise AssertionError(f"empty range opened {path}")
+
+    monkeypatch.setattr(pq, "ParquetFile", unexpected)
+    assert _texts(dataset) == []
+    assert dataset.epoch_rows(2) == 0
+
+
+def test_running_iterator_keeps_its_resume_offset(ranged_dir: Path) -> None:
+    dataset = ParquetTextDataset(ranged_dir, "p", skip_rows=3, max_rows=18)
+    dataset.set_resume_offset(8)
+    iterator = iter(dataset)
+    assert next(iterator)["text"] == "doc 11"
+    dataset.set_resume_offset(0)
+    assert [row["text"] for row in iterator] == _docs(12, 21)
+    assert _texts(dataset) == _docs(3, 21)
+
+
+@pytest.mark.parametrize("scope", [None, "test-config-hash"])
+def test_reader_accepts_both_processed_layouts_without_mutating_extra_columns(tmp_path: Path, scope: str | None) -> None:
+    directory = DatasetLayout(tmp_path, processed_scope=scope).processed_dir("test-source")
+    directory.mkdir(parents=True)
+    table = pa.table({"text": _docs(0, 6), "hash": list(range(6))})
+    path = directory / "data-00000.parquet"
+    pq.write_table(table, path, row_group_size=2)
+    before = path.read_bytes()
+    dataset = ParquetTextDataset(directory, "test-source", skip_rows=1)
+    dataset.set_resume_offset(2)
+    rows = list(dataset)
+    assert [row["text"] for row in rows] == _docs(3, 6)
+    assert all(set(row) == {"text", "data_signature", "data_id"} for row in rows)
+    assert path.read_bytes() == before
+    assert pq.read_table(path).equals(table)
+
+
+def test_unreadable_selected_file_still_raises(ranged_dir: Path) -> None:
+    dataset = ParquetTextDataset(ranged_dir, "p", skip_rows=3)
+    dataset.set_resume_offset(8)
+    (ranged_dir / "data-00001.parquet").write_bytes(b"corrupt parquet")
+    with pytest.raises(pa.ArrowInvalid, match="Parquet magic bytes"):
+        _texts(dataset)

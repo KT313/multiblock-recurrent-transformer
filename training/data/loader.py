@@ -207,11 +207,11 @@ class RunDataloaders:
     training_max_sequence_length is only quoted in the messages about dropped rows; a fake may leave it out.
 
     Data wait: `next_train_batch` times every pull from a loader (`clock`, monotonic) and adds the seconds to
-    `wait_seconds` per source; `take_wait_seconds` hands them out and resets. A pull blocks only when the worker has
-    no batch ready, so this is the time the training process (and every GPU behind it) waits for data. The first
-    pull of a fresh iterator (a source's first batch, every epoch restart) is the worker start-up (process spawn,
-    tokenizer load) and is not counted: it would put nearly every run's first log interval over the warning
-    threshold and says nothing about the tokenization rate.
+    `wait_seconds` per source; `take_wait_seconds` hands them out and resets. This measures loader retrieval time,
+    including waiting for ready batches and retrieval overhead. It cannot distinguish storage, decompression,
+    tokenization, collation, worker scheduling or inter-process transfer. The first pull of a fresh iterator
+    (a source's first batch, every epoch restart) includes worker start-up (process spawn, tokenizer load) and is
+    not counted: it would put nearly every run's first log interval over the warning threshold.
     """
 
     train_loaders: dict[str, Iterable[WorkerBatch]]
@@ -336,7 +336,7 @@ class RunDataloaders:
         """
 
         iterator = self._train_iterators[source]
-        fresh = iterator is None  # a fresh iterator's first pull is the worker start-up, not a wait on tokenization
+        fresh = iterator is None  # a fresh iterator's first pull includes worker start-up
         if iterator is None:
             iterator = self._start_train_iterator(source)
         while True:
