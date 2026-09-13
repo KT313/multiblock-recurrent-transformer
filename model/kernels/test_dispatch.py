@@ -129,7 +129,7 @@ def test_exported_cuda_model_can_coexist_with_original(tmp_path: Path) -> None:
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
     torch.manual_seed(14)
     original = RecurrentGPT(tiny_config(use_custom_kernels=True)).cuda().train()
-    export_to_hf(original, original.config, tmp_path / 'export')
+    export_to_hf(original, original.config, tmp_path / 'export', allow_missing_generation_metadata=True)
     remote_class: Any = get_class_from_dynamic_module('hf_modeling.RecurrentGPTForCausalLM', str(tmp_path / 'export'))
     exported = remote_class.from_pretrained(tmp_path / 'export')
     torch.nn.Module.cuda(exported)

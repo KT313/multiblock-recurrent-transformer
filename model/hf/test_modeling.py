@@ -8,11 +8,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
 import model.model as model_module
 from model.layers.norms import RMSNorm
@@ -28,6 +29,7 @@ from model.hf.modeling import (
     flatten_relative_imports,
     mask_padded_vocabulary,
     parse_recurrence_steps,
+    resolve_special_token_ids,
 )
 
 
@@ -504,12 +506,166 @@ def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir
     tok = AutoTokenizer.from_pretrained(out_dir)
     ref = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
     assert tok("hello world")["input_ids"] == ref("hello world")["input_ids"]
+    loaded = load_exported(out_dir)
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        assert getattr(loaded.config, name) == getattr(loaded.generation_config, name) == getattr(tok, name)
+    assert loaded.generation_config.pad_token_id == 0
+    assert_stops_on_token(loaded, 2)
+
+
+class ForceToken(LogitsProcessor):
+    def __init__(self, token_id: int) -> None:
+        self.token_id = token_id
+
+    # transformers annotates scores as FloatTensor, but generation passes an ordinary Tensor.
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
+        scores.fill_(float("-inf"))
+        scores[:, self.token_id] = 0
+        return scores
+
+
+def assert_stops_on_token(model: RecurrentGPTForCausalLM, token_id: int) -> None:
+    prompt = ids(1, 4)
+    generated = model.generate(
+        prompt, attention_mask=torch.ones_like(prompt), max_new_tokens=5, do_sample=False,
+        logits_processor=LogitsProcessorList([ForceToken(token_id)]),
+    )
+    assert generated.shape == (1, 5)
+    assert generated[0, -1].item() == token_id
+
+
+@pytest.mark.parametrize("eos", [0, [0, 2]])
+def test_explicit_export_with_optional_ids_absent(tmp_path: Path, eos: int | list[int]) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", eos_token_id=eos)
+    loaded = load_exported(out_dir)
+    for filename in ("config.json", "generation_config.json"):
+        metadata = json.loads((out_dir / filename).read_text())
+        assert metadata["eos_token_id"] == eos
+        assert metadata.get("bos_token_id") is None and metadata.get("pad_token_id") is None
+    for token_id in eos if isinstance(eos, list) else [eos]:
+        assert_stops_on_token(loaded, token_id)
+
+
+def test_tokenizer_instance_explicit_supplement_does_not_mutate_source(
+    tmp_path: Path, tiny_tokenizer_dir: Path,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    tokenizer.bos_token = None
+    tokenizer.pad_token = None
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", tokenizer=tokenizer, bos_token_id=1, eos_token_id=[2])
+    saved = AutoTokenizer.from_pretrained(out_dir)
+    assert saved.bos_token_id == 1 and saved.pad_token_id is None and saved.eos_token_id == 2
+    assert tokenizer.bos_token_id is None and tokenizer.pad_token_id is None
+    assert len(saved) == len(tokenizer)
+
+
+@pytest.mark.parametrize("field", ["bos_token_id", "eos_token_id", "pad_token_id"])
+@pytest.mark.parametrize("invalid", [True, False, 1.5, "2", -1, 511, [], [True], [2, -1]])
+def test_invalid_metadata_fails_before_output_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, invalid: object,
+) -> None:
+    # 511 is a padded-only row: the tiny model still has 512 physical rows.
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, vocab_size=511)
+    out_dir = tmp_path / "export"
+    out_dir.mkdir()
+    sentinel = out_dir / "config.json"
+    sentinel.write_text("existing export")
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid metadata reached weight access")
+
+    monkeypatch.setattr(model, "state_dict", forbidden)
+    kwargs = {"eos_token_id": 2, field: invalid}
+    with pytest.raises(ValueError, match=field):
+        export_to_hf(model, model.config, out_dir, **cast(dict[str, Any], kwargs))
+    assert list(out_dir.iterdir()) == [sentinel] and sentinel.read_text() == "existing export"
+
+
+def test_missing_and_conflicting_metadata_fail_before_directory_creation(
+    tmp_path: Path, tiny_tokenizer_dir: Path,
+) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = tmp_path / "export"
+    with pytest.raises(ValueError, match="allow_missing_generation_metadata=True"):
+        export_to_hf(model, model.config, out_dir)
+    with pytest.raises(ValueError, match="eos_token_id conflicts"):
+        export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir, eos_token_id=3)
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    with pytest.raises(ValueError, match="either tokenizer_dir or tokenizer"):
+        export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir, tokenizer=tokenizer)
+    assert not out_dir.exists()
+    out_dir = export_to_hf(model, model.config, out_dir, allow_missing_generation_metadata=True)
+    loaded = load_exported(out_dir)
+    assert loaded.config.eos_token_id is None and loaded.generation_config.eos_token_id is None
+
+
+def test_tokenizer_metadata_is_validated_after_loading(tiny_tokenizer_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    with pytest.raises(ValueError, match="eos_token_id"):
+        resolve_special_token_ids(2, tokenizer)
+    tokenizer.bos_token = None
+    with pytest.raises(ValueError, match="unknown to the tokenizer"):
+        resolve_special_token_ids(1024, tokenizer, bos_token_id=1000)
+
+
+@pytest.mark.parametrize("eos", [3, None])
+def test_tokenizer_free_export_refuses_existing_tokenizer_without_mutation(
+    tmp_path: Path, tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch, eos: int | None,
+) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", tiny_tokenizer_dir)
+    assert AutoTokenizer.from_pretrained(out_dir).eos_token_id == 2
+    before = {path.relative_to(out_dir): path.read_bytes() for path in out_dir.rglob("*") if path.is_file()}
+
+    with monkeypatch.context() as patch:
+        def forbidden(*args: object, **kwargs: object) -> None:
+            pytest.fail("ambiguous tokenizer reuse reached weight access")
+
+        patch.setattr(model, "state_dict", forbidden)
+        with pytest.raises(ValueError, match="fresh directory or supply a tokenizer"):
+            export_to_hf(model, model.config, out_dir, eos_token_id=eos, allow_missing_generation_metadata=eos is None)
+
+    after = {path.relative_to(out_dir): path.read_bytes() for path in out_dir.rglob("*") if path.is_file()}
+    assert after == before
+    # A clean explicit-only/model-only destination remains supported with the requested metadata.
+    fresh = export_to_hf(
+        model, model.config, tmp_path / "fresh", eos_token_id=eos, allow_missing_generation_metadata=eos is None,
+    )
+    loaded = load_exported(fresh)
+    assert loaded.config.eos_token_id == loaded.generation_config.eos_token_id == eos
+    # Supplying the tokenizer also makes reuse unambiguous.
+    export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir)
+    assert AutoTokenizer.from_pretrained(out_dir).eos_token_id == load_exported(out_dir).generation_config.eos_token_id == 2
+
+
+@pytest.mark.parametrize("artifact", ["tokenizer_config.json", "tokenizer.json", "vocab.txt", "spiece.model"])
+def test_tokenizer_free_export_refuses_partial_tokenizer_artifacts(tmp_path: Path, artifact: str) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    path = tmp_path / artifact
+    path.write_bytes(b"existing tokenizer artifact")
+    with pytest.raises(ValueError, match="fresh directory or supply a tokenizer"):
+        export_to_hf(model, model.config, tmp_path, eos_token_id=3)
+    assert list(tmp_path.iterdir()) == [path]
+    assert path.read_bytes() == b"existing tokenizer artifact"
+
+
+def test_saved_config_revalidates_special_token_ids(tmp_path: Path) -> None:
+    config = RecurrentGPTConfig.from_recurrent_config(tiny_config(vocab_size=511), eos_token_id=2)
+    config.save_pretrained(tmp_path)
+    path = tmp_path / "config.json"
+    saved = json.loads(path.read_text())
+    saved["eos_token_id"] = 511
+    path.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="eos_token_id"):
+        RecurrentGPTConfig.from_pretrained(tmp_path)
 
 
 def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     torch.manual_seed(0)
     model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", allow_missing_generation_metadata=True)
     names = {p.name for p in out_dir.iterdir()}
     assert {"config.json", "model.safetensors", "hf_modeling.py", "model.py", "config.py", "layers_norms.py"} <= names
     assert not any(n.startswith("test_") for n in names)
@@ -539,7 +695,7 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
 def test_generate_runs(tmp_path: Path) -> None:
     torch.manual_seed(0)
     model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", allow_missing_generation_metadata=True)
     loaded = load_exported(out_dir)
     prompt = ids(1, 8)
     torch.manual_seed(1)
@@ -559,7 +715,7 @@ def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> No
 
     torch.manual_seed(0)
     model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", bos_token_id=1, eos_token_id=2, pad_token_id=0)
     model.eval()
     x = ids()
     torch.manual_seed(1)
@@ -570,6 +726,7 @@ import importlib.util, sys
 assert importlib.util.find_spec("model") is None, "repo package importable; test would not be standalone"
 import torch
 from transformers import AutoModelForCausalLM
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 loaded = AutoModelForCausalLM.from_pretrained({str(out_dir)!r}, trust_remote_code=True).train(False)
 assert type(loaded).__module__.startswith("transformers_modules"), type(loaded).__module__
 assert loaded.execution_policy().precision is None
@@ -579,6 +736,15 @@ data = torch.load({str(tmp_path / "ref.pt")!r}, weights_only=True)
 torch.manual_seed(1)
 got = loaded(data["x"]).logits
 torch.testing.assert_close(got, data["ref"], atol=1e-5, rtol=0)
+class ForceEOS(LogitsProcessor):
+    def __call__(self, input_ids, scores):
+        scores.fill_(float("-inf"))
+        scores[:, 2] = 0
+        return scores
+assert loaded.config.eos_token_id == loaded.generation_config.eos_token_id == 2
+prompt = data["x"][:1, :4]
+output = loaded.generate(prompt, max_new_tokens=5, do_sample=False, logits_processor=LogitsProcessorList([ForceEOS()]))
+assert output.shape == (1, 5) and output[0, -1].item() == 2
 print("STANDALONE_OK")
 """
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
@@ -608,7 +774,7 @@ def test_export_execution_metadata_is_optional_and_nonarchitectural(tmp_path: Pa
 
     model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     policy = None if precision is None else ExecutionPolicy(precision)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export", execution_policy=policy)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", execution_policy=policy, allow_missing_generation_metadata=True)
     loaded = load_exported(out_dir)
     assert loaded.config.execution_precision == precision
     assert loaded.model.config == model.config

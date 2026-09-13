@@ -11,11 +11,12 @@ lines. The `auto_map` names this module's flat name.
 
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -52,6 +53,54 @@ _MODEL_FIELDS = (
     "mean_recurrence",
     "mean_backprop_depth",
 )
+
+
+def validate_special_token_id(name: str, value: object, vocab_size: int) -> int | list[int] | None:
+    """Validate against real vocabulary rows; only EOS supports a nonempty list of IDs."""
+    if value is None:
+        return None
+    if name == "eos_token_id" and isinstance(value, list) and value:
+        return [validate_single_token_id(name, item, vocab_size) for item in value]
+    return validate_single_token_id(name, value, vocab_size)
+
+
+def validate_single_token_id(name: str, value: object, vocab_size: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < vocab_size:
+        raise ValueError(f"{name} must contain integer IDs in the real vocabulary [0, {vocab_size}); got {value!r}")
+    return value
+
+
+def resolve_special_token_ids(
+    vocab_size: int, tokenizer: PreTrainedTokenizerBase | None = None, *,
+    bos_token_id: int | None = None, eos_token_id: int | list[int] | None = None,
+    pad_token_id: int | None = None, allow_missing_generation_metadata: bool = False,
+) -> dict[str, int | list[int] | None]:
+    """Pure metadata resolution. None means unspecified, so it never clears a tokenizer's existing ID."""
+    resolved: dict[str, int | list[int] | None] = {}
+    for name, value in (("bos_token_id", bos_token_id), ("eos_token_id", eos_token_id), ("pad_token_id", pad_token_id)):
+        explicit = validate_special_token_id(name, value, vocab_size)
+        saved = validate_special_token_id(name, getattr(tokenizer, name, None), vocab_size)
+        if explicit is not None and saved is not None:
+            # A singleton EOS list and its scalar are equivalent; preserve the explicit representation on export.
+            explicit_ids = explicit if isinstance(explicit, list) else [explicit]
+            saved_ids = saved if isinstance(saved, list) else [saved]
+            if explicit_ids != saved_ids:
+                raise ValueError(f"{name} conflicts: explicit {explicit!r}, tokenizer {saved!r}")
+        resolved[name] = saved if explicit is None else explicit
+    if resolved["eos_token_id"] is None and not allow_missing_generation_metadata:
+        raise ValueError(
+            "HF export requires eos_token_id from a tokenizer or explicit IDs for EOS stopping; "
+            "pass allow_missing_generation_metadata=True for an intentional model-only export"
+        )
+    if tokenizer is not None:
+        known_ids = set(tokenizer.get_vocab().values())
+        for name, value in resolved.items():
+            token_ids = value if isinstance(value, list) else ([] if value is None else [value])
+            if any(token_id not in known_ids for token_id in token_ids):
+                raise ValueError(f"{name} {value!r} contains IDs unknown to the tokenizer")
+            if len(token_ids) > 1:
+                raise ValueError("a tokenizer has one EOS token; use explicit-only export for multiple EOS IDs")
+    return resolved
 
 
 def parse_recurrence_steps(steps_str: str, num_blocks: int) -> StepsPair | list[StepsSpec] | None:
@@ -145,6 +194,9 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
         self.num_hidden_layers = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
 
         kwargs.setdefault("tie_word_embeddings", self.tie_embeddings)
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            if name in kwargs:
+                kwargs[name] = validate_special_token_id(name, kwargs[name], int(self.vocab_size))
         super().__init__(**kwargs)
 
     @classmethod
@@ -382,6 +434,12 @@ AutoModelForCausalLM.register(RecurrentGPTConfig, RecurrentGPTForCausalLM)
 # --- export ----------------------------------------------------------------------------------------------------------
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]  # the `model/` package (this file is `model/hf/modeling.py`)
+# Tokenizer metadata plus common fast/slow tokenizer artifacts. Refuse ambiguous reuse; never delete these files.
+_TOKENIZER_EXPORT_ARTIFACTS = (
+    "tokenizer_config.json", "special_tokens_map.json", "tokenizer.json", "added_tokens.json",
+    "vocab.json", "vocab.txt", "merges.txt", "tokenizer.model", "spiece.model", "sentencepiece.bpe.model",
+    "chat_template.jinja", "chat_templates",
+)
 # One `from .x import` / `from ..x.y import` line: leading whitespace, the dots, the dotted module name.
 _RELATIVE_IMPORT = re.compile(r"^(?P<indent>[ \t]*)from[ \t]+(?P<dots>\.+)(?P<name>[\w.]*)[ \t]+import\b", re.MULTILINE)
 
@@ -445,18 +503,51 @@ def export_sources(package_dir: Path, out_dir: Path) -> list[Path]:
 
 def export_to_hf(
     model: RecurrentGPT, config: RecurrentConfig, out_dir: str | Path, tokenizer_dir: str | Path | None = None,
-    *, execution_policy: ExecutionPolicy | None = None,
+    *, execution_policy: ExecutionPolicy | None = None, tokenizer: PreTrainedTokenizerBase | None = None,
+    bos_token_id: int | None = None, eos_token_id: int | list[int] | None = None, pad_token_id: int | None = None,
+    allow_missing_generation_metadata: bool = False,
 ) -> Path:
     """
-    Write `model` as a self-contained `trust_remote_code` folder (safetensors, config.json, model sources).
+    Write a self-contained HF folder with model and generation special-token metadata.
+
+    Supply tokenizer_dir, a loaded tokenizer, or explicit IDs. None means unspecified, never an override of
+    tokenizer metadata. Explicit IDs must agree with any tokenizer IDs. EOS is required unless
+    allow_missing_generation_metadata=True intentionally permits a model-only export without EOS stopping.
+    BOS/PAD remain optional; no IDs are guessed and no vocabulary resizing occurs. Metadata errors precede writes.
+    Without a tokenizer, existing tokenizer artifacts require a fresh output directory or an explicit tokenizer.
     """
 
+    if tokenizer_dir is not None and tokenizer is not None:
+        raise ValueError("supply either tokenizer_dir or tokenizer, not both")
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if tokenizer_dir is None and tokenizer is None:
+        existing = [name for name in _TOKENIZER_EXPORT_ARTIFACTS if (out_dir / name).exists() or (out_dir / name).is_symlink()]
+        if existing:
+            raise ValueError(
+                f"HF export destination {out_dir} contains tokenizer artifacts ({', '.join(existing)}); "
+                "use a fresh directory or supply a tokenizer to avoid stale special-token metadata"
+            )
+    if tokenizer_dir is not None:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    elif tokenizer is not None:
+        tokenizer = deepcopy(tokenizer)  # metadata resolution and serialization use this one independent instance
+    metadata = resolve_special_token_ids(
+        config.vocab_size, tokenizer, bos_token_id=bos_token_id, eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id, allow_missing_generation_metadata=allow_missing_generation_metadata,
+    )
+    if tokenizer is not None:
+        # Fill missing special-token roles without adding tokens or mutating the caller's tokenizer.
+        for name, value in metadata.items():
+            if value is not None and getattr(tokenizer, name) is None:
+                token_id = value[0] if isinstance(value, list) else value
+                setattr(tokenizer, name.removesuffix("_id"), tokenizer.convert_ids_to_tokens(token_id))
+                if getattr(tokenizer, name) != token_id:
+                    raise ValueError(f"tokenizer cannot represent {name}={token_id}")
 
     this_module = flat_module_name(Path(__file__).resolve().relative_to(_PACKAGE_DIR))
     hf_config = RecurrentGPTConfig.from_recurrent_config(
         config, execution_precision=execution_policy.precision if execution_policy is not None else None,
+        **metadata,
     )
     hf_config.auto_map = {
         "AutoConfig": f"{this_module}.RecurrentGPTConfig",
@@ -466,14 +557,17 @@ def export_to_hf(
     # Build the wrapper without allocating weights, then hand it `model`'s tensors under the wrapper's `model.` prefix.
     with torch.device("meta"):
         hf_model = RecurrentGPTForCausalLM(hf_config)
+    for name, value in metadata.items():
+        setattr(hf_model.generation_config, name, value)
     state_dict: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
         state_dict[f"model.{name}"] = tensor.detach().cpu()
     state_dict["model.freqs_cis"] = model.freqs_cis.detach().cpu()  # persistent in the wrapper only (see its __init__)
     hf_model.load_state_dict(state_dict, assign=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     hf_model.save_pretrained(out_dir, safe_serialization=True)
     export_sources(_PACKAGE_DIR, out_dir)
 
-    if tokenizer_dir is not None:
-        AutoTokenizer.from_pretrained(tokenizer_dir).save_pretrained(out_dir)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(out_dir)
     return out_dir

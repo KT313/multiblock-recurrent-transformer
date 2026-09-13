@@ -764,6 +764,8 @@ def test_export_to_hf_produces_loadable_folder(full_run: dict[str, Any]) -> None
     assert (export_dir / "config.json").exists() and (export_dir / "model.safetensors").exists()
     model = AutoModelForCausalLM.from_pretrained(export_dir, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(export_dir)
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        assert getattr(model.config, name) == getattr(model.generation_config, name) == getattr(tokenizer, name)
     ids = tokenizer("tok_1 tok_2 tok_3", return_tensors="pt").input_ids
     with torch.no_grad():
         out = model(input_ids=ids)
