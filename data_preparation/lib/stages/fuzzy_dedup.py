@@ -183,8 +183,10 @@ def fuzzy_dedup(
     rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], pass_workers: int = 1, chunk_size: int = CHUNK_SIZE
 ) -> Iterator[Row]:
     """
-    Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= dedup.threshold) among the rows
-    yielded before; rows too short for a single n-gram pass through untouched (stats["too_short_passed"], they
+    Yield rows with no approximate MinHash/LSH candidate among previously yielded rows. The threshold tunes
+    candidate matching; actual Jaccard similarity is not checked, so below-threshold removals and missed
+    duplicates are possible. This approximate policy is intentional; rows too short for a single n-gram pass
+    through untouched (stats["too_short_passed"], they
     are only deduplicated exactly). stats gets threshold, num_perm, near_duplicates_removed,
     near_duplicate_rate and seconds. See the module docstring for the memory footprint.
     """

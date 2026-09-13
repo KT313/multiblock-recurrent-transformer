@@ -397,6 +397,10 @@ the durable frontier so an uncommitted reservation cannot steal a rightful sampl
 There is an explicit preseed-key hook for a future optional feature; this feature
 never loads benchmark datasets itself.
 
+**Minhash** deliberately uses approximate matching: the threshold tunes LSH candidate discovery, not a verified
+Jaccard cutoff. Below-threshold removals and missed duplicates are possible. This accepted policy leaves the
+algorithm unchanged; the shipped dataset configs use Bloom-based `mode: exact` instead.
+
 **Minhash** (`dedup: {mode: minhash, threshold: 0.95, num_perm: 256, ngram: 5}`, `lib/stages/fuzzy_dedup.py`,
 `datasketch` extra) runs the exact pass first and then MinHash/LSH near-duplicate removal over the whole source at
 once (the LSH index needs every signature; documents shorter than one n-gram pass through). It is **not meant for

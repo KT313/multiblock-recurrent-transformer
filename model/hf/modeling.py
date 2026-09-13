@@ -416,6 +416,21 @@ class RecurrentGPTForCausalLM(PreTrainedModel, GenerationMixin):  # type: ignore
     def get_input_embeddings(self) -> torch.nn.Module:
         return self.model.transformer.wte
 
+    def resize_token_embeddings(
+        self,
+        new_num_tokens: int | None = None,
+        pad_to_multiple_of: int | None = None,
+        mean_resizing: bool = True,
+    ) -> torch.nn.Embedding:
+        """Preserve HF's lookup-only call; reject resize requests before any weights or config can change."""
+        if new_num_tokens is None and pad_to_multiple_of is None:
+            return self.model.transformer.wte
+        raise NotImplementedError(
+            "Vocabulary resizing is not supported by RecurrentGPT. Finalize the tokenizer and configure "
+            "vocab_size/padded_vocab_size before constructing the model; resizing an existing model would "
+            "leave native loss and saved vocabulary settings inconsistent."
+        )
+
     def set_input_embeddings(self, value: torch.nn.Module) -> None:
         # transformers types the argument as Module; the contract (resize_token_embeddings) passes an Embedding.
         self.model.transformer.wte = value  # type: ignore[assignment]

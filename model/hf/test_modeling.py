@@ -485,6 +485,38 @@ def test_embedding_accessors() -> None:
     assert hf_model.get_output_embeddings() is new_head
 
 
+@pytest.mark.parametrize("tied", [True, False])
+@pytest.mark.parametrize(("new_num_tokens", "pad_to_multiple_of"), [(500, None), (520, None), (512, None), (None, 1024)])
+def test_vocabulary_resize_rejected_without_mutation(
+    tied: bool, new_num_tokens: int | None, pad_to_multiple_of: int | None,
+) -> None:
+    hf_model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(tiny_config(tie_embeddings=tied)))
+    embedding = hf_model.get_input_embeddings()
+    head = hf_model.get_output_embeddings()
+    parameters = dict(hf_model.named_parameters())
+    weights = {name: parameter.detach().clone() for name, parameter in parameters.items()}
+    hf_config = hf_model.config.to_dict()
+    native_config = hf_model.model.config.to_dict()
+    rng = torch.get_rng_state().clone()
+
+    with pytest.raises(NotImplementedError, match="Vocabulary resizing is not supported.*before constructing"):
+        hf_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing=False)
+
+    assert hf_model.get_input_embeddings() is embedding
+    assert hf_model.get_output_embeddings() is head
+    assert hf_model.config.to_dict() == hf_config
+    assert hf_model.model.config.to_dict() == native_config
+    assert torch.equal(torch.get_rng_state(), rng)
+    for name, parameter in hf_model.named_parameters():
+        assert parameter is parameters[name]
+        assert torch.equal(parameter, weights[name])
+
+
+def test_vocabulary_resize_without_arguments_remains_an_embedding_lookup() -> None:
+    hf_model = tiny_hf_model()
+    assert hf_model.resize_token_embeddings() is hf_model.get_input_embeddings()
+
+
 def test_prepare_inputs_for_generation_forwards_the_mask_and_the_row_positions() -> None:
     hf_model = tiny_hf_model()
     x = ids(1, 4)
