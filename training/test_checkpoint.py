@@ -77,10 +77,11 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
 
 def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
     metadata = _metadata(backend, tiny_model, step=7)
+    metadata.dataset_build_id = "immutable-build"
     state = metadata.to_state()
     assert set(state) == {
         "step", "stage", "world_size", "rng_states", "settings", "model_config", "dataset_config_hash", "validation_rows",
-        "source_rows", "data_stream",
+        "source_rows", "data_stream", "dataset_build_id",
     }
     assert state["rng_states"] is metadata.rng_states  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
@@ -136,6 +137,7 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
         "validation_rows",
         "source_rows",
         "data_stream",
+        "dataset_build_id",
     ]
 
 
@@ -578,3 +580,9 @@ def test_legacy_objective_requires_acknowledgement(backend: SingleDeviceBackend,
     assert "loss_normalization" not in metadata.settings  # historical provenance is never relabeled
     with pytest.raises(ValueError, match="legacy pack weighting is unsupported"):
         _settings(loss_normalization="legacy_pack_v0")
+
+
+def test_legacy_checkpoint_has_unknown_build_identity(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    state = _metadata(backend, tiny_model).to_state()
+    state.pop("dataset_build_id")
+    assert CheckpointMetadata.from_state(state).dataset_build_id is None

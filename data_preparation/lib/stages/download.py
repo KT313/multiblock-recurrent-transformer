@@ -468,7 +468,7 @@ def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_
         _load_tokenizer(temporary, tokenizer.name)  # verify it is usable before removing published data
         manifest = new_manifest(config, tokenizer.name, config.tokenizer_hash(), "tokenizer")
         manifest.extra = {"kind": tokenizer.kind, "hf_id": tokenizer.hf_id, "revision": tokenizer.revision}
-        manifest.save(temporary)
+        manifest.complete_generation(temporary)
         if tokenizer_dir.exists():
             shutil.rmtree(tokenizer_dir)  # a non-empty directory cannot be replaced; failures must propagate
         os.replace(temporary, tokenizer_dir)

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -97,10 +98,31 @@ class Manifest:
     # Raw folders are keyed by source name and shared by every dataset config: the file name of the config the folder
     # was downloaded under (None when unknown) lets the repair step tell a deletion another config asks for.
     dataset_config: str | None = None
+    # Published training-output identity; legacy manifests have unknown provenance.
+    generation_id: str | None = None
+    generation_complete: bool = True
 
     def __post_init__(self) -> None:
+        if self.generation_id is not None and (not isinstance(self.generation_id, str) or not self.generation_id):
+            raise ValueError("generation_id must be a nonempty string or null")
+        if not isinstance(self.generation_complete, bool):
+            raise ValueError("generation_complete must be a boolean")
         if self.stage not in STAGES:
             raise ValueError(f"unknown manifest stage {self.stage!r}; expected one of {STAGES}")
+
+    def begin_generation(self, directory: Path) -> None:
+        """Invalidate old snapshots before mutating output; interrupted retries keep their generation."""
+        if self.generation_complete or self.generation_id is None:
+            self.generation_id = uuid4().hex
+        self.generation_complete = False
+        self.save(directory)
+
+    def complete_generation(self, directory: Path) -> None:
+        """Finish a coherent output, or adopt legacy bytes from this point forward."""
+        if self.generation_id is None:
+            self.generation_id = uuid4().hex
+        self.generation_complete = True
+        self.save(directory)
 
     # --- derived -----------------------------------------------------------------------------------------------------
 

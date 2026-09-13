@@ -72,6 +72,10 @@ class DatasetLayout:
         validate_identifier(name, field="tokenizer.name")
         return self.root / "tokenizers" / name
 
+    def snapshot_path(self, config_hash: str) -> Path:
+        validate_identifier(config_hash, field="dataset config hash")
+        return self.root / "snapshots" / f"{config_hash}.json"
+
     def benchmark_cache_dir(self) -> Path:
         return self.root / "benchmarks"
 

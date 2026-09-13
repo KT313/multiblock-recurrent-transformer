@@ -37,6 +37,7 @@ from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dat
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
+from data_preparation.lib.storage.snapshot import read_snapshot
 from data_preparation.lib.storage.parquet import SHARD_PATTERN
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 from training.settings import Settings
@@ -102,6 +103,7 @@ class ResolvedDataset:
     validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
     source_rows: dict[str, int]  # per source: the rows of processed/<source> (what a checkpoint stores and a resume verifies)
     rows_on_disk: dict[str, int]  # per processed directory (`DataEntry.data_dir`): its rows, counted once at setup
+    dataset_build_id: str | None = None  # None only for legacy/manual callers, never a resolved managed dataset
 
 
 def build_command(dataset_config: str, dataset_dir: str) -> str:
@@ -549,6 +551,7 @@ def _resolve_dataset(
         check_validation_batches(
             stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
         )
+        snapshot = read_snapshot(dataset_config, layout)
         resolved_dataset = ResolvedDataset(
             config=dataset_config,
             config_hash=dataset_config.config_hash(),
@@ -558,7 +561,12 @@ def _resolve_dataset(
             validation_rows=validation_rows,
             source_rows={name: rows_on_disk[str(layout.processed_dir(name))] for name in dataset_config.sources},
             rows_on_disk=rows_on_disk,
+            dataset_build_id=snapshot.build_id,
         )
+    if backend is not None:
+        identities = backend.all_gather_object(resolved_dataset.dataset_build_id)
+        if len(set(identities)) != 1:
+            raise RuntimeError(f"dataset build identities differ across ranks: {identities}")
     return resolved_dataset
 
 
@@ -569,7 +577,7 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
     """
     Verify that a checkpoint was written against the dataset the run now resolves to.
 
-    Compared: the dataset-config hash, the rows per source (`{source: rows}`: the stream resumes by row offset
+    Compared: the immutable build ID (missing legacy identity is unknown), the dataset-config hash, the rows per source (`{source: rows}`: the stream resumes by row offset
     into each source, so a source re-prepared to another row count would continue from other rows) and the
     validation split (`{source: validation_rows}`: a resumed run would otherwise validate on rows it trained on).
     A mismatch raises `RuntimeError` naming every difference, unless `allow_change` (`allow_dataset_change`), which
@@ -577,6 +585,16 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
     """
 
     problems: list[str] = []
+    if metadata.dataset_build_id is None or dataset.dataset_build_id is None:
+        problems.append(
+            f"dataset build identity has unknown provenance (checkpoint {metadata.dataset_build_id!r}, "
+            f"current {dataset.dataset_build_id!r}); legacy missing identity is not evidence of equality"
+        )
+    elif metadata.dataset_build_id != dataset.dataset_build_id:
+        problems.append(
+            f"dataset build identity differs: checkpoint {metadata.dataset_build_id}, current {dataset.dataset_build_id}; "
+            "a managed source/tokenizer generation or ordered snapshot changed"
+        )
     if metadata.dataset_config_hash != dataset.config_hash:
         problems.append(
             f"checkpoint was written with dataset config hash {metadata.dataset_config_hash}, the current dataset "
@@ -597,7 +615,7 @@ def check_dataset_unchanged(metadata: CheckpointMetadata, dataset: ResolvedDatas
         return
     message = "; ".join(problems)
     if allow_change:
-        log.warning("%s; continuing because allow_dataset_change is set", message)
+        log.warning("%s; continuing because allow_dataset_change is set; exact dataset replay is not claimed", message)
         return
     raise RuntimeError(f"{message}. Set allow_dataset_change: true to resume anyway.")
 

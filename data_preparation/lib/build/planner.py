@@ -142,7 +142,8 @@ def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) ->
     nothing to build from.
     """
 
-    return source_ledger(config, name, layout).build_pending
+    manifest = Manifest.load(layout.processed_dir(name))
+    return (manifest is not None and not manifest.generation_complete) or source_ledger(config, name, layout).build_pending
 
 
 def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
@@ -225,9 +226,12 @@ class DatasetReport:
     tokenizer_complete: bool = False
     needs_repair: list[str] = field(default_factory=list)  # sources the repair step would touch (`status` only; `prepare` repaired first)
 
+    snapshot_problem: str | None = None
+
     @property
     def complete(self) -> bool:
-        return self.tokenizer_complete and not self.needs_repair and all(source.satisfaction()[0] for source in self.sources)
+        return (self.snapshot_problem is None and self.tokenizer_complete and not self.needs_repair
+                and all(source.satisfaction()[0] for source in self.sources))
 
     def missing(self) -> list[str]:
         """
@@ -238,6 +242,8 @@ class DatasetReport:
         names = [source.name for source in self.sources if not source.satisfaction()[0] or source.name in self.needs_repair]
         if not self.tokenizer_complete:
             names.append("tokenizer")
+        if self.snapshot_problem is not None and not names:
+            names.append(f"dataset snapshot ({self.snapshot_problem})")
         return names
 
     def unsatisfied(self) -> list[SourceLedger]:
@@ -288,7 +294,8 @@ class DatasetReport:
         The table plus the overall verdict line (dataset complete / dataset INCOMPLETE).
         """
 
-        return self.table() + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
+        detail = f"\ndataset snapshot: {self.snapshot_problem}" if self.snapshot_problem is not None else ""
+        return self.table() + detail + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
 
 
 @dataclass(frozen=True)

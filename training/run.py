@@ -530,6 +530,7 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: RankBatches
         dataset_config_hash=state.dataset.config_hash,
         validation_rows=state.dataset.validation_rows,
         source_rows=state.dataset.source_rows,
+        dataset_build_id=state.dataset.dataset_build_id,
         data_stream=batches.state_dict(),
     )
     def publish() -> None:

@@ -74,6 +74,7 @@ from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import (
     download, download_github_code_group, inspect_tokenizer, prepare_planned_tokenizer, reopen_raw,
 )
+from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
 log = get_logger(__name__)
@@ -187,7 +188,7 @@ def prepare(
             if not another_round_can_fetch_more(config, layout, active_steps, selected):
                 break  # still short, but nothing left to download: the report names the sources
         set_status(step="status")
-        report = assess_dataset_state(config, layout, repair_report)
+        report = assess_dataset_state(config, layout, repair_report, publish=not dry_run)
     return report
 
 
@@ -639,7 +640,9 @@ def log_repair(report: RepairReport) -> None:
         log.info("repair:\n%s", report.describe(), extra={"keep": True})
 
 
-def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_report: RepairReport) -> DatasetReport:
+def assess_dataset_state(
+    config: DatasetConfig, layout: DatasetLayout, repair_report: RepairReport, *, publish: bool = False
+) -> DatasetReport:
     """
     The verdict :func:`prepare` and :func:`status` both end with, so the two can never disagree about one tree:
     the status table, with the sources of the repairs repair_report left undone counted as incomplete. A
@@ -648,6 +651,9 @@ def assess_dataset_state(config: DatasetConfig, layout: DatasetLayout, repair_re
     """
 
     report = summarize_dataset_state(config, layout, needs_repair=[action.source for action in outstanding_repairs(repair_report)])
+    if publish and report.complete:
+        publish_snapshot(config, layout)
+    report.snapshot_problem = snapshot_problem(config, layout)
     log_report(report)
     return report
 

@@ -773,7 +773,9 @@ def test_pending_sources_that_need_no_download_are_built_right_away(
     plan = plan_downloads(cfg, layout)
     assert plan.total_rows_to_fetch() == 0
     runner.download_and_build_missing(plan, cfg, layout, steps={"download", "build"}, sources=None, max_parallel_downloads=2, num_workers=2, pass_workers=1)
-    assert downloaded == [] and sorted(built) == ["s0", "s1", "s2"] and status(path, layout.root).complete
+    assert downloaded == [] and sorted(built) == ["s0", "s1", "s2"]
+    assert not status(path, layout.root).complete  # direct stage calls do not publish dataset snapshots
+    assert prepare(path, layout.root, assume_yes=False).complete
 
 
 # --- lock, dry run, confirmation -----------------------------------------------------------------------------------------

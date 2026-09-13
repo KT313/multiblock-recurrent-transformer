@@ -862,3 +862,60 @@ def test_a_build_whose_rows_saturate_the_dedup_filter_is_refused(
     with pytest.raises(ValueError, match="past the 2x this build accepts"):
         build_source(cfg, "s", layout)
     assert not layout.processed_dir("s").exists()
+
+
+def test_interrupted_output_generation_finishes_without_changing_identity(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(8)], with_tokenizer,
+                   write=write_local, shard_size=2)
+    with pytest.raises(BuildAborted):
+        build_source(cfg, "s", layout, should_stop=lambda: True)
+    partial = Manifest.load(layout.processed_dir("s"))
+    assert partial is not None and partial.generation_id is not None and not partial.generation_complete
+    result = build_source(cfg, "s", layout)
+    assert result.generation_id == partial.generation_id and result.generation_complete
+    assert build_source(cfg, "s", layout).generation_id == result.generation_id
+
+
+def test_same_count_rebuild_gets_new_generation(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(4)], with_tokenizer, write=write_local)
+    original = build_source(cfg, "s", layout)
+    # The stale processing metadata triggers the managed rebuild path with identical input bytes/counts.
+    original.source_hash = "stale"
+    original.save(layout.processed_dir("s"))
+    replacement = build_source(cfg, "s", layout)
+    assert replacement.rows() == original.rows() and replacement.generation_id != original.generation_id
+
+
+def test_recovered_all_at_once_output_finalizes_the_existing_generation(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(4)], with_tokenizer,
+                   write=write_local, source={"shuffle": True})
+    original = build_source(cfg, "s", layout)
+    # Model the complete-input private manifest recovered by repair after a crash before finalization.
+    original.generation_complete = False
+    original.save(layout.processed_dir("s"))
+    recovered = build_source(cfg, "s", layout)
+    assert recovered.generation_complete and recovered.generation_id == original.generation_id
+    assert build_source(cfg, "s", layout) == recovered
+
+
+def test_generation_invalidation_does_not_commit_unprocessed_row_statistics(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(4)], with_tokenizer, write=write_local)
+    def fail_publication(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("interrupted before first shard")
+    with monkeypatch.context() as patch:
+        patch.setattr(stages_build, "publish_shard", fail_publication)
+        with pytest.raises(RuntimeError, match="interrupted before first shard"):
+            build_source(cfg, "s", layout)
+    partial = Manifest.load(layout.processed_dir("s"))
+    assert partial is not None and partial.stats["input_rows"] == 0 and not partial.generation_complete
+    result = build_source(cfg, "s", layout)
+    assert result.stats["input_rows"] == 4 and result.generation_id == partial.generation_id

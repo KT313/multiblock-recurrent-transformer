@@ -312,6 +312,7 @@ def test_restore_refuses_a_checkpoint_of_another_world_size(
         settings=asdict(tiny_settings),
         model_config=tiny_model.config.to_dict(),
         dataset_config_hash=tiny_resolved.config_hash,
+        dataset_build_id=tiny_resolved.dataset_build_id,
         validation_rows=tiny_resolved.validation_rows,
         source_rows=tiny_resolved.source_rows,
         data_stream={"consumed_rows": {}, "pool_loaded": {}, "pool_target": {}, "buffers": {}, "pool": []},
@@ -544,6 +545,7 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
         assert len(extra["rng_states"]) == 1 and set(extra["rng_states"][0]) >= {"python", "torch"}
         assert extra["model_config"]["model_max_sequence_length"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
         assert extra["dataset_config_hash"] == full_run["dataset_hash"]
+        assert isinstance(extra["dataset_build_id"], str) and extra["dataset_build_id"]
         assert extra["validation_rows"] == validation_rows
 
 

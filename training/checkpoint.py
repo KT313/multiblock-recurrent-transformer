@@ -52,6 +52,8 @@ class CheckpointMetadata:
     source_rows: dict[str, int]  # `ResolvedDataset.source_rows`, {source: processed rows}; a resume refuses a changed count
     data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
 
+    dataset_build_id: str | None = None  # unknown provenance in legacy checkpoints
+
     def to_state(self) -> dict[str, Any]:
         """
         The metadata as the flat dict merged into the checkpoint (a shallow copy, tensors are not copied).
@@ -69,6 +71,7 @@ class CheckpointMetadata:
 
         if LEGACY_RNG_KEY in state and "world_size" not in state and "rng_states" not in state:
             state = {**state, "world_size": 1, "rng_states": [state[LEGACY_RNG_KEY]]}
+        state = {"dataset_build_id": None, **state}
         missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(

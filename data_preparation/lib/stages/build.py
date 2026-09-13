@@ -124,6 +124,8 @@ def build_source(
     if all_at_once:
         BuildWorkspace(processed_dir).check_start()
         if assessment.problem == "none" and assessment.manifest is not None:
+            if not assessment.manifest.generation_complete:
+                assessment.manifest.complete_generation(processed_dir)
             return assessment.manifest  # built from exactly the current raw shards
         # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
         config.check_all_at_once_rows(name, raw.rows(), at_build=True)
@@ -135,6 +137,8 @@ def build_source(
         if not pending:
             if output.is_new:
                 output.save([])  # an exhausted raw folder with zero shards still gets its processed manifest
+            if output.manifest.generation_id is None or not output.manifest.generation_complete:
+                output.manifest.complete_generation(output.directory)
             return output.manifest
 
     stats = output.manifest.stats
@@ -162,6 +166,8 @@ def build_source(
     if seen is not None:
         _record_filter_load(stats["dedup"], seen)
         output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
+    if not output.manifest.generation_complete:
+        output.manifest.complete_generation(output.directory)
     log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
     return output.manifest
 
@@ -190,6 +196,8 @@ def _build_per_raw_shard(
                 raw.source, output.manifest.rows(), rows_target, len(pending) - index + 1,
             )
             return
+        if output.manifest.generation_complete or output.manifest.generation_id is None:
+            output.manifest.begin_generation(output.directory)
         if pipeline.bar is not None:
             pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows
@@ -231,6 +239,7 @@ def _build_all_at_once(
     BuildWorkspace(processed_dir).create_temporary()
     output.publish(survivors, shard_size)
     output.save(shard_list(raw.shards))
+    output.manifest.complete_generation(output.directory)
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
 
@@ -321,6 +330,8 @@ class ProcessedOutput:
         Append rows as shard(s) of at most shard_size rows, each recorded in the manifest.
         """
 
+        if self.manifest.generation_complete or self.manifest.generation_id is None:
+            self.manifest.begin_generation(self.directory)
         for start in range(0, len(rows), shard_size):
             chunk = rows[start : start + shard_size]
             path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))

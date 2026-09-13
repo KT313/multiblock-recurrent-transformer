@@ -825,6 +825,7 @@ def _resolved(config_hash: str, validation_rows: dict[str, int], source_rows: di
     return ResolvedDataset(
         config=load_dataset_config(TINY_DATASET_YAML),
         config_hash=config_hash,
+        dataset_build_id="test-build",
         tokenizer_dir="unused",
         stages=[],
         train_sources=[],
@@ -843,6 +844,7 @@ def _metadata(config_hash: str, validation_rows: dict[str, int], source_rows: di
         settings={},
         model_config={},
         dataset_config_hash=config_hash,
+        dataset_build_id="test-build",
         validation_rows=validation_rows,
         source_rows=source_rows,
         data_stream={},
@@ -942,3 +944,74 @@ def test_resolution_takes_lock_before_complete_dataset_assessment(
     with build_lock(tiny_dataset_dir), pytest.raises(RunLocked):
         resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=auto_prepare))
     assert called == []
+
+
+def test_build_identity_mismatch_and_unknown_provenance_require_explicit_override(caplog: pytest.LogCaptureFixture) -> None:
+    metadata = _metadata("abc", {"a": 3, "b": 0})
+    dataset = _resolved("abc", {"a": 3, "b": 0})
+    for old in (None, "previous-build"):
+        metadata.dataset_build_id = old
+        with pytest.raises(RuntimeError, match="dataset build identity") as error:
+            check_dataset_unchanged(metadata, dataset, allow_change=False)
+        assert str(old) in str(error.value) and "test-build" in str(error.value)
+        check_dataset_unchanged(metadata, dataset, allow_change=True)
+    assert "exact dataset replay is not claimed" in caplog.text
+
+
+def _identity_rank(rank: int, root: str, rendezvous: str, connection: Any, mismatch: bool) -> None:
+    from datetime import timedelta
+    import torch.distributed as dist
+    from training.data.ownership import main_rank_phase
+    from training.data.test_ownership import _GlooBackend
+
+    try:
+        dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=10))
+        backend = _GlooBackend(rank)
+        dataset = resolve_dataset(_settings(TINY_DATASET_YAML, Path(root), auto_prepare=False), backend)
+        metadata = _metadata(dataset.config_hash, dataset.validation_rows, dataset.source_rows)
+        metadata.dataset_build_id = "replaced-build" if mismatch and rank == 1 else dataset.dataset_build_id
+        with main_rank_phase(backend, "resume identity"):
+            check_dataset_unchanged(metadata, dataset, allow_change=False)
+        connection.send(("ok", dataset.dataset_build_id))
+    except Exception as error:
+        connection.send(("error", str(error)))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        connection.close()
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(45)
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_gloo_ranks_agree_on_dataset_identity_or_resume_refusal(
+    tmp_path: Path, tiny_dataset_dir: Path, mismatch: bool,
+) -> None:
+    import multiprocessing as mp
+
+    context = mp.get_context("spawn")
+    connections = [context.Pipe() for _ in range(2)]
+    processes = [context.Process(target=_identity_rank, args=(rank, str(tiny_dataset_dir),
+                 (tmp_path / "rendezvous").as_uri(), pair[1], mismatch)) for rank, pair in enumerate(connections)]
+    try:
+        for process in processes:
+            process.start()
+        results = []
+        for parent, child in connections:
+            child.close()
+            assert parent.poll(30), "rank did not finish dataset identity setup"
+            results.append(parent.recv())
+        if mismatch:
+            assert all(result[0] == "error" and "replaced-build" in result[1] for result in results)
+        else:
+            assert results[0] == results[1] and results[0][0] == "ok" and results[0][1] is not None
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        for parent, _ in connections:
+            parent.close()
