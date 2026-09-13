@@ -428,3 +428,90 @@ def test_later_source_valid_candidate_offset_restart_matches_uninterrupted(
     baseline = DatasetLayout(tmp_path / "baseline").for_config(cfg)
     assert prepare(path, baseline.root, assume_yes=True).complete
     assert {name: _rows(layout, name) for name in cfg.sources} == {name: _rows(baseline, name) for name in cfg.sources}
+
+
+def test_benchmark_seeds_replay_restart_and_noop(
+    cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from data_preparation.lib.stages import benchmark_seeds
+    from data_preparation.lib.stages.test_benchmarks import EXACT_EXAMPLES
+
+    prompt, answer = benchmark_seeds.complete_example("mmlu", EXACT_EXAMPLES["mmlu"])
+    text = f"{prompt}\nAnswer: {answer}"
+    for name in ("a", "b"):
+        write_local(tmp_path / name, [{"text": text}, {"text": f"{name} unique"}, {"text": f"{name} second"}])
+    cfg = cfg_factory({name: SourceConfig(kind="pretrain", loader="local", path=str(tmp_path / name)) for name in ("a", "b")},
+                      tokens=20, training_target_sequence_length=1, token_count="estimate",
+                      processing=ProcessingConfig(min_chars=1, dedup=DedupConfig(mode="none")),
+                      bloom_deduplicate_across_sources=True)
+    cfg = replace(cfg, bloom_dedup_memory_mb=1)
+    root = tmp_path / "dataset"
+    assert prepare(config_file(cfg), root, assume_yes=True).complete
+    old = DatasetLayout(root).for_config(cfg)
+    assert text in [row["text"] for row in _rows(old, "a")]
+    raw_before = {p: p.read_bytes() for p in (root / "sources").rglob("*") if p.is_file()}
+    seeded = replace(cfg, bloom_deduplicate_across_sources_add_benchmarks=["mmlu"])
+    path = config_file(seeded)
+    layout = DatasetLayout(root).for_config(seeded)
+    calls: list[str] = []
+
+    def records(name: str, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(name)
+        return [EXACT_EXAMPLES[name]]
+
+    monkeypatch.setattr(benchmark_seeds, "benchmark_records", records)
+    original = publish_shard
+    failed = False
+
+    def interrupted(table: Any, destination: Path) -> Path:
+        nonlocal failed
+        result = original(table, destination)
+        if not failed and destination.parent == layout.processed_dir("b"):
+            failed = True
+            raise OSError("seeded publication interrupted")
+        return result
+
+    monkeypatch.setattr(global_build, "publish_shard", interrupted)
+    with pytest.raises(OSError, match="seeded publication interrupted"):
+        prepare(path, root, assume_yes=True, steps=["build"])
+    assert not status(path, root).complete
+    monkeypatch.setattr(global_build, "publish_shard", original)
+    assert prepare(path, root, assume_yes=True, steps=["build"]).complete
+    baseline = DatasetLayout(tmp_path / "baseline").for_config(seeded)
+    assert prepare(path, baseline.root, assume_yes=True).complete
+    assert {name: _rows(layout, name) for name in seeded.sources} == {name: _rows(baseline, name) for name in seeded.sources}
+    assert [row["text"] for row in _rows(layout, "a")] == ["a unique", "a second"]
+    assert [row["text"] for row in _rows(layout, "b")] == ["b unique", "b second"]
+    assert text in [row["text"] for row in _rows(old, "a")]
+    assert {p: p.read_bytes() for p in raw_before} == raw_before
+    assert len(calls) == 3
+    assert prepare(path, root, assume_yes=False).complete and status(path, root).complete
+    assert len(calls) == 3  # completed snapshots and status never reload benchmarks
+    manifest = Manifest.load(layout.processed_dir("a"))
+    assert manifest is not None
+    assert manifest.extra["global_start"]["preseed_count"] == 2
+    assert manifest.stats["global_filter"]["preseed_count"] == 2
+    assert manifest.extra["global_dedup"]["benchmark_seeds"]["sets"][0]["name"] == "mmlu"
+
+
+def test_benchmark_load_failure_precedes_dataset_publication(
+    cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from data_preparation.lib.stages import benchmark_seeds
+
+    cfg = replace(_config(cfg_factory, write_local, tmp_path), bloom_deduplicate_across_sources_add_benchmarks=["mmlu"])
+    root, path = tmp_path / "dataset", config_file(cfg)
+
+    def failed(name: str, **kwargs: Any) -> Any:
+        raise OSError("benchmark unavailable")
+
+    monkeypatch.setattr(benchmark_seeds, "benchmark_records", failed)
+    assert not prepare(path, root, assume_yes=True, dry_run=True).complete
+    assert not root.exists()
+    with pytest.raises(OSError, match="benchmark unavailable"):
+        prepare(path, root, assume_yes=True)
+    assert not (root / "sources").exists()
+    assert not (root / "tokenizers").exists()
+    assert not (root / ".dataset-scopes").exists()

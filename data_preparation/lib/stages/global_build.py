@@ -9,7 +9,8 @@ runs under the caller's exclusive dataset lease; readers use completed snapshots
 from __future__ import annotations
 
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from itertools import chain, islice
 from pathlib import Path
 from typing import Any, cast
@@ -90,6 +91,16 @@ def outputs_complete(config: DatasetConfig, layout: DatasetLayout) -> bool:
         manifest = Manifest.load(layout.processed_dir(name))
         if manifest is None or not manifest.generation_complete:
             return False
+        if index == 0 and config.bloom_deduplicate_across_sources_add_benchmarks:
+            # Read-only completion never fetches benchmarks. The configured pinned policy
+            # and durable initial seed identity must cover the entire frontier chain.
+            try:
+                initial = GlobalFrontier.from_dict(manifest.extra["global_start"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if initial.preseed_count <= 0:
+                return False
+            previous = replace(previous, preseed_count=initial.preseed_count, preseed_digest=initial.preseed_digest)
         if (manifest.extra.get("global_dedup") != global_policy(config)
                 or manifest.extra.get("global_start") != previous.to_dict()
                 or manifest.extra.get("global_dependencies") != dependencies):
@@ -104,7 +115,7 @@ def outputs_complete(config: DatasetConfig, layout: DatasetLayout) -> bool:
 def build_global_source(
     config: DatasetConfig, name: str, layout: DatasetLayout, start: GlobalFrontier,
     *, rows_target: int, exhausted: bool, should_stop: StopCheck | None = None,
-    batch_rows: int = GLOBAL_BATCH_ROWS,
+    batch_rows: int = GLOBAL_BATCH_ROWS, preseed_keys: Iterable[int] = (),
 ) -> tuple[GlobalFrontier, bool]:
     """Admit one source; return its frontier and whether budget/exhaustion finalized it.
 
@@ -179,7 +190,7 @@ def build_global_source(
     own_keys = committed_keys(layout, (name,))
     admission = GlobalAdmission(
         order, memory_mb=config.bloom_dedup_memory_mb, frontier=frontier,
-        committed_keys=chain(committed_keys(layout, prior_names), own_keys),
+        committed_keys=chain(committed_keys(layout, prior_names), own_keys), preseed_keys=preseed_keys,
     )
     admission.check_capacity(start.retained + candidates.rows())
     if frontier.source_index == start.source_index + 1:

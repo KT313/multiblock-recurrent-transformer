@@ -35,7 +35,7 @@ from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
 
 from data_preparation.identifiers import validate_identifier
 from data_preparation.lib.stages.global_dedup import global_policy
-from data_preparation.lib.stages.benchmarks import benchmark_revisions
+from data_preparation.lib.stages.benchmarks import benchmark_revisions, bloom_benchmark_names
 from data_preparation.lib.stages.truncation import TOKEN_RULE
 
 SourceKind = Literal["pretrain", "instruct"]
@@ -459,6 +459,8 @@ class DatasetConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
 
     bloom_deduplicate_across_sources: bool = field(default=True, metadata=_CONFIG)  # one dataset filter after local processing
+    # Hashed through global_policy only; empty selection preserves existing dataset identities.
+    bloom_deduplicate_across_sources_add_benchmarks: list[str] = field(default_factory=list, metadata=_UNHASHED)
     bloom_dedup_memory_mb: int = field(default=1024, metadata={"hash": _global_memory_hash})  # separate global allocation; frozen in dataset identity when enabled
 
     # --- validation ------------------------------------------------------------------------------------------------
@@ -467,6 +469,11 @@ class DatasetConfig:
         self.validate_identifiers()
         if not isinstance(self.bloom_deduplicate_across_sources, bool):
             raise ValueError("bloom_deduplicate_across_sources must be a boolean")
+        self.bloom_deduplicate_across_sources_add_benchmarks = bloom_benchmark_names(
+            self.bloom_deduplicate_across_sources_add_benchmarks,
+        )
+        if self.bloom_deduplicate_across_sources_add_benchmarks and not self.bloom_deduplicate_across_sources:
+            raise ValueError("benchmark Bloom exclusion requires bloom_deduplicate_across_sources=true")
         if type(self.bloom_dedup_memory_mb) is not int or self.bloom_dedup_memory_mb < 1:
             raise ValueError("bloom_dedup_memory_mb must be an integer of at least 1 MiB")
         if self.dataset_max_sequence_length <= 0:

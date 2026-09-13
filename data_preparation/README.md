@@ -680,3 +680,67 @@ fineweb-edu training source (`validation_fraction`) instead of fineweb-edu's `sa
 training dump: about a fifth of that validation set was training data), several HuggingFace ids moved
 (`wikimedia/wikipedia`, `openai/gsm8k`, `common-pile/arxiv_papers_filtered`) and every source is pinned to a
 revision. `docs/data_mixture.md` lists the resulting budgets.
+
+### Optional exact benchmark copies in the shared Bloom filter
+
+`bloom_deduplicate_across_sources_add_benchmarks: []` is off by default. A nonempty
+list requires `bloom_deduplicate_across_sources: true`. Names are validated and
+sorted/deduplicated; unknown names, unavailable/empty splits and invalid examples
+fail before tokenizer publication, repairs or dataset output publication. Download-only,
+status, dry-run and already-complete snapshot checks do not fetch seed material.
+
+| Friendly name | Pinned registry entry | Included evaluation split |
+| --- | --- | --- |
+| `arc_challenge` | `allenai/ai2_arc`, `ARC-Challenge` | `test` |
+| `hellaswag` | `Rowan/hellaswag` | `validation` (labelled) |
+| `mmlu` | `cais/mmlu`, `all` | `test`, all subjects in the aggregate config |
+| `winogrande` | `allenai/winogrande`, `winogrande_xl` | `validation` (labelled) |
+
+Revisions reuse `lib/stages/benchmarks.py`'s pinned registry. HellaSwag and WinoGrande
+use their labelled validation splits; their public test splits have no usable
+answers. No training, development or few-shot splits are silently included.
+
+The adapters deliberately seed only two **complete-example** representations:
+
+1. An instruction record with `instruction=prompt`, `input=""`, and
+   `output="<label>. <answer text>"`.
+2. A pretrain record with `text=prompt + "\nAnswer: <label>. <answer text>"`.
+
+The prompt contains the complete question/context followed by one choice per line,
+`<label>. <choice text>`. ARC retains its original labels. MMLU and HellaSwag use
+A/B/C/D; WinoGrande uses 1/2. MMLU prepends `Subject: <subject>\n`; HellaSwag
+prepends `Activity: <activity_label>\n` to its full `ctx`. WinoGrande retains the
+sentence's underscore. IDs and other metadata are ignored; redundant HellaSwag
+`ctx_a`/`ctx_b` are represented by `ctx`. For example:
+
+```text
+Which planet?
+A. Earth
+B. Mars
+Answer: B. Mars
+```
+
+The shared key policy lowercases and collapses whitespace independently within
+each field; pretrain and instruction formats remain distinct. Changed answers or
+choices, label-only outputs, extra wrappers, omitted subject/activity headers,
+questions embedded in long documents, and paraphrases can remain. This is exact
+whole-example key exclusion with Bloom false positives, **not a benchmark-clean
+corpus guarantee**. No prompt-only, answer-only, substring or semantic matching
+is enabled. The separate optional `processing.decontamination` n-gram filter can
+coexist with this setting; neither setting activates or replaces the other.
+
+Every record's two keys are inserted directly, including repeated records. A
+streamed, temporary packed-key spool bounds Python memory and never rewrites the
+benchmark sources. Seeds precede every dataset source and are reloaded on recovery.
+Their count and ordered digest enter the committed initial frontier and must match
+on restart. Names, repositories, configs, revisions, splits, adapter/key versions
+and filter settings enter dataset identity; changing them requires a new scoped
+output replay through the normal preparation/repair lifecycle. Source-local
+candidates and raw folders remain reusable, and older snapshots keep their identity.
+
+Logs report configured sets and insertion counts; manifests expose the seed policy,
+`preseed_count`, filter memory, nominal capacity and maximum load. Capacity includes
+all seed insertions plus retained dataset keys, counting repeated seeds
+conservatively. `bloom_positive` combines seed matches, dataset duplicates and false
+positives. A shared Bloom filter cannot attribute a removal to an individual
+benchmark or prove that a positive was a true match.

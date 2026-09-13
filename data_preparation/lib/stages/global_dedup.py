@@ -5,7 +5,7 @@ Only eligible source-local survivors enter this component. The caller owns the d
 lease, persists output with its frontier atomically, and streams committed global_hash
 columns to recover. A failed publication poisons this instance: recover from the durable
 frontier, never reuse an in-memory reservation. Batch size bounds extra Python memory.
-No benchmark data is read; explicit immutable preseed keys are the future extension hook.
+Benchmark material is loaded by the preparation lifecycle and passed as immutable preseed keys.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
+from data_preparation.lib.stages.benchmarks import bloom_benchmark_policy
 from data_preparation.lib.stages.exact_dedup import (
     BLOOM_MAX_LOAD, TARGET_FALSE_POSITIVE_RATE, SeenDocuments, memory_mb_for,
 )
@@ -48,6 +49,8 @@ def global_policy(config: DatasetConfig) -> dict[str, Any]:
         "source_order": list(ordered_sources(config)),
         "memory_mb": config.bloom_dedup_memory_mb,
         "false_positive_rate": TARGET_FALSE_POSITIVE_RATE,
+        **({"benchmark_seeds": bloom_benchmark_policy(config.bloom_deduplicate_across_sources_add_benchmarks)}
+           if config.bloom_deduplicate_across_sources_add_benchmarks else {}),
     }
 
 
@@ -229,6 +232,8 @@ class GlobalAdmission:
             "bloom_positive": self.frontier.bloom_positive,
             "memory_mb": self.frontier.memory_mb,
             "preseed_count": self.frontier.preseed_count,
+            "nominal_capacity": self.seen.nominal_capacity,
+            "max_load": BLOOM_MAX_LOAD,
             "items_in_filter": items,
             "load": items / self.seen.nominal_capacity,
             "measured_false_positive_rate": self.seen.expected_false_positive_rate(items),

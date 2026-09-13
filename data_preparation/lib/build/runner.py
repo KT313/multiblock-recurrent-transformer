@@ -70,11 +70,12 @@ from data_preparation.lib.build.repair import (
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
+from data_preparation.lib.stages.benchmark_seeds import load_benchmark_seeds
 from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import (
     download, download_github_code_group, inspect_tokenizer, prepare_planned_tokenizer, reopen_raw,
 )
-from data_preparation.lib.stages.global_dedup import GlobalFrontier, global_policy, ordered_sources
+from data_preparation.lib.stages.global_dedup import global_policy, ordered_sources
 from data_preparation.lib.stages.global_build import build_global_source, outputs_complete, source_frontier
 from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
 from data_preparation.lib.storage.manifest import Manifest
@@ -268,82 +269,86 @@ def prepare_global(
         log.info("dry run, downloads planned:\n%s", plan_downloads(config, layout, sources=selected).describe())
         return assess_dataset_state(config, layout, repair)
     authorize_repairs(repair, assume_yes=assume_yes, confirm=confirm, allow_foreign_raw=allow_foreign_raw)
-    if "tokenizer" in steps:
-        prepare_planned_tokenizer(config, inspect_tokenizer(config, layout), hf_token=hf_token)
-    perform_repairs(repair)
-    log_repair(repair)
-    reopen_sources(config, layout, reopened, dry_run=False)
-    candidates = DatasetLayout(layout.root)
-    plan = plan_downloads(config, candidates, sources=selected)
-    log.info("round 1: %s", plan.summary())
-    download_and_build_missing(
-        plan, config, candidates, steps=steps, sources=selected,
-        max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
-        hf_token=hf_token, should_stop=should_stop, config_name=config_name,
-    )
-    if "build" not in steps:
-        for _ in range(1, MAX_ROUNDS):
-            if "download" not in steps:
+    with load_benchmark_seeds(
+        config.bloom_deduplicate_across_sources_add_benchmarks if "build" in steps else [],
+        memory_mb=config.bloom_dedup_memory_mb, hf_token=hf_token, should_stop=should_stop,
+    ) as seeds:
+        if "tokenizer" in steps:
+            prepare_planned_tokenizer(config, inspect_tokenizer(config, layout), hf_token=hf_token)
+        perform_repairs(repair)
+        log_repair(repair)
+        reopen_sources(config, layout, reopened, dry_run=False)
+        candidates = DatasetLayout(layout.root)
+        plan = plan_downloads(config, candidates, sources=selected)
+        log.info("round 1: %s", plan.summary())
+        download_and_build_missing(
+            plan, config, candidates, steps=steps, sources=selected,
+            max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+        )
+        if "build" not in steps:
+            for _ in range(1, MAX_ROUNDS):
+                if "download" not in steps:
+                    break
+                followup = plan_downloads(config, candidates, sources=selected)
+                if followup.total_rows_to_fetch() == 0:
+                    break
+                download_and_build_missing(
+                    followup, config, candidates, steps=steps, sources=selected,
+                    max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
+                    hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+                )
+            return assess_dataset_state(config, layout, repair)
+        frontier = seeds.frontier(ordered_sources(config), config.bloom_dedup_memory_mb)
+        for name in ordered_sources(config):
+            start = frontier
+            complete = False
+            for round_number in range(1, MAX_ROUNDS + 1):
+                check_stop(should_stop)
+                ledger = source_ledger(config, name, layout)
+                if ledger.raw_state != "current":
+                    break
+                # Extend local candidates only by the global shortfall. Existing buffered
+                # raw shards are consumed before any additional download is requested.
+                local = Manifest.load(candidates.processed_dir(name))
+                target = ledger.rows_sufficient
+                retained = Manifest.load(layout.processed_dir(name))
+                if local is not None and retained is not None:
+                    target = local.rows() + max(0, ledger.rows_sufficient - ledger.processed_rows)
+                    if (not retained.generation_complete and retained.extra.get("candidate_generation") == local.generation_id
+                            and (source_frontier(retained).source_index > start.source_index
+                                 or source_frontier(retained).source_candidates < local.rows())):
+                        target = local.rows()  # recover pending candidates before planning a top-up
+                local = build_source(config, name, candidates, pass_workers=pass_workers,
+                                     should_stop=should_stop, rows_target=target)
+                frontier, complete = build_global_source(
+                    config, name, layout, start, rows_target=ledger.rows_sufficient,
+                    exhausted=ledger.exhausted, should_stop=should_stop, preseed_keys=seeds.keys(),
+                )
+                if complete:
+                    break
+                if round_number == MAX_ROUNDS:
+                    break
+                raw = Manifest.load(candidates.raw_dir(name))
+                if raw is not None and len(local.input_shards) < len(raw.shards):
+                    continue
+                if "download" not in steps:
+                    break
+                ledger = source_ledger(config, name, layout)
+                increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
+                # A zero-yield source can have unique rows later; continue bounded top-ups
+                # instead of treating global losses as proof that every later row is useless.
+                log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
+                download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
+                         hf_token=hf_token, should_stop=should_stop, config_name=config_name)
+                after = source_ledger(config, name, layout)
+                if after.raw_rows <= ledger.raw_rows and not after.exhausted:
+                    log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
+                    break
+            if not complete:
+                log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
                 break
-            followup = plan_downloads(config, candidates, sources=selected)
-            if followup.total_rows_to_fetch() == 0:
-                break
-            download_and_build_missing(
-                followup, config, candidates, steps=steps, sources=selected,
-                max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
-                hf_token=hf_token, should_stop=should_stop, config_name=config_name,
-            )
-        return assess_dataset_state(config, layout, repair)
-    frontier = GlobalFrontier(ordered_sources(config), config.bloom_dedup_memory_mb)
-    for name in ordered_sources(config):
-        start = frontier
-        complete = False
-        for round_number in range(1, MAX_ROUNDS + 1):
-            check_stop(should_stop)
-            ledger = source_ledger(config, name, layout)
-            if ledger.raw_state != "current":
-                break
-            # Extend local candidates only by the global shortfall. Existing buffered
-            # raw shards are consumed before any additional download is requested.
-            local = Manifest.load(candidates.processed_dir(name))
-            target = ledger.rows_sufficient
-            retained = Manifest.load(layout.processed_dir(name))
-            if local is not None and retained is not None:
-                target = local.rows() + max(0, ledger.rows_sufficient - ledger.processed_rows)
-                if (not retained.generation_complete and retained.extra.get("candidate_generation") == local.generation_id
-                        and (source_frontier(retained).source_index > start.source_index
-                             or source_frontier(retained).source_candidates < local.rows())):
-                    target = local.rows()  # recover pending candidates before planning a top-up
-            local = build_source(config, name, candidates, pass_workers=pass_workers,
-                                 should_stop=should_stop, rows_target=target)
-            frontier, complete = build_global_source(
-                config, name, layout, start, rows_target=ledger.rows_sufficient,
-                exhausted=ledger.exhausted, should_stop=should_stop,
-            )
-            if complete:
-                break
-            if round_number == MAX_ROUNDS:
-                break
-            raw = Manifest.load(candidates.raw_dir(name))
-            if raw is not None and len(local.input_shards) < len(raw.shards):
-                continue
-            if "download" not in steps:
-                break
-            ledger = source_ledger(config, name, layout)
-            increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
-            # A zero-yield source can have unique rows later; continue bounded top-ups
-            # instead of treating global losses as proof that every later row is useless.
-            log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
-            download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
-                     hf_token=hf_token, should_stop=should_stop, config_name=config_name)
-            after = source_ledger(config, name, layout)
-            if after.raw_rows <= ledger.raw_rows and not after.exhausted:
-                log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
-                break
-        if not complete:
-            log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
-            break
-    return assess_dataset_state(config, layout, repair, publish=True)
+        return assess_dataset_state(config, layout, repair, publish=True)
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------

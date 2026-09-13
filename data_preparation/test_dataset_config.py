@@ -20,6 +20,7 @@ import pytest
 import yaml
 
 from data_preparation import dataset_config as dc
+from data_preparation.conftest import CfgFactory
 from data_preparation.dataset_config import (
     DatasetConfig,
     DedupConfig,
@@ -1197,3 +1198,36 @@ def test_yaml_source_identifiers_rejected_before_layout_mutation(tmp_path: Path,
     with pytest.raises(ValueError, match="sources|key"):
         load_dataset_config(path)
     assert sorted(item.name for item in tmp_path.iterdir()) == ["invalid.yaml"]
+
+
+@pytest.mark.parametrize("names", ["mmlu", [1], ["unknown"], None])
+def test_benchmark_seed_names_reject_invalid_types(cfg_factory: CfgFactory, names: Any) -> None:
+    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path="x")})
+    with pytest.raises(ValueError, match="benchmark"):
+        dataclasses.replace(cfg, bloom_deduplicate_across_sources_add_benchmarks=names)
+
+
+def test_benchmark_seed_identity_is_opt_in_and_canonical(cfg_factory: CfgFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from data_preparation.lib.stages import benchmarks
+
+    cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="local", path="x")}, bloom_deduplicate_across_sources=True)
+    assert cfg.bloom_deduplicate_across_sources_add_benchmarks == []
+    seeded = replace(cfg, bloom_deduplicate_across_sources_add_benchmarks=["mmlu", "arc_challenge", "mmlu"])
+    equivalent = replace(cfg, bloom_deduplicate_across_sources_add_benchmarks=["arc_challenge", "mmlu"])
+    assert seeded.config_hash() == equivalent.config_hash() != cfg.config_hash()
+    assert seeded.raw_hash("s") == cfg.raw_hash("s")
+    assert seeded.processed_hash("s") == cfg.processed_hash("s")
+    with pytest.raises(ValueError, match="requires"):
+        replace(seeded, bloom_deduplicate_across_sources=False)
+    identity = seeded.config_hash()
+    monkeypatch.setattr(benchmarks, "BLOOM_ADAPTER_VERSION", "fixture-v2")
+    assert seeded.config_hash() != identity
+    identity = seeded.config_hash()
+    definition = benchmarks.BENCHMARKS["mmlu_test"]
+    monkeypatch.setitem(benchmarks.BENCHMARKS, "mmlu_test", definition._replace(revision="f" * 40))
+    assert seeded.config_hash() != identity
+    identity = seeded.config_hash()
+    monkeypatch.setitem(benchmarks.BLOOM_BENCHMARKS, "mmlu", ("mmlu_test", "validation"))
+    assert seeded.config_hash() != identity
