@@ -453,34 +453,28 @@ def test_rows_needed_counts_the_margin_and_the_split() -> None:
     assert cfg.rows_needed("hold") == 12 and cfg.rows_sufficient("hold") == 10  # validation-only: its `rows` survive the build, × 1.2 downloaded
 
 
-# --- the shuffled-build row cap ---------------------------------------------------------------------------------------
+# --- disk-backed shuffle and the remaining MinHash row cap -------------------------------------------------------------
 
 
 def _over_the_cap_tokens() -> int:
     """
-    A stage budget whose `rows_needed` exceeds `SHUFFLED_BUILD_MAX_ROWS` for `pre` (64 tokens per row, split 0.05):
+    A stage budget above the former shuffle limit for `pre` (64 tokens per row, split 0.05):
     ceil(80e6 / 64) = 1,250,000 rows; × 1.2 ÷ 0.95 = 1,578,948 rows.
     """
 
     return 80_000_000
 
 
-def test_a_shuffled_source_over_the_build_cap_is_refused_at_load(tmp_path: Path) -> None:
+def test_large_shuffled_source_loads_with_disk_backed_shuffle(tmp_path: Path) -> None:
     """
-    `shuffle: true` builds all-at-once in memory (`lib/stages/build.py`); a config asking that of a huge source
-    would OOM hours in, so it fails at `load_dataset_config`, before `prepare` or auto-prepare do any work (D4).
+    Shuffle no longer retains all rows, so a million-row source needs no row-count exception.
     """
 
     d = _minimal()
     d["sources"]["pre"]["shuffle"] = True
     d["stages"][0]["tokens"] = _over_the_cap_tokens()
-    with pytest.raises(ValueError, match=re.escape(
-        "pre: shuffle=true builds all-at-once in memory; 1,578,948 rows exceed the limit of 1,000,000. "
-        "Split the source or turn shuffle off. "
-        "(A read-time shuffle that would lift this limit is not implemented.)"
-    )):
-        load_dataset_config(_write(tmp_path, d))
-    assert dc.SHUFFLED_BUILD_MAX_ROWS == 1_000_000
+    cfg = load_dataset_config(_write(tmp_path, d))
+    assert cfg.rows_needed("pre") == 1_578_948 and cfg.shuffle_of("pre")
 
 
 def test_the_build_cap_spares_small_shuffled_and_huge_unshuffled_sources(tmp_path: Path) -> None:
@@ -494,28 +488,14 @@ def test_the_build_cap_spares_small_shuffled_and_huge_unshuffled_sources(tmp_pat
 
 def test_check_all_at_once_rows_says_what_helps_at_the_build() -> None:
     """
-    The build re-checks the two limits on the rows really on disk (`lib/stages/build.py`), which the load-time
-    estimate can undershoot. Same limits, same first sentence; splitting the source no longer helps once the rows
-    are downloaded, so only the remedy differs.
+    Only MinHash retains a row-count limit. The shuffle accepts actual counts above the old limit as well.
     """
 
     d = _minimal()
     d["sources"]["pre"]["shuffle"] = True
     cfg = _build(d)  # under the caps at load: the planned requirement is 21 rows
-    rows = dc.SHUFFLED_BUILD_MAX_ROWS + 1
-    cfg.check_all_at_once_rows("pre", dc.SHUFFLED_BUILD_MAX_ROWS, at_build=True)  # exactly at the limit still builds
-    messages = []
     for at_build in (False, True):
-        with pytest.raises(ValueError) as error:
-            cfg.check_all_at_once_rows("pre", rows, at_build=at_build)
-        messages.append(str(error.value))
-    first_sentence = "pre: shuffle=true builds all-at-once in memory; 1,000,001 rows exceed the limit of 1,000,000. "
-    assert all(message.startswith(first_sentence) for message in messages)
-    assert messages[0].endswith("Split the source or turn shuffle off. (A read-time shuffle that would lift this limit is not implemented.)")
-    assert messages[1].endswith(
-        "The raw folder already holds these rows, so lower the token budget and delete raw/pre, or turn shuffle off. "
-        "(A read-time shuffle that would lift this limit is not implemented.)"
-    )
+        cfg.check_all_at_once_rows("pre", 1_199_425, at_build=at_build)
     minhash = _build({**d, "sources": {**d["sources"], "pre": {**d["sources"]["pre"], "processing": {"dedup": {"mode": "minhash"}}, "shuffle": False}}})
     with pytest.raises(ValueError, match=re.escape(
         "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 250,001 rows "
@@ -525,34 +505,31 @@ def test_check_all_at_once_rows_says_what_helps_at_the_build() -> None:
         minhash.check_all_at_once_rows("pre", dc.MINHASH_BUILD_MAX_ROWS + 1, at_build=True)
 
 
-def test_the_build_cap_applies_to_the_instruct_default_and_val_only_rows() -> None:
+def test_large_shuffled_instruct_and_validation_only_sources_are_allowed() -> None:
     instruct = _minimal()
     instruct["stages"][1]["tokens"] = _over_the_cap_tokens()  # `ins` never sets shuffle; instruct defaults to True
-    with pytest.raises(ValueError, match="ins: shuffle=true builds all-at-once"):
-        _build(instruct)
+    assert _build(instruct).rows_needed("ins") > 1_000_000
     val_only = _minimal()
     val_only["sources"]["hold"].update({"shuffle": True, "rows": 2_000_000})  # a val-only source uses its `rows` (× the download margin)
-    with pytest.raises(ValueError, match="hold: shuffle=true builds all-at-once in memory; 2,400,000 rows"):
-        _build(val_only)
+    assert _build(val_only).rows_needed("hold") == 2_400_000
     val_only["sources"]["hold"]["rows"] = 10
     assert _build(val_only).rows_needed("hold") == 12
 
 
 def test_a_minhash_source_over_its_lower_build_cap_is_refused_at_load(tmp_path: Path) -> None:
     """
-    `dedup.mode: minhash` builds all-at-once too and holds an LSH index of every kept row on top, so its cap is
-    lower than the shuffle cap; the same rows under exact dedup stream per shard and load fine.
+    MinHash still holds all rows and an LSH index; the same rows under exact dedup stream and load fine.
     """
 
     d = _minimal()
     d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
-    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 rows; × 1.2 ÷ 0.95 = 394,737: under the shuffle cap
+    d["stages"][0]["tokens"] = 20_000_000  # ceil(20e6 / 64) = 312,500 rows; × 1.2 ÷ 0.95 = 394,737
     with pytest.raises(ValueError, match=re.escape(
         "pre: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 394,737 rows exceed "
         "the limit of 250,000. Use dedup.mode=exact or a smaller source."
     )):
         load_dataset_config(_write(tmp_path, d))
-    assert dc.MINHASH_BUILD_MAX_ROWS == 250_000 < dc.SHUFFLED_BUILD_MAX_ROWS
+    assert dc.MINHASH_BUILD_MAX_ROWS == 250_000
     d["sources"]["pre"]["processing"] = {"dedup": {"mode": "exact"}}
     assert _build(d).rows_needed("pre") == 394_737
     d["sources"]["pre"]["processing"] = {"dedup": {"mode": "minhash"}}
@@ -586,15 +563,15 @@ def test_source_processing_override() -> None:
 # shared raw, local preprocessing and tokenizer hashes remain byte-identical.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "c6a8cc6acb239b27",
+        "config": "f6598573a182da06",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
             "synthetic_pretrain": ("17d1b52ca471d587", "7eeb11a1b3e52a08"),
-            "synthetic_instruct": ("56011107fbf9f026", "b9ea28f7af1497fe"),
+            "synthetic_instruct": ("56011107fbf9f026", "b7cb6805e222e8f2"),
         },
     },
     "crow_300m_final": {
-        "config": "4081d7ec5101d520",
+        "config": "8daec2efc6745507",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("9ff1cc2140a2b822", "ca1ab0beb98b43f7"),
@@ -616,20 +593,20 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
             "github_code_clean_shell": ("06c3e2f62b5481c7", "d19072a55c1b70e9"),
             "github_code_clean_sql": ("890f39eabba63e8a", "3785a8bae1fa1922"),
             "github_code_clean_html": ("00e33acbdcfd3f11", "3978d8f25cd4261d"),
-            "flan": ("6d7a9f3f3bc1b8bc", "e74eddc0a7c705b9"),
-            "metamath": ("30b30fcdd9878afb", "4a3fc55288cfdde9"),
-            "orca_math": ("381878828be6e63e", "b96faabbf8e755a2"),
-            "evol_code": ("cb646fa51c648585", "d39756fbe8890177"),
-            "code_alpaca": ("ab159c3c08e77fd9", "382c34ee68619be9"),
-            "slimorca": ("1008180f9ff17ce6", "32be05e5c416aedd"),
-            "sharegpt": ("d9695c8ec7a208f7", "abd6da4cd2d78dda"),
-            "wizardlm": ("2350f2ca1c56dce9", "25d3f26f05f3359f"),
+            "flan": ("6d7a9f3f3bc1b8bc", "9826943aee76a1b8"),
+            "metamath": ("30b30fcdd9878afb", "f6b41f76e6648eaa"),
+            "orca_math": ("381878828be6e63e", "0c64163b70f7e5dc"),
+            "evol_code": ("cb646fa51c648585", "7177047ce3c60098"),
+            "code_alpaca": ("ab159c3c08e77fd9", "a449a52da96023d7"),
+            "slimorca": ("1008180f9ff17ce6", "961931cd2f9cb9b0"),
+            "sharegpt": ("d9695c8ec7a208f7", "d99c78ff0323f8a7"),
+            "wizardlm": ("2350f2ca1c56dce9", "0c8e71914ec45dd5"),
         },
     },
 }
 # The mini and the v2 config are the final config's sources with other budgets: the same raw and processed hashes.
-PINNED_HASHES["crow_300m_mini"] = {"config": "d09546ee782f7f6d", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
-PINNED_HASHES["v2_50M_tokens"] = {"config": "0ebea22e2724b517", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["crow_300m_mini"] = {"config": "fd684dbb378b5593", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["v2_50M_tokens"] = {"config": "8aceeb87c65cafb1", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
 
 
 @pytest.mark.parametrize("name", list(PINNED_HASHES))
@@ -1019,7 +996,7 @@ def test_hash_payloads_are_exactly_what_the_hashes_hash() -> None:
         assert cfg.raw_hash_payload_of(cfg.sources[name]) == cfg.raw_hash_payload(name)
     assert set(cfg.raw_hash_payload("pre")) == {"source"}
     assert set(cfg.processed_hash_payload("pre")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing"}
-    assert set(cfg.processed_hash_payload("ins")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing", "input_inversions"}
+    assert set(cfg.processed_hash_payload("ins")) == {"raw", "max_seq_length", "tokenizer", "token_count", "token_rule", "shuffle", "seed", "processing", "input_inversions", "shuffle_algorithm"}
     assert cfg.processed_hash_payload("ins")["processing"] == {"dedup": {"mode": "exact", "normalize": True}}
 
 

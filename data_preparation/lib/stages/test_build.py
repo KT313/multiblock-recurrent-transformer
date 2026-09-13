@@ -577,17 +577,73 @@ def test_pretrain_source_with_shuffle_is_built_all_at_once_in_seeded_order(
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=4, source={"shuffle": True, "seed": 5})
     m = build_source(cfg, "s", layout, shard_size=5)
     out = [r["text"] for r in read_rows(layout.processed_dir("s"))]
-    expected = list(texts)
-    random.Random(5).shuffle(expected)
+    rng = random.Random(5)
+    expected = sorted(texts, key=lambda _: rng.getrandbits(128))
     assert out == expected != texts and m.shuffled is True and [s.rows for s in m.shards] == [5, 5, 2]
     assert m.input_shards == [[f"data-{i:05d}.parquet", 4] for i in range(3)]
     # a top-up rebuilds the whole folder in the seeded order of the larger list
     write_local(local_dir, [{"text": _words(6, 100)}], "parquet")
     download(cfg, "s", layout, rows_needed=13, shard_size=4)
     m2 = build_source(cfg, "s", layout, shard_size=5)
-    expected = texts + [_words(6, 100)]
-    random.Random(5).shuffle(expected)
+    rng = random.Random(5)
+    expected = sorted(texts + [_words(6, 100)], key=lambda _: rng.getrandbits(128))
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == expected and m2.stats["input_rows"] == 13
+
+
+def test_shuffle_restart_and_batch_size_preserve_order_and_previous_generation(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(20)], with_tokenizer,
+                   write=write_local, shard_size=3, source={"shuffle": True, "seed": 5})
+    first = build_source(cfg, "s", layout, shard_size=4)
+    processed = layout.processed_dir("s")
+    before, rows_before = mtimes(processed), read_rows(processed)
+    changed = replace(cfg, sources={"s": replace(cfg.sources["s"], seed=6)})
+    publish = stages_build.ProcessedOutput.publish
+    calls = 0
+
+    def fail_after_one(self: stages_build.ProcessedOutput, rows: list[Row], shard_size: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated output failure")
+        publish(self, rows, shard_size)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stages_build.ProcessedOutput, "publish", fail_after_one)
+        with pytest.raises(OSError, match="simulated output failure"):
+            build_source(changed, "s", layout, shard_size=3)
+    assert mtimes(processed) == before and read_rows(processed) == rows_before
+    assert Manifest.load(processed) == first
+    temporary = BuildWorkspace(processed).path("temporary")
+    assert temporary.exists() and not list(temporary.glob("shuffle-*"))
+    rebuilt = build_source(changed, "s", layout, shard_size=5)
+    assert rebuilt.generation_complete and not temporary.exists()
+    assert read_rows(processed) != rows_before
+    # Rebuild with the first seed but a different processing/writing batch size.
+    restored = build_source(cfg, "s", layout, shard_size=7)
+    assert read_rows(processed) == rows_before and restored.tokens() == first.tokens()
+
+
+def test_shuffle_identity_change_reuses_raw_and_marks_old_processed_stale(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    mtimes: Mtimes,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(4)], with_tokenizer,
+                   write=write_local, source={"shuffle": True})
+    raw_before = mtimes(layout.raw_dir("s"))
+    manifest = build_source(cfg, "s", layout)
+    assert manifest.hash_payload is not None
+    payload = dict(manifest.hash_payload)
+    assert payload.pop("shuffle_algorithm") == "sqlite_random128_v1"
+    manifest.hash_payload = payload
+    manifest.source_hash = dc._stable_hash(payload)
+    manifest.save(layout.processed_dir("s"))
+    assert not manifest.is_current(cfg.processed_hash("s"))
+    rebuilt = build_source(cfg, "s", layout)
+    assert rebuilt.is_current(cfg.processed_hash("s"))
+    assert mtimes(layout.raw_dir("s")) == raw_before
 
 
 # --- instruct: all-at-once shuffled build --------------------------------------------------------------------------------
@@ -623,7 +679,8 @@ def test_instruct_build_columns_dedup_empty_removal_and_seeded_shuffle(
     assert [s.rows for s in m.shards] == [8, 8, 4] and m.tokens() == sum(r["tokens"] for r in out) == 20 * 8
     assert all(r["hash"] == text_hash64(instruct_text(r)) for r in out)
     expected = [{**_instruct_row(i), "tokens": 8} for i in range(20)]
-    random.Random(3).shuffle(expected)
+    rng = random.Random(3)
+    expected.sort(key=lambda _: rng.getrandbits(128))
     assert [{k: r[k] for k in ("instruction", "input", "output", "tokens")} for r in out] == expected, "seeded shuffle of the survivors, in raw order before the shuffle"
     assert not processed.with_name("i.tmp").exists()
     before = mtimes(processed)
@@ -828,23 +885,24 @@ def test_a_raw_folder_over_the_all_at_once_cap_is_refused_before_anything_is_all
     """
 
     texts = [_words(6, i) for i in range(5)]
-    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2, source={"shuffle": True})
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=2,
+                   source={"shuffle": True}, processing=ProcessingConfig(min_chars=5, dedup=DedupConfig(mode="minhash")))
 
     def no_filter(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the row cap must be checked before the dedup filter is allocated")
 
-    monkeypatch.setattr(dc, "SHUFFLED_BUILD_MAX_ROWS", 3)
+    monkeypatch.setattr(dc, "MINHASH_BUILD_MAX_ROWS", 3)
     monkeypatch.setattr(stages_build, "SeenDocuments", no_filter)
     with pytest.raises(ValueError) as refused:
         build_source(cfg, "s", layout)
-    first_sentence = "s: shuffle=true builds all-at-once in memory; 5 rows exceed the limit of 3. "
+    first_sentence = "s: dedup.mode=minhash builds all-at-once in memory with an LSH index of every kept row; 5 rows exceed the limit of 3. "
     assert str(refused.value).startswith(first_sentence)
-    assert "The raw folder already holds these rows, so lower the token budget and delete raw/s, or turn shuffle off." in str(refused.value)
+    assert "The raw folder already holds these rows, so lower the token budget and delete raw/s, or use dedup.mode=exact." in str(refused.value)
     assert not layout.processed_dir("s").exists() and not layout.processed_dir("s").with_name("s.tmp").exists()
     with pytest.raises(ValueError) as at_load:
         cfg.check_all_at_once_rows("s", 5, at_build=False)
     assert str(at_load.value).startswith(first_sentence), "the config-load refusal says the same thing"
-    assert "Split the source or turn shuffle off." in str(at_load.value)
+    assert "Use dedup.mode=exact or a smaller source." in str(at_load.value)
 
 
 def test_a_build_whose_rows_saturate_the_dedup_filter_is_refused(

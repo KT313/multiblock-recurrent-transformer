@@ -16,13 +16,13 @@ Two write modes:
   resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
   dedup.bloom_memory_mb) is refilled from the hash column of the processed shards at the start of every
   build, so the rows kept are exactly those of one full pass.
-* all at once (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash): every
-  raw shard is read, the survivors are shuffled with random.Random(source.seed) (or, for minhash, run through
-  the LSH index), written into a private owned build slot and swapped into place rename-aside
+* whole-source publication (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash):
+  every raw shard is streamed through the filters. Shuffling uses a bounded-cache SQLite index on disk;
+  MinHash still retains rows and its LSH index in memory. Results are written into a private owned build slot
+  and swapped into place rename-aside
   (:func:`_swap_into_place`; the repair step finishes an interrupted swap). Why shuffle: the training loader reads
   a source's shards in order and only mixes between sources; instruct repositories are sorted by task, so without
-  a shuffle the model would see one task for thousands of steps. Instruct sources are small, so rebuilding them
-  whole is cheap; a top-up rebuilds the folder from every raw shard.
+  a shuffle the model would see one task for thousands of steps. A top-up rebuilds the folder from every raw shard.
 
 A build is a no-op when the processed manifest is current and covers every raw shard. It starts from a fresh
 manifest, deleting the whole processed folder first, when the manifest is stale, when the covered shards are no
@@ -56,6 +56,7 @@ from data_preparation.lib.progress import Progress
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
 from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
+from data_preparation.lib.stages.shuffle import shuffled_rows
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
     check_quality,
@@ -153,8 +154,8 @@ def build_source(
         stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 
-    # per-shard builds check the stop request after every published shard; an all-at-once build reads every raw
-    # shard before it writes anything, so its readers check between raw shards instead
+    # Per-shard builds stop after published shards; whole-source builds also stop while reading/staging and
+    # writing their private output, so the old generation stays available until publication.
     pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
     with pipeline, progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar:
@@ -218,8 +219,8 @@ def _build_all_at_once(
     should_stop: StopCheck | None,
 ) -> None:
     """
-    Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
-    it, written into output.directory (the owned temporary slot) and swapped over processed_dir rename-aside
+    Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled on disk when requested,
+    written in bounded batches into output.directory (the owned temporary slot) and swapped over processed_dir
     (:func:`_swap_into_place`).
     """
 
@@ -227,9 +228,6 @@ def _build_all_at_once(
     rows = pipeline.run(raw_dir, list(raw.shards), first_row_index=0)
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
         rows = fuzzy_dedup(rows, pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.pass_workers)
-    survivors = list(rows)
-    if output.manifest.shuffled:
-        random.Random(pipeline.source.seed).shuffle(survivors)
     check_stop(should_stop)
 
     temporary = output.directory
@@ -237,7 +235,16 @@ def _build_all_at_once(
         log.warning("removing leftover %s of an interrupted build", temporary)
         BuildWorkspace(processed_dir).remove(temporary, "temporary")
     BuildWorkspace(processed_dir).create_temporary()
-    output.publish(survivors, shard_size)
+    if output.manifest.shuffled:
+        with shuffled_rows(rows, temporary, pipeline.source.seed, should_stop=should_stop) as shuffled:
+            for batch in chunks(shuffled, shard_size):
+                check_stop(should_stop)
+                output.publish(batch, shard_size)
+    else:
+        for batch in chunks(rows, shard_size):
+            check_stop(should_stop)
+            output.publish(batch, shard_size)
+    check_stop(should_stop)
     output.save(shard_list(raw.shards))
     output.manifest.complete_generation(output.directory)
     _swap_into_place(temporary, processed_dir)

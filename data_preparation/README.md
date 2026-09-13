@@ -305,13 +305,35 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
   on after its target, above) cost raw disk only. A processed folder behind raw that serves the budget is healthy,
   satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
   budget, or a lower measured tokens-per-row rate, builds the next shards.
-- **all at once** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw shard is read,
-  the survivors are shuffled with `random.Random(seed)`, written into `.build-work/processed/<source>/temporary` and renamed into
-  place; a top-up rebuilds the folder whole. Why shuffle at all: the training loader reads a source's shards **in
+- **whole-source publication** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw
+  shard is streamed through the existing processing pipeline, with results written into
+  `.build-work/processed/<source>/temporary` and renamed into place only when complete; a top-up rebuilds the
+  folder whole. Why shuffle at all: the training loader reads a source's shards **in
   order** and only mixes *between* sources; instruct repositories are sorted by task, so without a shuffle the model
   would see one task for thousands of steps and the "first k rows" validation split (below) would be a single task.
-  Instruct sources are small (the eight of the thesis run hold about 150 M tokens together), so rebuilding them
-  whole is cheap. Pretrain sources are not shuffled (`shuffle: false` unless set).
+  Pretrain sources are not shuffled (`shuffle: false` unless set).
+
+**Disk-backed shuffle** (`lib/stages/shuffle.py`): each surviving row receives a seeded random 128-bit key.
+Rows are staged in a disposable SQLite database inside the owned build workspace, then streamed in key order
+into normal Parquet shards. The original row ordinal breaks key ties; duplicates are never lost by the shuffle.
+This mixes across the entire source, independently of input/output batch boundaries. Filters, inversions and
+source-local dedup still run before shuffling in their original order. SQLite has a 32 MiB page-cache target per
+active source with memory mapping disabled; processing and output batches, the existing Bloom filter, and any
+workers are additional memory. No whole-source row list or permutation is kept in RAM, and the former million-row
+shuffle limit is removed. **MinHash still retains rows and its LSH index and keeps its 250,000-row limit.**
+
+The tradeoff is additional disk I/O and temporary disk usage: allow space for the uncompressed JSON row payloads,
+SQLite pages/index overhead, and replacement Parquet shards alongside any previous processed generation. SQLite
+errors (including disk full) stop the build with workspace guidance; no fallback disables shuffling. Normal
+cancellation/failure removes SQLite scratch files; hard-crash leftovers stay in the owned workspace for the
+existing repair flow. A cancelled whole-source build restarts from raw; incomplete output is never published.
+
+The algorithm is recorded as `shuffle_algorithm: sqlite_random128_v1` in **shuffled processed** fingerprints.
+It is deterministic for the source seed and surviving input rows but differs from the previous Python list
+shuffle. Existing shuffled processed folders require the normal stale-output rebuild flow; downloaded raw
+folders and unshuffled fingerprints remain reusable. Changed ordering can change held-out membership and
+order-sensitive downstream Bloom admission; dataset identity and generation checks prevent silent reuse of the
+old result. Training still reads the resulting standard Parquet files without a new runtime shuffle.
 
 **Exact dedup** (`lib/stages/exact_dedup.py`) hashes the normalized text (lowercased, whitespace collapsed;
 `normalize: false` for verbatim) and keeps the first occurrence. The "seen" set is a Bloom filter (`rbloom`) under a
