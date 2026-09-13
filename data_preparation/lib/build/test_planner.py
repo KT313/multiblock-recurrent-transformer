@@ -577,7 +577,8 @@ def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile
     lines = report.table().splitlines()
     assert lines[0].split() == ["source", "kind", "needed", "tokens/row", "raw", "processed", "epochs", "state", "reason"]
     assert lines[1].split() == ["a", "pretrain", "127", "64", "0", "0", "-", "incomplete", "raw", "missing"]
-    assert lines[-1].split() == ["tokenizer", "tokenizer", "incomplete"]
+    assert lines[-1].split()[:3] == ["tokenizer", "tokenizer", "incomplete"]
+    assert "missing or unreadable tokenizer manifest" in lines[-1] and "run prepare" in lines[-1]
     prepare(config_file(cfg), layout.root, assume_yes=False)
     complete = summarize_dataset_state(cfg, layout)
     assert complete.complete and complete.unsatisfied() == []

@@ -30,3 +30,12 @@ def test_configure_hf_cache_sets_all_vars_and_creates_dir(tmp_path: Path, monkey
     assert cache.is_dir()
     for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
         assert os.environ[var] == str(cache.resolve())
+
+
+def test_configure_hf_cache_readonly_selects_without_creating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
+        monkeypatch.setenv(var, "placeholder")
+    cache = tmp_path / "absent" / "hf_cache"
+    configure_hf_cache(cache, create=False)
+    assert not cache.parent.exists()
+    assert all(os.environ[var] == str(cache) for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"))

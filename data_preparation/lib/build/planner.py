@@ -53,6 +53,7 @@ from data_preparation.lib.build.repair import RepairError
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, inspect_raw
 from data_preparation.lib.storage.manifest import shard_list, shard_tokens, Manifest
+from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
 
 log = get_logger(__name__)
 
@@ -105,10 +106,7 @@ def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
     """
 
     directory = layout.tokenizer_dir(config.tokenizer.name)
-    manifest = Manifest.load(directory)
-    if manifest is None:
-        return False
-    return manifest.is_current(config.tokenizer_hash()) and (directory / "tokenizer_config.json").is_file()
+    return assess_tokenizer_folder(directory, config.tokenizer_hash()).ready
 
 
 def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
@@ -233,6 +231,7 @@ class DatasetReport:
     needs_repair: list[str] = field(default_factory=list)  # sources the repair step would touch (`status` only; `prepare` repaired first)
 
     snapshot_problem: str | None = None
+    tokenizer_problem: str | None = None
 
     @property
     def complete(self) -> bool:
@@ -292,7 +291,8 @@ class DatasetReport:
                 source.name, source.kind, f"{source.rows_needed:,}", f"{source.tokens_per_row:,.0f}", f"{source.raw_rows:,}",
                 f"{source.processed_rows:,}", "-" if epochs is None else f"{epochs:.2f}", state, source.satisfaction()[1],
             ))  # fmt: skip
-        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
+        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete",
+                     "" if self.tokenizer_problem is None else f"{self.tokenizer_problem}; run prepare with the tokenizer step"))
         return format_table(header, rows)
 
     def describe(self) -> str:
@@ -581,9 +581,11 @@ def summarize_dataset_state(config: DatasetConfig, layout: DatasetLayout, *, nee
     needs_repair names the sources a repair dry run would touch (status): they count as incomplete.
     """
 
+    tokenizer = assess_tokenizer_folder(layout.tokenizer_dir(config.tokenizer.name), config.tokenizer_hash())
     return DatasetReport(
         sources=read_ledgers(config, layout),
-        tokenizer_complete=tokenizer_is_prepared(config, layout),
+        tokenizer_complete=tokenizer.ready,
+        tokenizer_problem=tokenizer.problem,
         needs_repair=sorted(set(needs_repair)),
     )
 

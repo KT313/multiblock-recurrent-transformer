@@ -36,6 +36,7 @@ from data_preparation.lib.build.repair import ConfirmationRequired, RepairReport
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.stages import download as download_stage
 from data_preparation.lib.stages.build import build_source as real_build
+from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.stages.download import MalformedSourceError, download as real_download
 from data_preparation.lib.stages.download import download_github_code_group as real_group
 from data_preparation.lib.storage.manifest import Manifest
@@ -1284,3 +1285,86 @@ def test_prepare_borrows_training_lease_without_unlocking(
             pass
     with build_lock(layout.root):
         pass
+
+
+@pytest.mark.parametrize("global_bloom", [False, True])
+@pytest.mark.parametrize("defect", ["tokenizer.json", "tokenizer_config.json", "MANIFEST.json", "stage", "hash", "generation", "manifest_malformed", "malformed"])
+def test_incomplete_tokenizer_is_repaired_without_changing_source_bytes(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile, global_bloom: bool, defect: str,
+) -> None:
+    from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+    from data_preparation.lib.storage.snapshot import read_snapshot
+
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10,
+                      bloom_deduplicate_across_sources=global_bloom)
+    path = config_file(cfg)
+    assert prepare(path, layout.root, assume_yes=True).complete
+    scoped = layout.for_config(cfg)
+    original = read_snapshot(cfg, scoped, processing=global_policy(cfg) if global_bloom else None)
+    directory = layout.tokenizer_dir(cfg.tokenizer.name)
+    if defect in ("stage", "hash", "generation"):
+        manifest = Manifest.load(directory)
+        assert manifest is not None
+        if defect == "stage":
+            manifest.stage = "processed"
+        elif defect == "hash":
+            manifest.source_hash = "wrong"
+        else:
+            manifest.generation_complete = False
+        manifest.save(directory)
+    elif defect in ("malformed", "manifest_malformed"):
+        (directory / ("tokenizer.json" if defect == "malformed" else "MANIFEST.json")).write_text("not valid json")
+    else:
+        (directory / defect).unlink()
+    before = _published_bytes(layout.root)
+    report = status(path, layout.root)
+    dry = prepare(path, layout.root, assume_yes=False, dry_run=True)
+    # Read-only readiness is intentionally structural; mutating preparation also validates the payload.
+    assert report.tokenizer_complete == dry.tokenizer_complete == (defect == "malformed")
+    if defect != "malformed":
+        assert not report.complete and report.tokenizer_problem
+        assert "run prepare" in report.describe()
+    assert _published_bytes(layout.root) == before
+    if global_bloom and defect == "malformed":
+        with pytest.raises(ValueError, match="unusable tokenizer.*run prepare with the tokenizer step"):
+            prepare(path, layout.root, assume_yes=False, steps=["build"])
+        assert _published_bytes(layout.root) == before
+    assert prepare(path, layout.root, assume_yes=False, confirm=lambda _: False).complete
+    assert SavedTokenizer(directory).encode("hello")
+    replacement = read_snapshot(cfg, scoped, processing=global_policy(cfg) if global_bloom else None)
+    assert replacement.build_id != original.build_id
+    assert replacement.tokenizer["generation_id"] != original.tokenizer["generation_id"]
+    assert {p: b for p, b in before.items() if p.parts[0] == "sources"} == {
+        p: b for p, b in _published_bytes(layout.root).items() if p.parts[0] == "sources"
+    }
+    after = _published_bytes(layout.root)
+    assert prepare(path, layout.root, assume_yes=False).complete
+    assert _published_bytes(layout.root) == after
+
+
+@pytest.mark.parametrize("global_bloom", [False, True])
+@pytest.mark.parametrize("failure", ["missing", "malformed"])
+def test_incomplete_tokenizer_failed_replacement_preserves_snapshot(
+    cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile,
+    monkeypatch: pytest.MonkeyPatch, global_bloom: bool, failure: str,
+) -> None:
+    cfg = cfg_factory({"p": SourceConfig(kind="pretrain", loader="synthetic")}, tokens=10,
+                      bloom_deduplicate_across_sources=global_bloom)
+    path = config_file(cfg)
+    prepare(path, layout.root, assume_yes=True)
+    (layout.tokenizer_dir(cfg.tokenizer.name) / "tokenizer.json").unlink()
+    before = _published_bytes(layout.root)
+
+    def bad_replacement(directory: Path) -> None:
+        write_synthetic_tokenizer(directory)
+        payload = directory / "tokenizer.json"
+        if failure == "missing":
+            payload.unlink()
+        else:
+            payload.write_text("invalid json")
+
+    monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", bad_replacement)
+    with pytest.raises(Exception, match="no tokenizer.json|line [0-9]"):
+        prepare(path, layout.root, assume_yes=False)
+    assert _published_bytes(layout.root) == before
+    assert not list(layout.tokenizer_dir(cfg.tokenizer.name).parent.glob(".tokenizer-*"))

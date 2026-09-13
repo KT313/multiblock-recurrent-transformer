@@ -1603,3 +1603,19 @@ def test_tokenizer_staging_leaves_unowned_sibling_untouched(cfg_factory: CfgFact
     prepare_tokenizer(cfg, layout)
     assert sentinel.read_bytes() == b"do not remove"
     assert not list(published.parent.glob(".tokenizer-*"))
+
+
+@pytest.mark.parametrize("missing", ["tokenizer.json", "tokenizer_config.json"])
+def test_tokenizer_only_preparation_repairs_missing_payload(cfg_factory: CfgFactory, layout: DatasetLayout, missing: str) -> None:
+    from data_preparation.lib.build.planner import tokenizer_is_prepared
+    from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+
+    cfg = cfg_factory({"p": _synthetic()})
+    original = prepare_tokenizer(cfg, layout)
+    directory = layout.tokenizer_dir(cfg.tokenizer.name)
+    (directory / missing).unlink()
+    assert not tokenizer_is_prepared(cfg, layout)
+    replacement = prepare_tokenizer(cfg, layout)
+    assert replacement.generation_id != original.generation_id
+    assert tokenizer_is_prepared(cfg, layout)
+    assert SavedTokenizer(directory).encode("hello")

@@ -185,7 +185,7 @@ def _materialise(args: argparse.Namespace, all_steps: tuple[str, ...], completen
     # batch barely gets faster while the CPU time keeps growing). Explicit values in the environment win.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     os.environ.setdefault("RAYON_NUM_THREADS", str(TOKENIZER_POOL_THREADS))
-    configure_hf_cache(args.cache_dir)
+    configure_hf_cache(args.cache_dir, create=not args.dry_run)
     layout = DatasetLayout(args.dataset_dir)
     log_file = None if args.dry_run else layout.root / BUILD_LOG_NAME  # a dry run writes nothing
 
@@ -214,7 +214,7 @@ def _materialise(args: argparse.Namespace, all_steps: tuple[str, ...], completen
 
 
 def run_status(args: argparse.Namespace) -> None:
-    configure_hf_cache(args.cache_dir)
+    configure_hf_cache(args.cache_dir, create=False)
     report = status(args.dataset_config, args.dataset_dir)
     print(report.describe())
     if not report.complete:

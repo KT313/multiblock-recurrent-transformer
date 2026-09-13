@@ -9,3 +9,20 @@ Training validates the descriptor against small manifests under the dataset leas
 Legacy prepared output can be adopted by preparation without rebuilding its bytes. This establishes identity **from adoption onward**. Legacy checkpoints retain a missing ID as unknown provenance. Protected resume refuses missing or different identities; `allow_dataset_change: true` explicitly acknowledges that exact dataset replay cannot be established. `allow_settings_change` does not authorize a dataset identity mismatch.
 
 Build IDs are managed-publication evidence, not content hashes. Manual file edits that retain the identity metadata are outside this guarantee. No sample-order, split, tokenizer behavior, stream-buffer restoration or training numerical settings are changed by identity bookkeeping.
+
+Tokenizer readiness requires a current tokenizer-stage manifest, a completed generation, and both
+`tokenizer.json` and `tokenizer_config.json`. Status and dry runs check these files without loading a
+potentially large vocabulary; they report structural defects and do not adopt or change identities.
+An existing descriptor alone cannot make an incomplete tokenizer ready.
+
+Mutating tokenizer preparation also loads the existing payload before accepting a no-op. An unusable
+payload is replaced through the existing private staging and load-validation path, after any required
+raw/processed repair authorization. Acquisition or validation failure preserves the published tokenizer
+and descriptor; successful replacement publishes a new tokenizer generation and invalidates the old
+snapshot. A valid no-op preserves bytes and generation. Payload validation is not cached across calls:
+managed generation IDs do not certify manual edits. Source token counts and raw adoption rules are unchanged.
+Training auto-prepare can repair missing derived tokenizer files but never confirms raw repair actions.
+
+`status --cache_dir DIR` and `prepare --dry_run --cache_dir DIR` select the Hugging Face cache in the
+process environment without creating it or initializing Hub clients. Mutating commands create the
+selected cache before acquiring tokenizers or datasets.

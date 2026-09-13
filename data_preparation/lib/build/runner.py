@@ -76,6 +76,7 @@ from data_preparation.lib.stages.download import (
 )
 from data_preparation.lib.stages.global_dedup import GlobalFrontier, global_policy, ordered_sources
 from data_preparation.lib.stages.global_build import build_global_source, outputs_complete, source_frontier
+from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
@@ -243,9 +244,18 @@ def prepare_global(
     current = summarize_dataset_state(config, layout, needs_repair=[action.source for action in repair.actions])
     current.snapshot_problem = snapshot_problem(config, layout, processing=global_policy(config))
     if current.complete and not reopened and outputs_complete(config, layout):
-        log.info("dataset-wide Bloom snapshot already complete; no preparation changes needed")
-        log_report(current)
-        return current
+        if not dry_run:
+            tokenizer = assess_tokenizer_folder(
+                layout.tokenizer_dir(config.tokenizer.name), config.tokenizer_hash(), validate_payload=True,
+            )
+            if not tokenizer.ready and "tokenizer" not in steps:
+                raise ValueError(f"{tokenizer.problem}; run prepare with the tokenizer step to repair it")
+            current.tokenizer_complete = tokenizer.ready
+            current.tokenizer_problem = tokenizer.problem
+        if current.complete:
+            log.info("dataset-wide Bloom snapshot already complete; no preparation changes needed")
+            log_report(current)
+            return current
     if selected is not None and set(selected) != set(config.sources):
         raise ValueError(
             "dataset-wide Bloom admission requires the complete dataset scope and priority prerequisites; "

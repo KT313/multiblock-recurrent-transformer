@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+from data_preparation.lib.storage.tokenizer_assessment import tokenizer_files_problem
 
 # Label value of positions without a loss (padding, masked prompts, out-of-vocab); the model defaults to it too.
 # Never a token id: a real `<unk>` or `<pad>` token in a document is a supervised label like any other.
@@ -63,8 +64,10 @@ class Tokenizer:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        if not (self.path / "tokenizer.json").is_file():
-            raise FileNotFoundError(f"No tokenizer.json in {self.path}")
+        problem = tokenizer_files_problem(self.path)
+        if problem is not None:
+            raise FileNotFoundError(f"{problem}; run data_preparation/prepare.py prepare "
+                                    "with the dataset config and tokenizer step to repair it")
         self._backend = SavedTokenizer(self.path)
         self._processor: Any = None
         bos_id, eos_id = self._backend.bos_id, self._backend.eos_id

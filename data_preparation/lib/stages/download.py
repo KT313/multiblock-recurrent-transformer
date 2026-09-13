@@ -85,6 +85,7 @@ from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS, est
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import RawFolder, RowProgress
+from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
@@ -429,10 +430,10 @@ def inspect_tokenizer(config: DatasetConfig, layout: DatasetLayout) -> Tokenizer
 
     directory = layout.tokenizer_dir(config.tokenizer.name)
     guarded_path(layout.root, directory)
-    manifest = current_manifest(directory, config.tokenizer_hash(), "tokenizer")
-    if not (directory / "tokenizer_config.json").is_file():
-        manifest = None
-    return TokenizerPlan(directory, manifest)
+    assessment = assess_tokenizer_folder(directory, config.tokenizer_hash())
+    if not assessment.ready:
+        log.warning("%s; rebuilding from scratch", assessment.problem)
+    return TokenizerPlan(directory, assessment.manifest if assessment.ready else None)
 
 
 def prepare_tokenizer(config: DatasetConfig, layout: DatasetLayout, *, hf_token: str | None = None) -> Manifest:
@@ -451,7 +452,10 @@ def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_
     """
 
     if plan.current is not None:
-        return plan.current
+        assessment = assess_tokenizer_folder(plan.directory, config.tokenizer_hash(), validate_payload=True)
+        if assessment.ready and assessment.manifest is not None:
+            return assessment.manifest
+        log.warning("%s; preparing a validated replacement", assessment.problem)
     tokenizer = config.tokenizer
     tokenizer_dir = plan.directory
     guarded_path(tokenizer_dir.parent.parent, tokenizer_dir)

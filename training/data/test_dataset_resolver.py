@@ -1015,3 +1015,27 @@ def test_gloo_ranks_agree_on_dataset_identity_or_resume_refusal(
                 process.join(timeout=5)
         for parent, _ in connections:
             parent.close()
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_missing_tokenizer_payload_is_actionable_or_auto_repaired(
+    tmp_path: Path, auto_prepare: bool,
+) -> None:
+    from data_preparation.lib.build.runner import prepare
+    from training.data.tokenizer import Tokenizer
+
+    root = tmp_path / "dataset"
+    prepare(TINY_DATASET_YAML, root, assume_yes=False, num_workers=1, pass_workers=1, max_parallel_downloads=1)
+    directory = DatasetLayout(root).tokenizer_dir("synthetic")
+    payload = directory / "tokenizer.json"
+    payload.unlink()
+    settings = _settings(TINY_DATASET_YAML, root, auto_prepare=auto_prepare)
+    if auto_prepare:
+        resolved = resolve_dataset(settings)
+        assert Tokenizer(resolved.tokenizer_dir).encode("hello")
+    else:
+        with pytest.raises(RuntimeError) as error:
+            resolve_dataset(settings)
+        assert "tokenizer.json" in str(error.value)
+        assert build_command(str(TINY_DATASET_YAML), str(root)) in str(error.value)
+        assert not payload.exists()

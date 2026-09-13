@@ -13,15 +13,16 @@ from data_preparation.lib.log import get_logger
 log = get_logger(__name__)
 
 
-def configure_hf_cache(cache_dir: Path | None) -> None:
+def configure_hf_cache(cache_dir: Path | None, *, create: bool = True) -> None:
     """
-    Point every HuggingFace cache at cache_dir; must run before datasets/transformers are imported.
+    Select the cache before HF imports; read-only commands pass create=False to leave disk unchanged.
     """
 
     if cache_dir is None:
         return
     cache_dir = cache_dir.expanduser().resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
         os.environ[var] = str(cache_dir)
     log.info("using HuggingFace cache %s", cache_dir)

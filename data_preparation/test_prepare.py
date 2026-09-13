@@ -339,3 +339,65 @@ def test_prepare_turns_the_tokenizer_thread_pool_on_unless_the_environment_says_
     monkeypatch.setenv("RAYON_NUM_THREADS", "3")
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "b"), "--dry_run"])
     assert os.environ["TOKENIZERS_PARALLELISM"] == "false" and os.environ["RAYON_NUM_THREADS"] == "3"
+
+
+@pytest.mark.parametrize("command", ["status", "prepare", "download"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_readonly_cli_selects_cache_without_writes_or_hf_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, existing: bool,
+) -> None:
+    import os
+    from data_preparation.lib.sources import hub_files
+    from data_preparation.lib.stages import download as download_stage
+
+    root, cache = tmp_path / "dataset", tmp_path / "new_cache"
+    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
+        monkeypatch.setenv(var, "placeholder")
+    if existing:
+        cache.mkdir()
+        (cache / "sentinel").write_bytes(b"keep")
+        root.mkdir()
+        (root / "sentinel").write_bytes(b"keep")
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    monkeypatch.setattr(hub_files, "configure_hub_http", lambda: pytest.fail("read-only CLI initialized Hub HTTP"))
+    monkeypatch.setattr(download_stage, "_auto_tokenizer", lambda: pytest.fail("read-only CLI imported transformers"))
+    argv = [command, "--dataset_config", str(TINY), "--dataset_dir", str(root), "--cache_dir", str(cache)]
+    if command == "status":
+        with pytest.raises(SystemExit) as error:
+            prepare.main(argv)
+        assert error.value.code == 1
+    else:
+        prepare.main([*argv, "--dry_run"])
+    assert cache.exists() == existing and root.exists() == existing
+    assert before == {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert all(os.environ[var] == str(cache) for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"))
+
+
+def test_mutating_cli_selects_and_creates_cache_before_tokenizer_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    from data_preparation.lib.stages import download as download_stage
+
+    cache = tmp_path / "cache"
+    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
+        monkeypatch.setenv(var, "placeholder")
+    from types import SimpleNamespace
+    from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
+
+    config = tmp_path / "hf.yaml"
+    config.write_text(TINY.read_text().replace("tokenizer: {name: synthetic, kind: synthetic}",
+                                             "tokenizer: {name: fake, kind: hf, hf_id: test/offline}"))
+    initialized: list[bool] = []
+
+    def initialize_hf() -> Any:
+        assert cache.is_dir()
+        assert all(os.environ[var] == str(cache) for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"))
+        initialized.append(True)
+        saved = SimpleNamespace(save_pretrained=lambda path: write_synthetic_tokenizer(Path(path)))
+        return SimpleNamespace(from_pretrained=lambda *args, **kwargs: saved)
+
+    monkeypatch.setattr(download_stage, "_auto_tokenizer", initialize_hf)
+    prepare.main(["prepare", "--dataset_config", str(config), "--dataset_dir", str(tmp_path / "dataset"),
+                  "--steps", "tokenizer", "--cache_dir", str(cache)])
+    assert initialized == [True]
