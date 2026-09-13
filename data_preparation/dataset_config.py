@@ -10,11 +10,12 @@ carries a trailing comment, `DatasetConfig` lists the top-level keys.
 Layout produced on disk (see `data_preparation/README.md`):
 
     dataset/sources/<source>/raw/     rows as downloaded (text truncated to dataset_max_sequence_length tokens); shared, append-only
-    dataset/processed/<source>/       rows after cleaning (what training reads); derived from raw, shared
+    dataset/processed/<source>/       reusable source-local candidates; training reads these with global dedup disabled
+    dataset/.dataset-scopes/<config hash>/processed/<source>/  globally filtered final rows (default)
     dataset/tokenizers/<name>/
 
 Mixing (stage weights) and the validation split (`validation_fraction`) happen in the training dataloader; the
-pipeline only downloads and cleans one folder per source.
+pipeline preserves one output per source within the selected dataset scope.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
 
 
 from data_preparation.identifiers import validate_identifier
+from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.stages.benchmarks import benchmark_revisions
 from data_preparation.lib.stages.truncation import TOKEN_RULE
 
@@ -144,6 +146,11 @@ def _normalize_hash(dedup: DedupConfig) -> str:
     """
 
     return "none" if dedup.mode == "none" else "processed"
+
+
+def _global_memory_hash(dataset: DatasetConfig) -> str:
+    """Only an enabled global filter's memory affects retained output."""
+    return "config" if dataset.bloom_deduplicate_across_sources else "none"
 
 
 def _minhash_only(dedup: DedupConfig) -> str:
@@ -427,6 +434,8 @@ class DatasetConfig:
     - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
     - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
     - `processing`: dataset-level processing defaults (`ProcessingConfig`); a pretrain source may override.
+    - `bloom_deduplicate_across_sources`: enable dataset-wide ordered exact-key Bloom admission (default true).
+    - `bloom_dedup_memory_mb`: separate global filter allocation (default 1024 MiB); freezes dataset identity.
 
     Stage keys are plain source names in `train` and `val`. A source used only in `val` states `rows` (how many to
     deliver); a source used in `train` is sized by `token_budget` and must not give `rows`; a source used
@@ -449,10 +458,17 @@ class DatasetConfig:
     # hashed through every source's *effective* processing block, not as a field of its own
     processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
 
+    bloom_deduplicate_across_sources: bool = field(default=True, metadata=_CONFIG)  # one dataset filter after local processing
+    bloom_dedup_memory_mb: int = field(default=1024, metadata={"hash": _global_memory_hash})  # separate global allocation; frozen in dataset identity when enabled
+
     # --- validation ------------------------------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
         self.validate_identifiers()
+        if not isinstance(self.bloom_deduplicate_across_sources, bool):
+            raise ValueError("bloom_deduplicate_across_sources must be a boolean")
+        if type(self.bloom_dedup_memory_mb) is not int or self.bloom_dedup_memory_mb < 1:
+            raise ValueError("bloom_dedup_memory_mb must be an integer of at least 1 MiB")
         if self.dataset_max_sequence_length <= 0:
             raise ValueError("dataset_max_sequence_length must be positive")
         if not 0 < self.training_target_sequence_length <= self.dataset_max_sequence_length:
@@ -795,6 +811,7 @@ class DatasetConfig:
             name: {"processed": self.processed_hash(name), **payload["sources"][name]} for name in self.sources
         }
         payload["tokenizer"] = self.tokenizer_hash()
+        payload["global_dedup"] = global_policy(self)
         return _stable_hash(payload)
 
     def overlap_warnings(self) -> list[str]:

@@ -38,6 +38,7 @@ from data_preparation.layout import DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
 from data_preparation.lib.storage.snapshot import read_snapshot
+from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.storage.parquet import SHARD_PATTERN
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 from training.settings import Settings
@@ -536,7 +537,7 @@ def _resolve_dataset(
     with main_rank_phase(backend, "dataset configuration"):
         dataset_config = load_dataset_config(settings.dataset_config)
         validate_settings(settings, dataset_config)
-        layout = DatasetLayout(Path(settings.dataset_dir))
+        layout = DatasetLayout(Path(settings.dataset_dir)).for_config(dataset_config)
     _ensure_prepared(settings, dataset_config, layout, backend, should_stop, dataset_lease)
     with main_rank_phase(backend, "dataset metadata resolution"):
         rows_on_disk = processed_row_counts(dataset_config, layout)
@@ -551,7 +552,7 @@ def _resolve_dataset(
         check_validation_batches(
             stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
         )
-        snapshot = read_snapshot(dataset_config, layout)
+        snapshot = read_snapshot(dataset_config, layout, processing=global_policy(dataset_config) if layout.processed_scope else None)
         resolved_dataset = ResolvedDataset(
             config=dataset_config,
             config_hash=dataset_config.config_hash(),

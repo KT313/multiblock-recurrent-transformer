@@ -194,6 +194,7 @@ def cfg_factory() -> CfgFactory:
         tokens_per_row: int = 1,
         tokens: int = 10_000,
         tokenizer: TokenizerConfig | None = None,
+        bloom_deduplicate_across_sources: bool = False,
     ) -> DatasetConfig:
         sources = {name: replace(source, describe_tokens_per_row=tokens_per_row) for name, source in sources.items()}
         trained = {kind: [n for n, s in sources.items() if s.kind == kind and s.rows is None] for kind in ("pretrain", "instruct")}
@@ -227,6 +228,8 @@ def cfg_factory() -> CfgFactory:
             dataset_max_sequence_length=dataset_max_sequence_length,
             token_count=token_count,  # type: ignore[arg-type]  # Literal narrowed by the caller
             processing=processing,
+            bloom_deduplicate_across_sources=bloom_deduplicate_across_sources,
+            bloom_dedup_memory_mb=TEST_BLOOM_MEMORY_MB,
         )
 
     return make

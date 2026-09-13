@@ -25,7 +25,7 @@ import yaml
 
 from data_preparation import prepare as prepare_cli
 from data_preparation.conftest import REPO, REV, FakeHub
-from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig
+from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
@@ -95,7 +95,7 @@ def test_prepare_tiny_end_to_end_and_a_second_run_is_a_no_op(tmp_path: Path, cap
     assert report.complete and report.missing() == [] and "round 1: 2 source(s) short" in caplog.text
     assert "round 2" not in caplog.text and "dataset status:" in caplog.text
     assert status(TINY, root).complete
-    layout = DatasetLayout(root)
+    layout = DatasetLayout(root).for_config(load_dataset_config(TINY))
     for name in ("synthetic_pretrain", "synthetic_instruct"):
         assert (layout.raw_dir(name) / "MANIFEST.json").is_file() and (layout.processed_dir(name) / "MANIFEST.json").is_file()
 
@@ -104,7 +104,7 @@ def test_prepare_tiny_end_to_end_and_a_second_run_is_a_no_op(tmp_path: Path, cap
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         assert prepare(TINY, root, assume_yes=False).complete
     assert all_mtimes(root) == before
-    assert "round 1: nothing to download" in caplog.text
+    assert "dataset-wide Bloom snapshot already complete" in caplog.text
 
 
 def test_prepare_returns_the_report_of_every_source(cfg_factory: CfgFactory, layout: DatasetLayout, config_file: ConfigFile) -> None:

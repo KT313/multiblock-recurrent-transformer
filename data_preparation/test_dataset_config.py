@@ -581,9 +581,11 @@ def test_source_processing_override() -> None:
 # and accepts that the data on disk are invalidated.
 # 2026-09-12: only ShareGPT/SlimOrca raw/processed and enclosing config pins change for the opening-exchange
 # policy v2; old normalized raw rows require an explicitly authorized reread of upstream conversations.
+# 2026-09-13: dataset-wide Bloom admission changes enclosing config identity only;
+# shared raw, local preprocessing and tokenizer hashes remain byte-identical.
 PINNED_HASHES: dict[str, dict[str, Any]] = {
     "tiny": {
-        "config": "086e3cbcd55d23a5",
+        "config": "c6a8cc6acb239b27",
         "tokenizer": "262a9e169b012e3f",
         "sources": {
             "synthetic_pretrain": ("17d1b52ca471d587", "7eeb11a1b3e52a08"),
@@ -591,7 +593,7 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
         },
     },
     "crow_300m_final": {
-        "config": "822b2e35c4b3b067",
+        "config": "4081d7ec5101d520",
         "tokenizer": "568e606fb9a422a5",
         "sources": {
             "fineweb_edu": ("9ff1cc2140a2b822", "ca1ab0beb98b43f7"),
@@ -625,8 +627,8 @@ PINNED_HASHES: dict[str, dict[str, Any]] = {
     },
 }
 # The mini and the v2 config are the final config's sources with other budgets: the same raw and processed hashes.
-PINNED_HASHES["crow_300m_mini"] = {"config": "19a97bee362aac7a", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
-PINNED_HASHES["v2_50M_tokens"] = {"config": "c979b088fdc5c40b", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["crow_300m_mini"] = {"config": "d09546ee782f7f6d", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
+PINNED_HASHES["v2_50M_tokens"] = {"config": "0ebea22e2724b517", "tokenizer": "568e606fb9a422a5", "sources": PINNED_HASHES["crow_300m_final"]["sources"]}
 
 
 @pytest.mark.parametrize("name", list(PINNED_HASHES))

@@ -260,8 +260,8 @@ def inspect_source(config: DatasetConfig, name: str, layout: DatasetLayout, repo
         _plan(report, name, layout.raw_dir(name), "raw", "leave", inspection.reason)
         return
     raw_shards = inspect_raw_folder(config, name, layout, inspection, report, config_name=config_name)
-    inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, report)
-    inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, report)
+    inspect_processed_folder(config, name, layout.processed_dir(name), raw_shards, report, global_output=layout.processed_scope is not None)
+    inspect_swap_leftovers(config, name, layout.processed_dir(name), raw_shards, report, global_output=layout.processed_scope is not None)
 
 
 def inspect_raw_folder(
@@ -306,7 +306,7 @@ def inspect_raw_folder(
     return shard_list(kept)
 
 
-def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
+def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, report: RepairReport, *, global_output: bool = False) -> None:
     """
     Plan what happens to the processed folder of name given the raw shards it will be able to build from
     (None: the raw folder is being deleted). The shared verdict of
@@ -319,7 +319,7 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
     crash leftover (the next shard the resumed build writes) is not corruption: the build overwrites it.
     """
 
-    assessment = assess_processed_folder(config, name, folder, raw_shards)
+    assessment = assess_processed_folder(config, name, folder, raw_shards, global_output=global_output)
     if assessment.repair == "rebuild":
         asks = assessment.problem in ("unreadable_manifest", "stale")
         _plan(report, name, folder, "processed", "delete", assessment.reason, needs_confirmation=asks)
@@ -327,7 +327,7 @@ def inspect_processed_folder(config: DatasetConfig, name: str, folder: Path, raw
         log.info("%s: leaving %s alone (%s)", name, folder, assessment.reason)
 
 
-def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path, raw_shards: ShardList | None, report: RepairReport) -> None:
+def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path, raw_shards: ShardList | None, report: RepairReport, *, global_output: bool = False) -> None:
     """
     Inspect private build slots and legacy siblings without mutation. Each needs explicit ownership or a
     legacy processed manifest naming this source. A complete temporary replaces an absent final directory;
@@ -360,7 +360,7 @@ def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path
                 raise RepairError(str(error)) from error
     adopted = False
     if temporary is not None:
-        if not final_survives and assess_processed_folder(config, name, temporary, raw_shards).problem == "none":
+        if not final_survives and assess_processed_folder(config, name, temporary, raw_shards, global_output=global_output).problem == "none":
             _plan(report, name, temporary, "processed", "swap", "complete build of an interrupted swap; renaming it into place",
                   destination=processed_dir, artifact_role="temporary")
             adopted = True
@@ -370,7 +370,7 @@ def inspect_swap_leftovers(config: DatasetConfig, name: str, processed_dir: Path
     if old is not None:
         if not final_survives and not adopted:
             # Retain the last complete generation when a new build cannot be adopted.
-            if assess_processed_folder(config, name, old, raw_shards).problem != "none":
+            if assess_processed_folder(config, name, old, raw_shards, global_output=global_output).problem != "none":
                 raise RepairError(f"{old}: last backup has no complete current replacement; preserving it for inspection")
             _plan(report, name, old, "processed", "swap", "restoring the complete backup of an interrupted swap",
                   destination=processed_dir, artifact_role="backup")

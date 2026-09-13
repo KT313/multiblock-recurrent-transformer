@@ -8,8 +8,8 @@ The tree shows the download/build boundary: sources/ holds only downloaded data,
                                                          + `tokens` column); append-only, shared by every dataset config;
                                                          deleted only when the source identity changes or the cap is
                                                          raised, after the user confirmed
-    <root>/processed/<source>/                           cleaned rows (one flat folder per source, derived from raw,
-                                                         cheap to rebuild, shared); what training reads
+    <root>/processed/<source>/                           reusable source-local candidates; training output with global dedup disabled
+    <root>/.dataset-scopes/<config hash>/processed/<source>/  dataset-wide final output when global dedup is enabled
     <root>/tokenizers/<tokenizer name>/
     <root>/benchmarks/                                   cache of benchmark test sets used for decontamination
     <root>/hub_index/<repo>@<revision>/<glob hash>.json  file lists + row counts of `hf_files` / `github_code` repos
@@ -21,6 +21,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from data_preparation.dataset_config import DatasetConfig
 
 from data_preparation.identifiers import validate_identifier
 
@@ -51,6 +55,11 @@ class DatasetLayout:
     """
 
     root: Path = Path("dataset")
+    processed_scope: str | None = None
+
+    def for_config(self, config: DatasetConfig) -> DatasetLayout:
+        return DatasetLayout(self.root, config.config_hash() if config.bloom_deduplicate_across_sources else None)
+
 
     def raw_dir(self, name: str) -> Path:
         """
@@ -66,6 +75,9 @@ class DatasetLayout:
         """
 
         validate_identifier(name, field="source name")
+        if self.processed_scope is not None:
+            validate_identifier(self.processed_scope, field="dataset processed scope")
+            return self.root / ".dataset-scopes" / self.processed_scope / "processed" / name
         return self.root / "processed" / name
 
     def tokenizer_dir(self, name: str) -> Path:

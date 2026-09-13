@@ -593,7 +593,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
     monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir, **kwargs: DatasetReport(tokenizer_complete=True))
     root = tmp_path / "ds"
-    expected_folder = re.escape(str(DatasetLayout(root).processed_dir("synthetic_pretrain")))
+    expected_folder = re.escape(str(DatasetLayout(root).for_config(load_dataset_config(TINY_DATASET_YAML)).processed_dir("synthetic_pretrain")))
     with pytest.raises(FileNotFoundError, match=f"source 'synthetic_pretrain' \\(stage keys pretrain_a.train, pretrain_b.train, pretrain_a.val, pretrain_b.val\\): processed folder {expected_folder} does not exist"):
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
 
@@ -607,7 +607,7 @@ def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(
 
     root = tmp_path / "ds"
     shutil.copytree(tiny_dataset_dir, root)
-    folder = DatasetLayout(root).processed_dir("synthetic_instruct")
+    folder = DatasetLayout(root).for_config(load_dataset_config(TINY_DATASET_YAML)).processed_dir("synthetic_instruct")
     shutil.copy(folder / "data-00000.parquet", folder / "data-00001.parquet")
     with pytest.raises(RuntimeError, match="not prepared .*auto_prepare is off.*synthetic_instruct"):
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
@@ -701,7 +701,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     assert "preparing missing data" in caplog.text
     assert caplog.text.count("dataset status:") == 2  # once before the build (incomplete), once after it (complete)
     assert re.search(r"source synthetic_pretrain: \d+ processed rows, rows \[0, \d+\) validation \(5.0%\)", caplog.text)
-    layout = DatasetLayout(empty)
+    layout = DatasetLayout(empty).for_config(resolved.config)
     assert list(layout.processed_dir("synthetic_pretrain").glob("*.parquet"))
     assert list(layout.processed_dir("synthetic_instruct").glob("*.parquet"))
     assert Path(resolved.tokenizer_dir).is_dir()

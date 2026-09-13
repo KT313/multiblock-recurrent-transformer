@@ -17,7 +17,7 @@ import pytest
 
 from data_preparation import prepare
 from data_preparation.lib.build.lock import build_lock
-from data_preparation.dataset_config import DatasetConfig
+from data_preparation.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.planner import DatasetReport, SourceLedger
@@ -135,13 +135,15 @@ def test_prepare_dry_run_writes_nothing(tmp_path: Path) -> None:
 
 def test_prepare_sources_and_steps_filters(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
-    layout = DatasetLayout(root)
+    layout = DatasetLayout(root).for_config(load_dataset_config(TINY))
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--steps", "tokenizer", "download"])
     assert (layout.tokenizer_dir("synthetic") / "MANIFEST.json").is_file()
     assert (layout.raw_dir("synthetic_pretrain") / "MANIFEST.json").is_file()
     assert not layout.processed_dir("synthetic_pretrain").exists() and not layout.processed_dir("synthetic_instruct").exists()
-    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_instruct"])
-    assert layout.processed_dir("synthetic_instruct").is_dir() and not layout.processed_dir("synthetic_pretrain").exists()
+    with pytest.raises(SystemExit) as partial:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--sources", "synthetic_instruct"])
+    assert partial.value.code == 1  # a partial request cannot bypass the dataset's global prerequisites
+    assert not layout.processed_dir("synthetic_instruct").exists() and not layout.processed_dir("synthetic_pretrain").exists()
     with pytest.raises(SystemExit) as exc:
         prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == 1
@@ -218,7 +220,7 @@ def test_an_explicit_full_steps_list_is_not_a_partial_run(tmp_path: Path, monkey
 
 def test_download_runs_tokenizer_and_download_only_and_prepare_builds_afterwards(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     root = tmp_path / "dataset"
-    layout = DatasetLayout(root)
+    layout = DatasetLayout(root).for_config(load_dataset_config(TINY))
     with caplog.at_level(logging.INFO, logger="data_preparation"):
         prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(root)])  # exit 0
     assert f"download complete: {root}" in caplog.text
@@ -302,7 +304,7 @@ def test_tiny_end_to_end(tmp_path: Path, tiny_dataset_config: DatasetConfig) -> 
     root = tmp_path / "dataset"
     prepare.main(["tiny", "--dataset_dir", str(root)])
     prepare.main(["status", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
-    layout = DatasetLayout(root)
+    layout = DatasetLayout(root).for_config(load_dataset_config(TINY))
     assert all((layout.processed_dir(name) / "MANIFEST.json").is_file() for name in tiny_dataset_config.sources)
     shutil.rmtree(layout.processed_dir("synthetic_instruct"))
     with pytest.raises(SystemExit):

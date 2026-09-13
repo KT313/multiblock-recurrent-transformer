@@ -74,8 +74,9 @@ dataset/
 ├── sources/<source>/raw/     MANIFEST.json + data-*.parquet   rows as downloaded (converter applied, pretrain text
 │                                                              truncated to dataset_max_sequence_length tokens, `tokens` column);
 │                                                              append-only; the ONLY tree the download step writes
-├── processed/<source>/       MANIFEST.json + data-*.parquet   rows after cleaning; derived from raw, cheap to rebuild;
-│                                                              the ONLY tree the build step writes  <- training reads this
+├── processed/<source>/       MANIFEST.json + data-*.parquet   reusable source-local candidates (training output when global dedup is false);
+├── .dataset-scopes/<config hash>/processed/<source>/       globally filtered final rows; default training paths
+├── snapshots/<config hash>.json                            completed dataset build descriptor
 ├── .build-work/processed/<source>/{temporary,backup}/       private, owned build generations
 ├── tokenizers/<name>/        MANIFEST.json + tokenizer files
 ├── hub_index/<repo>@<rev>/   file lists, row counts and row-group layout of `hf_files` / `github_code` repos (safe to delete)
@@ -94,8 +95,9 @@ identifies the expected source (or valid explicit ownership metadata is present)
 conflicting leftovers are preserved and preparation fails with their path; inspect those folders manually.
 Status/dry-run only inspects ownership and never creates, deletes or adopts artifacts.
 
-Both trees are shared by every dataset config (stages 1 and 2 of the thesis config draw from the same
-`processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
+Raw and source-local candidate trees are shared by dataset configs. Global final output belongs to one
+config scope; stages of that config share each source's final rows with their configured weights.
+Every source folder carries a `MANIFEST.json`
 (`lib/storage/manifest.py`): the hash of the settings that produced it and the exact dict it was computed from
 (`hash_payload`), rows and tokens per shard, the loader offset and the rejected-row totals after each raw shard, how
 tokens were counted (`token_count`, `tokenizer`, and for raw the tokenizer's definition hash `tokenizer_hash`) and,
@@ -332,6 +334,68 @@ rather than drop that many unique documents. The processed manifest keeps both n
 The filter is not persisted: every build refills it from the `hash` column of the processed shards
 already on disk, which is exactly the set a full pass would have accumulated, so an incremental build keeps the
 same rows as a full one. Changing `bloom_memory_mb` does not invalidate processed folders (it is a resource knob).
+
+**Dataset-wide Bloom admission** uses the top-level
+`bloom_deduplicate_across_sources: true` (the default) and
+`bloom_dedup_memory_mb: 1024` (MiB). The global filter is an additional allocation;
+source-local `processing.dedup.bloom_memory_mb` retains its existing compatibility
+rules. With the dataset switch false, only the existing source-local path applies.
+The global memory budget changes probabilistic membership and therefore belongs to
+the dataset's processed identity: changing it requires replay into a new snapshot.
+Local candidate folders and shared raw downloads remain reusable. Enabled output lives
+in `.dataset-scopes/<config_hash>/processed/<source>/`; training resolves this complete
+scope through the dataset build descriptor in `snapshots/<config_hash>.json`. Different
+source sets/orders and global policies have independent output folders. The extra disk
+cost is one retained-row copy per dataset scope, including an 8-byte `global_hash` per
+row; source-local candidates remain on disk. The global writer reads at most 4096 rows
+per batch. It runs after the parallel candidate workers join, so its filter does not
+multiply by `num_workers`; source-local filter/worker budgets retain their existing rules.
+Recovering a source streams keys from committed earlier sources (bounded RAM, additional
+key-column reads as the number of sources grows).
+
+Old shared `processed/` folders are candidates, not proof of global readiness. Status
+and dry-run show a missing dataset-wide frontier until preparation replays them; this
+migration does not require raw redownloads. An incomplete partial `--sources` request
+fails before content mutation and asks for the full dataset scope. Once the coherent
+snapshot is complete, a partial no-op request is allowed. Download-only preparation
+retains the existing measured-size top-up rounds.
+
+A source consumes its existing preprocessing unit, retaining unique surplus rows, then
+checks its global budget. Shortfalls extend local candidates from buffered raw before
+fetching more. Top-ups finish the current priority source before lower-priority
+admission; shuffled/MinHash candidate changes replay that source and generation-bound
+downstream output. An exhausted source's shortfall is reported. A zero-yield source gets
+bounded further attempts because later rows may be unique; lack of raw progress or the
+five-round limit stops before lower-priority output and leaves the snapshot incomplete.
+
+Priority is validation-only sources first, followed by all training sources in YAML
+declaration order (`validation-only-then-declaration-v1`). Each source must reach
+its retained budget or exhaustion before the next source can reserve a global key.
+Local quality/length filtering, instruction transformations and optional MinHash
+run before global admission; rejected candidates reserve nothing. Candidate order
+is the existing source preprocessing order, including its deterministic shuffle.
+Worker completion order never selects the winner.
+
+The installed rbloom version and splitmix64 mixing policy are recorded and frozen
+for each build/restart. The versioned global key
+(`normalized-tagged-json-sha256-64-v1`) lowercases text
+and collapses whitespace runs. It ignores source names and source-local
+`dedup.normalize` overrides. A tagged JSON array preserves instruction/input/output
+boundaries, includes the complete answer, and treats null/missing input as empty.
+Equal prompts with different answers survive separately. Prose and structured
+instruction rows have distinct format tags, even when rendered prose looks alike.
+This does not detect embedded text or semantic/near duplicates. A Bloom-positive
+rejection can be a false positive; counters use `bloom_positive`, not confirmed
+duplicate counts. The nominal target FPR is 0.1%; overload beyond twice nominal
+capacity fails with a global-memory/replay remedy.
+
+The admission component commits a bounded row batch together with a deterministic
+frontier. Its recovery stream is the separately stored `global_hash` column from
+exactly committed retained rows; a SHA-256 digest detects mismatched recovery keys.
+A failed publication poisons the live admission instance, requiring recovery from
+the durable frontier so an uncommitted reservation cannot steal a rightful sample.
+There is an explicit preseed-key hook for a future optional feature; this feature
+never loads benchmark datasets itself.
 
 **Minhash** (`dedup: {mode: minhash, threshold: 0.95, num_perm: 256, ngram: 5}`, `lib/stages/fuzzy_dedup.py`,
 `datasketch` extra) runs the exact pass first and then MinHash/LSH near-duplicate removal over the whole source at
@@ -599,7 +663,7 @@ crow config mirrors that with exact dedup on, `dataset_max_sequence_length` 2048
 off by default (available as `dedup: {mode: minhash, threshold: 0.95}`), PII masking no longer exists, texts are
 truncated at the token cap when downloaded instead of stored whole, download sizes follow the token budgets
 (÷ the measured tokens per row, × 1.2) instead of fixed row counts, the finetune stage mixes the eight instruct sources by weight in the
-dataloader (no prebuilt mixture, no cross-source dedup of instruct data), validation is the first 5 % of the
+dataloader (no prebuilt mixture; dataset-wide Bloom dedup runs during preparation), validation is the first 5 % of the
 fineweb-edu training source (`validation_fraction`) instead of fineweb-edu's `sample-10BT` (which overlapped the
 training dump: about a fifth of that validation set was training data), several HuggingFace ids moved
 (`wikimedia/wikipedia`, `openai/gsm8k`, `common-pile/arxiv_papers_filtered`) and every source is pinned to a

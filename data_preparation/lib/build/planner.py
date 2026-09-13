@@ -132,7 +132,8 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
     build read no parquet footers; broken or stray shard files are the repair step's business).
     """
 
-    return assess_processed_folder(config, name, layout.processed_dir(name), shard_list(raw.shards), check_files=False)
+    return assess_processed_folder(config, name, layout.processed_dir(name), shard_list(raw.shards),
+                                   check_files=False, global_output=layout.processed_scope is not None)
 
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:

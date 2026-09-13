@@ -70,6 +70,7 @@ def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, t
         training_target_sequence_length=training_target_sequence_length,
         dataset_max_sequence_length=128,
         processing=ProcessingConfig(min_chars=min_chars),
+        bloom_deduplicate_across_sources=False,
     )
 
 

@@ -89,9 +89,9 @@ def read_snapshot(config: DatasetConfig, layout: DatasetLayout, *, processing: d
     return snapshot
 
 
-def snapshot_problem(config: DatasetConfig, layout: DatasetLayout) -> str | None:
+def snapshot_problem(config: DatasetConfig, layout: DatasetLayout, *, processing: dict[str, Any] | None = None) -> str | None:
     try:
-        read_snapshot(config, layout)
+        read_snapshot(config, layout, processing=processing)
     except RuntimeError as error:
         return str(error)
     return None

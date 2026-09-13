@@ -74,6 +74,10 @@ from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import (
     download, download_github_code_group, inspect_tokenizer, prepare_planned_tokenizer, reopen_raw,
 )
+from data_preparation.lib.stages.global_dedup import GlobalFrontier, global_policy, ordered_sources
+from data_preparation.lib.stages.global_build import build_global_source, outputs_complete, source_frontier
+from data_preparation.lib.storage.manifest import Manifest
+from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
@@ -161,6 +165,13 @@ def prepare(
     warn_about_overlaps(config)
 
     with dataset_lock(layout.root, lease=dataset_lease) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
+        if config.bloom_deduplicate_across_sources:
+            return prepare_global(
+                config, layout.for_config(config), config_name=config_name, steps=active_steps, selected=selected,
+                reopened=reopened, dry_run=dry_run, assume_yes=assume_yes, confirm=confirm,
+                allow_foreign_raw=allow_foreign_raw, hf_token=hf_token, num_workers=num_workers,
+                pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads, should_stop=should_stop,
+            )
         repair_report = inspect_repairs(config, layout, sources=selected, config_name=config_name)
         tokenizer_plan = inspect_tokenizer(config, layout) if "tokenizer" in active_steps else None
         if not dry_run:
@@ -200,12 +211,129 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
 
     config = load_dataset_config(config_path)
     config.validate_identifiers()
-    layout = DatasetLayout(Path(dataset_dir))
+    layout = DatasetLayout(Path(dataset_dir)).for_config(config)
     warn_about_overlaps(config)
     with unreadable_shard_remedy(config_path, dataset_dir):
-        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name)
+        repair_report = (inspect_repairs(config, layout, config_name=Path(config_path).name) if layout.processed_scope else
+                         repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name))
         log_repair(repair_report)
         return assess_dataset_state(config, layout, repair_report)
+
+
+def inspect_global_repairs(config: DatasetConfig, layout: DatasetLayout, config_name: str) -> RepairReport:
+    """Inspect local candidates and final output; shared raw actions execute only once."""
+    candidate = inspect_repairs(config, DatasetLayout(layout.root), config_name=config_name)
+    final = inspect_repairs(config, layout, config_name=config_name)
+    folders = {action.folder for action in candidate.actions}
+    return RepairReport([*candidate.actions, *(action for action in final.actions if action.folder not in folders)])
+
+
+def prepare_global(
+    config: DatasetConfig, layout: DatasetLayout, *, config_name: str, steps: set[str],
+    selected: list[str] | None, reopened: list[str], dry_run: bool, assume_yes: bool,
+    confirm: Confirm | None, allow_foreign_raw: bool, hf_token: str | None,
+    num_workers: int, pass_workers: int, max_parallel_downloads: int, should_stop: StopCheck | None,
+) -> DatasetReport:
+    """Caller holds the exclusive lease until every worker and ordered writer stops."""
+    from data_preparation.lib.build.planner import source_ledger
+
+    for name in config.sources:
+        guarded_path(layout.root, layout.processed_dir(name))
+    repair = inspect_repairs(config, layout, config_name=config_name)
+    current = summarize_dataset_state(config, layout, needs_repair=[action.source for action in repair.actions])
+    current.snapshot_problem = snapshot_problem(config, layout, processing=global_policy(config))
+    if current.complete and not reopened and outputs_complete(config, layout):
+        log.info("dataset-wide Bloom snapshot already complete; no preparation changes needed")
+        log_report(current)
+        return current
+    if selected is not None and set(selected) != set(config.sources):
+        raise ValueError(
+            "dataset-wide Bloom admission requires the complete dataset scope and priority prerequisites; "
+            "omit --sources to prepare/replay all sources before requesting a partial no-op"
+        )
+    repair = inspect_global_repairs(config, layout, config_name)
+    log.info("dataset-wide Bloom preparation/replay -> %s; source-local candidates and raw downloads are reusable", layout.processed_scope)
+    if dry_run:
+        log_repair(repair)
+        log.info("dry run, downloads planned:\n%s", plan_downloads(config, layout, sources=selected).describe())
+        return assess_dataset_state(config, layout, repair)
+    authorize_repairs(repair, assume_yes=assume_yes, confirm=confirm, allow_foreign_raw=allow_foreign_raw)
+    if "tokenizer" in steps:
+        prepare_planned_tokenizer(config, inspect_tokenizer(config, layout), hf_token=hf_token)
+    perform_repairs(repair)
+    log_repair(repair)
+    reopen_sources(config, layout, reopened, dry_run=False)
+    candidates = DatasetLayout(layout.root)
+    plan = plan_downloads(config, candidates, sources=selected)
+    log.info("round 1: %s", plan.summary())
+    download_and_build_missing(
+        plan, config, candidates, steps=steps, sources=selected,
+        max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
+        hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+    )
+    if "build" not in steps:
+        for _ in range(1, MAX_ROUNDS):
+            if "download" not in steps:
+                break
+            followup = plan_downloads(config, candidates, sources=selected)
+            if followup.total_rows_to_fetch() == 0:
+                break
+            download_and_build_missing(
+                followup, config, candidates, steps=steps, sources=selected,
+                max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
+                hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            )
+        return assess_dataset_state(config, layout, repair)
+    frontier = GlobalFrontier(ordered_sources(config), config.bloom_dedup_memory_mb)
+    for name in ordered_sources(config):
+        start = frontier
+        complete = False
+        for round_number in range(1, MAX_ROUNDS + 1):
+            check_stop(should_stop)
+            ledger = source_ledger(config, name, layout)
+            if ledger.raw_state != "current":
+                break
+            # Extend local candidates only by the global shortfall. Existing buffered
+            # raw shards are consumed before any additional download is requested.
+            local = Manifest.load(candidates.processed_dir(name))
+            target = ledger.rows_sufficient
+            retained = Manifest.load(layout.processed_dir(name))
+            if local is not None and retained is not None:
+                target = local.rows() + max(0, ledger.rows_sufficient - ledger.processed_rows)
+                if (not retained.generation_complete and retained.extra.get("candidate_generation") == local.generation_id
+                        and (source_frontier(retained).source_index > start.source_index
+                             or source_frontier(retained).source_candidates < local.rows())):
+                    target = local.rows()  # recover pending candidates before planning a top-up
+            local = build_source(config, name, candidates, pass_workers=pass_workers,
+                                 should_stop=should_stop, rows_target=target)
+            frontier, complete = build_global_source(
+                config, name, layout, start, rows_target=ledger.rows_sufficient,
+                exhausted=ledger.exhausted, should_stop=should_stop,
+            )
+            if complete:
+                break
+            if round_number == MAX_ROUNDS:
+                break
+            raw = Manifest.load(candidates.raw_dir(name))
+            if raw is not None and len(local.input_shards) < len(raw.shards):
+                continue
+            if "download" not in steps:
+                break
+            ledger = source_ledger(config, name, layout)
+            increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
+            # A zero-yield source can have unique rows later; continue bounded top-ups
+            # instead of treating global losses as proof that every later row is useless.
+            log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
+            download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
+                     hf_token=hf_token, should_stop=should_stop, config_name=config_name)
+            after = source_ledger(config, name, layout)
+            if after.raw_rows <= ledger.raw_rows and not after.exhausted:
+                log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
+                break
+        if not complete:
+            log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
+            break
+    return assess_dataset_state(config, layout, repair, publish=True)
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------
@@ -651,9 +779,14 @@ def assess_dataset_state(
     """
 
     report = summarize_dataset_state(config, layout, needs_repair=[action.source for action in outstanding_repairs(repair_report)])
-    if publish and report.complete:
-        publish_snapshot(config, layout)
-    report.snapshot_problem = snapshot_problem(config, layout)
+    processing = global_policy(config) if layout.processed_scope else None
+    if publish and report.complete and outputs_complete(config, layout):
+        publish_snapshot(config, layout, processing=processing)
+    report.snapshot_problem = snapshot_problem(config, layout, processing=processing)
+    if layout.processed_scope and report.snapshot_problem is None and not outputs_complete(config, layout):
+        report.snapshot_problem = "dataset-wide Bloom frontier is incomplete; run prepare to continue ordered admission"
+    elif layout.processed_scope and report.snapshot_problem is not None:
+        report.snapshot_problem = "dataset-wide Bloom preparation/replay required: " + report.snapshot_problem
     log_report(report)
     return report
 

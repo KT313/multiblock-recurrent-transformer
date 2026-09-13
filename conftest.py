@@ -117,8 +117,8 @@ def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_conf
 
 
 @pytest.fixture(scope="session")
-def tiny_layout(tiny_dataset_dir: Path) -> DatasetLayout:
-    return DatasetLayout(tiny_dataset_dir)
+def tiny_layout(tiny_dataset_dir: Path, tiny_dataset_config: DatasetConfig) -> DatasetLayout:
+    return DatasetLayout(tiny_dataset_dir).for_config(tiny_dataset_config)
 
 
 @pytest.fixture(scope="session")
