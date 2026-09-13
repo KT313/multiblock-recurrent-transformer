@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from evaluation.rng import preserve_rng, seed_model_rng
 from evaluation.wrapper import RECURRENCE_ENV, Recurrence, check_recurrence, hf_wrapper_around, recurrence_env
 from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
@@ -40,16 +41,15 @@ def inference_session(
     model: torch.nn.Module, recurrence: Recurrence = None, *, seed: int = 0,
     execution_policy: ExecutionPolicy | None = None,
 ) -> Iterator[InferenceSession]:
-    """Preserve the operation seed and CPU/model-CUDA RNG, including exceptional exits.
+    """Preserve caller global RNG and seed only CPU/model-CUDA, including exceptional exits.
 
-    Python/NumPy and other CUDA-device RNG isolation retain their historical limitations. No parameter is
-    constructed, copied, moved or cast here; the live wrapper shares the original versioned tensors.
+    No parameter is constructed, copied, moved or cast here; the live wrapper shares the original
+    versioned tensors. External evaluators must also use scoped seeding (see the benchmark adapter).
     """
     policy = execution_policy or ExecutionPolicy()
     device = next(model.parameters()).device
     if isinstance(model, RecurrentGPT):
         check_recurrence(recurrence, model)
-    devices = [device.index or 0] if device.type == "cuda" else []
     was_training = model.training
     previous = os.environ.get(RECURRENCE_ENV)
     env_value = recurrence_env(recurrence)
@@ -58,8 +58,8 @@ def inference_session(
     else:
         os.environ[RECURRENCE_ENV] = env_value
     try:
-        with torch.random.fork_rng(devices=devices), torch.inference_mode(), policy.autocast(device):
-            torch.manual_seed(seed)
+        with preserve_rng(device), torch.inference_mode(), policy.autocast(device):
+            seed_model_rng(seed, device)
             model.eval()
             if isinstance(model, RecurrentGPT) and policy.precision is not None:
                 # Legacy callers can enter their own autocast inside this context; kernels still enforce support.

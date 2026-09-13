@@ -99,13 +99,19 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"]
     assert (calls["evaluate"]["num_fewshot"], calls["evaluate"]["limit"]) == (2, 40)
     assert calls["evaluate"]["model"].__class__.__name__ == "HFLM"
-    # lm-eval reseeds torch on every call, so the seed of the isolated inference only reaches it as an argument
-    assert calls["evaluate"]["torch_random_seed"] == 5
+    # The adapter seeds Torch after HFLM construction and disables the harness all-device reseed.
+    assert calls["evaluate"]["torch_random_seed"] is None
+    assert calls["evaluate"]["random_seed"] == 0
+    assert calls["evaluate"]["numpy_random_seed"] == calls["evaluate"]["fewshot_random_seed"] == 1234
     assert calls["evaluate"]["log_samples"] is False and calls["evaluate"]["bootstrap_iters"] == BOOTSTRAP_ITERS
     record = json.loads(path.read_text(encoding="utf-8"))
     assert path == tmp_path / "benchmarks" / "step-00000007.json"
     assert (record["step"], record["tasks"], record["limit"], record["num_fewshot"]) == (7, ["arc_easy", "hellaswag"], 40, 2)
     assert record["seed"] == 5
+    assert record["rng_seeds"] == {
+        "random_seed": 0, "numpy_random_seed": 1234, "torch_random_seed": 5, "fewshot_random_seed": 1234,
+    }
+    assert record["torch_seed_owner"] == "evaluation_cpu_model_device"
     assert record["recurrences"] == [None, [2, 2]] and record["metrics"] == metrics
     assert record["results"] == {"mean": RESULTS, "2-2": RESULTS} and record["versions"] == {"arc_easy": 1, "hellaswag": 1}
 
@@ -122,7 +128,7 @@ def test_num_fewshot_default_leaves_every_task_at_its_own(
     evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"])
     assert calls["evaluate"]["num_fewshot"] is None
     evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=0)
-    assert calls["evaluate"]["num_fewshot"] == 0
+    assert calls["evaluate"].get("num_fewshot") == 0
     with pytest.raises(ValueError, match="num_fewshot must be >= -1"):
         evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=-2)
 
@@ -136,7 +142,9 @@ def test_default_tasks_are_the_settings_default() -> None:
     from training.settings import DEFAULT_BENCHMARK_TASKS, Settings
 
     assert DEFAULT_TASKS is DEFAULT_BENCHMARK_TASKS
-    assert list(DEFAULT_TASKS) == Settings.__dataclass_fields__["benchmark_tasks"].default_factory()
+    factory = Settings.__dataclass_fields__["benchmark_tasks"].default_factory
+    assert callable(factory)
+    assert list(DEFAULT_TASKS) == factory()
 
 
 def test_evaluate_on_benchmarks_errors(
@@ -192,3 +200,16 @@ def test_real_harness_scores_arc_easy(tiny_model: RecurrentGPT, tiny_tokenizer_d
         tiny_model, Tokenizer(tiny_tokenizer_dir), ["arc_easy"], limit=4, batch_size=2, out_path=benchmarks_path(tmp_path, 1)
     )
     assert "benchmark/mean/arc_easy/acc" in metrics and 0.0 <= metrics["benchmark/mean/arc_easy/acc"] <= 1.0
+
+
+def test_harness_without_seed_arguments_fails_explicitly(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_lm_eval(monkeypatch)
+
+    def incompatible(model: object, tasks: object) -> None:
+        pytest.fail("unsupported harness must be rejected before evaluation")
+
+    monkeypatch.setattr(sys.modules["lm_eval"], "simple_evaluate", incompatible)
+    with pytest.raises(RuntimeError, match="lacks required RNG seed arguments.*torch_random_seed"):
+        evaluate_on_benchmarks(tiny_model, Tokenizer(tiny_tokenizer_dir), ["offline"])

@@ -9,11 +9,13 @@ datasets come from the HuggingFace Hub (network on first use).
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from evaluation.rng import preserve_rng, seed_model_rng
 from evaluation.wrapper import Recurrence, check_recurrence, recurrence_label
 from evaluation.session import inference_session
 from model.execution import ExecutionPolicy
@@ -26,6 +28,9 @@ BENCHMARKS_DIR = "benchmarks"  # under the run directory
 METRIC_PREFIX = "benchmark"  # wandb keys: benchmark/<recurrence label>/<task>/<metric>
 EVAL_EXTRA_HINT = "lm_eval is not installed: install the eval extra (uv sync --extra eval) to run benchmarks"
 TASK_DEFAULT_FEWSHOT = -1  # num_fewshot: each task's own default (gsm8k is 5-shot), lm-eval's `num_fewshot=None`
+HARNESS_RANDOM_SEED = 0  # preserve lm-eval defaults, independently of the model seed
+HARNESS_NUMPY_SEED = 1234
+HARNESS_FEWSHOT_SEED = 1234
 BOOTSTRAP_ITERS = 100  # lm-eval's stderr resampling; its default of 100000 is the slowest part of a small run
 
 
@@ -51,8 +56,9 @@ def evaluate_on_benchmarks(
     Score the model on tasks with lm-eval-harness, once per recurrence setting (steps per core block, None: the
     mean recurrence), and return `benchmark/<recurrence label>/<task>/<metric>` floats (stderr entries left out).
     limit caps the examples per task, num_fewshot -1 leaves every task at its own default (`TASK_DEFAULT_FEWSHOT`).
-    seed seeds the isolated RNG and lm-eval's own seeding of torch (it reseeds on every call, so passing it is the
-    only way the seed reaches the scoring). With out_path the full lm-eval results per setting (plus step and the
+    seed seeds the isolated CPU/model-device RNG again immediately before the harness call. The harness's
+    all-device Torch seeding is disabled through its supported None option. Python/NumPy/few-shot seeds
+    retain their historical defaults (0/1234/1234). With out_path the full lm-eval results per setting (plus step and the
     settings used) are written as JSON.
     """
 
@@ -64,7 +70,9 @@ def evaluate_on_benchmarks(
         raise ValueError(f"num_fewshot must be >= {TASK_DEFAULT_FEWSHOT} ({TASK_DEFAULT_FEWSHOT}: each task's own default), got {num_fewshot}")
     for recurrence in recurrences:
         check_recurrence(recurrence, model)
-    lm_eval, hf_models = _import_lm_eval()
+    # Lazy optional imports belong to the operation too; they must not leak global RNG draws.
+    with preserve_rng(next(model.parameters()).device):
+        lm_eval, hf_models = _import_lm_eval()
     metrics: dict[str, float] = {}
     raw_results: dict[str, Any] = {}
     versions: dict[str, Any] = {}
@@ -77,10 +85,16 @@ def evaluate_on_benchmarks(
                 max_length=model.config.model_max_sequence_length,
                 mixed_precision_dtype=session.mixed_precision_dtype,
             )
+            # HFLM/wrapper construction may consume Torch RNG. Reseed AFTER construction, at the same
+            # effective point as simple_evaluate's old set_torch_seed: its preceding argument checks,
+            # Python/NumPy seeds and logging consume no Torch randomness. None is its supported opt-out,
+            # avoiding torch.manual_seed's all-device (including pending lazy CUDA) side effects.
+            seed_model_rng(seed, session.device)
             results: dict[str, Any] = lm_eval.simple_evaluate(  # log_samples: the per-sample logs are held in memory and never read
                 model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
                 num_fewshot=None if num_fewshot == TASK_DEFAULT_FEWSHOT else num_fewshot,
-                torch_random_seed=seed, bootstrap_iters=BOOTSTRAP_ITERS,
+                random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
+                torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
             )
         label = recurrence_label(recurrence)
         metrics |= flatten_results(results["results"], label)
@@ -94,6 +108,11 @@ def evaluate_on_benchmarks(
             "num_fewshot": num_fewshot,
             "limit": limit,
             "seed": seed,
+            "rng_seeds": {
+                "random_seed": HARNESS_RANDOM_SEED, "numpy_random_seed": HARNESS_NUMPY_SEED,
+                "torch_random_seed": seed, "fewshot_random_seed": HARNESS_FEWSHOT_SEED,
+            },
+            "torch_seed_owner": "evaluation_cpu_model_device",
             "recurrences": [None if recurrence is None else list(recurrence) for recurrence in recurrences],
             "metrics": metrics,
             "results": raw_results,
@@ -131,6 +150,14 @@ def flatten_results(results: Mapping[str, Mapping[str, Any]], label: str) -> dic
 
 def _import_lm_eval() -> tuple[Any, Any]:
     try:
-        return importlib.import_module("lm_eval"), importlib.import_module("lm_eval.models.huggingface")
+        package = importlib.import_module("lm_eval")
+        huggingface = importlib.import_module("lm_eval.models.huggingface")
     except ImportError as error:
         raise ImportError(EVAL_EXTRA_HINT) from error
+    required = ("random_seed", "numpy_random_seed", "torch_random_seed", "fewshot_random_seed")
+    parameters = inspect.signature(package.simple_evaluate).parameters
+    accepts_keywords = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    missing = [name for name in required if name not in parameters and not accepts_keywords]
+    if missing:
+        raise RuntimeError(f"lm-eval simple_evaluate lacks required RNG seed arguments: {', '.join(missing)}")
+    return package, huggingface

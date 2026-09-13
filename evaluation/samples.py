@@ -19,6 +19,7 @@ import torch
 
 from data_preparation.lib.log import get_logger
 from evaluation.prompts import DEFAULT_PROMPTS, Prompt
+from evaluation.rng import seed_model_rng
 from evaluation.wrapper import Recurrence, check_recurrence
 from evaluation.session import inference_session
 from model.execution import ExecutionPolicy
@@ -94,7 +95,7 @@ def generate_samples(
             sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
             # Reseed each batch so prior batches cannot affect its latent seed or token sampling stream.
             # Cached generation uses private normal generators; legacy forwards draw full-prefix latent states.
-            torch.manual_seed(seed + start)
+            seed_model_rng(seed + start, device)
             output = generate(
                 input_ids.to(device),
                 attention_mask=attention_mask.to(device),
