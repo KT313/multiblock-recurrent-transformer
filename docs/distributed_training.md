@@ -83,3 +83,18 @@ launches two ranks through torchrun). What the CPU path does not cover: NCCL, bf
 `torch.compile` with the DDP wrapper, and throughput.
 
 Configuration sidecars and accepted resume records are described in [resume configuration history](resume_configuration_history.md).
+## Fatal worker failures
+
+The `torchrun` DDP CLI reports an ordinary fatal error directly to stderr, including its rank and
+original traceback, then exits the worker with code 1 before run-level logger, reader and process-group
+cleanup. It does not attempt a final distributed checkpoint, including after a non-finite training loss.
+Resume from a regular checkpoint. `torchrun` owns termination of the remaining ranks; PyTorch loader
+workers detect parent exit. A peer unable to honor SIGTERM may require the launcher's forced-kill grace.
+
+This policy is opt-in at the CLI boundary (`backend: ddp` with `TORCHELASTIC_RUN_ID` present).
+Library `train()` calls and single-device runs retain ordinary exception cleanup. Successful runs,
+cooperative stop requests, lock refusals and build cancellation retain their existing behavior.
+No validation collectives, batches, DDP synchronization settings or numerical policies change.
+The boundary cannot intercept a native call that hangs without raising, or guarantee error output through
+a blocked stderr destination. Such hangs still require external job supervision. Fatal exits can leave
+incomplete disposable output; only previously completed checkpoints should be used for recovery.

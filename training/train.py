@@ -24,6 +24,8 @@ handler out for the duration, so nothing prints twice.
 
 Exit codes: 0 finished, 1 failed (traceback logged), 3 another run holds the lock (the message names its pid and
 start time; `data_preparation/lib/build/lock.py`), 130 interrupted.
+Supervised DDP workers report fatal errors directly to stderr and exit immediately before run-level cleanup;
+torchrun terminates their peers. Success, cooperative stops and library/single-device callers retain cleanup.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.lock import RunLocked
 from data_preparation.lib.log import LOG_FORMAT, ProgressStreamHandler, configure_logging
 from training.run import train
+from training.failure import exit_failed_worker, handle_fatal_error
 from training.settings import parse_settings
 from training.ui.common import KEEP, TRAINING_LOGGER_NAME  # `training`: the hierarchy `RunLogger` and the dashboard log on
 
@@ -151,16 +154,19 @@ def main(argv: list[str] | None = None) -> int:
     rank = launch_rank()
     configure_console_logging(rank=rank)
     settings = parse_settings(argv)
+    # Hard exit is a CLI policy for supervised DDP workers, never a default of the training library.
+    on_fatal_error = exit_failed_worker if settings.backend == "ddp" and "TORCHELASTIC_RUN_ID" in os.environ else None
     with stop_on_interrupt() as should_stop:
         try:
-            report = train(settings, should_stop=should_stop, started_at=started_at)
+            report = train(settings, should_stop=should_stop, started_at=started_at, on_fatal_error=on_fatal_error)
         except RunLocked as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_ALREADY_RUNNING
         except (KeyboardInterrupt, BuildAborted):
             log.warning("training interrupted; checkpoints and published dataset shards are kept, rerun to resume")
             return EXIT_INTERRUPTED
-        except Exception:
+        except Exception as error:
+            handle_fatal_error(on_fatal_error, error)  # failures before the run's cleanup scopes exist
             log.exception("training failed")
             return 1
     if rank == 0:

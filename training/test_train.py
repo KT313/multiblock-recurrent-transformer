@@ -32,6 +32,7 @@ from training.checkpoint import checkpoint_dir
 from training.testing.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
+from training.failure import FatalHandler, exit_failed_worker
 from training.train import StopRequest, main, stop_on_interrupt
 from training.ui.common import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
 from training.ui.testing import BOX_CHARACTERS
@@ -99,8 +100,10 @@ class FakeTrain:
         backend: Backend | None = None,
         should_stop: StopRequest | None = None,
         started_at: float | None = None,
+        on_fatal_error: FatalHandler | None = None,
     ) -> TrainingReport:
-        self.calls.append({"settings": settings, "backend": backend, "should_stop": should_stop, "started_at": started_at})
+        self.calls.append({"settings": settings, "backend": backend, "should_stop": should_stop,
+                           "started_at": started_at, "on_fatal_error": on_fatal_error})
         if self.error is not None:
             raise self.error
         assert self.report is not None
@@ -182,6 +185,22 @@ def test_main_without_a_config_exits_through_the_parser(capsys: pytest.CaptureFi
         main([])
     assert excinfo.value.code == 2
     assert "dataset_config" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('backend,supervised', [('single_device', False), ('single_device', True),
+                                              ('ddp', False), ('ddp', True)])
+def test_fatal_policy_is_only_selected_for_supervised_ddp_cli(
+    monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, backend: str, supervised: bool,
+) -> None:
+    if supervised:
+        monkeypatch.setenv('TORCHELASTIC_RUN_ID', 'fixture')
+    else:
+        monkeypatch.delenv('TORCHELASTIC_RUN_ID', raising=False)
+    fake = FakeTrain(_report(tmp_path / 'out'))
+    monkeypatch.setattr(train_module, 'train', fake)
+    assert main(['--config', str(yaml_path), '--backend', backend]) == 0
+    expected = exit_failed_worker if supervised and backend == 'ddp' else None
+    assert fake.calls[0]['on_fatal_error'] is expected
 
 
 # --- the stop request --------------------------------------------------------------------------------------------------

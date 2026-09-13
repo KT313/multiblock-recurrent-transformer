@@ -68,6 +68,7 @@ from training.data.tokenizer import Tokenizer
 from training.data.loader import build_run_dataloaders
 from training.data.dataset_resolver import ResolvedDataset, check_dataset_unchanged, resolve_dataset, resolve_stage_plan
 from training.evaluation import evaluate, is_evaluation_step
+from training.failure import FatalHandler, fatal_errors, handle_fatal_error
 from training.logger import RunLogger, TrainingReport, num_parameters
 from training.optim import build_optimizer, get_param_groups
 from training.data.ownership import main_rank_phase, training_dataset_access
@@ -118,6 +119,7 @@ def train(
     should_stop: StopCheck | None = None,
     started_at: float | None = None,
     keep_history: bool = False,
+    on_fatal_error: FatalHandler | None = None,
 ) -> TrainingReport:
     """
     Run the training run described by `settings` and return its report.
@@ -127,6 +129,7 @@ def train(
     boundaries; the loop saves the completed state and skips optional work. Incomplete runs set `report.stopped`.
     `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
+    `on_fatal_error`: launcher-owned CLI policy invoked before run-level cleanup; library callers leave it unset.
     `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
 
     Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint) are the
@@ -144,7 +147,7 @@ def train(
         backend.seed_everything(settings.seed)
         run_directory = prepare_run_directory(settings)
         # the main rank holds the run lock (released on every way out, exception included); other ranks share its run
-        with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as dataset_lease:
+        with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as dataset_lease, fatal_errors(on_fatal_error):
             with main_rank_phase(backend, "run directory selection"):
                 resume_path = resolve_resume_checkpoint(settings, run_directory)
                 if backend.is_main and resume_path is None:
@@ -174,7 +177,7 @@ def train(
                 resume = restore_checkpoint(state, resume_path) if resume_path is not None else None
                 progress = state.progress
 
-                with ExitStack() as logger_stack:
+                with ExitStack() as logger_stack, fatal_errors(on_fatal_error):
                     with main_rank_phase(backend, "run logger initialization"):
                         logger = logger_stack.enter_context(RunLogger.open(
                             settings,
@@ -215,6 +218,7 @@ def train(
                                 on_micro_batch=logger.note_micro_batch,
                             )  # fmt: skip
                         except NonFiniteLossError as error:
+                            handle_fatal_error(on_fatal_error, error)  # fatal workers use the last regular checkpoint
                             raise RuntimeError(f"{error}. Terminating; {_checkpoint_before_failed_step(state, logger, batches)}") from None
                         progress.advance()
                         stop.poll("after optimizer step")
@@ -253,8 +257,14 @@ def train(
                             save_run_checkpoint(state, logger, batches)
                     export_dir = None if stop.requested or not backend.is_main else export_if_requested(state, logger)
                     return logger.close(progress, export_dir, stopped=stopped)
+            except Exception as error:
+                handle_fatal_error(on_fatal_error, error)
+                raise
             finally:
                 loaders.close()  # the loader workers stop now, not when the GC finds the iterators
+    except Exception as error:
+        handle_fatal_error(on_fatal_error, error)
+        raise
     finally:
         backend.shutdown()  # the process group, on every way out (a setup failure included)
 
