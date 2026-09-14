@@ -19,7 +19,7 @@ import pytest
 import torch
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig
+from data_preparation import DatasetConfig
 from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
 from training.backend.single_device import SingleDeviceBackend

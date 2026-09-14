@@ -23,7 +23,7 @@ from data_preparation.lib.stages.exact_dedup import (
 from data_preparation.lib.stages.row_pipeline import normalize_text
 
 if TYPE_CHECKING:
-    from data_preparation.dataset_config import DatasetConfig
+    from data_preparation.lib.dataset_config import DatasetConfig
 
 GLOBAL_KEY_POLICY = "normalized-tagged-json-sha256-64-v1"
 GLOBAL_ORDER_POLICY = "validation-only-then-declaration-v1"

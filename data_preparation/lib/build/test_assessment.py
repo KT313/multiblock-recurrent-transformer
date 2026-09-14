@@ -11,8 +11,8 @@ from collections.abc import Callable
 from math import ceil
 from pathlib import Path
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.planner import measured_tokens_per_row, source_ledger
 from data_preparation.lib.build.repair import repair_broken_and_stale_folders

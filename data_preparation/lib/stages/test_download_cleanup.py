@@ -15,8 +15,8 @@ from typing import Any
 import pytest
 
 from data_preparation.conftest import REPO, REV, FakeHub
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.progress import NoProgress
 from data_preparation.lib.sources.hub_files import FileIndex

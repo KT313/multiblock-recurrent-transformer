@@ -51,8 +51,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from data_preparation.lib.storage.ownership import BuildWorkspace, OwnershipError, Role, guarded_path
-from data_preparation.dataset_config import DatasetConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ShardList, assess_processed_folder
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.ui.dashboard import suspended

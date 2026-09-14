@@ -33,7 +33,7 @@ from jsonargparse import ArgumentError, ArgumentParser
 from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
 
 
-from data_preparation.identifiers import validate_identifier
+from data_preparation.lib.identifiers import validate_identifier
 from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.stages.benchmarks import benchmark_revisions, bloom_benchmark_names
 from data_preparation.lib.stages.truncation import TOKEN_RULE

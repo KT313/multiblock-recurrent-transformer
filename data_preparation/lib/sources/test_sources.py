@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 import pytest
 import zstandard
 
-from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
+from data_preparation.lib.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources.converters import (
     CONVERTERS,
     FILTERS,
@@ -33,7 +33,7 @@ from data_preparation.lib.sources.converters import (
     sharegpt_conversations,
     sharegpt_quality,
 )
-from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE
+from data_preparation.lib.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE
 from data_preparation.lib.sources.loaders import (
     LOADERS,
     Row,

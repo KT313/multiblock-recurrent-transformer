@@ -12,8 +12,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.conftest import CfgFactory
-from data_preparation.dataset_config import DatasetConfig, DedupConfig, ProcessingConfig, SourceConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, DedupConfig, ProcessingConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.stages import global_build
 from data_preparation.lib.stages.build import build_source

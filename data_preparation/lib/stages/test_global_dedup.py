@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from data_preparation.conftest import CfgFactory
-from data_preparation.dataset_config import SourceConfig
+from data_preparation.lib.dataset_config import SourceConfig
 from data_preparation.lib.stages.global_dedup import (
     GlobalAdmission, GlobalFrontier, global_key, global_policy, ordered_sources,
 )

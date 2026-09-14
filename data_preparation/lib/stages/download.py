@@ -57,8 +57,8 @@ from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import Any, Literal, NamedTuple
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress

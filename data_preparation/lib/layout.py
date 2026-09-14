@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from data_preparation.dataset_config import DatasetConfig
+    from data_preparation.lib.dataset_config import DatasetConfig
 
-from data_preparation.identifiers import validate_identifier
+from data_preparation.lib.identifiers import validate_identifier
 
 # columns of a processed shard per source kind; `hash` (int64 exact-dedup key) lets the build append new shards
 # instead of rewriting, and refills the dedup filter from disk

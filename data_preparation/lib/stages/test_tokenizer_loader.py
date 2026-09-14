@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
-from data_preparation.dataset_config import TokenizerConfig, load_dataset_config
+from data_preparation.lib.dataset_config import TokenizerConfig, load_dataset_config
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

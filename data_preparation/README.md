@@ -7,13 +7,18 @@ sources). `uv run python data_preparation/prepare.py prepare --dataset_config <f
 the prepared data before training, building whatever is missing by default. The pipeline does two things per
 source, **download** rows and **build** a cleaned copy, and nothing else: mixing sources by weight and splitting
 a source into training and validation rows happen in the training dataloader. Everything runs from the repo root
-with `uv run ...`; the implementation lives in `lib/` (tests beside every module).
+with `uv run ...`; CLI support lives in `cli/` and the implementation lives in `lib/` (tests beside every module).
+
+Other packages should import the public config types, `DatasetLayout`, and `load_dataset_config` from
+`data_preparation`, for example `from data_preparation import DatasetConfig, DatasetLayout, load_dataset_config`.
+These exports are loaded on demand and remain stable when implementation files move. Modules inside
+`data_preparation` use direct internal imports to avoid circular dependencies.
 
 ## The dataset config
 
-**Config reference:** `data_preparation/dataset_config.py` itself: the `DatasetConfig` docstring lists the
+**Config reference:** `data_preparation/lib/dataset_config.py` itself: the `DatasetConfig` docstring lists the
 top-level keys, every field carries a `# ...` comment, `__post_init__` holds the validation rules;
-`data_preparation/layout.py` beside it maps a config to its directories under `dataset/`. Nothing here duplicates
+`data_preparation/lib/layout.py` beside it maps a config to its directories under `dataset/`. Nothing here duplicates
 that file; this is the shape:
 
 ```yaml

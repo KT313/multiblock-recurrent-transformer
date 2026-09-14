@@ -22,14 +22,14 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from data_preparation.dataset_config import (
+from data_preparation import (
     DatasetConfig,
+    DatasetLayout,
     SourceConfig,
     StageConfig,
     TokenizerConfig,
     load_dataset_config,
 )
-from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.planner import DatasetReport, UnreadableRawShardError
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
@@ -254,8 +254,8 @@ FRAMEWORK_NEUTRAL_MODULES = (
     "training.stage_manager",
     "training.lr_schedule",
     "training.data.dataset_resolver",
-    "data_preparation.dataset_config",
-    "data_preparation.layout",
+    "data_preparation.lib.dataset_config",
+    "data_preparation.lib.layout",
 )
 
 

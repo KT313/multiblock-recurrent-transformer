@@ -1,13 +1,13 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-Tests for data_preparation.layout: pure path arithmetic.
+Tests for data_preparation.lib.layout: pure path arithmetic.
 """
 
 from pathlib import Path
 
 import pytest
 
-from data_preparation.layout import (
+from data_preparation.lib.layout import (
     INSTRUCT_PROCESSED_COLUMNS,
     PRETRAIN_PROCESSED_COLUMNS,
     PROCESSED_COLUMNS,

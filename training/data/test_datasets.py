@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 from torch.utils.data import DataLoader
 
-from data_preparation.layout import DatasetLayout
+from data_preparation import DatasetLayout
 from training.data import datasets as datasets_module
 from training.data.datasets import DEFAULT_DATA_SIGNATURE, ParquetTextDataset, WeightedMixtureDataset
 

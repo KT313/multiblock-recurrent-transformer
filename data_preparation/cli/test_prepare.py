@@ -16,15 +16,16 @@ from typing import Any
 import pytest
 
 from data_preparation import prepare
+from data_preparation.cli import arguments as cli_arguments, commands as cli_commands, runtime as cli_runtime
 from data_preparation.lib.build.lock import build_lock
-from data_preparation.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.planner import DatasetReport, SourceLedger
 from data_preparation.lib.build.runner import STEPS
 from data_preparation.lib.build.repair import ConfirmationRequired, RepairAction, RepairError, RepairReport
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TINY = REPO_ROOT / "config" / "datasets" / "tiny.yaml"
 
 
@@ -48,7 +49,9 @@ def detached_data_preparation_handlers() -> Iterator[logging.Logger]:
 
 
 def test_commands_are_registered() -> None:
-    parser = prepare.build_parser()
+    parser = cli_arguments.build_parser(
+        description=prepare.__doc__, log=prepare.log, on_prepare=prepare.run_prepare, on_download=prepare.run_download,
+    )
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 2 and args.pass_workers == 4 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
@@ -58,9 +61,9 @@ def test_commands_are_registered() -> None:
     assert args.num_workers == 3 and args.pass_workers == 5 and args.max_parallel_downloads == 4
     assert parser.parse_args(["prepare", "--dataset_config", "x.yaml", "-y"]).yes
     args = parser.parse_args(["status", "--dataset_config", "x.yaml", "--dataset_dir", "d"])
-    assert args.run is prepare.run_status and args.dataset_dir == Path("d")
+    assert args.run.func is cli_commands.run_status and args.dataset_dir == Path("d")
     args = parser.parse_args(["describe", "--dataset_config", "x.yaml"])
-    assert args.run is prepare.run_describe and args.dataset_config == Path("x.yaml")
+    assert args.run is cli_commands.run_describe and args.dataset_config == Path("x.yaml")
     args = parser.parse_args(["tiny"])
     assert args.run is prepare.run_prepare and args.dataset_config == Path("config/datasets/tiny.yaml")
     args = parser.parse_args(["download", "--dataset_config", "x.yaml", "--sources", "a", "--yes", "--steps", "download"])
@@ -162,7 +165,7 @@ def test_prepare_failure_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("stage exploded")
 
-    monkeypatch.setattr(prepare, "prepare", boom)
+    monkeypatch.setattr(cli_commands, "prepare", boom)
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1 and "stage exploded" in caplog.text and "prepare failed" in caplog.text
@@ -190,7 +193,7 @@ def test_a_broken_config_and_a_repair_error_are_one_line(
     def unrepairable(*args: object, **kwargs: object) -> None:
         raise RepairError("raw shards without a manifest")
 
-    monkeypatch.setattr(prepare, "prepare", unrepairable)
+    monkeypatch.setattr(cli_commands, "prepare", unrepairable)
     with caplog.at_level(logging.ERROR, logger="data_preparation"), pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "d")])
     assert exc.value.code == 1 and "Traceback" not in caplog.text
@@ -198,7 +201,7 @@ def test_a_broken_config_and_a_repair_error_are_one_line(
 
 
 def test_prepare_incomplete_result_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: DatasetReport())
+    monkeypatch.setattr(cli_commands, "prepare", lambda *a, **k: DatasetReport())
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1
@@ -210,7 +213,7 @@ def test_an_explicit_full_steps_list_is_not_a_partial_run(tmp_path: Path, monkey
     for any --steps); a strict subset is partial and exits 0 whatever the report says.
     """
 
-    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: DatasetReport())
+    monkeypatch.setattr(cli_commands, "prepare", lambda *a, **k: DatasetReport())
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--steps", "build", "tokenizer", "download"])
     assert exc.value.code == 1
@@ -250,7 +253,7 @@ def test_download_names_the_sources_still_short_and_exits_one(tmp_path: Path, mo
 
     report = DatasetReport(sources=[ledger("done"), ledger("short", raw_rows=40), ledger("absent", raw_state="missing", raw_reason="missing", raw_rows=0)], tokenizer_complete=True)
     assert not report.complete  # nothing is built: prepare would call this incomplete
-    monkeypatch.setattr(prepare, "prepare", lambda *a, **k: report)
+    monkeypatch.setattr(cli_commands, "prepare", lambda *a, **k: report)
     with pytest.raises(SystemExit) as exc:
         prepare.main(["download", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 1 and "download incomplete: short, absent" in caplog.text and "download failed" in caplog.text
@@ -263,7 +266,7 @@ def test_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca
     def interrupted(*args: object, **kwargs: object) -> None:
         raise error
 
-    monkeypatch.setattr(prepare, "prepare", interrupted)
+    monkeypatch.setattr(cli_commands, "prepare", interrupted)
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 130 and "prepare interrupted; everything published so far is kept" in caplog.text
@@ -276,7 +279,7 @@ def test_unconfirmed_raw_deletion_exits_two_with_the_list(tmp_path: Path, monkey
     def refused(*args: object, **kwargs: object) -> None:
         raise ConfirmationRequired(RepairReport([action]), message, interactive=False)
 
-    monkeypatch.setattr(prepare, "prepare", refused)
+    monkeypatch.setattr(cli_commands, "prepare", refused)
     with pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert exc.value.code == 2
@@ -292,7 +295,7 @@ def test_yes_flag_reaches_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         seen.update(kwargs)
         return DatasetReport(tokenizer_complete=True)
 
-    monkeypatch.setattr(prepare, "prepare", record)
+    monkeypatch.setattr(cli_commands, "prepare", record)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--allow_foreign_raw", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2"])
     assert (seen["assume_yes"], seen["allow_foreign_raw"], seen["hf_token"], seen["num_workers"], seen["pass_workers"], seen["steps"]) == (True, True, "t", 3, 2, STEPS)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
@@ -317,7 +320,7 @@ def test_prepare_exits_3_while_another_run_holds_the_build_lock(tmp_path: Path, 
     root = tmp_path / "dataset"
     with build_lock(root), pytest.raises(SystemExit) as exc:
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
-    assert exc.value.code == prepare.EXIT_ALREADY_RUNNING
+    assert exc.value.code == cli_runtime.EXIT_ALREADY_RUNNING
     err = capsys.readouterr().err
     assert "data preparation expects one run at a time on this system; one is already running (started " in err
     assert f"kill -INT {os.getpid()}" in err
@@ -334,7 +337,7 @@ def test_prepare_turns_the_tokenizer_thread_pool_on_unless_the_environment_says_
     monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
     monkeypatch.delenv("RAYON_NUM_THREADS", raising=False)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "a"), "--dry_run"])
-    assert os.environ["TOKENIZERS_PARALLELISM"] == "true" and os.environ["RAYON_NUM_THREADS"] == str(prepare.TOKENIZER_POOL_THREADS)
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true" and os.environ["RAYON_NUM_THREADS"] == str(cli_commands.TOKENIZER_POOL_THREADS)
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
     monkeypatch.setenv("RAYON_NUM_THREADS", "3")
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "b"), "--dry_run"])

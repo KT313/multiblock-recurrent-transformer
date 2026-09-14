@@ -43,7 +43,7 @@ from typing import cast, Any
 from torch.nn import Module
 from torch.optim import Optimizer
 
-from data_preparation.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation import DatasetConfig, load_dataset_config
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.abort import StopCheck
 from model import RecurrentConfig, RecurrentGPT

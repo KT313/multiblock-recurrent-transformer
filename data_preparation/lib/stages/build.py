@@ -46,8 +46,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.ownership import BuildWorkspace, guarded_path
-from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
-from data_preparation.layout import DatasetLayout, processed_columns
+from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout, processed_columns
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.build.assessment import ProcessedAssessment, assess_processed_folder
 from data_preparation.lib.iteration import chunks

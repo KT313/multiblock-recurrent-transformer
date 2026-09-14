@@ -32,8 +32,7 @@ import torch
 if "PYTEST_XDIST_WORKER_COUNT" in os.environ:
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
-from data_preparation.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation import DatasetConfig, load_dataset_config, DatasetLayout
 from data_preparation.lib.build.runner import prepare
 from model import RecurrentGPT
 

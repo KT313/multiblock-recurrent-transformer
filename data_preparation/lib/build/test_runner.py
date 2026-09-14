@@ -25,8 +25,8 @@ import yaml
 
 from data_preparation import prepare as prepare_cli
 from data_preparation.conftest import REPO, REV, FakeHub
-from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, load_dataset_config
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
 from data_preparation.lib.build import runner
 from data_preparation.lib.build.runner import prepare, status

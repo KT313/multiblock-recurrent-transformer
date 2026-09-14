@@ -22,8 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python evaluation/evaluate.py` from the repo root
 
-from data_preparation.dataset_config import load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation import load_dataset_config, DatasetLayout
 from evaluation.benchmarks import TASK_DEFAULT_FEWSHOT, benchmarks_path, evaluate_on_benchmarks
 from evaluation.prompts import load_prompts
 from evaluation.samples import generate_and_save_samples, samples_path

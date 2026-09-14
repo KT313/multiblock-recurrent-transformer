@@ -58,7 +58,7 @@ from training.run import (
     train,
 )
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
-from data_preparation.dataset_config import load_dataset_config
+from data_preparation import load_dataset_config
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
 from training.step import TrainingProgress, run_one_optimizer_step

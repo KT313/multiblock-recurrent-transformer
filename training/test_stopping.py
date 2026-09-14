@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import torch
 
-from data_preparation.dataset_config import load_dataset_config
+from data_preparation import load_dataset_config
 from training import run as run_module
 from training.backend.single_device import SingleDeviceBackend
 from training.run import train

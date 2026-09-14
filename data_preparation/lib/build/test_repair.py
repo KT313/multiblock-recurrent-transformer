@@ -18,8 +18,8 @@ import pytest
 
 from dataclasses import replace
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.repair import (
     CONFIRMATION_HEADER,
     CONFIRMATION_QUESTION,

@@ -20,16 +20,16 @@ from typing import Any
 
 import pytest
 
-from data_preparation import dataset_config as dc
+from data_preparation.lib import dataset_config as dc
 from data_preparation.lib.storage.ownership import BuildWorkspace, OwnershipError
-from data_preparation.dataset_config import (
+from data_preparation.lib.dataset_config import (
     DatasetConfig,
     DecontaminationConfig,
     DedupConfig,
     ProcessingConfig,
     SourceConfig,
 )
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source

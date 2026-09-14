@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from data_preparation.dataset_config import DedupConfig
+from data_preparation.lib.dataset_config import DedupConfig
 from data_preparation.lib.iteration import chunks
 from data_preparation.lib.stages.row_pipeline import get_ngrams
 

@@ -46,8 +46,8 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import SAFETY_MARGIN, DatasetConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
 from data_preparation.lib.build.repair import RepairError
 from data_preparation.lib.log import get_logger

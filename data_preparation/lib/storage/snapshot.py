@@ -13,8 +13,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from data_preparation.dataset_config import DatasetConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.storage.manifest import Manifest

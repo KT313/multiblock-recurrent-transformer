@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.conftest import REPO, REV, FakeHub, RecordingFile
-from data_preparation.dataset_config import SourceConfig
+from data_preparation.lib.dataset_config import SourceConfig
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import (
     HUB_REQUEST_TIMEOUT,

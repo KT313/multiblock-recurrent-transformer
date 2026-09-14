@@ -24,8 +24,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
-from data_preparation.identifiers import validate_identifier
-from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE, SourceConfig
+from data_preparation.lib.identifiers import validate_identifier
+from data_preparation.lib.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE, SourceConfig
 from data_preparation.lib.sources.hub_files import (
     DEFAULT_MAX_CACHED_FILE_MB,
     FORMATS,

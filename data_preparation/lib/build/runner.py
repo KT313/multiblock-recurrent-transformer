@@ -48,8 +48,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from data_preparation.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, load_dataset_config
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck, check_stop
 from data_preparation.lib.build.lock import DatasetLease, dataset_lock
 from data_preparation.lib.build.planner import (

@@ -8,7 +8,7 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, StageConfig, TokenizerConfig, load_dataset_config
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, StageConfig, TokenizerConfig, load_dataset_config
 from data_preparation.lib.build.describe import GENERATED_WITH, describe, leading_comment
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

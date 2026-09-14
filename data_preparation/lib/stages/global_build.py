@@ -18,8 +18,8 @@ from typing import Any, cast
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_preparation.dataset_config import DatasetConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.global_dedup import GlobalAdmission, GlobalFrontier, global_policy, ordered_sources

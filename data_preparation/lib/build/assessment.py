@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from data_preparation.dataset_config import DatasetConfig, describe_hash_change
-from data_preparation.layout import processed_columns
+from data_preparation.lib.dataset_config import DatasetConfig, describe_hash_change
+from data_preparation.lib.layout import processed_columns
 from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name

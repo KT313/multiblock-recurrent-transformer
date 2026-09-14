@@ -33,8 +33,7 @@ from training.data.ownership import OwnershipBackend, dataset_access, main_rank_
 from data_preparation.lib.build.planner import summarize_dataset_state
 from data_preparation.lib.build.repair import ConfirmationRequired
 from data_preparation.lib.build.runner import prepare, status
-from data_preparation.dataset_config import DatasetConfig, StageConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation import DatasetConfig, StageConfig, load_dataset_config, DatasetLayout
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.storage.manifest import MANIFEST_NAME, Manifest, shard_rows
 from data_preparation.lib.storage.snapshot import read_snapshot

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
-from data_preparation.identifiers import validate_identifier
+from data_preparation.lib.identifiers import validate_identifier
 from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.storage.manifest import Manifest
 

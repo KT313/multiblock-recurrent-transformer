@@ -23,8 +23,8 @@ import pyarrow.parquet as pq
 import pytest
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
 from data_preparation.lib.sources.loaders import SharedLoaderParameters
@@ -1621,7 +1621,7 @@ def test_legacy_sharegpt_identity_refuses_append_and_repair_without_confirmation
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
     read_rows: Reader, mtimes: Mtimes, filtered: bool,
 ) -> None:
-    from data_preparation.dataset_config import _stable_hash
+    from data_preparation.lib.dataset_config import _stable_hash
     from data_preparation.lib.build.repair import ConfirmationRequired, repair_broken_and_stale_folders
 
     src_dir = layout.root.parent / "legacy_sharegpt"

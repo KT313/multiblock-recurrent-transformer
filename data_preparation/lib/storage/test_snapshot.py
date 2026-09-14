@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.lock import dataset_lock
 from data_preparation.lib.storage.manifest import Manifest, ShardInfo
 from data_preparation.lib.storage.snapshot import publish_snapshot, read_snapshot, snapshot_problem
