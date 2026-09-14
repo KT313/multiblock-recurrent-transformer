@@ -38,21 +38,15 @@ from training.testing.golden import (
     single_thread_deterministic,
     write_tiny_yaml,
 )
-from training.run import build_run_optimizer
+from training.execution import build_run_optimizer
 from training.settings import OptimizerConfig, Settings, parse_settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
-from training.step import (
-    BatchStream,
-    MAX_CONSECUTIVE_REJECTS,
-    StepResult,
-    TrainingProgress,
-    model_inputs,
-    NonFiniteLossError,
-    run_one_optimizer_step,
-    scheduled_learning_rate,
-    RankBatches,
+from training.steps import (
+    BatchStream, MAX_CONSECUTIVE_REJECTS, NonFiniteLossError, RankBatches, StepResult, TrainingProgress,
+    build_model_inputs, get_scheduled_learning_rate,
 )
+from training.step import run_one_optimizer_step
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_MODEL_ARCHITECTURE = REPO_ROOT / "config" / "model_architecture" / "tiny.yaml"
@@ -194,11 +188,11 @@ def test_training_progress_counts_steps() -> None:
 
 def test_scheduled_learning_rate_follows_warmup_and_cooldown(settings: Settings) -> None:
     stage_manager = reference_stage_manager(settings)  # 10 steps, warmup 2, cooldown 2, base LR 3e-4
-    lrs = [scheduled_learning_rate(settings, stage_manager, TrainingProgress(step=s)) for s in range(10)]
+    lrs = [get_scheduled_learning_rate(settings, stage_manager, TrainingProgress(step=s)) for s in range(10)]
     assert lrs[:5] == pytest.approx([0.0, 1.5e-4, 3e-4, 3e-4, 3e-4])
     assert lrs[8] == pytest.approx(3e-4) and lrs[9] == pytest.approx(1.5e-4)  # cooldown over the last 2 steps
     resumed = TrainingProgress(step=4, resume_step=4)
-    assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(3e-4)  # a resume changes nothing
+    assert get_scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(3e-4)  # a resume changes nothing
 
 
 def test_learning_rate_is_set_on_all_groups(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
@@ -266,7 +260,7 @@ def _hand_accumulation(
     losses = []
     for micro_batch_index in range(settings.micro_batches_per_rank(1)):
         copy_of_model.micro_batch_index = micro_batch_index
-        loss = copy_of_model(**model_inputs(next(batches), backend))["loss"]
+        loss = copy_of_model(**build_model_inputs(next(batches), backend))["loss"]
         assert loss is not None
         (loss / settings.micro_batches_per_rank(1)).backward()
         losses.append(loss.detach())
@@ -1340,7 +1334,7 @@ def record_step_reference() -> Path:
     Recorded with torch 2.14.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic algorithms), in
     the commit that made packing mandatory. The padded reference before it was recorded in the commit that extracted
     `run_one_optimizer_step`, with the tiny golden run passing unchanged, which tied the step to the thesis loop;
-    the packed loop is that step with `model_inputs` adding the per-document positions and mask.
+    the packed loop is that step with `build_model_inputs` adding the per-document positions and mask.
     """
 
     GOLDEN_STEPS_PATH.write_text(golden_run_json(step_reference_metrics()))
@@ -1589,7 +1583,7 @@ def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> Non
     """
 
     packed = next(scripted_batches(reference_settings()))
-    inputs = model_inputs(packed, cpu_backend)
+    inputs = build_model_inputs(packed, cpu_backend)
     assert set(inputs) == {"input_ids", "labels", "position_ids", "attention_mask"}
     assert torch.equal(inputs["position_ids"], packed.position_ids)
     mask = inputs["attention_mask"]
@@ -1639,7 +1633,7 @@ def test_packed_step_on_cuda_runs_through_flex_attention() -> None:
 
     backend = SingleDeviceBackend(device="cuda:0", precision="bf16-mixed")
     settings = reference_settings(precision="bf16-mixed")
-    inputs = model_inputs(next(scripted_batches(settings)), backend)
+    inputs = build_model_inputs(next(scripted_batches(settings)), backend)
     assert isinstance(inputs["attention_mask"], BlockMask)
     model = fresh_tiny_model(backend)
     optimizer = fresh_optimizer(settings, model, backend)
@@ -1699,7 +1693,7 @@ def test_gradient_metrics_have_independent_completed_step_cadence(
         calls.append(completed)
         return {"gradient_probe": torch.tensor(float(completed))}
 
-    monkeypatch.setattr("training.step.track_gradient_metrics", record_metrics)
+    monkeypatch.setattr("training.steps.operations.track_gradient_metrics", record_metrics)
     expected_calls = []
     for _ in range(steps):
         result = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)

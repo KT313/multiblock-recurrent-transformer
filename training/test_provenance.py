@@ -14,10 +14,12 @@ import pytest
 import torch
 
 from training import provenance, run as run_module
+from training.execution import loop as loop_helpers
+from training.execution import get_run_directory, prepare_run_directory
 from training.backend.single_device import SingleDeviceBackend
 from training.logger import RunLogger
 from training.settings import Settings, parse_settings
-from training.step import RankBatches
+from training.steps import RankBatches
 from training.testing.golden import write_tiny_yaml
 
 
@@ -43,7 +45,7 @@ def _train(settings: Settings, *, step: bool = False) -> None:
 @pytest.fixture
 def checkpoint_run(settings: Settings) -> tuple[Path, Path]:
     _train(settings, step=True)
-    root = run_module.run_directory_of(settings)
+    root = get_run_directory(settings)
     checkpoint = root / "checkpoints" / "step-00000001-tiny.pth"
     assert checkpoint.is_file()
     settings.resume = True
@@ -123,7 +125,7 @@ def test_missing_originals_are_explicit_checkpoint_evidence(
     stored = torch.load(checkpoint, weights_only=False)
     if new_directory:
         settings.out_dir = str(tmp_path / "new")
-        root = run_module.run_directory_of(settings)
+        root = get_run_directory(settings)
     else:
         for name in _sidecars(root):
             (root / name).unlink()
@@ -163,7 +165,7 @@ def test_publication_failure_has_no_partial_record_or_update(
     def update(*args: Any, **kwargs: Any) -> None:
         pytest.fail("publication failure reached optimizer update")
 
-    monkeypatch.setattr(run_module, "run_one_optimizer_step", update)
+    monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", update)
     monkeypatch.setattr(Path, "write_text", write if failure == "write" else real_write)
     monkeypatch.setattr(os, "replace", rename if failure == "rename" else real_replace)
     with pytest.raises(OSError, match="disk full|rename refused"):
@@ -223,7 +225,7 @@ def test_ellis_tensor_hyperparameters_are_recorded_as_scalars(settings: Settings
     _train(settings, step=True)
     settings.resume = True
     _train(settings)
-    record = json.loads(_records(run_module.run_directory_of(settings))[0].read_text())
+    record = json.loads(_records(get_run_directory(settings))[0].read_text())
     group = record["effective"]["optimizer"]["parameter_groups_at_acceptance"][0]["hyperparameters"]
     assert group["lr"] == 0.0
     assert group["init_lr"] == settings.optim_config.lr
@@ -276,7 +278,7 @@ def test_each_original_history_or_checkpoint_artifact_blocks_fresh_reuse(tmp_pat
 
 @pytest.mark.parametrize("resume", [False, True])
 def test_precreated_empty_run_directory_allows_fresh_start(settings: Settings, resume: bool) -> None:
-    root = run_module.prepare_run_directory(settings)
+    root = prepare_run_directory(settings)
     (root / "resumes").mkdir()
     settings.resume = resume
     _train(settings)

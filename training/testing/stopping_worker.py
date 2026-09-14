@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 
 from training import run as run_module
+from training.execution import loop as loop_helpers
 from training.backend.ddp import DDPBackend
 from training.settings import parse_settings
 from training.step import run_one_optimizer_step
@@ -91,7 +92,7 @@ def main() -> None:
         return result
 
     if mode == "stop":
-        with patch.object(run_module, "run_one_optimizer_step", completed_step):
+        with patch.object(loop_helpers, "run_one_optimizer_step", completed_step):
             stopped = run_module.train(settings, backend=backend, should_stop=lambda: requested)
         assert stopped.stopped and stopped.completed_steps == stopped.steps_this_process == 2
         checkpoint = Path(settings.out_dir) / settings.run_name / "checkpoints" / "step-00000002-tiny.pth"
@@ -109,7 +110,7 @@ def main() -> None:
             raise AssertionError("publication failure reached an optimizer update")
 
         with patch.object(run_module, "publish_configuration", fail_publication), \
-                patch.object(run_module, "run_one_optimizer_step", unexpected_step):
+                patch.object(loop_helpers, "run_one_optimizer_step", unexpected_step):
             try:
                 run_module.train(settings, backend=backend)
             except (OSError, RuntimeError) as error:

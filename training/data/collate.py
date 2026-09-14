@@ -4,7 +4,7 @@ Batch collation in two halves: `collate_samples` tokenizes rows into unpadded sa
 and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (in the main process).
 
 `collate_fn` composes the two for the padded validation loaders. The training loaders stop after the first half:
-their workers hand out unpadded samples (`collate_worker_batch`) that `training.step.BatchStream` packs into one
+their workers hand out unpadded samples (`collate_worker_batch`) that `training.steps.BatchStream` packs into one
 row per micro-batch (`training.data.packing`).
 """
 

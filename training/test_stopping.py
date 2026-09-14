@@ -13,6 +13,8 @@ import torch
 
 from data_preparation import load_dataset_config
 from training import run as run_module
+from training.execution import loop as loop_helpers
+from training.execution import checkpoints as checkpoint_helpers
 from training.backend.single_device import SingleDeviceBackend
 from training.run import train
 from training.step import run_one_optimizer_step
@@ -146,12 +148,12 @@ def test_request_at_each_completed_phase(
                 requested.set()
         return work
 
-    monkeypatch.setattr(run_module, "run_one_optimizer_step", step)
-    monkeypatch.setattr(run_module, "evaluate", evaluation)
-    monkeypatch.setattr(run_module, "save_training_checkpoint", save)
-    monkeypatch.setattr(run_module, "write_samples", optional("samples"))
-    monkeypatch.setattr(run_module, "run_benchmarks", optional("benchmark"))
-    monkeypatch.setattr(run_module, "export_if_requested", optional("export"))
+    monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", step)
+    monkeypatch.setattr(loop_helpers, "evaluate", evaluation)
+    monkeypatch.setattr(checkpoint_helpers, "save_training_checkpoint", save)
+    monkeypatch.setattr(loop_helpers, "write_samples", optional("samples"))
+    monkeypatch.setattr(loop_helpers, "run_benchmarks", optional("benchmark"))
+    monkeypatch.setattr(loop_helpers, "export_if_requested", optional("export"))
     report = train(settings, backend=backend, should_stop=requested.is_set, keep_history=True)
     completed = 20 if phase == "final_step" else 1
     assert report.completed_steps == completed and report.steps_this_process == completed
@@ -187,7 +189,7 @@ def test_step_zero_stop_and_immediately_stopped_resume_preserve_continuation(
     def unexpected(*args: Any, **kwargs: Any) -> Any:
         pytest.fail("an already requested stop must not consume a training pack")
 
-    monkeypatch.setattr(run_module, "run_one_optimizer_step", unexpected)
+    monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", unexpected)
     report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), should_stop=lambda: True)
     assert report.stopped and report.completed_steps == report.steps_this_process == 0
     checkpoint = report.checkpoints_written[0]
@@ -200,7 +202,7 @@ def test_step_zero_stop_and_immediately_stopped_resume_preserve_continuation(
     restored = torch.load(resumed_stop.checkpoints_written[0], weights_only=False)
     assert torch.equal(initial["rng_states"][0]["torch"], restored["rng_states"][0]["torch"])
     assert initial["data_stream"] == restored["data_stream"]
-    monkeypatch.setattr(run_module, "run_one_optimizer_step", original_step)
+    monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", original_step)
     resumed = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)
     settings.resume = False
     settings.out_dir = str(tmp_path / "fresh")
@@ -300,7 +302,7 @@ def test_request_at_final_export_boundary_suppresses_export_but_keeps_completion
         pytest.fail("export started after the shared stop decision")
 
     monkeypatch.setattr(StopController, "poll", at_export)
-    monkeypatch.setattr(run_module, "export_if_requested", unexpected)
+    monkeypatch.setattr(loop_helpers, "export_if_requested", unexpected)
     report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), should_stop=request.is_set)
     assert report.completed_steps == report.steps_this_process == 20 and not report.stopped
     assert report.export_dir is None

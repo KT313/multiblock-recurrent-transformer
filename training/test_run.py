@@ -41,27 +41,31 @@ from training.testing.golden import (
 )
 from training import logger as logger_module
 from training import run as run_module
+from training.execution import loop as loop_helpers
+from training.run import train
+from training.execution import checkpoints as checkpoint_helpers, setup as setup_helpers
 from training.logger import TrainingReport
-from training.run import (
+from training.execution import (
     RunState,
     build_run_model,
     build_run_optimizer,
     build_stage_manager,
+    check_evaluation_recurrences,
     check_sequence_lengths,
     check_tokenizer_vocabulary,
     create_backend,
     prepare_run_directory,
     record_run_config,
     restore_checkpoint_if_resuming,
-    run_directory_of,
-    stop_requested,
-    train,
+    get_run_directory,
+    is_stop_requested,
 )
 from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
 from data_preparation import load_dataset_config
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.step import TrainingProgress, run_one_optimizer_step
+from training.steps import TrainingProgress
+from training.step import run_one_optimizer_step
 from evaluation.prompts import DEFAULT_PROMPTS
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
@@ -114,10 +118,10 @@ def test_create_backend_follows_the_settings(tiny_settings: Settings) -> None:
         create_backend(tiny_settings)
 
 
-def test_stop_requested() -> None:
-    assert stop_requested(None) is False
-    assert stop_requested(lambda: False) is False
-    assert stop_requested(lambda: True) is True
+def test_is_stop_requested() -> None:
+    assert is_stop_requested(None) is False
+    assert is_stop_requested(lambda: False) is False
+    assert is_stop_requested(lambda: True) is True
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
@@ -184,8 +188,8 @@ def test_invalid_schedule_fails_before_startup(
         monkeypatch.setenv("LOCAL_RANK", backend_kind[-1])
     forbidden = Mock(side_effect=AssertionError("invalid schedule reached expensive startup"))
     for name in (
-        "create_backend", "prepare_run_directory", "resolve_resume_checkpoint", "resolve_dataset",
-        "build_run_dataloaders", "build_run_model", "build_run_optimizer", "record_run_config",
+        "create_backend", "prepare_run_directory", "select_resume_for_run", "resolve_dataset",
+        "build_run_dataloaders", "build_run_model", "build_run_optimizer",
     ):
         monkeypatch.setattr(run_module, name, forbidden)
     injected = Mock(spec=SingleDeviceBackend)
@@ -208,7 +212,7 @@ def test_changed_stage_plan_is_rejected_before_loaders(
     with pytest.raises(ValueError, match="stage plan changed after learning-rate schedule validation"):
         train(tiny_settings, backend=cpu_backend)
     loaders.assert_not_called()
-    assert not (run_directory_of(tiny_settings) / "run_config.json").exists()
+    assert not (get_run_directory(tiny_settings) / "run_config.json").exists()
 
 
 def test_runtime_schedule_failure_on_a_peer_is_rejected_before_loaders(
@@ -229,12 +233,12 @@ def test_runtime_schedule_failure_on_a_peer_is_rejected_before_loaders(
         train(tiny_settings, backend=cpu_backend)
     exchange.assert_called_once_with(None)
     loaders.assert_not_called()
-    assert not (run_directory_of(tiny_settings) / "run_config.json").exists()
+    assert not (get_run_directory(tiny_settings) / "run_config.json").exists()
 
 
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
     run_directory = prepare_run_directory(tiny_settings)
-    assert run_directory == Path(tiny_settings.out_dir) / "tiny" == run_directory_of(tiny_settings)
+    assert run_directory == Path(tiny_settings.out_dir) / "tiny" == get_run_directory(tiny_settings)
     assert checkpoint_dir(run_directory).is_dir()
     assert not (run_directory / "run_config.json").exists(), "written only for a FRESH run, by record_run_config"
     record_run_config(tiny_settings, run_directory)
@@ -253,7 +257,7 @@ def test_train_refuses_a_run_directory_another_run_holds(
 
     with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
-    assert list(checkpoint_dir(run_directory_of(tiny_settings)).glob("*.pth")) == [], "nothing ran"
+    assert list(checkpoint_dir(get_run_directory(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
 
 def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: ResolvedDataset, caplog: pytest.LogCaptureFixture) -> None:
@@ -604,7 +608,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
     resolved = resolve_dataset(settings)
     return {
         "out_dir": out_dir,
-        "run_dir": run_directory_of(settings),
+        "run_dir": get_run_directory(settings),
         "yaml": yaml_path,
         "report": report,
         "history": report.history,
@@ -1108,7 +1112,7 @@ class StopAfterSteps:
             self.count += 1
             return result
 
-        monkeypatch.setattr(run_module, "run_one_optimizer_step", counted)
+        monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", counted)
 
     def __call__(self) -> bool:
         return self.count >= self.steps
@@ -1234,7 +1238,7 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
         def select_once(directory: Path, name: str) -> Path | None:
             selections.append((directory, name))
             return find_checkpoint(directory, name)
-        monkeypatch.setattr(run_module, "find_latest_checkpoint", select_once)
+        monkeypatch.setattr(checkpoint_helpers, "find_latest_checkpoint", select_once)
         resumed_yaml = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False, resume=True)
         for previous, stop in zip(stops, stops[1:]):
             should_stop = StopAfterSteps(monkeypatch, stop - previous) if stop < 20 else None
@@ -1605,7 +1609,7 @@ def test_resume_without_checkpoint_keeps_fresh_initialization(
     from model.layers import init as init_module
     directory = prepare_run_directory(tiny_settings)
     tiny_settings.resume = True
-    selected = run_module.resolve_resume_checkpoint(tiny_settings, directory)
+    selected = checkpoint_helpers.resolve_resume_checkpoint(tiny_settings, directory)
     assert selected is None
     calls = []
     original = init_module.trunc_orthogonal_
@@ -1663,7 +1667,8 @@ def test_invalid_model_config_fails_before_startup(
         architecture.write_text(json.dumps(overwrite))
         settings.model_architecture_config = str(architecture)
     forbidden = Mock(side_effect=AssertionError("invalid model config reached expensive startup"))
-    for name in ("create_backend", "resolve_dataset", "build_run_model", "build_run_dataloaders", "RecurrentGPT"):
+    monkeypatch.setattr(setup_helpers, "RecurrentGPT", forbidden)
+    for name in ("create_backend", "resolve_dataset", "build_run_model", "build_run_dataloaders"):
         monkeypatch.setattr(run_module, name, forbidden)
     with pytest.raises(ValueError, match=field):
         train(settings)
@@ -1676,7 +1681,7 @@ def test_build_run_model_reuses_preflight_config(
     tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = run_module.check_evaluation_recurrences(tiny_settings)
+    config = check_evaluation_recurrences(tiny_settings)
     forbidden = Mock(side_effect=AssertionError("validated architecture was read twice"))
     monkeypatch.setattr(RecurrentConfig, "from_yaml", forbidden)
     model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, Path(tiny_settings.out_dir), model_config=config)

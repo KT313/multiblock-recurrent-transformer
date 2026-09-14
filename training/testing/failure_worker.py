@@ -12,11 +12,14 @@ from typing import Any
 from unittest.mock import patch
 
 from training import run as run_module
+from training.execution import loop as loop_helpers
+from training.execution import RunState, build_run_model, save_run_checkpoint
 from training.backend.ddp import DDPBackend
 from training.data.collate import Batch
 from training.data.loader import RunDataloaders
 from training.evaluation import evaluate as original_evaluate
-from training.step import NonFiniteLossError, run_one_optimizer_step
+from training.steps import NonFiniteLossError
+from training.step import run_one_optimizer_step
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -73,16 +76,15 @@ def main() -> None:
 
     DDPBackend.shutdown = shutdown  # type: ignore[method-assign]
     RunDataloaders.close = close  # type: ignore[method-assign]
-    original_save = run_module.save_run_checkpoint
+    original_save = save_run_checkpoint
 
-    def save(state: run_module.RunState, *args: Any, **kwargs: Any) -> Path:
+    def save(state: RunState, *args: Any, **kwargs: Any) -> Path:
         result = original_save(state, *args, **kwargs)
         if rank == 0:
             for file in state.run_directory.glob('checkpoints/*.pth'):
                 event('checkpoint', file=str(file), sha256=hashlib.sha256(file.read_bytes()).hexdigest())
         return result
 
-    run_module.save_run_checkpoint = save
     step_count = 0
 
     def step(*args: Any, **kwargs: Any) -> Any:
@@ -97,7 +99,7 @@ def main() -> None:
             os.kill(os.getpid(), signal.SIGINT)
         return result
 
-    original_model = run_module.build_run_model
+    original_model = build_run_model
 
     def build_model(*args: Any, **kwargs: Any) -> Any:
         if case == 'setup_error' and rank == failing_rank:
@@ -105,9 +107,13 @@ def main() -> None:
             raise ValueError('FAULT_ORIGIN: model setup failed')
         return original_model(*args, **kwargs)
 
-    run_module.build_run_model = build_model
     try:
-        with patch.object(run_module, 'evaluate', evaluate), patch.object(run_module, 'run_one_optimizer_step', step):
+        with (
+            patch.object(loop_helpers, 'save_run_checkpoint', save),
+            patch.object(run_module, 'build_run_model', build_model),
+            patch.object(loop_helpers, 'evaluate', evaluate),
+            patch.object(loop_helpers, 'run_one_optimizer_step', step),
+        ):
             runpy.run_path(str(ROOT / 'training/train.py'), run_name='__main__')
     except SystemExit as error:
         event('worker_exit', code=error.code)

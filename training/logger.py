@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
     from training.backend.base import Backend
     from training.data.dataset_resolver import ResolvedDataset
-    from training.step import StepResult, TrainingProgress  # `step.py` imports `track_gradient_metrics` from here
+    from training.steps import StepResult, TrainingProgress
 
 CONSOLE_LOGGER_NAME = "training.logger"  # under the `training` hierarchy; named explicitly, not via `__name__`
 SILENT_CONSOLE_LOGGER_NAME = f"{CONSOLE_LOGGER_NAME}.silent"  # the non-main ranks' console: nothing leaves it

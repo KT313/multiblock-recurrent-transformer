@@ -20,7 +20,7 @@ from torch import Tensor
 from data_preparation.lib.storage.atomic import write_atomically
 
 if TYPE_CHECKING:
-    from training.run import ResumePoint, RunState
+    from training.execution.state import ResumePoint, RunState
     from training.settings import Settings
 
 # Only known optimizer hyperparameters: never serialize parameters, moments, arbitrary checkpoint extras, or env.

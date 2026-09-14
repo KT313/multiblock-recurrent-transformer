@@ -33,7 +33,8 @@ from training.testing.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
 from training.failure import FatalHandler, exit_failed_worker
-from training.train import StopRequest, main, stop_on_interrupt
+from training.cli import StopRequest, configure_console_logging, get_launch_rank, stop_on_interrupt
+from training.train import main
 from training.ui.common import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
 from training.ui.testing import BOX_CHARACTERS
 from ui.testing import screen_of, strip_ansi
@@ -318,8 +319,8 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
     terminal in the line format of the data-prep CLI (the resolver itself configures nothing).
     """
 
-    training_logger = train_module.configure_console_logging()
-    train_module.configure_console_logging()
+    training_logger = configure_console_logging()
+    configure_console_logging()
     assert training_logger is detached_training_handlers and training_logger.level == logging.INFO
     for configured in (training_logger, detached_data_preparation_handlers):
         handlers = [h for h in configured.handlers if isinstance(h, ProgressStreamHandler)]
@@ -341,7 +342,7 @@ def test_a_non_main_rank_logs_warnings_only_with_a_rank_prefix(
     so the main rank tells the story of the run and a failing rank is still heard.
     """
 
-    training_logger = train_module.configure_console_logging(rank=3)
+    training_logger = configure_console_logging(rank=3)
     assert training_logger.level == logging.WARNING and detached_data_preparation_handlers.level == logging.WARNING
     logging.getLogger("training.logger").info("Total training steps: 20 (2 micro-batches each)")
     logging.getLogger("data_preparation.training.data.dataset_resolver").info("source a: 40 processed rows, all training")
@@ -352,7 +353,7 @@ def test_a_non_main_rank_logs_warnings_only_with_a_rank_prefix(
     assert lines[0].startswith("[rank 3] ") and lines[0].endswith("WARNING training.run: the loader workers do not keep up")
     assert lines[1].startswith("[rank 3] ") and lines[1].endswith("ERROR data_preparation.lib.build.runner: shard broken")
     # back on the main rank: INFO again, no prefix (the same handlers, reconfigured)
-    train_module.configure_console_logging(rank=0)
+    configure_console_logging(rank=0)
     logging.getLogger("training.logger").info("resumed")
     line = capsys.readouterr().err.rstrip().splitlines()[-1]
     assert not line.startswith("[rank") and line.endswith("INFO training.logger: resumed")
@@ -370,9 +371,9 @@ def test_main_on_a_non_main_rank_prints_no_summary(
     monkeypatch.setattr(train_module, "train", fake_train)
     assert main(["--config", str(yaml_path)]) == 0
     assert len(fake_train.calls) == 1 and capsys.readouterr().out == ""
-    assert train_module.launch_rank() == 1
+    assert get_launch_rank() == 1
     monkeypatch.delenv("RANK")
-    assert train_module.launch_rank() == 0
+    assert get_launch_rank() == 0
 
 
 # --- end to end in a pseudo-terminal: the live dashboard ---------------------------------------------------------------

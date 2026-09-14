@@ -28,7 +28,8 @@ import yaml
 from data_preparation.lib.build.runner import prepare
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.run import run_directory_of, train
+from training.execution import get_run_directory
+from training.run import train
 from training.settings import Settings, parse_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -140,7 +141,7 @@ def run_reference(tmp_path: Path, tiny_dataset_dir: Path) -> ReferenceRun:
         )
         settings = parse_settings(["--config", str(yaml_path)])
         report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)
-    return ReferenceRun(report.history, yaml_path, run_directory_of(settings))
+    return ReferenceRun(report.history, yaml_path, get_run_directory(settings))
 
 
 def reference_metrics(reference: ReferenceRun) -> dict[str, Any]:

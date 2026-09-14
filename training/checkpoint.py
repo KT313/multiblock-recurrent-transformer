@@ -50,7 +50,7 @@ class CheckpointMetadata:
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
     source_rows: dict[str, int]  # `ResolvedDataset.source_rows`, {source: processed rows}; a resume refuses a changed count
-    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
+    data_stream: dict[str, Any]  # `training.steps.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
 
     dataset_build_id: str | None = None  # unknown provenance in legacy checkpoints
 

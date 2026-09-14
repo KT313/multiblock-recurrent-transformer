@@ -44,7 +44,7 @@ from training.optim import ELLISAdam, get_param_groups
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
-from training.step import StepResult, TrainingProgress
+from training.steps import StepResult, TrainingProgress
 from training.test_step import PACK_LENGTH, reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS

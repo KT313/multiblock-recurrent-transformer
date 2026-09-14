@@ -14,7 +14,8 @@ from training.backend.ddp import DDPBackend
 from training.backend.single_device import SingleDeviceBackend
 from training.data.packing import PackedBatch
 from training.evaluation import evaluate
-from training.step import NonFiniteLossError, TrainingProgress, run_one_optimizer_step
+from training.steps import NonFiniteLossError, TrainingProgress
+from training.step import run_one_optimizer_step
 from training.test_step import reference_settings, reference_stage_manager
 
 

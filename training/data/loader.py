@@ -3,7 +3,7 @@
 Dataloader construction: one train loader per SOURCE for the whole run (unpadded worker batches the stream packs)
 and one validation loader per stage (padded batches), `build_run_dataloaders`.
 
-The stage structure never touches the train loaders: `training.step.BatchStream` draws the source per sample with
+The stage structure never touches the train loaders: `training.steps.BatchStream` draws the source per sample with
 the stage-interpolated weights, so a reader continues across stage boundaries and never re-reads rows.
 """
 
@@ -108,7 +108,7 @@ def worker_init_fn(worker_id: int) -> None:
     """
     A DataLoader worker ignores SIGINT. A terminal Ctrl-C signals the whole process group; a worker that took it
     would exit on the KeyboardInterrupt and the parent would fail with "DataLoader worker exited unexpectedly"
-    instead of finishing the step and checkpointing (`training.train.stop_on_interrupt`). Ignoring changes nothing
+    instead of finishing the step and checkpointing (`training.cli.stop_on_interrupt`). Ignoring changes nothing
     about a worker's lifetime: the parent ends it by message (a sentinel once its iterator is dropped) and torch's
     watchdog ends it when the parent dies. SIGTERM keeps its default: torch's shutdown fallback and the interpreter's
     exit both end a leftover worker with it, and a worker that ignored it would hang the parent's exit.
@@ -417,7 +417,7 @@ def build_run_dataloaders(settings: Settings, dataset: ResolvedDataset, backend:
     evaluation) never touches the global torch RNG and a resume replays the same latent noise.
 
     Ranks: the train loaders exist on the main rank only, which reads every source as ONE shard and packs for the
-    whole world (`training.step.RankBatches`); the other ranks get no train loader (and raise no file limit). The
+    whole world (`training.steps.RankBatches`); the other ranks get no train loader (and raise no file limit). The
     validation loaders exist on every rank, each reading its shard of the rows.
     """
 
