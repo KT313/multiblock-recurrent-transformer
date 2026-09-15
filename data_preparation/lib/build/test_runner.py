@@ -28,7 +28,7 @@ from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, load_dataset_config
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, check_stop
-from data_preparation.lib.build import runner
+from data_preparation.lib.build import preparation, runner
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.lock import RunLocked, build_lock, dataset_lock
 from data_preparation.lib.build.planner import DatasetReport, DownloadPlan, SourceLedger, plan_downloads, source_ledger
@@ -1237,7 +1237,7 @@ def test_approved_tokenizer_is_published_before_repairs_and_only_once(
         real_perform(report)
 
     monkeypatch.setattr(download_stage, "write_synthetic_tokenizer", acquire)
-    monkeypatch.setattr(runner, "perform_repairs", perform)
+    monkeypatch.setattr(preparation, "perform_repairs", perform)
     assert prepare(path, layout.root, assume_yes=False, confirm=confirm).complete
     assert events == ["authorize", "acquire", "repair"]
     raw = Manifest.load(layout.raw_dir("p"))

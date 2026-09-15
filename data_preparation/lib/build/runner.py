@@ -41,9 +41,8 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -51,11 +50,10 @@ from types import TracebackType
 from data_preparation.lib.dataset_config import DatasetConfig, load_dataset_config
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck, check_stop
-from data_preparation.lib.build.lock import DatasetLease, dataset_lock
+from data_preparation.lib.build.lock import DatasetLease
 from data_preparation.lib.build.planner import (
     DatasetReport,
     DownloadPlan,
-    UnreadableRawShardError,
     build_is_pending,
     every_source_satisfies_its_budget,
     plan_downloads,
@@ -67,6 +65,7 @@ from data_preparation.lib.build.planner import (
 from data_preparation.lib.build.repair import (
     Confirm, RepairAction, RepairReport, authorize_repairs, inspect_repairs, perform_repairs, repair_broken_and_stale_folders,
 )
+from data_preparation.lib.build.preparation import explain_unreadable_shards, open_preparation_scope, prepare_tokenizer_and_apply_repairs
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
@@ -93,33 +92,6 @@ DEFAULT_PASS_WORKERS = 4  # spawn processes per build for the optional cleaning 
 
 
 # --- prepare / status ------------------------------------------------------------------------------------------------
-
-
-def prepare_command(config_path: str | Path, dataset_dir: str | Path) -> str:
-    """
-    The command an error message tells the user to run: the same one training's auto-prepare prints
-    (`training/data/dataset_resolver.py::build_command`), with the `--yes` that answers the repair confirmation.
-    """
-
-    return f"python data_preparation/prepare.py prepare --dataset_config {config_path} --dataset_dir {dataset_dir} --yes"
-
-
-@contextmanager
-def unreadable_shard_remedy(config_path: str | Path, dataset_dir: str | Path) -> Iterator[None]:
-    """
-    Give an :class:`UnreadableRawShardError` from the planner the remedy this level knows: the repair step and the
-    command that runs it. The planner sees neither the config path nor the dataset directory, and a read-only
-    caller (status, a dry run) does not repair anything itself, so the message has to say what will.
-    """
-
-    try:
-        yield
-    except UnreadableRawShardError as error:
-        remedy = (
-            f"the repair step truncates raw/{error.source} to its readable prefix, or deletes the folder when no "
-            f"shard is readable; run\n  {prepare_command(config_path, dataset_dir)}\nthen status again"
-        )
-        raise error.with_remedy(remedy) from error
 
 
 def prepare(
@@ -156,6 +128,7 @@ def prepare(
     whose exhausted flag is cleared before planning (:func:`reopen_raw`: their loader has more rows now).
     """
 
+    # resolve the configuration and validate the requested work
     config = load_dataset_config(config_path)
     config.validate_identifiers()
     config_name = Path(config_path).name
@@ -166,7 +139,8 @@ def prepare(
     check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
     warn_about_overlaps(config)
 
-    with dataset_lock(layout.root, lease=dataset_lease) if not dry_run else nullcontext(), unreadable_shard_remedy(config_path, dataset_dir):
+    # hold dataset ownership and attach the unreadable-shard remedy
+    with open_preparation_scope(config_path, dataset_dir, dry_run=dry_run, dataset_lease=dataset_lease):
         if config.bloom_deduplicate_across_sources:
             return prepare_global(
                 config, layout.for_config(config), config_name=config_name, steps=active_steps, selected=selected,
@@ -174,35 +148,51 @@ def prepare(
                 allow_foreign_raw=allow_foreign_raw, hf_token=hf_token, num_workers=num_workers,
                 pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads, should_stop=should_stop,
             )
+
+        # authorize changes and publish the tokenizer before repairing source data
         repair_report = inspect_repairs(config, layout, sources=selected, config_name=config_name)
-        tokenizer_plan = inspect_tokenizer(config, layout) if "tokenizer" in active_steps else None
-        if not dry_run:
-            authorize_repairs(repair_report, assume_yes=assume_yes, confirm=confirm, allow_foreign_raw=allow_foreign_raw)
-            # Validate and publish the intended tokenizer before changing raw/processed data. Staging failures
-            # preserve all published content; after publication starts there is no multi-directory rollback.
-            if tokenizer_plan is not None:
-                prepare_planned_tokenizer(config, tokenizer_plan, hf_token=hf_token)
-            perform_repairs(repair_report)
+        prepare_tokenizer_and_apply_repairs(
+            config, layout, active_steps, repair_report, dry_run=dry_run, assume_yes=assume_yes,
+            confirm=confirm, allow_foreign_raw=allow_foreign_raw, hf_token=hf_token,
+        )
         log_repair(repair_report)
         reopen_sources(config, layout, reopened, dry_run=dry_run)
-        for round_number in range(1, MAX_ROUNDS + 1):
-            download_plan = plan_downloads(config, layout, sources=selected)
-            if dry_run:
-                log.info("dry run, downloads planned:\n%s", download_plan.describe(), extra={"keep": True})
-                break
-            log.info("round %d: %s", round_number, download_plan.summary())
-            set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download + build")
-            download_and_build_missing(
-                download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
-                num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
-            )
-            if every_source_satisfies_its_budget(config, layout, sources=selected):
-                break
-            if not another_round_can_fetch_more(config, layout, active_steps, selected):
-                break  # still short, but nothing left to download: the report names the sources
+
+        # download and build the missing source content
+        run_preparation_rounds(
+            config, layout, active_steps, selected, config_name=config_name, dry_run=dry_run,
+            num_workers=num_workers, pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads,
+            hf_token=hf_token, should_stop=should_stop,
+        )
+
+        # publish and report the final dataset state
         set_status(step="status")
         report = assess_dataset_state(config, layout, repair_report, publish=not dry_run)
     return report
+
+
+def run_preparation_rounds(
+    config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None,
+    *, config_name: str, dry_run: bool, num_workers: int, pass_workers: int, max_parallel_downloads: int,
+    hf_token: str | None, should_stop: StopCheck | None,
+) -> None:
+    """Plan and run bounded download/build rounds until the budget is met or no more rows can be fetched."""
+
+    for round_number in range(1, MAX_ROUNDS + 1):
+        download_plan = plan_downloads(config, layout, sources=selected)
+        if dry_run:
+            log.info("dry run, downloads planned:\n%s", download_plan.describe(), extra={"keep": True})
+            break
+        log.info("round %d: %s", round_number, download_plan.summary())
+        set_status(round=f"{round_number}/{MAX_ROUNDS}", step="download + build")
+        download_and_build_missing(
+            download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
+            num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+        )
+        if every_source_satisfies_its_budget(config, layout, sources=selected):
+            break
+        if not another_round_can_fetch_more(config, layout, active_steps, selected):
+            break  # still short, but nothing left to download: the report names the sources
 
 
 def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
@@ -215,7 +205,7 @@ def status(config_path: str | Path, dataset_dir: str | Path) -> DatasetReport:
     config.validate_identifiers()
     layout = DatasetLayout(Path(dataset_dir)).for_config(config)
     warn_about_overlaps(config)
-    with unreadable_shard_remedy(config_path, dataset_dir):
+    with explain_unreadable_shards(config_path, dataset_dir):
         repair_report = (inspect_repairs(config, layout, config_name=Path(config_path).name) if layout.processed_scope else
                          repair_broken_and_stale_folders(config, layout, assume_yes=False, dry_run=True, config_name=Path(config_path).name))
         log_repair(repair_report)
