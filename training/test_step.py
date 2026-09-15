@@ -1667,6 +1667,41 @@ def test_golden_tiny_steps() -> None:
     assert not mismatches, "step reference changed:\n" + "\n".join(mismatches)
 
 
+@pytest.mark.parametrize('precision,stream', [('32', 'none'), ('bf16-mixed', 'none'),
+                                            ('bf16-mixed', 'core'), ('bf16-mixed', 'all')])
+@pytest.mark.parametrize('checkpointing', ['none', 'selective', 'full'])
+def test_representation_logging_preserves_following_updates(precision: str, stream: str, checkpointing: str) -> None:
+    """Same sampled training trajectory with probes disabled/enabled, including optimizer moments and RNG."""
+    backend = SingleDeviceBackend('cpu', precision)
+    baseline = None
+    for enabled in (False, True):
+        settings = reference_settings(precision=precision, log_gradient_metrics_interval=int(enabled),
+                                      log_correlations='adapter,attention,mlp')
+        torch.manual_seed(0)
+        model = backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False,
+                                                gradient_checkpointing=checkpointing, bf16_residual_stream=stream))
+        optimizer = fresh_optimizer(settings, model, backend)
+        # First update is skipped; the following two exercise optimizer state and the forward after a probe.
+        try:
+            results = run_steps(settings, backend, model, optimizer, steps=3)
+        except RuntimeError as error:
+            if (not enabled and precision == 'bf16-mixed' and checkpointing == 'selective'
+                    and 'encountered during backward but not found in storage' in str(error)):
+                pytest.xfail('CPU BF16 selective checkpoint baseline fails before any diagnostic; parity untested')
+            raise
+        snapshot = {
+            'weights': copy.deepcopy(model.state_dict()), 'optimizer': copy.deepcopy(optimizer.state_dict()),
+            'rng': torch.get_rng_state().clone(),
+            'losses': [result.loss.detach().clone() for result in results],
+            'grad_norms': [result.grad_norm.detach().clone() for result in results],
+        }
+        assert all(('token_correlation' in result.metrics) == enabled for result in results)
+        if baseline is None:
+            baseline = snapshot
+        else:
+            torch.testing.assert_close(snapshot, baseline, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("log_interval,gradient_interval,start,steps", [
     (1, 0, 0, 5), (1, 1, 0, 4), (1, 4, 0, 5), (2, 4, 0, 5), (1, 4, 2, 3), (1, 100, 0, 5),
 ])
@@ -1678,13 +1713,15 @@ def test_gradient_metrics_have_independent_completed_step_cadence(
     Expensive statistics run only on their own absolute step grid, before zero_grad; basic metrics keep their grid.
     """
 
-    settings = reference_settings(log_step_interval=log_interval, log_gradient_metrics_interval=gradient_interval)
+    settings = reference_settings(log_step_interval=log_interval, log_gradient_metrics_interval=gradient_interval,
+                                  log_correlations='attention,mlp')
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     stage_manager = reference_stage_manager(settings)
     progress = TrainingProgress(step=start, resume_step=start if start else -1)
     batches = scripted_batches(settings)
     calls: list[int] = []
+    recurrence_calls: list[int] = []
 
     def record_metrics(plain: torch.nn.Module, opt: torch.optim.Optimizer) -> dict[str, torch.Tensor]:
         assert plain is cpu_backend.plain_model(model) and opt is optimizer
@@ -1694,6 +1731,14 @@ def test_gradient_metrics_have_independent_completed_step_cadence(
         return {"gradient_probe": torch.tensor(float(completed))}
 
     monkeypatch.setattr("training.steps.operations.track_gradient_metrics", record_metrics)
+    def record_recurrence(plain: RecurrentGPT, backend: SingleDeviceBackend, batch: PackedBatch,
+                          *, correlations: str | None = '') -> dict[str, torch.Tensor]:
+        assert plain is cpu_backend.plain_model(model) and backend is cpu_backend
+        assert batch.input_ids.shape[0] == 1
+        assert correlations == 'attention,mlp'
+        recurrence_calls.append(progress.step+1)
+        return {"token_correlation": torch.tensor(.25)}
+    monkeypatch.setattr("training.steps.operations.track_recurrence_metrics", record_recurrence)
     expected_calls = []
     for _ in range(steps):
         result = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
@@ -1703,9 +1748,11 @@ def test_gradient_metrics_have_independent_completed_step_cadence(
         if due:
             expected_calls.append(completed)
         assert ("gradient_probe" in result.metrics) == due
+        assert ("token_correlation" in result.metrics) == due
         assert ("packing/padding_fraction" in result.metrics) == (completed % log_interval == 0)
         assert torch.isfinite(result.loss) and torch.isfinite(result.grad_norm)
     assert calls == expected_calls
+    assert recurrence_calls == expected_calls
 
 
 @pytest.mark.parametrize('enabled', [False, True])

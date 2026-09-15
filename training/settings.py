@@ -24,6 +24,20 @@ CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
 # are copied here to be checked at construction time, and settings tests keep the copies equal to the originals.
 OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam", "ELLISAdam8bit")
 LR_SCHEDULES: tuple[str, ...] = ("trapezoid",)
+CORRELATION_TARGETS = ("adapter", "attention", "mlp")
+
+
+def normalize_log_correlations(value: object) -> str:
+    """Canonical, validated comma-separated selector; omitted/null/empty means no detailed correlations."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError('log_correlations must be a string containing adapter, attention and/or mlp, or empty')
+    selected = {word.strip().lower() for word in value.split(',') if word.strip()}
+    unknown = selected.difference(CORRELATION_TARGETS)
+    if unknown:
+        raise ValueError(f"Unknown log_correlations target(s): {', '.join(sorted(unknown))}; choose adapter, attention, mlp")
+    return ','.join(target for target in CORRELATION_TARGETS if target in selected)
 
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
 # relating two fields stay explicit below the loops.
@@ -150,7 +164,8 @@ class Settings:
     # Evaluation / logging / checkpoints. Validation batches are padded rows (not packs): `validation_batch_size`
     # rows padded to the longest of them, rounded up to a multiple of `validation_padding_multiple`.
     log_step_interval: int = 1
-    log_gradient_metrics_interval: int = 1  # expensive gradient/update statistics every N completed optimizer steps; 0 disables; a positive multiple of log_step_interval
+    log_gradient_metrics_interval: int = 1  # gradient/update + representation/state probes every N completed optimizer steps; 0 disables; a positive multiple of log_step_interval
+    log_correlations: str | None = ""  # detailed probe targets: comma-separated adapter,attention,mlp; null/empty disables
     eval_step_interval: int = 100
     eval_iters: int = 64  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
     validation_batch_size: int = 4  # rows per validation forward
@@ -185,6 +200,7 @@ class Settings:
     benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
     def __post_init__(self) -> None:
+        self.log_correlations = normalize_log_correlations(self.log_correlations)
         if not isinstance(self.use_custom_kernels, bool):
             raise ValueError("use_custom_kernels must be a boolean")
         if isinstance(self.log_gradient_metrics_interval, bool) or not isinstance(self.log_gradient_metrics_interval, int):

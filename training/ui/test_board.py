@@ -143,6 +143,17 @@ def test_metrics_table_shows_the_latest_step(board: TrainingDashboard) -> None:
     assert board.latest_metrics["loss"] == 2.5
 
 
+def test_recurrence_metrics_order_and_retention(board: TrainingDashboard) -> None:
+    board.update_step(4, 0, None, metrics(4, token_correlation=.9876, token_dispersion=.0012, state_sensitivity=.034))
+    text = board.render_text()
+    assert text.index('grad norm') < text.index('tok corr') < text.index('tok disp') < text.index('state sens') < text.index('tokens/s')
+    assert '0.9876' in text and '1.20e-03' in text and '3.40e-02' in text
+    board.update_step(5, 0, None, metrics(5))
+    assert board.latest_metrics['token_correlation'] == .9876
+    board.update_step(8, 0, None, metrics(8, token_correlation=float('nan')))
+    assert 'n/a' in board.render_text()
+
+
 def test_metrics_missing_from_a_step_keep_their_last_value(board: TrainingDashboard) -> None:
     board.update_step(1, 0, None, metrics(1, loss=4.0))
     board.update_step(2, 0, None, {"loss": 3.5})  # a non-log step: only the loss

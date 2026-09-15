@@ -584,6 +584,34 @@ def test_old_gradient_metrics_flag_is_rejected() -> None:
         parse_settings(["--config", str(TINY_YAML), "--log_gradient_metrics", "true"])
 
 
+@pytest.mark.parametrize(('value', 'expected'), [
+    (None, ''), ('', ''), ('  ,  ', ''), ('adapter', 'adapter'), ('attention', 'attention'), ('mlp', 'mlp'),
+    ('mlp, adapter,adapter', 'adapter,mlp'), (' ATTENTION, adapter, MLP ', 'adapter,attention,mlp'),
+])
+def test_correlation_selector_normalization(value: str | None, expected: str) -> None:
+    assert _settings(log_correlations=value).log_correlations == expected
+    assert _settings().log_correlations == ''
+
+
+@pytest.mark.parametrize('value', [True, False, 1, ['adapter'], 'true', 'all', 'adapter,attn', 'mlp,typo'])
+def test_correlation_selector_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match='log_correlations'):
+        _settings(log_correlations=value)
+
+
+def test_correlation_selector_yaml_and_cli(tmp_path: Path) -> None:
+    values = yaml.safe_load(TINY_YAML.read_text())
+    values['log_correlations'] = 'mlp,adapter'
+    path = tmp_path/'correlations.yaml'
+    path.write_text(yaml.safe_dump(values))
+    assert parse_settings(['--config', str(path)]).log_correlations == 'adapter,mlp'
+    assert parse_settings(['--config', str(path), '--log_correlations', 'attention,mlp']).log_correlations == 'attention,mlp'
+    assert parse_settings(['--config', str(path), '--log_correlations', '']).log_correlations == ''
+    values['log_correlations'] = None
+    path.write_text(yaml.safe_dump(values))
+    assert parse_settings(['--config', str(path)]).log_correlations == ''
+
+
 def test_gradient_metrics_interval_yaml_validation(tmp_path: Path) -> None:
     values = yaml.safe_load(TINY_YAML.read_text())
     values.update(log_step_interval=2, log_gradient_metrics_interval=3)

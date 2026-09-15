@@ -60,6 +60,14 @@ def test_fallback_step_line_shows_the_transition(clock: FakeClock) -> None:
     assert "step 30/30 | stage 5 ?" in output and "step 30: validation (no losses)" in output
 
 
+def test_fallback_includes_recurrence_metrics_in_order(clock: FakeClock) -> None:
+    stream = io.StringIO()
+    with fallback_board('r', STAGES, STEPS, TOTAL, stream=stream, clock=clock) as board:
+        board.update_step(4, 0, None, metrics(4, token_correlation=.9876, token_dispersion=.0012, state_sensitivity=.034))
+    output = stream.getvalue()
+    assert 'grad norm 1.250 | tok corr 0.9876 | tok disp 1.20e-03 | state sens 3.40e-02 | tokens/s' in output
+
+
 def test_step_line_is_none_off_the_interval_and_reads_the_recorded_throughput(clock: FakeClock) -> None:
     throughput = Throughput(TOTAL, clock=clock)
     clock.advance(2)

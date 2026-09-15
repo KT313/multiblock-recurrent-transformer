@@ -693,7 +693,7 @@ class RunLogger:
         * `data/wait_seconds`, `data/wait_fraction`: the seconds the loaders blocked on a worker batch since the last
           log step and their share of the interval's training time; above `DATA_WAIT_WARNING_FRACTION` a kept
           warning names the slowest sources, repeated at most every `DATA_WAIT_WARNING_INTERVAL_SECONDS`;
-        * extra `track_gradient_metrics` on `log_gradient_metrics_interval` steps (0: disabled), and the validation metrics (`val_loss*`, `val_ppl*`,
+        * extra gradient and representation/state probe metrics on `log_gradient_metrics_interval` steps (0: disabled), and the validation metrics (`val_loss*`, `val_ppl*`,
           `val_loss/<data id>` per validation source, `val_time`).
         """
 

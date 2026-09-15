@@ -512,6 +512,35 @@ def _record_wandb_logs(monkeypatch: pytest.MonkeyPatch) -> dict[int, dict[str, A
     return recorded
 
 
+def test_recurrence_metrics_reach_wandb_history_and_dashboard_without_filling_gaps(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = _record_wandb_logs(monkeypatch)
+    settings = reference_settings(log_step_interval=1, log_gradient_metrics_interval=2)
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    probes = {'token_correlation': torch.tensor(.5), 'token_dispersion': torch.tensor(.125),
+              'state_sensitivity': torch.tensor(.25), 'recurrence/core_0/state_sensitivity': torch.tensor(.75),
+              'representation/pre_head/correlation_pairs': torch.tensor(120),
+              'adapter/core_0/iter_3/state_input/correlation': torch.tensor(.1),
+              'adapter/core_0/iter_3/merged_output/correlation': torch.tensor(.8),
+              'adapter/core_2/iter_8/core_output/correlation': torch.tensor(.9),
+              'attention/core_1/iter_2/layer_3/input/correlation': torch.tensor(.4),
+              'mlp/core_2/iter_8/layer_4/output/correlation': torch.tensor(.6)}
+    progress = TrainingProgress(step=1)
+    result = fake_result(stage_manager, 1, metrics=probes)
+    progress.advance()
+    run_logger.log_step(result, progress)
+    for key, value in probes.items():
+        assert recorded[2][key] == value.item() == run_logger.history[2][key]
+        assert recording(run_logger).steps[-1][3][key] == value.item()
+    result = fake_result(stage_manager, 2)
+    progress.advance()
+    run_logger.log_step(result, progress)
+    assert not set(probes) & recorded[3].keys()
+
+
 def test_open_logs_the_run_header_and_ends_the_setup_timer(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:

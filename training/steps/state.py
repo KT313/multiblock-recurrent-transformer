@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from torch import Tensor
 
+from training.data.packing import PackedBatch
 from training.stage_manager import StageInfo
 
 
@@ -65,3 +66,4 @@ class AccumulatedGradients:
     data_ids: list[str]
     data_tokens: dict[str, int]
     padding_tokens: int
+    last_batch: PackedBatch | None = None  # small input tensors only; no training activations retained for diagnostics

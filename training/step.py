@@ -77,7 +77,7 @@ def run_one_optimizer_step(
         optimizer.step()
 
     # collect diagnostics before clearing gradients and returning the result
-    metrics = collect_step_metrics(settings, backend, model, optimizer, step, accumulated.padding_tokens)
+    metrics = collect_step_metrics(settings, backend, model, optimizer, step, accumulated.padding_tokens, accumulated.last_batch)
     optimizer.zero_grad(set_to_none=True)
 
     return StepResult(
@@ -100,6 +100,8 @@ def accumulate_microbatch_gradients(
 
     # initialize the local totals before reading any microbatches
     accumulated = create_accumulated_gradients(settings, backend, accumulation_steps)
+    gradient_interval = settings.log_gradient_metrics_interval
+    capture_probe = backend.is_main and gradient_interval > 0 and (plain.step + 1) % gradient_interval == 0
 
     # process each microbatch in the original data and recurrence order
     for micro_batch_index in range(accumulation_steps):
@@ -115,6 +117,8 @@ def accumulate_microbatch_gradients(
         # accumulate detached loss statistics, then notify the dashboard
         accumulated.loss_sum += outputs["loss_sum"].detach()
         accumulated.supervised_count += outputs["supervised_count"].detach()
+        if capture_probe and micro_batch_index == accumulation_steps - 1:
+            accumulated.last_batch = batch
         if on_micro_batch is not None:
             on_micro_batch(micro_batch_index + 1, accumulation_steps)
 

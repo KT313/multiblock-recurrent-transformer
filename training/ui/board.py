@@ -31,6 +31,7 @@ from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
     depth_losses,
     METRIC_COLUMNS,
+    RECURRENCE_METRIC_KEYS,
     event_line,
     fit_panel_heights,
     floats,
@@ -521,10 +522,13 @@ class TrainingDashboard(LiveDisplay):
 
     def _render_metrics(self) -> RenderableType:
         table = Table(
-            box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False, title=line(f"step {self._step}"), title_justify="left"
+            box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False, collapse_padding=True,
+            title=line(f"step {self._step}"), title_justify="left"
         )
         cells: list[str] = []
         for key, label in METRIC_COLUMNS:
+            if key in RECURRENCE_METRIC_KEYS and key not in self._latest:
+                continue  # appear on the first probe, then retain the latest measurement between probes
             table.add_column(label, justify="right", no_wrap=True)
             value = self._latest.get(key)
             if value is None and key == "seconds/step":

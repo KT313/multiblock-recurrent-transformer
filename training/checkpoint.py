@@ -168,6 +168,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",
     "log_gradient_metrics_interval",
+    "log_correlations",  # isolated diagnostic selection; does not change training RNG, gradients or parameters
     # validation cadence and width: `evaluate` runs under `torch.random.fork_rng` (training/evaluation.py), so how
     # often and how much validation runs leaves the training stream untouched; only the reported numbers change
     "eval_step_interval",

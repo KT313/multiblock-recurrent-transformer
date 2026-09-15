@@ -14,6 +14,7 @@ from model.kernels.runtime import CustomKernelError, DISABLE_HINT
 from training.backend.base import Backend
 from training.data.packing import PackedBatch
 from training.logger import track_gradient_metrics
+from training.representation_metrics import track_recurrence_metrics
 from training.lr_schedule import get_lr_multistage
 from training.settings import Settings
 from training.stage_manager import StageManager
@@ -131,13 +132,17 @@ def normalize_and_clip_gradients(
 
 def collect_step_metrics(
     settings: Settings, backend: Backend, model: Module, optimizer: Optimizer, step: int, padding_tokens: int,
+    probe_batch: PackedBatch | None = None,
 ) -> dict[str, Tensor]:
     """Collect diagnostics at their original intervals, after the update and before clearing gradients."""
 
     metrics: dict[str, Tensor] = {}
     gradient_interval = settings.log_gradient_metrics_interval
     if gradient_interval > 0 and (step + 1) % gradient_interval == 0:
-        metrics = track_gradient_metrics(backend.plain_model(model), optimizer)  # the DDP wrapper hides `.transformer`
+        plain = backend.plain_model(model)  # the DDP wrapper hides `.transformer`
+        metrics = track_gradient_metrics(plain, optimizer)
+        if probe_batch is not None and backend.is_main:
+            metrics.update(track_recurrence_metrics(plain, backend, probe_batch, correlations=settings.log_correlations))
     if (step + 1) % settings.log_step_interval == 0:
         metrics["packing/padding_fraction"] = torch.tensor(padding_tokens / settings.tokens_per_optimizer_step)  # pack tails
     return metrics
