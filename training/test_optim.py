@@ -393,7 +393,7 @@ def test_cpu_update_stays_eager_and_scalars_come_as_tensors() -> None:
     coefficients handed to it are 0-d float32 tensors, the form that keeps the compiled path free of recompiles.
     """
 
-    from training import optim
+    from training.optim import update as optim
 
     p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
     p.grad = torch.tensor([0.5, 0.25])
@@ -422,7 +422,7 @@ def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
     reorder the elementwise chain), across LR changes without a recompile, for every option combination.
     """
 
-    from training import optim
+    from training.optim import update as optim
 
     for flags in (
         dict(update_clipping=True, atan_adam=True, running_init=True),
@@ -621,7 +621,7 @@ def test_compiled_cuda_8bit_update_matches_eager() -> None:
     parameters within fp32 rounding, across LR changes without a recompile.
     """
 
-    from training import optim
+    from training.optim import update as optim
 
     results = []
     for compiled in (False, True):
@@ -763,3 +763,25 @@ def test_ellis_group_reference_lr_must_stay_positive(cls: type[ELLISAdam], value
     with pytest.raises(ValueError, match="init_lr"):
         opt.add_param_group({"params": [torch.nn.Parameter(torch.ones(2))], "init_lr": value})
     assert len(opt.param_groups) == 1
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+def test_optimizer_reorganization_preserves_public_identity_and_pickle(cls: type[ELLISAdam]) -> None:
+    import pickle
+
+    # Recorded provenance and old pickle references keep the public package path.
+    assert f"{cls.__module__}.{cls.__qualname__}" == f"training.optim.{cls.__name__}"
+    legacy_reference = f"ctraining.optim\n{cls.__name__}\n.".encode()
+    assert pickle.loads(legacy_reference) is cls
+
+    # A populated optimizer round-trips through the same class and state layout.
+    param = torch.nn.Parameter(torch.ones(4))
+    optimizer = cls([param], lr=0.1, running_init=True)
+    param.grad = torch.full_like(param, 0.5)
+    optimizer.step()
+    restored = pickle.loads(pickle.dumps(optimizer))
+    assert type(restored) is cls
+    restored_param = restored.param_groups[0]["params"][0]
+    torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+    for name in ("step", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(restored.state[restored_param][name], optimizer.state[param][name], rtol=0, atol=0)
