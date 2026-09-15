@@ -32,6 +32,8 @@ from .blocks.recurrence import (
 from .blocks.sandwich import SandwichBlock
 from .config import RecurrentConfig
 from .generation import GenerationState
+from .forward_inputs import validate_forward_options, validate_sequence_length
+from .generation_inputs import prepare_generation_inputs, build_generation_mask
 from .layers.attention import AttentionMask, precompute_freqs_cis
 from .layers.init import Linear
 from .kernels.runtime import load_head
@@ -289,14 +291,11 @@ class RecurrentGPT(torch.nn.Module):
         itself is eager by design, see `run_core_blocks`.
         """
 
-        if return_loss_statistics and (labels is None or return_logits or return_token_losses_chunked_nograd):
-            raise ValueError("return_loss_statistics requires labels and the loss-only training path")
-        if logits_to_keep < 0:
-            raise ValueError("logits_to_keep must be nonnegative")
-        if logits_to_keep and (labels is not None or return_token_losses_chunked_nograd):
-            raise ValueError("logits_to_keep requires inference without labels/token losses")
-        if use_cache and generation_state is None:
-            raise ValueError("use_cache requires an explicit generation_state")
+        # validate the requested output and select the generation path
+        validate_forward_options(
+            labels, return_logits, return_token_losses_chunked_nograd, logits_to_keep,
+            generation_state, use_cache, return_loss_statistics,
+        )
         if generation_state is not None:
             if labels is not None or return_token_losses_chunked_nograd:
                 raise ValueError("generation state cannot compute training/scoring losses")
@@ -304,18 +303,8 @@ class RecurrentGPT(torch.nn.Module):
                 input_ids, attention_mask, position_ids, num_steps, generation_state, use_cache, logits_to_keep, return_logits,
             )
 
-        # On `shape[1]`, not on a tensor value: a static guard under `torch.compile(dynamic=True)`. Without it the
-        # failure is a shape mismatch inside RoPE. Only for the path that takes the table's first S rows: with
-        # `position_ids` (packed training, left-padded generation) the length says nothing about the positions, and
-        # the bound that does hold there (`position_ids.max()`) is a tensor value, so checking it would break the
-        # graph; an out-of-range position still fails in the gather.
-        sequence_length = input_ids.shape[1]
-        if position_ids is None and sequence_length > self.config.model_max_sequence_length:
-            raise ValueError(
-                f"sequence length {sequence_length} is longer than model_max_sequence_length "
-                f"{self.config.model_max_sequence_length} (the RoPE table covers that many positions)"
-            )
-
+        # prepare attention inputs and run the prelude
+        validate_sequence_length(input_ids, position_ids, self.config.model_max_sequence_length)
         freqs_cis, mask = prepare_attention_inputs(self.freqs_cis, input_ids, attention_mask, position_ids)
 
         x = self.transformer.wte(input_ids)  # (B, S, E)
@@ -324,13 +313,24 @@ class RecurrentGPT(torch.nn.Module):
         for block in self.transformer.prelude:
             x = block(x, freqs_cis, mask)
 
+        # run recurrent cores across the existing eager boundary
         per_block_steps = normalize_num_steps(num_steps, len(self.transformer.core_blocks))
         x = self.run_core_blocks(x, freqs_cis, mask, per_block_steps)
 
+        # finish the architecture and assemble the requested outputs
         for block in self.transformer.coda:
             x = block(x, freqs_cis, mask)
         x = self.transformer.ln_final(x)
 
+        return self._assemble_forward_outputs(
+            x, labels, return_logits, return_token_losses_chunked_nograd, logits_to_keep, return_loss_statistics,
+        )
+
+    def _assemble_forward_outputs(
+        self, x: Tensor, labels: Tensor | None, return_logits: bool,
+        return_token_losses_chunked_nograd: bool, logits_to_keep: int, return_loss_statistics: bool,
+    ) -> dict[str, Tensor | None]:
+        """Select the existing loss/logit path without changing its numerical operations."""
         loss_sum: Tensor | None = None
         supervised_count: Tensor | None = None
         loss = torch.as_tensor(0.0)
@@ -372,33 +372,19 @@ class RecurrentGPT(torch.nn.Module):
         A state with use_cache=False is the full-prefix fixed-latent reference, not legacy prefix resampling.
         """
         try:
-            specs = normalize_num_steps(num_steps, len(self.transformer.core_blocks))
-            means = self.config.mean_recurrence
-            assert isinstance(means, list)
-            steps = tuple(means[i] if spec is None else sum(spec) for i, spec in enumerate(specs))
-            start = state.get_seq_length() if use_cache else 0
-            total = start + input_ids.shape[1]
-            if attention_mask is None:
-                padding = torch.ones((input_ids.shape[0], total), device=input_ids.device, dtype=torch.bool)
-            elif isinstance(attention_mask, Tensor) and attention_mask.dim() == 2:
-                padding = attention_mask.to(torch.bool)
-            else:
-                raise ValueError("generation state supports only a (B, S) padding mask, not packed attention")
-            if position_ids is None:
-                position_ids = (padding.long().cumsum(-1) - 1).clamp(min=0)[:, start:]
-            elif position_ids.dim() == 1:
-                position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
-            elif position_ids.dim() == 2 and position_ids.shape[0] == 1:
-                position_ids = position_ids.expand(input_ids.shape[0], -1)
+            # prepare and validate the session before touching any cache
+            steps, total, padding, position_ids = prepare_generation_inputs(
+                input_ids, attention_mask, position_ids, num_steps, state, use_cache,
+                len(self.transformer.core_blocks), self.config.mean_recurrence,
+            )
             start = state.begin(
                 self, input_ids, padding, position_ids, steps, use_cache=use_cache,
                 max_positions=self.config.model_max_sequence_length,
             )
             rotary, _ = prepare_attention_inputs(self.freqs_cis, input_ids, position_ids=position_ids)
-            query_columns = torch.arange(start, total, device=input_ids.device)[:, None]
-            key_columns = torch.arange(total, device=input_ids.device)[None, :]
-            # Explicit rectangular mask: each appended query sees all valid earlier keys and itself.
-            mask = (padding[:, None, None, :] & (key_columns <= query_columns)) | (key_columns == query_columns)
+            mask = build_generation_mask(input_ids, padding, start, total)
+
+            # run the prelude, recurrent occurrences and coda
             x = self.transformer.wte(input_ids)
             if self.emb_scale != 1:
                 x = x * self.emb_scale
@@ -421,6 +407,8 @@ class RecurrentGPT(torch.nn.Module):
                 cache = state.slot(("coda", index, 0, 0)) if use_cache else None
                 x = block(x, rotary, mask, cache)
             x = self.transformer.ln_final(x)
+
+            # produce outputs and publish the completed prefix
             logits = self.full_logits(x[:, -logits_to_keep:] if logits_to_keep else x) if return_logits else None
             state.finish()
             loss = torch.as_tensor(0.0)
