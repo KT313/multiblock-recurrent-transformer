@@ -51,6 +51,8 @@ from data_preparation.lib.stages.download import (
 )
 from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, NUMBER_OF_SPECIAL_TOKENS, estimate_tokens
 
+from data_preparation.lib.stages import download_progress, download_state
+
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
 Row = dict[str, Any]
@@ -847,7 +849,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     row exactly once (round-2 bug: the totals were saved from the running counters).
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", token_batch)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", token_batch)
     src_dir = layout.root.parent / "drop"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
     cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, dataset_max_sequence_length=5))
@@ -1058,7 +1060,7 @@ def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total:
 def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (256 in production)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (256 in production)
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     offsets = _failing_loader(monkeypatch, fail_at=27)
     with pytest.raises(OSError, match="connection reset"):
@@ -1303,7 +1305,7 @@ def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
     ahead of the token worker gets there (in one thread the tokenizer would wait for rows that are never pulled).
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
     tokenizer_may_go = threading.Event()
 
     def on_batch(call: int) -> None:
@@ -1311,7 +1313,7 @@ def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
             assert tokenizer_may_go.wait(timeout=10), "the fetch thread did not run ahead of the tokenizer"
 
     def on_row(yielded: int) -> None:
-        if yielded == 3 * download_module.TOKEN_BATCH:
+        if yielded == 3 * download_state.TOKEN_BATCH:
             tokenizer_may_go.set()
 
     monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
@@ -1334,7 +1336,7 @@ def test_a_failure_on_the_token_worker_ends_the_download_like_a_loader_failure(
     discarded (the same outcome as the loader failing there), and the next call resumes at shard 2.
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
 
     def on_batch(call: int) -> None:
         if call == 5:
@@ -1371,7 +1373,7 @@ def test_download_github_code_group_resumes_every_folder_aligned_after_a_stop(
     uninterrupted pass. Rows reach the writers in small batches so the stop lands mid-pass.
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 2)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 2)
     for prefix in "abcd":
         hub.add(f"data/{prefix}.parquet", _code_rows(prefix, 12))  # row groups of 2; Python, Java, Go in turns
     sources = {"py": _github("Python"), "rust": _github("Rust")}
@@ -1462,7 +1464,7 @@ def bars(monkeypatch: pytest.MonkeyPatch) -> list[_RecordingBar]:
         opened.append(bar)
         return bar
 
-    monkeypatch.setattr(download_module, "progress", fake_progress)
+    monkeypatch.setattr(download_progress, "progress", fake_progress)
     return opened
 
 

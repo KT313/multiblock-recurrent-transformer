@@ -17,6 +17,7 @@ import pytest
 from data_preparation.conftest import REPO, REV, FakeHub
 from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.layout import DatasetLayout
+from data_preparation.lib.stages import download_state, download_workers
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.progress import NoProgress
 from data_preparation.lib.sources.hub_files import FileIndex
@@ -84,7 +85,7 @@ class _Scenario:
             def close(self) -> None:
                 scenario.action("rows close")
 
-        monkeypatch.setattr(module, "ShardWriter", Writer)
+        monkeypatch.setattr(download_workers, "ShardWriter", Writer)
         monkeypatch.setattr(module, "_TokenWorker", Worker)
         self.rows = Rows()
 
@@ -197,7 +198,7 @@ def test_worker_reports_storage_failure_after_cancellation_and_join(monkeypatch:
         calls += 1
         raise stop if calls == 1 else storage
 
-    monkeypatch.setattr(module, "_store", store)
+    monkeypatch.setattr(download_workers, "_store", store)
     increment: Any = SimpleNamespace(name="A", submitted=0, settled=0, token_step=SimpleNamespace(tokenize=lambda batch: batch))
     worker = module._TokenWorker("failure-selection", {"A": SimpleNamespace()}, NoProgress(), module._StopGate(None))
     try:
@@ -280,7 +281,7 @@ def test_published_callback_failure_never_republishes_or_advances_unpersisted_ro
 ) -> None:
     cfg = cfg_factory({"s": SourceConfig(kind="pretrain", loader="synthetic")})
     module.prepare_tokenizer(cfg, layout)
-    monkeypatch.setattr(module, "TOKEN_BATCH", 2)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 2)
     original_record = RawFolder.record_shard
     callbacks: list[str] = []
     failure = OSError("callback after commit")
