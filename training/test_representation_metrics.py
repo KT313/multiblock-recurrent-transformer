@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, cast
+from dataclasses import replace
+from typing import Any, Literal, cast
 
 import pytest
 import torch
@@ -121,7 +122,11 @@ def test_selection_uses_local_document_boundaries_and_retains_prompt_context() -
 
 
 @pytest.mark.parametrize('precision', ['32', 'bf16-mixed'])
-def test_probe_is_repeatable_and_preserves_training_state(tiny_model: RecurrentGPT, precision: str) -> None:
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_probe_is_repeatable_and_preserves_training_state(
+    tiny_model: RecurrentGPT, precision: str, scaling: Literal['none', 'inverse_sqrt_depth'],
+) -> None:
+    tiny_model = RecurrentGPT(replace(tiny_model.config, residual_scaling=scaling))
     backend = SingleDeviceBackend('cpu', precision)
     tiny_model.train()
     tiny_model.transformer.coda[0].eval()  # preserve deliberately mixed child flags
@@ -145,6 +150,7 @@ def test_probe_is_repeatable_and_preserves_training_state(tiny_model: RecurrentG
     second = track_recurrence_metrics(tiny_model, backend, make_pack(), correlations='adapter,attention,mlp')
     assert {'token_correlation','token_dispersion','state_sensitivity'} <= first.keys()
     assert first['recurrence_probe/step'] == 8 and first['recurrence_probe/tokens'] == 4
+    assert first['recurrence_probe/residual_scale'] == pytest.approx(tiny_model.config.residual_scale)
     for key in first:
         torch.testing.assert_close(first[key], second[key], rtol=0, atol=0, equal_nan=True)
     assert torch.equal(torch.get_rng_state(), rng)
@@ -208,6 +214,33 @@ def test_disabled_details_do_not_calculate_correlations_or_install_hooks(
     result = track_recurrence_metrics(tiny_model, SingleDeviceBackend('cpu', '32'), make_pack(), correlations=selector)
     assert not any(key.startswith(('adapter/', 'attention/', 'mlp/')) for key in result)
     assert {'token_correlation', 'token_dispersion', 'state_sensitivity'} <= result.keys()
+
+
+def test_scaled_probe_matches_normal_forward_with_identical_initial_states(
+    tiny_model: RecurrentGPT, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = RecurrentGPT(replace(tiny_model.config, residual_scaling='inverse_sqrt_depth')).eval()
+    backend = SingleDeviceBackend('cpu', '32')
+    batch = make_pack()
+    probe = track_recurrence_metrics(model, backend, batch)
+    generator = torch.Generator().manual_seed(233)
+    def initialize(x: torch.Tensor) -> torch.Tensor:
+        return torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
+    monkeypatch.setattr('model.model.initialize_state', initialize)
+    observed = []
+    def record(module: torch.nn.Module, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
+        observed.append(output.detach().clone())
+    handle = model.transformer.ln_final.register_forward_hook(record)
+    tokens = select_probe_document(batch, model.config.model_max_sequence_length)
+    assert tokens is not None
+    try:
+        with torch.no_grad():
+            model(tokens, num_steps=(2, 0))  # tiny's configured mean and probe depth, held fixed
+    finally:
+        handle.remove()
+    expected = representation_metrics(observed[0][0])
+    for metric in ('correlation', 'dispersion', 'rms'):
+        torch.testing.assert_close(probe[f'representation/pre_head/{metric}'], expected[metric], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('selector', ['adapter', 'attention', 'mlp', 'adapter,attention', 'adapter,mlp', 'attention,mlp',

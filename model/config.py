@@ -42,6 +42,7 @@ class RoPESettings:
 
 # The accepted values of `bf16_residual_stream` (see the field).
 BF16_RESIDUAL_STREAM_VALUES = ("none", "core", "all")
+RESIDUAL_SCALING_VALUES = ("none", "inverse_sqrt_depth")
 
 # Fields that only ever had one value in the thesis run. They stay in the config (and in exported config.json files)
 # so that a different value is rejected loudly instead of silently running a different architecture.
@@ -103,6 +104,7 @@ class RecurrentConfig:
     # is bf16 (prelude, coda, the residual across blocks and the block input stay fp32), "all" rounds every RMSNorm.
     # Without autocast the stream is fp32 whatever the value. Parameters, gradients and optimizer state are unaffected.
     bf16_residual_stream: Literal["none", "core", "all"] = "none"
+    residual_scaling: Literal["none", "inverse_sqrt_depth"] = "none"
     init_strategy: Literal["takase"] = "takase"
     init_orthogonal: bool = True  # False: independent normal entries truncated at +/-3 Takase standard deviations
     activation_checkpoint_impl: Literal["per-iteration"] = "per-iteration"
@@ -136,6 +138,8 @@ class RecurrentConfig:
                 f"bf16_residual_stream={self.bf16_residual_stream!r} is not supported, only one of "
                 f"{BF16_RESIDUAL_STREAM_VALUES}"
             )
+        if self.residual_scaling not in RESIDUAL_SCALING_VALUES:
+            raise ValueError(f"residual_scaling={self.residual_scaling!r} is not supported; choose {RESIDUAL_SCALING_VALUES}")
 
         self._validate_sizes()
 
@@ -170,6 +174,8 @@ class RecurrentConfig:
         for n_layers, mean_recurrence in zip(self.n_layers_in_recurrent_block, self.mean_recurrence):
             recurrent_depth += n_layers * mean_recurrence
         self.effective_expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
+        # One fixed coefficient for all sandwich branches; sampled/evaluation depths never change the model map.
+        self.residual_scale = 1 / math.sqrt(self.effective_expected_depth) if self.residual_scaling == "inverse_sqrt_depth" else 1.0
 
         # Largest number of core-block layers the gradient can flow through (layers times the backprop cap, summed);
         # the actual number is lower whenever a block draws fewer than `mean_backprop_depth` iterations.

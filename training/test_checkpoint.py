@@ -569,6 +569,19 @@ def test_legacy_checkpoint_kernel_flag_means_native(
     check_settings_unchanged(metadata, current, config, True)
 
 
+def test_legacy_checkpoint_residual_scaling_defaults_to_none(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.model_config.pop('residual_scaling')
+    settings = _settings(run_name='tiny', seed=42)
+    config = tiny_model.config.to_dict()
+    check_settings_unchanged(metadata, settings, config, False)
+    with pytest.raises(ValueError, match='residual_scaling'):
+        check_settings_unchanged(metadata, settings, config | {'residual_scaling': 'inverse_sqrt_depth'}, False)
+    assert 'residual_scaling' not in metadata.model_config  # preserve historical metadata
+
+
 def test_legacy_objective_requires_acknowledgement(backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
                                                   caplog: pytest.LogCaptureFixture) -> None:
     settings = _settings(run_name="tiny", seed=42)

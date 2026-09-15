@@ -25,6 +25,7 @@ padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple
 tie_embeddings: true           # lm_head shares the token-embedding weights
 
 # Block details
+residual_scaling: none        # inverse_sqrt_depth: scale each sandwich attention/MLP branch by 1/sqrt(expected depth)
 init_orthogonal: true         # false: independent truncated-normal weights at Takase scales (+/-3 std)
 rope_settings:
   rope_base: 50000             # base of the rotary position embedding frequencies

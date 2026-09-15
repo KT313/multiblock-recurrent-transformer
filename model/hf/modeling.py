@@ -56,6 +56,7 @@ _MODEL_FIELDS = (
     "norm_eps",
     "qk_bias",
     "bf16_residual_stream",
+    "residual_scaling",
     "init_strategy",
     "init_orthogonal",
     "activation_checkpoint_impl",

@@ -72,6 +72,8 @@ Additional W&B keys retain detail:
   Both families include the same sample-count/degeneracy fields as adapters. Core/layer indices are zero-based;
   iteration indices are one-based. Only sandwich layers inside recurrent cores are instrumented.
 - `recurrence_probe/{version,available,tokens,seed,rank,step}`. `step` is the completed-step number of the probe.
+- `recurrence_probe/residual_scale`: the fixed sandwich-branch coefficient (1 when scaling is disabled).
+  Attention/MLP hooks observe raw module outputs before this multiplication; later representations include it.
 
 Probe version 3 makes detailed correlations opt-in and adds attention/MLP selection; version 2 logged adapters
 unconditionally. Existing summary definitions are unchanged. The three

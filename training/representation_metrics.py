@@ -232,6 +232,7 @@ def track_recurrence_metrics(
     means = model.config.mean_recurrence
     assert isinstance(means, list)
     metrics.update({'recurrence_probe/version': torch.tensor(PROBE_VERSION), 'recurrence_probe/tokens': torch.tensor(tokens.numel()),
+                    'recurrence_probe/residual_scale': torch.tensor(model.config.residual_scale),
                     'recurrence_probe/seed': torch.tensor(PROBE_SEED), 'recurrence_probe/rank': torch.tensor(backend.rank),
                     'recurrence_probe/step': torch.tensor(model.step+1)})
     def record(name: str, hidden: Tensor) -> dict[str, Tensor]:

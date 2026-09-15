@@ -219,7 +219,8 @@ def check_settings_unchanged(
     # Checkpoints predating kernel integration always used native operations. Treat an absent flag as false,
     # while keeping changes subject to the same resume policy as precision and compilation.
     stored_settings = {"use_custom_kernels": False, "loss_normalization": "legacy_pack_v0"} | metadata.settings
-    stored_model_config = {"use_custom_kernels": False} | metadata.model_config
+    # Pre-scaling checkpoints used unit-gain sandwich branches; only that default is implicit on resume.
+    stored_model_config = {"use_custom_kernels": False, "residual_scaling": "none"} | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
         key: f"checkpoint {stored_settings[key]!r} != current {current[key]!r}"

@@ -50,6 +50,27 @@ def seeded_tiny(seed: int = 0, **kwargs: Any) -> RecurrentGPT:
     return build_model(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | kwargs))
 
 
+def test_residual_scaling_reaches_all_layers_without_changing_weights_or_outer_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = seeded_tiny()
+    rng_plain = torch.get_rng_state().clone()
+    scaled = seeded_tiny(residual_scaling='inverse_sqrt_depth')
+    assert torch.equal(torch.get_rng_state(), rng_plain)
+    assert plain.state_dict().keys() == scaled.state_dict().keys()
+    for name, value in plain.state_dict().items():
+        assert torch.equal(value, scaled.state_dict()[name]), name
+    layers = [module for module in scaled.modules() if isinstance(module, SandwichBlock)]
+    assert len(layers) == 5  # prelude 2, two cores of one layer each, coda 1
+    assert all(layer.residual_scale == scaled.config.residual_scale for layer in layers)
+    def constant_core(*args: Any, **kwargs: Any) -> Tensor:
+        return torch.ones(1, 3, scaled.config.n_embd)
+    monkeypatch.setattr(scaled, 'run_core_block', constant_core)
+    x = torch.zeros(1, 3, scaled.config.n_embd)
+    actual = scaled.run_core_blocks(x, scaled.freqs_cis[:, :3], None, [(1, 0), (8, 0)])
+    assert torch.equal(actual, x+2)  # each whole-core output still added at gain 1
+
+
 def test_nonorthogonal_model_initialization_and_checkpoint_restore(monkeypatch: pytest.MonkeyPatch) -> None:
     from model.layers.init import checkpoint_initialization
     def forbidden(*args: Any, **kwargs: Any) -> None:
@@ -617,9 +638,10 @@ def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
 
 
 @pytest.mark.parametrize("mode", ["selective", "full"])
-def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    plain = seeded_tiny()
-    ckpt = seeded_tiny(gradient_checkpointing=mode)
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str, scaling: str) -> None:
+    plain = seeded_tiny(residual_scaling=scaling)
+    ckpt = seeded_tiny(gradient_checkpointing=mode, residual_scaling=scaling)
     assert ckpt.gradient_checkpointing == mode
     calls: list[int] = []
     wrapper_name = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}[mode]

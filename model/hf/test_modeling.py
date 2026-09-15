@@ -184,11 +184,13 @@ def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
     assert hf_cfg.to_recurrent_config() == defaults
 
 
-def test_hf_config_survives_json_round_trip(tmp_path: Path) -> None:
-    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config())
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_hf_config_survives_json_round_trip(tmp_path: Path, scaling: str) -> None:
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config(residual_scaling=scaling))
     hf_cfg.save_pretrained(tmp_path)
     loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
     assert loaded.to_recurrent_config() == hf_cfg.to_recurrent_config()
+    assert loaded.to_recurrent_config().residual_scale == hf_cfg.to_recurrent_config().residual_scale
 
 
 def tiny_hf_model() -> RecurrentGPTForCausalLM:
@@ -695,9 +697,10 @@ def test_saved_config_revalidates_special_token_ids(tmp_path: Path) -> None:
         RecurrentGPTConfig.from_pretrained(tmp_path)
 
 
-def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_export_and_reload_with_trust_remote_code(tmp_path: Path, scaling: str) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, residual_scaling=scaling)
     out_dir = export_to_hf(model, model.config, tmp_path / "export", allow_missing_generation_metadata=True)
     names = {p.name for p in out_dir.iterdir()}
     assert {"config.json", "model.safetensors", "hf_modeling.py", "model.py", "config.py", "layers_norms.py"} <= names
@@ -707,6 +710,8 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     cfg = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
     assert cfg.model_type == "recurrent_gpt"
     loaded = load_exported(out_dir)
+    assert loaded.model.config.residual_scaling == scaling
+    assert loaded.model.config.residual_scale == model.config.residual_scale
     # In-process, transformers resolves the registered class from `model.hf.modeling` (see the standalone test for the copied
     # sources); the weights nevertheless come from the exported safetensors.
     assert isinstance(loaded, RecurrentGPTForCausalLM)

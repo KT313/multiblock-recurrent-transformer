@@ -12,12 +12,12 @@ from model.model import RecurrentGPT
 from model.test_config import tiny_config
 
 
-def generation_model() -> RecurrentGPT:
+def generation_model(**overrides: Any) -> RecurrentGPT:
     torch.manual_seed(7)
     return RecurrentGPT(tiny_config(
         n_embd=32, intermediate_size=64, n_layers_in_prelude=1, n_layers_in_coda=1,
         n_layers_in_recurrent_block=[2, 1], mean_recurrence=[2, 3], mean_backprop_depth=[1, 1],
-        model_max_sequence_length=32,
+        model_max_sequence_length=32, **overrides,
     )).eval()
 
 
@@ -29,10 +29,11 @@ def batch() -> tuple[Tensor, Tensor]:
 
 @pytest.mark.parametrize("chunks", [(4, 1, 1, 1), (2, 3, 2), (7,)])
 @pytest.mark.parametrize("explicit_positions", [False, True])
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
 def test_cached_prefix_matches_nonzero_fixed_latent_reference(
-    chunks: tuple[int, ...], explicit_positions: bool,
+    chunks: tuple[int, ...], explicit_positions: bool, scaling: str,
 ) -> None:
-    model = generation_model()
+    model = generation_model(residual_scaling=scaling)
     ids, mask = batch()
     cached, reference = GenerationState(seed=321), GenerationState(seed=321)
     positions = (mask.cumsum(-1) - 1).clamp(min=0) + 3 if explicit_positions else None

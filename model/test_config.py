@@ -268,6 +268,25 @@ def test_initialization_selection_survives_json(tmp_path: Path, orthogonal: bool
     assert restored.init.table == cfg.init.table
 
 
+@pytest.mark.parametrize('mode', ['none', 'inverse_sqrt_depth'])
+def test_residual_scaling_uses_expected_transformer_depth(tmp_path: Path, mode: str) -> None:
+    cfg = tiny(residual_scaling=mode, n_layers_in_prelude=3, n_layers_in_coda=3,
+               n_layers_in_recurrent_block=[5, 5, 5], mean_recurrence=[8, 8, 8], mean_backprop_depth=[6, 6, 6])
+    assert cfg.effective_expected_depth == 126
+    assert cfg.residual_scale == (126**-.5 if mode == 'inverse_sqrt_depth' else 1.0)
+    cfg.to_json(tmp_path/'model.json')
+    restored = RecurrentConfig.from_json(tmp_path/'model.json')
+    assert restored.residual_scale == cfg.residual_scale
+    assert 'residual_scale' not in cfg.to_dict()  # derived, never mistaken for another persisted knob
+    assert tiny().residual_scaling == 'none' and tiny().residual_scale == 1.0
+
+
+@pytest.mark.parametrize('value', [None, True, False, 1, .1, '', 'sqrt_depth', [], {}])
+def test_residual_scaling_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match='residual_scaling'):
+        tiny(residual_scaling=value)
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
