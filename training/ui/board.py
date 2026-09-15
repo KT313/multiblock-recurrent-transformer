@@ -47,7 +47,7 @@ from ui.display import LiveDisplay, line
 
 DEFAULT_LOG_LINES = 12
 DEFAULT_EVENT_LINES = 6
-DEFAULT_REFRESH_PER_SECOND = 4  # bounded: the live display redraws on its own timer, never per optimizer step
+DEFAULT_REFRESH_PER_SECOND = 2  # poll for content changes every 500 ms; time-only frames wait up to 10 s
 
 
 @dataclass
@@ -113,7 +113,9 @@ class TrainingDashboard(LiveDisplay):
         self.details = dict(details or {})
         self.log_step_interval = max(int(log_step_interval), 1)
         super().__init__(
-            stream=stream if stream is not None else sys.stdout, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
+            stream=stream if stream is not None else sys.stdout, console=console,
+            refresh_per_second=min(max(refresh_per_second, 0.1), DEFAULT_REFRESH_PER_SECOND), log_lines=log_lines,
+            get_refresh_key=self._snapshot_for_refresh, refresh_clock=clock,
         )
         # plain lines once the display is gone: the run's fallback stream when it has one, else the display's own stream
         if fallback_stream is not None:
@@ -445,6 +447,20 @@ class TrainingDashboard(LiveDisplay):
             return [*self._bars, self._overall]
 
     # --- rendering ------------------------------------------------------------------------------------------------------
+
+    def _snapshot_for_refresh(self) -> object:
+        """Copy the displayed state without elapsed time or the overall bar's time-derived note."""
+
+        with self._lock:
+            bars = tuple((bar.name, bar.total, bar.completed, bar.note, bar.marker, bar.style) for bar in self._bars)
+            micro = (self._micro.total, self._micro.completed, self._micro.note) if self.show_micro_batches else None
+            validation = None if self._validation is None else (self._validation[0], tuple(self._validation[1].items()))
+            return (
+                self.run_name, tuple(self.details.items()), self._status, self._step, bars,
+                self._overall.total, self._overall.completed, micro, tuple(self._latest.items()), validation,
+                self._throughput.seconds_per_step, tuple(self._events), tuple(self._panel_lines),
+                self._panel_height, self._log_file,
+            )
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         try:

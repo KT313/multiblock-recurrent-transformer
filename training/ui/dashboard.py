@@ -11,7 +11,9 @@ Built on rich as the sibling of data_preparation/lib/ui/dashboard.py: both subcl
 a header (run, model / dataset config, device / precision, status), one bar per stage plus an overall bar with an
 ETA, the latest step's metrics, the latest validation losses per depth, the last events, the last logging
 records and a footer naming the log file. Every row is one line, the panels shrink on a short terminal, every
-mutation and render holds one lock, and the display redraws on its own timer: update_step is O(1).
+mutation and render holds one lock. The display checks for changes every 500 ms and redraws only when the
+displayed state changes, with a time-only heartbeat after 10 s; update_step is O(1). Startup and final cleanup
+are immediate. Elapsed time alone does not trigger the faster redraws.
 
 While the display is up nothing may print around it, so __enter__ (:class:`~training.ui.capture.TerminalCapture`)
 routes every logging record into the panel (third-party stream handlers detached for the duration), turns every

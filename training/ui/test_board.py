@@ -251,6 +251,7 @@ def test_a_dead_terminal_closes_the_display_and_training_continues(tmp_path: Pat
     with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
         b.update_step(1, 0, None, metrics(1))
         file.die()
+        clock.advance(0.5)
         live = _live_of(b)
         assert live is not None
         live.refresh()
@@ -273,6 +274,7 @@ def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen(clock: 
         live.refresh()
         assert "\x1b[2J" not in console_output(console), "the same size: the previous frame is erased with cursor-up"
         console.size = (100, 30)
+        clock.advance(0.5)
         live.refresh()
         live.refresh()
         assert console_output(console).count("\x1b[2J\x1b[H") == 1, "one clear per size change, right before the frame"
@@ -498,7 +500,8 @@ def test_a_frame_that_fails_outside_the_render_demotes_the_board_to_the_console_
         live = _live_of(b)
         assert live is not None
         b._console.file = _RaisingFile()
-        live.refresh()  # what the refresh thread does 4-8 times a second
+        clock.advance(10)
+        live.refresh()  # the idle heartbeat still detects a failed terminal write
         assert _is_enabled(b) is False and _live_of(b) is None and not b.headless, "the terminal itself is fine"
         b.update_step(2, 0, None, metrics(2))
     output = stream.getvalue()
