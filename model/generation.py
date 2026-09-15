@@ -143,12 +143,27 @@ class GenerationState:
         Cached input_ids are new tokens only; mask always describes the entire prefix. Reference input_ids and
         positions are the entire prefix. Explicit nondefault positions remain supported and validated.
         """
+        # validate mode, model identity and incoming prefix before any mutation
+        self._validate_generation_mode(model, use_cache)
+        signature = self._build_model_signature(model, input_ids)
+        self._validate_model_signature(signature, steps)
+        start = self._validate_generation_inputs(input_ids, mask, positions, use_cache, max_positions)
+        all_ids, all_positions = self._assemble_pending_prefix(input_ids, positions, use_cache)
+
+        # retain the validated prefix until finish publishes it
+        self._signature, self._steps, self._cached = signature, steps, use_cache
+        self._pending = all_ids.clone(), mask.clone(), all_positions.clone()
+        return start
+
+    def _validate_generation_mode(self, model: torch.nn.Module, use_cache: bool) -> None:
         if self._failed or self._pending is not None:
             raise ValueError("generation state is invalid or has an unfinished forward; start a new generation")
         if model.training or torch.is_grad_enabled():
             raise ValueError("generation state requires eval mode and no_grad/inference_mode")
         if self._cached is not None and self._cached != use_cache:
             raise ValueError("cannot switch cache mode within a generation")
+
+    def _build_model_signature(self, model: torch.nn.Module, input_ids: Tensor) -> tuple[object, ...]:
         parameters, buffers = tuple(model.parameters()), tuple(model.buffers())
         if any(tensor.is_inference() for tensor in (*parameters, *buffers)):
             raise ValueError(
@@ -162,10 +177,17 @@ class GenerationState:
             torch.is_autocast_enabled(input_ids.device.type),
             torch.get_autocast_dtype(input_ids.device.type),
         )
+        return signature
+
+    def _validate_model_signature(self, signature: tuple[object, ...], steps: tuple[int, ...]) -> None:
         if self._signature is not None and self._signature != signature:
             raise ValueError("model weights, device or precision changed; start a new generation")
         if self._steps is not None and self._steps != steps:
             raise ValueError("recurrence schedule changed; start a new generation")
+
+    def _validate_generation_inputs(
+        self, input_ids: Tensor, mask: Tensor, positions: Tensor, use_cache: bool, max_positions: int,
+    ) -> int:
         batch, query_length = input_ids.shape
         start = self._length if use_cache else 0
         total = start + query_length
@@ -179,6 +201,9 @@ class GenerationState:
             raise ValueError("generation positions exceed the model's RoPE table")
         if self._mask is not None and not torch.equal(mask[:, :self._length], self._mask):
             raise ValueError("generation padding mask changed; start a new generation")
+        return start
+
+    def _assemble_pending_prefix(self, input_ids: Tensor, positions: Tensor, use_cache: bool) -> tuple[Tensor, Tensor]:
         if use_cache:
             all_ids = input_ids if self._ids is None else torch.cat((self._ids, input_ids), dim=1)
             all_positions = positions if self._positions is None else torch.cat((self._positions, positions), dim=1)
@@ -187,9 +212,7 @@ class GenerationState:
             if self._positions is not None and not torch.equal(positions[:, :self._length], self._positions):
                 raise ValueError("generation positions changed; start a new generation")
             all_ids, all_positions = input_ids, positions
-        self._signature, self._steps, self._cached = signature, steps, use_cache
-        self._pending = all_ids.clone(), mask.clone(), all_positions.clone()
-        return start
+        return all_ids, all_positions
 
     def finish(self) -> None:
         assert self._pending is not None
