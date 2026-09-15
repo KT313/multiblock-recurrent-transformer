@@ -127,8 +127,8 @@ def test_checkpoint_precision_reaches_both_entry_points(
         calls.append(kwargs["execution_policy"])
         return {}
 
-    monkeypatch.setattr("evaluation.evaluate.generate_and_save_samples", samples)
-    monkeypatch.setattr("evaluation.evaluate.evaluate_on_benchmarks", benchmarks)
+    monkeypatch.setattr("evaluation.cli.commands.generate_and_save_samples", samples)
+    monkeypatch.setattr("evaluation.cli.commands.evaluate_on_benchmarks", benchmarks)
     argv = ["--checkpoint", str(checkpoint), "--device", "cpu", "--tasks", "offline"]
     if override is not None:
         argv.extend(["--precision", override])
