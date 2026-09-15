@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
 from fractions import Fraction
 from math import ceil
 from pathlib import Path
@@ -40,10 +39,21 @@ from data_preparation.lib.storage.snapshot import read_snapshot
 from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.storage.parquet import SHARD_PATTERN
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
+from training.data.entries import DataEntry, ResolvedDataset, ResolvedStage
 from training.settings import Settings
 
 if TYPE_CHECKING:  # annotation only: this module stays torch-free, `training.checkpoint` imports torch
     from training.checkpoint import CheckpointMetadata
+
+__all__ = [
+    "DataEntry", "ResolvedDataset", "ResolvedStage", "INSTRUCT_DATA_SIGNATURE", "Part", "TRAIN_LOADER_NUM_WORKERS",
+    "build_command", "validation_rows_of", "processed_rows", "processed_row_counts", "resolve_splits",
+    "resolve_train_sources", "resolve_val_entries", "entry_rows_in_range", "check_entries", "check_entry_rows",
+    "loader_shards", "check_entry_shards", "validation_batches_available", "check_validation_batches",
+    "validate_settings", "resolve_dataset", "load_dataset_setup", "resolve_dataset_metadata",
+    "build_resolved_dataset", "check_dataset_identity_across_ranks", "check_dataset_unchanged",
+    "resolve_stage_plan",
+]
 
 log = get_logger(__name__)
 
@@ -59,51 +69,7 @@ TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker pr
 # batch size and prefetch depth are `training.data.loader.TRAIN_LOADER_BATCH_ROWS` / `TRAIN_LOADER_PREFETCH_FACTOR`)
 
 
-@dataclass
-class DataEntry:
-    """
-    One parquet dataset directory with the row range its loader reads: a run-wide train source
-    (`ResolvedDataset.train_sources`, prefix = the source name) or a member of a stage's validation mixture
-    (`ResolvedStage.val_data`, prefix = `<stage>-<source>`).
-    """
-
-    prefix: str  # unique name within its list, used for logging (train: the data_id of `data_composition/...`)
-    data_dir: str  # directory with *.parquet files
-    weight: float = 1.0  # sampling weight relative to the other entries of the same stage
-    data_signature: Optional[dict[str, Any]] = None  # {"keys": [...], "format_fn": "..."}; default: text column
-    skip_rows: int = 0  # rows of the directory to skip from the start (shard order data-00000, data-00001, ...)
-    max_rows: Optional[int] = None  # at most this many rows after the skip; None = up to the last row
-
-
 _BuildBackend = OwnershipBackend
-
-
-@dataclass
-class ResolvedStage:
-    """
-    One training stage: token budget, base LR, transition length, sampling weights over the run-wide train sources
-    and its validation entries resolved on disk. The stage structure changes the WEIGHTS only.
-    """
-
-    name: str
-    tokens: int
-    base_lr: float
-    transition_pct: float
-    train_weights: dict[str, float]  # source name -> sampling weight (the dataset config's `stage.train`, sum 1)
-    val_data: list[DataEntry]
-
-
-@dataclass
-class ResolvedDataset:
-    config: DatasetConfig
-    config_hash: str
-    tokenizer_dir: str
-    stages: list[ResolvedStage]
-    train_sources: list[DataEntry]  # one per source any stage trains on, in config order; read by ONE loader all run
-    validation_rows: dict[str, int]  # per source: rows [0, n) of processed/<source> are validation, the rest training
-    source_rows: dict[str, int]  # per source: the rows of processed/<source> (what a checkpoint stores and a resume verifies)
-    rows_on_disk: dict[str, int]  # per processed directory (`DataEntry.data_dir`): its rows, counted once at setup
-    dataset_build_id: str | None = None  # None only for legacy/manual callers, never a resolved managed dataset
 
 
 def build_command(dataset_config: str, dataset_dir: str) -> str:
@@ -533,41 +499,76 @@ def _resolve_dataset(
     validation loader that cannot fill one micro-batch; `ValueError` for an entry with fewer rows than loader shards.
     """
 
+    # agree on configuration and prepare missing data under the existing lease
     with main_rank_phase(backend, "dataset configuration"):
-        dataset_config = load_dataset_config(settings.dataset_config)
-        validate_settings(settings, dataset_config)
-        layout = DatasetLayout(Path(settings.dataset_dir)).for_config(dataset_config)
+        dataset_config, layout = load_dataset_setup(settings)
     _ensure_prepared(settings, dataset_config, layout, backend, should_stop, dataset_lease)
-    with main_rank_phase(backend, "dataset metadata resolution"):
-        rows_on_disk = processed_row_counts(dataset_config, layout)
-        validation_rows = resolve_splits(dataset_config, layout, rows_on_disk)
 
-        train_sources = resolve_train_sources(dataset_config, layout, validation_rows)
-        stages = resolve_stage_plan(settings, dataset_config)
-        for resolved, stage in zip(stages, dataset_config.stages):
-            resolved.val_data = resolve_val_entries(dataset_config, layout, stage, validation_rows)
-        world_size = 1 if backend is None else backend.world_size
-        check_entries(train_sources, stages, rows_on_disk, world_size)
-        check_validation_batches(
-            stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
-        )
-        snapshot = read_snapshot(dataset_config, layout, processing=global_policy(dataset_config) if layout.processed_scope else None)
-        resolved_dataset = ResolvedDataset(
-            config=dataset_config,
-            config_hash=dataset_config.config_hash(),
-            tokenizer_dir=str(layout.tokenizer_dir(dataset_config.tokenizer.name)),
-            stages=stages,
-            train_sources=train_sources,
-            validation_rows=validation_rows,
-            source_rows={name: rows_on_disk[str(layout.processed_dir(name))] for name in dataset_config.sources},
-            rows_on_disk=rows_on_disk,
-            dataset_build_id=snapshot.build_id,
-        )
+    # resolve and validate row ranges before publishing the common build identity
+    with main_rank_phase(backend, "dataset metadata resolution"):
+        resolved_dataset = resolve_dataset_metadata(settings, dataset_config, layout, backend)
+    check_dataset_identity_across_ranks(resolved_dataset, backend)
+    return resolved_dataset
+
+
+def load_dataset_setup(settings: Settings) -> tuple[DatasetConfig, DatasetLayout]:
+    """Load and cross-check configuration before touching the prepared dataset."""
+
+    dataset_config = load_dataset_config(settings.dataset_config)
+    validate_settings(settings, dataset_config)
+    layout = DatasetLayout(Path(settings.dataset_dir)).for_config(dataset_config)
+    return dataset_config, layout
+
+
+def resolve_dataset_metadata(
+    settings: Settings, dataset_config: DatasetConfig, layout: DatasetLayout, backend: Optional[_BuildBackend],
+) -> ResolvedDataset:
+    """Count managed rows once and resolve verified training and validation ranges."""
+
+    # resolve source splits and stage mixtures in configuration order
+    rows_on_disk = processed_row_counts(dataset_config, layout)
+    validation_rows = resolve_splits(dataset_config, layout, rows_on_disk)
+    train_sources = resolve_train_sources(dataset_config, layout, validation_rows)
+    stages = resolve_stage_plan(settings, dataset_config)
+    for resolved, stage in zip(stages, dataset_config.stages):
+        resolved.val_data = resolve_val_entries(dataset_config, layout, stage, validation_rows)
+
+    # verify usable rank shards and validation batches before reading the snapshot
+    world_size = 1 if backend is None else backend.world_size
+    check_entries(train_sources, stages, rows_on_disk, world_size)
+    check_validation_batches(
+        stages, rows_on_disk, settings.validation_batch_size, settings.eval_iters_per_rank(world_size), world_size
+    )
+    return build_resolved_dataset(dataset_config, layout, stages, train_sources, validation_rows, rows_on_disk)
+
+
+def build_resolved_dataset(
+    dataset_config: DatasetConfig, layout: DatasetLayout, stages: list[ResolvedStage], train_sources: list[DataEntry],
+    validation_rows: dict[str, int], rows_on_disk: dict[str, int],
+) -> ResolvedDataset:
+    """Capture the verified ranges with their immutable managed-dataset identity."""
+
+    snapshot = read_snapshot(dataset_config, layout, processing=global_policy(dataset_config) if layout.processed_scope else None)
+    return ResolvedDataset(
+        config=dataset_config,
+        config_hash=dataset_config.config_hash(),
+        tokenizer_dir=str(layout.tokenizer_dir(dataset_config.tokenizer.name)),
+        stages=stages,
+        train_sources=train_sources,
+        validation_rows=validation_rows,
+        source_rows={name: rows_on_disk[str(layout.processed_dir(name))] for name in dataset_config.sources},
+        rows_on_disk=rows_on_disk,
+        dataset_build_id=snapshot.build_id,
+    )
+
+
+def check_dataset_identity_across_ranks(dataset: ResolvedDataset, backend: Optional[_BuildBackend]) -> None:
+    """Refuse ranks that resolved different managed dataset generations."""
+
     if backend is not None:
-        identities = backend.all_gather_object(resolved_dataset.dataset_build_id)
+        identities = backend.all_gather_object(dataset.dataset_build_id)
         if len(set(identities)) != 1:
             raise RuntimeError(f"dataset build identities differ across ranks: {identities}")
-    return resolved_dataset
 
 
 # --- resume checks ---------------------------------------------------------------------------------------------------
