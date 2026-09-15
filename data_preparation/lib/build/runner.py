@@ -51,6 +51,9 @@ from data_preparation.lib.dataset_config import DatasetConfig, load_dataset_conf
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted, StopCheck, check_stop
 from data_preparation.lib.build.lock import DatasetLease
+from data_preparation.lib.build.global_preparation import (
+    calculate_candidate_target, check_global_source_scope, inspect_completed_global_snapshot,
+)
 from data_preparation.lib.build.planner import (
     DatasetReport,
     DownloadPlan,
@@ -69,16 +72,14 @@ from data_preparation.lib.build.preparation import explain_unreadable_shards, op
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import github_code_repo_key
-from data_preparation.lib.stages.benchmark_seeds import load_benchmark_seeds
+from data_preparation.lib.stages.benchmark_seeds import BenchmarkSeeds, load_benchmark_seeds
 from data_preparation.lib.stages.build import build_source
 from data_preparation.lib.stages.download import (
     download, download_github_code_group, inspect_tokenizer, prepare_planned_tokenizer, reopen_raw,
 )
 from data_preparation.lib.stages.global_dedup import global_policy, ordered_sources
-from data_preparation.lib.stages.global_build import build_global_source, outputs_complete, source_frontier
-from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
+from data_preparation.lib.stages.global_build import build_global_source, outputs_complete
 from data_preparation.lib.storage.manifest import Manifest
-from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
 
@@ -227,31 +228,16 @@ def prepare_global(
     num_workers: int, pass_workers: int, max_parallel_downloads: int, should_stop: StopCheck | None,
 ) -> DatasetReport:
     """Caller holds the exclusive lease until every worker and ordered writer stops."""
-    from data_preparation.lib.build.planner import source_ledger
 
-    for name in config.sources:
-        guarded_path(layout.root, layout.processed_dir(name))
-    repair = inspect_repairs(config, layout, config_name=config_name)
-    current = summarize_dataset_state(config, layout, needs_repair=[action.source for action in repair.actions])
-    current.snapshot_problem = snapshot_problem(config, layout, processing=global_policy(config))
-    if current.complete and not reopened and outputs_complete(config, layout):
-        if not dry_run:
-            tokenizer = assess_tokenizer_folder(
-                layout.tokenizer_dir(config.tokenizer.name), config.tokenizer_hash(), validate_payload=True,
-            )
-            if not tokenizer.ready and "tokenizer" not in steps:
-                raise ValueError(f"{tokenizer.problem}; run prepare with the tokenizer step to repair it")
-            current.tokenizer_complete = tokenizer.ready
-            current.tokenizer_problem = tokenizer.problem
-        if current.complete:
-            log.info("dataset-wide Bloom snapshot already complete; no preparation changes needed")
-            log_report(current)
-            return current
-    if selected is not None and set(selected) != set(config.sources):
-        raise ValueError(
-            "dataset-wide Bloom admission requires the complete dataset scope and priority prerequisites; "
-            "omit --sources to prepare/replay all sources before requesting a partial no-op"
-        )
+    # reuse a complete snapshot only after validating its tokenizer and output chain
+    current = inspect_completed_global_snapshot(config, layout, config_name, steps, reopened, dry_run=dry_run)
+    if current is not None:
+        log.info("dataset-wide Bloom snapshot already complete; no preparation changes needed")
+        log_report(current)
+        return current
+
+    # inspect and authorize the full priority scope before acquiring benchmark seeds
+    check_global_source_scope(config, selected)
     repair = inspect_global_repairs(config, layout, config_name)
     log.info("dataset-wide Bloom preparation/replay -> %s; source-local candidates and raw downloads are reusable", layout.processed_scope)
     if dry_run:
@@ -263,6 +249,7 @@ def prepare_global(
         config.bloom_deduplicate_across_sources_add_benchmarks if "build" in steps else [],
         memory_mb=config.bloom_dedup_memory_mb, hf_token=hf_token, should_stop=should_stop,
     ) as seeds:
+        # publish the tokenizer before repairs and source-local preparation
         if "tokenizer" in steps:
             prepare_planned_tokenizer(config, inspect_tokenizer(config, layout), hf_token=hf_token)
         perform_repairs(repair)
@@ -276,69 +263,87 @@ def prepare_global(
             max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
             hf_token=hf_token, should_stop=should_stop, config_name=config_name,
         )
+
+        # finish downloads or admit sources in priority order
         if "build" not in steps:
-            for _ in range(1, MAX_ROUNDS):
-                if "download" not in steps:
-                    break
-                followup = plan_downloads(config, candidates, sources=selected)
-                if followup.total_rows_to_fetch() == 0:
-                    break
-                download_and_build_missing(
-                    followup, config, candidates, steps=steps, sources=selected,
-                    max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
-                    hf_token=hf_token, should_stop=should_stop, config_name=config_name,
-                )
+            run_global_download_rounds(
+                config, candidates, steps, selected, max_parallel_downloads=max_parallel_downloads,
+                num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token,
+                should_stop=should_stop, config_name=config_name,
+            )
             return assess_dataset_state(config, layout, repair)
-        frontier = seeds.frontier(ordered_sources(config), config.bloom_dedup_memory_mb)
-        for name in ordered_sources(config):
-            start = frontier
-            complete = False
-            for round_number in range(1, MAX_ROUNDS + 1):
-                check_stop(should_stop)
-                ledger = source_ledger(config, name, layout)
-                if ledger.raw_state != "current":
-                    break
-                # Extend local candidates only by the global shortfall. Existing buffered
-                # raw shards are consumed before any additional download is requested.
-                local = Manifest.load(candidates.processed_dir(name))
-                target = ledger.rows_sufficient
-                retained = Manifest.load(layout.processed_dir(name))
-                if local is not None and retained is not None:
-                    target = local.rows() + max(0, ledger.rows_sufficient - ledger.processed_rows)
-                    if (not retained.generation_complete and retained.extra.get("candidate_generation") == local.generation_id
-                            and (source_frontier(retained).source_index > start.source_index
-                                 or source_frontier(retained).source_candidates < local.rows())):
-                        target = local.rows()  # recover pending candidates before planning a top-up
-                local = build_source(config, name, candidates, pass_workers=pass_workers,
-                                     should_stop=should_stop, rows_target=target)
-                frontier, complete = build_global_source(
-                    config, name, layout, start, rows_target=ledger.rows_sufficient,
-                    exhausted=ledger.exhausted, should_stop=should_stop, preseed_keys=seeds.keys(),
-                )
-                if complete:
-                    break
-                if round_number == MAX_ROUNDS:
-                    break
-                raw = Manifest.load(candidates.raw_dir(name))
-                if raw is not None and len(local.input_shards) < len(raw.shards):
-                    continue
-                if "download" not in steps:
-                    break
-                ledger = source_ledger(config, name, layout)
-                increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
-                # A zero-yield source can have unique rows later; continue bounded top-ups
-                # instead of treating global losses as proof that every later row is useless.
-                log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
-                download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
-                         hf_token=hf_token, should_stop=should_stop, config_name=config_name)
-                after = source_ledger(config, name, layout)
-                if after.raw_rows <= ledger.raw_rows and not after.exhausted:
-                    log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
-                    break
-            if not complete:
-                log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
-                break
+        run_global_admission_rounds(
+            config, layout, candidates, steps, seeds, pass_workers=pass_workers,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+        )
         return assess_dataset_state(config, layout, repair, publish=True)
+
+
+def run_global_download_rounds(
+    config: DatasetConfig, candidates: DatasetLayout, steps: set[str], selected: list[str] | None,
+    *, max_parallel_downloads: int, num_workers: int, pass_workers: int, hf_token: str | None,
+    should_stop: StopCheck | None, config_name: str,
+) -> None:
+    """Complete the remaining bounded download rounds when final admission was not requested."""
+    for _ in range(1, MAX_ROUNDS):
+        if "download" not in steps:
+            break
+        followup = plan_downloads(config, candidates, sources=selected)
+        if followup.total_rows_to_fetch() == 0:
+            break
+        download_and_build_missing(
+            followup, config, candidates, steps=steps, sources=selected,
+            max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+        )
+
+
+def run_global_admission_rounds(
+    config: DatasetConfig, layout: DatasetLayout, candidates: DatasetLayout, steps: set[str], seeds: BenchmarkSeeds,
+    *, pass_workers: int, hf_token: str | None, should_stop: StopCheck | None, config_name: str,
+) -> None:
+    """Admit each source before proceeding to the next, with bounded top-ups for global losses."""
+    frontier = seeds.frontier(ordered_sources(config), config.bloom_dedup_memory_mb)
+    for name in ordered_sources(config):
+        start = frontier
+        complete = False
+        for round_number in range(1, MAX_ROUNDS + 1):
+            check_stop(should_stop)
+            ledger = source_ledger(config, name, layout)
+            if ledger.raw_state != "current":
+                break
+
+            # consume pending candidates before requesting extra raw data
+            target = calculate_candidate_target(name, layout, candidates, ledger, start)
+            local = build_source(config, name, candidates, pass_workers=pass_workers,
+                                 should_stop=should_stop, rows_target=target)
+            frontier, complete = build_global_source(
+                config, name, layout, start, rows_target=ledger.rows_sufficient,
+                exhausted=ledger.exhausted, should_stop=should_stop, preseed_keys=seeds.keys(),
+            )
+            if complete:
+                break
+            if round_number == MAX_ROUNDS:
+                break
+            raw = Manifest.load(candidates.raw_dir(name))
+            if raw is not None and len(local.input_shards) < len(raw.shards):
+                continue
+            if "download" not in steps:
+                break
+
+            # top up boundedly: a zero-yield source may still have unique rows later
+            ledger = source_ledger(config, name, layout)
+            increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
+            log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
+            download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
+                     hf_token=hf_token, should_stop=should_stop, config_name=config_name)
+            after = source_ledger(config, name, layout)
+            if after.raw_rows <= ledger.raw_rows and not after.exhausted:
+                log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
+                break
+        if not complete:
+            log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
+            break
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------

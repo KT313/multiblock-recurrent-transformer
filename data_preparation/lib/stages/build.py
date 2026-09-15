@@ -34,29 +34,26 @@ from __future__ import annotations
 
 import multiprocessing
 import random
-import shutil
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.ownership import BuildWorkspace, guarded_path
-from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
-from data_preparation.lib.layout import DatasetLayout, processed_columns
+from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig, DedupConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck, check_stop
-from data_preparation.lib.build.assessment import ProcessedAssessment, assess_processed_folder
 from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
-from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes, text_hash64
+from data_preparation.lib.stages.exact_dedup import SeenDocuments, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.stages.shuffle import shuffled_rows
+from data_preparation.lib.stages.build_output import ProcessedOutput as ProcessedOutput, prepare_source_output  # noqa: PLC0414 - compatibility export
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
     check_quality,
@@ -69,11 +66,9 @@ from data_preparation.lib.stages.download import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     inspect_raw,
-    new_manifest,
 )
 from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
-from data_preparation.lib.storage.parquet import publish_shard, shard_name
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
@@ -104,6 +99,7 @@ def build_source(
     without a current raw manifest (run the download first).
     """
 
+    # validate the source and require current raw input
     config.validate_identifiers()
     guarded_path(layout.root, layout.processed_dir(name))
     source = config.sources[name]
@@ -114,48 +110,17 @@ def build_source(
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")
-    assessment = assess_processed_folder(config, name, processed_dir, shard_list(raw.shards), check_files=False)
-    if assessment.problem == "unreadable_manifest":
-        # never deleted here, on either path: the repair step does that, after the user confirmed
-        raise RuntimeError(
-            f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
-            "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
-        )
+    prepared = prepare_source_output(config, name, source_hash, raw, processed_dir, all_at_once=all_at_once)
+    if isinstance(prepared, Manifest):
+        return prepared
+    output, pending = prepared
 
-    if all_at_once:
-        BuildWorkspace(processed_dir).check_start()
-        if assessment.problem == "none" and assessment.manifest is not None:
-            if not assessment.manifest.generation_complete:
-                assessment.manifest.complete_generation(processed_dir)
-            return assessment.manifest  # built from exactly the current raw shards
-        # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
-        config.check_all_at_once_rows(name, raw.rows(), at_build=True)
-        output = ProcessedOutput(_fresh_manifest(config, name, source_hash), _temporary_dir(processed_dir), is_new=True)
-        pending = list(raw.shards)
-    else:
-        output = ProcessedOutput.resume(config, name, source_hash, processed_dir, assessment)
-        pending = raw.shards[output.covered() :]
-        if not pending:
-            if output.is_new:
-                output.save([])  # an exhausted raw folder with zero shards still gets its processed manifest
-            if output.manifest.generation_id is None or not output.manifest.generation_complete:
-                output.manifest.complete_generation(output.directory)
-            return output.manifest
-
+    # restore the dedup filter and prepare row processing
     stats = output.manifest.stats
-    seen = SeenDocuments(memory_mb=processing.dedup.bloom_memory_mb) if processing.dedup.mode != "none" else None
-    if seen is not None:
-        if not output.is_new:
-            seen.add_all(output.stored_hashes())
-        # the raw row count is the honest upper bound of what this build can insert
-        log.info("%s: %s", name, seen.describe(raw.rows()))
-        seen.check(raw.rows())
-        stats["dedup"]["rows_on_disk"] = raw.rows()
-        stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
+    seen = restore_dedup_filter(name, raw, output, processing.dedup)
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 
-    # Per-shard builds stop after published shards; whole-source builds also stop while reading/staging and
-    # writing their private output, so the old generation stays available until publication.
+    # process shards without changing the publication and stop boundaries
     pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
     with pipeline, progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar:
@@ -164,6 +129,8 @@ def build_source(
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
         else:
             _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
+
+    # record the measured filter load and complete the generation
     if seen is not None:
         _record_filter_load(stats["dedup"], seen)
         output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
@@ -171,6 +138,20 @@ def build_source(
         output.manifest.complete_generation(output.directory)
     log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
     return output.manifest
+
+
+def restore_dedup_filter(name: str, raw: Manifest, output: ProcessedOutput, dedup: DedupConfig) -> SeenDocuments | None:
+    """Refill from committed hashes and record capacity using the raw row upper bound."""
+    stats = output.manifest.stats
+    seen = SeenDocuments(memory_mb=dedup.bloom_memory_mb) if dedup.mode != "none" else None
+    if seen is not None:
+        if not output.is_new:
+            seen.add_all(output.stored_hashes())
+        log.info("%s: %s", name, seen.describe(raw.rows()))
+        seen.check(raw.rows())
+        stats["dedup"]["rows_on_disk"] = raw.rows()
+        stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
+    return seen
 
 
 def _build_per_raw_shard(
@@ -285,94 +266,6 @@ def _old_dir(processed_dir: Path) -> Path:
 
 
 # --- the processed folder ------------------------------------------------------------------------------------------------
-
-
-@dataclass
-class ProcessedOutput:
-    """
-    The processed folder of one build: its manifest, the directory shards are published into (the final folder,
-    or the owned temporary slot of an all-at-once build) and whether the manifest was created by this call (a new
-    manifest is saved even when nothing is appended, so an empty source still counts as built).
-    """
-
-    manifest: Manifest
-    directory: Path
-    is_new: bool
-
-    @classmethod
-    def resume(cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, assessment: ProcessedAssessment) -> ProcessedOutput:
-        """
-        The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
-        raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
-        the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
-        parsed never gets here (:func:`build_source` refuses it before choosing a path).
-        """
-
-        if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
-            return cls(assessment.manifest, processed_dir, is_new=False)
-        if assessment.problem != "absent":
-            log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
-        if processed_dir.exists():
-            log.info("%s: removing %s before the rebuild", name, processed_dir)
-            guarded_path(processed_dir.parent.parent, processed_dir)
-            shutil.rmtree(processed_dir)
-        return cls(_fresh_manifest(config, name, source_hash), processed_dir, is_new=True)
-
-    def covered(self) -> int:
-        """
-        Raw shards the manifest already covers.
-        """
-
-        return len(self.manifest.input_shards)
-
-    def stored_hashes(self) -> Iterator[int]:
-        """
-        The exact-dedup keys of every processed row on disk, in manifest order (refills the dedup filter).
-        """
-
-        return stored_hashes(self.directory / shard.name for shard in self.manifest.shards)
-
-    def publish(self, rows: list[Row], shard_size: int) -> None:
-        """
-        Append rows as shard(s) of at most shard_size rows, each recorded in the manifest.
-        """
-
-        if self.manifest.generation_complete or self.manifest.generation_id is None:
-            self.manifest.begin_generation(self.directory)
-        for start in range(0, len(rows), shard_size):
-            chunk = rows[start : start + shard_size]
-            path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))
-            self.manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
-
-    def save(self, covered: list[list[Any]]) -> None:
-        self.manifest.input_shards = list(covered)
-        self.manifest.save(self.directory)
-        self.is_new = False
-
-
-def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manifest:
-    source = config.sources[name]
-    processing = config.source_processing(name)
-    manifest = new_manifest(config, name, source_hash, "processed", tokens=True, hash_payload=config.processed_hash_payload(name))
-    stats: dict[str, Any] = {
-        "input_rows": 0,
-        "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
-    }
-    if source.kind == "pretrain":
-        stats["length_filter"] = {"input_samples": 0, "removed_too_short": 0, "removed_invalid": 0, "output_samples": 0}
-        stats["quality_filter"] = {"enabled": processing.quality_filter, "filtered_count": 0, "rejection_reasons": {}}
-        stats["decontamination"] = {
-            "enabled": processing.decontamination.enabled, "contaminated_count": 0, "contaminated_by_benchmark": {},
-        }  # fmt: skip
-    else:
-        stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
-        stats["removed_empty"] = 0  # rows without instruction or output after stripping
-        stats["removed_too_long"] = 0  # rows over `dataset_max_sequence_length` tokens (a safety net; the download already drops them)
-    manifest.columns = list(processed_columns(source.kind))
-    manifest.shuffled = config.shuffle_of(name)
-    manifest.shuffle_seed = source.seed
-    manifest.stats = stats
-    return manifest
 
 
 # --- the row pipeline ----------------------------------------------------------------------------------------------------
