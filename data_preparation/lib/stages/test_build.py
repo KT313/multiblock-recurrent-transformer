@@ -33,7 +33,7 @@ from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source
-from data_preparation.lib.stages import exact_dedup
+from data_preparation.lib.stages import build_output, exact_dedup
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
@@ -970,7 +970,7 @@ def test_generation_invalidation_does_not_commit_unprocessed_row_statistics(
     def fail_publication(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("interrupted before first shard")
     with monkeypatch.context() as patch:
-        patch.setattr(stages_build, "publish_shard", fail_publication)
+        patch.setattr(build_output, "publish_shard", fail_publication)
         with pytest.raises(RuntimeError, match="interrupted before first shard"):
             build_source(cfg, "s", layout)
     partial = Manifest.load(layout.processed_dir("s"))
