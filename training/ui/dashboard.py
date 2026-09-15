@@ -15,6 +15,10 @@ mutation and render holds one lock. The display checks for changes every 500 ms 
 displayed state changes, with a time-only heartbeat after 10 s; update_step is O(1). Startup and final cleanup
 are immediate. Elapsed time alone does not trigger the faster redraws.
 
+Training frames overwrite and space-pad the previous rows; only terminal resize clears the screen. Each live
+refresh uses synchronized-output mode (DEC 2026), so supporting terminals hide partial updates. Terminals that
+ignore that mode still get the overwriting renderer. Normal shutdown retains the transient-display cleanup.
+
 While the display is up nothing may print around it, so __enter__ (:class:`~training.ui.capture.TerminalCapture`)
 routes every logging record into the panel (third-party stream handlers detached for the duration), turns every
 warnings.warn into one kept record, replaces sys.stdout / sys.stderr with line sinks, and quiets wandb

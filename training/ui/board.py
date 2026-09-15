@@ -115,7 +115,7 @@ class TrainingDashboard(LiveDisplay):
         super().__init__(
             stream=stream if stream is not None else sys.stdout, console=console,
             refresh_per_second=min(max(refresh_per_second, 0.1), DEFAULT_REFRESH_PER_SECOND), log_lines=log_lines,
-            get_refresh_key=self._snapshot_for_refresh, refresh_clock=clock,
+            get_refresh_key=self._snapshot_for_refresh, refresh_clock=clock, overwrite_frames=True,
         )
         # plain lines once the display is gone: the run's fallback stream when it has one, else the display's own stream
         if fallback_stream is not None:
