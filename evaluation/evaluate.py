@@ -7,7 +7,7 @@ Sample generations and benchmark scores for one training checkpoint.
 
 Writes `samples/step-XXXXXXXX.jsonl` and `benchmarks/step-XXXXXXXX.json` into the checkpoint's run directory
 (`--out_dir` elsewhere). The tokenizer comes from the dataset config the checkpoint was trained with
-(`--tokenizer_dir` overrides). Benchmarks need the `eval` extra (`uv sync --extra eval`).
+(`--tokenizer_dir` overrides). Benchmark dependencies are included in `uv sync`.
 """
 
 from __future__ import annotations

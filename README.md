@@ -123,7 +123,7 @@ or every norm's.
 Sample generations and lm-eval-harness scores (`evaluation/`), on a checkpoint or during training:
 
 ```bash
-uv sync --extra eval      # lm-eval-harness, only needed for benchmarks
+uv sync                  # installs training, data preparation, evaluation, and development dependencies
 
 # greedy samples for the built-in prompts; --tasks adds benchmarks
 uv run python evaluation/evaluate.py --checkpoint outputs/<run>/checkpoints/<file>.pth

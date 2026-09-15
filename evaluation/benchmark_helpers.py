@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 DEFAULT_TASKS: tuple[str, ...] = DEFAULT_BENCHMARK_TASKS  # one tuple, defined with the run setting that names it
 BENCHMARKS_DIR = "benchmarks"  # under the run directory
 METRIC_PREFIX = "benchmark"  # wandb keys: benchmark/<recurrence label>/<task>/<metric>
-EVAL_EXTRA_HINT = "lm_eval is not installed: install the eval extra (uv sync --extra eval) to run benchmarks"
+EVAL_EXTRA_HINT = "lm_eval is not installed: run uv sync to install the project dependencies and run benchmarks"
 TASK_DEFAULT_FEWSHOT = -1  # num_fewshot: each task's own default (gsm8k is 5-shot), lm-eval's `num_fewshot=None`
 HARNESS_RANDOM_SEED = 0  # preserve lm-eval defaults, independently of the model seed
 HARNESS_NUMPY_SEED = 1234

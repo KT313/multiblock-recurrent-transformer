@@ -58,7 +58,7 @@ def _import_datasketch() -> tuple[Any, Any]:
         from datasketch import MinHash, MinHashLSH
     except ImportError as exc:
         raise ImportError(
-            "dedup.mode=minhash needs the `datasketch` package (`uv sync --all-extras`), or use dedup.mode=exact"
+            "dedup.mode=minhash needs the `datasketch` package (`uv sync`), or use dedup.mode=exact"
         ) from exc
     return MinHash, MinHashLSH
 

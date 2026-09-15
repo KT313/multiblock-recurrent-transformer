@@ -174,7 +174,7 @@ def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_t
     here, instead of quietly costing every benchmark the few points a missing BOS costs.
     """
 
-    pytest.importorskip("lm_eval", reason="needs the eval extra (uv sync --extra eval)")
+    pytest.importorskip("lm_eval", reason="needs lm_eval (uv sync)")
     # Not an importorskip: with lm_eval installed, an `lm_eval.models.huggingface` that will not import (a missing
     # accelerate) is the state this test is here to catch, because a benchmark run dies on the same import.
     # `Any`: lm_eval ships no stubs for the HFLM constructor, and the assertions below are about its behaviour
@@ -193,7 +193,7 @@ def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_t
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not os.environ.get("RUN_BENCHMARK_TESTS"), reason="set RUN_BENCHMARK_TESTS=1 (needs the eval extra and network)")
+@pytest.mark.skipif(not os.environ.get("RUN_BENCHMARK_TESTS"), reason="set RUN_BENCHMARK_TESTS=1 (needs lm_eval and network)")
 def test_real_harness_scores_arc_easy(tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path) -> None:
     pytest.importorskip("lm_eval")
     metrics = evaluate_on_benchmarks(
