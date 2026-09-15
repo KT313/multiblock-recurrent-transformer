@@ -3,6 +3,10 @@
 The download step (sources/<source>/raw/) and the tokenizer step, plus the token counter and manifest helpers
 that stages/build.py shares.
 
+The single-source and grouped entry points and the row-dispatch loop remain here. download_state.py owns
+conversion and token batches; download_workers.py owns the worker and ordered shutdown; download_groups.py
+and download_progress.py provide group planning and dashboard setup.
+
 Every step is a function (config, name, layout, *options) -> Manifest that is idempotent via the manifest (a
 second call with nothing new returns the stored manifest without touching the shards) and incremental where the
 data allow it. Raw folders are append-only and precious (bandwidth): :func:`download` appends to a *current* raw
@@ -43,51 +47,54 @@ passive folder resumes aligned from there. Storage errors propagate and offsets 
 from __future__ import annotations
 
 import functools
-import logging
 import os
-import queue
 import shutil
 import threading
-import traceback
-from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import TracebackType
 from typing import Any, Literal, NamedTuple
 
 from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
 from data_preparation.lib.layout import DatasetLayout
-from data_preparation.lib.abort import BuildAborted, StopCheck
+from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
-from data_preparation.lib.sources.conversations import OrphanAssistantOpening
-from data_preparation.lib.sources.converters import Filter, expected_format, get_converter, get_filter, text_or_empty
+from data_preparation.lib.sources.converters import get_converter, get_filter
 from data_preparation.lib.sources.hub_files import FetchStats, ReadRequest
 from data_preparation.lib.sources.loaders import (
     MAX_CACHED_FILE_KEY,
-    GithubCodeRequest,
     Row,
     SharedLoaderParameters,
     get_loader,
     github_code_extra_name,
     github_code_extra_source,
-    github_code_repo_key,
     language_request,
     read_github_code_group,
 )
 from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.storage.atomic import _fsync_directory
 from data_preparation.lib.storage.ownership import guarded_path
-from data_preparation.lib.stages.row_pipeline import instruct_text
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
-from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS, estimate_tokens, truncate_many
+from data_preparation.lib.stages.truncation import estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
 from data_preparation.lib.storage.raw_folder import RawFolder, RowProgress
 from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
-from data_preparation.lib.ui.dashboard import progress
+from data_preparation.lib.stages.download_groups import create_github_requests, log_group_download_plan, validate_github_group
+from data_preparation.lib.stages.download_progress import open_download_progress
+
+from data_preparation.lib.stages.download_state import (
+    MALFORMED_WARNINGS_PER_INCREMENT as MALFORMED_WARNINGS_PER_INCREMENT,  # noqa: PLC0414  # preserve the existing stage import
+    MAX_CONSECUTIVE_MALFORMED as MAX_CONSECUTIVE_MALFORMED,  # noqa: PLC0414  # preserve the existing stage import
+    MalformedSourceError as MalformedSourceError,  # noqa: PLC0414  # preserve the existing stage import
+    _DownloadPostfix, _Increment, _IncrementCounters, _TokenStep,
+    text_row as text_row,  # noqa: PLC0414  # preserve the existing stage import
+)
+from data_preparation.lib.stages.download_workers import (
+    _DownloadFailures, _StopGate, _TokenWorker, finish_download_pass, open_increment_writer,
+)
 
 log = get_logger(__name__)
 
@@ -243,22 +250,6 @@ def new_manifest(
         versions=library_versions(),
         dataset_config=dataset_config,
     )
-
-
-def text_row(source: SourceConfig, row: Row, name: str) -> Row:
-    """
-    The pretrain row to store for a source row: the converter (if any) applied, then text_field alone, as a
-    string (None becomes "", which the build's min_chars filter drops). Only the Hub file reader projects
-    columns; hf_split and hf_stream deliver every source column, and a surplus column of varying type would
-    fail the shard write, a nested one bloat it.
-    """
-
-    converter = get_converter(source)
-    if converter is not None:
-        row = converter(row)
-    if source.text_field not in row:
-        raise ValueError(f"{name}: row has no {source.text_field!r} column; columns: {sorted(row)}")
-    return {source.text_field: text_or_empty(row[source.text_field])}
 
 
 # --- raw manifest state ------------------------------------------------------------------------------------------------
@@ -497,23 +488,6 @@ def fetch_source(config: DatasetConfig, source: SourceConfig) -> SourceConfig:
     return source
 
 
-@dataclass
-class _IncrementCounters:
-    """
-    What one download increment did so far (updated while :func:`_fetch` runs, read back at the end).
-
-    Two threads write here, each its own fields: the fetch thread `consumed` and `skipped_malformed`, the token
-    worker `kept` and `dropped_too_long` (they follow the tokenizer); either may read the other's. `exhausted` is
-    set after the worker joined.
-    """
-
-    consumed: int = 0  # source rows the loader yielded (the loader offset advances by this much)
-    kept: int = 0  # rows written to disk
-    skipped_malformed: int = 0  # instruct rows whose filter/converter raised ValueError or left out instruction / output
-    dropped_too_long: int = 0  # instruct rows with more than `dataset_max_sequence_length` tokens
-    exhausted: bool = False  # the loader ran dry, or check_limit was reached
-
-
 def download(
     config: DatasetConfig,
     name: str,
@@ -553,28 +527,27 @@ def download(
     complete shard without counting anything twice.
     """
 
+    # Plan the append and return immediately when no rows are needed.
     gate = _StopGate(should_stop)
     folder, increment = _plan_increment(
         config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout), should_stop=gate, config_name=config_name
     )
     if increment is None or increment.passive:  # passive: the rows are on disk; only a group pass reads on
         return folder.manifest
+
+    # Stream the source through conversion, tokenization, and shard publication.
     log.info("%s: fetching %d rows from offset %d -> %s", name, increment.rows_to_keep, folder.rows_fetched, folder.directory)
     loader = get_loader(increment.source.loader)
     fetch_stats = FetchStats()
-    # the bar reads rows on disk / target and credits only rows up to the target (a loader finishing a remote row
-    # group past it, e.g. 1000 rows for 11 wanted, shows in the postfix as consumed / surplus, not in the count)
-    with progress(
-        total=folder.rows + increment.rows_to_keep, initial=folder.rows, desc=name, unit="row", panel="downloads",
-        bytes_fetched=lambda: fetch_stats.bytes_fetched,
-    ) as bar:
-        postfix = _DownloadPostfix(bar)
+    with open_download_progress([increment], name, fetch_stats) as (bar, postfix):
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
             columns=loader_columns(increment.source),
         )
         rows = loader(increment.source, folder.rows_fetched, increment.loader_count, shared_parameters)
         _fetch([increment], _tagged(name, rows), bar, postfix, shard_size, gate)
+
+    # Publish final progress after the fetch and its cleanup succeeded.
     _finish_increment(folder, increment.source, increment.counters)
     _log_increment(name, increment.counters, folder.manifest)
     return folder.manifest
@@ -637,263 +610,6 @@ def _raw_folder_for(
     return RawFolder(raw_dir, manifest, config_cap=config.dataset_max_sequence_length, should_stop=should_stop)
 
 
-class _StopGate:
-    """
-    The stop check of one download pass (handed to every raw folder as its should_stop). A stop request trips it
-    once, and from then on it is suspended: the rows the pass already consumed are stored without another abort
-    on the way (each shard publish checks the stop again), and the pass ends after that.
-    """
-
-    def __init__(self, should_stop: StopCheck | None) -> None:
-        self._should_stop = should_stop
-        self.tripped = False
-        self.suspended = False
-
-    def __call__(self) -> bool:
-        if self.suspended or self._should_stop is None:
-            return False
-        if self._should_stop():
-            self.tripped = True
-            return True
-        return False
-
-    def suspend(self) -> None:
-        self.suspended = True
-
-
-UNBOUNDED_COUNT = 2**62  # "as many rows as there are": instruct downloads stop consuming once `rows_to_keep` rows are kept
-StoredRow = tuple[Row, RowProgress]  # a row ready to store, with where the fetch stood right after it
-
-TOKEN_BATCH = 256  # rows tokenized per tokenizer call while downloading
-TOKEN_QUEUE_DEPTH = 3  # batches the fetch thread may run ahead of the token worker (bounds the raw text alive per job)
-
-
-class _TokenStep:
-    """
-    The token step of a download, in two halves used from two threads. The fetch thread feeds it row by row:
-    add(row, progress) returns a full batch of :data:`TOKEN_BATCH` rows (else []), take() whatever is
-    buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls
-    tokenize(batch) on those batches, in order, and gets the rows ready to store.
-
-    Every stored tokens counts the text plus :data:`NUMBER_OF_SPECIAL_TOKENS` (the BOS and EOS the trainer adds), the one
-    place the specials enter a count. Pretrain rows: text_field is truncated (truncation.py) so that this sum is at
-    most max_tokens. Instruct rows: tokens counts the trainer's text (row_pipeline.instruct_text) uncapped; a row
-    over max_tokens is dropped (counters.dropped_too_long), never cut, and every stored row's progress carries the
-    drop count of the rows before it (exact per row, so a resume never double counts).
-    """
-
-    def __init__(self, source: SourceConfig, counter: TokenCounter, max_tokens: int, counters: _IncrementCounters) -> None:
-        if max_tokens < NUMBER_OF_SPECIAL_TOKENS:
-            raise ValueError(f"dataset_max_sequence_length {max_tokens} leaves no room for the {NUMBER_OF_SPECIAL_TOKENS} special tokens of a row")
-        self._counter = counter
-        self._max_tokens = max_tokens
-        self._counters = counters
-        self._is_instruct = source.kind == "instruct"
-        self._text_field = source.text_field
-        self._batch: list[StoredRow] = []
-
-    @property
-    def pending(self) -> int:
-        """
-        Rows buffered for the next tokenizer call.
-        """
-
-        return len(self._batch)
-
-    def add(self, row: Row, progress: RowProgress) -> list[StoredRow]:
-        """
-        Buffer row; a full batch (:data:`TOKEN_BATCH` rows) is released, untokenized.
-        """
-
-        self._batch.append((row, progress))
-        return self.take() if len(self._batch) >= TOKEN_BATCH else []
-
-    def take(self) -> list[StoredRow]:
-        """
-        The buffered rows (possibly none), untokenized; the buffer is empty afterwards.
-        """
-
-        batch, self._batch = self._batch, []
-        return batch
-
-    def tokenize(self, batch: list[StoredRow]) -> list[StoredRow]:
-        """
-        The rows of batch ready to store: pretrain rows truncated and counted, instruct rows counted or dropped.
-        """
-
-        if not batch:
-            return []
-        return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
-
-    def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
-        texts = [row[self._text_field] for row, _ in batch]
-        for (row, _), (cut, tokens) in zip(batch, self._counter.truncate_many(texts, self._max_tokens - NUMBER_OF_SPECIAL_TOKENS), strict=True):
-            row[self._text_field] = cut
-            row["tokens"] = tokens + NUMBER_OF_SPECIAL_TOKENS
-        return batch
-
-    def _drop_long_instruct_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
-        stored: list[StoredRow] = []
-        for (row, before), count in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
-            tokens = count + NUMBER_OF_SPECIAL_TOKENS
-            if tokens > self._max_tokens:
-                self._counters.dropped_too_long += 1
-                continue
-            row["tokens"] = tokens
-            stored.append((row, RowProgress(before.consumed, before.skipped_malformed, self._counters.dropped_too_long)))
-        return stored
-
-
-MAX_CONSECUTIVE_MALFORMED = 10  # malformed instruct rows in a row that fail the download (a wrong fields / converter, not a bad row)
-MALFORMED_WARNINGS_PER_INCREMENT = 100  # WARNING lines per increment; the rest go to DEBUG, the final "kept N of M" line carries the total
-
-
-class MalformedSourceError(RuntimeError):
-    """
-    :data:`MAX_CONSECUTIVE_MALFORMED` source rows in a row came out malformed: the source's `fields` / `converter`
-    does not fit the rows, so the download fails with what the converter expects and what the rows looked like
-    (column name -> value type name, and the converter's reason). It propagates like any download failure: the
-    shards published so far stay on disk, the runner reports the job failed.
-    """
-
-    def __init__(self, name: str, *, expected: str, samples: list[tuple[dict[str, str], str]]) -> None:
-        found = " | ".join(f"{columns} ({reason})" for columns, reason in samples)
-        super().__init__(
-            f"{name}: {len(samples)} consecutive rows could not be converted; expected format: {expected}; "
-            f"formats of the last {len(samples)} rows: {found}"
-        )
-        self.name = name
-        self.expected = expected
-        self.samples = samples
-
-
-def _row_format(raw: Row) -> dict[str, str]:
-    """
-    The shape of a source row for the malformed-row error: column name -> type name of its value.
-    """
-
-    return {str(column): type(value).__name__ for column, value in raw.items()}
-
-
-@dataclass
-class _Increment:
-    """
-    One source's part of a download pass: what it still wants, how a source row becomes a stored row, and what
-    the pass did for it so far (:attr:`counters`).
-
-    :attr:`consecutive_malformed` and :attr:`last_malformed` (the shapes and reasons of the last
-    :data:`MAX_CONSECUTIVE_MALFORMED` malformed rows) belong to the fetch thread, like :meth:`convert`.
-    """
-
-    name: str
-    source: SourceConfig
-    folder: RawFolder
-    rows_to_keep: int  # rows to keep in this pass
-    max_consume: int | None  # source rows this pass may consume (`check_limit` less the offset reached); None = no bound
-    token_step: _TokenStep
-    counters: _IncrementCounters
-    converter: Callable[[Row], Row] | None  # instruct sources: the standardizing converter (None: rows are standard already)
-    row_filter: Filter | None
-    passive: bool = False  # stores whatever rows the pass hands it (a group member past its target, or a language without a source); never bounds the pass
-    submitted: int = 0  # rows handed to the token worker (fetch thread)
-    settled: int = 0  # rows the token worker stored or dropped (worker thread)
-    consecutive_malformed: int = 0  # malformed rows since the last converted one (a filter rejection is neither)
-    last_malformed: deque[tuple[dict[str, str], str]] = field(default_factory=lambda: deque(maxlen=MAX_CONSECUTIVE_MALFORMED))
-
-    @property
-    def is_instruct(self) -> bool:
-        return self.source.kind == "instruct"
-
-    @property
-    def in_flight(self) -> int:
-        """
-        Rows handed to the token worker whose fate (stored or dropped) is not settled yet.
-        """
-
-        return self.submitted - self.settled
-
-    @property
-    def loader_count(self) -> int:
-        """
-        What the loader is asked for. Pretrain rows are all kept: rows_to_keep (or the consume budget when that is
-        smaller); a remote loader may still finish its row group beyond it. Instruct rows may be dropped by the
-        filter, the converter or the token step: everything within the budget, or without bound.
-        """
-
-        if self.passive:
-            return 0
-        if self.is_instruct:
-            return UNBOUNDED_COUNT if self.max_consume is None else self.max_consume
-        return self.rows_to_keep if self.max_consume is None else min(self.rows_to_keep, self.max_consume)
-
-    def credit(self, stored: int) -> int:
-        """
-        How many of stored rows just appended (counters.kept already advanced) the bar counts: the ones up to
-        :attr:`rows_to_keep`. None for a passive increment, none past the target (a member reading on for the
-        other languages, a loader finishing a remote row group).
-        """
-
-        if self.passive:
-            return 0
-        kept = self.counters.kept
-        return min(kept, self.rows_to_keep) - min(kept - stored, self.rows_to_keep)
-
-    @property
-    def done(self) -> bool:
-        """
-        No more source rows are taken: the consume budget is spent (check_limit bounds the source rows
-        consumed, whatever the loader yields beyond its count), or an instruct source kept its rows_to_keep rows.
-        """
-
-        if self.passive:
-            return False
-        if self.max_consume is not None and self.counters.consumed >= self.max_consume:
-            return True
-        return self.is_instruct and self.counters.kept >= self.rows_to_keep
-
-    def convert(self, name: str, raw: Row) -> Row | None:
-        """
-        The row to store for source row raw, or None when the filter rejects it or the filter/converter finds it
-        malformed (ValueError: logged at WARNING, counted in skipped_malformed). A converted row ends a run of
-        malformed ones; a filter rejection neither extends nor ends it. The :data:`MAX_CONSECUTIVE_MALFORMED`-th
-        malformed row in a row raises :class:`MalformedSourceError`.
-
-        Orphan GPT openings are counted and warned about, but neither extend nor reset the schema-error streak.
-        """
-
-        if not self.is_instruct:
-            return text_row(self.source, raw, name)
-        try:
-            if self.row_filter is not None and not self.row_filter(raw):
-                return None
-            row = _instruct_row(raw, self.converter)
-        except OrphanAssistantOpening as err:
-            # Preserve the existing manifest counter/offset contract without treating a known unsuitable
-            # conversation as evidence of a changed source schema. Never search later turns for another pair.
-            self.counters.skipped_malformed += 1
-            log.warning("%s: orphan assistant opening skipped (%s)", name, err)
-            return None
-        except ValueError as err:
-            self._malformed(name, raw, str(err))
-            return None
-        self.consecutive_malformed = 0
-        self.last_malformed.clear()
-        return row
-
-    def _malformed(self, name: str, raw: Row, reason: str) -> None:
-        """
-        Count, log and remember a malformed row; fail the download once :data:`MAX_CONSECUTIVE_MALFORMED` came in a row.
-        """
-
-        self.counters.skipped_malformed += 1
-        self.consecutive_malformed += 1
-        self.last_malformed.append((_row_format(raw), reason))
-        level = logging.WARNING if self.counters.skipped_malformed <= MALFORMED_WARNINGS_PER_INCREMENT else logging.DEBUG
-        log.log(level, "%s: malformed row skipped (%s)", name, reason)
-        if self.consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED:
-            raise MalformedSourceError(name, expected=expected_format(self.source), samples=list(self.last_malformed))
-
-
 def _plan_increment(
     config: DatasetConfig,
     name: str,
@@ -944,163 +660,6 @@ def _tagged(name: str, rows: Iterable[Row]) -> Iterator[tuple[str, Row]]:
             close()
 
 
-class _DownloadFailures:
-    """Keep exception identity and tracebacks; a substantive error takes precedence over cooperative stop."""
-
-    def __init__(self, gate: _StopGate) -> None:
-        self._gate = gate
-        self._errors: list[tuple[str, BaseException, TracebackType | None]] = []
-
-    @property
-    def primary(self) -> BaseException | None:
-        if not self._errors:
-            return None
-        return next((error for _, error, _ in self._errors if not isinstance(error, BuildAborted)), self._errors[0][1])
-
-    def record(self, phase: str, error: BaseException) -> None:
-        self._gate.suspend()
-        if not any(previous is error for _, previous, _ in self._errors):
-            self._errors.append((phase, error, error.__traceback__))
-
-    def attempt(self, phase: str, action: Callable[[], object]) -> None:
-        try:
-            action()
-        except BaseException as error:  # noqa: BLE001  # propagated after subsequent safe, sequential cleanup
-            self.record(phase, error)
-
-    def raise_if_failed(self) -> None:
-        primary = self.primary
-        if primary is None:
-            return
-        primary_tb = None
-        for phase, error, tb in self._errors:
-            if error is primary:
-                primary_tb = tb
-                primary.add_note(f"Download failure during {phase}")
-            else:
-                detail = "".join(traceback.format_exception(type(error), error, tb))
-                primary.add_note(f"Additional download failure during {phase}:\n{detail}")
-        raise primary.with_traceback(primary_tb)
-
-
-class _TokenWorker:
-    """
-    The tokenizing half of a download pass on its own thread: batches submitted by the fetch thread are tokenized
-    (:meth:`_TokenStep.tokenize`) and stored (:func:`_store`) in submission order, so row order, the per-row
-    progress and the shard boundaries are exactly those of the same pass done in one thread. The queue holds
-    :data:`TOKEN_QUEUE_DEPTH` batches: submit blocks the fetch thread when the worker is that far behind.
-
-    A failure on the worker is kept and re-raised on the fetch thread by the next :meth:`submit`, :meth:`drain`
-    or :meth:`close` (:attr:`failed` tells earlier). After a tokenizer or write error the worker only settles what
-    is queued without storing it; after :class:`BuildAborted` (the stop check, raised by a shard publish) it
-    stores on: the gate is suspended by then (:func:`_store`), and every row the pass consumed belongs on disk so
-    the folders' offsets stay the pass's frontier. A later substantive error takes precedence over that stop.
-    close is what leaving the with block does: it joins before reporting any stored failure. The fetch owner
-    verifies termination before writer cleanup; forced interruption cannot promise that cleanup is complete.
-    """
-
-    def __init__(self, name: str, writers: dict[str, ShardWriter], bar: Progress, gate: _StopGate) -> None:
-        self._queue: queue.Queue[tuple[_Increment, list[StoredRow]] | None] = queue.Queue(maxsize=TOKEN_QUEUE_DEPTH)
-        self._writers = writers
-        self._bar = bar
-        self._gate = gate
-        self._failure: BaseException | None = None
-        self._storing = True  # False after an error other than the stop: the queued batches are settled unstored
-        self._raised = False
-        self._stopped = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=f"tokenize:{name}")
-        self._thread.start()
-
-    @property
-    def failed(self) -> bool:
-        return self._failure is not None
-
-    @property
-    def stopped(self) -> bool:
-        """The worker released writer ownership and its thread was joined (also after a stored failure)."""
-
-        return self._stopped.is_set() and not self._thread.is_alive()
-
-    def submit(self, increment: _Increment, batch: list[StoredRow]) -> None:
-        """
-        Queue batch (nothing for an empty one) for increment; raises the worker's failure instead if it has one.
-        """
-
-        self._raise_failure()
-        if not batch:
-            return
-        increment.submitted += len(batch)
-        self._queue.put((increment, batch))
-
-    def drain(self) -> None:
-        """
-        Wait until every submitted batch is stored (or dropped), then raise the worker's failure if it has one.
-        """
-
-        self._queue.join()
-        self._raise_failure()
-
-    def close(self) -> None:
-        """
-        End the worker after the queued batches (or after settling them, once failed) and join it; raises the
-        worker's failure if it was not raised before.
-        """
-
-        self._queue.put(None)
-        self._thread.join()
-        self._raise_failure()
-
-    def __enter__(self) -> _TokenWorker:
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.close()
-
-    def _raise_failure(self) -> None:
-        if self._failure is not None and not self._raised:
-            self._raised = True
-            raise self._failure
-
-    def _remember_failure(self, error: BaseException) -> None:
-        previous = self._failure
-        if previous is None:
-            self._failure = error
-        elif isinstance(previous, BuildAborted) and not isinstance(error, BuildAborted):
-            error.add_note("Token worker previously stopped:\n" + "".join(traceback.format_exception(previous)))
-            self._failure = error
-            self._raised = False  # a stop already reported must not hide this later storage failure
-        elif error is not previous:
-            previous.add_note("Additional token worker failure:\n" + "".join(traceback.format_exception(error)))
-
-    def _run(self) -> None:
-        try:
-            self._process()
-        finally:
-            self._stopped.set()  # no writer access after this point, even if join itself is interrupted
-
-    def _process(self) -> None:
-        while True:
-            item = self._queue.get()
-            try:
-                if item is None:
-                    return
-                increment, batch = item
-                if self._storing:
-                    try:
-                        _store(increment, self._writers[increment.name], increment.token_step.tokenize(batch), self._bar, self._gate)
-                    except BuildAborted as stop:  # the gate is suspended now: keep storing what is queued
-                        self._remember_failure(stop)
-                    except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
-                        self._remember_failure(error)
-                        self._storing = False
-                increment.settled += len(batch)  # after the store: `kept` is up to date before the rows leave `in_flight`
-            finally:
-                self._queue.task_done()
-
-
-PASSIVE_SHARD_DIVISOR = 4  # passive increments publish shards of shard_size / this: one buffer per language, bounded together
-
-
 def _fetch(
     increments: list[_Increment], rows: Iterator[tuple[str, Row]], bar: Progress, postfix: _DownloadPostfix, shard_size: int, gate: _StopGate
 ) -> None:
@@ -1124,29 +683,23 @@ def _fetch(
     with secondary failures attached as traceback notes. Writers are never finalized while the worker is live.
     """
 
+    # Open writers as sources enter the pass, then start their shared token worker.
     increments_by_name: dict[str, _Increment] = {}
     writers: dict[str, ShardWriter] = {}
     consumed_total = surplus_total = 0
-
-    def increment_named(name: str) -> _Increment:
-        if name not in increments_by_name:
-            increments_by_name.update((increment.name, increment) for increment in increments)
-        increment = increments_by_name[name]
-        if name not in writers:
-            size = max(shard_size // PASSIVE_SHARD_DIVISOR, 1) if increment.passive else shard_size
-            writers[name] = ShardWriter(increment.folder.directory, size, start_shard=increment.folder.shard_count, on_shard=increment.folder.record_shard).__enter__()
-        return increment
 
     failures = _DownloadFailures(gate)
     worker: _TokenWorker | None = None
     try:
         for increment in increments:
-            increment_named(increment.name)
+            open_increment_writer(increment.name, increments, increments_by_name, writers, shard_size)
         worker = _TokenWorker(",".join(writers), writers, bar, gate)
+
+        # Keep the row dispatch loop visible; settle instruction batches before reading past their target.
         for name, raw in rows:
             if worker.failed:
                 worker.drain()  # raises: stop pulling rows for a worker that stores nothing anymore
-            increment = increment_named(name)
+            increment = open_increment_writer(name, increments, increments_by_name, writers, shard_size)
             if increment.done:
                 if all(increment.done for increment in increments):
                     break
@@ -1164,83 +717,15 @@ def _fetch(
                 continue
             worker.submit(increment, increment.token_step.add(row, RowProgress(counters.consumed, counters.skipped_malformed, 0)))
             if increment.is_instruct and counters.kept + increment.in_flight + increment.token_step.pending >= increment.rows_to_keep:
-                # the rows in flight and buffered would meet the target: settle them before reading on
-                worker.submit(increment, increment.token_step.take())
+                worker.submit(increment, increment.token_step.take())  # settle the possible target before reading on
                 worker.drain()
             if all(increment.done for increment in increments):
                 break  # enough: stop pulling; the ordered cleanup below closes the stream
     except BaseException as error:  # noqa: BLE001  # preserve the processing failure through cleanup
         failures.record("processing", error)
 
-    # Every phase is sequential. A failed action cannot bypass later safe actions, and writers remain
-    # worker-owned until shutdown is confirmed. Never retry a taken batch or a failed publication.
-    if worker is not None:
-        active_worker = worker
-
-        def settle_pending(increment: _Increment) -> None:
-            active_worker.submit(increment, increment.token_step.take())
-
-        for increment in increments:
-            failures.attempt(f"pending settlement for {increment.name}", functools.partial(settle_pending, increment))
-    close = getattr(rows, "close", None)
-    if close is not None:
-        failures.attempt("row iterator close", close)
-    if worker is not None:
-        failures.attempt("token worker close/join", worker.close)
-        if not worker.stopped:
-            failures.record(
-                "token worker shutdown",
-                RuntimeError("Token worker termination could not be established; writer cleanup is incomplete to avoid live worker access"),
-            )
-            failures.raise_if_failed()
-            return
-
-    failure = failures.primary
-    if failure is not None:
-        _flush_partial_shards(writers, failures)
-        failure = failures.primary  # salvage may reveal a substantive failure after cooperative cancellation
-    exit_args = (type(failure), failure, failure.__traceback__) if failure is not None else (None, None, None)
-    for name, writer in writers.items():
-        # On an initially successful pass every writer still gets its ordinary final flush, even if an
-        # earlier writer's exit fails. On failure, salvage already ran once and exit only releases ownership.
-        failures.attempt(f"writer exit for {name}", functools.partial(writer.__exit__, *exit_args))
-    failures.raise_if_failed()
-    for increment in increments:
-        if not increment.passive and increment.counters.kept < increment.rows_to_keep:
-            increment.counters.exhausted = True  # only a successful pass can establish exhaustion
-
-
-def _flush_partial_shards(writers: dict[str, ShardWriter], failures: _DownloadFailures) -> None:
-    """
-    After a stop or failure, attempt each buffered shard once in writer insertion order. All failures remain
-    visible; callbacks may already have published/recorded a shard, so no failed flush is retried. The worker
-    must have terminated before this phase begins. Final writer exits follow after every salvage attempt.
-    """
-
-    for name, writer in writers.items():
-        failures.attempt(f"partial shard flush for {name}", writer.flush)
-
-
-def _store(increment: _Increment, writer: ShardWriter, stored: list[StoredRow], bar: Progress, gate: _StopGate) -> None:
-    """
-    The rows the token step released, appended and counted as kept. A stop raised by a shard publish on the way
-    (the shard is published and recorded before the check) suspends the gate, the rest of the batch is stored, and
-    the stop is raised at the end.
-    """
-
-    stop: BuildAborted | None = None
-    for row, row_progress in stored:
-        try:
-            increment.folder.add(writer, row, row_progress)
-        except BuildAborted as error:
-            stop = error
-            gate.suspend()
-        increment.counters.kept += 1
-    credit = increment.credit(len(stored))
-    if credit:
-        bar.update(credit)  # once per batch: the dashboard bar takes a lock per update
-    if stop is not None:
-        raise stop
+    # Finish in ownership order and report any processing or cleanup failures.
+    finish_download_pass(increments, rows, writers, worker, failures)
 
 
 def download_github_code_group(
@@ -1267,14 +752,8 @@ def download_github_code_group(
     of every source in names and of every extra language the pass stored.
     """
 
-    if not names:
-        raise ValueError("download_github_code_group needs at least one source")
-    for name in names:
-        source = config.sources[name]
-        if source.loader != "github_code":
-            raise ValueError(f"{name}: download_github_code_group needs github_code sources")
-        if github_code_repo_key(source) != github_code_repo_key(config.sources[names[0]]):
-            raise ValueError(f"{name}: github_code group members must share hf_id, revision and data_files")
+    # Validate the group and plan each source without reading any rows.
+    validate_github_group(config, names)
     token_counter = functools.cache(lambda: TokenCounter(config, layout))
     gate = _StopGate(should_stop)
     results: dict[str, Manifest] = {}
@@ -1289,18 +768,9 @@ def download_github_code_group(
     if not any(not increment.passive for increment in increments):
         return results  # nothing to fetch: nothing is read, so nothing could be collected
 
-    for increment in increments:
-        if increment.passive:
-            log.info("%s: has its rows; storing what the pass reads on from offset %d -> %s", increment.name, increment.folder.rows_fetched, increment.folder.directory)
-        else:
-            log.info(
-                "%s: fetching %d rows from offset %d -> %s",
-                increment.name, increment.rows_to_keep, increment.folder.rows_fetched, increment.folder.directory,
-            )
-    requests = [
-        GithubCodeRequest(increment.name, increment.source, increment.folder.rows_fetched, increment.loader_count, passive=increment.passive)
-        for increment in increments
-    ]
+    # Open one shared reader, retaining passive members and discovering extra languages.
+    log_group_download_plan(increments)
+    requests = create_github_requests(increments)
     template = increments[0].source
     repo = str(template.hf_id)
     columns = _union_columns([loader_columns(increment.source) for increment in increments])
@@ -1313,12 +783,7 @@ def download_github_code_group(
         increments.append(extra)
         return language_request(extra.name, language, extra.folder.rows_fetched, 0, passive=True)
 
-    active = [increment for increment in increments if not increment.passive]  # the bar: their rows on disk / their targets
-    with progress(
-        total=sum(increment.folder.rows + increment.rows_to_keep for increment in active), initial=sum(increment.folder.rows for increment in active),
-        desc=f"{repo} ({len(increments)} languages)", unit="row", panel="downloads", bytes_fetched=lambda: fetch_stats.bytes_fetched,
-    ) as bar:
-        postfix = _DownloadPostfix(bar)
+    with open_download_progress(increments, f"{repo} ({len(increments)} languages)", fetch_stats) as (bar, postfix):
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats, columns=columns,
         )
@@ -1328,6 +793,8 @@ def download_github_code_group(
         finally:
             for increment in increments:  # after a stop or failure too: the flushed shards moved the offsets
                 results[increment.name] = increment.folder.manifest
+
+    # Finalize member counters only after the whole shared pass succeeded.
     for increment in increments:
         _finish_increment(increment.folder, increment.source, increment.counters)
         _log_increment(increment.name, increment.counters, increment.folder.manifest)
@@ -1403,62 +870,6 @@ def _union_columns(projections: list[list[str] | None]) -> list[str] | None:
             return None
         union.extend(column for column in columns if column not in union)
     return union
-
-
-def _instruct_row(raw: Row, converter: Callable[[Row], Row] | None) -> Row:
-    """
-    The standardized {instruction, input, output} row for raw, every field a string (None becomes "").
-
-    A malformed row raises ValueError, which the caller counts and skips: the converter's own, or a result
-    without instruction / output.
-    """
-
-    row = converter(raw) if converter is not None else raw
-    missing = [key for key in ("instruction", "output") if key not in row]
-    if missing:
-        raise ValueError(f"row has no {missing} column; columns: {sorted(row)}")
-    return {"instruction": text_or_empty(row["instruction"]), "input": text_or_empty(row.get("input")), "output": text_or_empty(row["output"])}
-
-
-class _DownloadPostfix:
-    """
-    The download bar's postfix: source rows consumed towards a target, surplus rows (stored, but not counted by
-    the bar: passive increments' rows and rows past a target), current repo file (refreshed sparsely).
-    """
-
-    def __init__(self, bar: Progress) -> None:
-        self._bar = bar
-        self._values: dict[str, Any] = {"consumed": 0}
-
-    def surplus(self, total: int) -> None:
-        """
-        Record the running count of surplus rows (passive increments' rows and rows consumed past a target); the
-        bar is refreshed every 100 rows.
-        """
-
-        self._values["surplus"] = total
-        if total % 100 == 0:
-            self._refresh()
-
-    def on_file(self, file: str) -> None:
-        """
-        Loader callback: a new repo file is being read.
-        """
-
-        self._values["file"] = file.rsplit("/", 1)[-1]
-        self._refresh()
-
-    def consumed(self, total: int) -> None:
-        """
-        Record the running count of source rows consumed towards a target; the bar is refreshed every 100 rows.
-        """
-
-        self._values["consumed"] = total
-        if total % 100 == 0:
-            self._refresh()
-
-    def _refresh(self) -> None:
-        self._bar.set_postfix(self._values, refresh=False)
 
 
 def loader_columns(source: SourceConfig) -> list[str] | None:
