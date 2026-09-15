@@ -150,7 +150,7 @@ or dropped source row twice. All-at-once builds (shuffled sources, minhash) writ
 ```bash
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
         [--sources NAME ...] [--steps tokenizer download build] [--reopen NAME ...] [--yes] [--dry_run]
-        [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
+        [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--download_prefetch_mb N] [--hf_token T] [--cache_dir DIR]
 uv run python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
@@ -220,7 +220,7 @@ def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel
     return report
 ```
 
-`download_and_build_missing` is the only place with thread-pool code: a pool of `--max_parallel_downloads` download
+`download_and_build_missing` owns the source-job pools: a pool of `--max_parallel_downloads` download
 jobs (the `github_code` sources of one repo form one job, every member of the repo included, and are read in a single
 pass over the repo's files) and a pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
 spawn process pool of `--pass_workers` for its optional cleaning passes (decontamination / minhash, off in the
@@ -236,7 +236,22 @@ overlap too (a token worker thread per job; the rows are still written in order)
 tokenizer's own thread pool on (`TOKENIZERS_PARALLELISM=true`, off by library default because a training run that
 prepares data in-process forks DataLoader workers afterwards) with 8 threads (`RAYON_NUM_THREADS`; the pool is one
 per process and shared by every download job, and past 8 threads a batch barely gets faster). A single download is
-therefore bound by its network fetch; `--max_parallel_downloads` scales from there.
+can still be limited by network, decoding, tokenization, or writing; `--max_parallel_downloads` overlaps work across sources.
+
+For server downloads, `--download_prefetch_mb 16` fetches the next 16 MiB of the current remote file in a
+background thread while its previous bytes are decoded and processed. This applies to `hf_files` and grouped
+`github_code` remote reads, including Parquet and compressed JSON streams; cached/local files and the
+`hf_split`/`hf_stream` loaders are unchanged. Set `download_prefetch_mb: 16` in the dataset YAML to persist it;
+the CLI overrides that value, including `--download_prefetch_mb 0` to disable it. The default is 0 (off).
+
+Each active remote file retains at most two blocks: the current block and one pending block. With eight
+download jobs and 16 MiB blocks this adds up to 256 MiB of byte buffers, beyond normal decoder, HTTP,
+tokenizer, and writer memory. This changes only IO scheduling: source/row order, row-group alignment, saved
+offsets, token counts, and dataset hashes are unchanged. Some prefetched bytes may be unused after a seek,
+stop, or target completion; larger values can waste bandwidth on sparsely read Parquet columns. Workers are
+joined and remote handles closed on completion, stop, or failure; shutdown may wait for an in-flight HTTP
+request. Network failures propagate rather than silently disabling prefetch. No whole-file or next-file
+downloads are introduced by this setting.
 
 A round is normally enough. A second one happens when the raw shards of the first measured fewer tokens per row than
 the estimate the download was sized with (by more than the 20 % safety margin covers), or when the length filter and

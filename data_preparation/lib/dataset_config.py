@@ -430,6 +430,7 @@ class DatasetConfig:
       it costs nothing. A storage cap only: it keeps a stray 100k-token document from being stored whole.
     - `validation_fraction`: share of a source's rows held out when the source is used for training AND validation.
     - `always_range_requests`: read Hub files remotely by piece instead of caching whole files (traffic only).
+    - `download_prefetch_mb`: optional background read-ahead block size in MiB; 0 disables it (traffic only).
     - `token_count`: how the `tokens` column is counted: with the tokenizer, or `estimate` (chars / 4).
     - `processing`: dataset-level processing defaults (`ProcessingConfig`); a pretrain source may override.
     - `bloom_deduplicate_across_sources`: enable dataset-wide ordered exact-key Bloom admission (default true).
@@ -452,6 +453,7 @@ class DatasetConfig:
     # Traffic only, not part of any hash: with it off, files up to load_kwargs.max_cached_file_mb are downloaded
     # whole into the Hub cache instead of being read remotely by piece.
     always_range_requests: bool = field(default=True, metadata=_UNHASHED)  # read every Hub file remotely by piece (row groups / stream prefix)
+    download_prefetch_mb: int = field(default=0, metadata=_UNHASHED)  # remote read-ahead block in MiB; 0 disables it, no dataset identity change
     token_count: TokenCountMode = field(default="tokenizer", metadata=_PROCESSED)  # "estimate" = chars / 4; the raw manifest records it, see "hash annotations"
     # hashed through every source's *effective* processing block, not as a field of its own
     processing: ProcessingConfig = field(default_factory=ProcessingConfig, metadata=_PROCESSED)  # defaults for every source; see ProcessingConfig
@@ -465,6 +467,8 @@ class DatasetConfig:
 
     def __post_init__(self) -> None:
         self.validate_identifiers()
+        if type(self.download_prefetch_mb) is not int or self.download_prefetch_mb < 0:
+            raise ValueError("download_prefetch_mb must be a nonnegative integer (MiB; 0 disables prefetch)")
         if not isinstance(self.bloom_deduplicate_across_sources, bool):
             raise ValueError("bloom_deduplicate_across_sources must be a boolean")
         self.bloom_deduplicate_across_sources_add_benchmarks = bloom_benchmark_names(

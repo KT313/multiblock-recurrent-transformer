@@ -1049,9 +1049,26 @@ def test_config_hash_ignores_fetch_and_describe_knobs() -> None:
     d["sources"]["files"]["load_kwargs"]["max_cached_file_mb"] = 3
     cfg = _build(d)
     cfg.always_range_requests = False
+    cfg.download_prefetch_mb = 32
     assert cfg.config_hash() == base
     d["sources"]["files"]["revision"] = "abc"
     assert _build(d).config_hash() != base
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_download_prefetch_rejects_invalid_sizes(value: Any) -> None:
+    with pytest.raises(ValueError, match="download_prefetch_mb"):
+        dataclasses.replace(_build(_minimal()), download_prefetch_mb=value)
+
+
+def test_download_prefetch_does_not_change_dataset_or_source_identity() -> None:
+    original = _build(_minimal())
+    prefetched = dataclasses.replace(original, download_prefetch_mb=16)
+    assert original.config_hash() == prefetched.config_hash()
+    assert original.tokenizer_hash() == prefetched.tokenizer_hash()
+    for name in original.sources:
+        assert original.raw_hash(name) == prefetched.raw_hash(name)
+        assert original.processed_hash(name) == prefetched.processed_hash(name)
 
 
 def test_dataset_config_fields_and_asdict_roundtrip() -> None:

@@ -55,6 +55,7 @@ def test_commands_are_registered() -> None:
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml"])
     assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 2 and args.pass_workers == 4 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
+    assert args.download_prefetch_mb is None
     assert not args.dry_run and not args.yes and args.reopen is None and not args.allow_foreign_raw
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--reopen", "a", "--dry_run", "--yes", "--allow_foreign_raw", "--num_workers", "3", "--pass_workers", "5", "--max_parallel_downloads", "4"])
     assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.reopen == ["a"] and args.dry_run and args.yes and args.allow_foreign_raw
@@ -296,7 +297,8 @@ def test_yes_flag_reaches_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         return DatasetReport(tokenizer_complete=True)
 
     monkeypatch.setattr(cli_commands, "prepare", record)
-    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--allow_foreign_raw", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2"])
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--allow_foreign_raw", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2", "--download_prefetch_mb", "16"])
+    assert seen["download_prefetch_mb"] == 16
     assert (seen["assume_yes"], seen["allow_foreign_raw"], seen["hf_token"], seen["num_workers"], seen["pass_workers"], seen["steps"]) == (True, True, "t", 3, 2, STEPS)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert (seen["assume_yes"], seen["dry_run"], seen["allow_foreign_raw"]) == (False, False, False)

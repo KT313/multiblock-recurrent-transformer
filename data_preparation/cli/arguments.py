@@ -89,4 +89,5 @@ def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] 
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
     sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")
+    sub.add_argument("--download_prefetch_mb", type=int, default=None, help="remote read-ahead block size in MiB per download (up to two blocks buffered); 0 disables; defaults to dataset config, otherwise 0")
     sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")

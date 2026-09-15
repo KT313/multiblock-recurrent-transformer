@@ -20,7 +20,7 @@ dataset directory's build lock::
     assess_dataset_state                               the status table and its verdict, counting the repairs this
                                                        run left undone (a dry run leaves all of them) as incomplete
 
-:func:`download_and_build_missing` is the only place with thread-pool code: a pool of max_parallel_downloads
+:func:`download_and_build_missing` owns the source-job pools: a pool of max_parallel_downloads
 download jobs (the github_code sources of one repo form one job) and a pool of num_workers build jobs run
 side by side (:class:`JobPool`). A source is built the moment its download job finished, sources with nothing to
 download are built right away, and a source is never built while its own download runs. Each build job may hold a
@@ -43,7 +43,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
 
@@ -102,6 +102,7 @@ def prepare(
     num_workers: int = DEFAULT_NUM_WORKERS,
     pass_workers: int = DEFAULT_PASS_WORKERS,
     max_parallel_downloads: int = DEFAULT_MAX_PARALLEL_DOWNLOADS,
+    download_prefetch_mb: int | None = None,
     assume_yes: bool,
     dry_run: bool = False,
     steps: Iterable[str] = STEPS,
@@ -131,6 +132,8 @@ def prepare(
 
     # resolve the configuration and validate the requested work
     config = load_dataset_config(config_path)
+    if download_prefetch_mb is not None:
+        config = replace(config, download_prefetch_mb=download_prefetch_mb)
     config.validate_identifiers()
     config_name = Path(config_path).name
     layout = DatasetLayout(Path(dataset_dir))

@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, cast
 import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.sources.prefetch import PrefetchReader
 
 if TYPE_CHECKING:
     import httpx
@@ -631,6 +632,7 @@ class HubFetcher:
     remote: OpenRemote | None = None
     stats: FetchStats = field(default_factory=FetchStats)
     created: float = field(default_factory=time.time)  # a cache file younger than this was downloaded by this fetcher
+    prefetch_bytes: int = 0
 
     def uses_cache(self, size: int) -> bool:
         """
@@ -669,15 +671,22 @@ class HubFetcher:
         block_size = PARQUET_BLOCK_SIZE if fmt == ".parquet" else STREAM_BLOCK_SIZE
         raw = open_file(index.repo_id, file, index.read_revision, self.token, block_size)
         self.stats.files_streamed += 1
-        counting = _CountingRaw(raw, self.stats)
-        if fmt == ".parquet":
-            # random access: pyarrow reads exact column-chunk ranges itself, no extra buffering wanted
-            with counting:
-                yield counting
+        counting: _CountingRaw | PrefetchReader = _CountingRaw(raw, self.stats)
+        if self.prefetch_bytes:
+            counting = PrefetchReader(counting, index.sizes[file], self.prefetch_bytes)
+        stream = counting if fmt == ".parquet" else io.BufferedReader(counting, buffer_size=STREAM_BUFFER_SIZE)
+        try:
+            yield stream
+        except BaseException as error:
+            try:
+                stream.close()
+            except Exception as cleanup_error:
+                if isinstance(error, GeneratorExit):
+                    raise  # an early consumer stop must still report a failed background request
+                error.add_note(f"Remote reader cleanup also failed: {cleanup_error!r}")
+            raise
         else:
-            # sequential decoding (json lines / ijson): read through a local buffer
-            with io.BufferedReader(counting, buffer_size=STREAM_BUFFER_SIZE) as buffered:
-                yield buffered
+            stream.close()
 
 
 # --- per-format readers -----------------------------------------------------------------------------------------------

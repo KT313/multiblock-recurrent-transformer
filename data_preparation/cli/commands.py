@@ -78,6 +78,7 @@ def prepare_requested_steps(
         num_workers=args.num_workers,
         pass_workers=args.pass_workers,
         max_parallel_downloads=args.max_parallel_downloads,
+        download_prefetch_mb=args.download_prefetch_mb,
         assume_yes=args.yes,
         dry_run=args.dry_run,
         allow_foreign_raw=args.allow_foreign_raw,

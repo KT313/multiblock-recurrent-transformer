@@ -649,8 +649,9 @@ def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> di
     return state
 
 
+@pytest.mark.parametrize("prefetch_mb", [0, 1])
 def test_download_github_code_group_equals_separate_downloads(
-    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader, prefetch_mb: int,
 ) -> None:
     """
     Golden: one group pass gives every member the rows, offsets and exhausted flag of its separate download as a
@@ -674,6 +675,7 @@ def test_download_github_code_group_equals_separate_downloads(
     assert expected["rust"]["rows"] == [] and expected["rust"]["exhausted"]
 
     hub.streams.clear()
+    cfg = replace(cfg, download_prefetch_mb=prefetch_mb)
     grouped = DatasetLayout(tmp_path / "grouped")
     prepare_tokenizer(cfg, grouped)
     manifests = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
@@ -1087,6 +1089,33 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
     assert (reference.rows(), reference.tokens(), reference.rows_fetched) == (m2.rows(), m2.tokens(), m2.rows_fetched)
     assert read_rows(other.raw_dir("p")) == read_rows(raw)
+
+
+def test_prefetched_download_resumes_from_saved_rows_after_stop(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+    monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
+    hub.add("data/a.parquet", [{"text": f"document {i}"} for i in range(200)])
+    source = SourceConfig(kind="pretrain", loader="hf_files", hf_id=REPO, revision=REV,
+                          load_kwargs={"data_files": "data/*.parquet"})
+    cfg = with_tokenizer(replace(cfg_factory({"p": source}), download_prefetch_mb=1))
+    with pytest.raises(BuildAborted):
+        download(cfg, "p", layout, rows_needed=200, shard_size=5, should_stop=lambda: True)
+    saved = Manifest.load(layout.raw_dir("p"))
+    assert saved is not None and 0 < saved.rows_fetched < 200
+    assert all(handle.closed for handle in hub.handles.values())
+    prefix = read_rows(layout.raw_dir("p"))
+
+    resumed = download(cfg, "p", layout, rows_needed=200, shard_size=5)
+    reference_layout = DatasetLayout(tmp_path / "reference")
+    reference_config = replace(cfg, download_prefetch_mb=0)
+    prepare_tokenizer(reference_config, reference_layout)
+    reference = download(reference_config, "p", reference_layout, rows_needed=200, shard_size=5)
+    expected = read_rows(reference_layout.raw_dir("p"))
+    assert prefix == expected[:len(prefix)]
+    assert read_rows(layout.raw_dir("p")) == expected
+    assert (resumed.rows_fetched, resumed.tokens()) == (reference.rows_fetched, reference.tokens())
 
 
 def test_download_instruct_shard_offsets_count_consumed_source_rows(

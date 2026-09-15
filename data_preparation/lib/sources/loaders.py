@@ -58,6 +58,7 @@ class SharedLoaderParameters:
     stats: FetchStats | None = None
     columns: list[str] | None = None
     align_to_row_group: bool = True
+    download_prefetch_mb: int = 0
 
 
 class Loader(Protocol):
@@ -174,7 +175,8 @@ def hub_fetcher(source: SourceConfig, shared_parameters: SharedLoaderParameters)
 
     threshold = source.load_kwargs.get(MAX_CACHED_FILE_KEY, DEFAULT_MAX_CACHED_FILE_MB)
     return HubFetcher(
-        token=shared_parameters.token, max_cached_file_mb=float(threshold), stats=shared_parameters.stats or FetchStats()
+        token=shared_parameters.token, max_cached_file_mb=float(threshold), stats=shared_parameters.stats or FetchStats(),
+        prefetch_bytes=shared_parameters.download_prefetch_mb * 1024 * 1024,
     )
 
 

@@ -543,6 +543,7 @@ def download(
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
             columns=loader_columns(increment.source),
+            download_prefetch_mb=config.download_prefetch_mb,
         )
         rows = loader(increment.source, folder.rows_fetched, increment.loader_count, shared_parameters)
         _fetch([increment], _tagged(name, rows), bar, postfix, shard_size, gate)
@@ -786,6 +787,7 @@ def download_github_code_group(
     with open_download_progress(increments, f"{repo} ({len(increments)} languages)", fetch_stats) as (bar, postfix):
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats, columns=columns,
+            download_prefetch_mb=config.download_prefetch_mb,
         )
         rows = read_github_code_group(requests, shared_parameters, discover=discover)
         try:

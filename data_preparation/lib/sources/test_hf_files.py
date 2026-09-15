@@ -127,6 +127,17 @@ def test_every_format(hub: FakeHub, suffix: str) -> None:
     assert _ids(LOADERS["hf_files"](src, 0, 9)) == [f"o{i}" for i in range(5)]
 
 
+@pytest.mark.parametrize("suffix", [".parquet", ".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".json"])
+def test_prefetched_remote_formats_preserve_rows_and_resume(hub: FakeHub, suffix: str) -> None:
+    hub.add(f"x/one{suffix}", _rows("o", 20))
+    src = _src(load_kwargs={"data_files": f"x/*{suffix}", "max_cached_file_mb": 0})
+    load = LOADERS["hf_files"]
+    baseline = list(load(src, 2, 7))
+    assert list(load(src, 2, 7, SharedLoaderParameters(download_prefetch_mb=1))) == baseline
+    resume_offset = 2 + len(baseline)
+    assert list(load(src, resume_offset, 100, SharedLoaderParameters(download_prefetch_mb=1))) == list(load(src, resume_offset, 100))
+
+
 def test_unknown_format_and_missing_files(hub: FakeHub) -> None:
     with pytest.raises(ValueError, match="unsupported file format"):
         file_format("data/x.csv")
