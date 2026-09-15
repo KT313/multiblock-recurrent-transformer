@@ -50,6 +50,43 @@ def seeded_tiny(seed: int = 0, **kwargs: Any) -> RecurrentGPT:
     return build_model(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | kwargs))
 
 
+def test_nonorthogonal_model_initialization_and_checkpoint_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    from model.layers.init import checkpoint_initialization
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError('nonorthogonal initialization must not call QR')
+    monkeypatch.setattr(torch.linalg, 'qr', forbidden)
+    model = seeded_tiny(init_orthogonal=False)
+    assert model.lm_head.weight is model.transformer.wte.weight
+    for name, parameter in model.named_parameters():
+        if 'bias' in name:
+            assert torch.count_nonzero(parameter) == 0, name
+        elif parameter.ndim == 1:
+            assert torch.equal(parameter, torch.ones_like(parameter)), name
+        else:
+            output_projection = name.endswith(('attn.proj.weight', 'mlp.proj.weight'))
+            std = model.config.init.table['out_proj' if output_projection else 'std']
+            assert parameter.abs().max() <= 3*std, name
+            assert torch.count_nonzero(parameter) > 0, name
+    batch = ids(batch=1, seq=8)
+    torch.manual_seed(456)
+    output = model(batch, labels=batch, num_steps=(1, 1))
+    loss = output['loss']
+    assert loss is not None and torch.isfinite(loss)
+    loss.backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+    with checkpoint_initialization():
+        restored = RecurrentGPT(model.config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert restored.lm_head.weight is restored.transformer.wte.weight
+    for name, parameter in restored.state_dict().items():
+        assert torch.equal(parameter, model.state_dict()[name]), name
+    torch.manual_seed(456)
+    restored_loss = restored(batch, labels=batch, num_steps=(1, 1))['loss']
+    assert restored_loss is not None
+    torch.testing.assert_close(restored_loss, loss, rtol=0, atol=0)
+
+
 # --- structure -------------------------------------------------------------------------------------------------------
 
 

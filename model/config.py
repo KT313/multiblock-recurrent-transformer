@@ -48,7 +48,6 @@ BF16_RESIDUAL_STREAM_VALUES = ("none", "core", "all")
 _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
     ("attn_impl", "sdpa"),
     ("init_strategy", "takase"),
-    ("init_orthogonal", True),
     ("activation_checkpoint_impl", "per-iteration"),
     ("injection_type", "linear"),
     ("state_init", "normal"),
@@ -105,7 +104,7 @@ class RecurrentConfig:
     # Without autocast the stream is fp32 whatever the value. Parameters, gradients and optimizer state are unaffected.
     bf16_residual_stream: Literal["none", "core", "all"] = "none"
     init_strategy: Literal["takase"] = "takase"
-    init_orthogonal: Literal[True] = True
+    init_orthogonal: bool = True  # False: independent normal entries truncated at +/-3 Takase standard deviations
     activation_checkpoint_impl: Literal["per-iteration"] = "per-iteration"
     # Recurrent structure
     injection_type: Literal["linear"] = "linear"
@@ -178,7 +177,7 @@ class RecurrentConfig:
         for n_layers, mean_backprop_depth in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth):
             self.max_backprop_layers += n_layers * mean_backprop_depth
 
-        self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
+        self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth, orthogonal=self.init_orthogonal)
 
     def _validate_sizes(self) -> None:
         """

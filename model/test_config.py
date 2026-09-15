@@ -154,7 +154,6 @@ def test_architecture_yamls_list_every_tunable_field() -> None:
     fixed = {
         "attn_impl",
         "init_strategy",
-        "init_orthogonal",
         "activation_checkpoint_impl",
         "injection_type",
         "state_init",
@@ -247,7 +246,6 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
     [
         ("attn_impl", "flash"),
         ("init_strategy", "normal"),
-        ("init_orthogonal", False),
         ("activation_checkpoint_impl", "per-block"),
         ("injection_type", "add"),
         ("state_init", "zero"),
@@ -257,6 +255,17 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
 def test_invalid_single_value_fields_rejected(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"{field}="):
         tiny(**{field: value})
+
+
+@pytest.mark.parametrize('orthogonal', [True, False])
+def test_initialization_selection_survives_json(tmp_path: Path, orthogonal: bool) -> None:
+    cfg = tiny(init_orthogonal=orthogonal)  # architecture YAML override
+    assert cfg.init.orthogonal is orthogonal
+    path = tmp_path/'model_config.json'
+    cfg.to_json(path)
+    restored = RecurrentConfig.from_json(path)
+    assert restored.init_orthogonal is orthogonal and restored.init.orthogonal is orthogonal
+    assert restored.init.table == cfg.init.table
 
 
 @pytest.mark.parametrize(

@@ -139,8 +139,9 @@ def test_export_sources_rejects_flat_name_clash(tmp_path: Path) -> None:
         export_sources(pkg, tmp_path / "out")
 
 
-def test_config_round_trip() -> None:
-    cfg = tiny_config(rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5])
+@pytest.mark.parametrize('orthogonal', [True, False])
+def test_config_round_trip(orthogonal: bool) -> None:
+    cfg = tiny_config(rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5], init_orthogonal=orthogonal)
     hf_cfg = RecurrentGPTConfig.from_recurrent_config(cfg)
     assert hf_cfg.model_type == "recurrent_gpt"
     assert hf_cfg.rope_base == 12_345

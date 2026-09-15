@@ -3,12 +3,12 @@
 Tests for `model.init`: the takase std table, orthogonality of `trunc_orthogonal_`, zero biases.
 """
 
-from math import sqrt
+from math import erf, exp, pi, sqrt
 
 import pytest
 import torch
 
-from model.layers.init import Init, Linear, init_glu, init_qkv, trunc_orthogonal_, wrapped_trunc_ortho
+from model.layers.init import Init, Linear, init_glu, init_qkv, trunc_orthogonal_, wrapped_trunc_ortho, wrapped_trunc_normal
 
 DIM, HEAD, LAYERS = 1024, 64, 50
 STD = sqrt(2 / (5 * DIM))
@@ -36,6 +36,40 @@ def test_depth_only_scales_the_output_projections() -> None:
     assert shallow._std("out_proj") == pytest.approx(deep._std("out_proj") * 10)
     for name in ("std", "embedding", "head", "qkv", "glu", "in_proj"):
         assert shallow._std(name) == deep._std(name) == STD
+
+
+@pytest.mark.parametrize('name', ['qkv', 'glu', 'embedding', 'head', 'in_proj', 'out_attn', 'out_proj'])
+def test_truncated_normal_scales_bounds_and_nonorthogonality(name: str) -> None:
+    torch.manual_seed(123)
+    dim = 256
+    init = Init(dim, 32, 126, orthogonal=False)
+    rows = 3*dim if name == 'qkv' else 2*dim if name == 'glu' else dim
+    weight = torch.empty(rows, dim)
+    init.fn(name)(weight)
+    std = sqrt(1/(5*dim*126)) if name in ('out_attn', 'out_proj') else sqrt(2/(5*dim))
+    # +/-3 truncation reduces the variance; do not mistake the pre-truncation scale for realized variance.
+    truncated_std = std*sqrt(1 - 6*exp(-4.5)/sqrt(2*pi)/erf(3/sqrt(2)))
+    assert weight.abs().max() <= 3*std
+    assert weight.std().item() == pytest.approx(truncated_std, rel=.015)
+    assert weight.mean().abs() < .02*std
+    gram = weight[:dim] @ weight[:dim].T / (dim*std**2)
+    assert not torch.allclose(gram, torch.eye(dim), atol=.001, rtol=0)
+
+
+def test_normal_qkv_and_glu_preserve_component_scales_and_draw_order() -> None:
+    for kind in ('qkv', 'glu'):
+        scales = [.01, .01, .1] if kind == 'qkv' else [.02, .2]
+        weight = torch.empty(len(scales)*32, 32)
+        torch.manual_seed(8)
+        if kind == 'qkv':
+            init_qkv(weight, .01, .1, 32, 8, init_fn=wrapped_trunc_normal)
+        else:
+            init_glu(weight, .02, .2, init_fn=wrapped_trunc_normal)
+        torch.manual_seed(8)
+        for actual, std in zip(weight.chunk(len(scales)), scales):
+            expected = torch.empty_like(actual)
+            torch.nn.init.trunc_normal_(expected, std=std, a=-3*std, b=3*std)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(("rows", "cols"), [(256, 256), (512, 256), (256, 512)])
