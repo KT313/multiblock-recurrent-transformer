@@ -140,7 +140,8 @@ def collect_step_metrics(
     gradient_interval = settings.log_gradient_metrics_interval
     if gradient_interval > 0 and (step + 1) % gradient_interval == 0:
         plain = backend.plain_model(model)  # the DDP wrapper hides `.transformer`
-        metrics = track_gradient_metrics(plain, optimizer)
+        metrics = (track_gradient_metrics(plain, optimizer, backend=backend)
+                   if settings.optimizer_sharding == "zero1" else track_gradient_metrics(plain, optimizer))
         if probe_batch is not None and backend.is_main:
             metrics.update(track_recurrence_metrics(plain, backend, probe_batch, correlations=settings.log_correlations))
     if (step + 1) % settings.log_step_interval == 0:

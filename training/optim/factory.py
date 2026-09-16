@@ -21,7 +21,9 @@ OPTIMIZERS = ("AdamW", "ELLISAdam", "ELLISAdam8bit")
 ELLIS_OPTIMIZERS = ("ELLISAdam", "ELLISAdam8bit")
 
 
-def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig) -> Optimizer:
+def build_optimizer(
+    name: str, params: Iterable[Tensor] | list[dict[str, Any]], config: OptimizerConfig, *, sharding: str = "none"
+) -> Optimizer:
     """
     Construct "AdamW" (torch) or "ELLISAdam" from the run's `optim_config`.
 
@@ -31,6 +33,8 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
 
     # Validate the configuration and retain each optimizer's default epsilon.
     config.validate(name)
+    if sharding not in ("none", "zero1"):
+        raise ValueError("optimizer sharding must be 'none' or 'zero1'")
     common: dict[str, Any] = {"lr": config.lr, "betas": config.betas, "weight_decay": config.weight_decay}
     if config.eps is not None:
         common["eps"] = config.eps
@@ -39,8 +43,8 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
     if name in ELLIS_OPTIMIZERS:
         ellis_options = {option: getattr(config, option) for option in ELLIS_ONLY_OPTIONS}
         if name == "ELLISAdam8bit":
-            return ELLISAdam8bit(_pin_embedding_group_to_fp32(params), **common, **ellis_options)
-        return ELLISAdam(params, **common, **ellis_options)
+            return _construct(ELLISAdam8bit, _pin_embedding_group_to_fp32(params), sharding, common | ellis_options)
+        return _construct(ELLISAdam, params, sharding, common | ellis_options)
 
     # Reject ELLIS-only settings before constructing native AdamW.
     defaults = OptimizerConfig()
@@ -48,8 +52,19 @@ def build_optimizer(name: str, params: Iterable[Tensor] | list[dict[str, Any]], 
     if ellis_only_set:
         raise ValueError(f"optim_config option(s) {ellis_only_set} apply only to 'ELLISAdam', not {name!r}")
     if name == "AdamW":
-        return torch.optim.AdamW(params, **common)
+        return _construct(torch.optim.AdamW, params, sharding, common)
     raise ValueError(f"Invalid optimizer {name!r} requested (use one of {', '.join(map(repr, OPTIMIZERS))}).")
+
+
+def _construct(
+    cls: type[Optimizer], params: Iterable[Tensor] | list[dict[str, Any]], sharding: str, options: dict[str, Any]
+) -> Optimizer:
+    if sharding == "none":
+        return cls(params, **options)
+    # Importing the ordinary optimizer does not import distributed optimizer machinery.
+    from training.optim.zero1 import ShardedOptimizer
+
+    return ShardedOptimizer(params, optimizer_class=cls, **options)
 
 
 def set_lr(optimizer: Optimizer, lr: float) -> None:
@@ -59,6 +74,8 @@ def set_lr(optimizer: Optimizer, lr: float) -> None:
     `lr.item()` per parameter every step.
     """
 
-    value: torch.Tensor | float = torch.as_tensor(lr) if isinstance(optimizer, ELLISAdam) else lr
+    from training.optim.sharding import local_optimizer
+
+    value: torch.Tensor | float = torch.as_tensor(lr) if isinstance(local_optimizer(optimizer), ELLISAdam) else lr
     for group in optimizer.param_groups:
         group["lr"] = value

@@ -208,4 +208,6 @@ def build_run_optimizer(settings: Settings, model: Module, backend: Backend) -> 
     param_groups = get_param_groups(
         model, settings.optim_config.weight_decay, settings.no_weight_decay_for_bias_and_norm_params
     )
-    return backend.setup_optimizer(build_optimizer(settings.optimizer, param_groups, settings.optim_config))
+    return backend.setup_optimizer(build_optimizer(
+        settings.optimizer, param_groups, settings.optim_config, sharding=settings.optimizer_sharding
+    ))

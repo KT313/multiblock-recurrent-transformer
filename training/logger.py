@@ -42,6 +42,7 @@ from torch.optim import Optimizer
 from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
 from training.optim import dequantized_state
+from training.optim.sharding import local_optimizer
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
@@ -895,7 +896,9 @@ def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
 
 
 @torch.no_grad()
-def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, torch.Tensor]:
+def track_gradient_metrics(
+    model: Module, optimizer: Optimizer, *, backend: Backend | None = None
+) -> dict[str, torch.Tensor]:
     """
     Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
     and before `zero_grad()`.
@@ -911,6 +914,17 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
     wte_module: Optional[Module] = getattr(transformer, "wte", None)
     wte_weight: Optional[torch.Tensor] = getattr(wte_module, "weight", None)
     names = {id(param): name for name, param in model.named_parameters()}
+    owner = local_optimizer(optimizer)
+    initialized: set[str] = set()
+    if owner is not optimizer:
+        if backend is None:
+            raise ValueError("sharded optimizer metrics require the distributed backend on every rank")
+        local_names = {
+            names[id(param)] for param, values in owner.state.items()
+            if param.grad is not None and values.get("exp_avg_sq") is not None
+            and values["exp_avg_sq"].shape == param.grad.shape
+        }
+        initialized = set().union(*backend.all_gather_object(local_names))
 
     grad_qkv_layer, grad_mlp_layer = 0, 0  # `query_grad_<i>` / `ffn2_grad_<i>`
     lr_qkv_layer, lr_mlp_layer = 0, 0  # `*_effective_lr_<i>`
@@ -940,8 +954,12 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
         if not finite:
             continue
         finite_grads.append(grad)
-        state = optimizer.state.get(param)
+        state = owner.state.get(param)
         if state is None:
+            # Reserve the same historical index on ranks that do not own this parameter's moments.
+            if name in initialized:
+                lr_qkv_layer += int(is_qkv)
+                lr_mlp_layer += int(is_proj)
             continue
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
@@ -990,4 +1008,33 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
         metrics["model_l2_param_norm"] = torch.norm(
             torch.stack([torch.norm(param.detach()) for name, param in model.named_parameters() if "wte" not in name])
         )
+    if owner is not optimizer:
+        assert backend is not None
+        metrics = _merge_sharded_gradient_metrics(metrics, num_params_with_grad, backend)
+    return metrics
+
+
+def _merge_sharded_gradient_metrics(
+    metrics: dict[str, torch.Tensor], rms_count: int, backend: Backend
+) -> dict[str, torch.Tensor]:
+    """Gather only owner-derived scalars; replicated gradient/parameter norms need no reduction."""
+    selected = {key: value for key, value in metrics.items()
+                if "effective_lr" in key or key in ("embed_RMS", "avg_RMS")}
+    # One batched device-to-host transfer, not one synchronization per tensor.
+    values = torch.stack([value.to(backend.device) for value in selected.values()]).cpu().tolist() if selected else []
+    records = backend.all_gather_object((dict(zip(selected, values, strict=True)), rms_count))
+    total, count = 0.0, 0
+    seen: set[str] = set()
+    for scalars, number in records:
+        total += scalars.get("avg_RMS", 0.0) * number
+        count += number
+        for key, value in scalars.items():
+            if key == "avg_RMS":
+                continue
+            if key in seen:
+                raise RuntimeError(f"optimizer metric {key} has multiple owners")
+            seen.add(key)
+            metrics[key] = torch.tensor(value)
+    if count:
+        metrics["avg_RMS"] = torch.tensor(total / count)
     return metrics

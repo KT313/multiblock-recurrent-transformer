@@ -89,6 +89,28 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
     assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["model_max_sequence_length"] == 256
 
 
+def test_pre_sharding_settings_keep_unsharded_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    del metadata.settings["optimizer_sharding"]
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), tiny_model.config.to_dict(), False)
+
+
+def test_resume_refuses_sharding_change_before_model_load(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT, tmp_path: Path
+) -> None:
+    optimizer = ELLISAdam(get_param_groups(tiny_model, 0.01))
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings["optimizer_sharding"] = "zero1"
+    path = tmp_path / "wrong-mode.pth"
+    save_training_checkpoint(backend, path, tiny_model, optimizer, metadata)
+    before = {name: param.detach().clone() for name, param in tiny_model.named_parameters()}
+    with pytest.raises(ValueError, match="changing optimizer_sharding"):
+        load_training_checkpoint(backend, path, tiny_model, optimizer)
+    assert not optimizer.state
+    for name, param in tiny_model.named_parameters():
+        assert torch.equal(param, before[name])
+
+
 def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
     """
     No tolerance for older layouts (clean break): a missing key names itself instead of becoming a default.
@@ -282,6 +304,7 @@ CHANGED_COMPARED_VALUES: dict[str, Any] = {
     "tokens_per_micro_batch": 16384,
     "micro_batches_per_step": 128,
     "optimizer": "AdamW",
+    "optimizer_sharding": "zero1",
     "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
     "grad_clip": 0.5,

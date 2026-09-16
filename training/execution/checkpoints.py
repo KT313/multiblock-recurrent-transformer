@@ -15,6 +15,7 @@ from training.checkpoint import (
 from training.data.dataset_resolver import check_dataset_unchanged
 from training.execution.state import ResumePoint, RunState
 from training.logger import RunLogger
+from training.optim.sharding import prepare_optimizer_state, release_optimizer_state
 from training.settings import Settings
 from training.steps import RankBatches
 from training.stopping import complete_main_phase
@@ -131,7 +132,11 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: RankBatches
             save_training_checkpoint(state.backend, path, state.model, state.optimizer, metadata)
         logger.log_checkpoint(path)
 
-    complete_main_phase(state.backend, "checkpoint publication", publish)
+    prepare_optimizer_state(state.optimizer)
+    try:
+        complete_main_phase(state.backend, "checkpoint publication", publish)
+    finally:
+        release_optimizer_state(state.optimizer)
     if not state.backend.is_main:
         logger.log_checkpoint(path)
     return path

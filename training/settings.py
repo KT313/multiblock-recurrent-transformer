@@ -153,6 +153,7 @@ class Settings:
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
+    optimizer_sharding: Literal["none", "zero1"] = "none"  # optimizer state only; requires DDP
     optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)  # typed; CLI overrides merge per field
     no_weight_decay_for_bias_and_norm_params: bool = True
     grad_clip: float = 1.0
@@ -226,6 +227,10 @@ class Settings:
         # optimizer used to fail after the build, an unknown schedule at the first optimizer step)
         if self.optimizer not in OPTIMIZERS:
             raise ValueError(f"optimizer must be one of {', '.join(OPTIMIZERS)}, not {self.optimizer!r}")
+        if self.optimizer_sharding not in ("none", "zero1"):
+            raise ValueError("optimizer_sharding must be 'none' or 'zero1'")
+        if self.optimizer_sharding == "zero1" and self.backend != "ddp":
+            raise ValueError("optimizer_sharding='zero1' requires backend='ddp'")
         if self.lr_schedule not in LR_SCHEDULES:
             raise ValueError(f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, not {self.lr_schedule!r}")
         if any(depth <= 0 for depth in self.partial_depth_eval):

@@ -18,6 +18,7 @@ from uuid import uuid4
 from torch import Tensor
 
 from data_preparation.lib.storage.atomic import write_atomically
+from training.optim.sharding import local_optimizer
 
 if TYPE_CHECKING:
     from training.execution.state import ResumePoint, RunState
@@ -100,6 +101,7 @@ def build_resume_record(
     # The optional build-ID interface also supports legacy checkpoints and pre-ID resolved datasets.
     dataset_id = getattr(state.dataset, "dataset_build_id", None)
     checkpoint_dataset_id = getattr(metadata, "dataset_build_id", None)
+    inner_optimizer = local_optimizer(state.optimizer)
     return {
         "schema_version": 1,
         "event": "resume_setup_accepted",
@@ -120,6 +122,7 @@ def build_resume_record(
             ],
             "optimizer": {
                 "implementation": f"{type(state.optimizer).__module__}.{type(state.optimizer).__qualname__}",
+                "local_implementation": f"{type(inner_optimizer).__module__}.{type(inner_optimizer).__qualname__}",
                 "parameter_groups_at_acceptance": groups,
                 "learning_rate_policy": "each update replaces group lr with the current run's stage schedule",
                 "unlisted_group_fields": "not recorded",

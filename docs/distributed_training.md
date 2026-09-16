@@ -12,6 +12,10 @@ uv run torchrun --standalone --nproc_per_node=gpu --shutdown-timeout=1800 traini
 The run config must say `backend: ddp`. The single-device backend refuses to start under torchrun (it would train
 one independent copy of the run per GPU), and the DDP backend refuses to start without torchrun's environment.
 
+Optimizer state is replicated by default. Set `optimizer_sharding: zero1` in the top-level run configuration
+to distribute it across ranks, with either FP32 or 8-bit ELLISAdam. See [optimizer-state sharding](optimizer_sharding.md)
+for supported optimizers, checkpoint restrictions, memory caveats and validation limits.
+
 ## What is shared and what is per rank
 
 Every rank runs the same `train()`; the differences are these.

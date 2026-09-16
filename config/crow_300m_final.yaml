@@ -61,6 +61,7 @@ micro_batches_per_step: 256             # packs per optimizer step, a multiple o
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
 optimizer: ELLISAdam                 # optimizer class (training/optim: AdamW, ELLISAdam, or ELLISAdam8bit = ELLISAdam with 8-bit moments for every group but the embeddings, 2 instead of 8 bytes of state per parameter)
+optimizer_sharding: none             # none | zero1: distribute optimizer state; zero1 requires backend: ddp
 optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
                                      # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
   lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation

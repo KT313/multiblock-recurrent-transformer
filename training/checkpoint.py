@@ -25,6 +25,7 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from training.backend.base import Backend
+from training.optim.sharding import sharded_optimizer
 from training.settings import Settings
 from training.stage_manager import StageManager
 
@@ -218,7 +219,9 @@ def check_settings_unchanged(
     current = asdict(settings)
     # Checkpoints predating kernel integration always used native operations. Treat an absent flag as false,
     # while keeping changes subject to the same resume policy as precision and compilation.
-    stored_settings = {"use_custom_kernels": False, "loss_normalization": "legacy_pack_v0"} | metadata.settings
+    stored_settings = {
+        "use_custom_kernels": False, "loss_normalization": "legacy_pack_v0", "optimizer_sharding": "none"
+    } | metadata.settings
     # Pre-scaling checkpoints used unit-gain sandwich branches; only that default is implicit on resume.
     stored_model_config = {"use_custom_kernels": False, "residual_scaling": "none"} | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
@@ -304,6 +307,19 @@ def load_training_checkpoint(
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
+    sharded = sharded_optimizer(optimizer)
+    mode = "zero1" if sharded is not None else "none"
+    if metadata.settings.get("optimizer_sharding", "none") != mode:
+        raise ValueError("changing optimizer_sharding on resume is unsupported; start a fresh run")
+    if sharded is not None:
+        if metadata.world_size != backend.world_size:
+            raise ValueError("zero1 resume requires the same number of ranks as the checkpoint")
+        sharded.validate_state_dict(state["optimizer"])
+        loaded_groups = [
+            {key: _plain(value) for key, value in group.items() if key not in UNCOMPARED_GROUP_KEYS}
+            for group in state["optimizer"]["param_groups"]
+        ]
+        check_param_groups_unchanged(_group_hyperparameters(optimizer), loaded_groups)
     backend.plain_model(model).load_state_dict(state["model"])
     expected = _group_hyperparameters(optimizer)
     optimizer.load_state_dict(state["optimizer"])
