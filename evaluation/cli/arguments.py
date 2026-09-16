@@ -23,6 +23,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_sample_cache", action="store_true", help="legacy full-prefix latent resampling (default: fixed per-token latents and per-recurrence KV cache)")
     parser.add_argument("--temperature", type=float, default=0.0, help="0: greedy")
     parser.add_argument("--tasks", default="", help="comma-separated lm-eval tasks; empty: no benchmarks")
+    parser.add_argument("--benchmark_apply_chat_template", action="store_true", help="explicit literal-aware chat benchmark protocol")
     parser.add_argument("--limit", type=int, default=None, help="examples per task")
     parser.add_argument(
         "--num_fewshot", type=int, default=TASK_DEFAULT_FEWSHOT,

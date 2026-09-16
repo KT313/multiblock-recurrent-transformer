@@ -47,9 +47,17 @@ def check_benchmark_requests(
 
 def build_benchmark_harness(
     session: InferenceSession, tokenizer: Tokenizer, hf_models: Any, batch_size: int | str, max_length: int,
+    apply_chat_template: bool = False,
 ) -> tuple[RecurrentGPTForCausalLM, Any]:
     wrapper = session.hf_wrapper(tokenizer)
-    language_model = hf_models.HFLM(  # BOS as in training and sampling; the table length caps few-shot prompts
+    harness = hf_models.HFLM
+    if tokenizer.contract is not None:
+        from evaluation.literal_harness import create_literal_harness_class
+
+        harness = create_literal_harness_class(harness, chat=apply_chat_template)
+    elif apply_chat_template:
+        raise ValueError("chat benchmarks require the literal chat tokenizer profile")
+    language_model = harness(  # BOS as in training and sampling; the table length caps few-shot prompts
         pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size, add_bos_token=True,
         max_length=max_length, mixed_precision_dtype=session.mixed_precision_dtype,
     )
@@ -58,6 +66,7 @@ def build_benchmark_harness(
 
 def run_benchmark_harness(
     lm_eval: Any, language_model: Any, tasks: Sequence[str], limit: int | None, num_fewshot: int,
+    apply_chat_template: bool = False,
 ) -> dict[str, Any]:
     """Use the caller's post-construction Torch seed and preserve the harness's other seed defaults.
 
@@ -70,6 +79,7 @@ def run_benchmark_harness(
         num_fewshot=None if num_fewshot == TASK_DEFAULT_FEWSHOT else num_fewshot,
         random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
         torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
+        **({"apply_chat_template": True} if apply_chat_template else {}),
     )
     return results
 

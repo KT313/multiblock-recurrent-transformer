@@ -115,6 +115,7 @@ def build_resume_record(
             # optim_config is a constructor request; restored parameter groups are authoritative at acceptance.
             "run_settings": {key: value for key, value in requested.items() if key != "optim_config"},
             "model_config": model_config,
+        "tokenizer_contract": state.tokenizer_contract,
             "stage_schedule": [
                 {"name": stage.name, "tokens": stage.tokens, "base_lr": stage.base_lr,
                  "transition_pct": stage.transition_pct, "boundaries": asdict(boundary)}

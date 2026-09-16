@@ -1,7 +1,8 @@
 # Bounded integration mixture, not a research recipe. Use an isolated --dataset_dir.
 # Selects small budgeted prefixes from the pinned pools; check_limit is a row bound, not a network byte bound.
 tokenizer:
-  name: llama-32k
+  name: llama-32k-chat-v1
+  profile: llama32k_chat_v1
   kind: hf
   hf_id: hf-internal-testing/llama-tokenizer
   revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0

@@ -39,6 +39,12 @@ class SavedTokenizer:
             raise ValueError(f"no tokenizer.json in {self.path}: only a fast tokenizer directory (as save_pretrained writes it) can be loaded")
         self._tokenizer = Tokenizer.from_file(str(file))
         config = _read_json(self.path / "tokenizer_config.json")
+        from tokenization.profile import validate_profile
+
+        self.contract = validate_profile(self.path)
+        self.profile = self.contract["profile"] if self.contract else None
+        if self.profile:
+            self._tokenizer.encode_special_tokens = True
         if config.get("clean_up_tokenization_spaces"):
             # transformers' decode would rewrite spaces around punctuation; decoding here is the raw tokenizer's
             raise ValueError(f"{self.path}: clean_up_tokenization_spaces is set, which this loader does not replicate")
@@ -52,9 +58,9 @@ class SavedTokenizer:
     def encode_literal(self, text: str) -> list[int]:
         """Encode message content without interpreting special-token spellings as control IDs."""
         if self._literal_tokenizer is None:
-            literal = Tokenizer.from_str(self._tokenizer.to_str())
-            literal.encode_special_tokens = True
-            self._literal_tokenizer = literal
+            from tokenization.chat import build_literal_encoder
+
+            self._literal_tokenizer = build_literal_encoder(self._tokenizer, chat_body=bool(self.profile))
         return self._literal_tokenizer.encode(text, add_special_tokens=False).ids
 
     def _special_id(self, name: str, value: Any) -> int | None:
@@ -69,10 +75,10 @@ class SavedTokenizer:
     @property
     def vocab_size(self) -> int:
         """
-        The base vocabulary without added tokens (what `training.data.collate` masks labels against).
+        The valid-label bound: base size for legacy artifacts, usable total size for the verified chat profile.
         """
 
-        return self._tokenizer.get_vocab_size(with_added_tokens=False)
+        return self._tokenizer.get_vocab_size(with_added_tokens=bool(self.profile))
 
     def __len__(self) -> int:
         return self._tokenizer.get_vocab_size(with_added_tokens=True)

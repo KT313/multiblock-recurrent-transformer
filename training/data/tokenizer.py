@@ -70,6 +70,8 @@ class Tokenizer:
                                     "with the dataset config and tokenizer step to repair it")
         self._backend = SavedTokenizer(self.path)
         self._processor: Any = None
+        self.contract = self._backend.contract
+        self.profile = self._backend.profile
         bos_id, eos_id = self._backend.bos_id, self._backend.eos_id
         if bos_id is None or eos_id is None:
             raise ValueError(f"Tokenizer at {self.path} must define a BOS and an EOS token")
@@ -103,9 +105,9 @@ class Tokenizer:
         """
 
         if self._processor is None:
-            from transformers import AutoTokenizer
+            from tokenization.profile import load_processor
 
-            processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=True, add_eos_token=False)
+            processor = load_processor(self.path, add_bos_token=True)
             check_automatic_bos(processor, self.bos_id, self.path)
             self._processor = processor
         return self._processor
@@ -113,7 +115,7 @@ class Tokenizer:
     @property
     def vocab_size(self) -> int:
         """
-        Size of the base vocabulary (without added tokens), used to mask out-of-range labels.
+        Valid-label bound: the verified profile's usable size, or the historical base size for legacy tokenizers.
         """
 
         return self._backend.vocab_size

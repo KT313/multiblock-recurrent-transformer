@@ -86,7 +86,7 @@ def test_check_recurrence_rejects_a_wrong_block_count(tiny_model: RecurrentGPT) 
 
 
 def test_default_prompts() -> None:
-    assert instruction_prompt("Translate.", "  Hallo  ") == Prompt("Translate.\n\nHallo\n\n", INSTRUCTION)
+    assert instruction_prompt("Translate.", "  Hallo  ") == Prompt("Translate.\n\nHallo\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Translate.\n\nHallo"}])
     assert all(p.kind in (CONTINUATION, INSTRUCTION) for p in DEFAULT_PROMPTS)
     assert all(p.text.endswith("\n\n") for p in DEFAULT_PROMPTS if p.kind == INSTRUCTION)
     assert load_prompts() == list(DEFAULT_PROMPTS)
@@ -98,7 +98,7 @@ def test_prompts_file(tmp_path: Path) -> None:
     prompts = load_prompts_file(path)
     assert prompts == [
         Prompt("Once upon a time"),
-        Prompt("Summarize the text.\n\nA long text.\n\n", INSTRUCTION),
+        Prompt("Summarize the text.\n\nA long text.\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Summarize the text.\n\nA long text."}]),
         Prompt("def f():"),
     ]
     assert load_prompts(path) == prompts
@@ -117,7 +117,7 @@ def test_prompts_file_markers_are_matched_exactly(tmp_path: Path) -> None:
     path.write_text("# Compute the primes up to n\ndef primes(n):\n---\n  # Instruction \nSummarize.\n---\n#poem\nRoses")
     assert load_prompts_file(path) == [
         Prompt("# Compute the primes up to n\ndef primes(n):"),
-        Prompt("Summarize.\n\n", INSTRUCTION),
+        Prompt("Summarize.\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Summarize."}]),
         Prompt("#poem\nRoses"),  # not `# instruction` or `# continuation`: content
     ]
     path.write_text("# instruction\n\n")

@@ -46,7 +46,7 @@ package = false
 
 [tool.pytest.ini_options]
 addopts = "-q -rs -n 8 --dist loadgroup"  # -rs names every skipped test and its reason; eight workers (about 3 GB each at peak, 3 cores each); -n 0 runs serially
-testpaths = ["model", "training", "data_preparation", "ui", "evaluation"]
+testpaths = ["tokenization", "model", "training", "data_preparation", "ui", "evaluation"]
 pythonpath = ["."]
 markers = [
   "gpu: needs a CUDA device (skipped otherwise)",
@@ -67,7 +67,7 @@ ignore = ["E501", "E731", "E741", "B008", "B905", "SIM108", "C408", "G004", "PLC
 
 [tool.mypy]
 python_version = "3.11"
-files = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
+files = ["tokenization", "model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["\\.venv/", "\\.claude/", "outputs/", "dataset/"]
 strict = true
 warn_unreachable = true
@@ -82,7 +82,7 @@ ignore_missing_imports = true
 
 [tool.basedpyright]
 pythonVersion = "3.11"
-include = ["model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
+include = ["tokenization", "model", "training", "data_preparation", "ui", "evaluation", "conftest.py"]
 exclude = ["**/__pycache__", ".venv", ".claude", "outputs", "dataset", "training/optim/torchao"]
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false

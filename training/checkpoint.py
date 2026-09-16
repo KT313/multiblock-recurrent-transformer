@@ -54,6 +54,7 @@ class CheckpointMetadata:
     data_stream: dict[str, Any]  # `training.steps.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
 
     dataset_build_id: str | None = None  # unknown provenance in legacy checkpoints
+    tokenizer_contract: dict[str, Any] | None = None
 
     def to_state(self) -> dict[str, Any]:
         """
@@ -72,7 +73,7 @@ class CheckpointMetadata:
 
         if LEGACY_RNG_KEY in state and "world_size" not in state and "rng_states" not in state:
             state = {**state, "world_size": 1, "rng_states": [state[LEGACY_RNG_KEY]]}
-        state = {"dataset_build_id": None, **state}
+        state = {"dataset_build_id": None, "tokenizer_contract": None, **state}
         missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(
@@ -196,6 +197,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "benchmark_tasks",
     "benchmark_limit",
     "benchmark_num_fewshot",
+    "benchmark_apply_chat_template",
     "benchmark_batch_size",
     "benchmark_recurrences",
 )
@@ -296,7 +298,8 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(
-    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer
+    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer,
+    *, tokenizer_contract: dict[str, Any] | None = None,
 ) -> CheckpointMetadata:
     """
     Load the model and optimizer state in place and return the checkpoint's metadata.
@@ -307,6 +310,9 @@ def load_training_checkpoint(
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
+    from training.tokenizer_contract import check_checkpoint_tokenizer
+
+    check_checkpoint_tokenizer(metadata.tokenizer_contract, tokenizer_contract)
     sharded = sharded_optimizer(optimizer)
     mode = "zero1" if sharded is not None else "none"
     if metadata.settings.get("optimizer_sharding", "none") != mode:

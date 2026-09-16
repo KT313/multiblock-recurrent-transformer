@@ -15,6 +15,7 @@ from evaluation.prompts import Prompt
 from evaluation.wrapper import Recurrence
 from model.execution import ExecutionPolicy
 from training.data.tokenizer import Tokenizer
+from training.data.formats import encode_generation_prompt
 
 log = get_logger("evaluation.samples")  # preserve the logger identity of the sample-generation entry point
 
@@ -40,7 +41,7 @@ def select_fitting_prompts(
 
     fitting: list[tuple[Prompt, list[int]]] = []
     for prompt in prompts:
-        ids = tokenizer.encode(prompt.text, bos=True)
+        ids = encode_generation_prompt(tokenizer, prompt.text, kind=prompt.kind, messages=prompt.messages)
         if len(ids) + max_new_tokens > model_max_sequence_length:
             log.warning(
                 "prompt %r skipped: its %d tokens plus max_new_tokens %d exceed the model's %d positions",

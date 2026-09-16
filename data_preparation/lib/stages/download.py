@@ -451,9 +451,14 @@ def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_
     publication succeeds; subsequent failures are likewise not a multi-directory rollback transaction.
     """
 
+    if config.tokenizer.profile:
+        from tokenization.profile import recover_profile
+
+        recover_profile(plan.directory)
     if plan.current is not None:
         assessment = assess_tokenizer_folder(plan.directory, config.tokenizer_hash(), validate_payload=True)
-        if assessment.ready and assessment.manifest is not None:
+        if (assessment.ready and assessment.manifest is not None
+                and (not config.tokenizer.profile or SavedTokenizer(plan.directory).profile == config.tokenizer.profile)):
             return assessment.manifest
         log.warning("%s; preparing a validated replacement", assessment.problem)
     tokenizer = config.tokenizer
@@ -463,7 +468,11 @@ def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_
     tokenizer_dir.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".tokenizer-", dir=tokenizer_dir.parent) as staging:
         temporary = Path(staging) / "payload"
-        if tokenizer.kind == "synthetic":
+        if tokenizer.profile:
+            from tokenization.profile import build_profile
+
+            build_profile(temporary, tokenizer_dir.parent / "llama-32k", token=hf_token)
+        elif tokenizer.kind == "synthetic":
             write_synthetic_tokenizer(temporary)
         else:
             _auto_tokenizer().from_pretrained(tokenizer.hf_id, revision=tokenizer.revision, token=hf_token).save_pretrained(str(temporary))
@@ -473,9 +482,14 @@ def prepare_planned_tokenizer(config: DatasetConfig, plan: TokenizerPlan, *, hf_
         manifest = new_manifest(config, tokenizer.name, config.tokenizer_hash(), "tokenizer")
         manifest.extra = {"kind": tokenizer.kind, "hf_id": tokenizer.hf_id, "revision": tokenizer.revision}
         manifest.complete_generation(temporary)
-        if tokenizer_dir.exists():
-            shutil.rmtree(tokenizer_dir)  # a non-empty directory cannot be replaced; failures must propagate
-        os.replace(temporary, tokenizer_dir)
+        if tokenizer.profile:
+            from tokenization.profile import publish_profile
+
+            publish_profile(temporary, tokenizer_dir)
+        else:
+            if tokenizer_dir.exists():
+                shutil.rmtree(tokenizer_dir)  # legacy publication semantics
+            os.replace(temporary, tokenizer_dir)
         _fsync_directory(tokenizer_dir.parent)
     return manifest
 

@@ -33,6 +33,7 @@ class RunState:
     dataset: ResolvedDataset
     stage_manager: StageManager
     progress: TrainingProgress
+    tokenizer_contract: dict[str, Any] | None = None
 
 
 

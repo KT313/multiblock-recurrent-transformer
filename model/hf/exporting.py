@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ..model import RecurrentGPT
 
@@ -62,7 +62,7 @@ def resolve_special_token_ids(
 _TOKENIZER_EXPORT_ARTIFACTS = (
     "tokenizer_config.json", "special_tokens_map.json", "tokenizer.json", "added_tokens.json",
     "vocab.json", "vocab.txt", "merges.txt", "tokenizer.model", "spiece.model", "sentencepiece.bpe.model",
-    "chat_template.jinja", "chat_templates",
+    "chat_template.jinja", "chat_templates", "tokenizer_contract.json", "hf.py", "chat.py", "profile.py",
 )
 # One `from .x import` / `from ..x.y import` line: leading whitespace, the dots, the dotted module name.
 _RELATIVE_IMPORT = re.compile(r"^(?P<indent>[ \t]*)from[ \t]+(?P<dots>\.+)(?P<name>[\w.]*)[ \t]+import\b", re.MULTILINE)
@@ -120,8 +120,19 @@ def export_sources(package_dir: Path, out_dir: Path) -> list[Path]:
         if target in written:
             raise ValueError(f"{module} and another module both flatten to {target.name}")
         text = flatten_relative_imports(source.read_text(encoding="utf-8"), module, package_dir)
+        text = re.sub(r"from tokenization\.(\w+) import", r"from .tokenization_\1 import", text)
         target.write_text(text, encoding="utf-8")
         written.append(target)
+    tokenizer_package = package_dir.parent / "tokenization"
+    if tokenizer_package.is_dir():
+        for source in sorted(tokenizer_package.glob("*.py")):
+            if source.name == "__init__.py" or source.name.startswith("test_"):
+                continue
+            text = re.sub(r"from \.(\w+) import", r"from .tokenization_\1 import", source.read_text(encoding="utf-8"))
+            # Setup-only parity checks are not part of exported model imports.
+            target = out_dir / f"tokenization_{source.name}"
+            target.write_text(text, encoding="utf-8")
+            written.append(target)
     return written
 
 
@@ -142,7 +153,9 @@ def prepare_export_metadata(
                 "use a fresh directory or supply a tokenizer to avoid stale special-token metadata"
             )
     if tokenizer_dir is not None:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        from tokenization.profile import load_processor
+
+        tokenizer = load_processor(tokenizer_dir)
     elif tokenizer is not None:
         tokenizer = deepcopy(tokenizer)  # metadata resolution and serialization use this one independent instance
     metadata = resolve_special_token_ids(

@@ -1,5 +1,5 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Small immutable build descriptors, validated using manifests only.
+"""Small immutable build descriptors, validated using manifests and new-profile tokenizer contracts.
 
 IDs attest managed publication, not file contents. Manual edits retaining manifests are outside this
 contract. Legacy adoption establishes identity from now onward and proves nothing about old checkpoints.
@@ -55,7 +55,12 @@ def _constituents(config: DatasetConfig, layout: DatasetLayout, *, adopt: bool =
         if stage == "processed":
             sources.append({**reference, "rows": manifest.rows()})
         else:
-            tokenizer = reference
+            from tokenization.profile import validate_profile
+
+            contract = validate_profile(directory) if config.tokenizer.profile else None
+            if config.tokenizer.profile and contract is None:
+                raise RuntimeError("selected chat tokenizer is missing its profile contract")
+            tokenizer = {**reference, **({"contract": contract} if contract else {})}
     return sources, tokenizer
 
 

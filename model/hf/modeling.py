@@ -141,6 +141,12 @@ class RecurrentGPTConfig(PretrainedConfig):  # type: ignore[no-untyped-call]  # 
             recurrent_depth += n_layers * mean_recurrence
         self.num_hidden_layers = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
 
+        contract = kwargs.pop("tokenizer_contract", None)
+        if contract is not None:
+            from tokenization.validation import check_model_vocabulary
+
+            check_model_vocabulary(validated, contract)
+            self.tokenizer_contract = contract
         kwargs.setdefault("tie_word_embeddings", self.tie_embeddings)
         for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if name in kwargs:
@@ -414,12 +420,26 @@ def export_to_hf(
         allow_missing_generation_metadata,
     )
 
+    from tokenization.validation import check_model_vocabulary
+    from tokenization.profile import inspect_processor_contract, validate_profile
+
+    contract = inspect_processor_contract(tokenizer) if tokenizer is not None else None
+    check_model_vocabulary(config, contract, model)
+    if contract is None and (out_dir / "tokenizer_contract.json").exists():
+        raise ValueError("export destination contains a chat profile; use a new directory for a different tokenizer")
+    if contract is not None and any((out_dir / name).exists() for name in ("tokenizer_config.json", "tokenizer.json", "chat_template.jinja", "chat_templates", "tokenizer_contract.json", "hf.py")):
+        existing = validate_profile(out_dir)
+        if existing is None or ("digest" in contract and existing != contract):
+            raise ValueError("export destination contains a different tokenizer; use a new directory")
+
     # configure the self-contained wrapper and its generation metadata
     this_module = flat_module_name(Path(__file__).resolve().relative_to(_PACKAGE_DIR))
     hf_config = RecurrentGPTConfig.from_recurrent_config(
         config, execution_precision=execution_policy.precision if execution_policy is not None else None,
         **metadata,
     )
+    if contract is not None:
+        hf_config.tokenizer_contract = contract
     hf_config.auto_map = {
         "AutoConfig": f"{this_module}.RecurrentGPTConfig",
         "AutoModelForCausalLM": f"{this_module}.RecurrentGPTForCausalLM",

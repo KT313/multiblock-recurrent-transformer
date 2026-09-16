@@ -38,8 +38,20 @@ def load_checkpoint_evaluation(arguments: argparse.Namespace) -> CheckpointEvalu
     out_dir = Path(arguments.out_dir) if arguments.out_dir else checkpoint.parent.parent
 
     # restore the model and tokenizer before parsing recurrence overrides
+    from training.tokenizer_contract import check_checkpoint_tokenizer, resolve_checkpoint_tokenizer
+    from tokenization.validation import check_model_vocabulary
+    from training.tokenizer_parity import check_template_parity
+    from evaluation.rng import preserve_rng
+
+    path = resolve_checkpoint_tokenizer(state, checkpoint, arguments.tokenizer_dir)
+    tokenizer = Tokenizer(path if path is not None else tokenizer_dir_of(state))
+    check_checkpoint_tokenizer(state.get("tokenizer_contract"), tokenizer.contract)
+    config = load_checkpoint_config(state)
+    check_model_vocabulary(config, tokenizer.contract)
+    with preserve_rng(torch.device("cpu")):
+        check_template_parity(tokenizer)
     model = load_checkpoint_model(state, arguments.device)
-    tokenizer = Tokenizer(arguments.tokenizer_dir or tokenizer_dir_of(state))
+    check_model_vocabulary(model.config, tokenizer.contract, model)
     recurrences = parse_recurrences(arguments.recurrence)
     return CheckpointEvaluation(checkpoint, step, out_dir, model, tokenizer, recurrences, execution_policy, state)
 
@@ -49,8 +61,7 @@ def load_checkpoint_model(state: dict[str, Any], device: str) -> RecurrentGPT:
     The checkpoint's model on device (its stored `model_config` and `model` state dict).
     """
 
-    known = {field.name for field in fields(RecurrentConfig)}
-    config = RecurrentConfig(**{key: value for key, value in state["model_config"].items() if key in known})
+    config = load_checkpoint_config(state)
     model = RecurrentGPT(config)
     model.load_state_dict(state["model"])
     return model.to(device)
@@ -64,3 +75,9 @@ def tokenizer_dir_of(state: dict[str, Any]) -> Path:
     settings = state["settings"]
     dataset_config = load_dataset_config(settings["dataset_config"])
     return DatasetLayout(Path(settings["dataset_dir"])).tokenizer_dir(dataset_config.tokenizer.name)
+
+
+def load_checkpoint_config(state: dict[str, Any]) -> RecurrentConfig:
+    """Preserve legacy nonarchitectural metadata while resolving the actual model dimensions."""
+    known = {field.name for field in fields(RecurrentConfig)}
+    return RecurrentConfig(**{key: value for key, value in state["model_config"].items() if key in known})

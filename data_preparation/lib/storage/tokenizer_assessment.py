@@ -47,6 +47,12 @@ def assess_tokenizer_folder(directory: Path, expected_hash: str, *, validate_pay
     if not manifest.generation_complete:
         return TokenizerAssessment(manifest, f"incomplete tokenizer generation in {directory}")
     problem = tokenizer_files_problem(directory)
+    if problem is None:
+        from tokenization.profile import validate_profile
+        try:
+            validate_profile(directory)
+        except (ValueError, OSError, KeyError) as error:
+            problem = f"invalid tokenizer profile in {directory}: {error}"
     if problem is None and validate_payload:
         from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 

@@ -3,7 +3,8 @@
 The prompts of the sample generations: the built-in defaults, or a prompts file given to the CLI.
 
 An instruction prompt follows the training template of instruct rows (`training/data/formats.py`): instruction,
-an optional input after a blank line, and a trailing blank line where the output starts.
+an optional input after a blank line. Its structured message is used with the chat tokenizer profile; the
+legacy display text retains a trailing blank line for historical plain instruction runs.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from pathlib import Path
 
 CONTINUATION = "continuation"
 INSTRUCTION = "instruction"
-PROMPT_KINDS = (CONTINUATION, INSTRUCTION)
+CHAT = "chat"
+PROMPT_KINDS = (CONTINUATION, INSTRUCTION, CHAT)
 FILE_SEPARATOR = "---"  # a line of its own between the prompts of a prompts file
 # The kind markers of a prompts file, matched on the whole first line (case and surrounding whitespace ignored):
 # anything else starting with `#` is content, a Python comment or a Markdown heading of the prompt itself.
@@ -24,6 +26,7 @@ KIND_MARKERS: dict[str, str] = {f"# {kind}": kind for kind in PROMPT_KINDS}
 class Prompt:
     text: str
     kind: str = CONTINUATION
+    messages: list[dict[str, str]] | None = None
 
 
 def instruction_prompt(instruction: str, input_text: str = "") -> Prompt:
@@ -34,7 +37,7 @@ def instruction_prompt(instruction: str, input_text: str = "") -> Prompt:
     text = instruction.strip()
     if input_text.strip():
         text += "\n\n" + input_text.strip()
-    return Prompt(text + "\n\n", INSTRUCTION)
+    return Prompt(text + "\n\n", INSTRUCTION, messages=[{"role": "user", "content": text}])
 
 
 DEFAULT_PROMPTS: tuple[Prompt, ...] = (
@@ -55,7 +58,7 @@ DEFAULT_PROMPTS: tuple[Prompt, ...] = (
 def load_prompts_file(path: str | Path) -> list[Prompt]:
     """
     Prompts separated by `---` lines; a first line `# instruction` makes the prompt an instruction prompt (its
-    first paragraph the instruction, the rest the input), `# continuation` is the default. Only those two exact
+    first paragraph the instruction, the rest the input), `# continuation` is the default. `# chat` supplies a literal user message. Only these exact
     lines are markers: a prompt may start with any other `#` line (a comment, a heading) and keeps it as content.
     """
 
@@ -76,7 +79,7 @@ def load_prompts_file(path: str | Path) -> list[Prompt]:
                 raise ValueError(f"{path}: a `# instruction` prompt needs an instruction on the lines below the marker")
             prompts.append(instruction_prompt(instruction, input_text))
         else:
-            prompts.append(Prompt(block))
+            prompts.append(Prompt(block, kind))
     if not prompts:
         raise ValueError(f"{path}: no prompts found")
     return prompts
