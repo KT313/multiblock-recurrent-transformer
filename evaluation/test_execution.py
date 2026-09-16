@@ -23,7 +23,7 @@ from training.data.tokenizer import Tokenizer
 @pytest.mark.parametrize("use_cache", [False, True])
 def test_bf16_samples_match_manual_context(tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, use_cache: bool) -> None:
     tokenizer = Tokenizer(tiny_tokenizer_dir)
-    prompts = [Prompt("tok_3 tok_4", "test")]
+    prompts = [Prompt("tok_3 tok_4", kind="continuation")]
     with torch.autocast("cpu", dtype=torch.bfloat16):
         expected = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=3, seed=19, use_cache=use_cache)
     actual = generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=3, seed=19, use_cache=use_cache,
@@ -139,9 +139,9 @@ def test_actual_cuda_samples_and_hflm_use_strict_kernels(
     for use_cache in (False, True):
         calls.clear()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            expected = generate_samples(model, tokenizer, [Prompt("tok_3", "test")], max_new_tokens=2, use_cache=use_cache)
+            expected = generate_samples(model, tokenizer, [Prompt("tok_3", kind="continuation")], max_new_tokens=2, use_cache=use_cache)
         calls.clear()
-        actual = generate_samples(model, tokenizer, [Prompt("tok_3", "test")], max_new_tokens=2, use_cache=use_cache,
+        actual = generate_samples(model, tokenizer, [Prompt("tok_3", kind="continuation")], max_new_tokens=2, use_cache=use_cache,
                                   execution_policy=ExecutionPolicy("bf16-mixed"))
         assert calls and all(calls) and actual == expected
     calls.clear()
@@ -149,7 +149,7 @@ def test_actual_cuda_samples_and_hflm_use_strict_kernels(
     assert calls and all(calls)
     assert model.training and all(parameter.dtype == torch.float32 for parameter in model.parameters())
     with pytest.raises(CustomKernelError, match="BF16 autocast"):
-        generate_samples(model, tokenizer, [Prompt("tok_3", "test")], max_new_tokens=2,
+        generate_samples(model, tokenizer, [Prompt("tok_3", kind="continuation")], max_new_tokens=2,
                          execution_policy=ExecutionPolicy("32"))
 
 
