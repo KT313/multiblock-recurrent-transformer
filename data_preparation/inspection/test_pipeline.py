@@ -47,7 +47,16 @@ def test_inspection_runs_actual_filters_global_dedup_and_packing(
     formatted = json.loads((output / 'formatted/code.json').read_text())
     assert formatted[0]['split'] == 'validation' and formatted[-1]['split'] == 'train'
     tokenizer = Tokenizer(output / 'dataset/tokenizers/synthetic')
-    samples = {record['id']: (torch.tensor(record['input_ids']), torch.tensor(record['labels']), record['id']) for record in formatted}
+    samples = {record['id']: (torch.tensor([row[0] for row in record['tokens']]),
+                             torch.tensor([row[1] for row in record['tokens']]), record['id']) for record in formatted}
+    for record in formatted:
+        assert 'input_ids' not in record and 'labels' not in record and 'loss_mask' not in record and 'decoded' not in record
+        for token, label, mask, decoded in record['tokens']:
+            assert mask == (label != -100)
+            assert decoded == tokenizer.decode([token], skip_special_tokens=False)
+    first_row = formatted[0]['tokens'][0]
+    assert first_row == [tokenizer.bos_id, -100, False, '<bos>']
+    assert json.dumps(first_row) in (output / 'formatted/code.json').read_text()
     for file in sorted((output / 'packed/sources/code').glob('*.pt')):
         saved = torch.load(file, weights_only=True)
         expected = pack_samples([samples[name] for name in saved['data_ids']], 128, tokenizer)
@@ -57,7 +66,17 @@ def test_inspection_runs_actual_filters_global_dedup_and_packing(
             else:
                 assert saved[key] == value
         exported = json.loads(file.with_suffix('.json').read_text())
-        assert exported['loss_mask'] == (saved['labels'] != -100).tolist()
+        assert 'input_ids' not in exported and 'labels' not in exported and 'loss_mask' not in exported
+        assert [row[0] for row in exported['tokens']] == saved['input_ids'][0].tolist()
+        assert [row[1] for row in exported['tokens']] == saved['labels'][0].tolist()
+        assert [row[2] for row in exported['tokens']] == (saved['labels'][0] != -100).tolist()
+        for row in exported['tokens']:
+            assert row[3] == tokenizer.decode([row[0]], skip_special_tokens=False)
+            assert json.dumps(row, ensure_ascii=False) in file.with_suffix('.json').read_text()
+        for key in ('position_ids', 'document_ids'):
+            assert exported[key] == saved[key].tolist()
+        for key in ('data_ids', 'data_tokens', 'padding_tokens'):
+            assert exported[key] == saved[key]
         assert file.with_suffix('.txt').is_file() and file.with_suffix('.tsv').is_file()
     assert sum(len(torch.load(f, weights_only=True)['data_ids']) for f in (output / 'packed/sources/code').glob('*.pt')) == len(formatted)
     for stage in report['stages'].values():

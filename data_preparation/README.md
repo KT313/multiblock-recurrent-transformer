@@ -815,11 +815,11 @@ Start with `README.txt` and `summary.json` in the printed directory. Artifacts i
 
 - `dataset/`: normal raw/processed Parquet shards and manifests, including globally deduplicated output when enabled.
 - `raw/` and `prepared/`: readable JSONL copies for each source.
-- `formatted/`: token IDs and assistant loss masks before next-token shifting, linked by source and prepared-row index.
+- `formatted/`: each sample has a `tokens` list of `[input_id, label, loss_mask, decoded_token]` rows before next-token shifting, one token per line, alongside its source ID, prepared-row index, and split.
 - `packed/sources/`: each source's usable samples packed once.
 - `packed/mixed/`: every usable sample packed once in interleaved source order, including held-out rows for inspection.
 - `packed/stages/`: two previews per stage using the real training `BatchStream` and training rows only; finite samples cycle as needed. Adjust with `--packs-per-stage` (`0` disables).
 
-Each pack is saved as `.pt` tensors, `.json` arrays, `.tsv` per-token input/next-target/mask, and `.txt` decoded text with loss spans. Special tokens stay visible; padding is identified. The JSON/tensors include positions and document IDs for the causal document mask, avoiding a quadratic matrix dump.
+Each pack is saved as `.pt` tensors, `.json` token rows, `.tsv` per-token input/next-target/mask, and `.txt` decoded text with loss spans. Packed JSON uses the same `tokens: [[input_id, label, loss_mask, decoded_token], ...]` layout as `formatted/`, one row per line, but **after** the next-token shift: `label` is the next-token target, and `decoded_token` describes the input. Special tokens stay visible; padding is identified. The JSON/tensors include positions and document IDs for the causal document mask, avoiding a quadratic matrix dump.
 
 Finite packing drains a partial final pool so no sample is hidden. Stage previews start independently with each stage's steady weights; they do not reproduce transitions, production dataset order, or checkpoint offsets. A stage missing usable training examples is explicitly skipped, not reweighted. This is an inspection fixture, not a training-ready dataset snapshot. Production dataset directories remain untouched.

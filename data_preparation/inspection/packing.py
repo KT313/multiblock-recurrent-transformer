@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from data_preparation.lib.dataset_config import DatasetConfig
-from data_preparation.inspection.artifacts import write_json, write_pack
+from data_preparation.inspection.artifacts import write_formatted_samples, write_json, write_pack
 from training.data.collate import Sample, WorkerBatch, collate_samples
 from training.data.dataset_resolver import CHAT_DATA_SIGNATURE, INSTRUCT_DATA_SIGNATURE, validation_rows_of
 from training.data.datasets import DEFAULT_DATA_SIGNATURE
 from training.data.entries import ResolvedStage
 from training.data.loader_state import RunDataloaders
 from training.data.packing import PackPool, pack_samples
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.steps.batches import BatchStream
@@ -37,18 +37,18 @@ def format_rows(
         identifier = f'{name}:{index:06d}'
         samples = collate_samples([{**row, 'data_id': identifier, 'data_signature': signature}], tokenizer, sequence_length)
         split = 'train' if config.used_in_train(name) and index >= validation_count else 'validation'
-        record: dict[str, Any] = {'id': identifier, 'prepared_row_index': index, 'split': split, 'usable': bool(samples)}
+        record: dict[str, Any] = {'id': identifier, 'prepared_row_index': index, 'split': split, 'usable': bool(samples), 'tokens': []}
         if samples:
             inputs, labels, _ = samples[0]
-            record.update(input_ids=inputs.tolist(), labels=labels.tolist(), loss_mask=(labels != -100).tolist(),
-                          decoded=tokenizer.decode(inputs.tolist(), skip_special_tokens=False))
+            record['tokens'] = [[token, label, label != IGNORE_INDEX, tokenizer.decode([token], skip_special_tokens=False)]
+                                for token, label in zip(inputs.tolist(), labels.tolist(), strict=True)]
             all_samples.extend(samples)
             if split == 'train':
                 train_samples.extend(samples)
         else:
             record['drop_reason'] = 'no supervised target after production collation at the requested length'
         records.append(record)
-    write_json(output / 'formatted' / f'{name}.json', records)
+    write_formatted_samples(output / 'formatted' / f'{name}.json', records)
     return all_samples, train_samples, {'processed': len(rows), 'formatted': len(all_samples), 'training_samples': len(train_samples),
                                        'validation_rows': validation_count if config.used_in_train(name) else len(rows),
                                        'collation_dropped': len(rows) - len(all_samples)}

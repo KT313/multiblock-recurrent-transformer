@@ -134,12 +134,15 @@ summary.json: stage status, counts, drops, paths, and diagnostic overrides. pipe
 dataset/: actual tokenizer, raw Parquet shards/manifests, source-local processed candidates, and global scoped output.
 raw/*.jsonl: readable copies of standardized downloader output, AFTER download-time conversion/filtering/token limits.
 prepared/*.jsonl: readable final prepared rows, AFTER source-local and optional global deduplication.
-formatted/*.json: training formatter IDs/labels before shifting; source:index links to the prepared JSONL row.
+formatted/*.json: each sample's tokens are [input_id, label, loss_mask, decoded_token] rows before shifting;
+source:index links to the prepared JSONL row. Each token row occupies one line; sample ID and split are retained.
 packed/sources/: each source's usable prepared samples, packed once through the actual training PackPool/pack_samples.
 packed/mixed/: all usable prepared samples, interleaved in config source order, packed once.
 packed/stages/: real BatchStream previews at each stage's steady weights; finite training samples cycle.
 
-Each pack has .pt tensors/metadata, .json exact arrays, .tsv per-position input/next-target/mask, and .txt decoded spans.
+Each pack has .pt tensors/metadata, .json token rows, .tsv per-position input/next-target/mask, and .txt decoded spans.
+Packed JSON tokens are [input_id, label, loss_mask, decoded_token], one row per line AFTER the next-token shift.
+The decoded token belongs to input_id; position_ids, document_ids and source/padding metadata are retained.
 Labels are NEXT-token targets. -100 means no loss. Document IDs and positions encode the actual causal document mask;
 no quadratic attention matrix is saved. Special tokens remain visible. Individual decoded token spacing is a display aid.
 

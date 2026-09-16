@@ -20,6 +20,22 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
+def format_token_record(record: dict[str, Any], *, indent: int = 0) -> str:
+    """Render metadata compactly and each aligned token row on its own line."""
+    prefix = ' ' * indent
+    fields = [f'{json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}' for key, value in record.items() if key != 'tokens']
+    rows = ',\n'.join(prefix + '    ' + json.dumps(row, ensure_ascii=False) for row in record['tokens'])
+    fields.append('"tokens": [\n' + rows + '\n' + prefix + '  ]' if rows else '"tokens": []')
+    return prefix + '{\n' + prefix + '  ' + (',\n' + prefix + '  ').join(fields) + '\n' + prefix + '}'
+
+
+def write_formatted_samples(path: Path, records: list[dict[str, Any]]) -> None:
+    """Keep each aligned token row on one line while retaining sample metadata."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = [format_token_record(record, indent=2) for record in records]
+    path.write_text('[\n' + ',\n'.join(samples) + '\n]\n', encoding='utf-8')
+
+
 def read_rows(directory: Path) -> Iterator[dict[str, Any]]:
     manifest = Manifest.load(directory)
     if manifest is None:
@@ -43,13 +59,15 @@ def write_pack(directory: Path, index: int, pack: PackedBatch, tokenizer: Tokeni
     directory.mkdir(parents=True, exist_ok=True)
     values = pack._asdict()
     torch.save(values, stem.with_suffix('.pt'))
-    arrays = {key: value.tolist() if isinstance(value, torch.Tensor) else value for key, value in values.items()}
-    arrays['loss_mask'] = (pack.labels != IGNORE_INDEX).tolist()
-    arrays['attention_rule'] = 'causal AND equal document_ids; padding has its own document ID'
-    write_json(stem.with_suffix('.json'), arrays)
-
-    # Each TSV line aligns one input with its NEXT-token target, not with its own label.
     ids, labels, positions, documents = (tensor[0].tolist() for tensor in (pack.input_ids, pack.labels, pack.position_ids, pack.document_ids))
+    record = {key: value.tolist() if isinstance(value, torch.Tensor) else value for key, value in values.items()
+              if key not in ('input_ids', 'labels')}
+    record['attention_rule'] = 'causal AND equal document_ids; padding has its own document ID'
+    record['tokens'] = [[token, label, label != IGNORE_INDEX, tokenizer.decode([token], skip_special_tokens=False)]
+                        for token, label in zip(ids, labels, strict=True)]
+    stem.with_suffix('.json').write_text(format_token_record(record) + '\n', encoding='utf-8')
+
+    # Each row aligns one input with its NEXT-token target, not with its own label.
     with stem.with_suffix('.tsv').open('w', encoding='utf-8') as stream:
         stream.write('slot\tdocument\tposition\tinput_id\tinput_token_json\tlabel_id\ttarget_token_json\tloss\n')
         for slot, (token, label, position, document) in enumerate(zip(ids, labels, positions, documents, strict=True)):
