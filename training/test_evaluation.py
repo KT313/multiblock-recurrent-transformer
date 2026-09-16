@@ -212,6 +212,11 @@ def test_evaluate_scores_every_depth_on_the_same_batches(
     assert delivered == [0, 1, 2]  # `eval_iters` batches, each pulled from the loader exactly once
     assert len(scored) == 3  # two partial depths plus the mean recurrence
     assert all(indices == [0, 1, 2] for indices in scored.values()), scored
+    # A later validation restarts the iterable; it does not retain a cursor after the first eval_iters batches.
+    torch.rand(17)
+    evaluate(settings, cpu_backend, tiny_model, RecordingLoader())
+    assert delivered == [0, 1, 2, 0, 1, 2]
+    assert all(indices == [0, 1, 2, 0, 1, 2] for indices in scored.values()), scored
 
 
 def test_evaluate_iterates_the_loader_once(
