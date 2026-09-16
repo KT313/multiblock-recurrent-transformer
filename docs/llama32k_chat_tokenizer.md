@@ -27,7 +27,7 @@ Every message body is tokenized as **literal text**, including occurrences of `<
 
 Assistant bodies and their structural EOS are supervised. User bodies, user EOS, role markers and BOS are masked. Whole exchanges are retained within the token budget; trailing users and exchanges that do not fit are removed with the existing counters. A conversation is one packed document, including its internal EOS tokens. Pretraining remains BOS + literal document text + EOS.
 
-Every instruction source using this profile must explicitly select `instruction_format: messages`. Use an existing message converter, or use `fields: {instruction: question_column, output: answer_column}` without a converter. An optional input field is appended to the instruction with a blank line. Inversions remain unsupported for message sources. System/tool roles remain unsupported; the existing Nemotron source policy handles empty/nonempty system prompts before formatting.
+Every instruction source using this profile must explicitly select `instruction_format: messages`. Use an existing message converter, one of the compatible pair converters (`sharegpt_conversations`, `first_two_turns`, `instruction_input_output`), or use `fields: {instruction: question_column, output: answer_column}` without a converter. An optional input field is appended to the instruction with a blank line. Inversions remain unsupported for message sources. System/tool roles remain unsupported; the existing Nemotron source policy handles empty/nonempty system prompts before formatting.
 
 ## Hugging Face use
 

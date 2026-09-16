@@ -32,7 +32,7 @@ from jsonargparse import ArgumentError, ArgumentParser
 
 from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
 from data_preparation.lib.conversation_format import CHAT_POLICY
-from data_preparation.lib.sources.instruction_messages import MESSAGE_CONVERTERS
+from data_preparation.lib.sources.instruction_messages import INSTRUCTION_PAIR_CONVERTERS, MESSAGE_CONVERTERS
 
 
 from data_preparation.lib.identifiers import validate_identifier
@@ -382,8 +382,8 @@ class SourceConfig:
         if self.instruction_format not in ("single_turn", "messages"):
             raise ValueError("instruction_format must be single_turn or messages")
         if self.instruction_format == "messages":
-            if not ((self.converter in MESSAGE_CONVERTERS and self.fields is None) or (self.converter is None and self.fields is not None)):
-                raise ValueError("instruction_format messages requires a registered message converter without fields, or explicit fields without a converter")
+            if not ((self.converter in MESSAGE_CONVERTERS | INSTRUCTION_PAIR_CONVERTERS and self.fields is None) or (self.converter is None and self.fields is not None)):
+                raise ValueError("instruction_format messages requires a registered message or instruction-pair converter without fields, or explicit fields without a converter")
             if self.input_inversions != 0:
                 raise ValueError("message conversations do not support input_inversions")
             if self.converter == "opencode_messages" and self.filter != "opencode_passed_tests":
@@ -773,7 +773,7 @@ class DatasetConfig:
             payload["tokenizer_profile"] = self.tokenizer_hash()  # no legacy raw/count adoption across this boundary
         # Keep unrelated source fingerprints unchanged. A fields override bypasses the named converter.
         if (source.converter == "sharegpt_conversations" and source.fields is None) or source.filter == "sharegpt_quality":
-            payload["row_semantics"] = {"sharegpt_exchange": SHAREGPT_EXCHANGE_POLICY}
+            payload.setdefault("row_semantics", {})["sharegpt_exchange"] = SHAREGPT_EXCHANGE_POLICY
         return payload
 
     def processed_hash(self, source_name: str) -> str:

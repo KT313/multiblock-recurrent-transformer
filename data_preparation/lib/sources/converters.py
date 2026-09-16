@@ -12,8 +12,9 @@ from collections.abc import Callable
 from typing import Any
 
 from data_preparation.lib.dataset_config import SourceConfig
+from data_preparation.lib.conversation_format import validate_messages
 from data_preparation.lib.sources.conversations import opening_exchange
-from data_preparation.lib.sources.instruction_messages import check_opencode_score, convert_opencode_messages, convert_webinstruct_messages, convert_nemotron_messages
+from data_preparation.lib.sources.instruction_messages import INSTRUCTION_PAIR_CONVERTERS, check_opencode_score, convert_opencode_messages, convert_webinstruct_messages, convert_nemotron_messages
 
 Row = dict[str, Any]
 Converter = Callable[[Row], Row]
@@ -168,30 +169,31 @@ def expected_format(source: SourceConfig) -> str:
     return EXPECTED_FORMATS.get(source.converter, f"whatever converter {source.converter!r} accepts (no description registered)")
 
 
-def get_converter(source: SourceConfig) -> Converter | None:
-    """
-    `fields` mapping first, then the named `converter`, else None (row used as is; `text_field` applied later).
-    """
+def wrap_instruction_converter(convert: Converter) -> Converter:
+    """Represent the selected pair as messages, retaining optional input/system context inside the user prompt."""
+    def convert_messages(raw: Row) -> Row:
+        row = convert(raw)
+        prompt = row["instruction"]
+        if row.get("input"):
+            prompt += "\n\n" + row["input"]
+        return {"messages": validate_messages([{"role": "user", "content": prompt},
+                                              {"role": "assistant", "content": row["output"]}])}
+    return convert_messages
 
+
+def get_converter(source: SourceConfig) -> Converter | None:
+    """Select the existing row converter, then adapt instruction pairs only for explicit message formatting."""
     if source.fields is not None:
         convert = fields_converter(source.fields)
-        if source.instruction_format == "messages":
-            def convert_messages(raw: Row) -> Row:
-                from data_preparation.lib.conversation_format import validate_messages
-
-                row = convert(raw)
-                prompt = row["instruction"]
-                if row.get("input"):
-                    prompt += "\n\n" + row["input"]
-                return {"messages": validate_messages([{"role": "user", "content": prompt},
-                                                      {"role": "assistant", "content": row["output"]}])}
-            return convert_messages
-        return convert
-    if source.converter is None:
+    elif source.converter is None:
         return None
-    if source.converter not in CONVERTERS:
-        raise ValueError(f"unknown converter {source.converter!r}; known converters: {sorted(CONVERTERS)}")
-    return CONVERTERS[source.converter]
+    else:
+        if source.converter not in CONVERTERS:
+            raise ValueError(f"unknown converter {source.converter!r}; known converters: {sorted(CONVERTERS)}")
+        convert = CONVERTERS[source.converter]
+    if source.instruction_format == "messages" and (source.fields is not None or source.converter in INSTRUCTION_PAIR_CONVERTERS):
+        return wrap_instruction_converter(convert)
+    return convert
 
 
 # --- filters ----------------------------------------------------------------------------------------------------------

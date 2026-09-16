@@ -123,7 +123,10 @@ def test_smoke_config_and_legacy_identity() -> None:
 
 
 def test_chat_tokenizer_identity_and_unsupported_benchmark_policy() -> None:
-    cfg = load_dataset_config(Path('config/datasets/instruction_sources_smoke.yaml'))
+    profile = load_dataset_config(Path('config/datasets/instruction_sources_smoke.yaml'))
+    with pytest.raises(ValueError, match='pinned Llama tokenizer'):
+        replace(profile.tokenizer, revision='different')
+    cfg = replace(profile, tokenizer=replace(profile.tokenizer, profile=None))
     changed = replace(cfg, tokenizer=replace(cfg.tokenizer, revision='different'))
     assert cfg.raw_hash('nemotron_chat_off_smoke') != changed.raw_hash('nemotron_chat_off_smoke')
     assert cfg.raw_hash('fineweb_edu_350bt_smoke') == changed.raw_hash('fineweb_edu_350bt_smoke')

@@ -67,3 +67,14 @@ See the scoped integration validation report for the actual checks and download 
 For the explicit `<user>`/`<assistant>` tokenizer profile, literal special-token strings in message content,
 startup checks and portable exports, see [Llama 32K chat tokenizer](llama32k_chat_tokenizer.md).
 The new instruction smoke dataset opts into this profile; legacy message datasets keep their original text headers.
+
+Existing instruction-pair converters also support explicit `instruction_format: messages` with `input_inversions: 0`:
+`sharegpt_conversations` (SlimOrca/ShareGPT), `first_two_turns` (WizardLM), and `instruction_input_output`.
+They pass their existing selected pair through the same message adapter as field-mapped sources. The adapter preserves
+literal content and appends optional input/system context to the user prompt after a blank line, matching the existing
+instruction/input ordering. It adds no special tokens; the shared formatter owns tokenization and assistant-only labels.
+
+This opt-in changes the output schema, not which turns those converters select: ShareGPT and WizardLM still retain only
+their opening pair. ShareGPT opening validation, orphan-assistant handling and its optional quality filter are unchanged.
+Message-format raw identities include both the tokenizer/format and ShareGPT opening policy, so legacy flattened caches
+cannot be adopted as message rows. Legacy `single_turn` configurations retain their existing output and identities.

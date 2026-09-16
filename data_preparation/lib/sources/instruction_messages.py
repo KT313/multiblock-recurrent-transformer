@@ -8,6 +8,7 @@ from typing import Any
 from data_preparation.lib.conversation_format import validate_messages
 
 MESSAGE_CONVERTERS = frozenset({"opencode_messages", "webinstruct_messages", "nemotron_messages"})
+INSTRUCTION_PAIR_CONVERTERS = frozenset({"sharegpt_conversations", "first_two_turns", "instruction_input_output"})
 
 
 class ExcludedConversation(Exception):
