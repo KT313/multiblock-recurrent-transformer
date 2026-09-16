@@ -81,7 +81,7 @@ def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: Recurrent
     state = metadata.to_state()
     assert set(state) == {
         "step", "stage", "world_size", "rng_states", "settings", "model_config", "dataset_config_hash", "validation_rows",
-        "source_rows", "data_stream", "dataset_build_id",
+        "source_rows", "data_stream", "dataset_build_id", "tokenizer_contract",
     }
     assert state["rng_states"] is metadata.rng_states  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
@@ -138,6 +138,7 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
         "source_rows",
         "data_stream",
         "dataset_build_id",
+        "tokenizer_contract",
     ]
 
 

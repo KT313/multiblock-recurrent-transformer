@@ -63,3 +63,7 @@ ids = encode_chat_prompt(messages, tokenizer, max_tokens=context_length - max_ne
 Pass these IDs directly as `input_ids` to the existing model/HF generation path, inside the usual inference session. Do not decode and retokenize them. The IDs already include BOS and completed-history EOS tokens and end with the pending assistant header. Stop the generated reply at EOS. Overflow raises; it does not silently discard history. Plain-text sample generation and standard benchmark prompts retain their original behavior.
 
 See the scoped integration validation report for the actual checks and download bounds used for this change.
+
+For the explicit `<user>`/`<assistant>` tokenizer profile, literal special-token strings in message content,
+startup checks and portable exports, see [Llama 32K chat tokenizer](llama32k_chat_tokenizer.md).
+The new instruction smoke dataset opts into this profile; legacy message datasets keep their original text headers.

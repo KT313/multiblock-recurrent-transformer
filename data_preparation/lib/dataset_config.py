@@ -172,7 +172,13 @@ class TokenizerConfig:
     hf_id: Optional[str] = field(default=None, metadata=_TOKENIZER)  # required for kind=hf
     revision: Optional[str] = field(default=None, metadata=_TOKENIZER)  # Hub commit sha; pin it
 
+    profile: str | None = field(default=None, metadata={"hash": lambda obj: "tokenizer" if obj.profile else "none"})
+
     def __post_init__(self) -> None:
+        from tokenization.chat import PROFILE, BASE_REPO, BASE_REVISION
+
+        if self.profile is not None and (self.profile != PROFILE or self.kind != "hf" or self.hf_id != BASE_REPO or self.revision != BASE_REVISION or self.name == "llama-32k"):
+            raise ValueError("literal chat profile requires the pinned Llama tokenizer and a distinct managed name")
         validate_identifier(self.name, field="tokenizer.name")
         if self.kind == "hf" and not self.hf_id:
             raise ValueError(f"tokenizer {self.name!r}: kind=hf requires hf_id")
@@ -376,8 +382,8 @@ class SourceConfig:
         if self.instruction_format not in ("single_turn", "messages"):
             raise ValueError("instruction_format must be single_turn or messages")
         if self.instruction_format == "messages":
-            if self.converter not in MESSAGE_CONVERTERS or self.fields is not None:
-                raise ValueError("instruction_format messages requires a registered message converter without fields")
+            if not ((self.converter in MESSAGE_CONVERTERS and self.fields is None) or (self.converter is None and self.fields is not None)):
+                raise ValueError("instruction_format messages requires a registered message converter without fields, or explicit fields without a converter")
             if self.input_inversions != 0:
                 raise ValueError("message conversations do not support input_inversions")
             if self.converter == "opencode_messages" and self.filter != "opencode_passed_tests":
@@ -485,6 +491,8 @@ class DatasetConfig:
 
     def __post_init__(self) -> None:
         self.validate_identifiers()
+        if self.tokenizer.profile and any(source.kind == "instruct" and source.instruction_format != "messages" for source in self.sources.values()):
+            raise ValueError("chat tokenizer requires instruction_format: messages for every instruction source")
         if any(source.instruction_format == "messages" for source in self.sources.values()) and self.token_count != "tokenizer":
             raise ValueError("message conversations require token_count: tokenizer for exact exchange boundaries")
         if type(self.download_prefetch_mb) is not int or self.download_prefetch_mb < 0:
@@ -758,9 +766,11 @@ class DatasetConfig:
         return self.raw_hash_payload_of(self.sources[source_name])
 
     def raw_hash_payload_of(self, source: SourceConfig) -> dict[str, Any]:
-        payload = {"source": hash_payload(source, "raw")}
+        payload: dict[str, Any] = {"source": hash_payload(source, "raw")}
         if source.instruction_format == "messages":
             payload["row_semantics"] = {"conversation": CHAT_POLICY, "tokenizer": self.tokenizer_hash()}
+        if self.tokenizer.profile:
+            payload["tokenizer_profile"] = self.tokenizer_hash()  # no legacy raw/count adoption across this boundary
         # Keep unrelated source fingerprints unchanged. A fields override bypasses the named converter.
         if (source.converter == "sharegpt_conversations" and source.fields is None) or source.filter == "sharegpt_quality":
             payload["row_semantics"] = {"sharegpt_exchange": SHAREGPT_EXCHANGE_POLICY}

@@ -62,6 +62,7 @@ def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> 
                 tokenizer,
                 settings.benchmark_tasks,
                 num_fewshot=settings.benchmark_num_fewshot,
+                apply_chat_template=settings.benchmark_apply_chat_template,
                 limit=settings.benchmark_limit,
                 batch_size=settings.benchmark_batch_size,
                 recurrences=settings.benchmark_recurrences or [None],

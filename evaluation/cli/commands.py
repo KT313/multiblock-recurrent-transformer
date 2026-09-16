@@ -32,6 +32,7 @@ def run_checkpoint_benchmarks(arguments: argparse.Namespace, evaluation: Checkpo
         evaluation.model, evaluation.tokenizer, tasks, num_fewshot=arguments.num_fewshot, limit=arguments.limit,
         batch_size=arguments.batch_size, recurrences=evaluation.recurrences, out_path=path, step=evaluation.step,
         seed=arguments.seed, execution_policy=evaluation.execution_policy,
+        apply_chat_template=arguments.benchmark_apply_chat_template,
     )
 
     # print the flattened metrics

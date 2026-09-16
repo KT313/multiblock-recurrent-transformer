@@ -18,6 +18,7 @@ from training.logger import RunLogger
 from training.settings import Settings
 from training.steps import RankBatches
 from training.stopping import complete_main_phase
+from tokenization.validation import check_model_vocabulary
 
 log = get_logger("training.run")
 
@@ -55,8 +56,11 @@ def restore_checkpoint(state: RunState, resume_path: Path) -> ResumePoint:
     settings = state.settings
     log.info("loading the checkpoint %s (%.1f GB) into the model and the optimizer", resume_path, resume_path.stat().st_size / 1e9)
     started = time.monotonic()
-    metadata = load_training_checkpoint(state.backend, resume_path, state.model, state.optimizer)
+    metadata = load_training_checkpoint(state.backend, resume_path, state.model, state.optimizer,
+                                        tokenizer_contract=state.tokenizer_contract)
     log.info("checkpoint of step %d loaded in %.1fs", metadata.step, time.monotonic() - started)
+    plain_model = state.backend.plain_model(state.model)
+    check_model_vocabulary(plain_model.config, state.tokenizer_contract, plain_model)
     check_dataset_unchanged(metadata, state.dataset, settings.allow_dataset_change)
     model_config = state.backend.plain_model(state.model).config.to_dict()
     check_settings_unchanged(metadata, settings, model_config, settings.allow_settings_change)
@@ -124,6 +128,7 @@ def save_run_checkpoint(state: RunState, logger: RunLogger, batches: RankBatches
         validation_rows=state.dataset.validation_rows,
         source_rows=state.dataset.source_rows,
         dataset_build_id=state.dataset.dataset_build_id,
+        tokenizer_contract=state.tokenizer_contract,
         data_stream=batches.state_dict(),
     )
     def publish() -> None:

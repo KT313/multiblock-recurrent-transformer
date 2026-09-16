@@ -72,6 +72,7 @@ def evaluate_on_benchmarks(
     step: int | None = None,
     seed: int = 0,
     execution_policy: ExecutionPolicy | None = None,
+    apply_chat_template: bool = False,
 ) -> dict[str, float]:
     """
     Score the model on tasks with lm-eval-harness, once per recurrence setting (steps per core block, None: the
@@ -97,15 +98,18 @@ def evaluate_on_benchmarks(
     for recurrence in recurrences:
         with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
             wrapper, language_model = build_benchmark_harness(
-                session, tokenizer, hf_models, batch_size, model.config.model_max_sequence_length,
+                session, tokenizer, hf_models, batch_size, model.config.model_max_sequence_length, apply_chat_template,
             )
             seed_model_rng(seed, session.device)  # reseed after HFLM/wrapper setup; it may consume Torch RNG
-            results = run_benchmark_harness(lm_eval, language_model, tasks, limit, num_fewshot)
+            results = run_benchmark_harness(lm_eval, language_model, tasks, limit, num_fewshot, apply_chat_template)
             if out_path is not None:
                 execution_settings[recurrence_label(recurrence)] = benchmark_execution_metadata(
                     session, language_model, wrapper, results, lm_eval.simple_evaluate, batch_size=batch_size,
                     context_cap=model.config.model_max_sequence_length, custom_kernels=model.config.use_custom_kernels,
                 )
+        if out_path is not None:
+            execution_settings[recurrence_label(recurrence)]["tokenizer_contract"] = tokenizer.contract
+            execution_settings[recurrence_label(recurrence)]["apply_chat_template"] = apply_chat_template
         label = recurrence_label(recurrence)
         metrics |= flatten_results(results["results"], label)
         raw_results[label] = results["results"]

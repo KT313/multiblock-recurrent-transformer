@@ -193,6 +193,7 @@ class Settings:
     sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
     benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)
     benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress
+    benchmark_apply_chat_template: bool = False
     benchmark_tasks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARK_TASKS))  # lm-eval task names
     benchmark_limit: Optional[int] = None  # examples per task (None: all); a few hundred keeps in-training runs short
     benchmark_num_fewshot: int = -1  # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)

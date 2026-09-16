@@ -69,6 +69,8 @@ def encode_exchange(user: Message, assistant: Message, tokenizer: ChatTokenizer,
 def fit_conversation(value: Any, tokenizer: ChatTokenizer, max_tokens: int | None = None, *, bos: bool = True, eos: bool = True) -> EncodedConversation:
     """Keep only complete leading exchanges; max_tokens bounds unshifted serialized IDs."""
     messages = validate_messages(value)
+    if getattr(tokenizer, "profile", None):
+        return fit_literal_conversation(messages, tokenizer, max_tokens, bos=bos, eos=eos)
     if max_tokens is not None and max_tokens < 0:
         raise ValueError("max_tokens must be nonnegative")
     if bos and tokenizer.bos_id is None:
@@ -93,6 +95,15 @@ def encode_chat_prompt(value: Any, tokenizer: ChatTokenizer, *, max_tokens: int 
     messages = validate_messages(value)
     if len(messages) % 2 != 1:
         raise ValueError("generation messages must end with a user query")
+    if getattr(tokenizer, "profile", None):
+        from tokenization.chat import encode_chat
+
+        if not bos:
+            raise ValueError("literal chat profile requires BOS")
+        ids = encode_chat(messages, tokenizer.encode_literal, generation_prompt=True).ids
+        if max_tokens is not None and len(ids) > max_tokens:
+            raise ValueError("chat generation prompt exceeds the context budget")
+        return ids
     if len(messages) > 1:
         ids = fit_conversation(messages[:-1], tokenizer, bos=bos).ids
     else:
@@ -119,3 +130,19 @@ def count_fitted_positions(ends: list[int], target: int) -> int:
     if not ends or any(type(end) is not int or end < 2 for end in ends) or any(b <= a for a, b in zip(ends, ends[1:])):
         raise ValueError("invalid conversation exchange_ends")
     return max((end - 1 for end in ends if end <= target + 1), default=0)
+
+
+def fit_literal_conversation(messages: list[Message], tokenizer: ChatTokenizer, max_tokens: int | None, *, bos: bool, eos: bool) -> EncodedConversation:
+    """Keep complete exchanges with masks computed from message provenance, never token-string matching."""
+    from tokenization.chat import encode_chat
+
+    if not bos or not eos or (max_tokens is not None and max_tokens < 0):
+        raise ValueError("literal chat requires BOS/EOS and a nonnegative token budget")
+    complete = messages[:len(messages) // 2 * 2]
+    if not complete:
+        return EncodedConversation([], [], [], [], 0, True)
+    encoded = encode_chat(complete, tokenizer.encode_literal)
+    ends = [end for end in encoded.exchange_ends if max_tokens is None or end <= max_tokens]
+    limit = ends[-1] if ends else 0
+    return EncodedConversation(encoded.ids[:limit], encoded.supervised[:limit], ends, complete[:2 * len(ends)],
+                               len(complete) // 2 - len(ends), bool(len(messages) % 2))

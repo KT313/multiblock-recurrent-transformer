@@ -174,7 +174,19 @@ def get_converter(source: SourceConfig) -> Converter | None:
     """
 
     if source.fields is not None:
-        return fields_converter(source.fields)
+        convert = fields_converter(source.fields)
+        if source.instruction_format == "messages":
+            def convert_messages(raw: Row) -> Row:
+                from data_preparation.lib.conversation_format import validate_messages
+
+                row = convert(raw)
+                prompt = row["instruction"]
+                if row.get("input"):
+                    prompt += "\n\n" + row["input"]
+                return {"messages": validate_messages([{"role": "user", "content": prompt},
+                                                      {"role": "assistant", "content": row["output"]}])}
+            return convert_messages
+        return convert
     if source.converter is None:
         return None
     if source.converter not in CONVERTERS:

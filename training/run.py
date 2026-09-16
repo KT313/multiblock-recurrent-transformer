@@ -53,6 +53,8 @@ from training.provenance import publish_configuration
 from training.settings import Settings
 from training.steps import RankBatches, TrainingProgress
 from training.stopping import StopController, complete_main_phase
+from training.tokenizer_contract import check_profile_config, prepare_run_tokenizer
+from tokenization.validation import check_model_vocabulary
 from training.triggers import StepTriggers
 
 
@@ -83,7 +85,9 @@ def train(
 
     # validate the pure plan before creating resources
     model_config = check_evaluation_recurrences(settings)
-    configured_schedule = build_stage_manager(settings, load_dataset_config(settings.dataset_config), world_size=1)
+    dataset_config = load_dataset_config(settings.dataset_config)
+    check_profile_config(dataset_config, model_config)
+    configured_schedule = build_stage_manager(settings, dataset_config, world_size=1)
     backend = backend or create_backend(settings)
 
     # acquire the run and dataset, preserving the seed and setup order
@@ -96,14 +100,16 @@ def train(
             dataset = resolve_dataset(settings, backend, should_stop=should_stop, dataset_lease=dataset_lease)
             stage_manager = validate_resolved_schedule(settings, dataset, backend, configured_schedule)
             sample_triggers, benchmark_triggers = build_run_triggers(settings, stage_manager.total_steps)
+            dataset, tokenizer_contract = prepare_run_tokenizer(dataset, model_config, run_directory, backend)
             loaders = build_run_dataloaders(settings, dataset, backend)
 
             # build model and optimizer, then restore the selected checkpoint
             with close_loaders_on_exit(loaders, on_fatal_error):
+                check_tokenizer_vocabulary(loaders.tokenizer, model_config)
                 model = build_run_model(settings, dataset, backend, run_directory, resume_checkpoint=resume_path, model_config=model_config)
-                check_tokenizer_vocabulary(loaders.tokenizer, backend.plain_model(model).config)
+                check_model_vocabulary(model_config, tokenizer_contract, backend.plain_model(model))
                 optimizer = build_run_optimizer(settings, model, backend)
-                state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress())
+                state = RunState(settings, run_directory, backend, model, optimizer, dataset, stage_manager, TrainingProgress(), tokenizer_contract)
                 resume = restore_checkpoint(state, resume_path) if resume_path is not None else None
 
                 # initialize logging and the stream before publishing configuration and training
