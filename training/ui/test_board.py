@@ -122,7 +122,10 @@ def test_stage_names_with_markup_characters_render_literally(clock: FakeClock) -
 
 def test_overall_bar_eta_from_the_injected_clock(board: TrainingDashboard, clock: FakeClock) -> None:
     assert "ETA —" in board.render_text() and "? steps/s" in board.render_text()
-    clock.advance(20)
+    clock.advance(4)
+    board.update_step(2, 0, None, metrics(2))
+    assert "ETA —" in board.render_text()
+    clock.advance(16)
     board.update_step(10, 0, None, metrics(10))  # 2 s/step, 20 steps left
     text = board.render_text()
     assert "0.50 steps/s" in text and "0:00:20 elapsed" in text and "ETA 0:00:40" in text
@@ -164,6 +167,8 @@ def test_metrics_missing_from_a_step_keep_their_last_value(board: TrainingDashbo
 def test_metrics_table_uses_the_loops_own_timing_without_seconds_per_step(board: TrainingDashboard, clock: FakeClock) -> None:
     clock.advance(4)
     board.update_step(2, 0, None, metrics(2))
+    clock.advance(2)
+    board.update_step(3, 0, None, metrics(3))
     assert "2.00s" in board.render_text()
 
 
@@ -213,6 +218,7 @@ def test_rows_never_wrap_so_the_frame_height_does_not_depend_on_the_width(clock:
     with live_board(
         "run-" * 10, [long_name, "b"], STEPS, TOTAL, details=details, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock
     ) as b:
+        b.update_step(2, 0, None, metrics(2))  # establish the timing baseline before testing a steady-state frame
         b.update_step(18, 0, 0.5, metrics(18))
         b.update_validation(10, {f"val_loss_{depth}": 3.0 for depth in range(1, 12)})
         b.note_event("saved checkpoint " + "outputs/very/long/path/" * 6 + "step-00000018-run.pth")

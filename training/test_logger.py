@@ -592,13 +592,15 @@ def test_log_step_history_wandb_dict_and_throughput(
 
     assert sorted(run_logger.history) == [1, 2, 3]
     for done, metrics in run_logger.history.items():
-        assert set(metrics) == STEP_KEYS | {"l2_param_norm", "data_composition/source_a"}
+        expected_keys = STEP_KEYS if done > 2 else STEP_KEYS - {"remaining_time"}
+        assert set(metrics) == expected_keys | {"l2_param_norm", "data_composition/source_a"}
         assert all(isinstance(value, float) for value in metrics.values())
         assert metrics["step"] == done and metrics["loss"] == 2.0 and metrics["ppl"] == pytest.approx(math.exp(2.0))
         assert metrics["lr"] == 1e-4 * (done - 1) and metrics["grad_norm"] == 0.5 and metrics["l2_param_norm"] == 7.0
         assert metrics["seconds/step"] == 2.0 and metrics["tokens/second"] == TOKENS_PER_STEP / 2.0
         assert metrics["total_tokens"] == done * TOKENS_PER_STEP and metrics["total_time"] == 2.0 * done
-        assert metrics["remaining_time"] == 2.0 * (10 - done)
+        if done > 2:
+            assert metrics["remaining_time"] == 2.0 * (10 - done)
         assert (metrics["stage/current_stage"], metrics["stage/in_transition"], metrics["stage/base_lr"]) == (0, 0, 3e-4)
         assert metrics["data_composition/source_a"] == 1.0
         assert recorded[done] == metrics and not any(torch.is_tensor(v) for v in recorded[done].values())
@@ -754,6 +756,43 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
     assert all(isinstance(v, float) for v in report.last_validation.values())
 
 
+@pytest.mark.parametrize("start_step", [0, 4])
+def test_eta_excludes_first_actual_update_and_smooths_after_start_or_resume(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, start_step: int
+) -> None:
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock, start_step=start_step)
+    progress = TrainingProgress(step=start_step)
+    warmup = 2 if start_step == 0 else 1
+    run_fake_steps(logger, stage_manager, progress, clock, warmup, 100)
+    assert all("remaining_time" not in row for row in logger.history.values())
+    run_fake_steps(logger, stage_manager, progress, clock, 1, 2)
+    assert logger.history[progress.step]["remaining_time"] == 2 * (stage_manager.total_steps - progress.step)
+    run_fake_steps(logger, stage_manager, progress, clock, 1, 4)
+    metrics = logger.history[progress.step]
+    assert metrics["remaining_time"] == pytest.approx(2.2 * (stage_manager.total_steps - progress.step))
+    assert metrics["total_time"] == warmup * 100 + 6
+    assert metrics["seconds/step"] == 4  # raw rates still describe the actual latest interval
+
+
+def test_eta_samples_each_step_even_when_logging_less_often(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    settings = reference_settings()
+    settings.log_step_interval = 5
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+    for seconds in (100, 200, 2, 4, 4):
+        run_fake_steps(logger, stage_manager, progress, clock, 1, seconds)
+    assert list(logger.history) == [5]
+    assert logger.history[5]["remaining_time"] == pytest.approx(2.38 * (stage_manager.total_steps - 5))
+    assert logger.history[5]["total_time"] == 310
+
+
 def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
 ) -> None:
@@ -776,7 +815,7 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[2]["seconds/step"] == 0.5
     assert run_logger.history[2]["tokens/second"] == TOKENS_PER_STEP / 0.5
-    assert run_logger.history[2]["remaining_time"] == 0.5 * (stage_manager.total_steps - 2)
+    assert "remaining_time" not in run_logger.history[2]
     assert run_logger.history[2]["total_time"] == 31.0, "total_time is the wall time since `open`, evaluation included"
 
     with run_logger.saving_checkpoint():
@@ -785,6 +824,7 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
         clock.advance(4.0)
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
+    assert run_logger.history[3]["remaining_time"] == 0.5 * (stage_manager.total_steps - 3)
     assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
     run_logger.note_micro_batch(1, 4)
     run_logger.note_micro_batch(4, 4)

@@ -46,6 +46,7 @@ from training.optim.sharding import local_optimizer
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
+from training.ui.throughput import Throughput
 from training.ui.capture import WANDB_QUIET_SETTINGS
 from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled, micro_batches_shown
 from training.ui.fallback import ConsoleFallbackDashboard
@@ -407,6 +408,7 @@ class RunLogger:
         # `setup_started` is the CLI's wall-clock reading (`train.py`), from before this object and its clock existed
         self.setup_seconds = wall_clock() - setup_started if setup_started is not None else 0.0
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
+        self._eta = Throughput(stage_manager.total_steps, start_step=start_step, clock=clock)
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._interval_step = start_step  # the step the interval timer started at
         self._side_seconds = 0.0  # seconds spent outside the training loop since the last log step (`_timed_status`)
@@ -553,6 +555,7 @@ class RunLogger:
             finally:
                 seconds = self._clock() - started
                 self._side_seconds += seconds
+                self._eta.discount(seconds)
                 self.dashboard.discount_time(seconds)
 
     def note_micro_batch(self, completed: int, total: int) -> None:
@@ -686,6 +689,8 @@ class RunLogger:
         * `seconds/step`, `tokens/second`, `remaining_time`: training only, the timed blocks that are not steps
           (evaluation, checkpoints, samples, benchmarks) subtracted; `total_tokens` (from step 0, also after a
           resume) and `total_time` (wall time since `open`, everything included);
+          `remaining_time` uses the dashboard's EMA policy and is omitted during startup warmup. Raw interval
+          rates still report the actual interval duration, including startup work;
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
         * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
@@ -698,6 +703,7 @@ class RunLogger:
           `val_loss/<data id>` per validation source, `val_time`).
         """
 
+        self._eta.record(progress.step)  # every completed step, independently of the log interval
         for data_id, tokens in result.data_tokens.items():
             self._token_counter[data_id] = self._token_counter.get(data_id, 0) + tokens
         for source, seconds in (data_wait or {}).items():
@@ -780,13 +786,15 @@ class RunLogger:
             "tokens/second": self.tokens_per_step / seconds_per_step if seconds_per_step > 0 else 0.0,
             "total_tokens": progress.step * self.tokens_per_step,
             "total_time": now - self._train_started,
-            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.step),
             "stage/current_stage": result.stage.stage_index,
             "stage/base_lr": self.stage_manager.stages[result.stage.stage_index].base_lr,
             "stage/in_transition": int(result.stage.transition_to is not None),
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }
+        remaining = self._eta.remaining(progress.step)
+        if remaining is not None:
+            metrics["remaining_time"] = remaining
         metrics |= {f"data_composition/{name}": count / total_tokens for name, count in self._token_counter.items()}
         self._token_counter.clear()
         metrics |= self._data_wait_metrics(now, training_seconds, steps_in_interval)

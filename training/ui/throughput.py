@@ -9,18 +9,19 @@ import time
 
 from training.ui.common import Clock
 
-RATE_SMOOTHING = 0.04  # weight of the newest seconds/step sample in the EMA behind the ETA: a memory of about 25 steps
+RATE_SMOOTHING = 0.1  # weight of the newest seconds/step sample in the EMA behind the ETA
 
 
 class Throughput:
     """
     Smoothed seconds per optimizer step from the times :meth:`record` is called with, and the ETA derived from it.
 
-    The first interval sets the estimate, the second replaces it (the first interval holds torch.compile and the
-    loader start-up, an outlier), later ones move it by :data:`RATE_SMOOTHING` (an exponential moving average, so
-    one slow step does not swing the ETA). start_step is the step the run (re)starts at, so a resumed run does
-    not count the checkpointed steps as done in zero seconds. :meth:`discount` takes the time of a block that was
-    not training out of the interval the next :meth:`record` measures, so the estimate stays steps of training.
+    Ignore startup through the first actual optimizer update, including its compilation. Fresh training skips
+    optimizer.step at step index 0, so completed steps 1 and 2 are warmup; a resumed run skips its first completed
+    interval. The next complete interval initializes the estimate; subsequent intervals use RATE_SMOOTHING.
+    If the caller reports several steps at once, discard the whole interval that contains warmup rather than
+    guessing which portion was compilation. Elapsed wall time is unchanged. discount() excludes non-training
+    blocks (evaluation, checkpointing, etc.) from the next rate sample.
     """
 
     def __init__(self, total_steps: int, *, start_step: int = 0, clock: Clock = time.monotonic) -> None:
@@ -30,7 +31,8 @@ class Throughput:
         self._last_time = self._started
         self._last_step = start_step
         self.seconds_per_step: float | None = None
-        self._samples = 0
+        self._warmup_until_step = max(start_step, 1) + 1
+        self._warming_up = True
 
     def record(self, step: int) -> None:
         """
@@ -42,14 +44,16 @@ class Throughput:
         if advanced <= 0:
             return
         sample = max(now - self._last_time, 0.0) / advanced  # `discount` can have moved the interval start past now
-        self._samples += 1
-        previous = self.seconds_per_step  # None for the first sample only; the check below narrows the type
-        if previous is None or self._samples <= 2:
-            self.seconds_per_step = sample  # the first sample is provisional, the second replaces it
-        else:
-            self.seconds_per_step = (1 - RATE_SMOOTHING) * previous + RATE_SMOOTHING * sample
         self._last_time = now
         self._last_step = step
+        if self._warming_up:
+            self._warming_up = step < self._warmup_until_step
+            return
+        previous = self.seconds_per_step  # None for the first sample only; the check below narrows the type
+        if previous is None:
+            self.seconds_per_step = sample
+        else:
+            self.seconds_per_step = (1 - RATE_SMOOTHING) * previous + RATE_SMOOTHING * sample
 
     def discount(self, seconds: float) -> None:
         """
@@ -71,7 +75,7 @@ class Throughput:
 
     def remaining(self, step: int) -> float | None:
         """
-        Estimated seconds until total_steps (None before the first interval).
+        Estimated seconds until total_steps (None until a post-warmup interval is available).
         """
 
         if self.seconds_per_step is None:
