@@ -232,6 +232,8 @@ def _details(config: DatasetConfig, name: str) -> str:
         parts.append("fields " + ", ".join(f"{field}←`{column}`" for field, column in source.fields.items()))
     if source.converter:
         parts.append(f"converter `{source.converter}`")
+    if source.instruction_format == "messages":
+        parts.append("complete-exchange messages; assistant-only supervision")
     if source.filter:
         parts.append(f"filter `{source.filter}`")
     if source.check_limit is not None:

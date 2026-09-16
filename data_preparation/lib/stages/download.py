@@ -118,6 +118,12 @@ class TokenCounter:
         if self.mode == "tokenizer":
             self._tokenizer = _load_tokenizer(layout.tokenizer_dir(config.tokenizer.name), config.tokenizer.name)
 
+    @property
+    def chat_tokenizer(self) -> SavedTokenizer:
+        if self._tokenizer is None:
+            raise ValueError("message conversations require token_count: tokenizer")
+        return self._tokenizer
+
     def count(self, text: str) -> int:
         if self._tokenizer is None:
             return estimate_tokens(text)
@@ -566,6 +572,8 @@ def _finish_increment(folder: RawFolder, source: SourceConfig, counters: _Increm
     by_limit = limit if limit is not None and folder.start_offset + counters.consumed >= limit else None
     progress_now = RowProgress(counters.consumed, counters.skipped_malformed, counters.dropped_too_long)
     folder.finish(progress_now, exhausted=counters.exhausted, check_limit=by_limit)
+    if source.instruction_format == "messages":
+        log.info("%s: conversation pass diagnostics: %s", folder.directory, dict(counters.chat))
 
 
 def _log_increment(name: str, counters: _IncrementCounters, manifest: Manifest) -> None:

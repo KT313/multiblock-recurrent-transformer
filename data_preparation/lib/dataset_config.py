@@ -31,6 +31,8 @@ from typing import Any, Literal, Optional
 from jsonargparse import ArgumentError, ArgumentParser
 
 from data_preparation.lib.sources.conversations import SHAREGPT_EXCHANGE_POLICY
+from data_preparation.lib.conversation_format import CHAT_POLICY
+from data_preparation.lib.sources.instruction_messages import MESSAGE_CONVERTERS
 
 
 from data_preparation.lib.identifiers import validate_identifier
@@ -275,6 +277,7 @@ SOURCE_FIELD_SCOPES: dict[str, FieldScope] = {
     "text_field": FieldScope(kinds=frozenset({"pretrain"})),
     "processing": FieldScope(kinds=frozenset({"pretrain"})),
     "fields": FieldScope(kinds=frozenset({"instruct"})),
+    "instruction_format": FieldScope(kinds=frozenset({"instruct"})),
     "filter": FieldScope(kinds=frozenset({"instruct"})),
     "input_inversions": FieldScope(kinds=frozenset({"instruct"})),
     # one loader (family) only
@@ -343,6 +346,8 @@ class SourceConfig:
     validation_fraction: Optional[float] = field(default=None, metadata=_CONFIG)  # override of the dataset-level validation_fraction for this source
     describe_tokens_per_row: int = field(default=DEFAULT_TOKENS_PER_ROW_ESTIMATE, metadata=_UNHASHED)  # assumed mean tokens per stored row until the first raw shard measures it: sizes the first download (clamped at the training length) and the row columns of `describe`
 
+    instruction_format: Literal["single_turn", "messages"] = field(default="single_turn", metadata=_UNHASHED)  # raw semantics below omit the legacy default
+
     def __post_init__(self) -> None:
         self._check_field_scopes()
         self._check_values()
@@ -368,6 +373,19 @@ class SourceConfig:
         The rules about a field's value, which the scope table cannot express.
         """
 
+        if self.instruction_format not in ("single_turn", "messages"):
+            raise ValueError("instruction_format must be single_turn or messages")
+        if self.instruction_format == "messages":
+            if self.converter not in MESSAGE_CONVERTERS or self.fields is not None:
+                raise ValueError("instruction_format messages requires a registered message converter without fields")
+            if self.input_inversions != 0:
+                raise ValueError("message conversations do not support input_inversions")
+            if self.converter == "opencode_messages" and self.filter != "opencode_passed_tests":
+                raise ValueError("opencode_messages requires filter opencode_passed_tests")
+        elif self.converter in MESSAGE_CONVERTERS:
+            raise ValueError("message converters require instruction_format: messages")
+        if self.filter == "opencode_passed_tests" and self.converter != "opencode_messages":
+            raise ValueError("opencode_passed_tests requires converter opencode_messages")
         if self.loader == "hf_files" and not isinstance(self.load_kwargs.get("data_files"), str):
             raise ValueError("loader hf_files requires load_kwargs.data_files (a glob relative to the repo root)")
         max_cached_file_mb = self.load_kwargs.get("max_cached_file_mb")
@@ -467,6 +485,8 @@ class DatasetConfig:
 
     def __post_init__(self) -> None:
         self.validate_identifiers()
+        if any(source.instruction_format == "messages" for source in self.sources.values()) and self.token_count != "tokenizer":
+            raise ValueError("message conversations require token_count: tokenizer for exact exchange boundaries")
         if type(self.download_prefetch_mb) is not int or self.download_prefetch_mb < 0:
             raise ValueError("download_prefetch_mb must be a nonnegative integer (MiB; 0 disables prefetch)")
         if not isinstance(self.bloom_deduplicate_across_sources, bool):
@@ -474,6 +494,8 @@ class DatasetConfig:
         self.bloom_deduplicate_across_sources_add_benchmarks = bloom_benchmark_names(
             self.bloom_deduplicate_across_sources_add_benchmarks,
         )
+        if self.bloom_deduplicate_across_sources_add_benchmarks and any(source.instruction_format == "messages" for source in self.sources.values()):
+            raise ValueError("benchmark Bloom exclusion does not yet support message conversations; use a separate benchmark-audited dataset instead of assuming chat records are excluded")
         if self.bloom_deduplicate_across_sources_add_benchmarks and not self.bloom_deduplicate_across_sources:
             raise ValueError("benchmark Bloom exclusion requires bloom_deduplicate_across_sources=true")
         if type(self.bloom_dedup_memory_mb) is not int or self.bloom_dedup_memory_mb < 1:
@@ -737,6 +759,8 @@ class DatasetConfig:
 
     def raw_hash_payload_of(self, source: SourceConfig) -> dict[str, Any]:
         payload = {"source": hash_payload(source, "raw")}
+        if source.instruction_format == "messages":
+            payload["row_semantics"] = {"conversation": CHAT_POLICY, "tokenizer": self.tokenizer_hash()}
         # Keep unrelated source fingerprints unchanged. A fields override bypasses the named converter.
         if (source.converter == "sharegpt_conversations" and source.fields is None) or source.filter == "sharegpt_quality":
             payload["row_semantics"] = {"sharegpt_exchange": SHAREGPT_EXCHANGE_POLICY}

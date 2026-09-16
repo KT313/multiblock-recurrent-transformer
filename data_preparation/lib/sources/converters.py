@@ -13,6 +13,7 @@ from typing import Any
 
 from data_preparation.lib.dataset_config import SourceConfig
 from data_preparation.lib.sources.conversations import opening_exchange
+from data_preparation.lib.sources.instruction_messages import check_opencode_score, convert_opencode_messages, convert_webinstruct_messages, convert_nemotron_messages
 
 Row = dict[str, Any]
 Converter = Callable[[Row], Row]
@@ -127,6 +128,9 @@ def instruction_input_output(row: Row) -> Row:
 
 
 CONVERTERS: dict[str, Converter] = {
+    "opencode_messages": convert_opencode_messages,
+    "webinstruct_messages": convert_webinstruct_messages,
+    "nemotron_messages": convert_nemotron_messages,
     "gsm8k_question_answer": gsm8k_question_answer,
     "sharegpt_conversations": sharegpt_conversations,
     "first_two_turns": first_two_turns,
@@ -139,6 +143,9 @@ IDENTITY_FORMAT = "columns instruction, output[, input]"
 # What each named converter expects a source row to look like, in the words of the error that fails a download
 # after too many malformed rows in a row (the row's own column names and value types are printed next to it).
 EXPECTED_FORMATS: dict[str, str] = {
+    "opencode_messages": "nonempty string input/output with numeric average_test_score",
+    "webinstruct_messages": "nonempty string question/answer",
+    "nemotron_messages": "reasoning off and alternating user/assistant messages, optional leading system",
     "gsm8k_question_answer": "columns question, answer",
     "sharegpt_conversations": "a `conversations` list opening with [system,] human, gpt turns, each with from/value keys",
     "first_two_turns": "a `conversations` list of at least two `{value}` turns (instruction, then output)",
@@ -200,7 +207,7 @@ def sharegpt_quality(row: Row) -> bool:
     return not any(marker in answer for marker in SHAREGPT_CODE_BLOCK_MARKERS)
 
 
-FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality}
+FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality, "opencode_passed_tests": check_opencode_score}
 
 
 def get_filter(name: str) -> Filter:

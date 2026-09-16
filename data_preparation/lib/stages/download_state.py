@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from data_preparation.lib.dataset_config import SourceConfig
+from data_preparation.lib.conversation_format import fit_conversation, validate_messages
+from data_preparation.lib.sources.instruction_messages import ExcludedConversation
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.conversations import OrphanAssistantOpening
@@ -45,6 +47,7 @@ class _IncrementCounters:
     kept: int = 0  # rows written to disk
     skipped_malformed: int = 0  # instruct rows whose filter/converter raised ValueError or left out instruction / output
     dropped_too_long: int = 0  # instruct rows with more than `dataset_max_sequence_length` tokens
+    chat: Counter[str] = field(default_factory=Counter)  # per-pass diagnostics, not durable offsets
     exhausted: bool = False  # the loader ran dry, or check_limit was reached
 
 
@@ -69,6 +72,11 @@ class _TokenStep:
         self._max_tokens = max_tokens
         self._counters = counters
         self._is_instruct = source.kind == "instruct"
+        self._messages = source.instruction_format == "messages"
+        if self._messages:
+            tokenizer = counter.chat_tokenizer
+            if any(token_id is None or not 0 <= token_id < tokenizer.vocab_size for token_id in (tokenizer.bos_id, tokenizer.eos_id)):
+                raise ValueError("message conversations require BOS and EOS IDs in the tokenizer base vocabulary")
         self._text_field = source.text_field
         self._batch: list[StoredRow] = []
 
@@ -103,7 +111,23 @@ class _TokenStep:
 
         if not batch:
             return []
+        if self._messages:
+            return self._fit_message_rows(batch)
         return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
+
+    def _fit_message_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
+        stored: list[StoredRow] = []
+        for row, before in batch:
+            encoded = fit_conversation(row["messages"], self._counter.chat_tokenizer, self._max_tokens)
+            self._counters.chat["trimmed_trailing_user"] += encoded.trimmed_user
+            self._counters.chat["removed_exchanges"] += encoded.removed_exchanges
+            if not encoded.messages:
+                self._counters.chat["no_fitting_exchange"] += 1
+                self._counters.dropped_too_long += 1
+                continue
+            row = {"messages": encoded.messages, "exchange_ends": encoded.exchange_ends, "tokens": len(encoded.ids)}
+            stored.append((row, RowProgress(before.consumed, before.skipped_malformed, self._counters.dropped_too_long)))
+        return stored
 
     def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
         texts = [row[self._text_field] for row, _ in batch]
@@ -241,8 +265,17 @@ class _Increment:
             return text_row(self.source, raw, name)
         try:
             if self.row_filter is not None and not self.row_filter(raw):
+                if self.source.instruction_format == "messages":
+                    self.counters.chat["quality_filter"] += 1
                 return None
-            row = _instruct_row(raw, self.converter)
+            if self.source.instruction_format == "messages":
+                converted = self.converter(raw) if self.converter else raw
+                row = {"messages": validate_messages(converted.get("messages"))}
+            else:
+                row = _instruct_row(raw, self.converter)
+        except ExcludedConversation as err:
+            self.counters.chat[err.reason] += 1
+            return None
         except OrphanAssistantOpening as err:
             # Preserve the existing manifest counter/offset contract without treating a known unsuitable
             # conversation as evidence of a changed source schema. Never search later turns for another pair.

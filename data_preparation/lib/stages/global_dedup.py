@@ -21,6 +21,7 @@ from data_preparation.lib.stages.exact_dedup import (
     BLOOM_MAX_LOAD, TARGET_FALSE_POSITIVE_RATE, SeenDocuments, memory_mb_for,
 )
 from data_preparation.lib.stages.row_pipeline import normalize_text
+from data_preparation.lib.conversation_format import hash_conversation
 
 if TYPE_CHECKING:
     from data_preparation.lib.dataset_config import DatasetConfig
@@ -62,6 +63,8 @@ def global_key(kind: str, row: Mapping[str, Any]) -> int:
     tuple, even if rendering that tuple would produce the same text. Source-local hashes
     and normalization overrides have no effect on this policy.
     """
+    if kind == "messages":
+        return hash_conversation(row["messages"])
     if kind == "pretrain":
         values = [row["text"]]
     elif kind == "instruct":

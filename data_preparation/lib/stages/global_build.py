@@ -14,7 +14,6 @@ from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
 
 from data_preparation.lib.dataset_config import DatasetConfig
 from data_preparation.lib.layout import DatasetLayout
@@ -23,7 +22,7 @@ from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.global_dedup import GlobalAdmission, GlobalFrontier, ordered_sources
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.ownership import guarded_path
-from data_preparation.lib.storage.parquet import publish_shard, shard_name
+from data_preparation.lib.storage.parquet import build_row_table, publish_shard, shard_name
 
 from data_preparation.lib.stages.global_output import (
     GLOBAL_BATCH_ROWS, candidate_rows, committed_keys,
@@ -90,7 +89,7 @@ def build_global_source(
         batch = list(islice(rows, batch_rows))
         if not batch:
             break
-        admission.commit_batch(name, config.sources[name].kind, batch, commit)
+        admission.commit_batch(name, "messages" if config.sources[name].instruction_format == "messages" else config.sources[name].kind, batch, commit)
 
     # finalize the source budget and publish filter statistics
     complete = manifest.rows() >= rows_target or exhausted
@@ -119,7 +118,7 @@ def commit_global_batch(
     if rows:
         path = guarded_path(layout.root, directory / shard_name(len(manifest.shards)))
         guarded_path(layout.root, path.with_name(path.name + ".tmp"))
-        publish_shard(pa.Table.from_pylist(rows), path)
+        publish_shard(build_row_table(rows), path)
         manifest.add_shard(path.name, len(rows), sum(int(row["tokens"]) for row in rows))
     manifest.extra["global_frontier"] = next_frontier.to_dict()
     manifest.stats["global_dedup"] = {

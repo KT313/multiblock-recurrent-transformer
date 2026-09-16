@@ -87,6 +87,10 @@ class Tokenizer:
         # pad_id is never a label (generation pads with it, training pads inputs with EOS), so it is not bounded here
         self.pad_id: int = resolve_pad_id(self._backend, self.eos_id)
 
+    def encode_literal(self, text: str) -> list[int]:
+        """Encode literal chat content through the shared tokenizer policy."""
+        return self._backend.encode_literal(text)
+
     @property
     def processor(self) -> Any:
         """

@@ -32,6 +32,7 @@ class SavedTokenizer:
     """
 
     def __init__(self, path: str | Path) -> None:
+        self._literal_tokenizer: Tokenizer | None = None
         self.path = Path(path)
         file = self.path / "tokenizer.json"
         if not file.is_file():
@@ -47,6 +48,14 @@ class SavedTokenizer:
         self.eos_id: int | None = ids["eos_token"]
         self.pad_id: int | None = ids["pad_token"]
         self.unk_id: int | None = ids["unk_token"]
+
+    def encode_literal(self, text: str) -> list[int]:
+        """Encode message content without interpreting special-token spellings as control IDs."""
+        if self._literal_tokenizer is None:
+            literal = Tokenizer.from_str(self._tokenizer.to_str())
+            literal.encode_special_tokens = True
+            self._literal_tokenizer = literal
+        return self._literal_tokenizer.encode(text, add_special_tokens=False).ids
 
     def _special_id(self, name: str, value: Any) -> int | None:
         if value is None:

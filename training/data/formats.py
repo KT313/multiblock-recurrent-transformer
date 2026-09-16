@@ -3,9 +3,9 @@
 Row -> (input_ids, labels) formatting functions, selected by data_signature["format_fn"].
 
 Every function returns two equal-length torch.long tensors. Positions that must not be supervised are
-`IGNORE_INDEX` in labels, never a token id, so a real `<unk>` or `<pad>` token stays supervised. Two formats exist:
+`IGNORE_INDEX` in labels, never a token id, so a real `<unk>` or `<pad>` token stays supervised. Legacy formats:
 pass_text (pretrain sources) and concatenate_instruction_input_output (instruct sources,
-`INSTRUCT_DATA_SIGNATURE` of the dataset resolver).
+`INSTRUCT_DATA_SIGNATURE` of the dataset resolver). Opt-in message sources use format_conversation for all assistant spans.
 """
 
 from typing import Any, Callable
@@ -13,6 +13,7 @@ from typing import Any, Callable
 import torch
 
 from data_preparation.lib.stages.row_pipeline import instruct_text
+from data_preparation.lib.conversation_format import fit_conversation
 from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 Row = dict[str, Any]
@@ -56,7 +57,19 @@ def concatenate_instruction_input_output(
     return input_ids, labels
 
 
+def format_conversation(
+    row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool, max_tokens: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit complete exchanges and supervise every assistant body and its end marker."""
+    encoded = fit_conversation(row.get("messages"), tokenizer, max_tokens, bos=add_bos, eos=add_eos)
+    inputs = torch.tensor(encoded.ids, dtype=torch.long)
+    labels = inputs.clone()
+    labels[~torch.tensor(encoded.supervised, dtype=torch.bool)] = IGNORE_INDEX
+    return inputs, labels
+
+
 FORMAT_FNS: dict[str, FormatFn] = {
+    "format_conversation": format_conversation,
     "pass_text": pass_text,
     "concatenate_instruction_input_output": concatenate_instruction_input_output,
 }

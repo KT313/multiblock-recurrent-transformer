@@ -77,10 +77,10 @@ def test_instruction_format_missing_fields_raise(tokenizer: Tokenizer) -> None:
 
 def test_registry_contents() -> None:
     """
-    Only the two formats of the thesis run; the upstream chat-template formats are gone.
+    Legacy formats and the opt-in structured conversation format.
     """
 
-    assert set(FORMAT_FNS) == {"pass_text", "concatenate_instruction_input_output"}
+    assert set(FORMAT_FNS) == {"pass_text", "concatenate_instruction_input_output", "format_conversation"}
     assert FORMAT_FNS["pass_text"] is pass_text
     assert FORMAT_FNS["concatenate_instruction_input_output"] is concatenate_instruction_input_output
 

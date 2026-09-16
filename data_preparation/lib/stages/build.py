@@ -32,6 +32,8 @@ with zero shards still gets a (zero-shard) processed manifest, so the source cou
 
 from __future__ import annotations
 
+from data_preparation.lib.conversation_format import CHAT_COLUMNS, fit_conversation, hash_conversation
+
 import multiprocessing
 import random
 from collections.abc import Iterator
@@ -324,6 +326,8 @@ class RowPipeline:
 
         if self.kind == "pretrain":
             rows = self._pretrain_rows(raw_dir, shards)
+        elif self.source.instruction_format == "messages":
+            rows = self._message_rows(raw_dir, shards)
         else:
             rows = self._instruct_rows(raw_dir, shards, first_row_index)
         if self.seen is not None:  # dedup on (minhash = this cheap exact pass first, then fuzzy, all at once)
@@ -371,6 +375,27 @@ class RowPipeline:
                 yield from kept
 
     # --- instruct --------------------------------------------------------------------------------------------------
+
+    def _message_rows(self, raw_dir: Path, shards: list[ShardInfo]) -> Iterator[Row]:
+        raw_manifest = Manifest.load(raw_dir)
+        same_tokenizer = raw_manifest is not None and raw_manifest.tokenizer_hash == self.config.tokenizer_hash()
+        for shard in shards:
+            check_stop(self.should_stop)
+            parquet = pq.ParquetFile(raw_dir / shard.name)
+            for batch in parquet.iter_batches(batch_size=self.batch_size, columns=list(CHAT_COLUMNS)):
+                self._advance(len(batch))
+                for row in batch.to_pylist():
+                    if same_tokenizer and int(row["tokens"]) <= self.dataset_max_sequence_length:
+                        yield {**row, "hash": hash_conversation(row["messages"])}
+                        continue
+                    encoded = fit_conversation(row["messages"], self._counter().chat_tokenizer, self.dataset_max_sequence_length)
+                    chat = self.stats.setdefault("conversation", {})
+                    chat["removed_exchanges"] = chat.get("removed_exchanges", 0) + encoded.removed_exchanges
+                    if not encoded.messages:
+                        self.stats["removed_too_long"] += 1
+                        continue
+                    yield {"messages": encoded.messages, "exchange_ends": encoded.exchange_ends,
+                           "tokens": len(encoded.ids), "hash": hash_conversation(encoded.messages)}
 
     def _instruct_rows(self, raw_dir: Path, shards: list[ShardInfo], first_row_index: int) -> Iterator[Row]:
         """

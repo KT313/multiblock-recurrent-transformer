@@ -12,7 +12,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from training.data.formats import apply_formatting
+from training.data.formats import apply_formatting, format_conversation
 from training.data.tokenizer import IGNORE_INDEX, TokenMetadata, Tokenizer
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
@@ -107,7 +107,10 @@ def collate_samples(
     max_tokens = training_max_sequence_length + 1
     samples: list[Sample] = []
     for row in batch:
-        input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
+        if row["data_signature"]["format_fn"] == "format_conversation":
+            input_ids, labels = format_conversation(row, tokenizer, add_bos, add_eos, max_tokens)
+        else:
+            input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
         if input_ids.shape[0] > max_tokens or labels.shape[0] > max_tokens:
             # cloned, not sliced: a slice is a view that keeps the WHOLE stored row alive (rows are stored cut at
             # dataset_max_sequence_length, trained cut at training_max_sequence_length), and `torch.save` writes a

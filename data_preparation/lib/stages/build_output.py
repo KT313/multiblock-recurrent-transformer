@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
 
 from data_preparation.lib.dataset_config import DatasetConfig
 from data_preparation.lib.layout import processed_columns
@@ -18,7 +17,7 @@ from data_preparation.lib.stages.download import new_manifest
 from data_preparation.lib.stages.exact_dedup import stored_hashes
 from data_preparation.lib.storage.manifest import Manifest, ShardInfo, shard_list
 from data_preparation.lib.storage.ownership import BuildWorkspace, guarded_path
-from data_preparation.lib.storage.parquet import publish_shard, shard_name
+from data_preparation.lib.storage.parquet import build_row_table, publish_shard, shard_name
 
 log = get_logger("data_preparation.lib.stages.build")
 Row = dict[str, Any]
@@ -78,7 +77,7 @@ class ProcessedOutput:
             self.manifest.begin_generation(self.directory)
         for start in range(0, len(rows), shard_size):
             chunk = rows[start : start + shard_size]
-            path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))
+            path = publish_shard(build_row_table(chunk), self.directory / shard_name(len(self.manifest.shards)))
             self.manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
 
     def save(self, covered: list[list[Any]]) -> None:
@@ -105,7 +104,7 @@ def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manif
         stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
         stats["removed_empty"] = 0  # rows without instruction or output after stripping
         stats["removed_too_long"] = 0  # rows over `dataset_max_sequence_length` tokens (a safety net; the download already drops them)
-    manifest.columns = list(processed_columns(source.kind))
+    manifest.columns = list(processed_columns(source.kind, source.instruction_format))
     manifest.shuffled = config.shuffle_of(name)
     manifest.shuffle_seed = source.seed
     manifest.stats = stats

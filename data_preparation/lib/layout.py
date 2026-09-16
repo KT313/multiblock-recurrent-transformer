@@ -36,7 +36,7 @@ INSTRUCT_PROCESSED_COLUMNS: tuple[str, ...] = ("instruction", "input", "output",
 PROCESSED_COLUMNS: tuple[str, ...] = PRETRAIN_PROCESSED_COLUMNS
 
 
-def processed_columns(kind: str) -> tuple[str, ...]:
+def processed_columns(kind: str, instruction_format: str = "single_turn") -> tuple[str, ...]:
     """
     Columns of a processed shard of a source of kind (pretrain or instruct).
     """
@@ -44,6 +44,8 @@ def processed_columns(kind: str) -> tuple[str, ...]:
     if kind == "pretrain":
         return PRETRAIN_PROCESSED_COLUMNS
     if kind == "instruct":
+        if instruction_format == "messages":
+            return ("messages", "exchange_ends", "tokens", "hash")
         return INSTRUCT_PROCESSED_COLUMNS
     raise ValueError(f"unknown source kind {kind!r}; expected 'pretrain' or 'instruct'")
 

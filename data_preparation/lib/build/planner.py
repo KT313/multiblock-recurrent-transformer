@@ -37,6 +37,8 @@ Pure functions of (config, layout); lib/build/runner.py executes them.
 
 from __future__ import annotations
 
+from data_preparation.lib.conversation_format import count_fitted_positions
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -45,6 +47,7 @@ from math import ceil
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from data_preparation.lib.dataset_config import SAFETY_MARGIN, DatasetConfig
 from data_preparation.lib.layout import DatasetLayout
@@ -553,9 +556,19 @@ def measured_tokens_per_row(config: DatasetConfig, name: str, layout: DatasetLay
     for shard in raw.shards:
         path = raw_dir / shard.name
         try:
-            capped += shard_tokens(path, cap=config.training_target_sequence_length)
+            if config.sources[name].instruction_format == "messages":
+                parquet = pq.ParquetFile(path)
+                for batch in parquet.iter_batches(batch_size=1024, columns=["exchange_ends"]):
+                    for ends in batch.column(0).to_pylist():
+                        if not isinstance(ends, list):
+                            raise ValueError(f"{name}: missing conversation exchange_ends in {path}")
+                        capped += count_fitted_positions(ends, min(config.training_target_sequence_length, config.dataset_max_sequence_length - 1))
+            else:
+                capped += shard_tokens(path, cap=config.training_target_sequence_length)
         except (OSError, pa.ArrowException) as error:
             raise UnreadableRawShardError(name, path, error) from error
+    if config.sources[name].instruction_format == "messages" and capped == 0:
+        raise ValueError(f"{name}: no stored complete conversation exchange fits training_target_sequence_length={config.training_target_sequence_length}; increase the training length or select shorter conversations")
     return capped / raw.rows()
 
 

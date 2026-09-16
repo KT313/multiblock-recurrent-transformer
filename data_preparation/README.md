@@ -792,3 +792,34 @@ all seed insertions plus retained dataset keys, counting repeated seeds
 conservatively. `bloom_positive` combines seed matches, dataset duplicates and false
 positives. A shared Bloom filter cannot attribute a removal to an individual
 benchmark or prove that a positive was a true match.
+
+### Multi-turn instruction sources
+
+The opt-in `instruction_format: messages` supports OpenCodeInstruct (perfect recorded test score), current WebInstruct-verified training pairs, and Nemotron reasoning-off chats. It preserves all fitting exchanges and trains only assistant responses. Existing single-turn sources are unchanged. See [conversation formatting and filtering](../docs/instruction_conversations.md) and [the small four-source integration config](../config/datasets/instruction_sources_smoke.yaml). Use an isolated dataset directory for this smoke config; the selected FineWeb pool is 350BT, but preparation is sized by the small stage budgets.
+
+### Inspect raw, prepared, and packed samples
+
+Run the actual stages on a small retained sample from every source:
+
+```bash
+uv run --no-sync python -m data_preparation.inspection \
+  --dataset_config config/datasets/instruction_sources_smoke.yaml \
+  -n 10 --sequence-length 4096 --pack-length 8192
+```
+
+The command prints a **retained temporary directory** at startup. It does not delete it on exit. Optional `--output-dir /path/to/new-directory` chooses a fresh location; existing directories are refused. `HF_TOKEN` supplies gated-source access. Source jobs run sequentially, cleaning uses one worker, and download read-ahead is disabled. Original quality, source-local dedup, and global Bloom policies remain active. The stage token budgets are not downloaded in full.
+
+`-n` targets retained **raw** rows after the normal downloader's conversion, filtering, and storage-length handling. The preparer may retain fewer. Instruction sources may examine up to `max(1000, 100*n)` upstream rows (override with `--max-source-rows`, also bounded by the config's `check_limit`). A source shortfall is recorded and warned about. These are row limits, not byte limits: Parquet column chunks/row groups can require larger transfers. Dataset policies such as benchmark seeding may also require their normal auxiliary downloads.
+
+Start with `README.txt` and `summary.json` in the printed directory. Artifacts include:
+
+- `dataset/`: normal raw/processed Parquet shards and manifests, including globally deduplicated output when enabled.
+- `raw/` and `prepared/`: readable JSONL copies for each source.
+- `formatted/`: token IDs and assistant loss masks before next-token shifting, linked by source and prepared-row index.
+- `packed/sources/`: each source's usable samples packed once.
+- `packed/mixed/`: every usable sample packed once in interleaved source order, including held-out rows for inspection.
+- `packed/stages/`: two previews per stage using the real training `BatchStream` and training rows only; finite samples cycle as needed. Adjust with `--packs-per-stage` (`0` disables).
+
+Each pack is saved as `.pt` tensors, `.json` arrays, `.tsv` per-token input/next-target/mask, and `.txt` decoded text with loss spans. Special tokens stay visible; padding is identified. The JSON/tensors include positions and document IDs for the causal document mask, avoiding a quadratic matrix dump.
+
+Finite packing drains a partial final pool so no sample is hidden. Stage previews start independently with each stage's steady weights; they do not reproduce transitions, production dataset order, or checkpoint offsets. A stage missing usable training examples is explicitly skipped, not reweighted. This is an inspection fixture, not a training-ready dataset snapshot. Production dataset directories remain untouched.

@@ -65,6 +65,9 @@ INSTRUCT_DATA_SIGNATURE: dict[str, Any] = {
 Part = Literal["train", "val"]
 
 
+CHAT_DATA_SIGNATURE: dict[str, Any] = {"keys": ["messages"], "format_fn": "format_conversation"}
+
+
 TRAIN_LOADER_NUM_WORKERS = 1  # every per-source train loader runs one worker process; fixed, not a setting (its worker
 # batch size and prefetch depth are `training.data.loader.TRAIN_LOADER_BATCH_ROWS` / `TRAIN_LOADER_PREFETCH_FACTOR`)
 
@@ -187,7 +190,8 @@ def _data_entry(
     `[0, validation_rows)` (part `val`) or the training rows from `validation_rows` on (part `train`).
     """
 
-    signature = dict(INSTRUCT_DATA_SIGNATURE) if dataset_config.sources[key].kind == "instruct" else None
+    source = dataset_config.sources[key]
+    signature = dict(CHAT_DATA_SIGNATURE if source.instruction_format == "messages" else INSTRUCT_DATA_SIGNATURE) if source.kind == "instruct" else None
     skip_rows, max_rows = (0, validation_rows) if part == "val" else (validation_rows, None)
     return DataEntry(
         prefix=prefix,

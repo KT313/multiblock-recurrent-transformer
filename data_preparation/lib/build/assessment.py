@@ -112,7 +112,7 @@ def assess_processed_folder(
         return ProcessedAssessment("stale", "stale: " + "; ".join(changes), manifest)
     if global_output and manifest.extra.get("global_dedup") != global_policy(config):
         return ProcessedAssessment("stale", "stale: missing or incompatible dataset-wide Bloom policy; replay required", manifest)
-    expected_columns = [*processed_columns(config.sources[name].kind), *(["global_hash"] if global_output else [])]
+    expected_columns = [*processed_columns(config.sources[name].kind, config.sources[name].instruction_format), *(["global_hash"] if global_output else [])]
     if manifest.columns != expected_columns:
         return ProcessedAssessment("stale", "stale: the shards predate the current columns", manifest)
     covered = manifest.input_shards
