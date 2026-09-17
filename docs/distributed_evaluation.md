@@ -8,12 +8,13 @@ Scheduled inference uses the model replica already resident on each training ran
 sample_batch_size: 1           # default 8; choose 1 to distribute the 11 default prompts over eight GPUs
 sample_max_new_tokens: 64
 sample_use_cache: true
+sample_temperature: [0.0, 0.7] # scalar remains supported; repeat all recurrences per temperature
 benchmark_batch_size: 8        # positive, fixed forward batch size
 benchmark_limit: 8             # per leaf task; omit for a full evaluation
 benchmark_apply_chat_template: false
 ```
 
-The usual sample/benchmark interval and progress triggers still apply. `sample_batch_size` may change on resume; old checkpoints that omit it remain compatible. Changing sample batch size changes the stochastic latent draws and can change completions. Training samples retain seed 0. Distribution only changes which rank executes each fixed batch.
+The usual sample/benchmark interval and progress triggers still apply. `sample_batch_size` may change on resume; old checkpoints that omit it remain compatible. Changing sample batch size changes the stochastic latent draws and can change completions. Training samples retain seed 0. Distribution only changes which rank executes each fixed batch. With a temperature list, output is ordered by temperature, recurrence, then prompt. Every combination uses the same batch-offset seeds as its corresponding standalone scalar run; adding a temperature does not change existing completions. Each JSONL row records its actual temperature in `decoding.temperature`. Empty lists, negative values, and nonfinite temperatures are rejected.
 
 Benchmark prompting stays explicit. Continuations use BOS plus literal text. Chat uses the checkpoint-owned role-token formatter, including literal body encoding, few-shot history, and an unfinished assistant prefix. Chat inputs that exceed context are rejected rather than silently losing role structure. System messages remain unsupported: stock MMLU descriptions currently require plain prompting. EOS token IDs stop generation; the ordinary-token spelling `</s>` does not, unless a task explicitly requests it as a text stop.
 

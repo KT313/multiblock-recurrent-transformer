@@ -29,6 +29,7 @@ class GeneratedSample:
     new_tokens: int  # generated tokens before the EOS (or the cap)
     stopped_at_eos: bool
     recurrence: list[int] | None = None  # recurrent steps per block the sample was generated with; None: the mean
+    temperature: float = 0.0
 
 
 def select_fitting_prompts(
@@ -64,7 +65,7 @@ def build_prompt_batch(batch: list[tuple[Prompt, list[int]]], pad_id: int) -> tu
 
 
 def decode_generated_sample(
-    prompt: Prompt, generated_ids: list[int], tokenizer: Tokenizer, recurrence: Recurrence = None
+    prompt: Prompt, generated_ids: list[int], tokenizer: Tokenizer, recurrence: Recurrence = None, *, temperature: float = 0.0,
 ) -> GeneratedSample:
     """Cut at the first EOS to drop trailing filler; without EOS, even pad IDs are generated output."""
     eos_id = tokenizer.eos_id
@@ -73,15 +74,15 @@ def decode_generated_sample(
         generated_ids = generated_ids[: generated_ids.index(eos_id)]
     completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
     steps = None if recurrence is None else [int(value) for value in recurrence]
-    return GeneratedSample(prompt.text, prompt.kind, completion, len(generated_ids), stopped_at_eos, steps)
+    return GeneratedSample(prompt.text, prompt.kind, completion, len(generated_ids), stopped_at_eos, steps, temperature)
 
 
 def save_generated_samples(
-    samples: list[GeneratedSample], out_path: Path, *, step: int, temperature: float, max_new_tokens: int,
+    samples: list[GeneratedSample], out_path: Path, *, step: int, max_new_tokens: int,
     seed: int, batch_size: int, use_cache: bool, execution_policy: ExecutionPolicy | None,
 ) -> None:
     decoding: dict[str, float | str | int | None] = {
-        "temperature": temperature, "max_new_tokens": max_new_tokens, "seed": seed, "batch_size": batch_size,
+        "max_new_tokens": max_new_tokens, "seed": seed, "batch_size": batch_size,
         "use_cache": use_cache, "latent_policy": "fixed_per_token" if use_cache else "resample_prefix",
         "latent_rng": "per_core_token_columns_v1" if use_cache else "global_prefix_v1",
         "logits_to_keep": 1 if use_cache else 0,
@@ -91,4 +92,6 @@ def save_generated_samples(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open_atomic_output(out_path) as file:
         for sample in samples:
-            file.write(json.dumps({"step": step, **asdict(sample), "decoding": decoding}, ensure_ascii=False) + "\n")
+            record = asdict(sample)
+            selected_temperature = record.pop("temperature")
+            file.write(json.dumps({"step": step, **record, "decoding": {**decoding, "temperature": selected_temperature}}, ensure_ascii=False) + "\n")

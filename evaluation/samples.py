@@ -27,6 +27,7 @@ from evaluation.wrapper import Recurrence, check_recurrence
 from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
+from training.sample_settings import normalize_sample_temperatures
 
 _sample_from = decode_generated_sample  # preserve existing helper imports
 _fitting_prompts = select_fitting_prompts
@@ -53,7 +54,7 @@ def generate_samples(
     prompts: Sequence[Prompt] = DEFAULT_PROMPTS,
     *,
     max_new_tokens: int = 64,
-    temperature: float = 0.0,
+    temperature: float | list[float] = 0.0,
     recurrence: Recurrence = None,
     batch_size: int = 8,
     seed: int = 0,
@@ -61,7 +62,7 @@ def generate_samples(
     use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
-    One completion per prompt: greedy when temperature is 0, sampled at that temperature otherwise; at most
+    One completion per prompt and temperature (scalar or list): greedy when temperature is 0, sampled at that temperature otherwise; at most
     max_new_tokens tokens, cut at the first EOS. recurrence (steps per core block, e.g. [4, 4, 4]) overrides the
     model's mean recurrence. A prompt whose tokens plus max_new_tokens do not fit the model's position table is
     skipped with a warning (`select_fitting_prompts`) instead of crashing the run.
@@ -80,6 +81,7 @@ def generate_samples(
     # validate generation limits and select prompts that fit the position table
     if batch_size < 1 or max_new_tokens < 1:
         raise ValueError("batch_size and max_new_tokens must be positive")
+    temperatures = normalize_sample_temperatures(temperature)
     check_recurrence(recurrence, model)
     fitting = select_fitting_prompts(prompts, tokenizer, max_new_tokens, model.config.model_max_sequence_length)
     samples: list[GeneratedSample] = []
@@ -87,11 +89,12 @@ def generate_samples(
     # generate each prompt batch inside one isolated inference session
     with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
         wrapper = session.hf_wrapper(tokenizer)
-        for start in range(0, len(fitting), batch_size):
-            samples.extend(generate_prompt_batch(
-                session, wrapper, tokenizer, fitting[start:start + batch_size], recurrence=recurrence,
-                seed=seed + start, max_new_tokens=max_new_tokens, temperature=temperature, use_cache=use_cache,
-            ))
+        for selected_temperature in temperatures:
+            for start in range(0, len(fitting), batch_size):
+                samples.extend(generate_prompt_batch(
+                    session, wrapper, tokenizer, fitting[start:start + batch_size], recurrence=recurrence,
+                    seed=seed + start, max_new_tokens=max_new_tokens, temperature=selected_temperature, use_cache=use_cache,
+                ))
     return samples
 
 
@@ -107,7 +110,7 @@ def generate_prompt_batch(
         pad_token_id=tokenizer.pad_id, eos_token_id=tokenizer.eos_id, use_cache=use_cache,
         logits_to_keep=1 if use_cache else 0, synced_gpus=False, **sampling,
     )
-    return [decode_generated_sample(prompt, output[row, width:].tolist(), tokenizer, recurrence)
+    return [decode_generated_sample(prompt, output[row, width:].tolist(), tokenizer, recurrence, temperature=temperature)
             for row, (prompt, _) in enumerate(batch)]
 
 
@@ -119,7 +122,7 @@ def generate_and_save_samples(
     step: int,
     prompts: Sequence[Prompt] = DEFAULT_PROMPTS,
     max_new_tokens: int = 64,
-    temperature: float = 0.0,
+    temperature: float | list[float] = 0.0,
     recurrences: Sequence[Recurrence] = (None,),
     batch_size: int = 8,
     seed: int = 0,
@@ -127,22 +130,23 @@ def generate_and_save_samples(
     use_cache: bool = True,
 ) -> list[GeneratedSample]:
     """
-    `generate_samples` once per recurrence setting, then one JSON line per sample in out_path (parents created):
+    `generate_samples` once per temperature and recurrence setting, then one JSON line per sample in out_path (parents created):
     the sample's fields (its `recurrence` included) plus `step` and the decoding settings.
     """
 
-    # collect each recurrence setting's samples in the requested order
+    # collect all recurrence settings for each temperature in the requested order
     samples: list[GeneratedSample] = []
-    for recurrence in recurrences:
-        samples.extend(generate_samples(
-            model, tokenizer, prompts, max_new_tokens=max_new_tokens, temperature=temperature,
-            recurrence=recurrence, batch_size=batch_size, seed=seed, execution_policy=execution_policy,
-            use_cache=use_cache,
-        ))
+    for selected_temperature in normalize_sample_temperatures(temperature):
+        for recurrence in recurrences:
+            samples.extend(generate_samples(
+                model, tokenizer, prompts, max_new_tokens=max_new_tokens, temperature=selected_temperature,
+                recurrence=recurrence, batch_size=batch_size, seed=seed, execution_policy=execution_policy,
+                use_cache=use_cache,
+            ))
 
     # write completions together with the decoding settings that produced them
     save_generated_samples(
-        samples, out_path, step=step, temperature=temperature, max_new_tokens=max_new_tokens,
+        samples, out_path, step=step, max_new_tokens=max_new_tokens,
         seed=seed, batch_size=batch_size, use_cache=use_cache, execution_policy=execution_policy,
     )
     return samples

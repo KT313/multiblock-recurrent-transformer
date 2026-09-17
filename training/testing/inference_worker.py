@@ -46,16 +46,22 @@ def main() -> None:
         rng = torch.get_rng_state()
         cuda_rng = torch.cuda.get_rng_state(backend.device) if use_cuda else None
         for cache in (True, False):
-            for recurrence in (None, [1, 1]):
-                reference.extend(generate_samples(model, tokenizer, prompts, batch_size=2, max_new_tokens=2,
-                                                   recurrence=recurrence, use_cache=cache, temperature=0.7 if cache else 0, execution_policy=backend.execution_policy))
+            for temperature in (0.0, 0.7):
+                for recurrence in (None, [1, 1]):
+                    reference.extend(generate_samples(
+                        model, tokenizer, prompts, batch_size=2, max_new_tokens=2, recurrence=recurrence,
+                        use_cache=cache, temperature=temperature, execution_policy=backend.execution_policy,
+                    ))
         results: list[Any] = []
         for cache in (True, False):
             result = generate_distributed_samples(
                 backend, model, tokenizer, root / f"samples-{cache}.jsonl", step=0, prompts=prompts,
-                recurrences=[None, [1, 1]], batch_size=2, max_new_tokens=2, use_cache=cache, temperature=0.7 if cache else 0,
+                recurrences=[None, [1, 1]], batch_size=2, max_new_tokens=2, use_cache=cache, temperature=[0.0, 0.7],
                 stop=StopController(backend), on_fatal_error=exit_failed_worker,
             )
+            if backend.is_main:
+                rows = [json.loads(line) for line in (root / f"samples-{cache}.jsonl").read_text().splitlines()]
+                assert [row["decoding"]["temperature"] for row in rows] == [sample.temperature for sample in result.samples]
             results.extend(result.samples)
             assert result.completed
             assert all(count > 0 for count in result.jobs_per_rank)

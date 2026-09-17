@@ -13,6 +13,7 @@ from typing import Any, Literal, Optional
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
 
+from training.sample_settings import normalize_sample_temperatures
 from training.optimizer_validation import validate_adam_hyperparameters, validate_scalar
 
 # The activation-checkpointing modes of the recurrence iterations, `model.blocks.recurrence.CHECKPOINT_MODES` (which
@@ -192,7 +193,7 @@ class Settings:
     sample_batch_size: int = 8
     sample_max_new_tokens: int = 64
     sample_use_cache: bool = True  # fixed per-token/core latents and per-recurrence K/V; False: legacy prefix resampling
-    sample_temperature: float = 0.0  # 0: greedy decoding
+    sample_temperature: float | list[float] = 0.0  # scalar or list; 0: greedy decoding
     sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
     benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)
     benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress
@@ -265,8 +266,7 @@ class Settings:
             )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
-        if self.sample_temperature < 0:
-            raise ValueError("sample_temperature must be >= 0 (0: greedy)")
+        normalize_sample_temperatures(self.sample_temperature)
         if self.benchmark_limit is not None and self.benchmark_limit <= 0:
             raise ValueError("benchmark_limit must be positive or null (all examples)")
         if self.benchmark_num_fewshot < -1:

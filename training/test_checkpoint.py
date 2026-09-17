@@ -650,3 +650,10 @@ def test_sample_batch_size_allows_legacy_checkpoint_resume(backend: SingleDevice
     metadata = _metadata(backend, tiny_model)
     metadata.settings.pop("sample_batch_size", None)
     check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42, sample_batch_size=1), tiny_model.config.to_dict(), False)
+
+
+def test_sample_temperature_list_is_allowed_on_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    assert metadata.settings["sample_temperature"] == 0.0
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42, sample_temperature=[0.0, 0.7]),
+                             tiny_model.config.to_dict(), False)

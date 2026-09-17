@@ -676,3 +676,20 @@ def test_yaml_invalid_optimizer_fails_before_nonexistent_dataset_or_model(
 def test_sample_batch_size_defaults_and_changes() -> None:
     assert _settings().sample_batch_size == 8
     assert _settings(sample_batch_size=1).sample_batch_size == 1
+
+
+@pytest.mark.parametrize("value", [0.0, 0.7, [0.0, 0.7], [0.0]])
+def test_sample_temperature_scalar_and_list_round_trip(tmp_path: Path, value: Any) -> None:
+    path = tmp_path / "temperatures.yaml"
+    config = yaml.safe_load(TINY_YAML.read_text())
+    config["sample_temperature"] = value
+    path.write_text(yaml.safe_dump(config))
+    parsed = parse_settings(["--config", str(path)])
+    assert parsed.sample_temperature == value
+    assert asdict(parsed)["sample_temperature"] == value
+
+
+@pytest.mark.parametrize("value", [[], [-0.1], [0.0, -0.1], float("nan"), float("inf"), [float("inf")], True, [True], ["0.7"]])
+def test_sample_temperature_rejects_invalid_values(value: Any) -> None:
+    with pytest.raises(ValueError, match="sample_temperature"):
+        _settings(sample_temperature=value)
