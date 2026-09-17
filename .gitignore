@@ -31,4 +31,7 @@ tasks/
 .claude/
 reports/
 audits/
-tools/
+tools/*
+!tools/__init__.py
+!tools/data_preparation/
+tools/data_preparation/native/target/

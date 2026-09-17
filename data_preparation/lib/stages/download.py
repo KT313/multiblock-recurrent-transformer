@@ -133,7 +133,7 @@ class TokenCounter:
     def count_many(self, texts: list[str]) -> list[int]:
         if self._tokenizer is None:
             return [estimate_tokens(text) for text in texts]
-        return [len(encoding.ids) for encoding in self._tokenizer.encode_batch(texts)]  # `encode_batch([])` is `[]`
+        return self._tokenizer.count_batch(texts)  # no Python ID lists or unused character offsets
 
     def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
         """

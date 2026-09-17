@@ -95,6 +95,11 @@ class SavedTokenizer:
 
         return self._tokenizer.encode_batch(texts, add_special_tokens=False)
 
+    @measured("count_batch")
+    def count_batch(self, texts: list[str]) -> list[int]:
+        """Count without offset tracking when supported; older tokenizers retain the same count API."""
+        encode = getattr(self._tokenizer, "encode_batch_fast", self._tokenizer.encode_batch)
+        return [len(encoding) for encoding in encode(texts, add_special_tokens=False)]
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         return self._tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)

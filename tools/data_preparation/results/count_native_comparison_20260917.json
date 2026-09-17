@@ -1,0 +1,2169 @@
+{
+  "schema_version": 1,
+  "mode": "count",
+  "threads": 4,
+  "jobs": 1,
+  "fixture_sha256": "c9aa629996ced32c7097e6ddcca87001e48355d2695bbeb8efe427ec4c88ff8f",
+  "tokenizer_files": {
+    "MANIFEST.json": "b7b5d0154413d3fc835cf6262e61672eda7b5cbba8dd2003ee3a1009ac52170d",
+    "chat_template.jinja": "e8d5b5a546d3f19df16a5320c614fab05bdc4edd50e850f1afd947b503ea41cf",
+    "tokenizer.json": "49039c8e0777a18ff622e884351a9e5d8d5ae6c54d6e632c24ed81f8efb79ea6",
+    "tokenizer_config.json": "acca9e18889e93b50e297dbf7bddf420f538f1dc0ad588f9652cf3a3951f81e1"
+  },
+  "trials": [
+    {
+      "variant": "original",
+      "wall_seconds": 3.2050348659977317,
+      "cpu_seconds": 12.200380708999997,
+      "peak_rss_bytes": 1432436736,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2259291.490654606,
+      "rows_per_second": 59.905744563633675,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1122150976\nuser_usec 961806392\nsystem_usec 160344584\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62167156987\nuser_usec 52015150104\nsystem_usec 10152006883\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144066906294\nuser_usec 115670372869\nsystem_usec 28396533424\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149739758409\nuser_usec 118362269409\nsystem_usec 31377488999\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161407154931\nuser_usec 128244681185\nsystem_usec 33162473745\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161409643178\nuser_usec 128246479976\nsystem_usec 33163163201\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167052676000\nuser_usec 127573295000\nsystem_usec 39479381000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1153089598\nuser_usec 991831330\nsystem_usec 161258267\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62201075772\nuser_usec 52047869306\nsystem_usec 10153206465\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144104022661\nuser_usec 115705646882\nsystem_usec 28398375779\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149777050608\nuser_usec 118397663952\nsystem_usec 31379386656\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161445247688\nuser_usec 128280733902\nsystem_usec 33164513785\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161447734855\nuser_usec 128282531395\nsystem_usec 33165203459\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167091649000\nuser_usec 127609538000\nsystem_usec 39482111000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "candidate",
+      "wall_seconds": 3.1433950109931175,
+      "cpu_seconds": 12.109903640000002,
+      "peak_rss_bytes": 1416073216,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2303594.672217877,
+      "rows_per_second": 61.080455790168074,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1155849926\nuser_usec 992691829\nsystem_usec 163158097\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62203962493\nuser_usec 52048780637\nsystem_usec 10155181855\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144106935759\nuser_usec 115706553923\nsystem_usec 28400381836\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149779969112\nuser_usec 118398572068\nsystem_usec 31381397044\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161448187024\nuser_usec 128281663327\nsystem_usec 33166523696\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161450674191\nuser_usec 128283460821\nsystem_usec 33167213369\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167094621000\nuser_usec 127610580000\nsystem_usec 39484041000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1185764721\nuser_usec 1021788752\nsystem_usec 163975969\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62236575591\nuser_usec 52080366262\nsystem_usec 10156209328\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144140937065\nuser_usec 115739219556\nsystem_usec 28401717508\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149814138052\nuser_usec 118431360917\nsystem_usec 31382777134\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161482940069\nuser_usec 128314922648\nsystem_usec 33168017420\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161485427236\nuser_usec 128316720140\nsystem_usec 33168707095\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167130148000\nuser_usec 127643941000\nsystem_usec 39486207000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "builtin",
+      "wall_seconds": 2.6030331350048073,
+      "cpu_seconds": 10.272740159000001,
+      "peak_rss_bytes": 1436491776,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2781796.3216156396,
+      "rows_per_second": 73.7601060155715,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1188523664\nuser_usec 1022629907\nsystem_usec 165893757\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62239454260\nuser_usec 52081248604\nsystem_usec 10158205655\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144143849517\nuser_usec 115740105784\nsystem_usec 28403743732\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149817055430\nuser_usec 118432247377\nsystem_usec 31384808052\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161485879245\nuser_usec 128315833792\nsystem_usec 33170045452\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161488366412\nuser_usec 128317631286\nsystem_usec 33170735126\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167133124000\nuser_usec 127644970000\nsystem_usec 39488154000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1217441921\nuser_usec 1050345685\nsystem_usec 167096236\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62270804690\nuser_usec 52111199843\nsystem_usec 10159604846\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144177181255\nuser_usec 115771674316\nsystem_usec 28405506939\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149850543018\nuser_usec 118463920405\nsystem_usec 31386622612\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161519893397\nuser_usec 128347918305\nsystem_usec 33171975092\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161522380726\nuser_usec 128349715926\nsystem_usec 33172664799\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167167816000\nuser_usec 127677144000\nsystem_usec 39490672000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "rust",
+      "wall_seconds": 2.7327771380078048,
+      "cpu_seconds": 10.804987682999997,
+      "peak_rss_bytes": 1108688896,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2649725.035858127,
+      "rows_per_second": 70.25819900556108,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1220292992\nuser_usec 1051188338\nsystem_usec 169104653\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62273763831\nuser_usec 52112070344\nsystem_usec 10161693487\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144180171686\nuser_usec 115772551137\nsystem_usec 28407620549\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149853539141\nuser_usec 118464795545\nsystem_usec 31388743596\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161522905990\nuser_usec 128348812872\nsystem_usec 33174093117\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161525393157\nuser_usec 128350610366\nsystem_usec 33174782790\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167170829000\nuser_usec 127678131000\nsystem_usec 39492698000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1249647800\nuser_usec 1079770744\nsystem_usec 169877056\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62305919255\nuser_usec 52143220731\nsystem_usec 10162698524\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144215095283\nuser_usec 115806140688\nsystem_usec 28408954594\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149888626079\nuser_usec 118498496128\nsystem_usec 31390129950\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161559024401\nuser_usec 128383396193\nsystem_usec 33175628207\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161561511568\nuser_usec 128385193685\nsystem_usec 33176317882\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167207669000\nuser_usec 127712780000\nsystem_usec 39494889000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "rust",
+      "wall_seconds": 2.6032090059889015,
+      "cpu_seconds": 10.231930047000002,
+      "peak_rss_bytes": 1110327296,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2781608.3853971083,
+      "rows_per_second": 73.75512283427409,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1252479455\nuser_usec 1080621668\nsystem_usec 171857787\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62308808976\nuser_usec 52144050243\nsystem_usec 10164758733\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144218007006\nuser_usec 115806965644\nsystem_usec 28411041361\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149891542787\nuser_usec 118499322414\nsystem_usec 31392220372\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161561956872\nuser_usec 128384241068\nsystem_usec 33177715804\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161564444039\nuser_usec 128386038561\nsystem_usec 33178405478\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167210611000\nuser_usec 127713723000\nsystem_usec 39496888000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1280474785\nuser_usec 1107889150\nsystem_usec 172585635\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62339274068\nuser_usec 52173543219\nsystem_usec 10165730849\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144250138168\nuser_usec 115837849231\nsystem_usec 28412288936\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149923824007\nuser_usec 118530316962\nsystem_usec 31393507044\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161594845575\nuser_usec 128415730027\nsystem_usec 33179115548\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161597332742\nuser_usec 128417527519\nsystem_usec 33179805222\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167244216000\nuser_usec 127745304000\nsystem_usec 39498912000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "builtin",
+      "wall_seconds": 2.66479316301411,
+      "cpu_seconds": 10.496171139999998,
+      "peak_rss_bytes": 1429544960,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2717324.594082073,
+      "rows_per_second": 72.05062016251628,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1283292715\nuser_usec 1108745399\nsystem_usec 174547316\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62342193696\nuser_usec 52174418719\nsystem_usec 10167774977\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144253175033\nuser_usec 115838809553\nsystem_usec 28414365480\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149926867660\nuser_usec 118531276549\nsystem_usec 31395591110\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161597913602\nuser_usec 128416715304\nsystem_usec 33181198297\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161600400769\nuser_usec 128418512798\nsystem_usec 33181887970\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167247326000\nuser_usec 127746408000\nsystem_usec 39500918000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1312428095\nuser_usec 1136756657\nsystem_usec 175671437\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62373931056\nuser_usec 52204793182\nsystem_usec 10169137873\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144286435180\nuser_usec 115870336050\nsystem_usec 28416099130\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149960293509\nuser_usec 118562921546\nsystem_usec 31397371962\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161631880601\nuser_usec 128448782959\nsystem_usec 33183097641\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161634367768\nuser_usec 128450580451\nsystem_usec 33183787316\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167282057000\nuser_usec 127778570000\nsystem_usec 39503487000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "candidate",
+      "wall_seconds": 3.1578866130148526,
+      "cpu_seconds": 12.113108710999995,
+      "peak_rss_bytes": 1415761920,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2293023.432239979,
+      "rows_per_second": 60.800156411156415,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1315205179\nuser_usec 1137575860\nsystem_usec 177629318\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62376800145\nuser_usec 52205626866\nsystem_usec 10171173278\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144289328050\nuser_usec 115871171670\nsystem_usec 28418156380\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149963191050\nuser_usec 118563756186\nsystem_usec 31399434863\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161634796196\nuser_usec 128449640150\nsystem_usec 33185156046\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161637283363\nuser_usec 128451437644\nsystem_usec 33185845719\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167284984000\nuser_usec 127779518000\nsystem_usec 39505466000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1345085700\nuser_usec 1166602425\nsystem_usec 178483275\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62409197174\nuser_usec 52236944845\nsystem_usec 10172252328\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144323472017\nuser_usec 115903891130\nsystem_usec 28419580886\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 149997499647\nuser_usec 118596599564\nsystem_usec 31400900082\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161669772728\nuser_usec 128483037319\nsystem_usec 33186735408\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161672259895\nuser_usec 128484834812\nsystem_usec 33187425083\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167320692000\nuser_usec 127812960000\nsystem_usec 39507732000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "original",
+      "wall_seconds": 3.2654739809804596,
+      "cpu_seconds": 12.358391744000002,
+      "peak_rss_bytes": 1427296256,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2217475.3319657,
+      "rows_per_second": 58.79697744287399,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1347744265\nuser_usec 1167380832\nsystem_usec 180363433\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62411989989\nuser_usec 52237763436\nsystem_usec 10174226553\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144326297946\nuser_usec 115904713633\nsystem_usec 28421584312\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150000331200\nuser_usec 118597421537\nsystem_usec 31402909663\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161672631428\nuser_usec 128483891305\nsystem_usec 33188740122\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161675118595\nuser_usec 128485688799\nsystem_usec 33189429796\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167323577000\nuser_usec 127813922000\nsystem_usec 39509655000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1378778856\nuser_usec 1197560316\nsystem_usec 181218540\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62445834608\nuser_usec 52270513979\nsystem_usec 10175320628\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144363735350\nuser_usec 115940698890\nsystem_usec 28423036459\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150037949466\nuser_usec 118633535950\nsystem_usec 31404413516\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161710908523\nuser_usec 128520536513\nsystem_usec 33190372010\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161713395690\nuser_usec 128522334005\nsystem_usec 33191061685\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167362655000\nuser_usec 127850641000\nsystem_usec 39512014000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "original",
+      "wall_seconds": 3.1347477679955773,
+      "cpu_seconds": 11.961749036,
+      "peak_rss_bytes": 1426812928,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2309949.1684557814,
+      "rows_per_second": 61.24894703179541,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1381405045\nuser_usec 1198389333\nsystem_usec 183015711\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62448542485\nuser_usec 52271349248\nsystem_usec 10177193237\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144366657068\nuser_usec 115941708737\nsystem_usec 28424948330\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150040876367\nuser_usec 118634542101\nsystem_usec 31406334266\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161713859591\nuser_usec 128521569019\nsystem_usec 33192290572\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161716346807\nuser_usec 128523366551\nsystem_usec 33192980256\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167365627000\nuser_usec 127851769000\nsystem_usec 39513858000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1411658191\nuser_usec 1227708388\nsystem_usec 183949803\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62481409896\nuser_usec 52303008254\nsystem_usec 10178401642\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144401621034\nuser_usec 115974854676\nsystem_usec 28426766358\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150076012303\nuser_usec 118667795980\nsystem_usec 31408216322\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161749554249\nuser_usec 128555243659\nsystem_usec 33194310590\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161752041416\nuser_usec 128557041150\nsystem_usec 33195000265\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167401936000\nuser_usec 127885401000\nsystem_usec 39516535000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "candidate",
+      "wall_seconds": 3.207556975976331,
+      "cpu_seconds": 12.307456952999999,
+      "peak_rss_bytes": 1423278080,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2257515.0041710227,
+      "rows_per_second": 59.85864052860921,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1414411081\nuser_usec 1228572536\nsystem_usec 185838544\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62484257422\nuser_usec 52303886848\nsystem_usec 10180370574\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144404503977\nuser_usec 115975733686\nsystem_usec 28428770291\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150078900747\nuser_usec 118668672650\nsystem_usec 31410228097\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161752462413\nuser_usec 128556138612\nsystem_usec 33196323800\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161754949580\nuser_usec 128557936105\nsystem_usec 33197013474\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167404861000\nuser_usec 127886396000\nsystem_usec 39518465000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1445057665\nuser_usec 1258325439\nsystem_usec 186732225\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62517600138\nuser_usec 52336080066\nsystem_usec 10181520071\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144439731685\nuser_usec 116009467002\nsystem_usec 28430264682\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150114293106\nuser_usec 118702526254\nsystem_usec 31411766852\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161788472239\nuser_usec 128590489665\nsystem_usec 33197982574\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161790959406\nuser_usec 128592287156\nsystem_usec 33198672249\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167441773000\nuser_usec 127920862000\nsystem_usec 39520911000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "builtin",
+      "wall_seconds": 2.6187614369846415,
+      "cpu_seconds": 10.284913738,
+      "peak_rss_bytes": 1434066944,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2765088.8308244427,
+      "rows_per_second": 73.31710223328986,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1447835111\nuser_usec 1259176396\nsystem_usec 188658714\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62520482478\nuser_usec 52336947712\nsystem_usec 10183534765\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144442686884\nuser_usec 116010353589\nsystem_usec 28432333294\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150117254190\nuser_usec 118703412979\nsystem_usec 31413841210\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161791458049\nuser_usec 128591402732\nsystem_usec 33200055316\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161793945372\nuser_usec 128593200349\nsystem_usec 33200745023\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167444785000\nuser_usec 127921882000\nsystem_usec 39522903000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1476977614\nuser_usec 1287200678\nsystem_usec 189776935\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62552177278\nuser_usec 52367315816\nsystem_usec 10184861461\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144476868256\nuser_usec 116042833255\nsystem_usec 28434035000\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150151595140\nuser_usec 118736010253\nsystem_usec 31415584886\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161826346356\nuser_usec 128624431466\nsystem_usec 33201914889\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161828833523\nuser_usec 128626228958\nsystem_usec 33202604565\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167480352000\nuser_usec 127954960000\nsystem_usec 39525392000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    },
+    {
+      "variant": "rust",
+      "wall_seconds": 2.6584375649981666,
+      "cpu_seconds": 10.463611165,
+      "peak_rss_bytes": 1101512704,
+      "input_rows": 192,
+      "input_characters": 35330579,
+      "tokens": 7241108,
+      "tokens_per_second": 2723820.974898462,
+      "rows_per_second": 72.22287351334971,
+      "compressed_bytes": 0,
+      "semantic": {
+        "digest": "dfc0d5d5c472ea86865f411ac889d03129eca469f5aadec48e5c81f81efc6bb6",
+        "rows": 192,
+        "tokens": 7241108
+      },
+      "environment_before": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1479815892\nuser_usec 1288094632\nsystem_usec 191721259\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62555126980\nuser_usec 52368239257\nsystem_usec 10186887722\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144479847995\nuser_usec 116043758077\nsystem_usec 28436089918\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150154580903\nuser_usec 118736933747\nsystem_usec 31417647155\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161829352695\nuser_usec 128625378705\nsystem_usec 33203973990\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161831840069\nuser_usec 128627176362\nsystem_usec 33204663707\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167483393000\nuser_usec 127956018000\nsystem_usec 39527375000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      },
+      "environment_after": {
+        "python": "3.11.14",
+        "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+        "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+        "versions": {
+          "tokenizers": "0.23.1",
+          "pyarrow": "25.0.1",
+          "fsspec": "2026.6.0",
+          "huggingface_hub": "1.29.0"
+        },
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "environment": {
+          "TOKENIZERS_PARALLELISM": "true",
+          "RAYON_NUM_THREADS": "4",
+          "OMP_NUM_THREADS": null,
+          "MKL_NUM_THREADS": null,
+          "SLURM_CPUS_PER_TASK": null
+        },
+        "arrow_cpu_threads": 24,
+        "arrow_io_threads": 8,
+        "cgroups": {
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+            "cpu.stat": "usage_usec 1508148283\nuser_usec 1315654446\nsystem_usec 192493836\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+            "cpu.stat": "usage_usec 62586275177\nuser_usec 52398386233\nsystem_usec 10187888944\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 144512571750\nuser_usec 116075210837\nsystem_usec 28437360913\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 150187455775\nuser_usec 118768513259\nsystem_usec 31418942516\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice/user-1000.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161862894921\nuser_usec 128657503935\nsystem_usec 33205390986\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup/user.slice": {
+            "cpu.max": "max 100000\n",
+            "cpu.stat": "usage_usec 161865383088\nuser_usec 128659302440\nsystem_usec 33206080647\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+          },
+          "/sys/fs/cgroup": {
+            "cpu.stat": "usage_usec 167517791000\nuser_usec 127988321000\nsystem_usec 39529470000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+            "cpuset.cpus.effective": "0-23\n"
+          }
+        }
+      }
+    }
+  ],
+  "experiment_files": {
+    "__init__.py": "fa962b90fae13684c7a7e730fbb4989940361346ce47debb512f21093535f24e",
+    "benchmark_download.py": "8adb82236919a15e7561fa69123da86b05605831e5861f9873bd725449192f0f",
+    "native/Cargo.lock": "94b3d6f651370e33facf25df0ae0517e71218eb9aa236685c43c3130fc424fe2",
+    "native/Cargo.toml": "3879685292d686a4b5e25c1007582d4fdf465a2d3905df7d2e17fbf006103c49",
+    "native/src/lib.rs": "988a191eb515af92c0ee705d9d49beecd9a8052d47db2a831c165813c2d424ec",
+    "native_backends.py": "9c9adaaecea6f58c518e092bfb834bfb9e6e6410744e669add272244c66e2919",
+    "reference.py": "aec875af9c325bfa7bf6656b37be758ac11631fed33c4b2d7aa8a596e0144958",
+    "replay.py": "a56c51d67640730d9ab411568766b9dbc5ea395838ec55bfe427a9cfa124b366",
+    "test_native_backends.py": "9200c3928533c720aa0dd9bb132bdba8b17671eaa52ff61a9dbbc1cb3a0630af",
+    "test_replay.py": "4d7a74fe0bae0f441f7628dbd17105f8ce699b9fdbc3db226dbd9518c323356b"
+  },
+  "native_library_sha256": "af109147c4182e5c28b1fd1b4a11f3714cb56f8410521fe33ba65c9170117b00",
+  "environment_before": {
+    "python": "3.11.14",
+    "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+    "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+    "versions": {
+      "tokenizers": "0.23.1",
+      "pyarrow": "25.0.1",
+      "fsspec": "2026.6.0",
+      "huggingface_hub": "1.29.0"
+    },
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "environment": {
+      "TOKENIZERS_PARALLELISM": null,
+      "RAYON_NUM_THREADS": null,
+      "OMP_NUM_THREADS": null,
+      "MKL_NUM_THREADS": null,
+      "SLURM_CPUS_PER_TASK": null
+    },
+    "arrow_cpu_threads": 24,
+    "arrow_io_threads": 8,
+    "cgroups": {
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+        "cpu.stat": "usage_usec 1119440859\nuser_usec 960975385\nsystem_usec 158465474\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+        "cpu.stat": "usage_usec 62164353517\nuser_usec 52014302020\nsystem_usec 10150051497\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 144064088515\nuser_usec 115669534390\nsystem_usec 28394554125\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 149736937298\nuser_usec 118361434079\nsystem_usec 31375503219\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 161404321437\nuser_usec 128243829633\nsystem_usec 33160491803\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 161406808613\nuser_usec 128245627133\nsystem_usec 33161181479\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup": {
+        "cpu.stat": "usage_usec 167049821000\nuser_usec 127572336000\nsystem_usec 39477485000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+        "cpuset.cpus.effective": "0-23\n"
+      }
+    }
+  },
+  "environment_after": {
+    "python": "3.11.14",
+    "git_revision": "b52b935a97cc2ec57f43cd3208148ece33f3449f",
+    "tracked_diff_sha256": "da983d64cb581207943a8e90723f342b5c920828c6b56dcecefb57b864feb7b1",
+    "versions": {
+      "tokenizers": "0.23.1",
+      "pyarrow": "25.0.1",
+      "fsspec": "2026.6.0",
+      "huggingface_hub": "1.29.0"
+    },
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "environment": {
+      "TOKENIZERS_PARALLELISM": null,
+      "RAYON_NUM_THREADS": null,
+      "OMP_NUM_THREADS": null,
+      "MKL_NUM_THREADS": null,
+      "SLURM_CPUS_PER_TASK": null
+    },
+    "arrow_cpu_threads": 24,
+    "arrow_io_threads": 8,
+    "cgroups": {
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-e7010c8f-a19d-401b-bc13-645c1640199c.scope": {
+        "cpu.stat": "usage_usec 1508235673\nuser_usec 1315693172\nsystem_usec 192542501\nnice_usec 0\ncore_sched.force_idle_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice": {
+        "cpu.stat": "usage_usec 62586386224\nuser_usec 52398439639\nsystem_usec 10187946585\nnice_usec 9071000\ncore_sched.force_idle_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 144512713285\nuser_usec 116075289432\nsystem_usec 28437423852\nnice_usec 9103000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 150187598897\nuser_usec 118768591527\nsystem_usec 31419007370\nnice_usec 9104000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice/user-1000.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 161863043073\nuser_usec 128657586353\nsystem_usec 33205456720\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup/user.slice": {
+        "cpu.max": "max 100000\n",
+        "cpu.stat": "usage_usec 161865530302\nuser_usec 128659383893\nsystem_usec 33206146408\nnice_usec 436849000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+      },
+      "/sys/fs/cgroup": {
+        "cpu.stat": "usage_usec 167517937000\nuser_usec 127988403000\nsystem_usec 39529534000\nnice_usec 447865000\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+        "cpuset.cpus.effective": "0-23\n"
+      }
+    }
+  },
+  "median_seconds": {
+    "original": 3.2050348659977317,
+    "candidate": 3.1578866130148526,
+    "builtin": 2.6187614369846415,
+    "rust": 2.6584375649981666
+  },
+  "speedup_vs_first": {
+    "original": 1.0,
+    "candidate": 1.0149303185201657,
+    "builtin": 1.223874317352157,
+    "rust": 1.205608477775156
+  },
+  "source_report": "/tmp/preparer-benchmarks/download-benchmark-pgj89lla/report.json"
+}

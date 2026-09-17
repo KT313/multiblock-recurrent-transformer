@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import dataclass
 from typing import Any, cast
 
 import pytest
@@ -26,6 +26,7 @@ from data_preparation.lib.stages.truncation import (
     estimate_tokens,
     truncate_many,
 )
+from tools.data_preparation.reference import truncate_original
 
 
 def truncate_to_token_cap(text: str, max_tokens: int, tokenizer: SavedTokenizer | None) -> tuple[str, int]:
@@ -172,6 +173,19 @@ def test_random_texts_satisfy_the_invariants(tokenizer: SavedTokenizer) -> None:
 # --- boundary merge: re-tokenizing the cut text can exceed the cap, the loop cuts again ---------------------------------
 
 
+@dataclass
+class _TestEncoding:
+    ids: list[int]
+    offsets: list[tuple[int, int]]
+    missing_direct_offset: bool = False
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def token_to_chars(self, index: int) -> tuple[int, int] | None:
+        return None if self.missing_direct_offset else self.offsets[index]
+
+
 class _ViterbiLikeStub:
     """
     One token per character, except that "xy" is one token when something follows it (an end-of-word dependent
@@ -204,7 +218,7 @@ class _ViterbiLikeStub:
 
     def encode_batch(self, texts: list[str]) -> list[Any]:
         self.calls.append(list(texts))
-        return [SimpleNamespace(ids=ids, offsets=offsets) for ids, offsets in (self._one(t) for t in texts)]
+        return [_TestEncoding(ids, offsets) for ids, offsets in (self._one(t) for t in texts)]
 
 
 def test_recount_above_the_cap_cuts_again_until_it_fits() -> None:
@@ -290,3 +304,23 @@ def test_unicode_text_with_bpe(metaspace_bpe: SavedTokenizer) -> None:
     for max_tokens in (1, 2, 5, 33):
         cut, _ = _check_invariants(metaspace_bpe, text, max_tokens)
         assert cut.encode("utf-8").decode("utf-8") == cut  # cut between code points, never inside one
+
+
+@pytest.mark.parametrize("cap", [0, 1, 2, 7, 64, 2048])
+def test_complete_results_match_original_algorithm(tokenizer: SavedTokenizer, cap: int) -> None:
+    rng = random.Random(723)
+    pieces = [PROSE, UNICODE, "e\u0301", "\r\n", "  ", "<user>", "<assistant>", "</s>", "a" * 101]
+    texts = ["", " ", "a" * 10000, "  " + UNICODE * 50, PROSE * 100]
+    texts += ["".join(rng.choices(pieces, k=rng.randrange(1, 25))) for _ in range(30)]
+    assert truncate_many(texts, cap, tokenizer) == truncate_original(texts, cap, tokenizer)
+    assert truncate_many([], cap, tokenizer) == truncate_original([], cap, tokenizer)
+    assert tokenizer.count_batch(texts) == [len(encoding.ids) for encoding in tokenizer.encode_batch(texts)]
+
+
+def test_missing_direct_offset_preserves_original_boundary() -> None:
+    class MissingOffset(_ViterbiLikeStub):
+        def encode_batch(self, texts: list[str]) -> list[Any]:
+            return [_TestEncoding(ids, offsets, True) for ids, offsets in (self._one(t) for t in texts)]
+
+    tokenizer = cast(SavedTokenizer, MissingOffset())
+    assert truncate_many(["xyz", "xyzw", "ab"], 1, tokenizer) == truncate_original(["xyz", "xyzw", "ab"], 1, tokenizer)

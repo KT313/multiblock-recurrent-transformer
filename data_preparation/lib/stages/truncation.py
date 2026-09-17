@@ -29,9 +29,6 @@ TOKEN_RULE = "with_specials"  # names the counting rule in DatasetConfig.raw_has
 # runs of one character) is cut earlier than its tokens require; the invariants still hold, the lost tail is accepted.
 PRE_CUT_CHARS_PER_TOKEN = 32
 
-Offsets = list[tuple[int, int]]
-
-
 def estimate_tokens(text: str) -> int:
     """
     The token_count: estimate count: characters / :data:`CHARS_PER_TOKEN_ESTIMATE`.
@@ -75,19 +72,22 @@ def truncate_many(texts: list[str], max_tokens: int, tokenizer: SavedTokenizer |
         encoded = tokenizer.encode_batch(batch)  # an empty batch encodes to an empty list
         still_pending: list[int] = []
         for index, encoding in zip(pending, encoded, strict=True):
-            if len(encoding.ids) <= max_tokens:
-                result[index] = (current[index], len(encoding.ids))
+            count = len(encoding)  # .ids materializes the entire Rust vector as Python integers
+            if count <= max_tokens:
+                result[index] = (current[index], count)
             else:
-                current[index] = _cut_before_token(current[index], encoding.offsets, max_tokens)
+                offset = encoding.token_to_chars(max_tokens)
+                if offset is None:
+                    offset = encoding.offsets[max_tokens]  # preserve the original boundary for unmapped tokens
+                current[index] = _cut_before_token(current[index], offset[0])
                 still_pending.append(index)
         pending = still_pending
     return [entry for entry in result if entry is not None]
 
 
-def _cut_before_token(text: str, offsets: Offsets, index: int) -> str:
+def _cut_before_token(text: str, start: int) -> str:
     """
-    text cut where token index starts; always strictly shorter than text so the recount loop ends.
+    Cut at a token's start; always strictly shorter than text so the recount loop ends.
     """
 
-    start, _ = offsets[index]
     return text[: min(start, len(text) - 1)]
