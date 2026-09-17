@@ -103,9 +103,11 @@ def generate_samples(
                 logits_to_keep=1 if use_cache else 0, **sampling,
             )
 
-            # decode only the generated suffix of each row
-            for row, (prompt, _) in enumerate(batch):
-                samples.append(decode_generated_sample(prompt, output[row, width:].tolist(), tokenizer, recurrence))
+            # Return only the generated suffix, retaining unpadded prompt context for chat decoding.
+            for row, (prompt, prompt_ids) in enumerate(batch):
+                samples.append(decode_generated_sample(
+                    prompt, output[row, width:].tolist(), tokenizer, recurrence, prompt_ids=prompt_ids
+                ))
     return samples
 
 

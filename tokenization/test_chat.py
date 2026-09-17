@@ -410,3 +410,90 @@ def test_chat_body_encoding_does_not_invent_whitespace(profile_path: Path) -> No
         ids = processor.apply_chat_template(messages)
         assert processor.decode(ids, skip_special_tokens=False) == processor.apply_chat_template(messages, tokenize=False)
         assert tokenizer.decode(ids) == f"<s><user>{body}</s><assistant>{body}</s>"
+
+
+@pytest.mark.parametrize("kind", ["instruction", "chat"])
+def test_completion_decoding_preserves_chat_whitespace_and_eos_metadata(profile_path: Path, kind: str) -> None:
+    from evaluation.prompts import Prompt
+    from evaluation.sample_helpers import decode_generated_sample, select_fitting_prompts
+    from training.data.tokenizer import Tokenizer
+
+    tokenizer = Tokenizer(profile_path)
+    messages = [{"role": "user", "content": "First?"}, {"role": "assistant", "content": "Before."},
+                {"role": "user", "content": "é🙂 literal <assistant>"}]
+    prompt = Prompt("display text differs from the actual chat prefix", kind, messages)
+    _, prompt_ids = select_fitting_prompts([prompt], tokenizer, 1, 1024)[0]
+    original_prompt = prompt_ids.copy()
+    for body in ("", "Hello", " leading", "  code\n", "    return x\n", "\tcode", "\n    code",
+                 " ", "   ", "é🙂", " é🙂", "literal </s><user><assistant>", "<s><unk> text"):
+        ids = tokenizer.encode_literal(body)
+        for stopped in (False, True):
+            generated = ids + ([EOS, USER, 42] if stopped else [])
+            original_generated = generated.copy()
+            sample = decode_generated_sample(prompt, generated, tokenizer, [2, 4], prompt_ids=prompt_ids)
+            assert sample.completion == body
+            assert sample.new_tokens == len(ids) and sample.stopped_at_eos is stopped
+            assert sample.recurrence == [2, 4] and sample.prompt == prompt.text and sample.kind == kind
+            assert generated == original_generated and prompt_ids == original_prompt
+    # Keep the existing filtering policy for actual generated control IDs.
+    generated = [BOS, USER, ASSISTANT, 0, *tokenizer.encode_literal("  code")]
+    assert decode_generated_sample(prompt, generated, tokenizer, prompt_ids=prompt_ids).completion == "  code"
+    continuation = Prompt("A document")
+    ids = tokenizer.encode_literal(" leading")
+    assert decode_generated_sample(continuation, ids, tokenizer).completion == tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def test_chat_completion_requires_context_and_rejects_unstable_prefix(profile_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from evaluation.prompts import instruction_prompt
+    from evaluation.sample_helpers import decode_generated_sample, select_fitting_prompts
+    from training.data.tokenizer import Tokenizer
+
+    tokenizer = Tokenizer(profile_path)
+    prompt = instruction_prompt("Question?")
+    _, prompt_ids = select_fitting_prompts([prompt], tokenizer, 1, 1024)[0]
+    generated = tokenizer.encode_literal(" answer")
+    with pytest.raises(ValueError, match="original prompt token IDs"):
+        decode_generated_sample(prompt, generated, tokenizer)
+    monkeypatch.setattr(tokenizer, "decode", lambda ids, **kwargs: "prefix" if ids == prompt_ids else "changed")
+    with pytest.raises(RuntimeError, match="Decoded prompt changed"):
+        decode_generated_sample(prompt, generated, tokenizer, prompt_ids=prompt_ids)
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_generation_passes_original_unpadded_prompts_to_completion_decoder(
+    profile_path: Path, tiny_model: Any, monkeypatch: pytest.MonkeyPatch, use_cache: bool,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from evaluation import samples as samples_module
+    from evaluation.prompts import instruction_prompt
+    from evaluation.sample_helpers import decode_generated_sample, select_fitting_prompts
+    from training.data.tokenizer import Tokenizer
+
+    tokenizer = Tokenizer(profile_path)
+    prompts = [instruction_prompt("Q?"), instruction_prompt("A longer question with extra context?")]
+    expected = [ids for _, ids in select_fitting_prompts(prompts, tokenizer, 8, 256)]
+    assert len(expected[0]) < len(expected[1])
+    body = "    return x\n"
+    suffix = tokenizer.encode_literal(body) + [EOS]
+
+    def generate(ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        assert kwargs["use_cache"] is use_cache
+        assert kwargs["attention_mask"][0, 0] == 0  # first prompt is genuinely left-padded
+        return torch.cat([ids, torch.tensor([suffix, suffix])], dim=1)
+
+    @contextmanager
+    def session(*args: Any, **kwargs: Any) -> Any:
+        yield SimpleNamespace(device=torch.device("cpu"), hf_wrapper=lambda _: SimpleNamespace(generate=generate))
+
+    observed = []
+    original = decode_generated_sample
+    def decode(*args: Any, **kwargs: Any) -> Any:
+        observed.append(kwargs["prompt_ids"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(samples_module, "inference_session", session)
+    monkeypatch.setattr(samples_module, "decode_generated_sample", decode)
+    samples = samples_module.generate_samples(tiny_model, tokenizer, prompts, max_new_tokens=8, batch_size=2, use_cache=use_cache)
+    assert observed == expected
+    assert [sample.completion for sample in samples] == [body, body]

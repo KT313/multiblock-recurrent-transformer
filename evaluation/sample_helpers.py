@@ -63,14 +63,24 @@ def build_prompt_batch(batch: list[tuple[Prompt, list[int]]], pad_id: int) -> tu
 
 
 def decode_generated_sample(
-    prompt: Prompt, generated_ids: list[int], tokenizer: Tokenizer, recurrence: Recurrence = None
+    prompt: Prompt, generated_ids: list[int], tokenizer: Tokenizer, recurrence: Recurrence = None,
+    *, prompt_ids: list[int] | None = None,
 ) -> GeneratedSample:
-    """Cut at the first EOS to drop trailing filler; without EOS, even pad IDs are generated output."""
+    """Cut at EOS; decode chat-profile bodies with their original prompt to preserve leading whitespace."""
     eos_id = tokenizer.eos_id
     stopped_at_eos = eos_id in generated_ids
     if stopped_at_eos:
         generated_ids = generated_ids[: generated_ids.index(eos_id)]
-    completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    if tokenizer.profile and prompt.kind in ("instruction", "chat"):
+        if not prompt_ids:
+            raise ValueError("chat completion decoding requires the original prompt token IDs")
+        prefix = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+        full = tokenizer.decode(prompt_ids + generated_ids, skip_special_tokens=True)
+        if not full.startswith(prefix):
+            raise RuntimeError("Decoded prompt changed at the completion boundary")
+        completion = full[len(prefix):]
+    else:
+        completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
     steps = None if recurrence is None else [int(value) for value in recurrence]
     return GeneratedSample(prompt.text, prompt.kind, completion, len(generated_ids), stopped_at_eos, steps)
 
