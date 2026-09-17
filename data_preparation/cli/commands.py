@@ -17,10 +17,11 @@ from data_preparation.lib.build.planner import DatasetReport
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.log import ROOT_LOGGER_NAME
 from data_preparation.lib.sources.hf_cache import configure_hf_cache
+from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS
 from data_preparation.lib.ui.dashboard import BUILD_LOG_NAME, DataDashboard
 
 DOWNLOAD_STEPS = ("tokenizer", "download")  # what the download command runs: STEPS without the build
-TOKENIZER_POOL_THREADS = 8  # threads of the tokenizer's Rust pool (one per process, shared by every download job)
+TOKENIZER_POOL_THREADS = THREADS_PER_PROCESS  # threads of this process's Rust tokenizer pool (shared by every download job)
 
 
 def check_dataset_complete(args: argparse.Namespace, report: DatasetReport, layout: DatasetLayout, *, log: logging.Logger) -> None:
@@ -45,12 +46,13 @@ def configure_preparation_environment(args: argparse.Namespace) -> None:
 
     # The tokenizer's Rust thread pool: on here, off by library default (`_auto_tokenizer` in lib/stages/download.py).
     # The guard exists for a training run that prepares data in-process and then forks DataLoader workers; this
-    # process never forks after the tokenizer is loaded (the cleaning passes use spawn pools), and a download
-    # batch tokenizes several times faster on several cores. The pool is one per process, shared by every download
-    # job, and sized TOKENIZER_POOL_THREADS (Rayon's default is every core: measured, past 8 threads a 256-row
-    # batch barely gets faster while the CPU time keeps growing). Explicit values in the environment win.
+    # process never forks after the tokenizer is loaded (the cleaning passes and the tokenizer pool use spawn),
+    # and a download batch tokenizes several times faster on several cores. The pool is one per process, shared
+    # by every download job, and sized at most TOKENIZER_POOL_THREADS (one encode call stops scaling past that:
+    # lib/stages/tokenizer_pool.py, which is where --tokenizer_threads above it go). Explicit values in the
+    # environment win.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
-    os.environ.setdefault("RAYON_NUM_THREADS", str(TOKENIZER_POOL_THREADS))
+    os.environ.setdefault("RAYON_NUM_THREADS", str(min(args.tokenizer_threads, TOKENIZER_POOL_THREADS)))
     configure_hf_cache(args.cache_dir, create=not args.dry_run)
 
 
@@ -77,6 +79,7 @@ def prepare_requested_steps(
         args.dataset_dir,
         num_workers=args.num_workers,
         pass_workers=args.pass_workers,
+        tokenizer_threads=args.tokenizer_threads,
         max_parallel_downloads=args.max_parallel_downloads,
         download_prefetch_mb=args.download_prefetch_mb,
         assume_yes=args.yes,

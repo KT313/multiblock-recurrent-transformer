@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from collections import Counter, deque
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -28,7 +29,7 @@ log = get_logger("data_preparation.lib.stages.download")
 
 UNBOUNDED_COUNT = 2**62  # instruct downloads stop after their kept-row target
 StoredRow = tuple[Row, RowProgress]  # stored row and the fetch progress immediately after it
-TOKEN_BATCH = 256  # rows per tokenizer call
+TOKEN_BATCH = 2048  # rows per tokenizer call (measured 2026-09-17: 256 rows leave most of a big Rust pool idle, see tokenizer_pool.py)
 MAX_CONSECUTIVE_MALFORMED = 10  # consecutive schema errors that fail the download
 MALFORMED_WARNINGS_PER_INCREMENT = 100  # subsequent malformed warnings use DEBUG
 
@@ -55,8 +56,10 @@ class _TokenStep:
     """
     The token step of a download, in two halves used from two threads. The fetch thread feeds it row by row:
     add(row, progress) returns a full batch of :data:`TOKEN_BATCH` rows (else []), take() whatever is
-    buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls
-    tokenize(batch) on those batches, in order, and gets the rows ready to store.
+    buffered; every row comes with the :class:`RowProgress` right after it. The token worker calls start(batch)
+    on those batches (the tokenizer's part: a future, computed in a tokenizer process when the counter has a
+    pool, tokenizer_pool.py, else right there) and finish(batch, result) in submission order, which gives the
+    rows ready to store and advances the drop counters; tokenize(batch) is both in one call.
 
     Every stored tokens counts the text plus :data:`NUMBER_OF_SPECIAL_TOKENS` (the BOS and EOS the trainer adds), the one
     place the specials enter a count. Pretrain rows: text_field is truncated (truncation.py) so that this sum is at
@@ -104,16 +107,52 @@ class _TokenStep:
         batch, self._batch = self._batch, []
         return batch
 
-    def tokenize(self, batch: list[StoredRow]) -> list[StoredRow]:
+    @property
+    def parallel_batches(self) -> int:
         """
-        The rows of batch ready to store: pretrain rows truncated and counted, instruct rows counted or dropped.
+        Batches the token worker keeps in flight: one per tokenizer process plus one queued, or one in-process.
+        """
+
+        pool = self._counter.pool
+        return 1 if pool is None else pool.processes + 1
+
+    def start(self, batch: list[StoredRow]) -> Future[Any] | None:
+        """
+        The tokenizer's part of batch: a future of the texts' (prefix, count) pairs (pretrain) or counts
+        (instruct), computed in a tokenizer process when the counter has a pool, else right here before this
+        returns. None for an empty batch and for message conversations, which finish fits per row.
+        """
+
+        if not batch or self._messages:
+            return None
+        pool = self._counter.pool
+        if self._is_instruct:
+            texts = [instruct_text(row) for row, _ in batch]
+            return _completed(self._counter.count_many(texts)) if pool is None else pool.count(self._counter.tokenizer_dir, texts)
+        texts = [row[self._text_field] for row, _ in batch]
+        max_tokens = self._max_tokens - NUMBER_OF_SPECIAL_TOKENS
+        return _completed(self._counter.truncate_many(texts, max_tokens)) if pool is None else pool.truncate(self._counter.tokenizer_dir, texts, max_tokens)
+
+    def finish(self, batch: list[StoredRow], result: Any) -> list[StoredRow]:
+        """
+        The rows of batch ready to store, given the result of start's future (None where start gave none):
+        pretrain rows truncated and counted, instruct rows counted or dropped. Batches finish in submission order:
+        the drop counter every stored row's progress carries advances here.
         """
 
         if not batch:
             return []
         if self._messages:
             return self._fit_message_rows(batch)
-        return self._drop_long_instruct_rows(batch) if self._is_instruct else self._truncate_pretrain_rows(batch)
+        return self._drop_long_instruct_rows(batch, result) if self._is_instruct else self._truncate_pretrain_rows(batch, result)
+
+    def tokenize(self, batch: list[StoredRow]) -> list[StoredRow]:
+        """
+        start and finish in one call: the rows of batch ready to store.
+        """
+
+        future = self.start(batch)
+        return self.finish(batch, None if future is None else future.result())
 
     def _fit_message_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
         stored: list[StoredRow] = []
@@ -129,16 +168,15 @@ class _TokenStep:
             stored.append((row, RowProgress(before.consumed, before.skipped_malformed, self._counters.dropped_too_long)))
         return stored
 
-    def _truncate_pretrain_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
-        texts = [row[self._text_field] for row, _ in batch]
-        for (row, _), (cut, tokens) in zip(batch, self._counter.truncate_many(texts, self._max_tokens - NUMBER_OF_SPECIAL_TOKENS), strict=True):
+    def _truncate_pretrain_rows(self, batch: list[StoredRow], truncated: list[tuple[str, int]]) -> list[StoredRow]:
+        for (row, _), (cut, tokens) in zip(batch, truncated, strict=True):
             row[self._text_field] = cut
             row["tokens"] = tokens + NUMBER_OF_SPECIAL_TOKENS
         return batch
 
-    def _drop_long_instruct_rows(self, batch: list[StoredRow]) -> list[StoredRow]:
+    def _drop_long_instruct_rows(self, batch: list[StoredRow], counts: list[int]) -> list[StoredRow]:
         stored: list[StoredRow] = []
-        for (row, before), count in zip(batch, self._counter.count_many([instruct_text(row) for row, _ in batch]), strict=True):
+        for (row, before), count in zip(batch, counts, strict=True):
             tokens = count + NUMBER_OF_SPECIAL_TOKENS
             if tokens > self._max_tokens:
                 self._counters.dropped_too_long += 1
@@ -146,6 +184,16 @@ class _TokenStep:
             row["tokens"] = tokens
             stored.append((row, RowProgress(before.consumed, before.skipped_malformed, self._counters.dropped_too_long)))
         return stored
+
+
+def _completed(value: Any) -> Future[Any]:
+    """
+    A future that already holds value (the in-process token step, computed before start returns).
+    """
+
+    future: Future[Any] = Future()
+    future.set_result(value)
+    return future
 
 
 class MalformedSourceError(RuntimeError):

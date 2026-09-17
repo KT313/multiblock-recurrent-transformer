@@ -23,7 +23,11 @@ During quiet network periods, look for:
 
 - `WAIT:queue_put`: fetching is blocked behind tokenization or storage.
 - `WAIT:queue_get`: a token worker needs input; inspect `input_next`, `remote_read`, and decoding.
-- `encode_batch` or `truncate_batch`: inspect process CPU alongside encoding/result-handling time.
+- `encode_batch` or `truncate_batch`: inspect process CPU alongside encoding/result-handling time. With
+  `--tokenizer_threads` above 8 these appear in the tokenizer processes' reports (`source=.../tokenizer`),
+  and the token worker shows `WAIT:pool_result_wait` (its oldest batch is still in a tokenizer process),
+  `WAIT:pipeline_wait` (batches in flight, room for more: polling the queue and the oldest batch) and
+  `finish_batch` (applying the results to the rows) instead.
 - `parquet_compress_write`, `file_sync`, or `publish_manifest`: output work may be delaying progress.
 - `WAIT:wait_jobs` on MainThread: the coordinator is waiting for workers, usually normal.
 - `WAIT:worker_result_wait`: check the corresponding cleaning-process reports.

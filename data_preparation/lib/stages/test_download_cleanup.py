@@ -40,7 +40,7 @@ class _Scenario:
             self.increments.append(SimpleNamespace(
                 name=name, passive=False, rows_to_keep=1,
                 folder=SimpleNamespace(directory=tmp_path / name, shard_count=0, record_shard=lambda *args: None),
-                token_step=SimpleNamespace(take=lambda name=name: self.action(f"take {name}")),
+                token_step=SimpleNamespace(take=lambda name=name: self.action(f"take {name}"), parallel_batches=1),
                 counters=SimpleNamespace(kept=0, exhausted=False),
             ))
         scenario = self
@@ -62,7 +62,7 @@ class _Scenario:
                 scenario.action(f"exit {self.name} {'success' if exc_type is None else 'error'}")
 
         class Worker:
-            def __init__(self, *args: Any) -> None:
+            def __init__(self, *args: Any, in_flight: int = 1) -> None:
                 scenario.action("worker start")
                 scenario.worker = self
                 self.stopped = False
@@ -199,7 +199,9 @@ def test_worker_reports_storage_failure_after_cancellation_and_join(monkeypatch:
         raise stop if calls == 1 else storage
 
     monkeypatch.setattr(download_workers, "_store", store)
-    increment: Any = SimpleNamespace(name="A", submitted=0, settled=0, token_step=SimpleNamespace(tokenize=lambda batch: batch))
+    increment: Any = SimpleNamespace(
+        name="A", submitted=0, settled=0, token_step=SimpleNamespace(start=lambda batch: None, finish=lambda batch, result: batch),
+    )
     worker = module._TokenWorker("failure-selection", {"A": SimpleNamespace()}, NoProgress(), module._StopGate(None))
     try:
         worker.submit(increment, [({}, None)])

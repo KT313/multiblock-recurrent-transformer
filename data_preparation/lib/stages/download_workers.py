@@ -7,8 +7,11 @@ import functools
 import queue
 import threading
 import traceback
+from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from types import TracebackType
+from typing import Any
 
 from data_preparation.lib.abort import BuildAborted, StopCheck
 from data_preparation.lib.download_profile import active_profile, bind_profile, measure, profile_source
@@ -18,6 +21,8 @@ from data_preparation.lib.stages.download_state import StoredRow, _Increment
 from data_preparation.lib.storage.parquet import ShardWriter
 
 TOKEN_QUEUE_DEPTH = 3  # bound token batches buffered ahead of the worker
+PIPELINE_POLL_SECONDS = 0.02  # how often a worker with batches in flight (and room for more) checks the queue and the oldest batch
+_Pending = tuple[_Increment, list[StoredRow], "Future[Any] | None"]  # a started batch: its future (None: nothing to wait for)
 PASSIVE_SHARD_DIVISOR = 4  # reduce each passive language writer buffer
 
 
@@ -86,22 +91,28 @@ class _DownloadFailures:
 
 class _TokenWorker:
     """
-    The tokenizing half of a download pass on its own thread: batches submitted by the fetch thread are tokenized
-    (:meth:`_TokenStep.tokenize`) and stored (:func:`_store`) in submission order, so row order, the per-row
-    progress and the shard boundaries are exactly those of the same pass done in one thread. The queue holds
-    :data:`TOKEN_QUEUE_DEPTH` batches: submit blocks the fetch thread when the worker is that far behind.
+    The tokenizing half of a download pass on its own thread: batches submitted by the fetch thread are started
+    (:meth:`_TokenStep.start`), finished (:meth:`_TokenStep.finish`) and stored (:func:`_store`) in submission
+    order, so row order, the per-row progress and the shard boundaries are exactly those of the same pass done in
+    one thread. The queue holds :data:`TOKEN_QUEUE_DEPTH` batches: submit blocks the fetch thread when the worker
+    is that far behind. in_flight batches are started before the oldest is finished: one in-process (start
+    computes right away, so this is the plain sequential loop), one per tokenizer process plus one with a pool
+    (tokenizer_pool.py), so every process has a batch while the worker stores the finished ones; with batches in
+    flight and room for more, the worker polls the queue and the oldest batch every
+    :data:`PIPELINE_POLL_SECONDS`.
 
     A failure on the worker is kept and re-raised on the fetch thread by the next :meth:`submit`, :meth:`drain`
     or :meth:`close` (:attr:`failed` tells earlier). After a tokenizer or write error the worker only settles what
-    is queued without storing it; after :class:`BuildAborted` (the stop check, raised by a shard publish) it
-    stores on: the gate is suspended by then (:func:`_store`), and every row the pass consumed belongs on disk so
-    the folders' offsets stay the pass's frontier. A later substantive error takes precedence over that stop.
-    close is what leaving the with block does: it joins before reporting any stored failure. The fetch owner
+    is queued or in flight without storing it; after :class:`BuildAborted` (the stop check, raised by a shard
+    publish) it stores on: the gate is suspended by then (:func:`_store`), and every row the pass consumed belongs
+    on disk so the folders' offsets stay the pass's frontier. A later substantive error takes precedence over that
+    stop. close is what leaving the with block does: it joins before reporting any stored failure. The fetch owner
     verifies termination before writer cleanup; forced interruption cannot promise that cleanup is complete.
     """
 
-    def __init__(self, name: str, writers: dict[str, ShardWriter], bar: Progress, gate: _StopGate) -> None:
+    def __init__(self, name: str, writers: dict[str, ShardWriter], bar: Progress, gate: _StopGate, *, in_flight: int = 1) -> None:
         self._queue: queue.Queue[tuple[_Increment, list[StoredRow]] | None] = queue.Queue(maxsize=TOKEN_QUEUE_DEPTH)
+        self._in_flight = max(1, in_flight)
         self._writers = writers
         self._bar = bar
         self._gate = gate
@@ -183,35 +194,83 @@ class _TokenWorker:
             self._stopped.set()  # no writer access after this point, even if join itself is interrupted
 
     def _process(self) -> None:
-        while True:
-            with measure("queue_get"):
-                item = self._queue.get()
+        pending: deque[_Pending] = deque()  # started batches, oldest first
+        closed = False
+        while pending or not closed:
+            closed = self._fill(pending, closed)
+            if pending:
+                self._settle(pending.popleft())
+
+    def _fill(self, pending: deque[_Pending], closed: bool) -> bool:
+        """
+        Start queued batches while the pipeline has room and the oldest started batch is not ready to store;
+        returns whether the end marker was taken. With nothing in flight the queue is waited for, otherwise it
+        is polled so a batch that finishes is stored promptly.
+        """
+
+        while not closed and len(pending) < self._in_flight:
+            if pending and _ready(pending[0]):
+                break
             try:
-                if item is None:
-                    return
-                increment, batch = item
-                if self._storing:
-                    try:
-                        with profile_source(increment.name):
-                            with measure("tokenize_batch"):
-                                stored = increment.token_step.tokenize(batch)
-                            try:
-                                with measure("store_batch"):
-                                    _store(increment, self._writers[increment.name], stored, self._bar, self._gate)
-                                profile = active_profile()
-                                if profile is not None:
-                                    profile.record("stored_rows", 0, amount=len(stored))
-                                    profile.record("stored_tokens", 0, amount=sum(row["tokens"] for row, _ in stored))
-                            finally:
-                                del stored  # release on failures too; never retain across queue.get
-                    except BuildAborted as stop:  # the gate is suspended now: keep storing what is queued
-                        self._remember_failure(stop)
-                    except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
-                        self._remember_failure(error)
-                        self._storing = False
-                increment.settled += len(batch)  # after the store: `kept` is up to date before the rows leave `in_flight`
-            finally:
-                self._queue.task_done()
+                with measure("pipeline_wait" if pending else "queue_get"):
+                    item = self._queue.get(timeout=PIPELINE_POLL_SECONDS if pending else None)
+            except queue.Empty:
+                continue
+            if item is None:
+                return True
+            pending.append(self._start(item))
+        return closed
+
+    def _start(self, item: tuple[_Increment, list[StoredRow]]) -> _Pending:
+        increment, batch = item
+        future: Future[Any] | None = None
+        if self._storing:
+            try:
+                with profile_source(increment.name), measure("tokenize_batch"):
+                    future = increment.token_step.start(batch)
+            except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
+                self._remember_failure(error)
+                self._storing = False
+        return increment, batch, future
+
+    def _settle(self, entry: _Pending) -> None:
+        """
+        Finish and store one started batch (the oldest), then settle it for the fetch thread.
+        """
+
+        increment, batch, future = entry
+        try:
+            if self._storing:
+                try:
+                    with profile_source(increment.name):
+                        result = None
+                        if future is not None:
+                            with measure("pool_result_wait"):
+                                result = future.result()
+                        with measure("finish_batch"):
+                            stored = increment.token_step.finish(batch, result)
+                        try:
+                            with measure("store_batch"):
+                                _store(increment, self._writers[increment.name], stored, self._bar, self._gate)
+                            profile = active_profile()
+                            if profile is not None:
+                                profile.record("stored_rows", 0, amount=len(stored))
+                                profile.record("stored_tokens", 0, amount=sum(row["tokens"] for row, _ in stored))
+                        finally:
+                            del stored  # release on failures too; never retain across queue.get
+                except BuildAborted as stop:  # the gate is suspended now: keep storing what is queued
+                    self._remember_failure(stop)
+                except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it
+                    self._remember_failure(error)
+                    self._storing = False
+            increment.settled += len(batch)  # after the store: `kept` is up to date before the rows leave `in_flight`
+        finally:
+            self._queue.task_done()
+
+
+def _ready(entry: _Pending) -> bool:
+    future = entry[2]
+    return future is None or future.done()
 
 
 def _flush_partial_shards(writers: dict[str, ShardWriter], failures: _DownloadFailures) -> None:

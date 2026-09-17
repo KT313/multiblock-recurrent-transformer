@@ -15,8 +15,10 @@ from data_preparation.lib.build.runner import (
     DEFAULT_MAX_PARALLEL_DOWNLOADS,
     DEFAULT_NUM_WORKERS,
     DEFAULT_PASS_WORKERS,
+    DEFAULT_TOKENIZER_THREADS,
     STEPS,
 )
+from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS
 
 DEFAULT_DATASET_DIR = Path("dataset")
 TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
@@ -103,6 +105,9 @@ def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] 
     sub.add_argument("--allow_foreign_raw", action="store_true", help="let the repair step delete stale / outdated raw folders that another dataset config downloaded (they are shared by source name)")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
     sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")
+    sub.add_argument("--tokenizer_threads", type=int, default=DEFAULT_TOKENIZER_THREADS,
+                     help=f"tokenizer threads of the downloads in total: up to {THREADS_PER_PROCESS} on this process's Rust pool, more in "
+                          f"ceil(N/{THREADS_PER_PROCESS}) separate tokenizer processes of up to {THREADS_PER_PROCESS} threads each (default: {DEFAULT_TOKENIZER_THREADS})")
     sub.add_argument("--max_parallel_downloads", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS, help="sources downloading at a time")
     sub.add_argument("--download_prefetch_mb", type=int, default=None, help="remote read-ahead block size in MiB per download (up to two blocks buffered); 0 disables; defaults to dataset config, otherwise 0")
     sub.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for gated sources")

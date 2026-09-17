@@ -30,8 +30,8 @@ P = ParamSpec("P")
 T = TypeVar("T")
 _SESSION: ContextVar[DebugSession | None] = ContextVar("download_debug_session", default=None)
 _WORKER: WorkerReporter | None = None
-WAITS = {"queue_put", "queue_get", "queue_drain", "wait_jobs", "prefetch_consumer_wait", "prefetch_discard_wait",
-         "worker_result_wait", "worker_shutdown", "prefetch_shutdown",
+WAITS = {"queue_put", "queue_get", "queue_drain", "pipeline_wait", "pool_result_wait", "wait_jobs", "prefetch_consumer_wait",
+         "prefetch_discard_wait", "worker_result_wait", "worker_shutdown", "prefetch_shutdown",
          "token_worker_shutdown", "job_pool_shutdown"}
 
 

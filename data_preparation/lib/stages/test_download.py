@@ -1062,7 +1062,7 @@ def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total:
 def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (256 in production)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (2048 in production)
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     offsets = _failing_loader(monkeypatch, fail_at=27)
     with pytest.raises(OSError, match="connection reset"):
@@ -1286,13 +1286,15 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
 
 class _FakeCounter:
     """
-    A `TokenCounter` stand-in (estimate counts) whose `truncate_many` calls go through `on_batch(call number)` first.
+    A `TokenCounter` stand-in (estimate counts, no tokenizer pool) whose `truncate_many` calls go through
+    `on_batch(call number)` first.
     """
 
     on_batch: Callable[[int], None] = staticmethod(lambda call: None)
     calls = 0
+    pool = None
 
-    def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
+    def __init__(self, config: DatasetConfig, layout: DatasetLayout, pool: Any = None) -> None:
         pass
 
     def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:

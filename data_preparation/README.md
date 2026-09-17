@@ -235,8 +235,13 @@ not the larger of the two. Inside a download job, fetching the next row group an
 overlap too (a token worker thread per job; the rows are still written in order), and `prepare.py` turns the
 tokenizer's own thread pool on (`TOKENIZERS_PARALLELISM=true`, off by library default because a training run that
 prepares data in-process forks DataLoader workers afterwards) with 8 threads (`RAYON_NUM_THREADS`; the pool is one
-per process and shared by every download job, and past 8 threads a batch barely gets faster). A single download is
-can still be limited by network, decoding, tokenization, or writing; `--max_parallel_downloads` overlaps work across sources.
+per process and shared by every download job). One encode call is a fork-join over the rows of a batch and stops
+scaling at about 8 threads, so `--tokenizer_threads N` above 8 runs ceil(N/8) separate tokenizer processes with
+balanced thread counts (`lib/stages/tokenizer_pool.py`; 20 threads are 7 + 7 + 6) that every job's token worker
+feeds, keeping one batch per process in flight and still storing in submission order. Measured on a 64-core node
+with github_code rows: 26 MB/s at 8 threads in one process, 47 MB/s at 50 threads in one process, 112 MB/s with
+three processes of 16 threads. A single download can still be limited by network, decoding, tokenization, or
+writing; `--max_parallel_downloads` overlaps work across sources.
 
 For server downloads, `--download_prefetch_mb 16` fetches the next 16 MiB of the current remote file in a
 background thread while its previous bytes are decoded and processed. This applies to `hf_files` and grouped
@@ -305,8 +310,8 @@ than a gap. For that the shared file index counts *every* language of every full
 (`full_counts` in `dataset/hub_index/`), and a stop or a failure publishes each folder's buffered rows as a short
 final shard first, so every folder's offset is the frontier the pass reached and the next pass resumes them all
 aligned. The cost is disk (the whole decoded volume, zstd, instead of the wanted languages), the tokenizer running
-over every row (the 8-thread pool keeps up with a row group's fetch), and one shard buffer per language (passive
-shards are a quarter of `shard_size`). `build.log` lists the rows stored past each target and per extra language.
+over every row (on a fast link this is the bottleneck: `--tokenizer_threads`), and one shard buffer per language
+(passive shards are a quarter of `shard_size`). `build.log` lists the rows stored past each target and per extra language.
 
 ### Build (`lib/stages/build.py`)
 

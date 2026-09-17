@@ -53,6 +53,39 @@ Complete saved reports:
 - [Four-way counting](../tools/data_preparation/results/count_native_comparison_20260917.json).
 - [Final production counting](../tools/data_preparation/results/count_production_20260917.json).
 
+## Tokenizer thread scaling on the server (2026-09-17, later the same day)
+
+A `--debug 1` log of the github_code group download (one download job, `RAYON_NUM_THREADS=50`) split into
+quarters: the first was download-bound (the token worker idle in `queue_get` 69% of the time), the middle two
+were tokenizer-bound (`encode_batch` 85% of the worker's time, the fetch thread blocked in `queue_put` 89%,
+6.5 busy cores, 25.7 MB/s of text). Busy cores ran at single-thread speed (4.4 MB/s each), so the pool was
+mostly idle rather than slow. A standalone benchmark (`tools/bench_tokenizer_scaling.py`, gitignored) on the
+same node, one raw shard of `github_code_clean_java`, 6000 rows per configuration, fresh process each:
+
+| configuration | threads | busy cores | MB/s |
+|---|---:|---:|---:|
+| single thread | 1 | 1.0 | 4.4 |
+| 256 rows/batch (production then) | 16 | 8.9 | 37.8 |
+| 256 rows/batch | 32 | 11.8 | 47.6 |
+| 256 rows/batch | 50 | 13.2 | 47.2 |
+| 2048 rows/batch | 32 | 17.5 | 70.1 |
+| 2048 rows/batch | 50 | 21.1 | 76.3 |
+| 2 processes x 16 threads, aggregate | 32 | 18.1 | 77.3 |
+| 3 processes x 16 threads, aggregate | 48 | 27.2 | 112.1 |
+
+One `encode_batch` call is a fork-join over the rows of the batch, one row one indivisible item, split in
+halves; the join waits for the slowest half, and with 256 uneven rows the single longest document explains
+half of a batch's wall time at 50 threads. Bigger batches help inside one process, separate processes add up
+linearly. Sorting a batch longest-first was measured slower (it unbalances the halves). Consequences:
+
+- `TOKEN_BATCH` is 2048 rows (was 256; not part of any hash or resume contract).
+- `--tokenizer_threads N` above 8 runs ceil(N/8) spawn tokenizer processes with balanced thread counts
+  (`lib/stages/tokenizer_pool.py`); the token worker keeps one batch per process plus one in flight and stores
+  in submission order, so shards, counts and progress are identical to the in-process path (tested against
+  it, including out-of-order completion and a failed batch).
+- The server run also spent 94 s of kernel time against 121 s of user time across the benchmark, far more
+  than the same script elsewhere; that is consistent with the stall below and remains unattributed.
+
 ## Separate unresolved server stall
 
 The supplied 02:30:40–02:30:56 sample showed approximately 100% system CPU and almost no user CPU.

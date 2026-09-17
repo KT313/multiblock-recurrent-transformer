@@ -30,7 +30,10 @@ A download pass (:func:`_fetch`) is a two-stage pipeline: the job's own thread p
 them and buffers :data:`TOKEN_BATCH` rows per source, and a token worker thread (:class:`_TokenWorker`) tokenizes
 the batches and writes the shards, in order. Fetching the next row group (network, parquet decode) so overlaps
 tokenizing the previous batches, which took as long as the fetch itself in one thread. The tokenizer's own thread
-pool is a separate matter (`TOKENIZERS_PARALLELISM`, see :func:`_guard_tokenizers_parallelism`).
+pool is a separate matter (`TOKENIZERS_PARALLELISM`, see :func:`_guard_tokenizers_parallelism`); with a
+:class:`~data_preparation.lib.stages.tokenizer_pool.TokenizerPool` (`--tokenizer_threads` above 8) the
+:class:`TokenCounter` hands the batches' tokenizer work to separate processes and the worker keeps one batch per
+process in flight, still storing in submission order.
 
 The github_code group pass (:func:`download_github_code_group`) keeps everything it decodes: a member that has its
 rows stays in the pass as a *passive* increment and stores every further row of its language the pass reads for
@@ -78,6 +81,7 @@ from data_preparation.lib.sources.synthetic import write_synthetic_tokenizer
 from data_preparation.lib.storage.atomic import _fsync_directory
 from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+from data_preparation.lib.stages.tokenizer_pool import TokenizerPool
 from data_preparation.lib.stages.truncation import estimate_tokens, truncate_many
 from data_preparation.lib.storage.manifest import Manifest, has_shards, library_versions
 from data_preparation.lib.storage.parquet import ShardWriter
@@ -110,14 +114,21 @@ class TokenCounter:
     len(text) // 4 (estimate): the text's own tokens, without the BOS and EOS the trainer adds (the token step adds
     truncation.NUMBER_OF_SPECIAL_TOKENS to what it stores). Counts are never capped here: the download truncates pretrain
     *text* at the cap (:meth:`truncate_many`) and drops long instruct rows, so every stored count is a true count.
+
+    With a pool (tokenizer_pool.py; only in tokenizer mode) the token step sends its batches there instead of
+    calling :meth:`truncate_many` / :meth:`count_many` here: :attr:`pool` and :attr:`tokenizer_dir` are what it
+    needs for that. The methods here stay the in-process path (and what the pool processes run).
     """
 
-    def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
+    def __init__(self, config: DatasetConfig, layout: DatasetLayout, pool: TokenizerPool | None = None) -> None:
         self.mode = config.token_count
         self.tokenizer_name = config.tokenizer.name
+        self.tokenizer_dir = layout.tokenizer_dir(config.tokenizer.name)
         self._tokenizer: SavedTokenizer | None = None
+        self.pool: TokenizerPool | None = None
         if self.mode == "tokenizer":
-            self._tokenizer = _load_tokenizer(layout.tokenizer_dir(config.tokenizer.name), config.tokenizer.name)
+            self._tokenizer = _load_tokenizer(self.tokenizer_dir, self.tokenizer_name)
+            self.pool = pool
 
     @property
     def chat_tokenizer(self) -> SavedTokenizer:
@@ -519,10 +530,13 @@ def download(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     config_name: str | None = None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> Manifest:
     """
     Append raw shards until rows_needed rows are on disk (no-op if they already are). config_name (the
-    dataset config's file name) is recorded in a manifest this call creates, for the repair step.
+    dataset config's file name) is recorded in a manifest this call creates, for the repair step. tokenizer_pool
+    (tokenizer_pool.py) takes the batches' tokenizer work off this process; without it the token worker thread
+    tokenizes on the process's own Rust pool.
 
     The folder's manifest must be current (:func:`inspect_raw`): a stale or outdated one raises
     :class:`RawFolderError` (nothing is deleted here), a missing one starts the folder from shard 0 (refused when
@@ -551,7 +565,7 @@ def download(
     # Plan the append and return immediately when no rows are needed.
     gate = _StopGate(should_stop)
     folder, increment = _plan_increment(
-        config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout), should_stop=gate, config_name=config_name
+        config, name, layout, rows_needed, token_counter=lambda: TokenCounter(config, layout, tokenizer_pool), should_stop=gate, config_name=config_name
     )
     if increment is None or increment.passive:  # passive: the rows are on disk; only a group pass reads on
         return folder.manifest
@@ -718,7 +732,8 @@ def _fetch(
     try:
         for increment in increments:
             open_increment_writer(increment.name, increments, increments_by_name, writers, shard_size)
-        worker = _TokenWorker(",".join(writers), writers, bar, gate)
+        in_flight = max((increment.token_step.parallel_batches for increment in increments), default=1)
+        worker = _TokenWorker(",".join(writers), writers, bar, gate, in_flight=in_flight)
 
         # Keep the row dispatch loop visible; settle instruction batches before reading past their target.
         for name, raw in measure_rows(rows):
@@ -763,6 +778,7 @@ def download_github_code_group(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     config_name: str | None = None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> dict[str, Manifest]:
     """
     :func:`download` for several `github_code` sources of one repo in a single pass over its files: every
@@ -774,12 +790,12 @@ def download_github_code_group(
     by the same token step), rows_fetched and exhausted of every member are, up to its target, exactly what a
     separate download call would produce: the same :func:`_fetch` pass over the repo reader instead of one loader.
     A stale or outdated member raises :class:`RawFolderError` before anything is fetched. Returns the raw manifest
-    of every source in names and of every extra language the pass stored.
+    of every source in names and of every extra language the pass stored. tokenizer_pool as in :func:`download`.
     """
 
     # Validate the group and plan each source without reading any rows.
     validate_github_group(config, names)
-    token_counter = functools.cache(lambda: TokenCounter(config, layout))
+    token_counter = functools.cache(lambda: TokenCounter(config, layout, tokenizer_pool))
     gate = _StopGate(should_stop)
     results: dict[str, Manifest] = {}
     increments: list[_Increment] = []

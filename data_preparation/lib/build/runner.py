@@ -43,6 +43,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
@@ -80,6 +81,7 @@ from data_preparation.lib.stages.download import (
 )
 from data_preparation.lib.stages.global_dedup import global_policy, ordered_sources
 from data_preparation.lib.stages.global_build import build_global_source, outputs_complete
+from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS, TokenizerPool
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
 from data_preparation.lib.ui.dashboard import active_dashboard, progress, set_status
@@ -91,6 +93,7 @@ MAX_ROUNDS = 5  # download + build rounds; a source still short afterwards is re
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
 DEFAULT_NUM_WORKERS = 2  # sources built at a time (threads; pyarrow/tokenizers release the GIL)
 DEFAULT_PASS_WORKERS = 4  # spawn processes per build for the optional cleaning passes (decontamination / minhash)
+DEFAULT_TOKENIZER_THREADS = THREADS_PER_PROCESS  # the downloads' tokenizer threads in total; above THREADS_PER_PROCESS they are separate processes
 
 
 # --- prepare / status ------------------------------------------------------------------------------------------------
@@ -102,6 +105,7 @@ def prepare(
     *,
     num_workers: int = DEFAULT_NUM_WORKERS,
     pass_workers: int = DEFAULT_PASS_WORKERS,
+    tokenizer_threads: int = DEFAULT_TOKENIZER_THREADS,
     max_parallel_downloads: int = DEFAULT_MAX_PARALLEL_DOWNLOADS,
     download_prefetch_mb: int | None = None,
     assume_yes: bool,
@@ -129,6 +133,9 @@ def prepare(
     same tree. steps (a subset of :data:`STEPS`) and sources restrict the work, and the satisfaction check,
     to the named steps / sources; the returned report always covers the whole config. reopen names sources
     whose exhausted flag is cleared before planning (:func:`reopen_raw`: their loader has more rows now).
+    tokenizer_threads is the downloads' tokenizer threads in total: up to :data:`THREADS_PER_PROCESS` on this
+    process's own Rust pool (the caller sizes that one, RAYON_NUM_THREADS), more in a
+    :class:`~data_preparation.lib.stages.tokenizer_pool.TokenizerPool` of separate processes open for the run.
     """
 
     # resolve the configuration and validate the requested work
@@ -141,17 +148,21 @@ def prepare(
     active_steps = checked_steps(steps)
     selected = checked_sources(config, sources)
     reopened = checked_sources(config, reopen) or []
-    check_worker_counts(num_workers, max_parallel_downloads, pass_workers)
+    check_worker_counts(num_workers, max_parallel_downloads, pass_workers, tokenizer_threads)
     warn_about_overlaps(config)
 
     # hold dataset ownership and attach the unreadable-shard remedy
-    with open_preparation_scope(config_path, dataset_dir, dry_run=dry_run, dataset_lease=dataset_lease):
+    with (
+        open_preparation_scope(config_path, dataset_dir, dry_run=dry_run, dataset_lease=dataset_lease),
+        tokenizer_pool_for(tokenizer_threads, active_steps, dry_run=dry_run) as tokenizer_pool,
+    ):
         if config.bloom_deduplicate_across_sources:
             return prepare_global(
                 config, layout.for_config(config), config_name=config_name, steps=active_steps, selected=selected,
                 reopened=reopened, dry_run=dry_run, assume_yes=assume_yes, confirm=confirm,
                 allow_foreign_raw=allow_foreign_raw, hf_token=hf_token, num_workers=num_workers,
                 pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads, should_stop=should_stop,
+                tokenizer_pool=tokenizer_pool,
             )
 
         # authorize changes and publish the tokenizer before repairing source data
@@ -167,7 +178,7 @@ def prepare(
         run_preparation_rounds(
             config, layout, active_steps, selected, config_name=config_name, dry_run=dry_run,
             num_workers=num_workers, pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads,
-            hf_token=hf_token, should_stop=should_stop,
+            hf_token=hf_token, should_stop=should_stop, tokenizer_pool=tokenizer_pool,
         )
 
         # publish and report the final dataset state
@@ -179,7 +190,7 @@ def prepare(
 def run_preparation_rounds(
     config: DatasetConfig, layout: DatasetLayout, active_steps: set[str], selected: list[str] | None,
     *, config_name: str, dry_run: bool, num_workers: int, pass_workers: int, max_parallel_downloads: int,
-    hf_token: str | None, should_stop: StopCheck | None,
+    hf_token: str | None, should_stop: StopCheck | None, tokenizer_pool: TokenizerPool | None = None,
 ) -> None:
     """Plan and run bounded download/build rounds until the budget is met or no more rows can be fetched."""
 
@@ -193,6 +204,7 @@ def run_preparation_rounds(
         download_and_build_missing(
             download_plan, config, layout, steps=active_steps, sources=selected, max_parallel_downloads=max_parallel_downloads,
             num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            tokenizer_pool=tokenizer_pool,
         )
         if every_source_satisfies_its_budget(config, layout, sources=selected):
             break
@@ -230,6 +242,7 @@ def prepare_global(
     selected: list[str] | None, reopened: list[str], dry_run: bool, assume_yes: bool,
     confirm: Confirm | None, allow_foreign_raw: bool, hf_token: str | None,
     num_workers: int, pass_workers: int, max_parallel_downloads: int, should_stop: StopCheck | None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> DatasetReport:
     """Caller holds the exclusive lease until every worker and ordered writer stops."""
 
@@ -265,7 +278,7 @@ def prepare_global(
         download_and_build_missing(
             plan, config, candidates, steps=steps, sources=selected,
             max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
-            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool,
         )
 
         # finish downloads or admit sources in priority order
@@ -273,12 +286,12 @@ def prepare_global(
             run_global_download_rounds(
                 config, candidates, steps, selected, max_parallel_downloads=max_parallel_downloads,
                 num_workers=num_workers, pass_workers=pass_workers, hf_token=hf_token,
-                should_stop=should_stop, config_name=config_name,
+                should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool,
             )
             return assess_dataset_state(config, layout, repair)
         run_global_admission_rounds(
             config, layout, candidates, steps, seeds, pass_workers=pass_workers,
-            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool,
         )
         return assess_dataset_state(config, layout, repair, publish=True)
 
@@ -286,7 +299,7 @@ def prepare_global(
 def run_global_download_rounds(
     config: DatasetConfig, candidates: DatasetLayout, steps: set[str], selected: list[str] | None,
     *, max_parallel_downloads: int, num_workers: int, pass_workers: int, hf_token: str | None,
-    should_stop: StopCheck | None, config_name: str,
+    should_stop: StopCheck | None, config_name: str, tokenizer_pool: TokenizerPool | None = None,
 ) -> None:
     """Complete the remaining bounded download rounds when final admission was not requested."""
     for _ in range(1, MAX_ROUNDS):
@@ -298,13 +311,14 @@ def run_global_download_rounds(
         download_and_build_missing(
             followup, config, candidates, steps=steps, sources=selected,
             max_parallel_downloads=max_parallel_downloads, num_workers=num_workers, pass_workers=pass_workers,
-            hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool,
         )
 
 
 def run_global_admission_rounds(
     config: DatasetConfig, layout: DatasetLayout, candidates: DatasetLayout, steps: set[str], seeds: BenchmarkSeeds,
     *, pass_workers: int, hf_token: str | None, should_stop: StopCheck | None, config_name: str,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> None:
     """Admit each source before proceeding to the next, with bounded top-ups for global losses."""
     frontier = seeds.frontier(ordered_sources(config), config.bloom_dedup_memory_mb)
@@ -340,7 +354,7 @@ def run_global_admission_rounds(
             increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
             log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
             download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
-                     hf_token=hf_token, should_stop=should_stop, config_name=config_name)
+                     hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool)
             after = source_ledger(config, name, layout)
             if after.raw_rows <= ledger.raw_rows and not after.exhausted:
                 log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
@@ -366,6 +380,7 @@ def download_and_build_missing(
     hf_token: str | None = None,
     should_stop: StopCheck | None = None,
     config_name: str | None = None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> None:
     """
     Internal mutation helper: caller must own the dataset lock until all job pools have stopped.
@@ -380,7 +395,7 @@ def download_and_build_missing(
     (the dataset config's file name) is recorded in the raw manifests the downloads create.
     """
 
-    downloads = download_jobs(download_plan, config, layout, hf_token, config_name) if "download" in steps else []
+    downloads = download_jobs(download_plan, config, layout, hf_token, config_name, tokenizer_pool=tokenizer_pool) if "download" in steps else []
     downloading = {name for job in downloads for name in job.sources}
     pending = sources_with_pending_raw_shards(config, layout, sources) if "build" in steps else []
     builds = [build_source_job(config, name, layout, pass_workers) for name in pending if name not in downloading]
@@ -425,7 +440,8 @@ class Job:
 
 
 def download_jobs(
-    download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None, config_name: str | None = None
+    download_plan: DownloadPlan, config: DatasetConfig, layout: DatasetLayout, hf_token: str | None, config_name: str | None = None,
+    *, tokenizer_pool: TokenizerPool | None = None,
 ) -> list[Job]:
     """
     One job per source with rows to fetch; the github_code sources of one repo are one job as soon as any of
@@ -443,11 +459,11 @@ def download_jobs(
     for names in github_code_groups(config, [source.name for source in download_plan.sources]):
         if not set(to_fetch).intersection(names):
             continue
-        jobs.append(github_code_group_job(config, names, layout, {name: targets[name] for name in names}, hf_token, config_name))
+        jobs.append(github_code_group_job(config, names, layout, {name: targets[name] for name in names}, hf_token, config_name, tokenizer_pool))
         grouped.update(names)
     for name in to_fetch:
         if name not in grouped:
-            jobs.append(download_source_job(config, name, layout, targets[name], hf_token, config_name))
+            jobs.append(download_source_job(config, name, layout, targets[name], hf_token, config_name, tokenizer_pool))
     return jobs
 
 
@@ -466,20 +482,26 @@ def github_code_groups(config: DatasetConfig, names: list[str]) -> list[list[str
 
 
 def download_source_job(
-    config: DatasetConfig, name: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None, config_name: str | None = None
+    config: DatasetConfig, name: str, layout: DatasetLayout, rows_needed: int, hf_token: str | None, config_name: str | None = None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> Job:
     def action(should_stop: StopCheck) -> object:
-        return download(config, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name)
+        return download(
+            config, name, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            tokenizer_pool=tokenizer_pool,
+        )
 
     return Job("source", name, (name,), action)
 
 
 def github_code_group_job(
-    config: DatasetConfig, names: list[str], layout: DatasetLayout, rows_needed: dict[str, int], hf_token: str | None, config_name: str | None = None
+    config: DatasetConfig, names: list[str], layout: DatasetLayout, rows_needed: dict[str, int], hf_token: str | None, config_name: str | None = None,
+    tokenizer_pool: TokenizerPool | None = None,
 ) -> Job:
     def action(should_stop: StopCheck) -> object:
         return download_github_code_group(
-            config, names, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name
+            config, names, layout, rows_needed=rows_needed, hf_token=hf_token, should_stop=should_stop, config_name=config_name,
+            tokenizer_pool=tokenizer_pool,
         )
 
     return Job("github_code group", ", ".join(names), tuple(names), action)
@@ -722,12 +744,26 @@ def checked_sources(config: DatasetConfig, sources: Iterable[str] | None) -> lis
     return None if sources is None else selected_sources(config, sources)
 
 
-def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_workers: int) -> None:
-    if num_workers < 1 or max_parallel_downloads < 1 or pass_workers < 1:
+def check_worker_counts(num_workers: int, max_parallel_downloads: int, pass_workers: int, tokenizer_threads: int = DEFAULT_TOKENIZER_THREADS) -> None:
+    if num_workers < 1 or max_parallel_downloads < 1 or pass_workers < 1 or tokenizer_threads < 1:
         raise ValueError(
-            "num_workers, max_parallel_downloads and pass_workers must be >= 1, got "
-            f"{num_workers}, {max_parallel_downloads} and {pass_workers}"
+            "num_workers, max_parallel_downloads, pass_workers and tokenizer_threads must be >= 1, got "
+            f"{num_workers}, {max_parallel_downloads}, {pass_workers} and {tokenizer_threads}"
         )
+
+
+def tokenizer_pool_for(tokenizer_threads: int, steps: set[str], *, dry_run: bool) -> AbstractContextManager[TokenizerPool | None]:
+    """
+    The tokenizer processes of a run that downloads with more than :data:`THREADS_PER_PROCESS` tokenizer threads
+    (open for the with block), else nothing: a dry run and a run without the download step tokenize nothing,
+    and up to that many threads the process's own Rust pool serves the downloads.
+    """
+
+    if dry_run or "download" not in steps or tokenizer_threads <= THREADS_PER_PROCESS:
+        return nullcontext(None)
+    pool = TokenizerPool(tokenizer_threads)
+    log.info("tokenizer pool: %d processes with %s threads", pool.processes, "/".join(map(str, pool.plan)))
+    return pool
 
 
 def reopen_sources(config: DatasetConfig, layout: DatasetLayout, names: list[str], *, dry_run: bool) -> None:

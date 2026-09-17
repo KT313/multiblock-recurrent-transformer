@@ -5,7 +5,7 @@ Entry point for dataset preparation.
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--reopen S ...] [--yes] [--dry_run]
                                                 [--allow_foreign_raw]
-                                                [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
+                                                [--num_workers N] [--pass_workers N] [--tokenizer_threads N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
                                                 [--debug [SECONDS]] [--debug-file PATH]
     python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
@@ -24,9 +24,11 @@ clears the exhausted flag of the named sources first (a loader that yielded fewe
 exhausted; say so when it has more rows now). status prints what the repair step would do plus the status table
 and exits 0 iff the dataset is complete. describe renders the config
 as Markdown (docs/data_mixture.md is generated with it). --cache_dir relocates the HuggingFace caches. prepare
-turns the tokenizer's thread pool on with TOKENIZER_POOL_THREADS threads (TOKENIZERS_PARALLELISM=true and
+turns the tokenizer's thread pool on with up to TOKENIZER_POOL_THREADS threads (TOKENIZERS_PARALLELISM=true and
 RAYON_NUM_THREADS=8 unless set in the environment): this process never forks after loading the tokenizer, and
-downloads tokenize every row on that one pool, whatever their number.
+downloads tokenize every row on that one pool, whatever their number. --tokenizer_threads above 8 adds separate
+tokenizer processes of up to 8 threads each (lib/stages/tokenizer_pool.py: one encode call stops scaling past
+that, processes add up), which every download job's token worker feeds.
 
 Exit codes: 0 ok, 1 failure (a broken config or a repair that cannot decide safely is logged as one line,
 anything else with its traceback; a failed source is a failed build), 2 an unconfirmed

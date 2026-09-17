@@ -297,8 +297,8 @@ def test_yes_flag_reaches_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         return DatasetReport(tokenizer_complete=True)
 
     monkeypatch.setattr(cli_commands, "prepare", record)
-    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--allow_foreign_raw", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2", "--download_prefetch_mb", "16"])
-    assert seen["download_prefetch_mb"] == 16
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path), "--yes", "--allow_foreign_raw", "--hf_token", "t", "--num_workers", "3", "--pass_workers", "2", "--download_prefetch_mb", "16", "--tokenizer_threads", "20"])
+    assert seen["download_prefetch_mb"] == 16 and seen["tokenizer_threads"] == 20
     assert (seen["assume_yes"], seen["allow_foreign_raw"], seen["hf_token"], seen["num_workers"], seen["pass_workers"], seen["steps"]) == (True, True, "t", 3, 2, STEPS)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path)])
     assert (seen["assume_yes"], seen["dry_run"], seen["allow_foreign_raw"]) == (False, False, False)
@@ -333,13 +333,20 @@ def test_prepare_turns_the_tokenizer_thread_pool_on_unless_the_environment_says_
 ) -> None:
     """
     The CLI never forks after loading the tokenizer, so it lifts the library's `TOKENIZERS_PARALLELISM=false`
-    guard; an explicit value in the environment is kept.
+    guard; an explicit value in the environment is kept. The process's own pool gets at most
+    TOKENIZER_POOL_THREADS of --tokenizer_threads (the rest are separate processes, lib/stages/tokenizer_pool.py).
     """
 
     monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
     monkeypatch.delenv("RAYON_NUM_THREADS", raising=False)
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "a"), "--dry_run"])
     assert os.environ["TOKENIZERS_PARALLELISM"] == "true" and os.environ["RAYON_NUM_THREADS"] == str(cli_commands.TOKENIZER_POOL_THREADS)
+    monkeypatch.delenv("RAYON_NUM_THREADS")
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "a"), "--dry_run", "--tokenizer_threads", "20"])
+    assert os.environ["RAYON_NUM_THREADS"] == str(cli_commands.TOKENIZER_POOL_THREADS)
+    monkeypatch.delenv("RAYON_NUM_THREADS")
+    prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "a"), "--dry_run", "--tokenizer_threads", "3"])
+    assert os.environ["RAYON_NUM_THREADS"] == "3"
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
     monkeypatch.setenv("RAYON_NUM_THREADS", "3")
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "b"), "--dry_run"])

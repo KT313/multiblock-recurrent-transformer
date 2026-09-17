@@ -1377,3 +1377,23 @@ def test_incomplete_tokenizer_failed_replacement_preserves_snapshot(
         prepare(path, layout.root, assume_yes=False)
     assert _published_bytes(layout.root) == before
     assert not list(layout.tokenizer_dir(cfg.tokenizer.name).parent.glob(".tokenizer-*"))
+
+
+def test_a_tokenizer_pool_is_opened_only_for_downloads_with_more_threads_than_one_process_takes(tmp_path: Path) -> None:
+    """
+    Up to THREADS_PER_PROCESS threads the process's own Rust pool serves the downloads; a dry run and a run
+    without the download step tokenize nothing.
+    """
+
+    from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS, TokenizerPool
+
+    with runner.tokenizer_pool_for(THREADS_PER_PROCESS, {"tokenizer", "download"}, dry_run=False) as pool:
+        assert pool is None
+    with runner.tokenizer_pool_for(20, {"tokenizer", "download"}, dry_run=True) as pool:
+        assert pool is None
+    with runner.tokenizer_pool_for(20, {"build"}, dry_run=False) as pool:
+        assert pool is None
+    with runner.tokenizer_pool_for(20, {"tokenizer", "download"}, dry_run=False) as pool:
+        assert isinstance(pool, TokenizerPool) and pool.plan == [7, 7, 6]
+    with pytest.raises(ValueError, match="tokenizer_threads must be >= 1"):
+        runner.check_worker_counts(1, 1, 1, 0)
