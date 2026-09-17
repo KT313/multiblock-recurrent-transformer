@@ -93,6 +93,8 @@ def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] 
 
     sub.add_argument("--debug", nargs="?", const=5.0, default=None, type=debug_interval, metavar="SECONDS",
                      help="log pipeline sections, ongoing waits and process CPU every SECONDS (default: 5); includes worker processes")
+    sub.add_argument("--debug-file", type=Path, default=None, metavar="PATH",
+                     help="also append debug overviews to PATH; enables --debug at 5 seconds unless an interval is specified")
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
     sub.add_argument("--steps", nargs="+", default=None, choices=steps, metavar="STEP", help=f"only these steps of {steps}")
     sub.add_argument("--reopen", nargs="+", default=None, metavar="NAME", help="clear the exhausted flag of these sources before planning (their loader has more rows now)")

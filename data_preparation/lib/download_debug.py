@@ -11,13 +11,14 @@ import resource
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from multiprocessing.queues import Queue
 from multiprocessing.util import Finalize
-from typing import ParamSpec, TypeVar
+from pathlib import Path
+from typing import ParamSpec, TextIO, TypeVar
 
 from data_preparation.lib.download_profile import (
     DownloadProfile, Metric, current_source, install_worker_profile, measure, profile_source,
@@ -111,13 +112,20 @@ class PeriodicReporter:
 
 
 class DebugSession(PeriodicReporter):
-    def __init__(self, profile: DownloadProfile, interval: float) -> None:
-        super().__init__(profile, interval, self._log)
+    def __init__(self, profile: DownloadProfile, interval: float, stream: TextIO | None = None) -> None:
+        self._stream = stream
+        super().__init__(profile, interval, self._write)
         self.messages: Queue[str] = multiprocessing.get_context("spawn").Queue(maxsize=64)
 
     @staticmethod
     def _log(message: str) -> None:
         log.info("%s", message)  # dashboard and build.log use their existing handlers; no child writes to them
+
+    def _write(self, message: str) -> None:
+        self._log(message)
+        if self._stream is not None:
+            self._stream.write(message + "\n\n")
+            self._stream.flush()  # allow tail -f to see each overview immediately
 
     def _drain(self) -> None:
         for _ in range(64):
@@ -125,7 +133,7 @@ class DebugSession(PeriodicReporter):
                 message = self.messages.get_nowait()
             except queue.Empty:
                 break
-            self._log(message)
+            self._write(message)
 
     def _run(self) -> None:
         deadline = time.monotonic() + self.interval
@@ -204,16 +212,26 @@ def measured_worker(phase: str) -> Callable[[Callable[P, T]], Callable[P, T]]:
 
 
 @contextmanager
-def log_download_debug(profile: DownloadProfile | None, interval: float | None) -> Iterator[None]:
+def log_download_debug(
+    profile: DownloadProfile | None, interval: float | None, *, debug_file: Path | None = None,
+) -> Iterator[None]:
     if profile is None or interval is None:
         yield
         return
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("debug interval must be positive and finite")
-    session = DebugSession(profile, interval)
-    token = _SESSION.set(session)
+    resources = ExitStack()
+    token = None
     failure: BaseException | None = None
     try:
+        stream = None
+        if debug_file is not None:
+            path = debug_file.expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stream = resources.enter_context(path.open("a", encoding="utf-8"))
+        session = DebugSession(profile, interval, stream)
+        resources.callback(session.close)  # stop/join reporting before closing its file
+        token = _SESSION.set(session)
         session.start()
         with profile_source("main"):
             yield
@@ -221,9 +239,10 @@ def log_download_debug(profile: DownloadProfile | None, interval: float | None) 
         failure = error
         raise
     finally:
-        _SESSION.reset(token)
+        if token is not None:
+            _SESSION.reset(token)
         try:
-            session.close()
+            resources.close()
         except Exception as error:
             if failure is None:
                 raise

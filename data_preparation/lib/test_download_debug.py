@@ -126,8 +126,9 @@ def test_spawn_worker_reports_during_its_task(stage: str, tmp_path: Path, caplog
     logger.addHandler(handler)
     context = multiprocessing.get_context("spawn")
     release = context.Event()
+    debug_file = tmp_path / "workers.log"
     try:
-        with profile_downloads(debug=0.05) as profile, debug.log_download_debug(profile, 0.05):
+        with profile_downloads(debug=0.05) as profile, debug.log_download_debug(profile, 0.05, debug_file=debug_file):
             options = debug.worker_debug_options()
             assert options is not None
             with ProcessPoolExecutor(1, mp_context=context, initializer=_initialize_blocked_worker,
@@ -141,6 +142,7 @@ def test_spawn_worker_reports_during_its_task(stage: str, tmp_path: Path, caplog
                 pid = future.result(timeout=10)
         assert pid != os.getpid()
         assert any(f"pid={pid}" in line and "MainThread[" in line for line in handler.messages)
+        assert f"pid={pid}" in debug_file.read_text()
     finally:
         release.set()
         logger.removeHandler(handler)

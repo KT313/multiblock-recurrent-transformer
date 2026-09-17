@@ -7,7 +7,7 @@ Entry point for dataset preparation.
                                                 [--allow_foreign_raw]
                                                 [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
-                                                [--debug [SECONDS]]
+                                                [--debug [SECONDS]] [--debug-file PATH]
     python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
@@ -91,10 +91,11 @@ def _materialise(
     layout = DatasetLayout(args.dataset_dir)
 
     steps = all_steps if args.steps is None else tuple(args.steps)
+    debug_interval = args.debug if args.debug is not None else (5.0 if args.debug_file is not None else None)
     with (
-        profile_downloads(dry_run=args.dry_run, debug=args.debug) as profile,
+        profile_downloads(dry_run=args.dry_run, debug=debug_interval) as profile,
         open_preparation_dashboard(args, layout),
-        log_download_debug(profile, args.debug),
+        log_download_debug(profile, debug_interval, debug_file=args.debug_file),
     ):
         report = prepare_requested_steps(args, steps, layout, log=log)
         check_completion_for_full_run(args, steps, all_steps, report, layout, completeness)

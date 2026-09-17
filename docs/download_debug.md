@@ -8,6 +8,13 @@ Reports appear in the terminal/dashboard and the dataset's `build.log`. Each ide
 PID, process name, source, and instrumented thread name/native ID. The main coordinator, download
 threads, token workers, read callbacks, and spawned MinHash/decontamination workers are covered.
 
+Use `--debug-file tmp/download-debug.log` to also append the complete, plain-text overviews to a
+dedicated file. Parent directories are created and each overview is flushed immediately, so you can
+read it with `tail -f tmp/download-debug.log`. Existing contents are preserved. This includes reports
+from worker processes, all written by the parent. Dashboard and `build.log` output continue normally.
+`--debug-file` alone enables the default five-second interval; combine it with `--debug 2` to change
+the interval. A dry run creates no debug file or directories.
+
 Timings describe the **latest interval**, including unfinished operations (`active` and `oldest`).
 They are inclusive thread-wall times: nested stages and different threads overlap, so their sum can
 exceed the interval. User/kernel CPU seconds are process-wide, including native tokenizer threads.
