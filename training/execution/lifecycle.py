@@ -15,7 +15,7 @@ from training.data.dataset_resolver import ResolvedDataset
 from training.data.loader import RunDataloaders
 from training.data.ownership import main_rank_phase, training_dataset_access
 from training.execution.checkpoints import resolve_resume_checkpoint
-from training.execution.setup import build_stage_manager
+from training.execution.setup import build_stage_manager, get_run_directory
 from training.execution.state import ResumePoint, RunState
 from training.failure import FatalHandler, fatal_errors, handle_fatal_error
 from training.logger import RunLogger
@@ -43,7 +43,12 @@ def close_backend_on_exit(backend: Backend, on_fatal_error: FatalHandler | None)
 def open_training_dataset(settings: Settings, backend: Backend, on_fatal_error: FatalHandler | None) -> Iterator[DatasetLease | None]:
     """Keep dataset access and the run lock until readers close; fatal workers exit before release."""
 
-    with training_dataset_access(Path(settings.dataset_dir), Path(settings.out_dir), backend) as lease, fatal_errors(on_fatal_error):
+    with (
+        training_dataset_access(
+            Path(settings.dataset_dir), get_run_directory(settings), backend, shared=not settings.auto_prepare,
+        ) as lease,
+        fatal_errors(on_fatal_error),
+    ):
         yield lease
 
 

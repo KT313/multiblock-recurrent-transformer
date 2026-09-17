@@ -324,8 +324,8 @@ def test_prepare_exits_3_while_another_run_holds_the_build_lock(tmp_path: Path, 
         prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root)])
     assert exc.value.code == cli_runtime.EXIT_ALREADY_RUNNING
     err = capsys.readouterr().err
-    assert "data preparation expects one run at a time on this system; one is already running (started " in err
-    assert f"kill -INT {os.getpid()}" in err
+    assert str(root / ".build.lock") in err
+    assert "another operation holds a conflicting lock" in err
 
 
 def test_prepare_turns_the_tokenizer_thread_pool_on_unless_the_environment_says_otherwise(

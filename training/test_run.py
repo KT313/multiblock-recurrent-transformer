@@ -250,12 +250,12 @@ def test_train_refuses_a_run_directory_another_run_holds(
     tiny_settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    `train()` takes the `out_dir` lock right after creating the run directory and holds it for the whole run: a
-    second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
+    `train()` takes the `out_dir/run_name` lock right after creating the run directory and holds it for the whole run: a
+    second run pointed at the same run directory fails before it resolves the dataset, instead of sharing checkpoints,
     `train.log` and `run_config.json` with the first one.
     """
 
-    with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
+    with run_lock(get_run_directory(tiny_settings) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
     assert list(checkpoint_dir(get_run_directory(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
@@ -1643,8 +1643,35 @@ def test_dataset_conflict_precedes_resolution_and_model_setup(
     with build_lock(Path(tiny_settings.dataset_dir)), pytest.raises(RunLocked):
         train(tiny_settings, backend=cpu_backend)
     assert called == []
-    with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"):
+    with run_lock(get_run_directory(tiny_settings) / TRAIN_LOCK_NAME, "training"):
         pass  # dataset refusal also releases the output lock
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_training_lock_scope_and_dataset_mode(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, auto_prepare: bool,
+) -> None:
+    from dataclasses import replace
+    from training.execution.lifecycle import open_training_dataset
+
+    tiny_settings.auto_prepare = auto_prepare
+    other = replace(tiny_settings, run_name="independent", auto_prepare=False)
+    with open_training_dataset(tiny_settings, cpu_backend, None):
+        with pytest.raises(RunLocked), open_training_dataset(tiny_settings, cpu_backend, None):
+            pass  # the same run remains exclusive, even when its dataset is shared
+        if auto_prepare:
+            with pytest.raises(RunLocked), open_training_dataset(other, cpu_backend, None):
+                pass  # even prepared data stays exclusive when auto-prepare is enabled
+        else:
+            with (
+                open_training_dataset(other, cpu_backend, None),
+                pytest.raises(RunLocked), build_lock(Path(tiny_settings.dataset_dir)),
+            ):
+                pass
+            with pytest.raises(RunLocked), build_lock(Path(tiny_settings.dataset_dir)):
+                pass  # closing the second run did not release the first run's protection
+    with build_lock(Path(tiny_settings.dataset_dir)):
+        pass
 
 
 @pytest.mark.parametrize("overwrite,field", [

@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 import subprocess
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -17,12 +18,64 @@ import pytest
 from data_preparation.lib.build.lock import BUILD_LOCK_NAME, TRAIN_LOCK_NAME, DatasetLease, RunLocked, build_lock, dataset_lock, run_lock
 
 
-def test_build_lock_is_exclusive_and_names_the_holder(tmp_path: Path) -> None:
+def test_shared_readers_exclude_writers_until_last_reader_exits(tmp_path: Path) -> None:
+    path = tmp_path / BUILD_LOCK_NAME
+    path.write_text("old holder metadata must not be changed or trusted")
+    original = path.stat()
+    with ExitStack() as remaining:
+        with dataset_lock(tmp_path, "training", shared=True):
+            remaining.enter_context(dataset_lock(tmp_path, "training", shared=True))
+            with pytest.raises(RunLocked, match="conflicting lock") as error, build_lock(tmp_path):
+                pass
+            assert error.value.holder is None
+        with pytest.raises(RunLocked), build_lock(tmp_path):
+            pass
+    with build_lock(tmp_path), pytest.raises(RunLocked), dataset_lock(tmp_path, shared=True):
+        pass
+    assert path.read_text() == "old holder metadata must not be changed or trusted"
+    assert path.stat().st_mtime_ns == original.st_mtime_ns
+    assert path.stat().st_ino == original.st_ino
+
+
+def test_read_lease_cannot_be_borrowed_for_writing(tmp_path: Path) -> None:
+    with dataset_lock(tmp_path, shared=True) as lease:
+        with dataset_lock(tmp_path, shared=True, lease=lease) as borrowed:
+            assert borrowed is lease
+        with pytest.raises(ValueError, match="cannot authorize preparation"), dataset_lock(tmp_path, lease=lease):
+            pass
+    with dataset_lock(tmp_path) as lease:
+        with dataset_lock(tmp_path, shared=True, lease=lease) as borrowed:
+            assert borrowed is lease
+        with pytest.raises(RunLocked), dataset_lock(tmp_path, shared=True):
+            pass  # borrowing read access did not downgrade the exclusive lock
+
+
+@pytest.mark.timeout(15)
+def test_shared_lock_coexists_across_processes(tmp_path: Path) -> None:
+    script = "\n".join([
+        "import sys",
+        "from pathlib import Path",
+        "from data_preparation.lib.build.lock import dataset_lock, build_lock, RunLocked",
+        "root = Path(sys.argv[1])",
+        "with dataset_lock(root, shared=True):",
+        "    try:",
+        "        with build_lock(root): raise AssertionError('writer entered')",
+        "    except RunLocked: pass",
+    ])
+    with dataset_lock(tmp_path, shared=True):
+        subprocess.run([sys.executable, "-c", script, str(tmp_path)], check=True, timeout=10)
+        with pytest.raises(RunLocked), build_lock(tmp_path):
+            pass  # child exit did not release the parent's ownership
+    with build_lock(tmp_path):
+        pass
+
+
+def test_exclusive_run_lock_names_the_holder(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
-    with build_lock(root):
+    with run_lock(root / BUILD_LOCK_NAME, "data preparation"):
         record = json.loads((root / BUILD_LOCK_NAME).read_text())
         assert record["pid"] == os.getpid() and record["program"] == "data preparation" and "since" in record
-        with pytest.raises(RunLocked, match=f"pid {os.getpid()} on") as exc, build_lock(root):  # a second open conflicts
+        with pytest.raises(RunLocked, match=f"pid {os.getpid()} on") as exc, run_lock(root / BUILD_LOCK_NAME, "data preparation"):  # a second open conflicts
             pass
         message = str(exc.value)
         assert message.startswith("data preparation expects one run at a time on this system; one is already running (started 20")
@@ -43,7 +96,7 @@ def test_build_lock_blocks_another_process(tmp_path: Path) -> None:
     )
     try:
         assert holder.stdout is not None and holder.stdout.readline().strip() == "locked"
-        with pytest.raises(RunLocked, match=f"pid {holder.pid}"), build_lock(root):
+        with pytest.raises(RunLocked, match="conflicting lock"), build_lock(root):
             pass
     finally:
         assert holder.stdin is not None

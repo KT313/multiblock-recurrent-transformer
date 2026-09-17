@@ -76,7 +76,7 @@ def train(
     `started_at`: the caller's clock reading at the start of the run (`report.setup_seconds`).
     `keep_history`: a test knob; `report.history` then holds every log step's metric dict.
     `on_fatal_error`: launcher-owned CLI policy invoked before run-level cleanup; library callers leave it unset.
-    `out_dir` is locked for the whole run: a second run on the same `out_dir` fails with `RunLocked`.
+    `out_dir/run_name` is locked for the whole run: a second run on the same directory fails with `RunLocked`.
 
     Numerics: the setup order (module docstring) and the loop body (step, evaluation, then the checkpoint) are the
     thesis loop's; `test_golden_tiny_run` fails on any change. Evaluation runs under `torch.random.fork_rng`

@@ -50,6 +50,23 @@ Every rank runs the same `train()`; the differences are these.
   a `SignalException` traceback after a Ctrl-C, even when every rank stopped cleanly; the confirmation of a clean stop
   is rank 0's summary ("stopped on request after step N") and its checkpoint.
 
+## Concurrent training runs on shared storage
+
+Use distinct `run_name` values and `auto_prepare: false` in each run. The exclusive output lock lives at
+`<out_dir>/<run_name>/.train.lock`; the shared dataset lock lives at `<dataset_dir>/.build.lock`.
+Multiple read-only training runs may share a prepared dataset. Preparation requires an exclusive dataset lock,
+so it fails while any training reader is active, and training fails while preparation is active.
+
+`auto_prepare: true` retains exclusive dataset ownership for the entire run, even when the dataset is already
+prepared. It can still build missing data. With `auto_prepare: false`, missing data fails with a preparation command;
+training never upgrades its lock or prepares under shared access.
+
+Rank zero holds each run's locks through reader cleanup and the normal all-rank completion barrier. Fatal rank
+loss still relies on launcher teardown of peers. Locks are nonblocking and advisory; all processes must use the
+same dataset root and a filesystem that enforces locking across nodes. Test that behavior on the actual mount
+before relying on concurrent jobs. Do not delete or replace lock files. Dataset lock files contain no holder list.
+The old output-root lock is no longer used; avoid mixing old and new trainers targeting the same run directory.
+
 ## Resuming
 
 A checkpoint stores one RNG state per rank and the number of ranks. Resume with the same number of GPUs; a checkpoint

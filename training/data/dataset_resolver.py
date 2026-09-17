@@ -481,13 +481,17 @@ def resolve_dataset(
     settings: Settings, backend: Optional[_BuildBackend] = None, *, should_stop: StopCheck | None = None,
     dataset_lease: DatasetLease | None = None,
 ) -> ResolvedDataset:
-    """Resolve under exclusive ownership; standalone calls release on return, before later reader use.
+    """Resolve under shared ownership, or exclusive when auto-prepare is enabled.
+
+    Standalone calls release on return, before later reader use.
 
     Training must hold its own outer lease through loader cleanup and pass it here on rank zero. All ranks
     participate in acquisition and preparation status exchanges, including the already-complete fast path.
     """
 
-    with dataset_access(Path(settings.dataset_dir), backend, lease=dataset_lease) as owned:
+    with dataset_access(
+        Path(settings.dataset_dir), backend, lease=dataset_lease, shared=not settings.auto_prepare,
+    ) as owned:
         return _resolve_dataset(settings, backend, should_stop=should_stop, dataset_lease=owned)
 
 

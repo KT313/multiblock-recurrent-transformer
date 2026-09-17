@@ -783,7 +783,7 @@ def test_pending_sources_that_need_no_download_are_built_right_away(
 
 
 def test_prepare_fails_fast_while_another_build_holds_the_lock(layout: DatasetLayout, tmp_path: Path) -> None:
-    with build_lock(layout.root), pytest.raises(RunLocked, match=f"pid {os.getpid()}") as excinfo:
+    with build_lock(layout.root), pytest.raises(RunLocked, match="conflicting lock") as excinfo:
         prepare(TINY, layout.root, assume_yes=False)
     assert "remove" not in str(excinfo.value)  # the OS releases the lock when the holder dies
     assert not (layout.root / "sources").exists()
@@ -1263,16 +1263,25 @@ def test_changed_tokenizer_dry_run_and_status_never_acquire(
     assert _published_bytes(layout.root) == before
 
 
+@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("steps", [("tokenizer",), ("download",), ("build",)])
 def test_training_lease_excludes_every_preparation_mode(
-    layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, steps: tuple[str, ...]
+    layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, steps: tuple[str, ...], shared: bool,
 ) -> None:
     called: list[str] = []
     for name in ("prepare_planned_tokenizer", "perform_repairs", "reopen_sources", "download_and_build_missing"):
         monkeypatch.setattr(runner, name, lambda *a, **k: called.append("mutation"))
-    with dataset_lock(layout.root, "training"), pytest.raises(RunLocked, match="training"):
+    with dataset_lock(layout.root, "training", shared=shared), pytest.raises(RunLocked, match="conflicting lock"):
         prepare(TINY, layout.root, assume_yes=False, steps=steps)
     assert called == []
+
+
+def test_prepare_rejects_read_lease_before_writing(layout: DatasetLayout) -> None:
+    with dataset_lock(layout.root, shared=True) as lease:
+        before = _published_bytes(layout.root)
+        with pytest.raises(ValueError, match="cannot authorize preparation"):
+            prepare(TINY, layout.root, assume_yes=False, dataset_lease=lease)
+        assert _published_bytes(layout.root) == before
 
 
 def test_prepare_borrows_training_lease_without_unlocking(

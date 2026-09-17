@@ -72,19 +72,22 @@ def _main_rank_lock(
 
 @contextmanager
 def dataset_access(
-    root: Path, backend: OwnershipBackend | None = None, *, lease: DatasetLease | None = None
+    root: Path, backend: OwnershipBackend | None = None, *, lease: DatasetLease | None = None, shared: bool = False,
 ) -> Iterator[DatasetLease | None]:
     """Every rank participates; only rank zero acquires/borrows. Hold through all readers' cleanup."""
 
-    with _main_rank_lock(dataset_lock(root, "training", lease=lease), backend, complete=True) as owned:
+    with _main_rank_lock(dataset_lock(root, "training", lease=lease, shared=shared), backend, complete=True) as owned:
         yield owned
 
 
 @contextmanager
 def training_dataset_access(
-    root: Path, out_dir: Path, backend: OwnershipBackend
+    root: Path, run_directory: Path, backend: OwnershipBackend, *, shared: bool = False,
 ) -> Iterator[DatasetLease | None]:
     """Acquire output lock first, dataset lock second. Both refusals reach peers before dataset I/O."""
 
-    with _main_rank_lock(run_lock(out_dir / TRAIN_LOCK_NAME, "training"), backend), dataset_access(root, backend) as owned:
+    with (
+        _main_rank_lock(run_lock(run_directory / TRAIN_LOCK_NAME, "training"), backend),
+        dataset_access(root, backend, shared=shared) as owned,
+    ):
         yield owned

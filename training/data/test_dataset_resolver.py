@@ -690,7 +690,24 @@ def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path)
     assert build_command(str(TINY_DATASET_YAML), str(empty)) in message
     assert f"python data_preparation/prepare.py prepare --dataset_config {TINY_DATASET_YAML} --dataset_dir {empty}" in message
     assert "Missing: synthetic_pretrain, synthetic_instruct, tokenizer" in message and "raw missing" in message
-    assert {p.name for p in empty.iterdir()} == {".build.lock"}  # only ownership metadata was written
+    assert {p.name for p in empty.iterdir()} == {".build.lock"}  # only an empty coordination file was created
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_resolution_with_an_existing_reader(tiny_dataset_dir: Path, auto_prepare: bool) -> None:
+    from data_preparation.lib.build.lock import RunLocked, build_lock, dataset_lock
+
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=auto_prepare)
+    before = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in tiny_dataset_dir.rglob("*") if p.is_file()}
+    with dataset_lock(tiny_dataset_dir, shared=True):
+        if auto_prepare:
+            with pytest.raises(RunLocked):
+                resolve_dataset(settings)
+        else:
+            assert resolve_dataset(settings).train_sources
+        with pytest.raises(RunLocked), build_lock(tiny_dataset_dir):
+            pass
+    assert before == {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in tiny_dataset_dir.rglob("*") if p.is_file()}
 
 
 @pytest.mark.slow

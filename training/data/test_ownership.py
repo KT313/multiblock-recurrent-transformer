@@ -37,13 +37,13 @@ class _GlooBackend:
         dist.barrier()
 
 
-def _rank(rank: int, root: str, rendezvous: str, connection: Connection, mode: str) -> None:
+def _rank(rank: int, root: str, rendezvous: str, connection: Connection, mode: str, shared: bool) -> None:
     import torch.distributed as dist
 
     try:
         dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=8))
         backend = _GlooBackend(rank)
-        with training_dataset_access(Path(root), Path(root).parent / "output", backend) as lease:
+        with training_dataset_access(Path(root), Path(root).parent / "output", backend, shared=shared) as lease:
             assert (lease is not None) == backend.is_main
             connection.send("entered")
             if mode in {"setup_error", "cancelled"}:
@@ -67,13 +67,14 @@ def _rank(rank: int, root: str, rendezvous: str, connection: Connection, mode: s
 
 
 @pytest.mark.timeout(40)
+@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("mode", ["delayed", "conflict", "setup_error", "peer_error", "cancelled"])
-def test_gloo_dataset_lifetime(tmp_path: Path, mode: str) -> None:
+def test_gloo_dataset_lifetime(tmp_path: Path, mode: str, shared: bool) -> None:
     context = mp.get_context("spawn")
     connections = [context.Pipe() for _ in range(2)]
     root = tmp_path / "dataset"
     rendezvous = (tmp_path / "rendezvous").as_uri()
-    processes = [context.Process(target=_rank, args=(rank, str(root), rendezvous, pair[1], mode))
+    processes = [context.Process(target=_rank, args=(rank, str(root), rendezvous, pair[1], mode, shared))
                  for rank, pair in enumerate(connections)]
     held = build_lock(root) if mode == "conflict" else None
     if held is not None:

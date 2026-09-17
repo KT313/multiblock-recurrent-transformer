@@ -122,7 +122,7 @@ class Settings:
     # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
-    auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
+    auto_prepare: bool = True  # True: exclusive dataset access and auto-build; False: shared read-only access
     prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers)
     prepare_pass_workers: int = 4  # worker processes of each cleaning pass of the in-process build (--pass_workers)
     prepare_max_parallel_downloads: int = 2  # sources downloading at a time during the in-process build
