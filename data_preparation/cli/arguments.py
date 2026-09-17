@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import logging
 from collections.abc import Callable
 from functools import partial
@@ -75,11 +76,23 @@ def add_dataset_options(sub: argparse.ArgumentParser, *, config_default: Path | 
     sub.add_argument("--cache_dir", type=Path, default=None, help="HuggingFace cache directory (default: HF defaults)")
 
 
+def debug_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("debug interval must be a positive finite number of seconds") from error
+    if not math.isfinite(interval) or interval <= 0:
+        raise argparse.ArgumentTypeError("debug interval must be a positive finite number of seconds")
+    return interval
+
+
 def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] = STEPS) -> None:
     """
     The options prepare and download share; steps are the ones the command runs (all of them by default).
     """
 
+    sub.add_argument("--debug", nargs="?", const=5.0, default=None, type=debug_interval, metavar="SECONDS",
+                     help="log pipeline sections, ongoing waits and process CPU every SECONDS (default: 5); includes worker processes")
     sub.add_argument("--sources", nargs="+", default=None, metavar="NAME", help="only these sources")
     sub.add_argument("--steps", nargs="+", default=None, choices=steps, metavar="STEP", help=f"only these steps of {steps}")
     sub.add_argument("--reopen", nargs="+", default=None, metavar="NAME", help="clear the exhausted flag of these sources before planning (their loader has more rows now)")

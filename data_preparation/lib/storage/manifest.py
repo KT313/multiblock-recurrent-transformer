@@ -36,6 +36,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.download_profile import measured
 from data_preparation.lib.storage.atomic import write_atomically
 from data_preparation.lib.storage.parquet import shard_index
 
@@ -227,6 +228,7 @@ class Manifest:
         kwargs["extra"] = extra
         return cls(**kwargs)
 
+    @measured("publish_manifest")
     def save(self, directory: Path) -> Path:
         """
         Write directory/MANIFEST.json atomically (:func:`write_atomically`) and return its path.

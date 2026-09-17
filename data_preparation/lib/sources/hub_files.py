@@ -63,6 +63,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
+from data_preparation.lib.download_profile import active_profile, bind_profile, measure, measured
+
 import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.atomic import write_atomically
@@ -127,6 +129,7 @@ def configure_hub_http() -> None:
             _HUB_HTTP_CONFIGURED = True
 
 
+@measured("hub_metadata")
 def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
     """
     All file paths of a dataset repo at revision plus the commit hash that revision resolved to.
@@ -144,6 +147,7 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
     return [sibling.rfilename for sibling in info.siblings or []], str(info.sha)
 
 
+@measured("hub_metadata")
 def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> str:
     """
     The commit hash revision currently resolves to (the default branch's head when unset).
@@ -152,6 +156,7 @@ def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> s
     return repo_listing(repo_id, revision, token)[1]
 
 
+@measured("hub_metadata")
 def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
     """
     Sizes in bytes of the given repo files (batched HfApi.get_paths_info).
@@ -175,6 +180,7 @@ def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str 
     return sizes
 
 
+@measured("hub_cached_file")
 def hub_download(repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
     """
     Download one repo file into the Hub cache (no-op if cached) and return its local path.
@@ -589,9 +595,20 @@ class _CountingRaw(io.RawIOBase, BinaryIO):
         super().__init__()
         self._inner = inner
         self._stats = stats
+        # Capture the handle, not self: a stored bound method would form a buffer-retaining cycle.
+        def read_inner(size: int) -> bytes:
+            with measure("remote_read"):
+                data = inner.read(size)
+            profile = active_profile()
+            if profile is not None:
+                profile.record("remote_returned_bytes", 0, amount=len(data))
+                profile.record("remote_requested_bytes", 0, amount=max(0, size))
+            return data
+
+        self._read = inner.read if active_profile() is None else bind_profile(read_inner)  # Arrow can enter from a native IO thread
 
     def readinto(self, buffer: Any) -> int:
-        data = self._inner.read(len(buffer))
+        data = self._read(len(buffer))
         bytes_read = len(data)
         buffer[:bytes_read] = data
         self._stats.bytes_fetched += bytes_read
@@ -769,8 +786,16 @@ def row_group_batches(parquet: pq.ParquetFile, group: int, columns: list[str] | 
     their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded.
     """
 
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group]):
-        yield batch.to_pylist()
+    batches = parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group])
+    while True:
+        with measure("parquet_next_batch"):
+            try:
+                batch = next(batches)
+            except StopIteration:
+                return
+        with measure("arrow_to_python"):
+            rows = batch.to_pylist()
+        yield rows
 
 
 def project_row(row: Row, columns: list[str] | None) -> Row:

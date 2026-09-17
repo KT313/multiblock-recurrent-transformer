@@ -71,6 +71,7 @@ from data_preparation.lib.build.repair import (
 from data_preparation.lib.build.preparation import explain_unreadable_shards, open_preparation_scope, prepare_tokenizer_and_apply_repairs
 from data_preparation.lib.log import ROOT_LOGGER_NAME, get_logger
 from data_preparation.lib.progress import Progress
+from data_preparation.lib.download_profile import bind_profile, measure, profile_source
 from data_preparation.lib.sources.loaders import github_code_repo_key
 from data_preparation.lib.stages.benchmark_seeds import BenchmarkSeeds, load_benchmark_seeds
 from data_preparation.lib.stages.build import build_source
@@ -552,7 +553,7 @@ class JobPool:
         return self._bar
 
     def submit(self, job: Job) -> None:
-        self.futures[self._executor.submit(run_job, job, self.flag, self._running, self.bar)] = job
+        self.futures[self._executor.submit(bind_profile(run_job), job, self.flag, self._running, self.bar)] = job
 
     def cancel_queued(self) -> None:
         """
@@ -569,7 +570,8 @@ class JobPool:
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
         try:
-            self._executor.__exit__(exc_type, exc, tb)  # waits for the running jobs
+            with measure("job_pool_shutdown"):
+                self._executor.__exit__(exc_type, exc, tb)  # waits for the running jobs
         except KeyboardInterrupt:
             self._end_without_waiting()
         finally:
@@ -624,7 +626,8 @@ def run_job(job: Job, flag: StopFlag, running: RunningJobs, bar: Progress) -> No
     bar.set_postfix({"running": running.add(job.name)}, refresh=False)
     try:
         check_stop(flag.should_stop)  # a job dequeued after a failure or an interrupt does not start
-        job.action(flag.should_stop)
+        with profile_source(job.name), measure("job"):
+            job.action(flag.should_stop)
     except BuildAborted:
         log.info("%s %s stopped: %s", job.what, job.name, flag.reason or "stop requested")
         raise
@@ -648,7 +651,8 @@ def wait_for_jobs(pools: list[JobPool], flag: StopFlag) -> list[BaseException]:
     handled: set[Future[None]] = set()
     try:
         while unhandled := [future for pool in pools for future in pool.futures if future not in handled]:
-            done, _ = wait(unhandled, return_when=FIRST_COMPLETED)
+            with measure("wait_jobs"):
+                done, _ = wait(unhandled, return_when=FIRST_COMPLETED)
             for future in done:
                 handled.add(future)
                 pool = next(pool for pool in pools if future in pool.futures)

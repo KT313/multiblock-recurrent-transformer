@@ -51,6 +51,8 @@ from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
+from data_preparation.lib.download_debug import WorkerDebugOptions, initialize_worker_debug, measured_worker, worker_debug_options
+from data_preparation.lib.download_profile import measure
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
 from data_preparation.lib.stages.exact_dedup import SeenDocuments, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
@@ -508,12 +510,16 @@ _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 
 
-def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float) -> None:
+def _init_decontamination(
+    ngrams: dict[str, set[str]], n: int, threshold: float, debug: WorkerDebugOptions | None = None,
+) -> None:
     global _BENCHMARK_NGRAMS
     _BENCHMARK_NGRAMS = ngrams
     _DECONTAM.update({"n": n, "threshold": threshold})
+    initialize_worker_debug(debug, "decontamination")
 
 
+@measured_worker("decontamination")
 def _contaminated_by(text: str) -> list[str]:
     """
     Benchmarks text is contaminated by, using the worker-global n-grams of _init_decontamination.
@@ -546,7 +552,7 @@ class Decontaminator:
             return self
         self._ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
         if self.pass_workers > 1:
-            init_args = (self._ngrams, self.config.ngram, self.config.threshold)
+            init_args = (self._ngrams, self.config.ngram, self.config.threshold, worker_debug_options())
             self._pool = ProcessPoolExecutor(
                 max_workers=self.pass_workers,
                 mp_context=multiprocessing.get_context("spawn"),
@@ -557,7 +563,8 @@ class Decontaminator:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self._pool is not None:
-            self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for the queued chunks
+            with measure("worker_shutdown"):
+                self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for queued chunks
             self._pool = None
 
     def __call__(self, rows: Iterator[Row]) -> Iterator[Row]:
@@ -576,12 +583,15 @@ class Decontaminator:
 
         if self._pool is None:
             for row in rows:
-                yield row, check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
+                with measure("decontamination"):
+                    contaminated = check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
+                yield row, contaminated
             return
         for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
             try:
-                hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
+                with measure("worker_result_wait"):
+                    hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
             except BrokenProcessPool as error:
                 raise RuntimeError(
                     f"a decontamination worker died, likely OOM-killed ({error}); every worker holds its own copy of "

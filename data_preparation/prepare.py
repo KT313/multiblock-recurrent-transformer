@@ -7,6 +7,7 @@ Entry point for dataset preparation.
                                                 [--allow_foreign_raw]
                                                 [--num_workers N] [--pass_workers N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
+                                                [--debug [SECONDS]]
     python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
     python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
     python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml   # Markdown to stdout
@@ -59,6 +60,8 @@ from data_preparation.cli.commands import (  # noqa: E402
 )
 from data_preparation.cli.runtime import configure_interrupt_handling, handle_command_errors  # noqa: E402
 from data_preparation.lib.layout import DatasetLayout  # noqa: E402
+from data_preparation.lib.download_profile import profile_downloads  # noqa: E402
+from data_preparation.lib.download_debug import log_download_debug  # noqa: E402
 from data_preparation.lib.build.planner import DatasetReport  # noqa: E402
 from data_preparation.lib.build.runner import STEPS  # noqa: E402
 from data_preparation.lib.log import configure_logging, get_logger  # noqa: E402
@@ -88,7 +91,11 @@ def _materialise(
     layout = DatasetLayout(args.dataset_dir)
 
     steps = all_steps if args.steps is None else tuple(args.steps)
-    with open_preparation_dashboard(args, layout):
+    with (
+        profile_downloads(dry_run=args.dry_run, debug=args.debug) as profile,
+        open_preparation_dashboard(args, layout),
+        log_download_debug(profile, args.debug),
+    ):
         report = prepare_requested_steps(args, steps, layout, log=log)
         check_completion_for_full_run(args, steps, all_steps, report, layout, completeness)
 

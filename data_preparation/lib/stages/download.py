@@ -57,6 +57,7 @@ from tempfile import TemporaryDirectory
 from typing import Any, Literal, NamedTuple
 
 from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, describe_hash_change
+from data_preparation.lib.download_profile import measure_rows, profile_source
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
@@ -559,7 +560,7 @@ def download(
     log.info("%s: fetching %d rows from offset %d -> %s", name, increment.rows_to_keep, folder.rows_fetched, folder.directory)
     loader = get_loader(increment.source.loader)
     fetch_stats = FetchStats()
-    with open_download_progress([increment], name, fetch_stats) as (bar, postfix):
+    with profile_source(name), open_download_progress([increment], name, fetch_stats) as (bar, postfix):
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats,
             columns=loader_columns(increment.source),
@@ -569,7 +570,8 @@ def download(
         _fetch([increment], _tagged(name, rows), bar, postfix, shard_size, gate)
 
     # Publish final progress after the fetch and its cleanup succeeded.
-    _finish_increment(folder, increment.source, increment.counters)
+    with profile_source(name):
+        _finish_increment(folder, increment.source, increment.counters)
     _log_increment(name, increment.counters, folder.manifest)
     return folder.manifest
 
@@ -719,7 +721,7 @@ def _fetch(
         worker = _TokenWorker(",".join(writers), writers, bar, gate)
 
         # Keep the row dispatch loop visible; settle instruction batches before reading past their target.
-        for name, raw in rows:
+        for name, raw in measure_rows(rows):
             if worker.failed:
                 worker.drain()  # raises: stop pulling rows for a worker that stores nothing anymore
             increment = open_increment_writer(name, increments, increments_by_name, writers, shard_size)
@@ -806,7 +808,7 @@ def download_github_code_group(
         increments.append(extra)
         return language_request(extra.name, language, extra.folder.rows_fetched, 0, passive=True)
 
-    with open_download_progress(increments, f"{repo} ({len(increments)} languages)", fetch_stats) as (bar, postfix):
+    with profile_source(",".join(names)), open_download_progress(increments, f"{repo} ({len(increments)} languages)", fetch_stats) as (bar, postfix):
         shared_parameters = SharedLoaderParameters(
             token=hf_token, index_dir=layout.hub_index_dir(), on_file=postfix.on_file, stats=fetch_stats, columns=columns,
             download_prefetch_mb=config.download_prefetch_mb,
@@ -820,7 +822,8 @@ def download_github_code_group(
 
     # Finalize member counters only after the whole shared pass succeeded.
     for increment in increments:
-        _finish_increment(increment.folder, increment.source, increment.counters)
+        with profile_source(increment.name):
+            _finish_increment(increment.folder, increment.source, increment.counters)
         _log_increment(increment.name, increment.counters, increment.folder.manifest)
     _log_surplus(repo, names, increments)
     return results

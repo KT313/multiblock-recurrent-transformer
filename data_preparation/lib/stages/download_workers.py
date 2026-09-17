@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from types import TracebackType
 
 from data_preparation.lib.abort import BuildAborted, StopCheck
+from data_preparation.lib.download_profile import active_profile, bind_profile, measure, profile_source
 from data_preparation.lib.progress import Progress
 from data_preparation.lib.sources.loaders import Row
 from data_preparation.lib.stages.download_state import StoredRow, _Increment
@@ -108,7 +109,7 @@ class _TokenWorker:
         self._storing = True  # False after an error other than the stop: the queued batches are settled unstored
         self._raised = False
         self._stopped = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=f"tokenize:{name}")
+        self._thread = threading.Thread(target=bind_profile(self._run), name=f"tokenize:{name}")
         self._thread.start()
 
     @property
@@ -130,14 +131,16 @@ class _TokenWorker:
         if not batch:
             return
         increment.submitted += len(batch)
-        self._queue.put((increment, batch))
+        with measure("queue_put"):
+            self._queue.put((increment, batch))
 
     def drain(self) -> None:
         """
         Wait until every submitted batch is stored (or dropped), then raise the worker's failure if it has one.
         """
 
-        self._queue.join()
+        with measure("queue_drain"):
+            self._queue.join()
         self._raise_failure()
 
     def close(self) -> None:
@@ -146,8 +149,9 @@ class _TokenWorker:
         worker's failure if it was not raised before.
         """
 
-        self._queue.put(None)
-        self._thread.join()
+        with measure("token_worker_shutdown"):
+            self._queue.put(None)
+            self._thread.join()
         self._raise_failure()
 
     def __enter__(self) -> _TokenWorker:
@@ -180,14 +184,26 @@ class _TokenWorker:
 
     def _process(self) -> None:
         while True:
-            item = self._queue.get()
+            with measure("queue_get"):
+                item = self._queue.get()
             try:
                 if item is None:
                     return
                 increment, batch = item
                 if self._storing:
                     try:
-                        _store(increment, self._writers[increment.name], increment.token_step.tokenize(batch), self._bar, self._gate)
+                        with profile_source(increment.name):
+                            with measure("tokenize_batch"):
+                                stored = increment.token_step.tokenize(batch)
+                            try:
+                                with measure("store_batch"):
+                                    _store(increment, self._writers[increment.name], stored, self._bar, self._gate)
+                                profile = active_profile()
+                                if profile is not None:
+                                    profile.record("stored_rows", 0, amount=len(stored))
+                                    profile.record("stored_tokens", 0, amount=sum(row["tokens"] for row, _ in stored))
+                            finally:
+                                del stored  # release on failures too; never retain across queue.get
                     except BuildAborted as stop:  # the gate is suspended now: keep storing what is queued
                         self._remember_failure(stop)
                     except BaseException as error:  # noqa: BLE001  # whatever it is, the fetch thread re-raises it

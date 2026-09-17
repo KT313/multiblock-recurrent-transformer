@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from data_preparation.lib.log import get_logger
+from data_preparation.lib.download_profile import measure, measured
 from data_preparation.lib.storage.atomic import write_atomically
 
 log = get_logger(__name__)
@@ -120,16 +121,18 @@ class ShardWriter:
                 existing.unlink()
 
 
+@measured("publish_shard")
 def publish_shard(table: pa.Table, path: Path) -> Path:
     """
     Write table to path atomically (:func:`write_atomically`) and return path.
     """
 
-    with write_atomically(path) as tmp:
+    with write_atomically(path) as tmp, measure("parquet_compress_write"):
         pq.write_table(table, tmp, compression=SHARD_COMPRESSION)
     return path
 
 
+@measured("build_arrow_table")
 def build_row_table(rows: list[dict[str, Any]]) -> pa.Table:
     """Publish canonical messages with a stable nested type, including empty message lists."""
     table = pa.Table.from_pylist(rows)

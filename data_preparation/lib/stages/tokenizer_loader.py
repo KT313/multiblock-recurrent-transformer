@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from tokenizers import Encoding, Tokenizer
+from data_preparation.lib.download_profile import measured
 
 SPECIAL_TOKEN_NAMES = ("bos_token", "eos_token", "pad_token", "unk_token")
 
@@ -86,12 +87,14 @@ class SavedTokenizer:
     def encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text, add_special_tokens=False).ids
 
+    @measured("encode_batch")
     def encode_batch(self, texts: list[str]) -> list[Encoding]:
         """
         One `Encoding` (ids, offsets) per text; an empty list gives an empty list.
         """
 
         return self._tokenizer.encode_batch(texts, add_special_tokens=False)
+
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         return self._tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)

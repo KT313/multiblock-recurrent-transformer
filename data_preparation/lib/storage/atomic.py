@@ -16,10 +16,12 @@ import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from data_preparation.lib.download_profile import measure, measured
 
 TEMP_SUFFIX = ".tmp"
 
 
+@measured("directory_sync")
 def _fsync_directory(directory: Path) -> None:
     """
     Persist the rename itself: the new file's bytes are on disk after its own fsync, but the directory entry that
@@ -78,10 +80,12 @@ def write_atomically(path: Path | str, *, suffix: str = TEMP_SUFFIX) -> Iterator
             # could otherwise leave the renamed file empty (a directory's files are the caller's concern)
             fd = os.open(temporary, os.O_RDONLY)
             try:
-                os.fsync(fd)
+                with measure("file_sync"):
+                    os.fsync(fd)
             finally:
                 os.close(fd)
-        os.replace(temporary, target)
+        with measure("atomic_rename"):
+            os.replace(temporary, target)
         _fsync_directory(target.parent)
     except BaseException:
         _remove(temporary)
