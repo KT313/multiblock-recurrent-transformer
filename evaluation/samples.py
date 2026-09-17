@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from evaluation.prompts import DEFAULT_PROMPTS, Prompt
 from evaluation.rng import seed_model_rng
@@ -22,7 +22,7 @@ from evaluation.sample_helpers import (
     save_generated_samples,
     select_fitting_prompts,
 )
-from evaluation.session import inference_session
+from evaluation.session import InferenceSession, inference_session
 from evaluation.wrapper import Recurrence, check_recurrence
 from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
@@ -87,26 +87,28 @@ def generate_samples(
     # generate each prompt batch inside one isolated inference session
     with inference_session(model, recurrence, seed=seed, execution_policy=execution_policy) as session:
         wrapper = session.hf_wrapper(tokenizer)
-        generate = cast(Any, wrapper).generate  # set dynamically by transformers, invisible to the type checkers
-        device = session.device
         for start in range(0, len(fitting), batch_size):
-            # prepare the left-padded inputs and sampling options
-            batch = fitting[start : start + batch_size]
-            input_ids, attention_mask, width = build_prompt_batch(batch, tokenizer.pad_id)
-            sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
-
-            # generate from this batch's independent seed
-            seed_model_rng(seed + start, device)  # prior batches cannot affect latent or token sampling streams
-            output = generate(
-                input_ids.to(device), attention_mask=attention_mask.to(device), max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.pad_id, eos_token_id=tokenizer.eos_id, use_cache=use_cache,
-                logits_to_keep=1 if use_cache else 0, **sampling,
-            )
-
-            # decode only the generated suffix of each row
-            for row, (prompt, _) in enumerate(batch):
-                samples.append(decode_generated_sample(prompt, output[row, width:].tolist(), tokenizer, recurrence))
+            samples.extend(generate_prompt_batch(
+                session, wrapper, tokenizer, fitting[start:start + batch_size], recurrence=recurrence,
+                seed=seed + start, max_new_tokens=max_new_tokens, temperature=temperature, use_cache=use_cache,
+            ))
     return samples
+
+
+def generate_prompt_batch(
+    session: InferenceSession, wrapper: Any, tokenizer: Tokenizer, batch: list[tuple[Prompt, list[int]]], *,
+    recurrence: Recurrence, seed: int, max_new_tokens: int, temperature: float, use_cache: bool,
+) -> list[GeneratedSample]:
+    input_ids, attention_mask, width = build_prompt_batch(batch, tokenizer.pad_id)
+    sampling = {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
+    seed_model_rng(seed, session.device)
+    output = wrapper.generate(
+        input_ids.to(session.device), attention_mask=attention_mask.to(session.device), max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.pad_id, eos_token_id=tokenizer.eos_id, use_cache=use_cache,
+        logits_to_keep=1 if use_cache else 0, synced_gpus=False, **sampling,
+    )
+    return [decode_generated_sample(prompt, output[row, width:].tolist(), tokenizer, recurrence)
+            for row, (prompt, _) in enumerate(batch)]
 
 
 def generate_and_save_samples(

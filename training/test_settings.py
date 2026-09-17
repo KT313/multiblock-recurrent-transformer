@@ -671,3 +671,8 @@ def test_yaml_invalid_optimizer_fails_before_nonexistent_dataset_or_model(
         parse_settings(["--config", str(path), "--dataset_config", "missing-data.yaml",
                         "--model_architecture_config", "missing-model.yaml"])
     assert "betas" in str(error.value) + capsys.readouterr().err
+
+
+def test_sample_batch_size_defaults_and_changes() -> None:
+    assert _settings().sample_batch_size == 8
+    assert _settings(sample_batch_size=1).sample_batch_size == 1

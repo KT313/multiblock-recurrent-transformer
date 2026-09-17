@@ -12,6 +12,7 @@ Writes `samples/step-XXXXXXXX.jsonl` and `benchmarks/step-XXXXXXXX.json` into th
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -39,6 +40,8 @@ __all__ = [
 
 def main(argv: list[str] | None = None) -> int:
     # parse arguments and restore the checkpoint's evaluation inputs
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise ValueError("standalone evaluation is single-device; use scheduled training evaluation for DDP")
     arguments = parse_arguments(argv)
     evaluation = load_checkpoint_evaluation(arguments)
     print(f"checkpoint {evaluation.checkpoint} (step {evaluation.step}) on {arguments.device}; output under {evaluation.out_dir}")

@@ -644,3 +644,9 @@ def test_invalid_optimizer_metadata_fails_before_restore(
     assert opt.param_groups[0] is original_group
     saved_value = backend.load_checkpoint(path)["optimizer"]["param_groups"][0][key]
     assert repr(saved_value) == repr(value)  # rejected checkpoint remains intact
+
+
+def test_sample_batch_size_allows_legacy_checkpoint_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("sample_batch_size", None)
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42, sample_batch_size=1), tiny_model.config.to_dict(), False)

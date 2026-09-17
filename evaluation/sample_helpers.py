@@ -12,6 +12,7 @@ import torch
 
 from data_preparation.lib.log import get_logger
 from evaluation.prompts import Prompt
+from evaluation.publication import open_atomic_output
 from evaluation.wrapper import Recurrence
 from model.execution import ExecutionPolicy
 from training.data.tokenizer import Tokenizer
@@ -88,6 +89,6 @@ def save_generated_samples(
     if execution_policy is not None:
         decoding["execution_precision"] = execution_policy.precision
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as file:
+    with open_atomic_output(out_path) as file:
         for sample in samples:
             file.write(json.dumps({"step": step, **asdict(sample), "decoding": decoding}, ensure_ascii=False) + "\n")

@@ -55,6 +55,7 @@ POSITIVE_SETTINGS: dict[str, str] = {
     "micro_batches_per_step": "packs per optimizer step; 0 or less makes the micro-batch loop of a step run zero times",
     "validation_batch_size": "rows per validation forward",
     "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
+    "sample_batch_size": "prompts per fixed sample-generation batch",
     "sample_max_new_tokens": "tokens generated per sample prompt",
     "benchmark_batch_size": "sequences per lm-eval forward",
 }
@@ -188,6 +189,7 @@ class Settings:
     # {run dir}/samples/ and {run dir}/benchmarks/, named by step.
     sample_step_interval: int = 0  # write samples every this many steps (0: never)
     sample_at_training_progress: list[float] = field(default_factory=lambda: [100.0])  # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+    sample_batch_size: int = 8
     sample_max_new_tokens: int = 64
     sample_use_cache: bool = True  # fixed per-token/core latents and per-recurrence K/V; False: legacy prefix resampling
     sample_temperature: float = 0.0  # 0: greedy decoding

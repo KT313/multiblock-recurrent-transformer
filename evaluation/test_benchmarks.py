@@ -40,6 +40,9 @@ def stub_lm_eval(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None
     A fake `lm_eval` package in `sys.modules` recording the `HFLM` and `simple_evaluate` arguments.
     """
 
+    import evaluation.benchmark_model  # noqa: F401
+    import torch
+
     calls: dict[str, Any] = {}
     package = types.ModuleType("lm_eval")
     models = types.ModuleType("lm_eval.models")
@@ -48,6 +51,8 @@ def stub_lm_eval(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None
     class HFLM:
         def __init__(self, **kwargs: Any) -> None:
             calls["hflm"] = kwargs
+            self.rank, self.world_size = 0, 1
+            self.device = torch.device("cpu")
 
     def simple_evaluate(**kwargs: Any) -> dict[str, Any]:
         calls["evaluate"] = kwargs

@@ -1502,14 +1502,13 @@ def test_samples_during_and_after_training_leave_the_numerics_unchanged(
 
 
 @pytest.mark.slow
-def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
+def test_benchmarks_during_training_publish_results_and_propagate_failure(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     With a stubbed lm_eval, on the 13-step config: benchmarks every 10 steps and at the end write
     `benchmarks/step-XXXXXXXX.json`, the scores reach the report, the JSON report and the log; a harness that raises
-    at every step leaves the run going on with a warning and no scores (three steps, then a stop request: the
-    failure at steps 1 and 2 did not end the run).
+    during a requested evaluation terminates the run without publishing partial scores.
     """
 
     from evaluation.benchmarks import flatten_results
@@ -1537,11 +1536,9 @@ def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
         tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", export_to_hf=False,
         sample_at_training_progress=[], benchmark_step_interval=1, benchmark_at_training_progress=[], benchmark_tasks=["arc_easy"],
     )
-    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 3), keep_history=True)
-    assert failing.completed_steps == 3 and failing.last_benchmarks == {} and failing.stopped
+    with pytest.raises(RuntimeError, match="no network"):
+        train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, keep_history=True)
     assert not (tmp_path / "failing" / "out" / "tiny" / "benchmarks").exists()
-    log_text = (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
-    assert log_text.count("benchmark evaluation failed: no network") == 2  # steps 1 and 2; the stop skips step 3's
 
 
 def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs(tmp_path: Path, tiny_dataset_dir: Path) -> None:

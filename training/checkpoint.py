@@ -188,6 +188,7 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # samples and benchmarks: RNG-isolated inference, files next to the checkpoints
     "sample_step_interval",
     "sample_at_training_progress",
+    "sample_batch_size",
     "sample_max_new_tokens",
     "sample_temperature",
     "sample_use_cache",

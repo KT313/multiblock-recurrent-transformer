@@ -103,6 +103,7 @@ export_hf_path: null                 # target of the export; null: {out_dir}/{ru
 # {run dir}/benchmarks/, named by step. Benchmarks need the eval extra (uv sync --extra eval) and network.
 sample_step_interval: 0              # write sample generations every this many steps (0: never)
 sample_at_training_progress: [100]   # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+sample_batch_size: 8                 # fixed prompts per sample batch; 1 exposes more GPU jobs
 sample_max_new_tokens: 64            # tokens generated per prompt
 sample_use_cache: true              # fixed per-token/core latents and per-recurrence K/V; false: legacy resampling
 sample_temperature: 0.0              # 0: greedy decoding
