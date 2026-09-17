@@ -962,6 +962,46 @@ def test_build_stops_at_rows_target_and_resumes_to_a_larger_one(
     assert [r["text"] for r in read_rows(processed)] == texts
 
 
+@pytest.mark.parametrize("complete", [False, True])
+def test_satisfied_budget_skips_workers_and_still_finishes_generation(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch, complete: bool,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(8)], with_tokenizer,
+                   write=write_local, shard_size=2)
+    first = build_source(cfg, "s", layout, rows_target=2)
+    first.generation_complete = complete
+    first.save(layout.processed_dir("s"))
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a satisfied source must not open its row pipeline or start workers")
+
+    monkeypatch.setattr(stages_build, "_shard_workers", unexpected)
+    monkeypatch.setattr(stages_build.RowPipeline, "__enter__", unexpected)
+    again = build_source(cfg, "s", layout, rows_target=2, pass_workers=2)
+    assert again.generation_complete
+    assert (again.shards, again.input_shards, again.stats) == (first.shards, first.input_shards, first.stats)
+
+
+def test_reaching_budget_does_not_queue_replacement_read_ahead(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _prepare(cfg_factory, layout, local_dir, [_words(6, i) for i in range(10)], with_tokenizer,
+                   write=write_local, shard_size=2)
+    queued: list[int] = []
+    original = ShardWorkers.prepare
+
+    def record(self: ShardWorkers, index: int, raw_path: Path) -> None:
+        queued.append(index)
+        original(self, index, raw_path)
+
+    monkeypatch.setattr(ShardWorkers, "prepare", record)
+    result = build_source(cfg, "s", layout, rows_target=3, pass_workers=2)
+    assert result.rows() == 4 and len(result.input_shards) == 2
+    assert queued == [0, 1, 2], "initial lookahead plus shard zero's replacement, but none after reaching the target"
+
+
 def test_an_all_at_once_build_ignores_rows_target(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep
 ) -> None:

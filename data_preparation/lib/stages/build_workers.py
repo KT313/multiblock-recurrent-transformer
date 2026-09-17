@@ -13,14 +13,15 @@ manifest in the build thread; the text never crosses a process boundary:
    path, in the same order); the surviving texts, clamped token counts and hashes stay in the worker, the hashes
    and the filter statistics come back (:class:`PreparedShard`).
 2. The build thread runs the Bloom filter over the hashes (first occurrence wins) and asks the same worker to
-   `write(index, keep, ...)` the kept rows as processed shards (`build_row_table` + `publish_shard`, the calls of
-   `ProcessedOutput.publish`), then records them in the manifest exactly as before.
+   `write(index, keep, ...)` the kept rows into private staging files. The parent atomically publishes these files
+   under the dataset lock, then records them in the manifest exactly as before.
 
 Raw shard k belongs to worker k % processes (each worker is a single-process executor, so a follow-up task lands
 in the process that holds the rows). One prepare per worker is in flight; the next one is queued behind the
 write, so a worker holds one shard's rows at a time and works on while the build thread waits for the write and
-saves the manifest. Nothing is written until the build thread asks, so a stop or a failure still loses at most
-one raw shard, as in the in-thread path; queued prepares are cancelled at shutdown. Spawn, not fork, for the
+saves the manifest. Workers never write final shard paths: after a forced parent exit they can only leave private
+files in a unique invocation directory, never overwrite a replacement build's output. Normal shutdown joins workers
+before removing that directory; abandoned directories are not reused. Queued prepares are cancelled at shutdown. Spawn, not fork, for the
 reason given at `build.Decontaminator`; a killed worker surfaces as a named RuntimeError. The workers report
 into the `--debug` overview as `source=<name>/build`.
 """
@@ -28,10 +29,12 @@ into the `--debug` overview as `source=<name>/build`.
 from __future__ import annotations
 
 import multiprocessing
+import shutil
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import TypeVar
 
 import pyarrow.parquet as pq
@@ -40,6 +43,8 @@ from data_preparation.lib.download_debug import WorkerDebugOptions, initialize_w
 from data_preparation.lib.download_profile import measure
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import check_quality, preprocess_batch
+from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.storage.ownership import BuildWorkspace
 from data_preparation.lib.storage.parquet import build_row_table, publish_shard, shard_name
 
 T = TypeVar("T")
@@ -86,6 +91,7 @@ class ShardWorkers:
         self.source = source
         self._pools: list[ProcessPoolExecutor] = []
         self._prepared: dict[int, Future[PreparedShard]] = {}
+        self._scratch: Path | None = None
 
     def __enter__(self) -> ShardWorkers:
         context = multiprocessing.get_context("spawn")
@@ -102,6 +108,10 @@ class ShardWorkers:
                 pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for queued shards
         self._pools = []
         self._prepared.clear()
+        # Only clean after every worker has joined. A forced exit leaves a unique, never-reused private directory.
+        if self._scratch is not None:
+            shutil.rmtree(self._scratch)
+            self._scratch = None
 
     def prepare(self, index: int, raw_path: Path) -> None:
         """
@@ -122,17 +132,28 @@ class ShardWorkers:
         self, index: int, keep: list[int], directory: Path, first_shard: int, shard_size: int, *, next_raw_path: Path | None,
     ) -> list[WrittenShard]:
         """
-        Publish the rows keep (indices into the prepared rows of raw shard index) as processed shards of at most
-        shard_size rows named from first_shard on in directory, and return them for the manifest. next_raw_path,
+        Stage the rows keep in the worker, then publish in this parent process and return their manifest entries.
+        Shards have at most shard_size rows and are named from first_shard on in directory. next_raw_path,
         if given, is raw shard index + processes, queued on the same worker behind the write.
         """
 
         pool = self._pool(index)
-        future = pool.submit(_write_shard, index, keep, str(directory), first_shard, shard_size, self.source.name)
+        if self._scratch is None:
+            workspace = BuildWorkspace(directory)
+            staging_root = workspace.path("temporary").parent / "shard-workers"
+            workspace.check(staging_root)
+            staging_root.mkdir(parents=True, exist_ok=True)
+            self._scratch = Path(mkdtemp(prefix="build-", dir=staging_root))
+        future = pool.submit(_write_shard, index, keep, str(self._scratch), first_shard, shard_size, self.source.name)
         if next_raw_path is not None:
             self.prepare(index + self.processes, next_raw_path)
         with measure("worker_result_wait"):
-            return _result(future)
+            written = _result(future)
+        for name, _, _ in written:
+            # Reuse file fsync, atomic rename and directory fsync; moving the staged file copies no row data.
+            with write_atomically(directory / name) as temporary:
+                (self._scratch / name).replace(temporary)
+        return written
 
     def _pool(self, index: int) -> ProcessPoolExecutor:
         if not self._pools:

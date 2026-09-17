@@ -332,12 +332,18 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
   satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
   budget, or a lower measured tokens-per-row rate, builds the next shards. **Shard workers**: with `--pass_workers`
   above 1 (and decontamination off) the raw shards are read, length- and quality-filtered, hashed and written as
-  processed shards in that many spawn processes (`lib/stages/build_workers.py`, raw shard k on worker
-  k % pass_workers, one shard per worker ahead of the loop); only the hashes come back, the Bloom dedup, the
-  statistics, the manifest and the stop check stay in the build thread, so the rows, shard boundaries and resume
+  private staged shards in that many spawn processes (`lib/stages/build_workers.py`, raw shard k on worker
+  k % pass_workers, one shard per worker ahead of the loop); only the hashes and file metadata come back. The
+  parent publishes the staged files with atomic renames under the dataset lock; the Bloom dedup, statistics,
+  manifest and stop check also stay in the build thread, so the rows, shard boundaries and resume
   points are exactly those of the in-thread path (tested byte for byte). The build threads share one GIL and
   everything per row holds it (eight in-thread builds measured 1.1 busy cores together), which is why this is the
-  setting that makes the build stage use the machine.
+  setting that makes the build stage use the machine. Each invocation has a unique directory under
+  `.build-work/processed/<source>/shard-workers/`, cleaned after its workers join. Forced parent exit can leave
+  private files there, but surviving workers cannot publish into a replacement run; abandoned directories are
+  never reused or automatically removed while old workers might still write. Staging and processed output must
+  be on the same filesystem for atomic promotion. A source already serving its row budget starts no shard
+  workers; an active build stops queuing replacement read-ahead when its current shard will satisfy the budget.
 - **whole-source publication** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw
   shard is streamed through the existing processing pipeline, with results written into
   `.build-work/processed/<source>/temporary` and renamed into place only when complete; a top-up rebuilds the

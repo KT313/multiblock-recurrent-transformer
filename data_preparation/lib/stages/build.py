@@ -16,8 +16,8 @@ Two write modes:
   resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
   dedup.bloom_memory_mb) is refilled from the hash column of the processed shards at the start of every
   build, so the rows kept are exactly those of one full pass. With pass_workers > 1 (and no decontamination) the
-  raw shards are read, filtered, hashed and written in that many worker processes (`build_workers.py`); the dedup,
-  the statistics and the manifest stay in the build thread, and the rows, shards and stop points are the same.
+  raw shards are read, filtered, hashed and staged in that many worker processes (`build_workers.py`); final file
+  publication, dedup, statistics and the manifest stay in the build thread, with the same rows and shard boundaries.
 * whole-source publication (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash):
   every raw shard is streamed through the filters. Shuffling uses a bounded-cache SQLite index on disk;
   MinHash still retains rows and its LSH index in memory. Results are written into a private owned build slot
@@ -129,18 +129,22 @@ def build_source(
     log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
 
     # process shards without changing the publication and stop boundaries
-    pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
-    pending_rows = sum(shard.rows for shard in pending)
-    with (
-        pipeline,
-        progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar,
-        _shard_workers(pipeline, all_at_once=all_at_once) as workers,
-    ):
-        pipeline.bar = bar
-        if all_at_once:
-            _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
-        else:
-            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target, workers)
+    if not all_at_once and rows_target is not None and output.manifest.rows() >= rows_target:
+        log.info("%s: %d processed rows serve the budget of %d; %d raw shard(s) left unbuilt",
+                 name, output.manifest.rows(), rows_target, len(pending))
+    else:
+        pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
+        pending_rows = sum(shard.rows for shard in pending)
+        with (
+            pipeline,
+            progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar,
+            _shard_workers(pipeline, all_at_once=all_at_once) as workers,
+        ):
+            pipeline.bar = bar
+            if all_at_once:
+                _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
+            else:
+                _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target, workers)
 
     # record the measured filter load and complete the generation
     if seen is not None:
@@ -205,7 +209,7 @@ def _build_per_raw_shard(
             survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
             output.publish(survivors, shard_size)
         else:
-            _publish_prepared(pipeline, workers, index - 1, pending, raw_dir, output, shard_size)
+            _publish_prepared(pipeline, workers, index - 1, pending, raw_dir, output, shard_size, rows_target)
         output.save([*output.manifest.input_shards, [shard.name, shard.rows]])
         first_row_index += shard.rows
         check_stop(should_stop)
@@ -213,6 +217,7 @@ def _build_per_raw_shard(
 
 def _publish_prepared(
     pipeline: RowPipeline, workers: ShardWorkers, index: int, pending: list[ShardInfo], raw_dir: Path, output: ProcessedOutput, shard_size: int,
+    rows_target: int | None,
 ) -> None:
     """
     Raw shard pending[index] through the workers: its hashes and filter counts (prepared earlier) into the
@@ -226,7 +231,8 @@ def _publish_prepared(
     pipeline._advance(pending[index].rows)
     keep = _new_hashes(prepared.hashes, pipeline.seen, pipeline.stats["dedup"])
     following = index + workers.processes
-    next_raw_path = raw_dir / pending[following].name if following < len(pending) else None
+    needs_more = rows_target is None or output.manifest.rows() + len(keep) < rows_target
+    next_raw_path = raw_dir / pending[following].name if following < len(pending) and needs_more else None
     written = workers.write(index, keep, output.directory, len(output.manifest.shards), shard_size, next_raw_path=next_raw_path)
     for name, rows, tokens in written:
         output.manifest.add_shard(name, rows, tokens)
