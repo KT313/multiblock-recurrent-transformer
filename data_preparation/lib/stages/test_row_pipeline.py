@@ -4,6 +4,7 @@ Tests for data_preparation.lib.stages.row_pipeline: length filter batches, quali
 instruct inversions and field checks.
 """
 
+import re
 from typing import Any
 
 import pyarrow as pa
@@ -139,6 +140,33 @@ def test_normalize_text_and_ngram_set() -> None:
     assert rp.normalize_text("  Hello\n\tWORLD  x ") == "hello world x"
     assert rp.get_ngram_set("A b C d", n=2) == {"a b", "b c", "c d"}
     assert rp.get_ngram_set("a b", n=13) == set()
+
+
+def test_normalize_text_equals_the_regex_it_replaced() -> None:
+    """
+    The hash column of every processed shard was computed with `re.sub(r"\\s+", " ", text.lower()).strip()`; the
+    split / join form must give the same string for every whitespace code point and for Unicode casing.
+    """
+
+    whitespace = re.compile(r"\s+")
+
+    def old(text: str) -> str:
+        return whitespace.sub(" ", text.lower()).strip()
+
+    spaces = [chr(code) for code in range(0x110000) if chr(code).isspace()]
+    assert len(spaces) >= 25
+    samples = [
+        "",
+        " ",
+        "".join(spaces),
+        "A" + "".join(spaces) + "B",
+        "\u00a0x\u2028y\u3000z\x1c\x1d\x1e\x1f\x85",
+        "ΟΔΥΣΣΕΥΣ ΣΟΦΟΣ\tİstanbul\r\nSTRASSE ẞ",  # final sigma, dotted I, capital sharp s
+        "\u200b\ufeff not whitespace \u200b",  # zero-width space and BOM are not whitespace for either
+        "ab\u2029\u2029cd\u000b\u000c",
+    ]
+    for sample in samples + [space.join(["Hello", "WORLD"]) for space in spaces]:
+        assert rp.normalize_text(sample) == old(sample), repr(sample)
 
 
 def test_check_contamination_with_planted_13gram_overlap() -> None:
