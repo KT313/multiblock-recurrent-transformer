@@ -13,11 +13,13 @@ import shutil
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pytest
 
 from data_preparation.lib import dataset_config as dc
@@ -33,7 +35,8 @@ from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.stages import build as stages_build
 from data_preparation.lib.stages.build import build_source
-from data_preparation.lib.stages import build_output, exact_dedup
+from data_preparation.lib.stages import build_output, build_workers, exact_dedup
+from data_preparation.lib.stages.build_workers import ShardSource, ShardWorkers
 from data_preparation.lib.stages.exact_dedup import text_hash64
 from data_preparation.lib.stages.row_pipeline import get_ngram_set, instruct_text
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
@@ -143,13 +146,14 @@ def test_build_of_an_exhausted_raw_dir_with_zero_shards_writes_an_empty_manifest
     assert Manifest.load(layout.processed_dir("p")) == m2 and m2.shards == [] and m2.input_shards == []
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_exact_dedup_tokens_and_idempotence(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
-    read_rows: Reader, mtimes: Mtimes,
+    read_rows: Reader, mtimes: Mtimes, pass_workers: int,
 ) -> None:  # fmt: skip
     texts = [_words(5), _words(3, 100), "  " + _words(5).upper() + "\n", _words(5), _words(62)]  # the last one exactly at the cap with BOS and EOS
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=64)
-    m = build_source(cfg, "s", layout, shard_size=2)
+    m = build_source(cfg, "s", layout, shard_size=2, pass_workers=pass_workers)
     processed = layout.processed_dir("s")
     assert m.stage == "processed" and m.token_count == "tokenizer" and m.tokenizer == "synthetic"
     rows = read_rows(processed)
@@ -165,11 +169,12 @@ def test_build_exact_dedup_tokens_and_idempotence(
     assert 0 < load["expected_false_positive_rate"] < 1e-9 and 0 < load["measured_false_positive_rate"] < 1e-9
     assert m.input_shards == [["data-00000.parquet", 4], ["data-00001.parquet", 1]]
     before = mtimes(processed)
-    assert build_source(cfg, "s", layout, shard_size=2) == m and mtimes(processed) == before
+    assert build_source(cfg, "s", layout, shard_size=2, pass_workers=pass_workers) == m and mtimes(processed) == before
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_clamps_stored_counts_to_a_lowered_cap(
-    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader, pass_workers: int,
 ) -> None:
     """
     Lowering `dataset_max_sequence_length` never re-downloads (it is not part of the raw hash); the build clamps the stored
@@ -180,7 +185,7 @@ def test_build_clamps_stored_counts_to_a_lowered_cap(
     assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5]
     lowered = replace(cfg, dataset_max_sequence_length=8, training_target_sequence_length=8)  # the target may not exceed the cap
     assert lowered.raw_hash("s") == cfg.raw_hash("s") and lowered.processed_hash("s") != cfg.processed_hash("s")
-    m = build_source(lowered, "s", layout)
+    m = build_source(lowered, "s", layout, pass_workers=pass_workers)
     assert [r["tokens"] for r in read_rows(layout.processed_dir("s"))] == [8, 5] and m.tokens() == 13
     assert [r["tokens"] for r in read_rows(layout.raw_dir("s"))] == [32, 5], "raw untouched"
 
@@ -195,9 +200,10 @@ def test_build_estimate_mode_caps_too(
     assert [len(r["text"]) for r in read_rows(layout.processed_dir("s"))] == [40, 192], "the download cut the long text at 4 chars/token, 2 tokens left for the specials"
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep,
-    read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    read_rows: Reader, mtimes: Mtimes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, pass_workers: int,
 ) -> None:  # fmt: skip
     """
     A top-up processes only the raw shards not yet covered, leaves the old processed shards untouched, removes
@@ -208,7 +214,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     first = [_words(6, i) for i in range(6)] + [_words(6, 0)]  # one duplicate inside
     cfg = _prepare(cfg_factory, layout, local_dir, first, with_tokenizer, write=write_local, shard_size=3)
     with caplog.at_level(logging.INFO, logger="data_preparation"):
-        m1 = build_source(cfg, "s", layout, shard_size=4)
+        m1 = build_source(cfg, "s", layout, shard_size=4, pass_workers=pass_workers)
     assert "s: dedup filter: 1 MB, 7 rows on disk" in caplog.text, "the test config's 1 MB budget, and the raw rows it is fed"
     processed = layout.processed_dir("s")
     old_rows = read_rows(processed)
@@ -226,7 +232,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
         return original(self, texts)
 
     monkeypatch.setattr(TokenCounter, "count_many", spy)
-    m2 = build_source(cfg, "s", layout, shard_size=4)
+    m2 = build_source(cfg, "s", layout, shard_size=4, pass_workers=pass_workers)
     assert sum(counted) == 0, "raw token counts reused, nothing tokenized"
     assert m2.stats["dedup"]["duplicates_removed"] == 3 and m2.stats["input_rows"] == 11
     assert m2.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 1, 3, 1])]
@@ -243,7 +249,7 @@ def test_build_appends_only_the_new_shards_and_refills_the_dedup_filter(
     fresh = DatasetLayout(tmp_path / "fresh")
     prepare_tokenizer(cfg, fresh)
     download(cfg, "s", fresh, rows_needed=11, shard_size=3)
-    m_fresh = build_source(cfg, "s", fresh, shard_size=4)
+    m_fresh = build_source(cfg, "s", fresh, shard_size=4, pass_workers=pass_workers)
     assert read_rows(fresh.processed_dir("s")) == new_rows
     assert m_fresh.tokens() == m2.tokens() and m_fresh.stats == m2.stats
     assert [sh.rows for sh in m_fresh.shards] == [3, 3, 1, 1], "same layout: one processed shard per raw shard"
@@ -378,16 +384,17 @@ def test_build_no_dedup_mode_keeps_duplicates(
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == ["dup", "DUP"]
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_quality_filter_only_when_enabled(
-    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader, pass_workers: int,
 ) -> None:
     texts = [GOOD, "This is one sentence. Another one here."]
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, dataset_max_sequence_length=500)
-    build_source(cfg, "s", layout)
+    build_source(cfg, "s", layout, pass_workers=pass_workers)
     assert len(read_rows(layout.processed_dir("s"))) == 2
     on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, quality_filter=True), dataset_max_sequence_length=500))
     download(on, "s", layout, rows_needed=2)
-    m = build_source(on, "s", layout)
+    m = build_source(on, "s", layout, pass_workers=pass_workers)
     assert [r["text"] for r in read_rows(layout.processed_dir("s"))] == [GOOD]
     assert m.stats["quality_filter"] == {"enabled": True, "filtered_count": 1, "rejection_reasons": {"too_few_sentences": 1}}
 
@@ -544,8 +551,9 @@ def test_build_requires_a_raw_manifest(cfg_factory: CfgFactory, layout: DatasetL
         build_source(cfg, "s", layout)
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_publishes_per_raw_shard_and_resumes_after_a_stop(
-    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader, pass_workers: int,
 ) -> None:
     texts = [_words(6, i) for i in range(9)] + [_words(6, 1)]  # 10 rows, one duplicate in the last raw shard
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=3)
@@ -557,17 +565,105 @@ def test_build_publishes_per_raw_shard_and_resumes_after_a_stop(
         return calls["n"] >= 2
 
     with pytest.raises(BuildAborted):
-        build_source(cfg, "s", layout, should_stop=stop_after_two)
+        build_source(cfg, "s", layout, should_stop=stop_after_two, pass_workers=pass_workers)
     partial = Manifest.load(processed)
     assert partial is not None and partial.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]]
     assert [s.rows for s in partial.shards] == [3, 3] and partial.stats["input_rows"] == 6
     assert len(read_rows(processed)) == 6
 
-    m = build_source(cfg, "s", layout)  # resumes behind the covered raw shards
+    m = build_source(cfg, "s", layout, pass_workers=pass_workers)  # resumes behind the covered raw shards
     assert m.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])]
     assert [s.rows for s in m.shards] == [3, 3, 3] and m.stats["input_rows"] == 10
     assert m.stats["dedup"]["duplicates_removed"] == 1
     assert [r["text"] for r in read_rows(processed)] == texts[:9]
+
+
+# --- pretrain: shard workers -----------------------------------------------------------------------------------------
+
+
+def test_shard_workers_build_exactly_what_the_build_thread_builds(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    """
+    The same raw folder built in three worker processes and in the build thread: the same rows, hashes, shard
+    boundaries, statistics and manifest (every filter exercised: null and short texts, the quality filter, dedup
+    across raw shards; the token clamp is covered by the parametrized cap test).
+    """
+
+    good = [GOOD + f" Extra sentence number {i} is here." for i in range(12)]
+    texts: list[str | None] = [*good[:4], good[1].replace("quick", "QUICK"), "  " + good[2] + "\n", "tiny", None, _words(6), _words(40), *good[4:]]  # 2 dupes, 2 short, 2 fail quality
+    proc = ProcessingConfig(min_chars=5, quality_filter=True)
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, processing=proc, dataset_max_sequence_length=500, shard_size=4)
+    processed = layout.processed_dir("s")
+    in_thread = build_source(cfg, "s", layout, shard_size=3, pass_workers=1)
+    rows = read_rows(processed)
+    files = {path.name: path.read_bytes() for path in processed.glob("data-*.parquet")}
+    shutil.rmtree(processed)
+    with_workers = build_source(cfg, "s", layout, shard_size=3, pass_workers=3)
+    assert read_rows(processed) == rows
+    assert {path.name: path.read_bytes() for path in processed.glob("data-*.parquet")} == files, "byte-identical shards"
+    assert (with_workers.shards, with_workers.input_shards, with_workers.stats) == (in_thread.shards, in_thread.input_shards, in_thread.stats)
+    assert [r["text"] for r in rows] == [text for text in texts[:4] + texts[10:] if isinstance(text, str)]
+    assert in_thread.stats["dedup"]["duplicates_removed"] == 2 and in_thread.stats["quality_filter"]["filtered_count"] == 2
+    assert in_thread.stats["length_filter"]["removed_too_short"] == 2 and in_thread.stats["input_rows"] == 18
+    assert [s.rows for s in in_thread.shards] == [3, 1, 2, 3, 1, 2], "one or two processed shards per raw shard with survivors"
+
+
+def test_a_raw_shard_a_worker_cannot_read_fails_the_build_behind_the_recorded_shards(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+) -> None:
+    texts = [_words(6, i) for i in range(10)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=3)  # raw shards of 3, 3, 3, 1
+    processed = layout.processed_dir("s")
+    third = layout.raw_dir("s") / "data-00002.parquet"
+    complete = third.read_bytes()
+    third.write_bytes(complete[: len(complete) // 2])
+    with pytest.raises(pa.ArrowInvalid):
+        build_source(cfg, "s", layout, pass_workers=2)
+    partial = Manifest.load(processed)
+    assert partial is not None and partial.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]]
+    assert len(read_rows(processed)) == 6
+    third.write_bytes(complete)
+    m = build_source(cfg, "s", layout, pass_workers=2)
+    assert m.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])]
+    assert [r["text"] for r in read_rows(processed)] == texts
+
+
+def test_shard_workers_only_for_per_raw_shard_pretrain_builds_without_decontamination(
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[int] = []
+
+    class Spy(ShardWorkers):
+        def __init__(self, processes: int, source: ShardSource) -> None:
+            created.append(processes)
+            super().__init__(processes, source)
+
+    monkeypatch.setattr(stages_build, "ShardWorkers", Spy)
+    monkeypatch.setattr(stages_build, "load_benchmark_ngrams", lambda names, n=13, cache_dir=None: {"gsm8k_test": set()})
+    texts = [_words(6, i) for i in range(4)]
+    cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local)
+    processed = layout.processed_dir("s")
+    build_source(cfg, "s", layout, pass_workers=1)
+    assert created == []
+    shutil.rmtree(processed)
+    build_source(cfg, "s", layout, pass_workers=2)
+    assert created == [2]
+    decon = DecontaminationConfig(enabled=True, benchmarks=["gsm8k_test"])
+    on = with_tokenizer(_cfg(cfg_factory, local_dir, ProcessingConfig(min_chars=5, decontamination=decon)))
+    download(on, "s", layout, rows_needed=4)
+    build_source(on, "s", layout, pass_workers=2)
+    shuffled = with_tokenizer(_cfg(cfg_factory, local_dir, source={"shuffle": True}))
+    download(shuffled, "s", layout, rows_needed=4)
+    build_source(shuffled, "s", layout, pass_workers=2)
+    assert created == [2], "decontamination has its own pool, an all-at-once build streams in the thread"
+
+
+def test_a_lost_build_worker_is_named() -> None:
+    future: Future[int] = Future()
+    future.set_exception(BrokenProcessPool("A process in the process pool was terminated abruptly"))
+    with pytest.raises(RuntimeError, match="a build worker died .*terminated abruptly"):
+        build_workers._result(future)
 
 
 def test_pretrain_source_with_shuffle_is_built_all_at_once_in_seeded_order(
@@ -849,18 +945,19 @@ def test_swap_crash_while_deleting_the_old_folder_keeps_the_new_data_in_place(
 # --- the build cap ------------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("pass_workers", [1, 2])
 def test_build_stops_at_rows_target_and_resumes_to_a_larger_one(
-    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader
+    cfg_factory: CfgFactory, layout: DatasetLayout, local_dir: Path, write_local: Writer, with_tokenizer: Prep, read_rows: Reader, pass_workers: int,
 ) -> None:
     texts = [_words(6, i) for i in range(10)]
     cfg = _prepare(cfg_factory, layout, local_dir, texts, with_tokenizer, write=write_local, shard_size=3)  # raw shards of 3, 3, 3, 1
     processed = layout.processed_dir("s")
-    m = build_source(cfg, "s", layout, rows_target=4)  # the second raw shard brings the processed rows to 6 >= 4
+    m = build_source(cfg, "s", layout, rows_target=4, pass_workers=pass_workers)  # the second raw shard brings the processed rows to 6 >= 4
     assert m.input_shards == [["data-00000.parquet", 3], ["data-00001.parquet", 3]] and m.rows() == 6
-    assert build_source(cfg, "s", layout, rows_target=6).input_shards == m.input_shards  # served already: nothing built
-    m2 = build_source(cfg, "s", layout, rows_target=8)  # a larger target builds on from the covered shards
+    assert build_source(cfg, "s", layout, rows_target=6, pass_workers=pass_workers).input_shards == m.input_shards  # served already: nothing built
+    m2 = build_source(cfg, "s", layout, rows_target=8, pass_workers=pass_workers)  # a larger target builds on from the covered shards
     assert m2.input_shards == [[f"data-{i:05d}.parquet", 3] for i in range(3)] and m2.rows() == 9
-    m3 = build_source(cfg, "s", layout)  # no target: everything
+    m3 = build_source(cfg, "s", layout, pass_workers=pass_workers)  # no target: everything
     assert m3.input_shards == [[f"data-{i:05d}.parquet", n] for i, n in enumerate([3, 3, 3, 1])] and m3.rows() == 10
     assert [r["text"] for r in read_rows(processed)] == texts
 

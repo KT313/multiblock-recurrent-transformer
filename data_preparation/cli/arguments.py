@@ -104,7 +104,7 @@ def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] 
     sub.add_argument("--dry_run", action="store_true", help="print what would be repaired and downloaded, write nothing")
     sub.add_argument("--allow_foreign_raw", action="store_true", help="let the repair step delete stale / outdated raw folders that another dataset config downloaded (they are shared by source name)")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
-    sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build's optional cleaning passes (decontamination / minhash; 1 = in-process)")
+    sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build: a per-raw-shard pretrain build reads, filters, hashes and writes its raw shards in them, a build with decontamination / minhash runs those passes in them (1 = everything in the build thread)")
     sub.add_argument("--tokenizer_threads", type=int, default=DEFAULT_TOKENIZER_THREADS,
                      help=f"tokenizer threads of the downloads in total: up to {THREADS_PER_PROCESS} on this process's Rust pool, more in "
                           f"ceil(N/{THREADS_PER_PROCESS}) separate tokenizer processes of up to {THREADS_PER_PROCESS} threads each (default: {DEFAULT_TOKENIZER_THREADS})")

@@ -15,7 +15,9 @@ Two write modes:
   failure or a stop request (checked between raw shards) loses at most one raw shard of work and the next call
   resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
   dedup.bloom_memory_mb) is refilled from the hash column of the processed shards at the start of every
-  build, so the rows kept are exactly those of one full pass.
+  build, so the rows kept are exactly those of one full pass. With pass_workers > 1 (and no decontamination) the
+  raw shards are read, filtered, hashed and written in that many worker processes (`build_workers.py`); the dedup,
+  the statistics and the manifest stay in the build thread, and the rows, shards and stop points are the same.
 * whole-source publication (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash):
   every raw shard is streamed through the filters. Shuffling uses a bounded-cache SQLite index on disk;
   MinHash still retains rows and its LSH index in memory. Results are written into a private owned build slot
@@ -38,6 +40,7 @@ import multiprocessing
 import random
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,7 @@ from data_preparation.lib.stages.exact_dedup import SeenDocuments, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
 from data_preparation.lib.stages.shuffle import shuffled_rows
 from data_preparation.lib.stages.build_output import ProcessedOutput as ProcessedOutput, prepare_source_output  # noqa: PLC0414 - compatibility export
+from data_preparation.lib.stages.build_workers import ShardSource, ShardWorkers
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
     check_quality,
@@ -96,8 +100,8 @@ def build_source(
 ) -> Manifest:
     """
     Turn the raw shards of source name into processed/<name> (see the module docstring) and return the
-    processed manifest. pass_workers sizes the spawn process pool of the optional cleaning passes
-    (decontamination / minhash; 1 = in-process). rows_target caps a per-raw-shard build: it stops after the raw
+    processed manifest. pass_workers sizes the spawn process pool of a per-raw-shard build's shard workers
+    (:class:`ShardWorkers`) or of the optional cleaning passes (decontamination / minhash); 1 = in-process. rows_target caps a per-raw-shard build: it stops after the raw
     shard that brings the processed rows to that many (the planner's rows_sufficient; raw rows past the budget
     stay unbuilt until a larger target asks for them); an all-at-once build ignores it. Raises FileNotFoundError
     without a current raw manifest (run the download first).
@@ -127,12 +131,16 @@ def build_source(
     # process shards without changing the publication and stop boundaries
     pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
     pending_rows = sum(shard.rows for shard in pending)
-    with pipeline, progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar:
+    with (
+        pipeline,
+        progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar,
+        _shard_workers(pipeline, all_at_once=all_at_once) as workers,
+    ):
         pipeline.bar = bar
         if all_at_once:
             _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
         else:
-            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
+            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target, workers)
 
     # record the measured filter load and complete the generation
     if seen is not None:
@@ -167,14 +175,20 @@ def _build_per_raw_shard(
     shard_size: int,
     should_stop: StopCheck | None,
     rows_target: int | None = None,
+    workers: ShardWorkers | None = None,
 ) -> None:
     """
     One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
     raw shard as covered) before the next raw shard starts; the stop request is checked in between. With
-    rows_target the loop ends once the processed rows reach it (checked before every raw shard).
+    rows_target the loop ends once the processed rows reach it (checked before every raw shard). With workers the
+    reading, filtering, hashing and writing happen in their processes (one raw shard per worker ahead of the loop),
+    the dedup and the bookkeeping here (:func:`_publish_prepared`).
     """
 
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
+    if workers is not None:
+        for ahead in range(min(workers.processes, len(pending))):
+            workers.prepare(ahead, raw_dir / pending[ahead].name)
     for index, shard in enumerate(pending, start=1):
         if rows_target is not None and output.manifest.rows() >= rows_target:
             log.info(
@@ -187,11 +201,65 @@ def _build_per_raw_shard(
         if pipeline.bar is not None:
             pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows
-        survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
-        output.publish(survivors, shard_size)
+        if workers is None:
+            survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
+            output.publish(survivors, shard_size)
+        else:
+            _publish_prepared(pipeline, workers, index - 1, pending, raw_dir, output, shard_size)
         output.save([*output.manifest.input_shards, [shard.name, shard.rows]])
         first_row_index += shard.rows
         check_stop(should_stop)
+
+
+def _publish_prepared(
+    pipeline: RowPipeline, workers: ShardWorkers, index: int, pending: list[ShardInfo], raw_dir: Path, output: ProcessedOutput, shard_size: int,
+) -> None:
+    """
+    Raw shard pending[index] through the workers: its hashes and filter counts (prepared earlier) into the
+    statistics and the bar, the dedup over the hashes, the kept rows written by the worker that holds them (which
+    takes raw shard index + processes next) and recorded in the manifest, in the order of `ProcessedOutput.publish`.
+    """
+
+    prepared = workers.prepared(index)
+    _add_counts(pipeline.stats["length_filter"], prepared.length_filter)
+    _add_counts(pipeline.stats["quality_filter"], prepared.quality_filter)
+    pipeline._advance(pending[index].rows)
+    keep = _new_hashes(prepared.hashes, pipeline.seen, pipeline.stats["dedup"])
+    following = index + workers.processes
+    next_raw_path = raw_dir / pending[following].name if following < len(pending) else None
+    written = workers.write(index, keep, output.directory, len(output.manifest.shards), shard_size, next_raw_path=next_raw_path)
+    for name, rows, tokens in written:
+        output.manifest.add_shard(name, rows, tokens)
+
+
+def _shard_workers(pipeline: RowPipeline, *, all_at_once: bool) -> AbstractContextManager[ShardWorkers | None]:
+    """
+    The shard workers of a per-raw-shard pretrain build with pass_workers > 1 and no decontamination (that pass
+    has its own pool, :class:`Decontaminator`); None (the in-thread path) otherwise.
+    """
+
+    processing = pipeline.processing
+    if pipeline.pass_workers <= 1 or all_at_once or pipeline.kind != "pretrain" or processing.decontamination.enabled:
+        return nullcontext(None)
+    log.info("%s: reading, filtering and writing the raw shards in %d worker processes", pipeline.name, pipeline.pass_workers)
+    source = ShardSource(
+        name=pipeline.name, text_field=pipeline.source.text_field, min_chars=processing.min_chars,
+        quality_filter=processing.quality_filter, normalize=processing.dedup.normalize,
+        max_tokens=pipeline.dataset_max_sequence_length, batch_size=pipeline.batch_size,
+    )
+    return ShardWorkers(pipeline.pass_workers, source)
+
+
+def _add_counts(totals: dict[str, Any], counts: dict[str, Any]) -> None:
+    """
+    counts summed into totals, nested dicts (rejection_reasons) included.
+    """
+
+    for key, value in counts.items():
+        if isinstance(value, dict):
+            _add_counts(totals.setdefault(key, {}), value)
+        else:
+            totals[key] = totals.get(key, 0) + value
 
 
 def _build_all_at_once(
@@ -480,6 +548,23 @@ def _exact_dedup(rows: Iterator[Row], seen: SeenDocuments, stats: dict[str, Any]
             stats["duplicates_removed"] += 1
             continue
         yield row
+
+
+def _new_hashes(hashes: list[int], seen: SeenDocuments | None, stats: dict[str, Any]) -> list[int]:
+    """
+    The indices of the hashes that survive :func:`_exact_dedup`'s rule (first occurrence wins; every index without
+    a filter), for rows that stayed in a worker process.
+    """
+
+    if seen is None:
+        return list(range(len(hashes)))
+    keep: list[int] = []
+    for index, hash64 in enumerate(hashes):
+        if seen.add_if_new(hash64):
+            keep.append(index)
+        else:
+            stats["duplicates_removed"] += 1
+    return keep
 
 
 def _quality_filter(rows: Iterator[Row], stats: dict[str, Any]) -> Iterator[Row]:

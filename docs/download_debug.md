@@ -33,6 +33,9 @@ During quiet network periods, look for:
   outer task times. `pool_idle_or_dispatch` accumulates only outside the task body, including after
   failures; it does not count time spent executing these tasks. The shared pool uses its process source
   label rather than attributing each task to a dataset source.
+- `build_prepare_shard` and `build_write_shard`: the shard workers of a per-raw-shard build (`--pass_workers`
+  above 1), reported as `source=<name>/build`; the build thread shows `WAIT:worker_result_wait` while it waits for
+  a prepared shard or a written one.
 - `parquet_compress_write`, `file_sync`, or `publish_manifest`: output work may be delaying progress.
 - `WAIT:wait_jobs` on MainThread: the coordinator is waiting for workers, usually normal.
 - `WAIT:worker_result_wait`: check the corresponding cleaning-process reports.

@@ -24,7 +24,9 @@ dataset directory's build lock::
 download jobs (the github_code sources of one repo form one job) and a pool of num_workers build jobs run
 side by side (:class:`JobPool`). A source is built the moment its download job finished, sources with nothing to
 download are built right away, and a source is never built while its own download runs. Each build job may hold a
-spawn process pool of pass_workers for its optional cleaning passes (decontamination / minhash), so the worst
+spawn process pool of pass_workers, either the shard workers of a per-raw-shard pretrain build (reading, filtering,
+hashing and writing the raw shards, `lib/stages/build_workers.py`: the build threads share one GIL, so this is
+what lets the builds use the machine) or the optional cleaning passes (decontamination / minhash), so the worst
 case is num_workers × pass_workers worker processes next to the threads. A failing job stops every running job
 of both pools at its next shard (:class:`StopFlag`) and is re-raised after they stopped: a failed source is a
 failed build. Ctrl-C while waiting does the same and raises :class:`BuildAborted` (prepare.py exits 130);
@@ -92,7 +94,7 @@ STEPS: tuple[str, ...] = ("tokenizer", "download", "build")
 MAX_ROUNDS = 5  # download + build rounds; a source still short afterwards is reported, not looped on forever
 DEFAULT_MAX_PARALLEL_DOWNLOADS = 2
 DEFAULT_NUM_WORKERS = 2  # sources built at a time (threads; pyarrow/tokenizers release the GIL)
-DEFAULT_PASS_WORKERS = 4  # spawn processes per build for the optional cleaning passes (decontamination / minhash)
+DEFAULT_PASS_WORKERS = 4  # spawn processes per build: shard workers, or the optional cleaning passes (decontamination / minhash)
 DEFAULT_TOKENIZER_THREADS = THREADS_PER_PROCESS  # the downloads' tokenizer threads in total; above THREADS_PER_PROCESS they are separate processes
 
 
@@ -389,7 +391,7 @@ def download_and_build_missing(
     not all processed yet, at the same time. A pool of max_parallel_downloads download jobs (the github_code
     sources of one repo are one job, :func:`download_github_code_group`) and a pool of num_workers build jobs
     (:func:`build_source`, resumable per raw shard) run under one :class:`StopFlag`; each build hands
-    pass_workers to its optional cleaning passes. Sources with nothing to download are built right away; every
+    pass_workers to its shard workers or its optional cleaning passes. Sources with nothing to download are built right away; every
     other source is built as soon as its download job finished, so a source is never built while its own download
     runs. steps restricts the round to its download / build part, sources to the named sources; config_name
     (the dataset config's file name) is recorded in the raw manifests the downloads create.

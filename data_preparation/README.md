@@ -223,8 +223,9 @@ def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel
 `download_and_build_missing` owns the source-job pools: a pool of `--max_parallel_downloads` download
 jobs (the `github_code` sources of one repo form one job, every member of the repo included, and are read in a single
 pass over the repo's files) and a pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
-spawn process pool of `--pass_workers` for its optional cleaning passes (decontamination / minhash, off in the
-shipped configs), so those toggles cost up to `num_workers × pass_workers` worker processes (2 × 4 = 8 with the
+spawn process pool of `--pass_workers`: the shard workers of a per-raw-shard pretrain build (below), or the
+optional cleaning passes (decontamination / minhash, off in the shipped configs), so a run costs up to
+`num_workers × pass_workers` worker processes (2 × 4 = 8 with the
 defaults). Sources with nothing to download are built right away, every other source the
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard, and a second Ctrl-C
@@ -329,7 +330,14 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
   (`lib/build/planner.py`; `build_source(rows_target=)`), so raw rows past the budget (a `github_code` member fed
   on after its target, above) cost raw disk only. A processed folder behind raw that serves the budget is healthy,
   satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
-  budget, or a lower measured tokens-per-row rate, builds the next shards.
+  budget, or a lower measured tokens-per-row rate, builds the next shards. **Shard workers**: with `--pass_workers`
+  above 1 (and decontamination off) the raw shards are read, length- and quality-filtered, hashed and written as
+  processed shards in that many spawn processes (`lib/stages/build_workers.py`, raw shard k on worker
+  k % pass_workers, one shard per worker ahead of the loop); only the hashes come back, the Bloom dedup, the
+  statistics, the manifest and the stop check stay in the build thread, so the rows, shard boundaries and resume
+  points are exactly those of the in-thread path (tested byte for byte). The build threads share one GIL and
+  everything per row holds it (eight in-thread builds measured 1.1 busy cores together), which is why this is the
+  setting that makes the build stage use the machine.
 - **whole-source publication** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw
   shard is streamed through the existing processing pipeline, with results written into
   `.build-work/processed/<source>/temporary` and renamed into place only when complete; a top-up rebuilds the
