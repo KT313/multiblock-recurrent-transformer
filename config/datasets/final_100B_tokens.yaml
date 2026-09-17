@@ -1,0 +1,208 @@
+tokenizer:
+  name: llama-32k-chat-v1
+  profile: llama32k_chat_v1
+  kind: hf
+  hf_id: hf-internal-testing/llama-tokenizer
+  revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+
+training_target_sequence_length: 4096        # the run trains at this length: a row counts min(its tokens, this) towards the download
+                                # budget (a 530-token row 530, a 4000-token row 2048); at most dataset_max_sequence_length
+dataset_max_sequence_length: 16384           # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
+                                # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
+                                # costs nothing
+token_count: tokenizer          # or: estimate (chars / 4)
+validation_fraction: 0.001      # share of a source's rows held out when it is used for training AND validation
+
+processing:                     # defaults for every source; a pretrain source may override with its own block
+  min_chars: 50                 # pretrain only; the upper bound is dataset_max_sequence_length at download
+  dedup: {mode: exact, normalize: true, bloom_memory_mb: 1024}   # minhash (not for scale): {mode: minhash, threshold: 0.95, num_perm: 256}
+  quality_filter: false
+  decontamination: {enabled: false}
+
+sources:
+  # --- pretraining (kind: pretrain) -------------------------------------------------------------------------------
+  fineweb_edu:
+    kind: pretrain
+    loader: hf_files
+    hf_id: HuggingFaceFW/fineweb-edu
+    revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+    load_kwargs: {data_files: "sample/350BT/*.parquet"}   # sample-350BT subset
+    describe_tokens_per_row: 2000
+    # used for training and validation: the first 0.1 % of its processed rows (validation_fraction) are the held-out
+    # set of both pretraining stages (replaces the old fineweb_val source, which overlapped the training dump)
+  wikipedia:
+    kind: pretrain
+    loader: hf_files
+    hf_id: wikimedia/wikipedia                     # replaces the removed `wikipedia` script dataset (20220301.en)
+    revision: b04c8d1ceb2f5cd4588862100d08de323dccfbaa
+    load_kwargs: {data_files: "20231101.en/*.parquet"}   # 41 files
+    describe_tokens_per_row: 1500
+  books_gutenberg:
+    kind: pretrain
+    loader: hf_files
+    hf_id: sedthh/gutenberg_english
+    revision: 28973b04f28fd7be4a6186a042bc26159d4366ca
+    load_kwargs: {data_files: "data/*.parquet"}   # 37 files
+    text_field: TEXT
+    describe_tokens_per_row: 3000
+  peso:
+    kind: pretrain
+    loader: hf_files
+    hf_id: nampdn-ai/mini-peS2o                    # gated: needs HF_TOKEN / --hf_token
+    revision: 18a60ef8d79fdcae1494469845b0cbcb7e88b8b2
+    load_kwargs: {data_files: "train-*.parquet"}   # 20 files at the repo root
+    describe_tokens_per_row: 1500
+  arxiv:
+    kind: pretrain
+    loader: hf_files
+    hf_id: common-pile/arxiv_papers_filtered
+    revision: 033cf7f53f9b348deec868c1a5a48484f3ee9e52
+    load_kwargs: {data_files: "arxiv-papers-*.json.gz"}   # 8 gzipped json-lines files at the repo root
+    describe_tokens_per_row: 1500
+  openwebmath:
+    kind: pretrain
+    loader: hf_files
+    hf_id: open-web-math/open-web-math
+    revision: fde8ef8de2300f5e778f56261843dab89f230815
+    load_kwargs: {data_files: "data/*.parquet"}   # 114 files
+    describe_tokens_per_row: 750
+  tinygsm:
+    kind: pretrain
+    loader: hf_files
+    hf_id: ostapeno/tinygsm-mind
+    revision: f5ecf416b71547b454cb9f4b06e769c2650ca33b
+    load_kwargs: {data_files: "data/*.parquet"}   # 50 files
+    describe_tokens_per_row: 300
+  algebraic_stack:
+    kind: pretrain
+    loader: hf_files
+    hf_id: EleutherAI/proof-pile-2                 # ships a loading script; the jsonl.zst files are read directly
+    revision: 901a9273a770e9d4138c5ddd91802f9c5c6cdc4b
+    load_kwargs: {data_files: "algebraic-stack/train/*.jsonl.zst"}   # 79 files
+    describe_tokens_per_row: 750
+  # GitHub code from codeparrot/github-code-clean, one source per language (labels are the dataset's own). All
+  # language sources of the repo are downloaded in one pass over its 880 `data/*.parquet` files (every row group is
+  # fetched once and its rows go to the language that wants them); the shared file index (`dataset/hub_index/`)
+  # remembers per-language row counts so a top-up skips files and row groups it has already consumed. The pass keeps
+  # every row it decodes: a language past its target stores on while the pass reads for the others, and the ~20
+  # languages without a source below land in `sources/github_code_clean_<slug>/raw` (C# -> csharp, Objective-C ->
+  # objective_c); to train on one later, add it under that name with the same fields (e.g.
+  # `github_code_clean_csharp: {..., language: C#, text_field: code}`) and its folder is adopted as is.
+  github_code_clean_python:     {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Python,     text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_javascript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: JavaScript, text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_typescript: {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: TypeScript, text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_java:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Java,       text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_cpp:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: C++,        text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_go:         {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: GO,         text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_rust:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Rust,       text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_shell:      {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: Shell,      text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_sql:        {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: SQL,        text_field: code, describe_tokens_per_row: 500}
+  github_code_clean_html:       {kind: pretrain, loader: github_code, hf_id: codeparrot/github-code-clean, revision: c48d40f9e70f0196f8236901ee35807f7d6c44c0, language: HTML,       text_field: code, describe_tokens_per_row: 500}
+
+  # --- instruction tuning (kind: instruct), mixed by weight in the finetune stage below ------------------------------
+  # Input inversions are disabled. Instruct sources are written to processed/ in a seeded shuffled order (the default for
+  # kind instruct), because their repos are sorted by task and the training loader reads a source's shards in order.
+  # Every repo uses `hf_files`: multi-file parquet repos one file at a time through the Hub cache, the single-file
+  # JSON-array repos (metamath 396 MB, wizardlm 375 MB, sharegpt 671 MB, evol_code 122 MB) streamed incrementally
+  # from the start with `ijson` so a build reads only the prefix it needs instead of downloading the whole file.
+  metamath:    {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: meta-math/MetaMathQA,                      revision: aa4f34d3d2d3231299b5b03d9b3e5a20da45aa18, load_kwargs: {data_files: "MetaMathQA-395K.json"}, fields: {instruction: query, output: response}, input_inversions: 0, describe_tokens_per_row: 300}
+  orca_math:   {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: microsoft/orca-math-word-problems-200k,    revision: 29255d1770cc4eac66e5e7fa378cba542c026350, load_kwargs: {data_files: "data/*.parquet"}, fields: {instruction: question, output: answer}, input_inversions: 0, describe_tokens_per_row: 300}
+  evol_code:   {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: nickrosh/Evol-Instruct-Code-80k-v1,        revision: 3ae930c20d5496e2c8386872d5628c45f6957db4, load_kwargs: {data_files: "EvolInstruct-Code-80k.json"}, fields: {instruction: instruction, output: output}, input_inversions: 0, describe_tokens_per_row: 400}
+  code_alpaca: {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: sahil2801/CodeAlpaca-20k,                  revision: 152bb5e9a29651266b018106053980070a0521a1, load_kwargs: {data_files: "code_alpaca_20k.json"}, fields: {instruction: instruction, input: input, output: output}, input_inversions: 0, describe_tokens_per_row: 200}
+  slimorca:    {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: Open-Orca/SlimOrca-Dedup,                  revision: bd7d445aa1ff695fb7e223bf3b5b321e075f244e, load_kwargs: {data_files: "data/*.parquet"}, converter: sharegpt_conversations, input_inversions: 0, describe_tokens_per_row: 300}
+  sharegpt:    {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: anon8231489123/ShareGPT_Vicuna_unfiltered, revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, load_kwargs: {data_files: "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json"}, converter: sharegpt_conversations, filter: sharegpt_quality, check_limit: 100000, input_inversions: 0, describe_tokens_per_row: 400}
+  wizardlm:    {kind: instruct, instruction_format: messages, loader: hf_files, hf_id: WizardLM/WizardLM_evol_instruct_V2_196k,   revision: 8a7d15a83028b5c93915677704f492839e2675f6, load_kwargs: {data_files: "WizardLM_evol_instruct_V2_143k.json"}, converter: first_two_turns, input_inversions: 0, describe_tokens_per_row: 400}
+
+  # Structured instruction sources; use the full pinned pools rather than smoke-test row limits.
+  opencodeinstruct:
+    kind: instruct
+    instruction_format: messages
+    loader: hf_files
+    hf_id: nvidia/OpenCodeInstruct
+    revision: 8f3ba5bafe4d6e8db46082cf7ae6741bc370604d
+    load_kwargs: {data_files: "data/train-*.parquet"}
+    converter: opencode_messages
+    filter: opencode_passed_tests
+    input_inversions: 0
+    describe_tokens_per_row: 1000
+  nemotron_chat_off:
+    kind: instruct
+    instruction_format: messages
+    loader: hf_files
+    hf_id: nvidia/Nemotron-SFT-Instruction-Following-Chat-v2
+    revision: 1a9454ed054b8544503ab8d8c0a519d141a44c5b
+    load_kwargs: {data_files: "data/reasoning_off.jsonl"}
+    converter: nemotron_messages
+    input_inversions: 0
+    describe_tokens_per_row: 1500
+
+stages:
+  - name: pretrain_phase1
+    tokens: 66_000_000_000
+    transition_pct: 0.10
+    train:
+      fineweb_edu: 0.650
+      wikipedia: 0.090
+      books_gutenberg: 0.060
+      github_code_clean_python: 0.040
+      github_code_clean_javascript: 0.024
+      github_code_clean_typescript: 0.012
+      github_code_clean_java: 0.012
+      github_code_clean_cpp: 0.010
+      github_code_clean_go: 0.008
+      github_code_clean_rust: 0.002
+      github_code_clean_shell: 0.005
+      github_code_clean_sql: 0.004
+      github_code_clean_html: 0.003
+      peso: 0.030
+      arxiv: 0.020
+      openwebmath: 0.030
+    val: {fineweb_edu: 1.000}             # split off the training rows by validation_fraction (0.1 %)
+
+  - name: pretrain_phase2
+    tokens: 30_000_000_000
+    transition_pct: 0.10
+    train:
+      fineweb_edu: 0.358
+      github_code_clean_python: 0.096
+      github_code_clean_javascript: 0.057
+      github_code_clean_typescript: 0.029
+      github_code_clean_java: 0.029
+      github_code_clean_cpp: 0.023
+      github_code_clean_go: 0.020
+      github_code_clean_rust: 0.004
+      github_code_clean_shell: 0.011
+      github_code_clean_sql: 0.009
+      github_code_clean_html: 0.009
+      openwebmath: 0.090
+      tinygsm: 0.067
+      algebraic_stack: 0.045
+      peso: 0.092
+      arxiv: 0.061
+    val: {fineweb_edu: 1.000}             # split off the training rows by validation_fraction (0.1 %)
+
+  - name: finetune
+    tokens: 4_000_000_000
+    transition_pct: 0.0
+    # Nemotron receives 50%, OpenCodeInstruct 25%; the remaining sources share 25% proportionally.
+    # Validation uses the same mixture.
+    train:
+      metamath: 0.062
+      orca_math: 0.042
+      evol_code: 0.052
+      code_alpaca: 0.010
+      slimorca: 0.042
+      sharegpt: 0.021
+      wizardlm: 0.021
+      opencodeinstruct: 0.250
+      nemotron_chat_off: 0.500
+    val:
+      metamath: 0.062
+      orca_math: 0.042
+      evol_code: 0.052
+      code_alpaca: 0.010
+      slimorca: 0.042
+      sharegpt: 0.021
+      wizardlm: 0.021
+      opencodeinstruct: 0.250
+      nemotron_chat_off: 0.500
