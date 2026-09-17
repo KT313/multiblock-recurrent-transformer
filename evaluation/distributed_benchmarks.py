@@ -19,12 +19,27 @@ from training.backend.base import Backend
 from training.data.tokenizer import Tokenizer
 from training.failure import FatalHandler, fatal_errors
 from training.stopping import StopController
+from training.settings import Settings
 
 
 @dataclass
 class BenchmarkPhaseResult:
     completed: bool
     metrics: dict[str, float]
+
+
+def evaluate_configured_benchmarks(
+    backend: Backend, model: RecurrentGPT, tokenizer: Tokenizer, settings: Settings, *, out_path: Path,
+    step: int, stop: StopController, on_fatal_error: FatalHandler | None = None,
+) -> BenchmarkPhaseResult:
+    """Keep scheduled training and checkpoint checks on exactly the same inference settings and path."""
+    return evaluate_distributed_benchmarks(
+        backend, model, tokenizer, settings.benchmark_tasks, stop=stop,
+        recurrences=settings.benchmark_recurrences or [None], out_path=out_path, step=step, seed=settings.seed,
+        batch_size=settings.benchmark_batch_size, limit=settings.benchmark_limit,
+        num_fewshot=settings.benchmark_num_fewshot, apply_chat_template=settings.benchmark_apply_chat_template,
+        on_fatal_error=on_fatal_error,
+    )
 
 
 def evaluate_distributed_benchmarks(

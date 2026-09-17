@@ -32,7 +32,7 @@ class StopRequest:
 
 
 @contextmanager
-def stop_on_interrupt() -> Iterator[StopRequest]:
+def stop_on_interrupt(*, message: str = "stopping after this step, saving a checkpoint") -> Iterator[StopRequest]:
     """
     Install the Ctrl-C / SIGTERM handling of a run and yield its stop request; the previous handlers are put back
     on exit.
@@ -52,8 +52,8 @@ def stop_on_interrupt() -> Iterator[StopRequest]:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         request.request_stop()
         log.warning(
-            "%s received: stopping after this step, saving a checkpoint (press Ctrl-C again to abort right away)",
-            signal.Signals(signum).name,
+            "%s received: %s (press Ctrl-C again to abort right away)",
+            signal.Signals(signum).name, message,
             extra=KEEP,
         )
 

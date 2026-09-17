@@ -32,7 +32,26 @@ Requested inference failures now propagate instead of warning and continuing. Un
 
 Cooperative stops are checked at shared round boundaries; a slow generation batch or rank-0 task-loading/aggregation phase can delay a stop. Incomplete evaluations publish no partial success. Complete outputs replace the previous file atomically on rank 0. A later logging failure does not undo a completed file. Training's process-group timeout remains unchanged (currently four hours).
 
-The direct `evaluation/evaluate.py` CLI is still single-device and rejects a multi-rank launch. Multi-GPU research benchmarking runs through scheduled training evaluation.
+The direct `evaluation/evaluate.py` CLI is still single-device and rejects a multi-rank launch. Use the checkpoint check below to run the scheduled training benchmark path immediately, including multi-GPU inference.
+
+## Run benchmarks immediately from a training checkpoint
+
+Run from the repository root, inside your GPU allocation. For a training config with `backend: ddp`:
+
+```bash
+uv run --no-sync torchrun --standalone --nproc_per_node=8 \
+  evaluation/benchmark_checkpoint.py --config config/final_multiblock_1-4B_100B_tokens.yaml
+```
+
+Use your training launch's process/node settings for multi-node runs instead of `--standalone`. For a config with `backend: single_device`, use `uv run --no-sync python evaluation/benchmark_checkpoint.py --config <run.yaml>`. To check a DDP config on one GPU without changing its settings, use `torchrun --standalone --nproc_per_node=1`.
+
+This command selects the most recently written regular checkpoint under `<out_dir>/<run_name>/checkpoints`, using training's selection rules. It ignores the `resume` switch, `resume_checkpoint_path`, and benchmark schedule triggers; use `--checkpoint /path/to/file.pth` to select a specific checkpoint. It runs the configured tasks, recurrences, batch size, few-shot count, limit, seed and chat-template setting immediately, through the same function used by scheduled training. All normal training CLI overrides work. For a quick check, append `--benchmark_limit 8`; omit that override to use the config unchanged.
+
+Weights and architecture come from the checkpoint, checked against the current architecture config. The current config controls precision and custom kernels. The checkpoint-owned tokenizer is validated for identity, vocabulary and template parity; `--tokenizer_dir /relocated/tokenizer` supports moving the matching artifact to another server. Legacy checkpoints use the current config's dataset tokenizer location. Paths in the config resolve from the working directory, just as in training.
+
+The command loads model weights on each rank but creates no optimizer, data loader, DDP model wrapper or training compile graph. Scheduled inference also uses the unwrapped, uncompiled replica. Checkpoints are memory-mapped to avoid eagerly loading unused optimizer storage on every rank. No training steps, data preparation, samples or checkpoint saves run. The inference rank count may differ from the checkpoint's training rank count, including ZeRO-1 checkpoints.
+
+Results use the normal benchmark JSON schema and are saved in a fresh `<out_dir>/<run_name>/benchmark_checks/step-XXXXXXXX-*/step-XXXXXXXX.json`. Existing scheduled results and training logs are preserved. `--output_dir` chooses a new directory, which must not already exist. Ctrl-C/SIGTERM requests a stop at the next shared benchmark boundary; incomplete work publishes no results. Fatal failures under torchrun use the same worker-exit policy as training. This verifies checkpoint inference, not resuming an optimizer or a complete training step. Benchmark datasets still need network access or an existing local cache.
 
 ## Qualification commands
 

@@ -46,17 +46,14 @@ def run_benchmarks(
     on_fatal_error: FatalHandler | None = None,
 ) -> dict[str, float] | None:
     """Run the official evaluator once and distribute inference jobs on resident replicas."""
-    from evaluation.distributed_benchmarks import evaluate_distributed_benchmarks
+    from evaluation.distributed_benchmarks import evaluate_configured_benchmarks
 
     settings, step = state.settings, state.progress.step
     path = benchmarks_path(state.run_directory, step)
     with logger.working("benchmarking"), fatal_errors(on_fatal_error):
-        result = evaluate_distributed_benchmarks(
-            state.backend, state.backend.plain_model(state.model), tokenizer, settings.benchmark_tasks,
-            stop=stop or StopController(state.backend), recurrences=settings.benchmark_recurrences or [None],
-            out_path=path, step=step, seed=settings.seed, batch_size=settings.benchmark_batch_size,
-            limit=settings.benchmark_limit, num_fewshot=settings.benchmark_num_fewshot,
-            apply_chat_template=settings.benchmark_apply_chat_template, on_fatal_error=on_fatal_error,
+        result = evaluate_configured_benchmarks(
+            state.backend, state.backend.plain_model(state.model), tokenizer, settings,
+            stop=stop or StopController(state.backend), out_path=path, step=step, on_fatal_error=on_fatal_error,
         )
         if result.completed and state.backend.is_main:
             logger.log_benchmarks(result.metrics, path, step)
