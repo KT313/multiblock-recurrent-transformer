@@ -7,7 +7,7 @@ tokenizer:
 
 training_target_sequence_length: 4096        # the run trains at this length: a row counts min(its tokens, this) towards the download
                                 # budget (a 530-token row 530, a 4000-token row 2048); at most dataset_max_sequence_length
-dataset_max_sequence_length: 16384           # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
+dataset_max_sequence_length: 8192           # pretrain rows are truncated to this many tokens when downloaded, instruct rows longer
                                 # than this are dropped; raising it re-downloads raw (after confirmation), lowering it
                                 # costs nothing
 token_count: tokenizer          # or: estimate (chars / 4)
