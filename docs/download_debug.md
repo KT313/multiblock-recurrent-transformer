@@ -6,7 +6,7 @@ effect on a dry run and does not change dataset identity or preparation settings
 
 Reports appear in the terminal/dashboard and the dataset's `build.log`. Each identifies the process
 PID, process name, source, and instrumented thread name/native ID. The main coordinator, download
-threads, token workers, read callbacks, and spawned MinHash/decontamination workers are covered.
+threads, token workers, read callbacks, and spawned tokenizer/MinHash/decontamination workers are covered.
 
 Use `--debug-file tmp/download-debug.log` to also append the complete, plain-text overviews to a
 dedicated file. Parent directories are created and each overview is flushed immediately, so you can
@@ -28,6 +28,11 @@ During quiet network periods, look for:
   and the token worker shows `WAIT:pool_result_wait` (its oldest batch is still in a tokenizer process),
   `WAIT:pipeline_wait` (batches in flight, room for more: polling the queue and the oldest batch) and
   `finish_batch` (applying the results to the rows) instead.
+- `tokenizer_truncate` and `tokenizer_count`: complete tasks in tokenizer processes, including lazy
+  tokenizer loading. Nested `truncate_batch`, `encode_batch`, and `count_batch` times overlap with these
+  outer task times. `pool_idle_or_dispatch` accumulates only outside the task body, including after
+  failures; it does not count time spent executing these tasks. The shared pool uses its process source
+  label rather than attributing each task to a dataset source.
 - `parquet_compress_write`, `file_sync`, or `publish_manifest`: output work may be delaying progress.
 - `WAIT:wait_jobs` on MainThread: the coordinator is waiting for workers, usually normal.
 - `WAIT:worker_result_wait`: check the corresponding cleaning-process reports.

@@ -33,7 +33,9 @@ from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
 from typing import TypeVar
 
-from data_preparation.lib.download_debug import WorkerDebugOptions, initialize_worker_debug, worker_debug_options
+from data_preparation.lib.download_debug import (
+    WorkerDebugOptions, initialize_worker_debug, measured_worker, worker_debug_options,
+)
 
 THREADS_PER_PROCESS = 8  # Rust threads per tokenizer process; also the in-process pool size (cli/commands.py)
 
@@ -106,12 +108,19 @@ class TokenizerPool:
 
 def _wrapped(future: Future[T]) -> Future[T]:
     """
-    future with a lost worker renamed: BrokenProcessPool says nothing about what died.
+    Forward completion, naming lost tokenizer processes and notifying cancellation waiters.
+    Cancelling the returned future does not cancel or terminate the underlying computation.
     """
 
     result: Future[T] = Future()
 
     def forward(done: Future[T]) -> None:
+        if done.cancelled():
+            result.cancel()
+        # Claim delivery atomically against caller cancellation. This also notifies wait()/as_completed()
+        # of cancellation; cancel() alone leaves Future waiters awaiting executor acknowledgement.
+        if not result.set_running_or_notify_cancel():
+            return
         error = done.exception()
         if isinstance(error, BrokenProcessPool):
             result.set_exception(RuntimeError(f"a tokenizer process died (killed by the OOM killer, or crashed): {error}"))
@@ -147,6 +156,7 @@ def _tokenizer(tokenizer_dir: str) -> object:
     return tokenizer
 
 
+@measured_worker("tokenizer_truncate")
 def _truncate_in_process(tokenizer_dir: str, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
     from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
     from data_preparation.lib.stages.truncation import truncate_many
@@ -156,6 +166,7 @@ def _truncate_in_process(tokenizer_dir: str, texts: list[str], max_tokens: int) 
     return truncate_many(texts, max_tokens, tokenizer)
 
 
+@measured_worker("tokenizer_count")
 def _count_in_process(tokenizer_dir: str, texts: list[str]) -> list[int]:
     from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 

@@ -6,11 +6,13 @@ same rows, counts, shard boundaries and progress as the in-process path, whateve
 
 from __future__ import annotations
 
+import multiprocessing
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future, as_completed, wait
 from concurrent.futures.process import BrokenProcessPool
+from multiprocessing.synchronize import Event
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +21,7 @@ import pytest
 from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
 from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.stages import download as download_module
-from data_preparation.lib.stages import download_state, download_workers
+from data_preparation.lib.stages import download_state, download_workers, tokenizer_pool
 from data_preparation.lib.stages.download import TokenCounter, download, prepare_tokenizer
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS, TokenizerPool, _wrapped, plan_processes
@@ -213,3 +215,143 @@ def test_a_failed_pool_batch_fails_the_download_and_keeps_the_published_shards(
     manifest = Manifest.load(layout.raw_dir("p"))
     assert manifest is not None and manifest.rows() == manifest.rows_fetched == 10  # the two batches before the failed one
     assert not manifest.exhausted
+
+
+@pytest.mark.parametrize("already_done", [False, True])
+@pytest.mark.parametrize("outcome", ["cancel", "success", "error", "broken"])
+def test_forwarded_futures_settle_and_notify_waiters(
+    already_done: bool, outcome: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    source: Future[list[int]] = Future()
+    value = [1, 2]
+    error = BrokenProcessPool("lost") if outcome == "broken" else ValueError("failed")
+
+    def complete() -> None:
+        if outcome == "cancel":
+            source.cancel()
+        elif outcome == "success":
+            source.set_result(value)
+        else:
+            source.set_exception(error)
+
+    if already_done:
+        complete()
+    proxy = _wrapped(source)
+    if not already_done:
+        complete()
+    assert wait([proxy], timeout=0.1).done == {proxy}
+    assert list(as_completed([proxy], timeout=0.1)) == [proxy]
+    if outcome == "cancel":
+        assert proxy.cancelled()
+        with pytest.raises(CancelledError):
+            proxy.result(timeout=0)
+    elif outcome == "success":
+        assert proxy.result(timeout=0) is value
+    elif outcome == "error":
+        assert proxy.exception(timeout=0) is error
+    else:
+        with pytest.raises(RuntimeError, match="a tokenizer process died"):
+            proxy.result(timeout=0)
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "success", "error"])
+def test_cancelling_proxy_does_not_cancel_source_or_break_forwarding(
+    outcome: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    source: Future[int] = Future()
+    proxy = _wrapped(source)
+    assert proxy.cancel()
+    assert not source.done()
+    if outcome == "cancel":
+        source.cancel()
+    elif outcome == "success":
+        source.set_result(3)
+    else:
+        source.set_exception(ValueError("failed"))
+    assert wait([proxy], timeout=0.1).done == {proxy}
+    assert proxy.cancelled()
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("cancel_first", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_proxy_cancellation_races_with_delivery(
+    cancel_first: bool, fails: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedFuture(Future[int]):
+        def set_running_or_notify_cancel(self) -> bool:
+            if cancel_first:
+                entered.set()
+                assert release.wait(5)
+            claimed = super().set_running_or_notify_cancel()
+            if not cancel_first:
+                entered.set()
+                assert release.wait(5)
+            return claimed
+
+    source: Future[int] = Future()
+    monkeypatch.setattr(tokenizer_pool, "Future", GatedFuture)
+    proxy = _wrapped(source)
+    error = ValueError("failed")
+    deliver = threading.Thread(target=lambda: source.set_exception(error) if fails else source.set_result(7))
+    deliver.start()
+    try:
+        assert entered.wait(5)
+        assert proxy.cancel() is cancel_first
+    finally:
+        release.set()
+        deliver.join(5)
+    assert not deliver.is_alive()
+    assert wait([proxy], timeout=0.1).done == {proxy}
+    if cancel_first:
+        assert proxy.cancelled()
+    elif fails:
+        assert proxy.exception(timeout=0) is error
+    else:
+        assert proxy.result(timeout=0) == 7
+    assert not caplog.records
+
+
+def _hold_initializer(entered: Event, release: Event) -> None:
+    entered.set()
+    assert release.wait(20)
+
+
+@pytest.mark.timeout(30)
+def test_pool_shutdown_settles_queued_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    entered, release = context.Event(), context.Event()
+    sources: list[Future[Any]] = []
+    wrap = tokenizer_pool._wrapped
+
+    def capture(source: Future[Any]) -> Future[Any]:
+        sources.append(source)
+        return wrap(source)
+
+    monkeypatch.setattr(tokenizer_pool, "_wrapped", capture)
+    pool = TokenizerPool(1)
+    # The real executor queues work while its only worker is held in initialization.
+    from concurrent.futures import ProcessPoolExecutor
+    pool._pool = ProcessPoolExecutor(1, mp_context=context, initializer=_hold_initializer, initargs=(entered, release))
+    shutdown = threading.Thread(target=pool.__exit__, args=(None, None, None))
+    try:
+        proxies = [pool.count(tmp_path, []) for _ in range(16)]
+        assert entered.wait(10)
+        assert not sources[-1].running() and not sources[-1].done()
+        shutdown.start()
+        with pytest.raises(CancelledError):
+            proxies[-1].result(timeout=5)
+        assert wait([proxies[-1]], timeout=0.1).done == {proxies[-1]}
+    finally:
+        release.set()
+        if shutdown.ident is None:
+            pool.__exit__(None, None, None)
+        else:
+            shutdown.join(10)
+    assert not shutdown.is_alive()
+    assert not caplog.records

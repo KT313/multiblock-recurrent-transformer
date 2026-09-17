@@ -70,6 +70,8 @@ class ReplayCounter(TokenCounter):
     def __init__(self, path: Path, original: bool) -> None:
         self.mode = "tokenizer"
         self.tokenizer_name = path.name
+        self.tokenizer_dir = path
+        self.pool = None
         self._tokenizer = SavedTokenizer(path)
         self.original = original
 
