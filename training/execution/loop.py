@@ -14,7 +14,7 @@ from training.failure import FatalHandler, handle_fatal_error
 from training.logger import RunLogger, TrainingReport
 from training.steps import NonFiniteLossError, RankBatches
 from training.step import run_one_optimizer_step
-from training.stopping import StopController, complete_main_phase
+from training.stopping import StopController
 from training.triggers import StepTriggers
 
 
@@ -57,17 +57,18 @@ def save_checkpoint_if_due(state: RunState, logger: RunLogger, batches: RankBatc
 def run_scheduled_inference(
     state: RunState, logger: RunLogger, tokenizer: Tokenizer, sample_triggers: StepTriggers,
     benchmark_triggers: StepTriggers, stop: StopController, checkpoint_fresh: bool,
+    on_fatal_error: FatalHandler | None = None,
 ) -> bool:
     """Run samples before benchmarks, polling after each phase and tracking checkpoint freshness."""
 
     if sample_triggers.due(state.progress.step):
         checkpoint_fresh = False  # inference can change third-party RNG state
-        complete_main_phase(state.backend, "sample generation", lambda: write_samples(state, logger, tokenizer))
+        write_samples(state, logger, tokenizer, stop=stop, on_fatal_error=on_fatal_error)
         if stop.poll("after samples"):
             return checkpoint_fresh
     if benchmark_triggers.due(state.progress.step):
         checkpoint_fresh = False  # inference can change third-party RNG state
-        complete_main_phase(state.backend, "benchmarking", lambda: run_benchmarks(state, logger, tokenizer))
+        run_benchmarks(state, logger, tokenizer, stop=stop, on_fatal_error=on_fatal_error)
         if stop.poll("after benchmarks"):
             return checkpoint_fresh
     return checkpoint_fresh

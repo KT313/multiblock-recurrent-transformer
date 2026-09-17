@@ -15,6 +15,7 @@ from evaluation.wrapper import RECURRENCE_ENV, Recurrence, check_recurrence, hf_
 from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
+from training.failure import FatalHandler
 
 if TYPE_CHECKING:
     from model.hf.modeling import RecurrentGPTForCausalLM
@@ -40,7 +41,7 @@ class InferenceSession:
 @contextmanager
 def inference_session(
     model: torch.nn.Module, recurrence: Recurrence = None, *, seed: int = 0,
-    execution_policy: ExecutionPolicy | None = None,
+    execution_policy: ExecutionPolicy | None = None, on_fatal_error: FatalHandler | None = None,
 ) -> Iterator[InferenceSession]:
     """Preserve caller global RNG and seed only CPU/model-CUDA, including exceptional exits.
 
@@ -58,7 +59,7 @@ def inference_session(
     else:
         os.environ[RECURRENCE_ENV] = env_value
     try:
-        with preserve_rng(device), torch.inference_mode(), policy.autocast(device):
+        with preserve_rng(device, on_fatal_error), torch.inference_mode(), policy.autocast(device):
             seed_model_rng(seed, device)
             with evaluation_mode(model):
                 if isinstance(model, RecurrentGPT) and policy.precision is not None:

@@ -144,7 +144,7 @@ def run_training_loop(
         checkpoint_fresh = save_checkpoint_if_due(state, logger, batches, stop)
         if bool(stop.requested):
             break
-        checkpoint_fresh = run_scheduled_inference(state, logger, loaders.tokenizer, sample_triggers, benchmark_triggers, stop, checkpoint_fresh)
+        checkpoint_fresh = run_scheduled_inference(state, logger, loaders.tokenizer, sample_triggers, benchmark_triggers, stop, checkpoint_fresh, on_fatal_error)
         if bool(stop.requested):
             break
 

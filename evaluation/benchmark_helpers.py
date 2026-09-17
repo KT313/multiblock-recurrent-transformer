@@ -10,9 +10,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from evaluation.harness_runtime import check_benchmark_results, use_serial_bootstrap
+from evaluation.publication import open_atomic_output
 from evaluation.metadata import METADATA_VERSION, dependency_versions
 from evaluation.session import InferenceSession
-from evaluation.wrapper import Recurrence, check_recurrence
+from evaluation.wrapper import Recurrence, check_recurrence, recurrence_label
 from model.execution import ExecutionPolicy
 from model.model import RecurrentGPT
 from training.data.tokenizer import Tokenizer
@@ -41,13 +43,15 @@ def check_benchmark_requests(
         raise ValueError("no recurrence setting given (None stands for the mean recurrence)")
     if num_fewshot < TASK_DEFAULT_FEWSHOT:
         raise ValueError(f"num_fewshot must be >= {TASK_DEFAULT_FEWSHOT} ({TASK_DEFAULT_FEWSHOT}: each task's own default), got {num_fewshot}")
+    if len({recurrence_label(value) for value in recurrences}) != len(recurrences):
+        raise ValueError("benchmark recurrence labels must be unique")
     for recurrence in recurrences:
         check_recurrence(recurrence, model)
 
 
 def build_benchmark_harness(
     session: InferenceSession, tokenizer: Tokenizer, hf_models: Any, batch_size: int | str, max_length: int,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = False, *, local_generation: bool = False,
 ) -> tuple[RecurrentGPTForCausalLM, Any]:
     wrapper = session.hf_wrapper(tokenizer)
     harness = hf_models.HFLM
@@ -57,9 +61,12 @@ def build_benchmark_harness(
         harness = create_literal_harness_class(harness, chat=apply_chat_template)
     elif apply_chat_template:
         raise ValueError("chat benchmarks require the literal chat tokenizer profile")
+    if local_generation:
+        from evaluation.local_harness import create_local_harness_class
+        harness = create_local_harness_class(harness)
     language_model = harness(  # BOS as in training and sampling; the table length caps few-shot prompts
         pretrained=wrapper, tokenizer=tokenizer.processor, batch_size=batch_size, add_bos_token=True,
-        max_length=max_length, mixed_precision_dtype=session.mixed_precision_dtype,
+        max_length=max_length, mixed_precision_dtype=session.mixed_precision_dtype, logits_cache=True,
     )
     return wrapper, language_model
 
@@ -74,13 +81,16 @@ def run_benchmark_harness(
     argument checks, Python/NumPy seeds and logging consume no Torch randomness. None opts out of the harness's
     all-device Torch seeding, including its pending lazy CUDA side effects.
     """
-    results: dict[str, Any] = lm_eval.simple_evaluate(  # per-sample logs would be retained in memory but never read
-        model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
-        num_fewshot=None if num_fewshot == TASK_DEFAULT_FEWSHOT else num_fewshot,
-        random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
-        torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
-        **({"apply_chat_template": True} if apply_chat_template else {}),
-    )
+    with use_serial_bootstrap():
+        results: dict[str, Any] = lm_eval.simple_evaluate(  # per-sample logs would be retained in memory but never read
+            model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
+            num_fewshot=None if num_fewshot == TASK_DEFAULT_FEWSHOT else num_fewshot,
+            random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
+            torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
+            fewshot_as_multiturn=True, use_cache=None, cache_requests=False,
+            **({"apply_chat_template": True} if apply_chat_template else {}),
+        )
+    check_benchmark_results(results)
     return results
 
 
@@ -115,7 +125,8 @@ def save_benchmark_results(
     if execution_policy is not None:
         record["execution_precision"] = execution_policy.precision
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
+    with open_atomic_output(out_path) as file:
+        file.write(json.dumps(record, indent=2, default=str) + "\n")
 
 
 def flatten_results(results: Mapping[str, Mapping[str, Any]], label: str) -> dict[str, float]:

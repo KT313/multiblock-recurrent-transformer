@@ -14,6 +14,8 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 
+from training.failure import FatalHandler, handle_fatal_error
+
 
 def seed_model_rng(seed: int, device: torch.device) -> None:
     """The CPU/model-device streams of torch.manual_seed, without its other-device side effects."""
@@ -25,7 +27,7 @@ def seed_model_rng(seed: int, device: torch.device) -> None:
 
 
 @contextmanager
-def preserve_rng(device: torch.device) -> Iterator[None]:
+def preserve_rng(device: torch.device, on_fatal_error: FatalHandler | None = None) -> Iterator[None]:
     """Restore Python, NumPy legacy global RNG, Torch CPU and the model's CUDA generator.
 
     Callers must use scoped seeding, including third-party adapters: torch.manual_seed seeds all devices
@@ -47,6 +49,7 @@ def preserve_rng(device: torch.device) -> Iterator[None]:
         yield
     except BaseException as error:
         original = error
+        handle_fatal_error(on_fatal_error, error)
         raise
     finally:
         # Attempt every restoration even if one fails, and retain the original evaluation exception.
@@ -55,6 +58,7 @@ def preserve_rng(device: torch.device) -> Iterator[None]:
             try:
                 reset()
             except BaseException as error:
+                handle_fatal_error(on_fatal_error, error)
                 failures.append(error)
         if failures:
             primary = original if original is not None else failures[0]

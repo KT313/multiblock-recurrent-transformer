@@ -37,6 +37,7 @@ Every rank runs the same `train()`; the differences are these.
   DDP broadcasts rank 0's parameters at start, so the model initialization is shared.
 - **Validation is sharded.** Each rank scores its share of the validation rows; the per-depth losses are the mean of
   the per-rank means, the per-source losses are summed over the ranks.
+- **Scheduled inference is distributed.** Fixed sample batches and benchmark inference jobs use the resident model replicas; rank 0 retains official lm-eval aggregation and publication. See [distributed evaluation](distributed_evaluation.md) for batching, prompting, and qualification.
 - **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, accepted resume history, checkpoints, samples, benchmarks,
   the export, `train.log`, wandb and the dashboard belong to rank 0. The other ranks print WARNING and above with a
   `[rank N]` prefix; `torchrun --redirects 3 --local-ranks-filter 0` silences them entirely.
@@ -93,8 +94,8 @@ means the tokenizer workers are the bottleneck.
 ## Timeouts
 
 The process group's collective timeout is four hours (`DDP_TIMEOUT` in `training/backend/ddp.py`): while rank 0
-builds a missing dataset (`auto_prepare`) or runs the lm-eval benchmarks, the other ranks wait at a barrier, and that
-wait is legitimate. A rank that dies ends the whole launch through torchrun regardless.
+builds a missing dataset (`auto_prepare`), prepares benchmark tasks, or aggregates metrics, the other ranks can wait
+at a shared phase boundary. Benchmark inference itself is distributed. These waits are legitimate. A rank that dies ends the whole launch through torchrun regardless.
 
 ## Testing without GPUs
 

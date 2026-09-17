@@ -6,76 +6,61 @@ from __future__ import annotations
 from pathlib import Path
 
 from data_preparation.lib.log import get_logger
-from evaluation.benchmarks import benchmarks_path, evaluate_on_benchmarks
+from evaluation.benchmarks import benchmarks_path
 from evaluation.prompts import load_prompts
-from evaluation.samples import GeneratedSample, generate_and_save_samples, samples_path
+from evaluation.samples import GeneratedSample, samples_path
 from training.data.tokenizer import Tokenizer
 from training.execution.state import RunState
 from training.logger import RunLogger
+from training.failure import FatalHandler, fatal_errors
+from training.stopping import StopController
 
 log = get_logger("training.run")
 
 
-def write_samples(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> list[GeneratedSample]:
-    """
-    Sample generations of the model as it is now, written to `samples/step-XXXXXXXX.jsonl` of the run directory
-    and noted by the logger. RNG-isolated: the training numerics do not change. An empty list when generation
-    failed (a warning, the run goes on), the policy `run_benchmarks` has: neither is worth a run.
-    """
+def write_samples(
+    state: RunState, logger: RunLogger, tokenizer: Tokenizer, *, stop: StopController | None = None,
+    on_fatal_error: FatalHandler | None = None,
+) -> list[GeneratedSample]:
+    """Generate fixed batches on resident replicas; rank zero publishes complete samples."""
+    from evaluation.distributed_samples import generate_distributed_samples
 
     settings, step = state.settings, state.progress.step
     path = samples_path(state.run_directory, step)
-    try:
-        with logger.working("generating samples"):
-            samples = generate_and_save_samples(
-                state.backend.plain_model(state.model),
-                tokenizer,
-                path,
-                step=step,
-                prompts=load_prompts(),
-                max_new_tokens=settings.sample_max_new_tokens,
-                temperature=settings.sample_temperature,
-                use_cache=settings.sample_use_cache,
-                recurrences=settings.sample_recurrences or [None],
-                execution_policy=state.backend.execution_policy,
-            )
-    except Exception as error:  # a prompt the model cannot take, an OOM in generation: the run must not end on it
-        log.warning("sample generation failed, the run continues: %s", error)
-        return []
-    logger.log_samples(path, samples)
-    return samples
+    with logger.working("generating samples"), fatal_errors(on_fatal_error):
+        result = generate_distributed_samples(
+            state.backend, state.backend.plain_model(state.model), tokenizer, path, step=step,
+            prompts=load_prompts() if state.backend.is_main else [], recurrences=settings.sample_recurrences or [None],
+            stop=stop or StopController(state.backend), batch_size=settings.sample_batch_size,
+            max_new_tokens=settings.sample_max_new_tokens, temperature=settings.sample_temperature,
+            use_cache=settings.sample_use_cache, on_fatal_error=on_fatal_error,
+        )
+        if result.completed and state.backend.is_main:
+            logger.log_samples(path, result.samples)
+            log.info("sample jobs per rank: %s", result.jobs_per_rank)
+    return result.samples
 
 
-
-def run_benchmarks(state: RunState, logger: RunLogger, tokenizer: Tokenizer) -> dict[str, float] | None:
-    """
-    lm-eval scores of the model as it is now, written to `benchmarks/step-XXXXXXXX.json` of the run directory and
-    logged as `benchmark/<recurrence>/<task>/<metric>`; None when the harness failed (logged as a warning, the run goes on).
-    """
+def run_benchmarks(
+    state: RunState, logger: RunLogger, tokenizer: Tokenizer, *, stop: StopController | None = None,
+    on_fatal_error: FatalHandler | None = None,
+) -> dict[str, float] | None:
+    """Run the official evaluator once and distribute inference jobs on resident replicas."""
+    from evaluation.distributed_benchmarks import evaluate_distributed_benchmarks
 
     settings, step = state.settings, state.progress.step
     path = benchmarks_path(state.run_directory, step)
-    try:
-        with logger.working("benchmarking"):
-            metrics = evaluate_on_benchmarks(
-                state.backend.plain_model(state.model),
-                tokenizer,
-                settings.benchmark_tasks,
-                num_fewshot=settings.benchmark_num_fewshot,
-                apply_chat_template=settings.benchmark_apply_chat_template,
-                limit=settings.benchmark_limit,
-                batch_size=settings.benchmark_batch_size,
-                recurrences=settings.benchmark_recurrences or [None],
-                out_path=path,
-                step=step,
-                seed=settings.seed,
-                execution_policy=state.backend.execution_policy,
-            )
-    except Exception as error:  # the harness needs the extra and the network; the run must not end on it
-        logger.log_benchmark_failure(error)
-        return None
-    logger.log_benchmarks(metrics, path, step)
-    return metrics
+    with logger.working("benchmarking"), fatal_errors(on_fatal_error):
+        result = evaluate_distributed_benchmarks(
+            state.backend, state.backend.plain_model(state.model), tokenizer, settings.benchmark_tasks,
+            stop=stop or StopController(state.backend), recurrences=settings.benchmark_recurrences or [None],
+            out_path=path, step=step, seed=settings.seed, batch_size=settings.benchmark_batch_size,
+            limit=settings.benchmark_limit, num_fewshot=settings.benchmark_num_fewshot,
+            apply_chat_template=settings.benchmark_apply_chat_template, on_fatal_error=on_fatal_error,
+        )
+        if result.completed and state.backend.is_main:
+            logger.log_benchmarks(result.metrics, path, step)
+    return result.metrics if result.completed else None
 
 
 

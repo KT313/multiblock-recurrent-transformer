@@ -19,6 +19,24 @@ def create_literal_harness_class(base: Any, *, chat: bool) -> Any:
             self.tokenizer.apply_chat_template(chat_history, tokenize=True, add_generation_prompt=True)
             return CHAT_ENVELOPE + json.dumps(chat_history, ensure_ascii=True, separators=(",", ":"))
 
+        def _encode_pair(self, context: str, continuation: str) -> tuple[list[int], list[int]]:
+            context_ids, answer_ids = super()._encode_pair(context, continuation)
+            if chat and context.startswith(CHAT_ENVELOPE):
+                if not answer_ids:
+                    raise ValueError("chat likelihood requires a nonempty candidate")
+                if len(context_ids) + len(answer_ids) - 1 > self.max_length:
+                    raise ValueError("chat likelihood exceeds context; shorten few-shot history explicitly")
+            return list(context_ids), list(answer_ids)
+
+        def loglikelihood_rolling(self, requests: list[Any], **kwargs: Any) -> Any:
+            if chat:
+                raise ValueError("rolling likelihood has no chat protocol; select plain prompting")
+            return super().loglikelihood_rolling(requests, **kwargs)
+
+        def generate_until(self, requests: list[Any], disable_tqdm: bool = False) -> list[str]:
+            from evaluation.literal_generation import generate_literal_until
+            return generate_literal_until(self, requests, disable_tqdm)
+
         def tok_encode(self, string: str, add_special_tokens: bool | None = None, left_truncate_len: int | None = None, **kwargs: Any) -> list[int]:
             if chat and string.startswith(CHAT_ENVELOPE):
                 messages, end = json.JSONDecoder().raw_decode(string[len(CHAT_ENVELOPE):])

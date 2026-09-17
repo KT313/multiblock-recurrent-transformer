@@ -293,3 +293,31 @@ def test_sampling_leaves_the_next_training_update_identical(
         assert torch.equal(left, right)
         assert left.grad is not None and right.grad is not None and torch.equal(left.grad, right.grad)
     assert plain.step == sampled.step == 11 and plain.training and sampled.training
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_temperature_list_matches_separate_runs(
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, tmp_path: Path, use_cache: bool,
+) -> None:
+    prompts = IN_VOCAB_PROMPTS[:3]
+    path = tmp_path / "temperatures.jsonl"
+    expected = [sample for temperature in (0.0, 0.7) for recurrence in (None, [1, 1])
+                for sample in generate_samples(tiny_model, tokenizer, prompts, temperature=temperature,
+                    recurrence=recurrence, max_new_tokens=3, batch_size=2, use_cache=use_cache)]
+    rng = torch.get_rng_state()
+    actual = generate_and_save_samples(
+        tiny_model, tokenizer, path, step=1, prompts=prompts, temperature=[0.0, 0.7],
+        recurrences=[None, [1, 1]], max_new_tokens=3, batch_size=2, use_cache=use_cache,
+    )
+    assert actual == expected
+    assert torch.equal(rng, torch.get_rng_state())
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["decoding"]["temperature"] for row in rows] == [sample.temperature for sample in expected]
+    assert len(actual) == 4 * len(prompts)
+    combined = generate_samples(tiny_model, tokenizer, prompts, temperature=[0.0, 0.7],
+                                max_new_tokens=3, batch_size=2, use_cache=use_cache)
+    separate = [sample for temperature in (0.0, 0.7) for sample in generate_samples(
+        tiny_model, tokenizer, prompts, temperature=temperature, max_new_tokens=3, batch_size=2, use_cache=use_cache)]
+    assert combined == separate
+    assert generate_samples(tiny_model, tokenizer, prompts, temperature=[0.0], max_new_tokens=3) == generate_samples(
+        tiny_model, tokenizer, prompts, temperature=0.0, max_new_tokens=3)
