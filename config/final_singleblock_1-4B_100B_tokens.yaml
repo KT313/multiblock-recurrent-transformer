@@ -1,6 +1,6 @@
 # --- Config references (both required) --------------------------------------------------------------------------
 dataset_config: config/datasets/final_100B_tokens.yaml               # sources, stages, budgets, weights, tokenizer
-model_architecture_config: config/model_architecture/final_multiblock_1-4B.yaml   # RecurrentConfig: sizes, depth, recurrence
+model_architecture_config: config/model_architecture/final_singleblock_1-4B.yaml   # RecurrentConfig: sizes, depth, recurrence
 
 # --- Data -------------------------------------------------------------------------------------------------------
 dataset_dir: dataset                 # root of the prepared data (sources/, processed/, tokenizers/)
@@ -13,7 +13,7 @@ allow_dataset_change: false          # allow resuming from a checkpoint written 
 allow_settings_change: true          # allow resuming although settings / model config differ from the checkpoint (all compared but exemptions)
 
 # --- Run --------------------------------------------------------------------------------------------------------
-run_name: final_multiblock_1-4B_100B_tokens                # name of the run: checkpoint file names, wandb run, resume lookup
+run_name: final_singleblock_1-4B_100B_tokens                # name of the run: checkpoint file names, wandb run, resume lookup
 out_dir: outputs                     # the run directory is {out_dir}/{run_name}: checkpoints/, wandb/, train.log, configs
 resume: true                         # resume from the most recently written checkpoint in the run directory if one exists
 resume_checkpoint_path: null         # explicit checkpoint to resume from (overrides the search); null: search
@@ -85,11 +85,11 @@ sample_at_training_progress: [100]   # ... and after the steps at these percenta
 sample_max_new_tokens: 128           # tokens generated per prompt
 sample_use_cache: true               # fixed per-token/core latents and per-recurrence K/V; false: legacy resampling
 sample_temperature: 0.0              # 0: greedy decoding
-sample_recurrences: [[1, 1, 1], [2, 2, 2], [4, 4, 4], [8, 8, 8]]               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
+sample_recurrences: [[1], [2], [4], [8]]               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
 benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
 benchmark_at_training_progress: [100]   # ... and at these percentages of the run, like sample_at_training_progress
 benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
 benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
 benchmark_num_fewshot: -1         # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
 benchmark_batch_size: 8              # sequences per lm-eval forward
-benchmark_recurrences: [[1, 1, 1], [2, 2, 2], [4, 4, 4], [8, 8, 8]]            # like sample_recurrences, for the benchmarks
+benchmark_recurrences: [[1], [2], [4], [8]]            # like sample_recurrences, for the benchmarks
