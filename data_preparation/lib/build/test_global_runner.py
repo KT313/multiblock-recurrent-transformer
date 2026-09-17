@@ -119,6 +119,52 @@ def test_real_admission_failure_and_retry(
     assert {name: _rows(resumed, name) for name in cfg.sources} == {name: _rows(baseline, name) for name in cfg.sources}
 
 
+def test_pipelined_admission_commits_what_a_plain_loop_commits(
+    cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Shard by shard: the threaded pass (reader ahead, writer behind; one-row batches so every source has several
+    shards) publishes exactly the batches a plain in-memory GlobalAdmission commits over the same candidates in
+    the same order, and ends at the same frontier.
+    """
+
+    from data_preparation.lib.build import runner
+    from data_preparation.lib.stages.global_dedup import GlobalAdmission, ordered_sources
+    from data_preparation.lib.stages.global_output import candidate_rows
+
+    cfg = _config(cfg_factory, write_local, tmp_path)
+    path = config_file(cfg)
+    root = tmp_path / "dataset"
+
+    def one_row_batches(
+        config: DatasetConfig, name: str, scoped: DatasetLayout, start: GlobalFrontier, **kwargs: Any,
+    ) -> tuple[GlobalFrontier, bool]:
+        return global_build.build_global_source(config, name, scoped, start, batch_rows=1, **kwargs)
+
+    monkeypatch.setattr(runner, "build_global_source", one_row_batches)
+    assert prepare(path, root, assume_yes=True).complete
+    scoped, candidates = DatasetLayout(root).for_config(cfg), DatasetLayout(root)
+    admission = GlobalAdmission(ordered_sources(cfg), memory_mb=cfg.bloom_dedup_memory_mb)
+    for name in ordered_sources(cfg):
+        local = Manifest.load(candidates.processed_dir(name))
+        assert local is not None
+        expected: list[list[dict[str, Any]]] = []
+
+        def collect(rows: list[dict[str, Any]], frontier: GlobalFrontier, batches: list[list[dict[str, Any]]] = expected) -> None:
+            batches.append(rows)
+
+        for row in candidate_rows(candidates.processed_dir(name), local, 0):
+            admission.commit_batch(name, "pretrain", [row], collect)
+        admission.finish_source(name, lambda rows, frontier: None)
+        output = Manifest.load(scoped.processed_dir(name))
+        assert output is not None and output.generation_complete
+        shards = [pq.read_table(scoped.processed_dir(name) / shard.name).to_pylist() for shard in output.shards]
+        assert shards == [rows for rows in expected if rows], name
+        assert GlobalFrontier.from_dict(output.extra["global_frontier"]) == admission.frontier, name
+    assert sum(len(_rows(scoped, name)) for name in cfg.sources) > 3, "several shards were compared"
+
+
 def test_ordered_zero_yield_topup_reaches_later_unique_rows(
     cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
 ) -> None:

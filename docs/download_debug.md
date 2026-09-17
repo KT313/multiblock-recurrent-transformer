@@ -36,6 +36,9 @@ During quiet network periods, look for:
 - `build_prepare_shard` and `build_write_shard`: the shard workers of a per-raw-shard build (`--pass_workers`
   above 1), reported as `source=<name>/build`; the build thread shows `WAIT:worker_result_wait` while it waits for
   a prepared shard or a written one.
+- `WAIT:global_reader_wait` and `WAIT:global_writer_wait` on the main thread: the dataset-wide admission pass is
+  waiting for its reader thread (candidate decoding) or its writer thread (shard and manifest publication); neither
+  wait means the Bloom pass itself is slow.
 - `parquet_compress_write`, `file_sync`, or `publish_manifest`: output work may be delaying progress.
 - `WAIT:wait_jobs` on MainThread: the coordinator is waiting for workers, usually normal.
 - `WAIT:worker_result_wait`: check the corresponding cleaning-process reports.

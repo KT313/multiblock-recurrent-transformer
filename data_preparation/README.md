@@ -405,6 +405,10 @@ cost is one retained-row copy per dataset scope, including an 8-byte `global_has
 row; source-local candidates remain on disk. The global writer reads at most 4096 rows
 per batch. It runs after the parallel candidate workers join, so its filter does not
 multiply by `num_workers`; source-local filter/worker budgets retain their existing rules.
+The pass is pipelined over three threads (`lib/stages/global_build.py`): a reader decodes
+the next candidate batches, the build thread runs the Bloom pass, a writer publishes the
+previous batch's shard and manifest; the commits are the same, in the same order, as a
+plain loop, and a failed commit leaves the manifest at the last complete one.
 Recovering a source streams keys from committed earlier sources (bounded RAM, additional
 key-column reads as the number of sources grows).
 
