@@ -141,9 +141,9 @@ stages:
     tokens: 66_000_000_000
     transition_pct: 0.10
     train:
-      fineweb_edu: 0.650
+      fineweb_edu: 0.704
       wikipedia: 0.090
-      books_gutenberg: 0.060
+      books_gutenberg: 0.006
       github_code_clean_python: 0.040
       github_code_clean_javascript: 0.024
       github_code_clean_typescript: 0.012
@@ -189,20 +189,20 @@ stages:
     train:
       metamath: 0.062
       orca_math: 0.042
-      evol_code: 0.052
-      code_alpaca: 0.010
+      evol_code: 0.0065
+      code_alpaca: 0.0004
       slimorca: 0.042
-      sharegpt: 0.021
+      sharegpt: 0.0021
       wizardlm: 0.021
-      opencodeinstruct: 0.250
+      opencodeinstruct: 0.324
       nemotron_chat_off: 0.500
     val:
       metamath: 0.062
       orca_math: 0.042
-      evol_code: 0.052
-      code_alpaca: 0.010
+      evol_code: 0.0065
+      code_alpaca: 0.0004
       slimorca: 0.042
-      sharegpt: 0.021
+      sharegpt: 0.0021
       wizardlm: 0.021
-      opencodeinstruct: 0.250
+      opencodeinstruct: 0.324
       nemotron_chat_off: 0.500
