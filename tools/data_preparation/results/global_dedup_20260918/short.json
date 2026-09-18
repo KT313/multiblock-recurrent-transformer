@@ -1,0 +1,2640 @@
+{
+  "filesystem": "ext4   /dev/nvme0n1p4[/tmp]",
+  "settings": {
+    "output_root": "/tmp/global-benchmark-final-v2-short",
+    "repo": "/home/tobi/Desktop/multiblock-recurrent-transformer",
+    "baseline_repo": "/tmp/global-dedup-baseline-4xd69mzt",
+    "cases": [
+      "baseline",
+      "reuse",
+      "hash2",
+      "hash4"
+    ],
+    "rows": 60000,
+    "text_chars": 64,
+    "bloom_mb": 8,
+    "trials": 3,
+    "max_input_mb": 256,
+    "max_rss_mb": 4096,
+    "timeout": 180,
+    "worker": null
+  },
+  "cache_conditions": "fresh fixture writes, warm input cache; no host cache clearing",
+  "rss_method": "100ms sampled sum of process-tree VmRSS, including setup; shared pages counted per process",
+  "summary": {
+    "baseline": {
+      "median_seconds": 1.5788159139992786,
+      "seconds": [
+        1.6261620310033322,
+        1.5387395510006172,
+        1.5788159139992786
+      ]
+    },
+    "reuse": {
+      "median_seconds": 1.3300828729989007,
+      "seconds": [
+        1.3300828729989007,
+        1.4071347620010783,
+        1.2875894290009455
+      ]
+    },
+    "hash2": {
+      "median_seconds": 1.27572443200188,
+      "seconds": [
+        1.207512641998619,
+        1.27572443200188,
+        1.344307203002245
+      ]
+    },
+    "hash4": {
+      "median_seconds": 1.3707643289999396,
+      "seconds": [
+        1.2984527070002514,
+        1.3707643289999396,
+        1.4116529199964134
+      ]
+    }
+  },
+  "trials": [
+    {
+      "source_digest": "d7d89786994523072d59cade5945bc92dafffbc525fcd4a2ca8763f5c5805003",
+      "case": "baseline",
+      "rows": 90000,
+      "wall_seconds": 1.6261620310033322,
+      "source_seconds": {
+        "a": 0.8980802380028763,
+        "b": 0.3725348550033232,
+        "c": 0.35551373300040723
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.000602834999881452
+        },
+        {
+          "keys": 60000,
+          "seconds": 0.1090202009982022
+        },
+        {
+          "keys": 72000,
+          "seconds": 0.11093210599938175
+        }
+      ],
+      "rows_per_second": 55345.03836894441,
+      "cpu_seconds_parent_and_joined_children": 1.1927699999999999,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 231624704
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "reuse",
+      "rows": 90000,
+      "wall_seconds": 1.3300828729989007,
+      "source_seconds": {
+        "a": 0.8373260979969928,
+        "b": 0.2420998250017874,
+        "c": 0.25062403899937635
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0004678840014094021
+        }
+      ],
+      "rows_per_second": 67664.95669332206,
+      "cpu_seconds_parent_and_joined_children": 0.9028370000000001,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 228343808
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash2",
+      "rows": 90000,
+      "wall_seconds": 1.207512641998619,
+      "source_seconds": {
+        "a": 0.8127918860009231,
+        "b": 0.1828824429976521,
+        "c": 0.18229183099902002
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0006027879971952643
+        }
+      ],
+      "rows_per_second": 74533.38115867355,
+      "cpu_seconds_parent_and_joined_children": 3.6589859999999996,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 414326784
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash4",
+      "rows": 90000,
+      "wall_seconds": 1.2984527070002514,
+      "source_seconds": {
+        "a": 0.8454357459995663,
+        "b": 0.19891804900180432,
+        "c": 0.21183248400120647
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0005589460015471559
+        }
+      ],
+      "rows_per_second": 69313.26764139325,
+      "cpu_seconds_parent_and_joined_children": 4.466702000000001,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 578260992
+    },
+    {
+      "source_digest": "d7d89786994523072d59cade5945bc92dafffbc525fcd4a2ca8763f5c5805003",
+      "case": "baseline",
+      "rows": 90000,
+      "wall_seconds": 1.5387395510006172,
+      "source_seconds": {
+        "a": 0.814088241000718,
+        "b": 0.36055544199916767,
+        "c": 0.36405741999988095
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0003868349995173048
+        },
+        {
+          "keys": 60000,
+          "seconds": 0.1085210780001944
+        },
+        {
+          "keys": 72000,
+          "seconds": 0.11675905199808767
+        }
+      ],
+      "rows_per_second": 58489.430483199365,
+      "cpu_seconds_parent_and_joined_children": 1.085734,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 222113792
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "reuse",
+      "rows": 90000,
+      "wall_seconds": 1.4071347620010783,
+      "source_seconds": {
+        "a": 0.9174793989986938,
+        "b": 0.23219342599986703,
+        "c": 0.2574306599999545
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0005956690001767129
+        }
+      ],
+      "rows_per_second": 63959.75881656957,
+      "cpu_seconds_parent_and_joined_children": 0.985411,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 225890304
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash2",
+      "rows": 90000,
+      "wall_seconds": 1.27572443200188,
+      "source_seconds": {
+        "a": 0.8392408760009857,
+        "b": 0.20362965800086386,
+        "c": 0.1998989560015616
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.000352281000232324
+        }
+      ],
+      "rows_per_second": 70548.15110718783,
+      "cpu_seconds_parent_and_joined_children": 3.8421000000000003,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 417230848
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash4",
+      "rows": 90000,
+      "wall_seconds": 1.3707643289999396,
+      "source_seconds": {
+        "a": 0.9195000420004362,
+        "b": 0.20494219999818597,
+        "c": 0.20866870499958168
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0005874630005564541
+        }
+      ],
+      "rows_per_second": 65656.80044042345,
+      "cpu_seconds_parent_and_joined_children": 4.480563999999999,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 577437696
+    },
+    {
+      "source_digest": "d7d89786994523072d59cade5945bc92dafffbc525fcd4a2ca8763f5c5805003",
+      "case": "baseline",
+      "rows": 90000,
+      "wall_seconds": 1.5788159139992786,
+      "source_seconds": {
+        "a": 0.8582140910002636,
+        "b": 0.37019435899856035,
+        "c": 0.35038432399960584
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0004593580015352927
+        },
+        {
+          "keys": 60000,
+          "seconds": 0.10356369999863091
+        },
+        {
+          "keys": 72000,
+          "seconds": 0.11642284999834374
+        }
+      ],
+      "rows_per_second": 57004.7458997434,
+      "cpu_seconds_parent_and_joined_children": 1.1383280000000005,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 220647424
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "reuse",
+      "rows": 90000,
+      "wall_seconds": 1.2875894290009455,
+      "source_seconds": {
+        "a": 0.8221134289997281,
+        "b": 0.2470531490034773,
+        "c": 0.2183924820019456
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.00047354399794130586
+        }
+      ],
+      "rows_per_second": 69898.05754294827,
+      "cpu_seconds_parent_and_joined_children": 0.8799959999999998,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 216621056
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash2",
+      "rows": 90000,
+      "wall_seconds": 1.344307203002245,
+      "source_seconds": {
+        "a": 0.8863817220008059,
+        "b": 0.21961388400086435,
+        "c": 0.20520026099984534
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0005012439978600014
+        }
+      ],
+      "rows_per_second": 66948.98294006218,
+      "cpu_seconds_parent_and_joined_children": 3.908055,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 414232576
+    },
+    {
+      "source_digest": "6ba30623149734018711eff92778def5e3ffe879864258d91957c0695aaf1955",
+      "case": "hash4",
+      "rows": 90000,
+      "wall_seconds": 1.4116529199964134,
+      "source_seconds": {
+        "a": 0.9394657119992189,
+        "b": 0.21975283999927342,
+        "c": 0.21003184499932104
+      },
+      "restorations": [
+        {
+          "keys": 0,
+          "seconds": 0.0006440379984269384
+        }
+      ],
+      "rows_per_second": 63755.04823113933,
+      "cpu_seconds_parent_and_joined_children": 4.6740759999999995,
+      "semantic": {
+        "a": {
+          "frontier": {
+            "bloom_positive": 0,
+            "candidates": 60000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "40adcfdd986e0d74d5d69c6351ce04295a183493bb57254baad73b9d945967a7",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 60000,
+            "source_candidates": 0,
+            "source_index": 1,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "retained": 60000
+            },
+            "global_filter": {
+              "bloom_positive": 0,
+              "candidates": 60000,
+              "items_in_filter": 59999.97467759362,
+              "load": 0.01285456100961342,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 1.3639815419838927e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 60000
+            },
+            "local_candidates": 60000
+          },
+          "shards": [
+            "ccf828b7f6694c0dbb0c9165940f586a5450862411f31b3be768b56bdb0d925e",
+            "7416180699ae691260f2689aa79c1053df4e111a69020a8cccfa287a39bc31a3",
+            "ac0514f284ee0bdfa136c9c89ef9847b054b4310b031302e6c09979708a9717e",
+            "421d250b5c807669b618cfddd1c45ad8db0ec5496880c3f174ebfecf801c0bd9",
+            "3866e83f2187b185abcb7ad4bfa7e03dc98db5ab0f9b61df85a0673184df1336",
+            "e31390ae69966f2429d1e925bfb7016627149ceda0b22bda7799db70ee4d3f8d",
+            "a80e7e67a81c20cb7b7e9335a1f06c4931f4fc2928ba9e2498113ded842cf2bc",
+            "1746a84ca90e3708da9ade3c7ed1853b747cb09061b2c7baa13bc77071d81ece",
+            "d10d66ac589f63152e9c2ffc38acbe3c21badc8c623732f22cf8d1ad7a248ad5",
+            "7aa1d3f23f752aff7cde0f51a5bcf6ec3087452d86d5263710c9b6cf57626eb7",
+            "831be0d358d0bc66a4d5a27accbc5248373a6eb3bddd7a33085720826ffd67be",
+            "2b1340ce08d399f3d0010ebd0da6b50c4c3d28c6db0b5d650e25ef0854daf06b",
+            "396e2e7e2442bd91f1d99a38a3782d13d2ae00726fbfeef1c43b511b6a864b4e",
+            "b2fd1876381cf2978e0fdaf055dea70e43ea4ad066324dea8c86a391d66a08ab",
+            "38ebc1c9ed927d9e3b2b23ee78868221b9fb84a3aba9977d71e60379e7d3a918"
+          ]
+        },
+        "b": {
+          "frontier": {
+            "bloom_positive": 3000,
+            "candidates": 75000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "a3a8c799d76159a4ca78623339426263f076d6aa8961ade1fc45928f6d23db9b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 72000,
+            "source_candidates": 0,
+            "source_index": 2,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 3000,
+              "candidates": 75000,
+              "items_in_filter": 71998.93236123207,
+              "load": 0.015425250987816028,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 6.986234598043109e-19,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 72000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "56fea699716064ee3d283b1db6a24d6b7c0ae5bb28a2dc63a3b468bc5cff8d6c",
+            "bd6a309848019ea7137a6510877f9cab1b2fd8762ca18e5584ea4be3ef4c17ad",
+            "e4b44c1ca020311f74857f7f30a2f951865e038d4a523cdc1ebedeb103b7995c",
+            "769fbb1941030caa87e7208f15fc8a567c82cb63c7c6e626dbace332972a8e53"
+          ]
+        },
+        "c": {
+          "frontier": {
+            "bloom_positive": 6000,
+            "candidates": 90000,
+            "false_positive_rate": 0.001,
+            "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+            "key_digest": "c0004f36a2b6a28c740efb7b36e08d524c1a05f76020b8f67282668bc608276b",
+            "key_policy": "normalized-tagged-json-sha256-64-v1",
+            "memory_mb": 8,
+            "order_policy": "validation-only-then-declaration-v1",
+            "preseed_count": 0,
+            "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "retained": 84000,
+            "source_candidates": 0,
+            "source_index": 3,
+            "source_order": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "stats": {
+            "budget_shortfall": 0,
+            "global_dedup": {
+              "bloom_positive": 3000,
+              "candidates": 15000,
+              "retained": 12000
+            },
+            "global_filter": {
+              "bloom_positive": 6000,
+              "candidates": 90000,
+              "items_in_filter": 83998.23919230436,
+              "load": 0.017996015768333366,
+              "max_load": 2.0,
+              "measured_false_positive_rate": 2.7771594545039656e-18,
+              "memory_mb": 8,
+              "nominal_capacity": 4667602,
+              "preseed_count": 0,
+              "retained": 84000
+            },
+            "local_candidates": 15000
+          },
+          "shards": [
+            "197b65d1e47879641a7d3e9d1d509059d48aa78ec1f7beb07a321aa07a9457b4",
+            "f7995013ebdd080650e1e2a837a38c990da08982cd8b0503d71b1d3835350f89",
+            "49c8fa64fe3c745f34012ea44cbea5a59a5cbdd7d414ca6885c4dbdfe397b271",
+            "5fe8e1b3fdc024cd90839cc25f6a53ca85ef127a18c6b26a50d4935282379c2e"
+          ]
+        }
+      },
+      "fixture_digest": "9abe71d89c50b41c7e0c07fdb45212082276b5106406bdbe790ea1155fbec8a6",
+      "config_hash": "cde6147e90d547ff",
+      "versions": {
+        "pyarrow": "25.0.1",
+        "rbloom": "1.5.4"
+      },
+      "python": "3.11.14",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "sampled_peak_tree_rss_bytes": 580919296
+    }
+  ]
+}

@@ -83,6 +83,10 @@ from data_preparation.lib.stages.download import (
 )
 from data_preparation.lib.stages.global_dedup import global_policy, ordered_sources
 from data_preparation.lib.stages.global_build import build_global_source, outputs_complete
+from data_preparation.lib.stages.global_session import GlobalAdmissionSession
+from data_preparation.lib.stages.global_hash_workers import (
+    DEFAULT_GLOBAL_HASH_WORKERS, GlobalHashWorkers, check_global_hash_workers,
+)
 from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS, TokenizerPool
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.snapshot import publish_snapshot, snapshot_problem
@@ -107,6 +111,7 @@ def prepare(
     *,
     num_workers: int = DEFAULT_NUM_WORKERS,
     pass_workers: int = DEFAULT_PASS_WORKERS,
+    global_hash_workers: int = DEFAULT_GLOBAL_HASH_WORKERS,
     tokenizer_threads: int = DEFAULT_TOKENIZER_THREADS,
     max_parallel_downloads: int = DEFAULT_MAX_PARALLEL_DOWNLOADS,
     download_prefetch_mb: int | None = None,
@@ -151,6 +156,7 @@ def prepare(
     selected = checked_sources(config, sources)
     reopened = checked_sources(config, reopen) or []
     check_worker_counts(num_workers, max_parallel_downloads, pass_workers, tokenizer_threads)
+    check_global_hash_workers(global_hash_workers)
     warn_about_overlaps(config)
 
     # hold dataset ownership and attach the unreadable-shard remedy
@@ -164,7 +170,7 @@ def prepare(
                 reopened=reopened, dry_run=dry_run, assume_yes=assume_yes, confirm=confirm,
                 allow_foreign_raw=allow_foreign_raw, hf_token=hf_token, num_workers=num_workers,
                 pass_workers=pass_workers, max_parallel_downloads=max_parallel_downloads, should_stop=should_stop,
-                tokenizer_pool=tokenizer_pool,
+                tokenizer_pool=tokenizer_pool, global_hash_workers=global_hash_workers,
             )
 
         # authorize changes and publish the tokenizer before repairing source data
@@ -244,7 +250,7 @@ def prepare_global(
     selected: list[str] | None, reopened: list[str], dry_run: bool, assume_yes: bool,
     confirm: Confirm | None, allow_foreign_raw: bool, hf_token: str | None,
     num_workers: int, pass_workers: int, max_parallel_downloads: int, should_stop: StopCheck | None,
-    tokenizer_pool: TokenizerPool | None = None,
+    tokenizer_pool: TokenizerPool | None = None, global_hash_workers: int = DEFAULT_GLOBAL_HASH_WORKERS,
 ) -> DatasetReport:
     """Caller holds the exclusive lease until every worker and ordered writer stops."""
 
@@ -292,7 +298,7 @@ def prepare_global(
             )
             return assess_dataset_state(config, layout, repair)
         run_global_admission_rounds(
-            config, layout, candidates, steps, seeds, pass_workers=pass_workers,
+            config, layout, candidates, steps, seeds, pass_workers=pass_workers, global_hash_workers=global_hash_workers,
             hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool,
         )
         return assess_dataset_state(config, layout, repair, publish=True)
@@ -320,50 +326,52 @@ def run_global_download_rounds(
 def run_global_admission_rounds(
     config: DatasetConfig, layout: DatasetLayout, candidates: DatasetLayout, steps: set[str], seeds: BenchmarkSeeds,
     *, pass_workers: int, hf_token: str | None, should_stop: StopCheck | None, config_name: str,
-    tokenizer_pool: TokenizerPool | None = None,
+    tokenizer_pool: TokenizerPool | None = None, global_hash_workers: int = DEFAULT_GLOBAL_HASH_WORKERS,
 ) -> None:
     """Admit each source before proceeding to the next, with bounded top-ups for global losses."""
     frontier = seeds.frontier(ordered_sources(config), config.bloom_dedup_memory_mb)
-    for name in ordered_sources(config):
-        start = frontier
-        complete = False
-        for round_number in range(1, MAX_ROUNDS + 1):
-            check_stop(should_stop)
-            ledger = source_ledger(config, name, layout)
-            if ledger.raw_state != "current":
-                break
+    session = GlobalAdmissionSession(config, layout, frontier, seeds.keys)
+    with GlobalHashWorkers(global_hash_workers) as hashing:
+        for name in ordered_sources(config):
+            start = frontier
+            complete = False
+            for round_number in range(1, MAX_ROUNDS + 1):
+                check_stop(should_stop)
+                ledger = source_ledger(config, name, layout)
+                if ledger.raw_state != "current":
+                    break
 
-            # consume pending candidates before requesting extra raw data
-            target = calculate_candidate_target(name, layout, candidates, ledger, start)
-            local = build_source(config, name, candidates, pass_workers=pass_workers,
-                                 should_stop=should_stop, rows_target=target)
-            frontier, complete = build_global_source(
-                config, name, layout, start, rows_target=ledger.rows_sufficient,
-                exhausted=ledger.exhausted, should_stop=should_stop, preseed_keys=seeds.keys(),
-            )
-            if complete:
-                break
-            if round_number == MAX_ROUNDS:
-                break
-            raw = Manifest.load(candidates.raw_dir(name))
-            if raw is not None and len(local.input_shards) < len(raw.shards):
-                continue
-            if "download" not in steps:
-                break
+                # consume pending candidates before requesting extra raw data
+                target = calculate_candidate_target(name, layout, candidates, ledger, start)
+                local = build_source(config, name, candidates, pass_workers=pass_workers,
+                                     should_stop=should_stop, rows_target=target)
+                frontier, complete = build_global_source(
+                    config, name, layout, start, rows_target=ledger.rows_sufficient,
+                    exhausted=ledger.exhausted, should_stop=should_stop, session=session, hash_workers=hashing,
+                )
+                if complete:
+                    break
+                if round_number == MAX_ROUNDS:
+                    break
+                raw = Manifest.load(candidates.raw_dir(name))
+                if raw is not None and len(local.input_shards) < len(raw.shards):
+                    continue
+                if "download" not in steps:
+                    break
 
-            # top up boundedly: a zero-yield source may still have unique rows later
-            ledger = source_ledger(config, name, layout)
-            increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
-            log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
-            download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
-                     hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool)
-            after = source_ledger(config, name, layout)
-            if after.raw_rows <= ledger.raw_rows and not after.exhausted:
-                log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
+                # top up boundedly: a zero-yield source may still have unique rows later
+                ledger = source_ledger(config, name, layout)
+                increment = ledger.rows_to_fetch[0] or max(1, ledger.rows_needed)
+                log.info("%s: ordered global top-up %d/%d, fetching at most %d rows", name, round_number, MAX_ROUNDS, increment)
+                download(config, name, candidates, rows_needed=ledger.raw_rows + increment,
+                         hf_token=hf_token, should_stop=should_stop, config_name=config_name, tokenizer_pool=tokenizer_pool)
+                after = source_ledger(config, name, layout)
+                if after.raw_rows <= ledger.raw_rows and not after.exhausted:
+                    log.warning("%s: global top-up made no raw progress; stopping before lower-priority admission", name)
+                    break
+            if not complete:
+                log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
                 break
-        if not complete:
-            log.warning("%s: global retained budget is unfinished; lower-priority sources remain pending", name)
-            break
 
 
 # --- one round: downloads and builds side by side --------------------------------------------------------------------

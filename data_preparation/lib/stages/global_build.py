@@ -13,6 +13,8 @@ each batch's shard and manifest (:class:`_Writer`, at most two commits behind th
 published before the manifest that lists it, and the frontier in the manifest equals the rows on disk, at every
 commit; a failed commit poisons the admission at its next batch and leaves the manifest at the last complete
 commit, the state :func:`restore_output_generation` and :func:`source_frontier` resume from.
+An invocation-local session reuses only successfully published admission state. Optional
+spawn workers compute keys ahead of admission; Bloom decisions and publication stay here.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import queue
 import threading
 from collections.abc import Iterable, Iterator
 from functools import partial
-from itertools import chain, islice
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +33,15 @@ from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck, check_stop
 from data_preparation.lib.download_profile import bind_profile, measure
 from data_preparation.lib.log import get_logger
-from data_preparation.lib.stages.global_dedup import GlobalAdmission, GlobalFrontier, PublishBatch, ordered_sources
+from data_preparation.lib.stages.global_dedup import GlobalFrontier, PublishBatch, ordered_sources
+from data_preparation.lib.stages.global_session import GlobalAdmissionSession
+from data_preparation.lib.stages.global_hash_workers import GlobalHashWorkers
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.ownership import guarded_path
 from data_preparation.lib.storage.parquet import build_row_table, publish_shard, shard_name
 
 from data_preparation.lib.stages.global_output import (
-    GLOBAL_BATCH_ROWS, candidate_rows, committed_keys,
+    GLOBAL_BATCH_ROWS, candidate_rows,
     outputs_complete as outputs_complete, source_frontier as source_frontier,  # noqa: PLC0414 - compatibility exports
     build_generation_identity, inspect_owned_output, load_completed_candidates, restore_output_generation,
 )
@@ -51,7 +55,8 @@ READ_AHEAD_BATCHES = 2  # candidate batches decoded ahead of the admission
 def build_global_source(
     config: DatasetConfig, name: str, layout: DatasetLayout, start: GlobalFrontier,
     *, rows_target: int, exhausted: bool, should_stop: StopCheck | None = None,
-    batch_rows: int = GLOBAL_BATCH_ROWS, preseed_keys: Iterable[int] = (),
+    batch_rows: int = GLOBAL_BATCH_ROWS, preseed_keys: Iterable[int] | None = None,
+    session: GlobalAdmissionSession | None = None, hash_workers: GlobalHashWorkers | None = None,
 ) -> tuple[GlobalFrontier, bool]:
     """Admit one source; return its frontier and whether budget/exhaustion finalized it.
 
@@ -60,6 +65,26 @@ def build_global_source(
     A matching partial generation resumes behind exactly its committed candidate offset.
     """
 
+    if session is not None and preseed_keys is not None:
+        session.invalidate()
+        raise ValueError("a shared global admission session owns its benchmark seeds")
+    session = session or GlobalAdmissionSession(config, layout, start, lambda: () if preseed_keys is None else preseed_keys)
+    try:
+        with session.pass_scope(config, layout, start):
+            return _build_global_source(config, name, layout, start, rows_target=rows_target, exhausted=exhausted,
+                                        should_stop=should_stop, batch_rows=batch_rows, session=session,
+                                        hash_workers=hash_workers or GlobalHashWorkers())
+    except BaseException as error:
+        if hash_workers is not None:
+            hash_workers.close(error)
+        raise
+
+
+def _build_global_source(
+    config: DatasetConfig, name: str, layout: DatasetLayout, start: GlobalFrontier,
+    *, rows_target: int, exhausted: bool, should_stop: StopCheck | None,
+    batch_rows: int, session: GlobalAdmissionSession, hash_workers: GlobalHashWorkers,
+) -> tuple[GlobalFrontier, bool]:
     # validate the source priority and guard all output paths
     if batch_rows < 1:
         raise ValueError("global batch_rows must be positive")
@@ -80,18 +105,17 @@ def build_global_source(
         config, name, directory, start, candidates, identity, manifest, rows_target=rows_target, exhausted=exhausted,
     )
     if completed_frontier is not None:
+        session.invalidate()  # a skipped source must not advance a cached filter through counters alone
         return completed_frontier, True
 
-    # rebuild admission from committed keys before recovering or extending the frontier
+    # Recover once, or borrow exactly the committed state of the preceding successful pass.
     frontier = source_frontier(manifest)
-    own_keys = committed_keys(layout, (name,))
-    admission = GlobalAdmission(
-        order, memory_mb=config.bloom_dedup_memory_mb, frontier=frontier,
-        committed_keys=chain(committed_keys(layout, prior_names), own_keys), preseed_keys=preseed_keys,
-    )
+    admission = session.acquire(config, layout, manifest)
     admission.check_capacity(start.retained + candidates.rows())
     if frontier.source_index == start.source_index + 1:
         manifest.complete_generation(directory)  # the final frontier committed before a crash in completion
+        check_stop(should_stop)
+        session.remember(manifest, admission)
         return frontier, True
 
     commit = partial(commit_global_batch, layout, directory, manifest, start)
@@ -101,10 +125,13 @@ def build_global_source(
     rows = candidate_rows(candidates_dir, candidates, frontier.source_candidates)
     batches = iter(lambda: list(islice(rows, batch_rows)), [])
     with _Writer(commit) as writer:
-        with _Reader(batches) as decoded:
-            for batch in decoded:
+        with (
+            _Reader(batches) as decoded,
+            contextlib.closing(hash_workers.batches(decoded, name, kind, frontier.source_candidates, should_stop)) as hashed,
+        ):
+            for batch, keys in hashed:
                 check_stop(should_stop)
-                admission.commit_batch(name, kind, batch, writer.publish)
+                admission.commit_batch(name, kind, batch, writer.publish, keys=keys)
         check_stop(should_stop)
         writer.flush()  # the manifest holds every commit before its rows are counted
 
@@ -126,6 +153,7 @@ def build_global_source(
     log.info("%s: global Bloom filter: %d MiB, %.3fx nominal load, measured FPR %.6f%%", name,
              metrics["memory_mb"], metrics["load"], metrics["measured_false_positive_rate"] * 100)
     check_stop(should_stop)
+    session.remember(manifest, admission)
     return admission.frontier, complete
 
 

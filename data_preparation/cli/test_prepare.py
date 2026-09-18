@@ -56,6 +56,7 @@ def test_commands_are_registered() -> None:
     assert args.run is prepare.run_prepare and args.dataset_dir == Path("dataset") and args.sources is None and args.steps is None
     assert args.num_workers == 2 and args.pass_workers == 4 and args.max_parallel_downloads == 2 and args.hf_token is None and args.cache_dir is None
     assert args.download_prefetch_mb is None
+    assert args.global_hash_workers == 1
     assert not args.dry_run and not args.yes and args.reopen is None and not args.allow_foreign_raw
     args = parser.parse_args(["prepare", "--dataset_config", "x.yaml", "--sources", "a", "b", "--steps", "download", "build", "--reopen", "a", "--dry_run", "--yes", "--allow_foreign_raw", "--num_workers", "3", "--pass_workers", "5", "--max_parallel_downloads", "4"])
     assert args.sources == ["a", "b"] and args.steps == ["download", "build"] and args.reopen == ["a"] and args.dry_run and args.yes and args.allow_foreign_raw
@@ -135,6 +136,30 @@ def test_prepare_dry_run_writes_nothing(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root), "--dry_run"])
     assert not root.exists()
+
+
+@pytest.mark.parametrize("workers", ["0", "-1", "1.5"])
+def test_bad_global_worker_count_fails_before_creating_output(tmp_path: Path, workers: str) -> None:
+    root = tmp_path / "dataset"
+    with pytest.raises(SystemExit) as caught:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(root),
+                      "--global_hash_workers", workers])
+    assert caught.value.code == 2
+    assert not root.exists()
+
+
+def test_global_workers_reach_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    received: list[int] = []
+
+    def run(*args: Any, **kwargs: Any) -> DatasetReport:
+        received.append(kwargs["global_hash_workers"])
+        raise BuildAborted("test runner boundary")
+
+    monkeypatch.setattr(cli_commands, "prepare", run)
+    with pytest.raises(SystemExit) as caught:
+        prepare.main(["prepare", "--dataset_config", str(TINY), "--dataset_dir", str(tmp_path / "dataset"),
+                      "--global_hash_workers", "4"])
+    assert caught.value.code == 130 and received == [4]
 
 
 def test_prepare_sources_and_steps_filters(tmp_path: Path) -> None:

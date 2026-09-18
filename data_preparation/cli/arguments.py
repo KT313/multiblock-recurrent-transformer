@@ -19,6 +19,7 @@ from data_preparation.lib.build.runner import (
     STEPS,
 )
 from data_preparation.lib.stages.tokenizer_pool import THREADS_PER_PROCESS
+from data_preparation.lib.stages.global_hash_workers import DEFAULT_GLOBAL_HASH_WORKERS
 
 DEFAULT_DATASET_DIR = Path("dataset")
 TINY_DATASET_CONFIG = Path("config/datasets/tiny.yaml")
@@ -88,6 +89,13 @@ def debug_interval(value: str) -> float:
     return interval
 
 
+def positive_workers(value: str) -> int:
+    workers = int(value)
+    if workers < 1:
+        raise argparse.ArgumentTypeError("worker count must be a positive integer")
+    return workers
+
+
 def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] = STEPS) -> None:
     """
     The options prepare and download share; steps are the ones the command runs (all of them by default).
@@ -105,6 +113,7 @@ def add_prepare_options(sub: argparse.ArgumentParser, *, steps: tuple[str, ...] 
     sub.add_argument("--allow_foreign_raw", action="store_true", help="let the repair step delete stale / outdated raw folders that another dataset config downloaded (they are shared by source name)")
     sub.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help="sources built at a time (build threads)")
     sub.add_argument("--pass_workers", type=int, default=DEFAULT_PASS_WORKERS, help="worker processes of EACH build: a per-raw-shard pretrain build reads, filters, hashes and writes its raw shards in them, a build with decontamination / minhash runs those passes in them (1 = everything in the build thread)")
+    sub.add_argument("--global_hash_workers", type=positive_workers, default=DEFAULT_GLOBAL_HASH_WORKERS, help="processes for final cross-source document hashing (1 = serial; admission stays ordered)")
     sub.add_argument("--tokenizer_threads", type=int, default=DEFAULT_TOKENIZER_THREADS,
                      help=f"tokenizer threads of the downloads in total: up to {THREADS_PER_PROCESS} on this process's Rust pool, more in "
                           f"ceil(N/{THREADS_PER_PROCESS}) separate tokenizer processes of up to {THREADS_PER_PROCESS} threads each (default: {DEFAULT_TOKENIZER_THREADS})")

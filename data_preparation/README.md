@@ -150,7 +150,7 @@ or dropped source row twice. All-at-once builds (shuffled sources, minhash) writ
 ```bash
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
         [--sources NAME ...] [--steps tokenizer download build] [--reopen NAME ...] [--yes] [--dry_run]
-        [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--download_prefetch_mb N] [--hf_token T] [--cache_dir DIR]
+        [--num_workers N] [--pass_workers N] [--global_hash_workers N] [--max_parallel_downloads N] [--download_prefetch_mb N] [--hf_token T] [--cache_dir DIR]
 uv run python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
@@ -415,8 +415,33 @@ The pass is pipelined over three threads (`lib/stages/global_build.py`): a reade
 the next candidate batches, the build thread runs the Bloom pass, a writer publishes the
 previous batch's shard and manifest; the commits are the same, in the same order, as a
 plain loop, and a failed commit leaves the manifest at the last complete one.
-Recovering a source streams keys from committed earlier sources (bounded RAM, additional
-key-column reads as the number of sources grows).
+Within one preparation invocation, compatible source transitions reuse the global filter,
+checksum and frontier. Restarting reconstructs that state once from committed key columns,
+then continues at the saved candidate offset. Candidate-generation changes or priority
+replay can require another reconstruction; speculative or failed publication state is
+never reused. Logs distinguish `restored global Bloom state` from `reusing global Bloom state`.
+
+`--global_hash_workers N` optionally computes normalized document keys in N spawn processes.
+The default `1` hashes in the parent without creating a pool. Admission stays ordered in the
+parent, and only the parent writer publishes files. The setting changes neither dataset
+identity nor shard boundaries and can change between restarts. `--pass_workers`,
+`--num_workers`, and `--tokenizer_threads` do not control this final hashing stage.
+Training auto-preparation retains the serial default.
+
+The hash window holds at most N unadmitted batches of 4,096 rows, in addition to the
+existing reader/writer queues. This is a batch limit, not a byte limit: long texts,
+serialization and worker normalization make additional copies. Try 2 or 4 workers only
+after measuring representative input; more processes can be slower for short documents.
+Cancellation discards speculative hashes and preserves committed progress; ordinary
+shutdown waits for active worker tasks. Complete snapshots and download-only/dry runs
+create no global hash pool. Workers do not publish dataset files.
+
+To enable workers on an existing remote run, stop preparation gracefully, wait for it to
+exit, deploy the updated code, and rerun the same command/config/dataset directory with
+`--global_hash_workers 4` (or the measured best count). A running process does not adopt
+the update. One initial filter reconstruction is expected. See
+[`docs/global_dedup_performance_results.md`](../docs/global_dedup_performance_results.md)
+for local measurements and the bounded offline benchmark command.
 
 Old shared `processed/` folders are candidates, not proof of global readiness. Status
 and dry-run show a missing dataset-wide frontier until preparation replays them; this

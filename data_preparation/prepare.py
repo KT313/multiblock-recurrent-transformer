@@ -5,7 +5,7 @@ Entry point for dataset preparation.
     python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
                                                 [--sources S ...] [--steps tokenizer download build] [--reopen S ...] [--yes] [--dry_run]
                                                 [--allow_foreign_raw]
-                                                [--num_workers N] [--pass_workers N] [--tokenizer_threads N] [--max_parallel_downloads N]
+                                                [--num_workers N] [--pass_workers N] [--global_hash_workers N] [--tokenizer_threads N] [--max_parallel_downloads N]
                                                 [--hf_token T] [--cache_dir DIR]
                                                 [--debug [SECONDS]] [--debug-file PATH]
     python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]

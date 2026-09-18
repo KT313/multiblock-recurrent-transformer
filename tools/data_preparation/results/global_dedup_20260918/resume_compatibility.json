@@ -1,0 +1,844 @@
+{
+  "baseline_commit": "eed1208",
+  "saved_candidate_offset": 8192,
+  "candidate_shard_rows": 10000,
+  "formats": [
+    "pretrain",
+    "instruct",
+    "messages"
+  ],
+  "results": {
+    "0": {
+      "a": {
+        "candidate_generation": "9d061004b965456993aaea4204098ddf",
+        "frontier": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": "e1912b2e76ee49659fa93cadaeef7e00",
+        "shards": [
+          "e4f0ed69ba3bf42185dd5f1b90dd7603ae288c8c2b2d19338e904a68c13c5b66",
+          "a35183b4f52991ea6c2761872f24b0aa01fd8f863d011c265d7706140aeb6ea3",
+          "f9e73d07528d8209b8902a067cfe367d53c45621ff7c8c16230b928333e82ffd"
+        ],
+        "start": {
+          "bloom_positive": 0,
+          "candidates": 0,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 0,
+          "source_candidates": 0,
+          "source_index": 0,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "retained": 9990
+          },
+          "global_filter": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "items_in_filter": 9987.429900540561,
+            "load": 0.017117884823961885,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7747394418668988e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9990
+          },
+          "local_candidates": 10000
+        }
+      },
+      "b": {
+        "candidate_generation": "12eb63012592428b98c80763ac44098d",
+        "frontier": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "4b96c1a06f1b2de5dc6926c212c28742841efc42927ba50180be65b220c721f1"
+        ],
+        "start": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 13,
+            "candidates": 10007,
+            "items_in_filter": 9991.473001168664,
+            "load": 0.017124814467681316,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.781181248178307e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9994
+          },
+          "local_candidates": 7
+        }
+      },
+      "c": {
+        "candidate_generation": "dc41c11cde1c4a9b83c47a2f724c62be",
+        "frontier": {
+          "bloom_positive": 16,
+          "candidates": 10014,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "222e3d4c400982bb31a36e304e498d756d7e137789ae219c0c93c33a22079429",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9998,
+          "source_candidates": 0,
+          "source_index": 3,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "cbd2e763c72877e8cd9e9ec66f2db6d3c22b4beb9cf842d4dfcc52aa7457521a"
+        ],
+        "start": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 16,
+            "candidates": 10014,
+            "items_in_filter": 9995.516119334912,
+            "load": 0.01713174414146013,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7876438300690794e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9998
+          },
+          "local_candidates": 7
+        }
+      }
+    },
+    "1": {
+      "a": {
+        "candidate_generation": "9d061004b965456993aaea4204098ddf",
+        "frontier": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": "e1912b2e76ee49659fa93cadaeef7e00",
+        "shards": [
+          "e4f0ed69ba3bf42185dd5f1b90dd7603ae288c8c2b2d19338e904a68c13c5b66",
+          "a35183b4f52991ea6c2761872f24b0aa01fd8f863d011c265d7706140aeb6ea3",
+          "f9e73d07528d8209b8902a067cfe367d53c45621ff7c8c16230b928333e82ffd"
+        ],
+        "start": {
+          "bloom_positive": 0,
+          "candidates": 0,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 0,
+          "source_candidates": 0,
+          "source_index": 0,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "retained": 9990
+          },
+          "global_filter": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "items_in_filter": 9987.429900540561,
+            "load": 0.017117884823961885,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7747394418668988e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9990
+          },
+          "local_candidates": 10000
+        }
+      },
+      "b": {
+        "candidate_generation": "12eb63012592428b98c80763ac44098d",
+        "frontier": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "4b96c1a06f1b2de5dc6926c212c28742841efc42927ba50180be65b220c721f1"
+        ],
+        "start": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 13,
+            "candidates": 10007,
+            "items_in_filter": 9991.473001168664,
+            "load": 0.017124814467681316,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.781181248178307e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9994
+          },
+          "local_candidates": 7
+        }
+      },
+      "c": {
+        "candidate_generation": "dc41c11cde1c4a9b83c47a2f724c62be",
+        "frontier": {
+          "bloom_positive": 16,
+          "candidates": 10014,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "222e3d4c400982bb31a36e304e498d756d7e137789ae219c0c93c33a22079429",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9998,
+          "source_candidates": 0,
+          "source_index": 3,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "cbd2e763c72877e8cd9e9ec66f2db6d3c22b4beb9cf842d4dfcc52aa7457521a"
+        ],
+        "start": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 16,
+            "candidates": 10014,
+            "items_in_filter": 9995.516119334912,
+            "load": 0.01713174414146013,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7876438300690794e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9998
+          },
+          "local_candidates": 7
+        }
+      }
+    },
+    "2": {
+      "a": {
+        "candidate_generation": "9d061004b965456993aaea4204098ddf",
+        "frontier": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": "e1912b2e76ee49659fa93cadaeef7e00",
+        "shards": [
+          "e4f0ed69ba3bf42185dd5f1b90dd7603ae288c8c2b2d19338e904a68c13c5b66",
+          "a35183b4f52991ea6c2761872f24b0aa01fd8f863d011c265d7706140aeb6ea3",
+          "f9e73d07528d8209b8902a067cfe367d53c45621ff7c8c16230b928333e82ffd"
+        ],
+        "start": {
+          "bloom_positive": 0,
+          "candidates": 0,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 0,
+          "source_candidates": 0,
+          "source_index": 0,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "retained": 9990
+          },
+          "global_filter": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "items_in_filter": 9987.429900540561,
+            "load": 0.017117884823961885,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7747394418668988e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9990
+          },
+          "local_candidates": 10000
+        }
+      },
+      "b": {
+        "candidate_generation": "12eb63012592428b98c80763ac44098d",
+        "frontier": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "4b96c1a06f1b2de5dc6926c212c28742841efc42927ba50180be65b220c721f1"
+        ],
+        "start": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 13,
+            "candidates": 10007,
+            "items_in_filter": 9991.473001168664,
+            "load": 0.017124814467681316,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.781181248178307e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9994
+          },
+          "local_candidates": 7
+        }
+      },
+      "c": {
+        "candidate_generation": "dc41c11cde1c4a9b83c47a2f724c62be",
+        "frontier": {
+          "bloom_positive": 16,
+          "candidates": 10014,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "222e3d4c400982bb31a36e304e498d756d7e137789ae219c0c93c33a22079429",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9998,
+          "source_candidates": 0,
+          "source_index": 3,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "cbd2e763c72877e8cd9e9ec66f2db6d3c22b4beb9cf842d4dfcc52aa7457521a"
+        ],
+        "start": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 16,
+            "candidates": 10014,
+            "items_in_filter": 9995.516119334912,
+            "load": 0.01713174414146013,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7876438300690794e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9998
+          },
+          "local_candidates": 7
+        }
+      }
+    },
+    "4": {
+      "a": {
+        "candidate_generation": "9d061004b965456993aaea4204098ddf",
+        "frontier": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": "e1912b2e76ee49659fa93cadaeef7e00",
+        "shards": [
+          "e4f0ed69ba3bf42185dd5f1b90dd7603ae288c8c2b2d19338e904a68c13c5b66",
+          "a35183b4f52991ea6c2761872f24b0aa01fd8f863d011c265d7706140aeb6ea3",
+          "f9e73d07528d8209b8902a067cfe367d53c45621ff7c8c16230b928333e82ffd"
+        ],
+        "start": {
+          "bloom_positive": 0,
+          "candidates": 0,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 0,
+          "source_candidates": 0,
+          "source_index": 0,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "retained": 9990
+          },
+          "global_filter": {
+            "bloom_positive": 10,
+            "candidates": 10000,
+            "items_in_filter": 9987.429900540561,
+            "load": 0.017117884823961885,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7747394418668988e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9990
+          },
+          "local_candidates": 10000
+        }
+      },
+      "b": {
+        "candidate_generation": "12eb63012592428b98c80763ac44098d",
+        "frontier": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "4b96c1a06f1b2de5dc6926c212c28742841efc42927ba50180be65b220c721f1"
+        ],
+        "start": {
+          "bloom_positive": 10,
+          "candidates": 10000,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "c456c315403015eab56cca21adfcaabb50890ea2d5a7f0b768bde18aa4f807c2",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9990,
+          "source_candidates": 0,
+          "source_index": 1,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 13,
+            "candidates": 10007,
+            "items_in_filter": 9991.473001168664,
+            "load": 0.017124814467681316,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.781181248178307e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9994
+          },
+          "local_candidates": 7
+        }
+      },
+      "c": {
+        "candidate_generation": "dc41c11cde1c4a9b83c47a2f724c62be",
+        "frontier": {
+          "bloom_positive": 16,
+          "candidates": 10014,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "222e3d4c400982bb31a36e304e498d756d7e137789ae219c0c93c33a22079429",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9998,
+          "source_candidates": 0,
+          "source_index": 3,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "generation": null,
+        "shards": [
+          "cbd2e763c72877e8cd9e9ec66f2db6d3c22b4beb9cf842d4dfcc52aa7457521a"
+        ],
+        "start": {
+          "bloom_positive": 13,
+          "candidates": 10007,
+          "false_positive_rate": 0.001,
+          "filter_policy": "rbloom-1.5.4-splitmix64-v1",
+          "key_digest": "e7a45a94beb252ca2b436b42fab06709669d02aa4b61b5eba5aaac49e8f9e334",
+          "key_policy": "normalized-tagged-json-sha256-64-v1",
+          "memory_mb": 1,
+          "order_policy": "validation-only-then-declaration-v1",
+          "preseed_count": 0,
+          "preseed_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "retained": 9994,
+          "source_candidates": 0,
+          "source_index": 2,
+          "source_order": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "stats": {
+          "budget_shortfall": 0,
+          "global_dedup": {
+            "bloom_positive": 3,
+            "candidates": 7,
+            "retained": 4
+          },
+          "global_filter": {
+            "bloom_positive": 16,
+            "candidates": 10014,
+            "items_in_filter": 9995.516119334912,
+            "load": 0.01713174414146013,
+            "max_load": 2.0,
+            "measured_false_positive_rate": 1.7876438300690794e-18,
+            "memory_mb": 1,
+            "nominal_capacity": 583450,
+            "preseed_count": 0,
+            "retained": 9998
+          },
+          "local_candidates": 7
+        }
+      }
+    }
+  }
+}

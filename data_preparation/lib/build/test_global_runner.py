@@ -88,6 +88,39 @@ def test_partial_scope_rejected_before_mutation(
     assert not (root / "tokenizers").exists()
 
 
+def test_hash_pool_is_lazy_and_used_only_for_global_work(
+    cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from data_preparation.lib.stages.global_hash_workers import GlobalHashWorkers
+    from data_preparation.lib.stages import global_session
+
+    cfg = _config(cfg_factory, write_local, tmp_path)
+    path, root = config_file(cfg), tmp_path / "dataset"
+    original = GlobalHashWorkers._submit
+    submitted: list[str] = []
+
+    def submit(self: GlobalHashWorkers, name: str, *args: Any) -> Any:
+        submitted.append(name)
+        return original(self, name, *args)
+
+    monkeypatch.setattr(GlobalHashWorkers, "_submit", submit)
+    prepare(path, root, assume_yes=True, steps=["download"], global_hash_workers=2)
+    assert not submitted
+    assert prepare(path, root, assume_yes=True, global_hash_workers=2).complete
+    assert set(submitted) == set(cfg.sources)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no global resources expected")
+
+    monkeypatch.setattr(GlobalHashWorkers, "_submit", forbidden)
+    monkeypatch.setattr(global_session, "GlobalAdmission", forbidden)
+    assert prepare(path, root, assume_yes=True, global_hash_workers=4).complete
+    prepare(path, tmp_path / "dry", assume_yes=True, dry_run=True, global_hash_workers=4)
+    disabled = replace(cfg, bloom_deduplicate_across_sources=False)
+    assert prepare(config_file(disabled), root, assume_yes=True, global_hash_workers=4).complete
+
+
 def test_real_admission_failure_and_retry(
     cfg_factory: CfgFactory, write_local: Writer, tmp_path: Path, config_file: ConfigFile,
     monkeypatch: pytest.MonkeyPatch,

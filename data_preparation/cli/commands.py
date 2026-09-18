@@ -79,6 +79,7 @@ def prepare_requested_steps(
         args.dataset_dir,
         num_workers=args.num_workers,
         pass_workers=args.pass_workers,
+        global_hash_workers=args.global_hash_workers,
         tokenizer_threads=args.tokenizer_threads,
         max_parallel_downloads=args.max_parallel_downloads,
         download_prefetch_mb=args.download_prefetch_mb,

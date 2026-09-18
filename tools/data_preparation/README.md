@@ -70,3 +70,20 @@ uv run --no-sync python -m tools.data_preparation.benchmark_download --tokenizer
 
 Use the exact server tokenizer to validate deployment. Local legacy llama-32k and synthetic tests
 do not substitute for server llama-32k-chat-v1 parity or a 32-CPU/NFS measurement.
+
+## Final cross-source admission benchmark
+
+`benchmark_global.py` compares original per-source recovery, session reuse, and ordered
+hashing with 2/4 workers on deterministic offline candidates. It creates a new disposable
+output directory for each run, retains comparison artifacts, and bounds each owned trial
+by time, input size and sampled process-tree RSS. It never uses the live dataset directory.
+
+```bash
+uv run --no-sync python tools/data_preparation/benchmark_global.py \
+  --output-root /tmp/global-benchmark-new \
+  --rows 24000 --text-chars 4096 --trials 3
+```
+
+Use `--baseline-repo /path/to/original-archive` for an old-code comparison; otherwise
+baseline uses the current implementation with a fresh session per source. See
+[measurements and compatibility checks](../../docs/global_dedup_performance_results.md).

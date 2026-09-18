@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
@@ -193,13 +193,21 @@ class GlobalAdmission:
         if index >= len(self.frontier.source_order) or self.frontier.source_order[index] != name:
             raise ValueError(f"global dedup priority violation for {name!r}: frontier is source index {index}")
 
-    def commit_batch(self, name: str, kind: str, rows: list[Row], publish: PublishBatch) -> None:
+    def commit_batch(
+        self, name: str, kind: str, rows: list[Row], publish: PublishBatch, *, keys: Sequence[int] | None = None,
+    ) -> None:
         self._check_source(name)
+        if kind not in ("pretrain", "instruct", "messages"):
+            raise ValueError(f"unknown global key kind {kind!r}")
+        if keys is not None and (len(keys) != len(rows) or any(
+            type(key) is not int or not -(1 << 63) <= key < (1 << 63) for key in keys
+        )):
+            raise ValueError("global precomputed keys must match rows and contain signed 64-bit integers")
         self.check_capacity(self.frontier.retained + len(rows))
         survivors: list[Row] = []
         try:
-            for row in rows:
-                key = global_key(kind, row)
+            computed = (global_key(kind, row) for row in rows) if keys is None else iter(keys)
+            for row, key in zip(rows, computed, strict=True):
                 if self.seen.add_if_new(key):
                     survivors.append({**row, "global_hash": key})
                     self._digest.update(key.to_bytes(8, "big", signed=True))
