@@ -37,6 +37,28 @@ def test_shared_readers_exclude_writers_until_last_reader_exits(tmp_path: Path) 
     assert path.stat().st_ino == original.st_ino
 
 
+def test_an_existing_lock_file_is_opened_without_asking_to_create_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Some NFS servers reject an open that carries O_CREAT when the directory is not writable, even though the file
+    exists (seen on a read-only dataset directory on a fresh compute node). The lock file is created only when it
+    is missing; an existing one is opened plainly. This fake os.open behaves like such a server.
+    """
+
+    path = tmp_path / BUILD_LOCK_NAME
+    real_open = os.open
+
+    def strict_nfs_open(name: str | bytes | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if Path(os.fsdecode(name)) == path and flags & os.O_CREAT and path.exists():
+            raise PermissionError(13, "Permission denied", str(name))
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", strict_nfs_open)
+    with dataset_lock(tmp_path, shared=True):
+        assert path.exists(), "a missing lock file is created"
+    with dataset_lock(tmp_path, shared=True), pytest.raises(RunLocked), build_lock(tmp_path):
+        pass  # an existing lock file is opened without O_CREAT and still locks
+
+
 def test_read_lease_cannot_be_borrowed_for_writing(tmp_path: Path) -> None:
     with dataset_lock(tmp_path, shared=True) as lease:
         with dataset_lock(tmp_path, shared=True, lease=lease) as borrowed:

@@ -78,7 +78,7 @@ def run_lock(
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open_lock_file(path)
     write_holder = record_holder and not shared
     try:
         try:
@@ -99,6 +99,22 @@ def run_lock(
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def _open_lock_file(path: Path) -> int:
+    """
+    Open the lock file read-write; create it only when it is missing.
+
+    An existing file is opened without O_CREAT on purpose. The Linux NFS client forwards the create request to the
+    server unless the name is already in its cache, and some servers then reject the open because the directory is
+    not writable, although the file exists. Dataset directories are commonly made read-only once prepared, so a
+    training run on a fresh node would otherwise fail with "Permission denied" on a lock file it may open.
+    """
+
+    try:
+        return os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
 
 
 class DatasetLease:
