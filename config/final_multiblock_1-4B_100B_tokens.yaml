@@ -10,7 +10,7 @@ prepare_pass_workers: 4              # worker processes of EACH build's optional
 prepare_max_parallel_downloads: 2    # sources downloading at a time during the in-process build
 stage_base_lrs: [3e-4, 1e-4, 5e-5]   # base LR per dataset-config stage, positional: pretrain_phase1, pretrain_phase2, finetune
 allow_dataset_change: false          # allow resuming from a checkpoint written with a different dataset config
-allow_settings_change: true          # allow resuming although settings / model config differ from the checkpoint (all compared but exemptions)
+allow_settings_change: false         # allow resuming although settings / model config differ from the checkpoint (all compared but exemptions)
 
 # --- Run --------------------------------------------------------------------------------------------------------
 run_name: final_multiblock_1-4B_100B_tokens                # name of the run: checkpoint file names, wandb run, resume lookup
@@ -60,9 +60,9 @@ min_lr: 0                            # LR floor of warmup and cooldown
 
 # --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
 log_step_interval: 1                 # log basic training metrics every this many optimizer steps
-log_gradient_metrics_interval: 4     # expensive gradient/update statistics every N optimizer steps; 0 disables; otherwise a multiple of log_step_interval
+log_gradient_metrics_interval: 8     # expensive gradient/update statistics every N optimizer steps; 0 disables; otherwise a multiple of log_step_interval
 log_correlations: "adapter,attention,mlp"
-eval_step_interval: 32               # run validation every this many steps
+eval_step_interval: 64               # run validation every this many steps
 eval_iters: 64                       # validation batches per evaluated depth
 validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
 validation_padding_multiple: 128     # pad validation batches to a multiple of this many tokens (null: the longest row)
@@ -80,11 +80,11 @@ export_hf_path: null                 # target of the export; null: {out_dir}/{ru
 # --- Samples and benchmarks (evaluation/) ----------------------------------------------------------------------------
 # Both run RNG-isolated, so they never change the training numerics; files go to {run dir}/samples/ and
 # {run dir}/benchmarks/, named by step. Benchmarks need the eval extra (uv sync --extra eval) and network.
-sample_step_interval: 16              # write sample generations every this many steps (0: never)
+sample_step_interval: 64              # write sample generations every this many steps (0: never)
 sample_at_training_progress: [100]   # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
 sample_max_new_tokens: 128           # tokens generated per prompt
 sample_use_cache: true               # fixed per-token/core latents and per-recurrence K/V; false: legacy resampling
-sample_temperature: 0.0              # 0: greedy decoding
+sample_temperature: [0.0, 1.0]              # 0: greedy decoding
 sample_recurrences: [[1, 1, 1], [2, 2, 2], [4, 4, 4], [8, 8, 8]]               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
 benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
 benchmark_at_training_progress: [100]   # ... and at these percentages of the run, like sample_at_training_progress
