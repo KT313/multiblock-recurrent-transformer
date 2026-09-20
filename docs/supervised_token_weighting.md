@@ -25,6 +25,4 @@ this field mean `legacy_pack_v0`; they are not relabeled. Resuming them is refus
 trajectory; model/optimizer moments, saved data and RNG state are preserved. Existing `run_config.json` remains the
 original run configuration, while subsequent checkpoints record current settings.
 
-The numerical fixtures were rerecorded after independent scalar-loss, clipped-SGD and actual two-rank gloo
-oracles passed. The old fixtures at baseline `cc447133adedcd54649e8792e0dff842d5bab5a6` represent the old objective.
-The recurrent RNG still depends on microbatch grouping, so full-model repartitioning is not a numerical invariant.
+The recurrent RNG depends on microbatch grouping, so full-model repartitioning is not a numerical invariant.

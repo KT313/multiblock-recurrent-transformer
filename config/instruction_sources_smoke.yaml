@@ -1,5 +1,5 @@
 # Tiny native model for checking the role-token pipeline; dataset acquisition still requires HF access.
-# Keep the historical tiny and research runs unchanged. This is not a throughput benchmark.
+# Functional smoke test, not a throughput benchmark.
 run_name: instruction_sources_smoke
 out_dir: outputs
 resume: false

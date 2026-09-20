@@ -22,17 +22,17 @@ Benchmark prompting stays explicit. Continuations use BOS plus literal text. Cha
 
 Training benchmarks use `fixed_document_jobs_v1` on both one and multiple ranks. Requests from one task/document stay together; deterministic groups target eight requests, with at most 128 requests per document. Job seeds derive from the configured seed, recurrence index, public-method call index, method, and job index. Identical text/repeats remain distinct occurrences. Each job restores the surrounding Python, NumPy, Torch CPU, and local-CUDA RNG streams.
 
-This is an intentional batching/seeding protocol change from historical single-process whole-list HFLM evaluation. The standalone checkpoint CLI retains that historical batching protocol for comparison. Compare rank counts with identical jobs and batch sizes, not against a different batching protocol. Different hardware/precision need not be bitwise identical. The current HFLM logits reuse default is retained: compatible candidates may share one stochastic prefix forward. Response/request caches remain disabled; no responses or KV state persist between optimizer updates.
+The standalone `evaluation/evaluate.py` CLI uses whole-list HFLM batching, which differs from scheduled training's batching/seeding protocol. Compare rank counts with identical jobs and batch sizes. Different hardware/precision need not be bitwise identical. HFLM's default logits reuse allows compatible candidates to share one stochastic prefix forward. Response/request caches are disabled; no responses or KV state persist between optimizer updates.
 
 Result JSON contains protocol, worker job/request counts, execution time, padded token counters, process-lifetime peak CUDA allocation (without resetting training counters), seed previews and rolling request digests, local HFLM settings, and evaluator/inference world sizes. Transport is bounded to 1 MiB per benchmark job/reply and 32 MiB per collective payload. The official evaluator still holds its task requests/metric state on the host. Bootstrap uses the harness's supported serial mode with 100 iterations; this does not disable standard errors.
 
 ## Failures, stopping, and artifacts
 
-Requested inference failures now propagate instead of warning and continuing. Under the training CLI, the existing fatal-worker handler exits immediately and torchrun terminates peers. Library callers retain normal exceptions and own peer termination. No recovery collective or emergency checkpoint runs after an arbitrary worker failure.
+Requested inference failures propagate. Under the training CLI, the fatal-worker handler exits immediately and torchrun terminates peers. Library callers receive exceptions and own peer termination. No recovery collective or emergency checkpoint runs after an arbitrary worker failure.
 
-Cooperative stops are checked at shared round boundaries; a slow generation batch or rank-0 task-loading/aggregation phase can delay a stop. Incomplete evaluations publish no partial success. Complete outputs replace the previous file atomically on rank 0. A later logging failure does not undo a completed file. Training's process-group timeout remains unchanged (currently four hours).
+Cooperative stops are checked at shared round boundaries; a slow generation batch or rank-0 task-loading/aggregation phase can delay a stop. Incomplete evaluations publish no partial success. Complete outputs replace the previous file atomically on rank 0. A later logging failure does not undo a completed file. Training's process-group timeout is four hours.
 
-The direct `evaluation/evaluate.py` CLI is still single-device and rejects a multi-rank launch. Use the checkpoint check below to run the scheduled training benchmark path immediately, including multi-GPU inference.
+The direct `evaluation/evaluate.py` CLI is single-device and rejects a multi-rank launch. Use the checkpoint check below to run the scheduled training benchmark path immediately, including multi-GPU inference.
 
 ## Run benchmarks immediately from a training checkpoint
 
@@ -43,7 +43,7 @@ uv run --no-sync torchrun --standalone --nproc_per_node=8 \
   evaluation/benchmark_checkpoint.py --config config/final_multiblock_1-4B_100B_tokens.yaml
 ```
 
-Use your training launch's process/node settings for multi-node runs instead of `--standalone`. For a config with `backend: single_device`, use `uv run --no-sync python evaluation/benchmark_checkpoint.py --config <run.yaml>`. To check a DDP config on one GPU without changing its settings, use `torchrun --standalone --nproc_per_node=1`.
+Distributed execution is supported on one node; multi-node execution is outside the supported scope. For a config with `backend: single_device`, use `uv run --no-sync python evaluation/benchmark_checkpoint.py --config <run.yaml>`. To check a DDP config on one GPU without changing its settings, use `torchrun --standalone --nproc_per_node=1`.
 
 This command selects the most recently written regular checkpoint under `<out_dir>/<run_name>/checkpoints`, using training's selection rules. It ignores the `resume` switch, `resume_checkpoint_path`, and benchmark schedule triggers; use `--checkpoint /path/to/file.pth` to select a specific checkpoint. It runs the configured tasks, recurrences, batch size, few-shot count, limit, seed and chat-template setting immediately, through the same function used by scheduled training. All normal training CLI overrides work. For a quick check, append `--benchmark_limit 8`; omit that override to use the config unchanged.
 
@@ -53,7 +53,7 @@ The command loads model weights on each rank but creates no optimizer, data load
 
 Results use the normal benchmark JSON schema and are saved in a fresh `<out_dir>/<run_name>/benchmark_checks/step-XXXXXXXX-*/step-XXXXXXXX.json`. Existing scheduled results and training logs are preserved. `--output_dir` chooses a new directory, which must not already exist. Ctrl-C/SIGTERM requests a stop at the next shared benchmark boundary; incomplete work publishes no results. Fatal failures under torchrun use the same worker-exit policy as training. This verifies checkpoint inference, not resuming an optimizer or a complete training step. Benchmark datasets still need network access or an existing local cache.
 
-## Qualification commands
+## Testing
 
 CPU tests are offline and should run serially:
 
@@ -64,20 +64,14 @@ uv run --no-sync pytest training/test_run.py -n 0 -k 'samples or benchmarks'
 
 Role-token tests use an already downloaded tokenizer; set `MBRT_TEST_BASE_TOKENIZER` if it is outside this checkout. They never download it.
 
-On a machine with free GPUs, first qualify the tiny model/harness on one GPU, then actual NCCL execution on two/eight GPUs:
+On a machine with free GPUs, test the tiny model/harness on one GPU, then NCCL execution on two/eight GPUs:
 
 ```bash
 uv run --no-sync pytest evaluation/test_qualification.py -n 0 -m gpu
 RUN_DISTRIBUTED_GPU_TESTS=1 uv run --no-sync pytest evaluation/test_distributed.py -n 0 -m gpu
 ```
 
-These tests do not establish research-checkpoint accuracy. Also run a bounded representative checkpoint evaluation in separate plain/chat output directories, with actual production precision/kernels and nonzero few-shot settings:
-
-```bash
-uv run --no-sync python evaluation/evaluate.py \
-  --checkpoint /path/to/checkpoint.pth --no_samples --device cuda:0 --precision bf16-mixed \
-  --tasks arc_challenge,hellaswag,winogrande,mmlu_abstract_algebra \
-  --limit 8 --batch_size 1 --num_fewshot 0 --seed 0 --out_dir /path/to/qualification/plain
-```
-
-Add a separate GSM8K generation run and explicit chat run using compatible tasks. Check context limits before using task-default few-shot counts. Eight GPUs on one node do not qualify multi-node execution. GPU and research-checkpoint qualification remain pending when no working CUDA runtime/checkpoint is available.
+These tests do not establish research-checkpoint accuracy. Use the [checkpoint command](#run-benchmarks-immediately-from-a-training-checkpoint)
+with representative weights and production precision/kernels. Run bounded plain and chat evaluations with compatible tasks,
+including generation and the intended few-shot settings. Keep outputs separate and check context limits before using
+task-default few-shot counts. Single-node tests do not validate multi-node execution.

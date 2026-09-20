@@ -1,4 +1,4 @@
-# Dataset definition of the v2 development runs: the thesis run's 27 sources, Hub commits and stage weights at a
+# Dataset definition for v2 runs: 27 pinned sources at a
 # 50M-token budget (30M + 15M + 5M over the three stages). Referenced from `config/v2_small.yaml` via
 # `dataset_config`. Materialise with `python data_preparation/prepare.py download --dataset_config <this file>`
 # (raw shards only) or `prepare` (download and build); training builds what is missing automatically
@@ -41,7 +41,7 @@ sources:
     load_kwargs: {data_files: "data/CC-MAIN-2013-20/*.parquet"}   # 14 files
     describe_tokens_per_row: 2000
     # used for training and validation: the first 5 % of its processed rows (validation_fraction) are the held-out
-    # set of both pretraining stages (replaces the old fineweb_val source, which overlapped the training dump)
+    # set of both pretraining stages
   wikipedia:
     kind: pretrain
     loader: hf_files
@@ -182,7 +182,7 @@ stages:
   - name: finetune
     tokens: 5_000_000
     transition_pct: 0.0
-    # the former flan_instruct mixture shares, now stage weights; the same eight sources validate with the same shares
+    # Training and validation use the same source weights
     # (each is split by validation_fraction, so train and val rows never share a document)
     train: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
     val:   {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}

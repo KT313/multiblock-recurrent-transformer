@@ -1,5 +1,5 @@
 # Tiny smoke-run config: the real train.py code path with a ~256K-parameter model on synthetic data.
-# Three stages mirroring the thesis curriculum, 20 optimizer steps total (8 + 8 + 4 at 2 × 512 tokens per step),
+# Three stages, 20 optimizer steps total (8 + 8 + 4 at 2 × 512 tokens per step),
 # a few seconds on CPU or GPU. The model is defined by config/model_architecture/tiny.yaml, the data (stages, token
 # budgets, weights, tokenizer) by config/datasets/tiny.yaml; training builds the data under dataset/ (sources/,
 # processed/, tokenizers/) when missing (`auto_prepare`), or run
@@ -9,7 +9,7 @@
 run_name: tiny
 out_dir: outputs
 resume: false
-sample_at_training_progress: []   # the golden run is a pure training run
+sample_at_training_progress: []   # disable sample generation for this smoke run
 seed: 42
 
 model_architecture_config: config/model_architecture/tiny.yaml

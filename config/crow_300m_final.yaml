@@ -1,14 +1,11 @@
-# Final thesis run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
+# Training run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
 #
 # This file lists EVERY run setting (`training/settings.py:Settings`) with its value, so the available knobs are
 # visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
 # command line: `python training/train.py --config config/crow_300m_final.yaml --run_name my-run`.
 #
 # All step values are OPTIMIZER steps. One step = micro_batches_per_step × tokens_per_micro_batch = 256 × 8192 ≈ 2.1M
-# tokens, so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on
-# 4 GPUs; on one GPU the same step is 256 packs, so it takes correspondingly longer.
-# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64,
-#  save 8192 → 128, eval 1024 → 16.)
+# tokens, so the three stages give 1573 + 715 + 71 = 2359 steps.
 #
 # Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/crow_300m_final.yaml;
 # `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets/weights (3.3B + 1.5B + 0.15B
@@ -50,8 +47,7 @@ compile_model: true                  # torch.compile the model
 use_custom_kernels: true        # require the CUDA kernel trio; false selects native operations
 loss_normalization: supervised_token_v1  # fixed objective version; legacy resume requires allow_settings_change
 gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.
-                                     # selective keeps the GEMM and FlexAttention outputs and recomputes only the cheap ops (v2_small, 8192-token packs:
-                                     # ~6 % slower than none, 75 % of the peak memory); full recomputes the whole iteration (~22 % slower, 35 % of the memory)
+                                     # selective saves GEMM and FlexAttention outputs; full recomputes the whole iteration.
 
 # --- Sequence packing (the training batches; validation runs on padded rows, see below) -----------------------
 # Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
@@ -110,7 +106,7 @@ sample_temperature: 0.0              # scalar or list, e.g. [0.0, 0.7]; 0: greed
 sample_recurrences: []               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
 benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
 benchmark_at_training_progress: []   # ... and at these percentages of the run, like sample_at_training_progress
-benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
+benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names
 benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
 benchmark_apply_chat_template: false  # explicit chat protocol; plain benchmark prompts remain the default
 benchmark_num_fewshot: -1         # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)

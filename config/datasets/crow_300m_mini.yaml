@@ -1,5 +1,5 @@
 # Real-source smoke config: `crow_300m_final.yaml` with tiny budgets (300k / 150k / 60k tokens) and everything else
-# identical, so a build exercises every source, loader and file format of the thesis config with a
+# identical, so a build exercises every source, loader and file format of the full config with a
 # few MB of data in minutes. `nampdn-ai/mini-peS2o` is gated: export `HF_TOKEN` (or `uv run hf auth login`) before
 # building. Build with
 #     uv run python data_preparation/prepare.py prepare --dataset_config config/datasets/crow_300m_mini.yaml
@@ -178,7 +178,7 @@ stages:
   - name: finetune
     tokens: 60_000
     transition_pct: 0.0
-    # the former flan_instruct mixture shares, now stage weights; the same eight sources validate with the same shares
+    # Training and validation use the same source weights
     # (each is split by validation_fraction, so train and val rows never share a document)
     train: {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}
     val:   {flan: 0.40, metamath: 0.15, orca_math: 0.10, evol_code: 0.125, code_alpaca: 0.025, slimorca: 0.10, sharegpt: 0.05, wizardlm: 0.05}

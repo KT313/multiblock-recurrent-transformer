@@ -29,7 +29,7 @@ sources:
     load_kwargs: {data_files: "sample/350BT/*.parquet"}   # sample-350BT subset
     describe_tokens_per_row: 2000
     # used for training and validation: the first 0.1 % of its processed rows (validation_fraction) are the held-out
-    # set of both pretraining stages (replaces the old fineweb_val source, which overlapped the training dump)
+    # set of both pretraining stages
   wikipedia:
     kind: pretrain
     loader: hf_files
@@ -184,7 +184,6 @@ stages:
   - name: finetune
     tokens: 4_000_000_000
     transition_pct: 0.0
-    # Nemotron receives 50%, OpenCodeInstruct 25%; the remaining sources share 25% proportionally.
     # Validation uses the same mixture.
     train:
       metamath: 0.062

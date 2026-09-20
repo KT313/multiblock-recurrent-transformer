@@ -1,9 +1,8 @@
 # Representation and state metrics during training
 
-`log_gradient_metrics_interval` now triggers representation/state diagnostics together with gradient statistics,
-after the optimizer update and before gradient clearing. Zero disables both. Model architecture and checkpoint
-tensor layouts are unchanged; the optional selector below is recorded with run settings. The helpers are in
-`training/representation_metrics.py`.
+`log_gradient_metrics_interval` triggers representation/state diagnostics together with gradient statistics,
+after the optimizer update and before gradient clearing. Zero disables both. The optional selector below is
+recorded with run settings. The helpers are in `training/representation_metrics.py`.
 
 ## Selecting detailed correlations
 
@@ -60,7 +59,7 @@ Additional W&B keys retain detail:
   previous-block stream; `state_input` is the random initial state at iteration 1 or the previous iteration's
   output thereafter; `merged_output` is the actual tensor entering the first core layer; `core_output` is the
   tensor leaving the last core layer. These are correlations between token positions within each stream, not
-  correlations between the two streams. Iterations 3, 5, 6 and 7 are included when executed, too.
+  correlations between the two streams.
 - Under those adapter prefixes: `correlation_pairs`, `sampled_tokens`, `sampled_zero_variance_fraction` and
   `sampled_nonfinite_fraction`. They describe the bounded correlation sample, not every token in the document.
 - With `attention` selected: `attention/core_<i>/iter_<r>/layer_<l>/{input,output}/correlation`.
@@ -71,18 +70,11 @@ Additional W&B keys retain detail:
   `input` is the output of `norm_3`; `output` is the MLP branch output **before** residual addition and `norm_4`.
   Both families include the same sample-count/degeneracy fields as adapters. Core/layer indices are zero-based;
   iteration indices are one-based. Only sandwich layers inside recurrent cores are instrumented.
-- `recurrence_probe/{version,available,tokens,seed,rank,step}`. `step` is the completed-step number of the probe.
+- `recurrence_probe/{version,available,tokens,seed,rank,step}`. The current probe version is 3; `step` is the
+  completed-step number of the probe.
 - `recurrence_probe/residual_scale`: the fixed sandwich-branch coefficient (1 when scaling is disabled).
   Attention/MLP hooks observe raw module outputs before this multiplication; later representations include it.
 
-Probe version 3 makes detailed correlations opt-in and adds attention/MLP selection; version 2 logged adapters
-unconditionally. Existing summary definitions are unchanged. The three
-dashboard summary columns remain compact; the detailed per-adapter curves are available in W&B (and in-memory
-run history when enabled) at `log_gradient_metrics_interval`, without filling gaps or inventing values for
-unexecuted iterations.
-
-These values travel through the ordinary `StepResult.metrics` → `RunLogger` → W&B/dashboard path. They do not
-change logged loss, supervised-token normalization, training-data token counts or scheduler progress.
 The displayed training loss comes from the earlier training forward; these probe activations use post-update
 weights. On the deliberately skipped first optimizer update, they describe the unchanged initial weights.
 
@@ -164,7 +156,7 @@ alongside fixed-data recurrence-gain evaluations and loss trajectories. Flat dep
 text early in training are not standalone diagnoses. Convergence from different initial states is not state
 ignoring. No automatic collapse/state-ignoring alarm or threshold is applied.
 
-## Isolation, cost and verification
+## Isolation and cost
 
 The helper is outside Dynamo compilation and uses no training-forward hooks. On measurement steps, rank zero
 retains only the last pack's small input tensors, not training activation graphs. Other ranks and disabled/off-grid
@@ -181,25 +173,8 @@ extra core iteration per core for sensitivity, and bounded FP32 summaries. It is
 like existing gradient-statistics overhead. Selected per-iteration correlations add sampled reductions/transfers,
 but no additional core forward calls or GEMMs. Attention/MLP selection scales with the physical layer count and
 produces more logged series than adapter-only selection. CUDA custom kernels may compile a new sequence-shape specialization
-on first use. No actual-width GPU overhead or memory result is claimed by the CPU tests. It is deliberately a
-bounded diagnostic; longer-context or late-depth failures require separate measurements.
+on first use. Longer-context or late-depth failures require separate measurements beyond this bounded probe.
 
-CPU tests cover metric controls, independent pair-mean arithmetic, prompt/padding/document boundaries,
-state-ignore/carry controls, RNG/gradient/parameter/mode preservation, exact cadence, logger propagation, and
-dashboard ordering. No remote training code is updated automatically by this local change.
-
-### Read-only contract and pre-commit review
-
-The numerical metric functions do not write their input tensors or retain an autograd graph. The probe itself
-temporarily sets eval flags and installs selected observer hooks; it is therefore not literally free of temporary
-module mutations. Those flags and hook registrations are restored on success and on exceptions. The current
-model forward has no running-statistic updates and receives no generation cache. This guarantee must be reviewed
-again if stateful layers or side-effecting forward hooks are introduced.
-
-Additional tests check input storage version counters, parameter/buffer identity and values (including the
-non-persistent RoPE table), configuration, and subsequent training updates. Nine eager CPU configurations give
-bit-identical logging-enabled/disabled losses, gradient norms, parameters, optimizer moments and RNG after three
-scripted optimizer-step calls: FP32 with all three checkpoint modes, and BF16 with no/full checkpointing across
-all three residual-stream settings. Eager CPU BF16 with selective checkpointing fails in the disabled baseline
-with a PyTorch checkpoint storage mismatch; these three comparisons explicitly xfail and do not establish parity.
-Compiled CUDA/custom-kernel/DDP integration and actual-width performance remain untested by this review.
+The metric functions do not write input tensors or retain autograd graphs. The probe temporarily sets eval flags
+and installs observer hooks, restoring them on success and failure. It assumes forwards have no running-statistic
+updates or other persistent side effects and receives no generation cache.

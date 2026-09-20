@@ -49,18 +49,15 @@ buffers on all ranks, and rank zero holds the full optimizer state on CPU. Each 
 checkpoint on CPU during resume. This feature does not provide sharded checkpoint I/O or recovery after a rank
 is lost during a collective; retain the last complete checkpoint.
 
-## Validation boundary
+## Testing
 
-The CPU tests compare real two-rank Gloo updates, quantized codes/scales, metrics and checkpoint continuation
-against the corresponding unsharded optimizer. The training integration tests use the existing tiny offline
-dataset and recurrent model. They do not establish H100/NCCL correctness, compiled CUDA optimizer parity,
-large-model memory peaks or speed. Those require a separately budgeted target-hardware test before deployment.
+Run the offline two-rank CPU tests with local multiprocessing sockets permitted:
 
 ```bash
 CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   uv run --no-sync --offline pytest training/test_optimizer_sharding.py -n 0
 ```
 
-Tests use two local CPU ranks; no external service or GPU is required. Local multiprocessing sockets must be
-permitted. The wrapper relies on PyTorch's state-load order and consolidation cache lifecycle; re-run these tests
-when upgrading PyTorch, and include CUDA save/resume memory checks on the target installation.
+CPU tests do not establish NCCL correctness, compiled CUDA optimizer parity, large-model memory peaks or speed.
+Test those on the target hardware, including save/resume memory use. Re-run the tests when upgrading PyTorch:
+the wrapper depends on its state-load order and consolidation cache lifecycle.

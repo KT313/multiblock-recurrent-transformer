@@ -13,7 +13,7 @@ tokenizer:
 
 Preparation verifies and reuses an existing `dataset/tokenizers/llama-32k` base offline, or obtains the pinned tokenizer through HF. It leaves that base folder unchanged. The extended folder stores its adapter, template and fingerprint. The profile fixes the Transformers 5 Llama conversion of the pinned payload; an incompatible change in tokenizer conversion fails explicitly rather than silently changing tokenization.
 
-The dataset example is `config/datasets/instruction_sources_smoke.yaml`; its matching tiny-model run is `config/instruction_sources_smoke.yaml`. Prepare the dataset explicitly before launching that run. Existing research configs are unchanged: update both the dataset tokenizer and model real vocabulary deliberately when starting a new run.
+The dataset example is `config/datasets/instruction_sources_smoke.yaml`; its matching tiny-model run is `config/instruction_sources_smoke.yaml`. Prepare the dataset explicitly before launching that run. Configure both the dataset tokenizer and model real vocabulary when starting a new run.
 
 ## Literal content and chat structure
 
@@ -47,9 +47,9 @@ For training-style masks, pass `return_dict=True, return_assistant_tokens_mask=T
 
 ## Validation, checkpoints and benchmarks
 
-Training checks configuration before automatic preparation, then compares the HF adapter and actual training formatter on small CPU probes before constructing the model. It checks real/physical vocabulary, actual embedding/head dimensions and tying, and verifies tokenizer agreement across ranks. These checks do not run per microbatch. Training's existing padded-column loss normalization is preserved.
+Training checks configuration before automatic preparation, then compares the HF adapter and actual training formatter on small CPU probes before constructing the model. It checks real/physical vocabulary, actual embedding/head dimensions and tying, and verifies tokenizer agreement across ranks. These checks do not run per microbatch. Training cross-entropy includes the padded vocabulary columns in its normalization, although labels must belong to the real vocabulary.
 
-Each new-profile run retains `outputs/<run>/tokenizer/` and embeds its contract in checkpoints. Evaluation resolves that artifact independently of subsequent edits to the dataset YAML. Move the complete run directory, or copy the matching tokenizer and pass `--tokenizer_dir` when evaluating an isolated checkpoint. Changing either token IDs or formatting is not an allowed settings override. Profile data has a distinct raw/processed identity; old counts cannot simply be relabeled. Any required data rebuilding uses the existing explicit preparation/confirmation flow.
+Each run using this profile retains `outputs/<run>/tokenizer/` and embeds its contract in checkpoints. Evaluation resolves that artifact independently of subsequent edits to the dataset YAML. Move the complete run directory, or copy the matching tokenizer and pass `--tokenizer_dir` when evaluating an isolated checkpoint. Changing either token IDs or formatting is not an allowed settings override. Profile data has a distinct raw/processed identity; old counts cannot simply be relabeled. Any required data rebuilding uses the existing explicit preparation/confirmation flow.
 
 Plain benchmark prompting remains the default. Opt into chat with `benchmark_apply_chat_template: true` in training settings or `--benchmark_apply_chat_template` on the evaluation CLI. The project's lm-eval adapter transports structured messages through its string request interface and encodes candidate answers literally. It does not feed that transport representation to the model. Standard third-party HFLM used directly with a flattened chat string does not provide this guarantee. Keep plain/chat scores separate; the selected protocol and tokenizer contract are recorded in benchmark metadata.
 
@@ -61,4 +61,4 @@ Focused offline checks:
 MBRT_TEST_BASE_TOKENIZER=dataset/tokenizers/llama-32k uv run pytest tokenization -n 0
 ```
 
-Tests using the actual pinned tokenizer skip if it is unavailable locally; they never download datasets. GPU custom-kernel and multi-GPU qualification are separate from these CPU checks.
+Tests using the actual pinned tokenizer skip if it is unavailable locally; they never download datasets.

@@ -1,10 +1,7 @@
 # Multi-stage training
 
-The thesis runs train through three phases (broad pretraining → domain
-upsampling → instruction finetuning) in a single launch, with smooth dataset
-transitions between phases. This document describes the mechanism; the
-implementation lives in `training/stage_manager.py` with its integration in
-`training/run.py` / `training/step.py` (LR schedule, transition detection, stage checkpoints, metrics).
+Multi-stage training combines phases such as broad pretraining, domain upsampling
+and instruction finetuning in one launch, with smooth dataset and learning-rate transitions.
 
 ## What a stage specifies
 
@@ -29,7 +26,7 @@ Instead of switching datasets abruptly at a stage boundary, the last
 by one continuous reader for the whole run, the weights are token shares that the
 stream realises by filling its packing pool from the source with the largest
 token deficit under the current step's weights (`BatchStream` in
-`training/step.py`; equal deficits go to the alphabetically smallest source
+`training/steps/batches.py`; equal deficits go to the alphabetically smallest source
 name, so reordering the dataset config's `sources:` block never changes the
 stream), and inside the window those weights are interpolated
 linearly between the two stages' (a source leaving ramps to 0, one entering
@@ -71,20 +68,5 @@ The stage boundary summary is printed at startup; check it before long runs.
 
 ## Example configs
 
-- `config/tiny.yaml` + `config/datasets/tiny.yaml`: 3-stage smoke run on synthetic data (20 steps, seconds)
-- `config/crow_300m_final.yaml` + `config/datasets/crow_300m_final.yaml`: the real final-run config
-
-## Notable bug found during development
-
-The first version of the stage-boundary computation (which counted per-device
-micro-batch steps) did not divide token budgets by `world_size`. On a single GPU
-everything looked correct, but on the 4-GPU DDP setup each stage would have
-silently run 4× longer than configured. There is no error to see, just a
-schedule that never ends. It was caught in a code audit before the main runs by
-checking the startup boundary summary against a hand calculation. The current
-code counts optimizer steps (world batches), which removes the `world_size`
-dependence altogether, and validates that `warmup_steps` and `cooldown_steps`
-fit inside the first/last stage. Lesson: in distributed
-training, verify step arithmetic by hand at startup rather than trusting that
-a config "looks right"; silent factor-of-`world_size` errors are cheap to
-make and expensive to discover mid-run.
+- `config/tiny.yaml` + `config/datasets/tiny.yaml`: 3-stage smoke run on synthetic data (20 steps)
+- `config/crow_300m_final.yaml` + `config/datasets/crow_300m_final.yaml`: 300M-model example

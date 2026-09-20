@@ -1,19 +1,19 @@
 # Multiblock Recurrent Transformer
 
-This repository contains the code for my thesis "Efficient Large Language Models via Recurrent Transformer Blocks" (PDF available [here](https://github.com/KT313/papers/blob/main/efficient_large_language_models.pdf)). 
+A multi-block depth-recurrent transformer with dataset preparation, training, evaluation, and Hugging Face export. The architecture is described in the thesis [Efficient Large Language Models via Recurrent Transformer Blocks](https://github.com/KT313/papers/blob/main/efficient_large_language_models.pdf).
 
-> **Built on [seal-rg/recurrent-pretraining](https://github.com/seal-rg/recurrent-pretraining)** (Geiping et al., 2025, Apache-2.0), base commit `3055b7f`. This repo is a multi-block extension of their depth-recurrent transformer; see `git diff upstream-base..HEAD` for exactly what was changed.
+> **Built on [seal-rg/recurrent-pretraining](https://github.com/seal-rg/recurrent-pretraining)** (Geiping et al., 2025, Apache-2.0).
 
-## Work
+## Features
 
-The original repo trains one recurrent block between a "prelude" and a "coda" block. This fork generalizes that to N core blocks, each with its own injection adapter, input norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, the architectures as YAML in `config/model_architecture/`).
-Besides the architecture change, I added the following:
+The model has N recurrent core blocks between prelude and coda blocks. Each core has its own injection adapter, input norm, mean recurrence and truncated-backprop depth (`model/model.py`, config in `model/config.py`, architectures in `config/model_architecture/`).
+
+The repository also provides:
+
 - 3-staged training with smooth data/LR transitions (`training/stage_manager.py`, `docs/multistage_training.md`)
 - a compact training loop with checkpoint/resume and dataset mixing (`training/run.py:train()`, the CLI `training/train.py`), on one GPU or on every GPU of one machine (`backend: ddp` under torchrun, `docs/distributed_training.md`)
 - HuggingFace export path (`model/hf/modeling.py`)
 - dataset preparation driven by a dataset config (`config/datasets/`, `data_preparation/`): sources, stages with token budgets and weights, and the tokenizer in one YAML; downloaded and built incrementally and verified before training
-
-The code was restructured and trimmed after the thesis: only the code path of the final run survives, with tests next to every module. The thesis-era tree (SLURM tooling, all upstream model variants) is in git history up to tag `v1.0`.
 
 ## Usage
 
@@ -34,8 +34,6 @@ make lint                 # ruff
 - `config/model_architecture/<name>.yaml`: model architecture settings
 - `config/datasets/<name>.yaml`: dataset composition
 
-Final model configs in the original repo were named "raven", so I named my model configs "crow" in the same spirit.
-
 ### Data Preparation
 
 Optional: training builds whatever is missing itself by default (`auto_prepare: true`). Gated sources need the huggingface login from Setup.
@@ -44,7 +42,7 @@ Optional: training builds whatever is missing itself by default (`auto_prepare: 
 # mini smoke run (real sources, a few MB)
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_mini.yaml
 
-# download and build the thesis data sources
+# download and build the configured data sources
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/crow_300m_final.yaml
 
 # download only (tokenizer + raw shards), build later with prepare
@@ -69,7 +67,7 @@ uv run python training/train.py --config config/tiny.yaml
 TRAINING_DASHBOARD=0 uv run python training/train.py --config config/tiny.yaml # TUI disabled
 DASHBOARD_SHOW_MICRO_BATCHES=1 uv run python training/train.py --config config/tiny.yaml # TUI with a micro-batch bar per optimizer step
 
-# thesis run on single gpu
+# train a configured model
 uv run python training/train.py --config config/crow_300m_final.yaml
 
 # make shortcut for the same
@@ -92,9 +90,9 @@ and kernel failures raise an explanatory error with that setting; there is no au
 The setting is saved in model/Hugging Face configs. On resume, changing it follows the existing
 `allow_settings_change` policy; older checkpoints without the flag represent native execution.
 
-When a resume checkpoint is found, model construction skips the expensive orthogonal weight initialization and
-uses cheap placeholders until the checkpoint is loaded. Fresh runs, including `resume: true` with no checkpoint
-found, retain the original initialization. Resume restores the saved model, optimizer and RNG states as before.
+Resuming skips fresh weight initialization and restores the saved model, optimizer and RNG states.
+With `resume: true` and no checkpoint, training starts fresh only if the run directory has no prior run evidence.
+Otherwise, choose a new run name or a valid checkpoint; see [resume behavior](docs/resume_configuration_history.md).
 
 Basic metrics follow `log_step_interval`; expensive per-parameter gradient/update statistics follow
 `log_gradient_metrics_interval` independently. Both count completed optimizer steps. The gradient interval must be
@@ -106,10 +104,8 @@ log_step_interval: 1
 log_gradient_metrics_interval: 8
 ```
 
-The default gradient interval is `1`. The ordinary scalar `grad_norm` is still part of basic logging because
-clipping already computes it. When migrating a YAML config, replace `log_gradient_metrics: true` with the previous
-`log_step_interval` value, or `false` with `0`, using the new key. Existing checkpoints remain resumable because
-logging cadence does not affect training state; saved historical run configurations are not rewritten.
+The default gradient interval is `1`. The scalar `grad_norm` is part of basic logging because clipping
+already computes it. Logging cadence can change on resume without affecting training state.
 
 A run resumes by default (`resume: true`): the most recently written checkpoint of `run_name` in its run directory is
 loaded, or `resume_checkpoint_path` names one; a checkpoint written with other settings, model config or dataset config
@@ -142,8 +138,7 @@ The percentages become step numbers once the stage plan is known; `train.log` li
 steps per block to run with, e.g. `[[4, 4, 4], [12, 12, 12]]` (empty: the mean recurrence once); the CLI takes
 `--recurrence 4,4,4` repeatedly. Both run RNG-isolated, so they do not change the training.
 
-Every scored context starts with a BOS token, as every training row does; scores recorded before this was fixed
-(September 2026) were measured without it and are not comparable. Both samples and scores also shift slightly with
+Every scored context starts with a BOS token, as every training row does. Samples and scores can shift with
 `batch_size`: each recurrent forward draws its initial latent state for the whole batch at once, so a row's noise
 depends on the rows it is batched with and on how far they are padded.
 
@@ -160,27 +155,6 @@ depends on the rows it is batched with and on how far they are padded.
 
 ### Sandwich Block
 ![Sandwich block internal structure](docs/figures/sandwich_block.png)
-
-## Results
-
-Training was stable across all three phases at 308M parameters / ~5B tokens. Due to resource limitations, the model is very undertrained, and as expected, benchmark scores are around the same performance as random guessing (raw numbers are in the thesis PDF).  
-It is expected that, with the same number of optimizer steps, the model with higher batch size per step would perform better.  
-Interestingly, the world batch size seems to directly affect the quality impact of recurrent step settings.
-Compared to world batch size 64, world batch size 1024 strongly increases the loss for a single iteration of the recurrent blocks (unexpected), while decreasing the loss significantly for higher numbers of recurrent iterations (expected).
-
-![Batch size comparison: validation loss vs optimizer step](docs/figures/batchsize_comparison_valloss.png)
-*Comparison between a training run with batch size 1024 (blue) and batch size 64 (red) and different numbers of recurrent steps (1-16) for each.*
-
-## Note
-
-During all training runs for my thesis, one of the two prelude blocks in my models never received a gradient during training. This was caused by the prelude blocks not chaining correctly in a for-loop. The issue has since been fixed in the code (commit "Fix prelude layers not chaining in model_dynamic forward"). The code used in the thesis is available under `Releases` as `v1.0` (thesis version).
-
-## Training Info
-
-- 3 days on 4×A100 80GB (DDP, bf16-mixed) via SLURM on a university cluster
-- ELLISAdam optimizer (following original repo)
-- world batch 1024
-- sequence length 2048 tokens
 
 ## Citation
 

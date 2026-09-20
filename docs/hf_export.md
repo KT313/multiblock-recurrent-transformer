@@ -15,8 +15,8 @@ export_to_hf(model, model.config, "export", eos_token_id=[2, 3], bos_token_id=1,
 ```
 
 EOS metadata is required by default so reloaded generation can stop without repeating token IDs. Supply either
-`tokenizer_dir` or a `PreTrainedTokenizerBase` instance. The original positional tokenizer-directory argument remains
-supported; all new options are keyword-only. `None` means unspecified and does not clear tokenizer metadata.
+`tokenizer_dir` or a `PreTrainedTokenizerBase` instance. `tokenizer_dir` accepts a positional argument; the other
+options are keyword-only. `None` means unspecified and does not clear tokenizer metadata.
 Explicit IDs must agree with existing tokenizer IDs. Missing tokenizer special-token roles can be supplied explicitly:
 export fills them on a copy using existing vocabulary tokens, leaving the source tokenizer untouched.
 
@@ -38,6 +38,5 @@ export_to_hf(model, model.config, "weights_export", allow_missing_generation_met
 ```
 
 This opt-in preserves absent IDs as `None`; generation callers must supply stopping metadata if they need EOS stopping.
-It does not bypass validation of supplied IDs. This is a deliberate compatibility change for callers that previously
-exported without any tokenizer or token metadata. Optional [execution precision](execution_precision.md), native model
-weights and strict custom-kernel behavior are unchanged.
+It does not bypass validation of supplied IDs. Callers exporting without a tokenizer or token metadata must set this
+option. See [execution precision](execution_precision.md) for optional precision metadata and its use during inference.

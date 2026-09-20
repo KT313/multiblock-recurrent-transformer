@@ -14,7 +14,7 @@ one independent copy of the run per GPU), and the DDP backend refuses to start w
 
 Optimizer state is replicated by default. Set `optimizer_sharding: zero1` in the top-level run configuration
 to distribute it across ranks, with either FP32 or 8-bit ELLISAdam. See [optimizer-state sharding](optimizer_sharding.md)
-for supported optimizers, checkpoint restrictions, memory caveats and validation limits.
+for supported optimizers, checkpoint restrictions and memory requirements.
 
 ## What is shared and what is per rank
 
@@ -25,7 +25,7 @@ Every rank runs the same `train()`; the differences are these.
   tokens whatever the GPU count, and every `*_steps` / `*_interval` setting, stage boundary and checkpoint name means
   the same thing on 1 or 8 GPUs. `eval_iters` is split the same way. Both must be multiples of the GPU count.
 - **One data reader.** Rank 0 owns the data stream (`BatchStream`: the per-source readers, the token-share picks,
-  the packing pool) and scatters each rank its pack for every micro-batch (`RankBatches` in `training/step.py`).
+  the packing pool) and scatters each rank its pack for every micro-batch (`RankBatches` in `training/steps/batches.py`).
   The other ranks have no train loaders. The checkpoint therefore holds one stream state; a resume continues the
   stream exactly as on one GPU.
 - **Fresh recurrence depths per local microbatch, shared across ranks.** The sampler deterministically combines
@@ -35,8 +35,8 @@ Every rank runs the same `train()`; the differences are these.
   index 0 and `2, 7, 7` at index 1. Fresh draws can coincide. This balances recurrence work; other costs can still
   cause timing differences. Latent values remain different per token and rank (the global RNG uses `seed + rank`);
   DDP broadcasts rank 0's parameters at start, so the model initialization is shared.
-- **Validation is sharded.** Each rank scores its share of the validation rows; the per-depth losses are the mean of
-  the per-rank means, the per-source losses are summed over the ranks.
+- **Validation is sharded.** Each rank scores its share of the validation rows. Overall, per-depth and per-source
+  losses are global supervised-token loss sums divided by their global supervised-token counts.
 - **Scheduled inference is distributed.** Fixed sample batches and benchmark inference jobs use the resident model replicas; rank 0 retains official lm-eval aggregation and publication. See [distributed evaluation](distributed_evaluation.md) for batching, prompting, and qualification.
 - **Rank 0 writes and logs.** The run lock, `run_config.json`, `model_config.json`, accepted resume history, checkpoints, samples, benchmarks,
   the export, `train.log`, wandb and the dashboard belong to rank 0. The other ranks print WARNING and above with a
@@ -99,12 +99,17 @@ at a shared phase boundary. Benchmark inference itself is distributed. These wai
 
 ## Testing without GPUs
 
-The DDP backend runs on the CPU with gloo, which is how the multi-rank loop is tested (`training/backend/test_ddp.py`
-in-process at world size 1, where it must reproduce the golden run bit for bit; `training/test_distributed.py`
-launches two ranks through torchrun). What the CPU path does not cover: NCCL, bf16 autocast under DDP,
-`torch.compile` with the DDP wrapper, and throughput.
+The DDP backend supports CPU execution with Gloo:
+
+```bash
+CUDA_VISIBLE_DEVICES= uv run --no-sync pytest training/backend/test_ddp.py training/test_distributed.py -n 0
+```
+
+These tests require local multiprocessing sockets. They do not cover NCCL, BF16 autocast under DDP,
+`torch.compile` with the DDP wrapper, or GPU throughput.
 
 Configuration sidecars and accepted resume records are described in [resume configuration history](resume_configuration_history.md).
+
 ## Fatal worker failures
 
 The `torchrun` DDP CLI reports an ordinary fatal error directly to stderr, including its rank and
@@ -116,7 +121,6 @@ workers detect parent exit. A peer unable to honor SIGTERM may require the launc
 This policy is opt-in at the CLI boundary (`backend: ddp` with `TORCHELASTIC_RUN_ID` present).
 Library `train()` calls and single-device runs retain ordinary exception cleanup. Successful runs,
 cooperative stop requests, lock refusals and build cancellation retain their existing behavior.
-No validation collectives, batches, DDP synchronization settings or numerical policies change.
 The boundary cannot intercept a native call that hangs without raising, or guarantee error output through
 a blocked stderr destination. Such hangs still require external job supervision. Fatal exits can leave
 incomplete disposable output; only previously completed checkpoints should be used for recovery.

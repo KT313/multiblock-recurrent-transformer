@@ -1,6 +1,6 @@
 # Structured instruction conversations
 
-`instruction_format: messages` opts an instruction source into structured multi-turn training. Existing sources default to `single_turn` and retain their existing preparation, hashes, formatting, and label masks.
+`instruction_format: messages` opts an instruction source into structured multi-turn training. The default is `single_turn`.
 
 The small integration config is `config/datasets/instruction_sources_smoke.yaml`. It selects a budgeted prefix of FineWeb-Edu's pinned 350BT pool and three instruction sources. It is not a recommended research mixture. Prepare it in a separate `--dataset_dir`; its token budgets and `check_limit` do not impose a network-byte limit.
 
@@ -12,11 +12,22 @@ The small integration config is `config/datasets/instruction_sources_smoke.yaml`
 | `webinstruct_messages` | `question`, `answer` | Nonempty strings; use `data/train-*.parquet` to exclude test and legacy splits. |
 | `nemotron_messages` | `messages`, `reasoning` | Require reasoning off; remove an empty leading system message, exclude the entire record for a nonempty one, and validate alternating roles. |
 
+Instruction-pair converters support `instruction_format: messages` with `input_inversions: 0`:
+`sharegpt_conversations` (SlimOrca/ShareGPT), `first_two_turns` (WizardLM), and `instruction_input_output`.
+They pass their selected pair through the same message adapter as field-mapped sources. The adapter preserves
+literal content and appends optional input/system context to the user prompt after a blank line, matching
+instruction/input ordering. It adds no special tokens; the shared formatter owns tokenization and assistant-only labels.
+
+Selecting message format preserves the converters' turn selection: ShareGPT and WizardLM still retain only
+their opening pair. ShareGPT opening validation, orphan-assistant handling and its optional quality filter are unchanged.
+Message-format raw identities include both the tokenizer/format and ShareGPT opening policy, so legacy flattened caches
+cannot be adopted as message rows. Legacy `single_turn` configurations retain their existing output and identities.
+
 Schema mistakes have malformed-row diagnostics and the existing consecutive-failure guard. Quality exclusions are counted separately in per-download-pass conversation diagnostics. Those diagnostic counters are not cumulative resumable totals; durable row offsets and malformed/oversize counters retain their existing contract.
 
 Content is preserved, including code indentation, case, and mathematical notation. Evaluator judgments, unit tests, and category metadata do not become training text. Supplied code is never executed. WebInstruct's short reference answers are not generated worked solutions.
 
-The new format requires `token_count: tokenizer` and rejects input inversions. Optional benchmark Bloom seeding currently supports the old flat formats only; combining it with message sources raises at configuration load. Chat deduplication does not establish benchmark decontamination.
+Message format requires `token_count: tokenizer` and rejects input inversions. Optional benchmark Bloom seeding currently supports the old flat formats only; combining it with message sources raises at configuration load. Chat deduplication does not establish benchmark decontamination.
 
 ## Serialization and loss
 
@@ -62,19 +73,6 @@ ids = encode_chat_prompt(messages, tokenizer, max_tokens=context_length - max_ne
 
 Pass these IDs directly as `input_ids` to the existing model/HF generation path, inside the usual inference session. Do not decode and retokenize them. The IDs already include BOS and completed-history EOS tokens and end with the pending assistant header. Stop the generated reply at EOS. Overflow raises; it does not silently discard history. Plain-text sample generation and standard benchmark prompts retain their original behavior.
 
-See the scoped integration validation report for the actual checks and download bounds used for this change.
-
 For the explicit `<user>`/`<assistant>` tokenizer profile, literal special-token strings in message content,
 startup checks and portable exports, see [Llama 32K chat tokenizer](llama32k_chat_tokenizer.md).
-The new instruction smoke dataset opts into this profile; legacy message datasets keep their original text headers.
-
-Existing instruction-pair converters also support explicit `instruction_format: messages` with `input_inversions: 0`:
-`sharegpt_conversations` (SlimOrca/ShareGPT), `first_two_turns` (WizardLM), and `instruction_input_output`.
-They pass their existing selected pair through the same message adapter as field-mapped sources. The adapter preserves
-literal content and appends optional input/system context to the user prompt after a blank line, matching the existing
-instruction/input ordering. It adds no special tokens; the shared formatter owns tokenization and assistant-only labels.
-
-This opt-in changes the output schema, not which turns those converters select: ShareGPT and WizardLM still retain only
-their opening pair. ShareGPT opening validation, orphan-assistant handling and its optional quality filter are unchanged.
-Message-format raw identities include both the tokenizer/format and ShareGPT opening policy, so legacy flattened caches
-cannot be adopted as message rows. Legacy `single_turn` configurations retain their existing output and identities.
+The instruction smoke dataset opts into this profile; legacy message datasets keep their original text headers.

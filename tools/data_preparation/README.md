@@ -1,6 +1,6 @@
 # Preparation performance tools
 
-Production changes use the installed Python `tokenizers` package. Rust compilation is needed only
+Dataset preparation uses the installed Python `tokenizers` package. Rust compilation is needed only
 for the optional comparison experiment, not for dataset preparation.
 
 ## Capture stage timings
@@ -17,14 +17,14 @@ The replay exercises `_fetch`, `_TokenStep`, `_TokenWorker`, `RawFolder`, and at
 publication. It intentionally bypasses network retrieval and decoder input; it is not an NFS or
 internet benchmark. It currently benchmarks pretrain rows; instruction behavior is regression-tested.
 
-Generate the synthetic fixtures used in the local results (these are not samples of real datasets):
+Generate synthetic fixtures:
 
 ```bash
 uv run --no-sync python -m tools.data_preparation.make_fixture /tmp/preparer-mixed.jsonl --case mixed
 uv run --no-sync python -m tools.data_preparation.make_fixture /tmp/preparer-long.jsonl --case long
 ```
 
-Compare the frozen original algorithm to production, in fresh processes with identical artifacts:
+Compare the benchmark variants in fresh processes with identical artifacts:
 
 ```bash
 uv run --no-sync python -m tools.data_preparation.benchmark_download --tokenizer dataset/tokenizers/llama-32k --fixture /tmp/preparer-mixed.jsonl --output-root /tmp/preparer-replay --mode pipeline --threads 4 --jobs 1 --cap 256 --repeats 3
@@ -68,8 +68,8 @@ PREPARER_NATIVE_LIBRARY=/tmp/preparer-native-target/release/libpreparer_native.s
 uv run --no-sync python -m tools.data_preparation.benchmark_download --tokenizer dataset/tokenizers/llama-32k --fixture /tmp/preparer-long.jsonl --output-root /tmp/preparer-replay --mode truncate --threads 4 --cap 16384 --repeats 3 --variants original candidate builtin rust --native-library /tmp/preparer-native-target/release/libpreparer_native.so
 ```
 
-Use the exact server tokenizer to validate deployment. Local legacy llama-32k and synthetic tests
-do not substitute for server llama-32k-chat-v1 parity or a 32-CPU/NFS measurement.
+Use the deployment tokenizer, representative inputs, and target filesystem when evaluating performance.
+Synthetic local comparisons do not establish server throughput or tokenizer parity.
 
 ## Final cross-source admission benchmark
 
@@ -85,5 +85,4 @@ uv run --no-sync python tools/data_preparation/benchmark_global.py \
 ```
 
 Use `--baseline-repo /path/to/original-archive` for an old-code comparison; otherwise
-baseline uses the current implementation with a fresh session per source. See
-[measurements and compatibility checks](../../docs/global_dedup_performance_results.md).
+baseline uses the current implementation with a fresh session per source.
